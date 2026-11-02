@@ -252,7 +252,7 @@ async fn copilot_prepared_schema_refresh_recreates_before_submission_and_resumes
                 root.path(),
             ),
         );
-        let (inspection, _lease) = crate::control_tools::harness::HarnessInspectionScope::open(
+        let (inspection, _lease) = crate::tools::session::HarnessInspectionScope::open(
             local_session,
             root.path().into(),
             "permissions.json".into(),

@@ -294,7 +294,7 @@ pub struct DispatchResult {
 
 /// Owns provider, permission, and analysis infrastructure shared by every session controller.
 pub struct BrokerRuntime {
-    pub(crate) lsp: Arc<crate::control_tools::lsp::LspService>,
+    pub(crate) lsp: Arc<crate::tools::lsp::LspService>,
     repositories: Arc<forge_git::store::RepositoryStore>,
     diff: Arc<forge_diff::engine::DiffEngine>,
     workspace_kind: WorkspaceKind,
@@ -550,7 +550,7 @@ pub struct HarnessBroker {
     pub(crate) questions: Arc<crate::question::QuestionController>,
     pub(crate) task_controller: Arc<crate::task::SessionTaskController>,
     context_usage_fresh: bool,
-    pub(crate) lsp: Arc<crate::control_tools::lsp::LspService>,
+    pub(crate) lsp: Arc<crate::tools::lsp::LspService>,
     checkpoint: Option<GitCheckpoint>,
     active_operation_id: Option<String>,
     observer: Arc<observation::BrokerObserver>,
@@ -1055,12 +1055,9 @@ impl HarnessBroker {
         Ok(Some(self.snapshot()?))
     }
 
-    fn control_turn_context(
-        &self,
-        mode: PromptMode,
-    ) -> Option<crate::control_tools::ControlTurnContext> {
+    fn control_turn_context(&self, mode: PromptMode) -> Option<crate::tools::ControlTurnContext> {
         if mode == PromptMode::Background {
-            return Some(crate::control_tools::ControlTurnContext::inactive(mode));
+            return Some(crate::tools::ControlTurnContext::inactive(mode));
         }
         let plan = self
             .current_plan_id()
@@ -1073,7 +1070,7 @@ impl HarnessBroker {
                 .read_working_document(&self.session.id, &plan.id)
                 .ok()
         });
-        Some(crate::control_tools::ControlTurnContext {
+        Some(crate::tools::ControlTurnContext {
             questions: Some(self.questions.clone()),
             question_exchange_id: self
                 .exchange_runtime
@@ -2669,8 +2666,7 @@ impl HarnessBroker {
                     policy,
                     Arc::new(AtomicBool::new(false)),
                 );
-                let mut context =
-                    crate::control_tools::ControlTurnContext::inactive(PromptMode::Chat);
+                let mut context = crate::tools::ControlTurnContext::inactive(PromptMode::Chat);
                 context.lsp = Some(scope);
                 context.workspace_root = Some(PathBuf::from(&self.session.workspace));
                 request.control_context = Some(context);
@@ -5396,7 +5392,7 @@ impl HarnessBroker {
         let turn_task_authority = request
             .control_context
             .as_ref()
-            .and_then(crate::control_tools::TaskAuthority::capture);
+            .and_then(crate::tools::TaskAuthority::capture);
         if request.mode != PromptMode::Background {
             self.notify_unavailable_mcp(
                 &BackendCatalogRequest {
@@ -9111,11 +9107,11 @@ mod test {
                     }
                     if turn == 0 && self.explicit {
                         let context = request.control_context.as_ref().unwrap();
-                        let advertised = crate::control_tools::ControlToolRegistry
+                        let advertised = crate::tools::ControlToolRegistry
                             .definition_list_for_context(Some(context), true);
                         assert!(advertised.iter().any(|tool| tool.name == "check_run"));
                         assert!(
-                            !crate::control_tools::ControlToolRegistry
+                            !crate::tools::ControlToolRegistry
                                 .definition_list_for_context(Some(context), false)
                                 .iter()
                                 .any(|tool| tool.name.starts_with("check_"))
@@ -11623,9 +11619,9 @@ let sink = Some(sink);
                 let output: anyhow::Result<crate::backend::BackendCompletion> = async {
                     let context = request.control_context.unwrap();
                     let plan_id = context.plan_document.as_ref().unwrap().plan_id.clone();
-                    let mut runtime = crate::control_tools::ControlToolRuntime::new(context);
+                    let mut runtime = crate::tools::ControlToolRuntime::new(context);
                     runtime
-                        .invoke(crate::control_tools::ControlToolInvocation {
+                        .invoke(crate::tools::ControlToolInvocation {
                             task_permit: None,
                             name: "plan_overview_read".into(),
                             arguments: json!({"plan_id":plan_id}),
@@ -11633,7 +11629,7 @@ let sink = Some(sink);
                         .await?;
                     assert!(
                         runtime
-                            .invoke(crate::control_tools::ControlToolInvocation {
+                            .invoke(crate::tools::ControlToolInvocation {
                                 task_permit: None,
                                 name: "goal_complete".into(),
                                 arguments: json!({"summary":"premature"})
@@ -11813,7 +11809,7 @@ let sink = Some(sink);
 
             let output: anyhow::Result<crate::backend::BackendCompletion> = async {
 let sink = Some(sink);
-            use crate::control_tools::{ControlToolInvocation, ControlToolRuntime};
+            use crate::tools::{ControlToolInvocation, ControlToolRuntime};
             let turn = self.turn.fetch_add(1, Ordering::SeqCst);
             let address = crate::backend::TurnAddress {
         scope: fixture_scope.clone(),
@@ -13943,7 +13939,7 @@ let sink = Some(sink);
             let result: anyhow::Result<crate::backend::BackendCompletion> = async {
 
             let output: anyhow::Result<crate::backend::BackendCompletion> = async {
-            use crate::control_tools::{
+            use crate::tools::{
                 ControlToolInvocation, ControlToolRuntime, apply_invocation,
             };
             let turn = self.turn.fetch_add(1, Ordering::SeqCst);
@@ -14297,8 +14293,8 @@ let sink = Some(sink);
             document.clone(),
             questions.remove(0),
         );
-        let context = crate::control_tools::ControlTurnContext::inactive(PromptMode::PlanQuestion);
-        let names = crate::control_tools::ControlToolRegistry
+        let context = crate::tools::ControlTurnContext::inactive(PromptMode::PlanQuestion);
+        let names = crate::tools::ControlToolRegistry
             .definition_list_for_context(Some(&context), true)
             .into_iter()
             .map(|tool| tool.name)

@@ -1,8 +1,20 @@
 use super::transport::AcpHandler;
+use crate::tools::mcp::{CallResult, Empty, Initialization, Response};
 use anyhow::{Context, Result, ensure};
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+/// Keep MCP envelopes typed around the open payload supplied by a control tool.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum Payload {
+    Initialization(Initialization),
+    Empty(Empty),
+    Tools(Value),
+    Call(CallResult),
+}
 
 /// Owns the loopback control endpoint for one Harness root session.
 pub(super) struct ControlServer {
@@ -135,34 +147,29 @@ async fn respond(
         return Ok(());
     };
     let result = match request["method"].as_str().unwrap_or_default() {
-        "initialize" => Ok(
-            json!({"protocolVersion":"2025-03-26", "capabilities":{"tools":{}},
-            "serverInfo":{"name":"forge-harness-control","version":"1"}}),
-        ),
-        "ping" => Ok(json!({})),
-        "tools/list" => handler.request("forge/tools", json!({})).await,
+        "initialize" => Ok(Payload::Initialization(Initialization::new("1"))),
+        "ping" => Ok(Payload::Empty(Empty {})),
+        "tools/list" => handler
+            .request("forge/tools", json!({}))
+            .await
+            .map(Payload::Tools),
         "tools/call" => {
             match handler
                 .request("forge/control", request["params"].clone())
                 .await
             {
-                Ok(value) => {
-                    Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&value)?}]}))
-                }
-                Err(error) => Ok(
-                    json!({"isError":true,"content":[{"type":"text","text":format!("{error:#}")}]}),
-                ),
+                Ok(value) => Ok(Payload::Call(CallResult::text(crate::codec::to_string(
+                    &value,
+                )?))),
+                Err(error) => Ok(Payload::Call(CallResult::failure(format!("{error:#}")))),
             }
         }
         _ => Err(anyhow::anyhow!("unsupported MCP control method")),
     };
-    let response = match result {
-        Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-        Err(error) => {
-            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":error.to_string()}})
-        }
+    let body = match result {
+        Ok(result) => crate::codec::to_vec(&Response::success(id, result))?,
+        Err(error) => crate::codec::to_vec(&Response::failure(id, -32601, error.to_string()))?,
     };
-    let body = serde_json::to_vec(&response)?;
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -175,6 +182,73 @@ async fn respond(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Handler;
+
+    #[async_trait::async_trait]
+    impl AcpHandler for Handler {
+        async fn notification(&self, _method: &str, _parameter: Value) -> Result<()> {
+            Ok(())
+        }
+
+        async fn request(&self, method: &str, parameter: Value) -> Result<Value> {
+            if parameter["fail"] == true {
+                anyhow::bail!("tool rejected the request");
+            }
+            match method {
+                "forge/tools" => Ok(json!({"tools":[]})),
+                "forge/control" => Ok(parameter),
+                _ => anyhow::bail!("unexpected handler method"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn typed_responses_preserve_http_lengths_and_mcp_outcomes() -> Result<()> {
+        let server = ControlServer::start(Arc::new(Handler)).await?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let content = "λ\n\"".repeat(150_000);
+        let requests = [
+            json!({"id":"init","method":"initialize"}),
+            json!({"id":1,"method":"ping"}),
+            json!({"id":2,"method":"tools/list"}),
+            json!({"id":3,"method":"tools/call","params":{"text":content}}),
+            json!({"id":4,"method":"tools/call","params":{"fail":true}}),
+            json!({"id":5,"method":"unknown"}),
+        ];
+        let mut responses = Vec::new();
+        for request in requests {
+            let response = client.post(&server.url).json(&request).send().await?;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let length = response.content_length().unwrap();
+            let bytes = response.bytes().await?;
+            assert_eq!(length, u64::try_from(bytes.len())?);
+            let response: Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(response["id"], request["id"]);
+            assert_eq!(response["jsonrpc"], "2.0");
+            responses.push(response);
+        }
+        assert_eq!(responses[0]["result"]["serverInfo"]["version"], "1");
+        assert_eq!(responses[1]["result"], json!({}));
+        assert_eq!(responses[2]["result"], json!({"tools":[]}));
+        let result = &responses[3]["result"];
+        let payload: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap())?;
+        assert_eq!(payload["text"], content);
+        assert!(result.get("isError").is_none());
+        assert!(result.get("structuredContent").is_none());
+        assert_eq!(responses[4]["result"]["isError"], true);
+        assert!(responses[4]["error"].is_null());
+        assert_eq!(responses[5]["error"]["code"], -32601);
+        assert!(responses[5].get("result").is_none());
+        let response = client
+            .post(&server.url)
+            .json(&json!({"method":"notifications/initialized"}))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        assert!(response.bytes().await?.is_empty());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn control_request_preserves_json_larger_than_one_mib() -> Result<()> {

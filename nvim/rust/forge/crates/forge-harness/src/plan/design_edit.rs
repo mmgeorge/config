@@ -9,7 +9,7 @@ use super::design_flows::DesignFlow;
 use super::design_tests::DesignTestFile;
 use super::{DesignPatchRequest, PatchField, PlanDocument};
 
-/// Preserves ordered file, overview, and check edits in the existing completion stream.
+/// Preserves ordered file and overview edits in the existing completion stream.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum DesignEditRequest {
@@ -17,8 +17,6 @@ pub enum DesignEditRequest {
     File(DesignPatchRequest),
     /// Updates supplied overview fields while preserving project file proposals.
     Overview(PlanOverviewEditRequest),
-    /// Selects configured checks without replacing other overview fields.
-    Checks(PlanChecksEditRequest),
 }
 
 impl DesignEditRequest {
@@ -31,7 +29,6 @@ impl DesignEditRequest {
         let (plan_id, expected_version) = match &self {
             Self::File(request) => (&request.plan_id, request.expected_version),
             Self::Overview(request) => (&request.plan_id, request.expected_version),
-            Self::Checks(request) => (&request.plan_id, request.expected_version),
         };
         ensure!(
             plan_id == &document.plan_id,
@@ -64,6 +61,7 @@ impl DesignEditRequest {
                     flows,
                     verification,
                     tests,
+                    checks,
                 } = request;
                 if let Some(value) = objective {
                     overview.objective = value;
@@ -94,22 +92,18 @@ impl DesignEditRequest {
                 if let Some(value) = tests {
                     overview.tests = value;
                 }
+                if let Some(checks) = checks {
+                    let snapshot = crate::checks::ConfigSnapshot::load(workspace)?;
+                    snapshot.config.validate_selection(&checks)?;
+                    overview.checks.clear();
+                    if !checks.is_empty() {
+                        overview.set_checks(
+                            &snapshot.config,
+                            &checks.into_iter().map(|id| (id, true)).collect(),
+                        )?;
+                    }
+                }
                 (plan_id, expected_version, title, overview)
-            }
-            Self::Checks(request) => {
-                let mut overview = document
-                    .design
-                    .as_ref()
-                    .context("plan has no declaration design")?
-                    .document
-                    .clone();
-                let snapshot = crate::checks::ConfigSnapshot::load(workspace)?;
-                snapshot.config.validate_selection(&request.check_ids)?;
-                overview.set_checks(
-                    &snapshot.config,
-                    &request.check_ids.into_iter().map(|id| (id, true)).collect(),
-                )?;
-                (request.plan_id, request.expected_version, None, overview)
             }
         };
         let before = serde_json::to_string_pretty(
@@ -150,7 +144,7 @@ impl From<DesignPatchRequest> for DesignEditRequest {
     }
 }
 
-/// Updates supplied overview fields while retaining omitted fields and selected checks.
+/// Updates supplied overview fields and check selections while retaining omitted fields.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanOverviewEditRequest {
@@ -165,9 +159,7 @@ pub struct PlanOverviewEditRequest {
     /// States the requested outcome and scope; required at submission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objective: Option<String>,
-    /// Shows one caller interaction and its expected result as Markdown, using fenced blocks for text inputs and outputs.
-    /// For a CLI, include the full command and expected stdout, exit status, or artifact; describe non-text results briefly.
-    /// Omit when no caller-facing behavior changes; null removes an existing example.
+    /// Replaces or clears the optional usage example.
     #[serde(default, skip_serializing_if = "usage_is_missing")]
     #[schemars(with = "Option<String>")]
     pub usage: PatchField<String>,
@@ -183,29 +175,18 @@ pub struct PlanOverviewEditRequest {
     /// Explains the solution, state ownership, failure behavior, and compatibility; required at submission. Describe unsupported or generated file changes here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub design: Option<String>,
-    /// Traces behavior with one initiating event per flow and ordered steps naming the objects or operations involved.
-    /// Use separate flows for independent lifecycles and state the values, events, or results passed between owners in the steps and effects.
-    /// Harness draws the diagrams; supply structured flows without hand-formatted diagrams, or an empty list when none are needed.
+    /// Replaces the structured runtime flows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flows: Option<Vec<DesignFlow>>,
     /// Lists manual actions and expected results after automated checks pass; use an empty list when unnecessary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<Vec<String>>,
-    /// Groups intended coverage by file with exact test names, change kinds, scenarios, and expected results. Includes inline and reused tests; does not record executed results.
+    /// Replaces the inventory of planned tests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tests: Option<Vec<DesignTestFile>>,
-}
-
-/// Adds saved check selections through the same ordered plan-edit stream.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PlanChecksEditRequest {
-    /// Identifies the active plan.
-    pub plan_id: String,
-    /// Prevents applying the selection to a newer plan version.
-    pub expected_version: u64,
-    /// Names the saved checks to enable along with their prerequisites.
-    pub check_ids: Vec<String>,
+    /// Replaces the additional check selection, resolving required prerequisites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<Vec<String>>,
 }
 
 /// Keeps an omitted usage field distinct from an explicit null during replay.

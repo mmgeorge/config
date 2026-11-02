@@ -37,10 +37,18 @@ pub(crate) fn to_vec<Value: Serialize + ?Sized>(
     value: &Value,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let mut bytes = Vec::new();
-    value.serialize(serde_stacker::Serializer::new(
-        &mut serde_json::Serializer::new(&mut bytes),
-    ))?;
+    to_writer(&mut bytes, value)?;
     Ok(bytes)
+}
+
+/// Serialize a typed payload into a writer with stack growth for nested content.
+pub(crate) fn to_writer<Value: Serialize + ?Sized>(
+    writer: impl std::io::Write,
+    value: &Value,
+) -> Result<(), serde_json::Error> {
+    value.serialize(serde_stacker::Serializer::new(
+        &mut serde_json::Serializer::new(writer),
+    ))
 }
 
 /// Serialize persisted JSON with readable indentation and stack growth.

@@ -34,7 +34,7 @@ pub fn run(command: Command, diagnostic_skip_line_stats: bool) -> Result<()> {
                 );
                 Ok(())
             }
-            Command::Mcp => forge_harness::control_tools::run_stdio().await,
+            Command::Mcp => forge_harness::tools::run_stdio().await,
             Command::Nvim => {
                 let host = Arc::new(runtime::ForgeRuntime::new()?);
                 host.repositories.diagnostic_skip_line_stats.store(

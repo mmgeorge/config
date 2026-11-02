@@ -968,14 +968,23 @@ impl PlanDocument {
 
     /// Read the descriptive overview and file inventory without exposing an internal document path.
     pub fn overview_json(&self) -> Result<String> {
+        Ok(super::codec::to_string_pretty(&self.overview()?)?)
+    }
+
+    /// Borrow the model-facing overview until its caller serializes the response.
+    pub(crate) fn overview(&self) -> Result<PlanOverview<'_>> {
         let design = self
             .design
             .as_ref()
             .context("plan has no semantic structure")?;
-        Ok(super::codec::to_string_pretty(&serde_json::json!({
-            "plan_id": self.plan_id, "version": self.version, "title": self.title,
-            "request": self.prompt, "overview": design.document, "files": design.file_inventory()
-        }))?)
+        Ok(PlanOverview {
+            plan_id: &self.plan_id,
+            version: self.version,
+            title: &self.title,
+            request: &self.prompt,
+            overview: &design.document,
+            files: design.file_inventory(),
+        })
     }
 
     /// Omit deferred verification instructions from code-writing handoffs.
@@ -1007,6 +1016,17 @@ impl PlanDocument {
         hide_derived_state(&mut value);
         Ok(value)
     }
+}
+
+/// Borrow the descriptive planning surface without copying it into a JSON tree.
+#[derive(Serialize)]
+pub(crate) struct PlanOverview<'a> {
+    plan_id: &'a str,
+    version: u64,
+    title: &'a str,
+    request: &'a str,
+    overview: &'a super::design_document::DesignDocument,
+    files: super::design::DesignFileInventory<'a>,
 }
 
 fn hide_derived_state(value: &mut serde_json::Value) {

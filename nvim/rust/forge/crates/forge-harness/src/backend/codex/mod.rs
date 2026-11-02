@@ -7,8 +7,8 @@ use crate::backend::{
     BackendRequest, BackendTimingRecord, CatalogCapability, CatalogMutation, McpDefinition,
     McpStatus, McpToolDefinition, PromptMode, SkillDefinition,
 };
-use crate::control_tools::ControlToolRegistry;
 use crate::session::ApprovalMode;
+use crate::tools::ControlToolRegistry;
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -1624,7 +1624,7 @@ impl Backend for CodexBackend {
             process.set_activity_publication(false);
             let request_text = request.input.text();
             let mut control_context = request.control_context.clone().unwrap_or_else(|| {
-                crate::control_tools::ControlTurnContext::inactive(request.mode)
+                crate::tools::ControlTurnContext::inactive(request.mode)
             });
             control_context.planning_feedback =
                 request.mode == PromptMode::Plan && request_text.contains("Planning feedback:");
@@ -2504,8 +2504,7 @@ mod test {
         let gate = crate::checkpoint::ToolGate::new()?;
         gate.complete(Err("fixture checkpoint failed".into()))?;
         let mut blocked_request = request.clone();
-        let mut blocked_context =
-            crate::control_tools::ControlTurnContext::inactive(PromptMode::Chat);
+        let mut blocked_context = crate::tools::ControlTurnContext::inactive(PromptMode::Chat);
         blocked_context.checkpoint = Some(gate);
         blocked_request.control_context = Some(blocked_context);
         let failure = backend.prompt(blocked_request).await.unwrap_err();
@@ -2518,9 +2517,8 @@ mod test {
             Some(CodexThread::Prepared(_))
         ));
         request.mode = PromptMode::Plan;
-        request.control_context = Some(crate::control_tools::ControlTurnContext::inactive(
-            PromptMode::Plan,
-        ));
+        request.control_context =
+            Some(crate::tools::ControlTurnContext::inactive(PromptMode::Plan));
         let output = backend.prompt(request.clone()).await?;
         assert_eq!(
             output.completion.backend_session_id.as_deref(),
@@ -2599,7 +2597,7 @@ mod test {
             backend_session_id: None,
         });
         let gate = crate::checkpoint::ToolGate::new()?;
-        let mut context = crate::control_tools::ControlTurnContext::inactive(PromptMode::Chat);
+        let mut context = crate::tools::ControlTurnContext::inactive(PromptMode::Chat);
         context.checkpoint = Some(gate.clone());
         request.control_context = Some(context);
         let mut process = CodexJsonRpc::connect(
@@ -3668,7 +3666,7 @@ mod test {
                         submission: None,
                         recovered_input: Vec::new(),
                         control_context: Some({
-                            let mut context = crate::control_tools::ControlTurnContext::inactive(PromptMode::GoalContinuation);
+                            let mut context = crate::tools::ControlTurnContext::inactive(PromptMode::GoalContinuation);
                             context.native_goal = Some("Resume test objective".into());
                             context
                         }),

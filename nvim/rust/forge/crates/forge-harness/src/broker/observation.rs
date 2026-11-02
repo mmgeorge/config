@@ -14,7 +14,7 @@ pub(crate) struct BrokerObserver {
     pub(crate) questions: Arc<crate::question::QuestionController>,
     pub(crate) admission: Arc<crate::storage::admission::SessionAdmission>,
     pub(crate) input_schedule: tokio::sync::watch::Sender<crate::session::InputSchedule>,
-    pub(super) lsp: Arc<crate::control_tools::lsp::LspService>,
+    pub(super) lsp: Arc<crate::tools::lsp::LspService>,
     pub(crate) status_thoughts: AtomicBool,
     pub(crate) check_editing: Arc<AtomicBool>,
     pub(crate) completion_queue: crate::checks::CompletionQueue,

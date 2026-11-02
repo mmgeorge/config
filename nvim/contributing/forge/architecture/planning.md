@@ -17,7 +17,7 @@ Three files define what the model is told. `plan/prompts/planning.md` introduces
 | `plan_file_read` | Returns a source file's semantic structure or a complete configuration file as numbered text, optionally within line bounds. Reading an uncaptured path returns its digest without changing the design. |
 | `plan_file_edit` | Applies Add, Update, Delete, Move, and context chunks atomically. The first edit of a path captures its baseline and digest. Invalid syntax, paths, versions, or context change nothing. |
 | `plan_overview_read` | Returns the descriptive overview, shared version, file inventory, and any current execution evidence. |
-| `plan_overview_edit` | Updates supplied overview fields atomically. Omitted fields remain unchanged, arrays replace their previous values, and `usage: null` removes the example. File proposals and check selections are preserved. |
+| `plan_overview_edit` | Updates supplied overview fields atomically. Omitted fields remain unchanged, arrays replace their previous values, and `usage: null` removes the example. The optional `checks` list replaces additional check selections and includes prerequisites. File proposals are preserved. |
 | `plan_submit` | Validates the complete document and freezes an immutable revision. |
 
 Optional `source_digests` carry read identities across turns, so a patch is rejected if the source changed after the read. File edits and overview edits share one version. Every effective edit increments it; a no-op leaves it unchanged. The model does not edit internal `plan.json` storage through the file tools.

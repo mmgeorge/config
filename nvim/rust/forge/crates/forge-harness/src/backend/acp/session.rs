@@ -1,9 +1,9 @@
 use super::transport::AcpHandler;
 use crate::backend::approval::{ApprovalResolution, PermissionCoordinator};
 use crate::backend::*;
-use crate::control_tools::{ControlToolExecutor, ControlToolInvocation, ControlTurnContext};
 use crate::permissions::matcher::PermissionTarget;
 use crate::session::ApprovalMode;
+use crate::tools::{ControlToolExecutor, ControlToolInvocation, ControlTurnContext};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -20,7 +20,7 @@ pub(super) struct AcpSessionState {
     pub(super) output: Mutex<BackendCompletion>,
     pub(super) control: Mutex<Option<Arc<ControlToolExecutor>>>,
     pub(super) catalog: RwLock<Value>,
-    pub(super) tool_definition: RwLock<Vec<crate::control_tools::ControlToolDefinition>>,
+    pub(super) tool_definition: RwLock<Vec<crate::tools::ControlToolDefinition>>,
     tool: Mutex<HashMap<(String, String), Value>>,
     finished_tool: Mutex<HashSet<(String, String)>>,
     compaction: Mutex<HashMap<String, Compaction>>,
@@ -31,7 +31,7 @@ pub(super) struct AcpSessionState {
 #[derive(Clone)]
 /// Captures immutable callback routing for the admitted provider turn.
 pub(super) struct ActiveTurn {
-    task_authority: Option<crate::control_tools::TaskAuthority>,
+    task_authority: Option<crate::tools::TaskAuthority>,
     pub(super) mode: ApprovalMode,
     pub(super) sink: BackendEventSink,
 }
@@ -95,7 +95,7 @@ impl AcpSessionState {
             task_authority: request
                 .control_context
                 .as_ref()
-                .and_then(crate::control_tools::TaskAuthority::capture),
+                .and_then(crate::tools::TaskAuthority::capture),
             mode: request.approval_mode,
             sink,
         });
@@ -435,7 +435,7 @@ impl AcpSessionState {
         let control = request.target_list.as_slice();
         let internal = matches!(control, [PermissionTarget::Mcp { target }]
             if target.strip_prefix("forge-harness-control/").is_some_and(|name|
-                crate::control_tools::ControlToolRegistry.definition_list().iter().any(|definition|definition.name == name)));
+                crate::tools::ControlToolRegistry.definition_list().iter().any(|definition|definition.name == name)));
         let resolution = if internal {
             ApprovalResolution::AllowOnce
         } else {
@@ -789,9 +789,9 @@ impl AcpHandler for AcpSessionState {
 
     async fn request(&self, method: &str, parameter: Value) -> Result<Value> {
         match method {
-            "forge/tools" => Ok(
-                json!({"tools":self.tool_definition.read().await.iter().map(|definition|definition.mcp_value()).collect::<Vec<_>>()}),
-            ),
+            "forge/tools" => Ok(serde_json::to_value(crate::tools::mcp::Tools {
+                tools: &self.tool_definition.read().await,
+            })?),
             "session/request_permission" => self.authorize(parameter).await,
             "forge/control" => {
                 ensure_active(&self.active).await?;
@@ -823,7 +823,7 @@ impl AcpHandler for AcpSessionState {
                     Ok(result) => result,
                     Err(error) => {
                         drop(control);
-                        let failure = crate::control_tools::control_tool_failure_json(
+                        let failure = crate::tools::control_tool_failure_json(
                             &invocation,
                             &error,
                             outcome.plan_document.as_ref(),
@@ -841,10 +841,7 @@ impl AcpHandler for AcpSessionState {
                     }
                 };
                 if let Some(invocation) = result.invocation {
-                    crate::control_tools::apply_invocation(
-                        &invocation,
-                        &mut *self.output.lock().await,
-                    )?;
+                    crate::tools::apply_invocation(&invocation, &mut *self.output.lock().await)?;
                 }
                 Ok(json!({"message":result.message}))
             }

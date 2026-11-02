@@ -21,7 +21,7 @@ pub struct AgentRuntime {
     pub task_id: String,
     pub cancellation: watch::Receiver<bool>,
     pub sender: AgentCommandSender,
-    pub(crate) lsp_lease: Option<crate::control_tools::lsp::LspLease>,
+    pub(crate) lsp_lease: Option<crate::tools::lsp::LspLease>,
 }
 
 impl AgentRuntime {

@@ -2,12 +2,12 @@ use super::approval::{PreparedApproval, codex_response, permission_from_provider
 use super::json_rpc::{DynamicToolTraceContext, control_invocation, rejects_question_resolution};
 use crate::backend::approval::{ApprovalResolution, PermissionCoordinator, protected_target};
 use crate::backend::{BackendCompletion, BackendEventSink, ExecutionOwner};
-use crate::control_tools::{
+use crate::plan::{PlanDocument, render_plan};
+use crate::session::ApprovalMode;
+use crate::tools::{
     ControlToolExecutor, ControlToolInvocation, ControlTurnContext, apply_invocation,
     control_tool_failure_json, validate_arguments,
 };
-use crate::plan::{PlanDocument, render_plan};
-use crate::session::ApprovalMode;
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -23,7 +23,7 @@ pub(super) struct RequestExecutor {
     planning_feedback: bool,
     plan_document: Option<PlanDocument>,
     control_runtime: Option<Arc<ControlToolExecutor>>,
-    task_authority: Option<crate::control_tools::TaskAuthority>,
+    task_authority: Option<crate::tools::TaskAuthority>,
     replay_invocation: Option<ControlToolInvocation>,
     source_digests: Option<BTreeMap<String, String>>,
     execution_finished: bool,
@@ -92,7 +92,7 @@ impl RequestExecutor {
 
     /// Installs the canonical plan and tool services for the next turn.
     pub(super) fn configure(&mut self, context: ControlTurnContext) -> Arc<ControlToolExecutor> {
-        self.task_authority = crate::control_tools::TaskAuthority::capture(&context);
+        self.task_authority = crate::tools::TaskAuthority::capture(&context);
         self.plan_document = context.plan_document.clone();
         self.planning_feedback = context.planning_feedback;
         let executor = Arc::new(ControlToolExecutor::new(context));
@@ -233,7 +233,7 @@ impl RequestExecutor {
                         Err(error) => {
                             let failure_json = control_tool_failure_json(
                                 &invocation,
-                                &error,
+                                error.as_ref(),
                                 self.plan_document.as_ref(),
                             );
                             if let Some(context) = trace_context {
@@ -325,7 +325,7 @@ impl RequestExecutor {
         let mut output = BackendCompletion::default();
         apply_invocation(invocation, &mut output)?;
         match invocation.name.as_str() {
-            name if crate::control_tools::is_agent_tool(name) => {
+            name if crate::tools::is_agent_tool(name) => {
                 anyhow::bail!("agent tools require an authenticated active root turn");
             }
             "plan_phase_done" => {
@@ -334,7 +334,7 @@ impl RequestExecutor {
             "harness_plan_edit" => {
                 anyhow::bail!("obsolete plan edit tool. Use plan_file_edit");
             }
-            "plan_file_edit" | "plan_overview_edit" | "plan_checks_add" => {
+            "plan_file_edit" | "plan_overview_edit" => {
                 let request = output
                     .design_patch
                     .pop()

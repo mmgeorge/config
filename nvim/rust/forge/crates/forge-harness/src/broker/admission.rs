@@ -86,7 +86,7 @@ impl HarnessBroker {
             .compiled()
             .clone();
         let (repository_scope, repository_lease) =
-            crate::control_tools::repository::RepositoryToolScope::open(
+            crate::tools::repository::RepositoryToolScope::open(
                 self.session.id.clone(),
                 interaction.id.clone(),
                 PathBuf::from(&self.session.workspace),
@@ -95,19 +95,18 @@ impl HarnessBroker {
                 Arc::clone(&self.repositories),
                 Arc::clone(&self.diff),
             )?;
-        let (harness_scope, harness_lease) =
-            crate::control_tools::harness::HarnessInspectionScope::open(
-                self.session.clone(),
-                self.data_root.clone(),
-                self.permission_store
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
-                    .open()
-                    .0,
-                policy.clone(),
-                Arc::clone(&self.turn_cancellation.requested),
-                self.trace.clone(),
-            )?;
+        let (harness_scope, harness_lease) = crate::tools::session::HarnessInspectionScope::open(
+            self.session.clone(),
+            self.data_root.clone(),
+            self.permission_store
+                .read()
+                .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
+                .open()
+                .0,
+            policy.clone(),
+            Arc::clone(&self.turn_cancellation.requested),
+            self.trace.clone(),
+        )?;
         let (lsp_scope, lsp_lease) = self.lsp.scope(
             self.session.id.clone(),
             interaction.id.clone(),

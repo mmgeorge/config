@@ -1,6 +1,6 @@
 use super::json_rpc::*;
 use crate::backend::*;
-use crate::control_tools::apply_invocation;
+use crate::tools::apply_invocation;
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::HashMap;

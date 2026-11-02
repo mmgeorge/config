@@ -6,7 +6,7 @@ Each provider reports identities, phases, tools, and failures differently, and a
 
 ## Backend contract
 
-The crate lives at `nvim/rust/forge/crates/forge-harness`, organized by capability: `broker`, `session`, `plan`, `goal`, `exchange`, `turn`, `timeline`, `checkpoint`, `backend`, `storage`, `workspace`, `protocol`, and `control_tools`. `Backend` defines the complete provider contract once. `CodexBackend`, `CopilotBackend`, and `AcpBackend` own private transports, and `MockBackend` implements the same boundary deterministically.
+The crate lives at `nvim/rust/forge/crates/forge-harness`, organized by capability: `broker`, `session`, `plan`, `goal`, `exchange`, `turn`, `timeline`, `checkpoint`, `backend`, `storage`, `workspace`, `protocol`, and `tools`. `Backend` defines the complete provider contract once. `CodexBackend`, `CopilotBackend`, and `AcpBackend` own private transports, and `MockBackend` implements the same boundary deterministically.
 
 `Backend::prompt_stream` writes to an ordered event sink and returns `BackendCompletion`, with provider metadata and control results but no event history. The broker drains accepted updates before settling the exchange. `BackendEvent` is an exhaustive enum with typed payloads, and every update carries the invocation scope of its owner, so no shared consumer decodes provider JSON. Compaction uses a separate session-operation scope instead of inventing an exchange.
 
@@ -30,7 +30,26 @@ Tool requests, input fragments, executions, output, reported changes, and outcom
 
 Codex classifies activity by top-level item type. Before titles enter durable state, the transport replaces values under credential-like keys, such as `token`, `api_key`, `password`, and `authorization`, with `[REDACTED]`. Shell headings summarize simple reads and searches after decoding the launcher, and the durable command never changes. ACP tool updates merge by tool-call identity, and structured diff content becomes a `ProviderChangeSet` without reading the workspace. Antigravity edits can complete without diff content, so `/capabilities` marks its file diffs as limited. Reported edits never replace checkpoint-based **Workspace changes**.
 
-`ControlToolRegistry` names tools by domain and action, without a `harness_` prefix or aliases. `ControlToolExecutor` owns the shared lifecycle for every adapter's control callbacks. It serializes runtime mutations, and cancellation interrupts tool waits and lock waiters. A new turn gets a fresh executor, so late results from an earlier generation are rejected.
+`ControlToolRegistry` assembles family catalogs under `tools/`. Each tool has its own file containing its description, schema, and handler. Shared schemas and services stay within their family; provider adapters use the same catalog and invocation boundary. `ControlToolExecutor` owns the shared lifecycle for every adapter's control callbacks. It serializes runtime mutations, and cancellation interrupts tool waits and lock waiters. A new turn gets a fresh executor, so late results from an earlier generation are rejected.
+
+Tool families are organized by purpose:
+
+```text
+tools/
+  agents/       child-agent tools
+  checks/       check definitions and execution
+  goals/        goal status and completion
+  lsp/          editor source queries
+  plan/         semantic file edits and the plan overview
+  questions/    asynchronous questions and answers
+  repository/   Git status and diffs
+  session/      session history and inspection
+  config.rs     Harness configuration inspection
+```
+
+The plan overview owns its check selection alongside planned tests and manual verification. Tool descriptions use multiline literals, and detailed field guidance belongs to the tool schema rather than the planning prompt. Domain modules such as `plan/`, `checks/`, and `agent/` retain their state and business operations.
+
+Tool handlers return `ToolResult` with explicit `ToolError` variants and conversions from lower-level errors. One response renderer preserves structured failure details and retry information across providers. Turn admission and cancellation remain transport errors so adapters can stop stale work before publishing a tool response.
 
 ## Attachments
 

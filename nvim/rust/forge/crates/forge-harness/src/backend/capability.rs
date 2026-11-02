@@ -82,7 +82,7 @@ impl CapabilityManifest {
             ("cancel", "Cancel active work"),
             ("resume", "Resume conversation"),
             ("cleanup", "Collect provider execution"),
-            ("control_tools", "Harness control tools"),
+            ("tools", "Harness control tools"),
         ] {
             add(
                 id,

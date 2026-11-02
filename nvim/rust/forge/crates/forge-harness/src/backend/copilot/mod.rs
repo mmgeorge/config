@@ -23,11 +23,11 @@ use crate::backend::{
     BackendInput, BackendKind, BackendModel, BackendOutput, BackendRequest, CatalogCapability,
     CatalogMutation, McpDefinition, McpStatus, McpToolDefinition, PromptMode, SkillDefinition,
 };
-use crate::control_tools::{
+use crate::session::ApprovalMode;
+use crate::tools::{
     ControlToolExecutor, ControlToolInvocation, ControlToolRegistry, ControlTurnContext,
     apply_invocation, control_tool_failure_json,
 };
-use crate::session::ApprovalMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use event_decoder::CopilotEventDecoder;
@@ -1156,7 +1156,7 @@ let event_sink = Some(event_sink);
             state.task_authority = request
                 .control_context
                 .as_ref()
-                .and_then(crate::control_tools::TaskAuthority::capture);
+                .and_then(crate::tools::TaskAuthority::capture);
         }
         let session = self.session(&request, CopilotSessionReuse::Compatible).await?;
         let mut subscription = event_stream::SessionEventStream::new(
@@ -2400,7 +2400,7 @@ impl ToolHandler for CopilotControlToolHandler {
 }
 
 struct CopilotPermissionState {
-    task_authority: Option<crate::control_tools::TaskAuthority>,
+    task_authority: Option<crate::tools::TaskAuthority>,
     cancelled: bool,
     checkpoint: Option<crate::checkpoint::ToolGate>,
     owner: Option<crate::backend::ExecutionOwner>,
@@ -2748,7 +2748,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn routes_control_tools_without_provider_specific_schemas() {
+    async fn routes_tools_without_provider_specific_schemas() {
         let router = Arc::new(ControlToolRouter::default());
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         let (_task_root, _task_store, task_controller) =

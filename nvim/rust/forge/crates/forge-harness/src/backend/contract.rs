@@ -196,7 +196,7 @@ pub struct BackendRequest {
     /// Earlier definitely undelivered input, ordered before the current instruction.
     pub recovered_input: Vec<BackendInput>,
     #[serde(skip, default)]
-    pub control_context: Option<crate::control_tools::ControlTurnContext>,
+    pub control_context: Option<crate::tools::ControlTurnContext>,
 }
 
 impl BackendRequest {
@@ -1154,9 +1154,7 @@ struct MockBackend {
     response_control: super::mock_response::MockResponseControl,
     lsp_probe: bool,
     retained_control: Option<
-        std::sync::Mutex<
-            std::collections::HashMap<String, crate::control_tools::ControlTurnContext>,
-        >,
+        std::sync::Mutex<std::collections::HashMap<String, crate::tools::ControlTurnContext>>,
     >,
     permission: Option<std::sync::Arc<approval::PermissionCoordinator>>,
     delay: Option<Duration>,
@@ -1379,23 +1377,23 @@ impl Backend for MockBackend {
             }
             let text = if control_probe && name == "__catalog" {
                 serde_json::to_string(
-                    &crate::control_tools::ControlToolRegistry
+                    &crate::tools::ControlToolRegistry
                         .definition_list_for_context(Some(&context), request.owner()?.is_root())
                         .into_iter()
                         .map(|tool| tool.name)
                         .collect::<Vec<_>>(),
                 )?
             } else {
-                let invocation = crate::control_tools::ControlToolInvocation {
+                let invocation = crate::tools::ControlToolInvocation {
                     task_permit: None,
                     name: name.clone(),
                     arguments: arguments.clone(),
                 };
-                let executor = crate::control_tools::ControlToolExecutor::new(context);
+                let executor = crate::tools::ControlToolExecutor::new(context);
                 match executor
                     .execute(invocation)
                     .await
-                    .and_then(|outcome| outcome.result)
+                    .and_then(|outcome| Ok(outcome.result?))
                 {
                     Ok(result) if collect_pages => {
                         let mut page: Value = serde_json::from_str(&result.message)?;
@@ -1413,7 +1411,7 @@ impl Backend for MockBackend {
                             );
                             arguments["cursor"] = json!(cursor);
                             let result = executor
-                                .execute(crate::control_tools::ControlToolInvocation {
+                                .execute(crate::tools::ControlToolInvocation {
                                     task_permit: None,
                                     name: name.clone(),
                                     arguments: arguments.clone(),
@@ -1467,7 +1465,7 @@ impl Backend for MockBackend {
                 .as_ref()
                 .is_some_and(|scope| scope.is_setup())
         {
-            let advertised = crate::control_tools::ControlToolRegistry
+            let advertised = crate::tools::ControlToolRegistry
                 .definition_list_for_context(Some(context), true);
             anyhow::ensure!(
                 advertised

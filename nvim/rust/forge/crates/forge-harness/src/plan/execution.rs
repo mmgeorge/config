@@ -1076,13 +1076,8 @@ mod revision_policy_tests {
                 control.require_revision_phase().is_ok(),
                 phase == PlanPhase::Resolve
             );
-            let tools = crate::control_tools::ControlToolRegistry.definition_list_for(Some(phase));
-            for name in [
-                "plan_file_edit",
-                "plan_overview_edit",
-                "plan_checks_add",
-                "plan_submit",
-            ] {
+            let tools = crate::tools::ControlToolRegistry.definition_list_for(Some(phase));
+            for name in ["plan_file_edit", "plan_overview_edit", "plan_submit"] {
                 assert_eq!(
                     tools.iter().any(|tool| tool.name == name),
                     phase == PlanPhase::Resolve

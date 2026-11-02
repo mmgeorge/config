@@ -10,7 +10,7 @@ Run Rust filters as `cargo test --profile dev --locked -p <package> --lib <filte
 | --- | --- | --- |
 | Project checks | `checks::`, `plan::design_review::tests`, `selected_plan_checks_are_versioned` | `harness_package_checks`, `harness_automatic_checks`, `harness_check_queue_host`, `harness_check_lifecycle_host`, `harness_check_repair_resume_host` |
 | Plan review | `plan::` | `plan_review_document`, `plan_check_selection`, `plan_checks_host`, `plan_review_calls_host`, `plan_workspace_definition` |
-| Provider lifecycle | `backend::codex`, `backend::copilot`, `backend::acp`, `control_tools::executor`, `service::tests` | `harness_prompt_lifecycle`, `harness_configuration_host` |
+| Provider lifecycle | `backend::codex`, `backend::copilot`, `backend::acp`, `tools::executor`, `service::tests` | `harness_prompt_lifecycle`, `harness_configuration_host` |
 | Input and queues | `deferred_steering_cancellation_preserves_acceptance_boundary` | `harness_host` |
 | Transcript folds | None | `harness_message_folds_host`, `harness_markdown_folds` |
 | Prompt history | None | `harness_prompt_history`, `harness_prompt_history_host` |
@@ -72,7 +72,7 @@ Set `forge_test_manual` to keep a successful run open for inspection, then close
 
 ## Provider lifecycle
 
-Run these filters when changing provider lifecycle ownership, with a 300-second compile deadline. The Codex tests hold an editor LSP request open during cleanup. `control_tools::executor` covers cancellation of active and queued tools and keeps completed results. The Copilot and ACP tests exercise that executor through their real callbacks.
+Run these filters when changing provider lifecycle ownership, with a 300-second compile deadline. The Codex tests hold an editor LSP request open during cleanup. `tools::executor` covers cancellation of active and queued tools and keeps completed results. The Copilot and ACP tests exercise that executor through their real callbacks.
 
 ## Configuration controls
 

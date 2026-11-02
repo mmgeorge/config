@@ -17,7 +17,7 @@ mod design;
 mod design_document;
 mod design_edit;
 pub(crate) use design_edit::ensure_file_patch;
-pub use design_edit::{DesignEditRequest, PlanChecksEditRequest, PlanOverviewEditRequest};
+pub use design_edit::{DesignEditRequest, PlanOverviewEditRequest};
 mod design_flows;
 mod design_tests;
 pub use design_tests::DesignTestChange;

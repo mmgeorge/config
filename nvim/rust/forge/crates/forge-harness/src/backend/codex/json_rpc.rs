@@ -11,11 +11,11 @@ use crate::backend::{
     ProviderChecklistEntry, ProviderChecklistUpdate, ProviderFileChange, ToolActivityKind,
     ToolInvocation,
 };
-use crate::control_tools::{
+use crate::session::{ApprovalMode, ContextUsage};
+use crate::tools::{
     ControlToolExecutor, ControlToolInvocation, ControlToolRegistry, ControlTurnContext,
     apply_invocation,
 };
-use crate::session::{ApprovalMode, ContextUsage};
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -1186,7 +1186,7 @@ fn apply_control_request_result(
     let Some(invocation) = control_invocation(method, params)? else {
         return Ok(());
     };
-    apply_invocation(&invocation, &mut output.completion)
+    Ok(apply_invocation(&invocation, &mut output.completion)?)
 }
 
 fn should_apply_control_request_semantics(
@@ -2482,8 +2482,8 @@ mod test {
         for (id, tool, arguments) in [
             (
                 1,
-                "plan_checks_add",
-                json!({"plan_id":"plan","expected_version":4,"check_ids":["manual"]}),
+                "plan_overview_edit",
+                json!({"plan_id":"plan","expected_version":4,"checks":["manual"]}),
             ),
             (
                 2,
@@ -2492,8 +2492,8 @@ mod test {
             ),
             (
                 3,
-                "plan_checks_add",
-                json!({"plan_id":"plan","expected_version":6,"check_ids":["manual"]}),
+                "plan_overview_edit",
+                json!({"plan_id":"plan","expected_version":6,"checks":["manual"]}),
             ),
         ] {
             process.publish_message(json!({"id":id,"method":"item/tool/call","params":{
@@ -2607,7 +2607,7 @@ mod test {
 
     #[test]
     fn every_registered_dynamic_tool_reaches_control_dispatch() {
-        for definition in crate::control_tools::ControlToolRegistry.definition_list() {
+        for definition in crate::tools::ControlToolRegistry.definition_list() {
             let request = serde_json::json!({"tool":definition.name,"arguments":{}});
             let invocation = super::control_invocation("item/tool/call", &request)
                 .unwrap()
@@ -3159,7 +3159,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn extracts_answer_and_withdrawal_without_rendering_control_tools() {
+    async fn extracts_answer_and_withdrawal_without_rendering_tools() {
         let mut answer_output = BackendOutput::default();
         apply_control_request_result(
             &json!({
@@ -3729,7 +3729,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn coalesces_message_deltas_without_treating_prose_as_control_tools() {
+    async fn coalesces_message_deltas_without_treating_prose_as_tools() {
         let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(
@@ -4451,7 +4451,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn does_not_classify_mcp_names_as_harness_control_tools() {
+    async fn does_not_classify_mcp_names_as_harness_tools() {
         let mut normalization = fixture_normalization();
         let mut output = BackendOutput::default();
         normalize_event(

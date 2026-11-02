@@ -100,11 +100,12 @@ the same action used to delete planned tests. Confirming disables those checks
 for this plan. Re-enable them through `oc`. Historical and accepted plans remain
 read-only.
 
-Agents add existing checks with `plan_checks_add`, supplying `plan_id`,
-`expected_version`, and `check_ids`. The tool updates the plan's `checks` list
-without changing repository settings or executing commands. Repeated IDs do not
-create repeated plan entries, and adding only already-selected checks leaves the
-plan version unchanged. The tool is available during plan authoring and Resolve.
+Agents select existing checks through the `checks` field of `plan_overview_edit`,
+alongside tests and manual verification. The list replaces the plan's additional
+check selection without changing repository settings or executing commands.
+Prerequisites are included automatically; `[]` clears additions while automatic
+checks still apply. Omitting `checks` preserves the selection. The tool is
+available during plan authoring and Resolve.
 `check_run` accepts `check` as a name or a list of names. Supply `inputs` as an
 object matching each check's declared input contract, or omit it to use defaults
 and automatic context bindings. `all: true` requests full context and cannot be
@@ -344,7 +345,7 @@ configured command or a discovery subprocess. Editing inputs invalidates a prior
 Previews never count as execution evidence.
 
 Agent tools separate saved definitions from execution. The source contracts live
-in `checks/response.rs` and `control_tools/mod.rs` in `forge-harness`.
+in `tools/checks/`, with shared execution and result models in `checks/`.
 
 | Tool | Request and response |
 | --- | --- |

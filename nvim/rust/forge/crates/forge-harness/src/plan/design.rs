@@ -14,6 +14,13 @@ pub struct DeclarationFile {
     pub source_digest: String,
 }
 
+/// Borrow the original and proposed paths while owning the computed change list.
+#[derive(Serialize)]
+pub(crate) struct DesignFileInventory<'a> {
+    paths: BTreeSet<&'a String>,
+    changed_paths: Vec<String>,
+}
+
 const PLAN_DOCUMENT_PATH: &str = "plan.json";
 
 type SourceOverviewCache =
@@ -441,13 +448,16 @@ impl DeclarationDesign {
     }
 
     /// List project files represented by the plan without exposing internal metadata paths.
-    pub(crate) fn file_inventory(&self) -> serde_json::Value {
+    pub(crate) fn file_inventory(&self) -> DesignFileInventory<'_> {
         let paths = self
             .baseline
             .keys()
             .chain(self.proposed.keys())
             .collect::<BTreeSet<_>>();
-        serde_json::json!({"paths":paths,"changed_paths":self.changed_paths()})
+        DesignFileInventory {
+            paths,
+            changed_paths: self.changed_paths(),
+        }
     }
 
     /// Read one virtual overview or list paths without sending the complete snapshot.

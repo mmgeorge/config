@@ -84,7 +84,7 @@ impl AcpBackend {
     async fn session(
         &self,
         mut request: BackendCatalogRequest,
-        tools: Option<Vec<crate::control_tools::ControlToolDefinition>>,
+        tools: Option<Vec<crate::tools::ControlToolDefinition>>,
         cancelled: Option<&AtomicBool>,
     ) -> Result<Arc<AcpSession>> {
         self.kind.validate_access(&request.access)?;
@@ -150,7 +150,7 @@ impl AcpBackend {
             },
         )?;
         *state.tool_definition.write().await = tools.unwrap_or_else(|| {
-            crate::control_tools::ControlToolRegistry
+            crate::tools::ControlToolRegistry
                 .definition_list_for_owner(
                     &owner,
                     setting.desired.subagent_tools.unwrap_or(false),
@@ -775,7 +775,7 @@ impl Backend for AcpBackend {
                 .lock()
                 .await
                 .insert(request.runtime_key()?, cancelled.clone());
-            let tools = crate::control_tools::ControlToolRegistry.definition_list_for_context(
+            let tools = crate::tools::ControlToolRegistry.definition_list_for_context(
                 request.control_context.as_ref(),
                 request.owner()?.is_root(),
             );

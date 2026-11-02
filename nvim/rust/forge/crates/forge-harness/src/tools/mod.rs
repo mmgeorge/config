@@ -1,0 +1,42 @@
+mod authority;
+mod error;
+mod executor;
+mod failure;
+mod invocation;
+pub(crate) mod mcp;
+mod registry;
+mod runtime;
+mod schema;
+mod stdio;
+
+mod agents;
+mod checks;
+mod config;
+mod goals;
+pub(crate) mod lsp;
+mod plan;
+mod questions;
+pub mod repository;
+pub(crate) mod session;
+
+pub(crate) use agents::is_tool as is_agent_tool;
+pub(crate) use authority::TaskAuthority;
+pub use error::{ToolError, ToolResult};
+pub(crate) use executor::ControlToolExecutor;
+pub(crate) use failure::{
+    ControlToolArgumentError, control_tool_failure_json, schema_violation_list,
+};
+pub use invocation::{ControlToolInvocation, apply_invocation};
+pub(crate) use invocation::{json_pointer_to_path, validate_arguments};
+pub use questions::{
+    plan_question_input_schema, question_answer_input_schema, question_withdraw_input_schema,
+};
+pub use registry::{ControlToolDefinition, ControlToolRegistry};
+#[cfg(test)]
+pub(crate) use runtime::ControlToolRuntime;
+pub use runtime::{ControlToolResult, ControlTurnContext};
+pub use stdio::run_stdio;
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod test;

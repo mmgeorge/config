@@ -104,19 +104,19 @@ impl BackendRequest {
 mod test {
     use super::*;
     use crate::backend::{BackendInput, ServiceTier};
-    use crate::control_tools::ControlTurnContext;
     use crate::session::ApprovalMode;
+    use crate::tools::ControlTurnContext;
 
     #[test]
     fn background_profile_excludes_workflow_instructions_and_tools() {
         let context = ControlTurnContext::inactive(PromptMode::Background);
         assert!(
-            crate::control_tools::ControlToolRegistry
+            crate::tools::ControlToolRegistry
                 .definition_list_for_context(Some(&context), true)
                 .is_empty()
         );
         assert!(
-            crate::control_tools::ControlToolRegistry
+            crate::tools::ControlToolRegistry
                 .definition_list_for_context(Some(&context), false)
                 .is_empty()
         );

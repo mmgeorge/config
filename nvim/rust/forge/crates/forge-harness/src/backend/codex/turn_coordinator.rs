@@ -1919,7 +1919,7 @@ mod test {
             backend_session_id: None,
             submission: None,
             recovered_input: Vec::new(),
-            control_context: Some(crate::control_tools::ControlTurnContext::inactive(
+            control_context: Some(crate::tools::ControlTurnContext::inactive(
                 crate::backend::PromptMode::GoalContinuation,
             )),
         };
@@ -1939,8 +1939,8 @@ mod test {
         use crate::backend::approval::PermissionCoordinator;
         use crate::backend::steering::SteeringLane;
         use crate::backend::{BackendInput, PromptMode};
-        use crate::control_tools::{ControlTurnContext, lsp::LspService};
         use crate::session::ApprovalMode;
+        use crate::tools::{ControlTurnContext, lsp::LspService};
         use crate::trace::TraceStore;
         use futures_util::{SinkExt, StreamExt};
         use std::sync::{Arc, atomic::AtomicBool};
@@ -2538,9 +2538,8 @@ mod test {
                         crate::backend::ExecutionOwner::root("session"),
                         "exchange",
                     )));
-                let mut context = crate::control_tools::ControlTurnContext::inactive(
-                    PromptMode::GoalContinuation,
-                );
+                let mut context =
+                    crate::tools::ControlTurnContext::inactive(PromptMode::GoalContinuation);
                 context.native_goal = Some("Fixture objective".into());
                 context.task_controller = Some(controller.clone());
                 process.set_control_context(context.clone()).await;
@@ -2706,7 +2705,7 @@ mod test {
                     "exchange",
                 )));
             let mut context =
-                crate::control_tools::ControlTurnContext::inactive(PromptMode::GoalContinuation);
+                crate::tools::ControlTurnContext::inactive(PromptMode::GoalContinuation);
             context.native_goal = Some("Fixture objective".into());
             context.task_controller = Some(controller);
             process.set_control_context(context.clone()).await;
@@ -2874,9 +2873,8 @@ mod test {
                 submission: None,
                 recovered_input: Vec::new(),
                 control_context: Some({
-                    let mut context = crate::control_tools::ControlTurnContext::inactive(
-                        PromptMode::GoalContinuation,
-                    );
+                    let mut context =
+                        crate::tools::ControlTurnContext::inactive(PromptMode::GoalContinuation);
                     context.native_goal = Some("Native reader objective".into());
                     context
                 }),
