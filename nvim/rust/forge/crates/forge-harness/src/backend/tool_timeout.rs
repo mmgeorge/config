@@ -23,6 +23,7 @@ enum ToolDeadline {
         title: String,
         background: bool,
     },
+    UserInput,
     Finished,
 }
 
@@ -60,7 +61,7 @@ impl ToolWatchdog {
         })
     }
 
-    /// Start each deadline once and retire it only on a terminal tool event.
+    /// Track execution deadlines while leaving explicit waits for user answers unbounded.
     pub(crate) fn observe(&self, event: &BackendEvent) -> Result<()> {
         let BackendEvent::Tool { address, update } = event else {
             return Ok(());
@@ -71,13 +72,19 @@ impl ToolWatchdog {
             .map_err(|_| anyhow!("tool deadline lock poisoned"))?;
         match update {
             ToolUpdate::Requested { invocation } => {
-                tools
-                    .entry(address.clone())
-                    .or_insert_with(|| ToolDeadline::Running {
-                        deadline: Instant::now() + self.duration,
-                        title: invocation.title.clone(),
-                        background: false,
-                    });
+                tools.entry(address.clone()).or_insert_with(|| {
+                    if invocation.name == "question_ask"
+                        && invocation.arguments["wait"].as_bool() == Some(true)
+                    {
+                        ToolDeadline::UserInput
+                    } else {
+                        ToolDeadline::Running {
+                            deadline: Instant::now() + self.duration,
+                            title: invocation.title.clone(),
+                            background: false,
+                        }
+                    }
+                });
             }
             ToolUpdate::Started => {
                 tools
@@ -126,7 +133,7 @@ impl ToolWatchdog {
                     ToolDeadline::Running {
                         deadline, title, ..
                     } => Some((*deadline, address.clone(), title.clone())),
-                    ToolDeadline::Finished => None,
+                    ToolDeadline::UserInput | ToolDeadline::Finished => None,
                 })
                 .min_by_key(|(deadline, _, _)| *deadline);
             let Some((deadline, address, title)) = next else {
@@ -220,6 +227,32 @@ mod tests {
                 },
             },
         }
+    }
+
+    /// Wait for user decisions without disabling deadlines on unrelated execution.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_questions_do_not_expire_but_other_tools_do() -> Result<()> {
+        let watchdog = watchdog()?;
+        let mut question = requested("question_ask", ToolActivityKind::ToolCall);
+        if let BackendEvent::Tool {
+            update: ToolUpdate::Requested { invocation },
+            ..
+        } = &mut question
+        {
+            invocation.arguments = serde_json::json!({"wait":true});
+        }
+        watchdog.observe(&question)?;
+        watchdog.observe(&BackendEvent::Tool {
+            address: address("question_ask"),
+            update: ToolUpdate::Started,
+        })?;
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let mut pending = Box::pin(watchdog.expired());
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        watchdog.observe(&requested("command", ToolActivityKind::Command))?;
+        let expired = pending.await?.unwrap();
+        assert_eq!(expired.address, address("command"));
+        Ok(())
     }
 
     /// Output and repeated starts cannot keep either shell or tool execution alive indefinitely.

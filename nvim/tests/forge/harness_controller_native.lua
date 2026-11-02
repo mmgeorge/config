@@ -204,6 +204,16 @@ local success, failure = xpcall(function()
   local title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
     { use_winbar = true, maxwidth = 200 }).str
   assert(title:find("rxw · sandbox · mock", 1, true), "winbar lost access, sandbox order, or model")
+  state.questions = { revision = 1, questions = {
+    { content = { question = "Which behavior should the function provide?" }, resolution = { kind = "pending" } },
+  } }
+  controller.refresh_winbar()
+  assert(table.concat(state.presentation.status_view.content.lines, "\n"):find(
+    "└─ Which behavior should the function provide?", 1, true), "controller omitted pending questions from status")
+  assert(not vim.wo[state.transcript_win].winbar:find("question", 1, true), "question status remained in the winbar")
+  state.questions = nil
+  controller.refresh_winbar()
+  assert(not table.concat(state.presentation.status_view.content.lines, "\n"):find("answer questions", 1, true))
   for _, sandbox in ipairs({ true, false }) do
     state.session.access = { sandbox = sandbox }
     for _, access in ipairs({ "r", "rx", "rw", "rxw", "rwx", "rxwx" }) do

@@ -48,6 +48,7 @@ pub struct DesignTestCase {
     /// Distinguishes additions, edits, removals, and unchanged coverage.
     pub change: DesignTestChange,
     /// Describes the scenario and expected result, or the reason for removal.
+    /// For an isolated test, name any collaborators to mock; for an integration test, name the real boundaries exercised.
     pub description: String,
 }
 

@@ -3,6 +3,7 @@ use crate::backend::submission::{Submission, SubmissionState};
 use crate::input::{
     InputAction, InputDelivery, InputIntent, InputMessage, InputOperation, InputRoute, InputUpdate,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Retain the acknowledged native selection together with its canonical task authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -351,7 +352,7 @@ impl SessionController {
         *task = Some(tokio::spawn(async move {
             let mut jobs = JoinSet::new();
             let mut job_owner = std::collections::HashMap::new();
-            let mut steering = false;
+            let steering = Arc::new(Semaphore::new(1));
             let mut native_goal_selection = None;
             let mut native_error_reported = false;
             loop {
@@ -386,7 +387,7 @@ impl SessionController {
                     Ok(InputProgress::Waiting)
                 } else {
                     controller
-                        .admit_input(&sink, &mut jobs, &mut steering, &mut job_owner)
+                        .admit_input(&sink, &mut jobs, &steering, &mut job_owner)
                         .await
                 };
                 let wait_execution = match progress {
@@ -411,17 +412,12 @@ impl SessionController {
                     _ = question_changed.changed() => {},
                     result = jobs.join_next_with_id(), if !jobs.is_empty() => {
                         match result {
-                            Some(Ok((id, was_steering))) => {
+                            Some(Ok((id, _))) => {
                                 job_owner.remove(&id);
-                                if was_steering { steering = false; }
                             }
                             Some(Err(error)) => {
                                 let Some(controller) = owner.upgrade() else { break };
                                 if let Some(id) = job_owner.remove(&error.id()) {
-                                    if let Ok(snapshot) = controller.coordinator.submissions.snapshot()
-                                        && snapshot.messages.iter().any(|message| message.id == id && message.route == Some(InputRoute::Steering)) {
-                                            steering = false;
-                                        }
                                     if let Err(failure) = controller.input_failure(&id, format!("Input worker failed: {error}"), &sink).await {
                                         let _ = sink.send_event(SessionEvent {
                                             session_id: controller.catalog_request.read().await.harness_session_id.clone(),
@@ -555,7 +551,7 @@ impl SessionController {
         self: &Arc<Self>,
         sink: &MessageSender,
         jobs: &mut JoinSet<bool>,
-        steering: &mut bool,
+        steering: &Arc<Semaphore>,
         job_owner: &mut std::collections::HashMap<tokio::task::Id, String>,
     ) -> Result<InputProgress> {
         if let Some(progress) = self.admit_task_checks(sink, jobs).await? {
@@ -645,7 +641,8 @@ impl SessionController {
         let mut command = crate::task::command::SessionCommand::queued_input(&message)?;
         let admission = self.coordinator.execution.clone().try_acquire_owned().ok();
         let steering_available = admission.is_none()
-            && !*steering
+            && steering.available_permits() > 0
+            && jobs.len() < crate::backend::SteeringLane::CAPACITY
             && (self.parent_input.is_active()
                 || snapshot.native_steer
                     && self.backend.has_active_turn(&snapshot.session.id).await);
@@ -777,10 +774,14 @@ impl SessionController {
         drop(control);
         let controller = self.clone();
         let sink = sink.clone();
-        *steering |= steer;
+        let steering_order = if steer {
+            Some(steering.clone().try_acquire_owned()?)
+        } else {
+            None
+        };
         let message_id = message.id.clone();
         let worker = jobs.spawn(async move {
-            let result = controller.deliver_input(&message, steer, admission, &sink).await;
+            let result = controller.deliver_input(&message, steering_order, admission, &sink).await;
             if let Err(error) = result {
                 let diagnostic = crate::storage::error_message(&error);
                 if let Err(persistence) = controller.input_failure(&message.id, diagnostic.clone(), &sink).await {
@@ -1178,10 +1179,11 @@ impl SessionController {
     async fn deliver_input(
         &self,
         message: &InputMessage,
-        steer: bool,
+        steering_order: Option<OwnedSemaphorePermit>,
         admission: Option<ExecutionPermit>,
         sink: &MessageSender,
     ) -> Result<()> {
+        let steer = steering_order.is_some();
         let catalog = self.catalog_request.read().await.clone();
         let trace = self.trace.clone();
         let session_id = &catalog.harness_session_id;
@@ -1261,6 +1263,11 @@ impl SessionController {
                 .settle_input(message, submission, Ok(()), steer, sink)
                 .await;
         }
+        let _steering_flight = if steer {
+            Some(submission.begin_steering()?)
+        } else {
+            None
+        };
         self.publish_input(
             self.coordinator.submissions.delivery(
                 &message.id,
@@ -1314,13 +1321,27 @@ impl SessionController {
                         submission: Some(submission.clone()),
                     }
                 };
-            if self.parent_input.is_active() {
-                self.parent_input.steer(input).await
-            } else {
-                self.backend
-                    .steer_session(&catalog.harness_session_id, input)
-                    .await
-            }
+            let mut queued = submission.steering_queued();
+            let dispatch = async {
+                if self.parent_input.is_active() {
+                    self.parent_input.steer(input).await
+                } else {
+                    self.backend
+                        .steer_session(&catalog.harness_session_id, input)
+                        .await
+                }
+            };
+            tokio::pin!(dispatch);
+            let result = tokio::select! {
+                result = &mut dispatch => result,
+                queued = async { queued.wait_for(|queued| *queued).await.map(drop) } => {
+                    queued.context("steering handoff channel closed")?;
+                    drop(steering_order);
+                    self.coordinator.submissions.changed.notify_one();
+                    dispatch.await
+                }
+            };
+            result
         } else {
             let mut broker = self.broker.lock().await;
             if let Some(config) = &message.config {

@@ -7,6 +7,7 @@
 ---@field commands ForgeViewCommandSet
 ---@field options table
 ---@field content? table
+---@field content_width? integer
 ---@field namespace integer
 ---@field animation_namespace integer
 ---@field group integer
@@ -108,7 +109,15 @@ function StatusView:render(context, commands)
     self.context = context
   end
   if commands then self.commands = commands end
-  local content = hint.compose(self.snapshot or { block = {} }, self.context, self.commands)
+  local window = self.window or self.options.transcript_window
+  local valid_window = vim.api.nvim_win_is_valid(window)
+  local width = valid_window and vim.api.nvim_win_get_width(window) or vim.o.columns
+  self.content_width = width
+  ---Measure wrapped previews with the owning window's display options.
+  local function compose()
+    return hint.compose(self.snapshot or { block = {} }, self.context, self.commands, width)
+  end
+  local content = valid_window and vim.api.nvim_win_call(window, compose) or compose()
   if vim.deep_equal(content, self.content) then self:resize() return end
   self.content = content
   vim.bo[self.buffer].modifiable = true
@@ -151,6 +160,10 @@ function StatusView:resize()
     if self.window and vim.api.nvim_win_is_valid(self.window) then vim.api.nvim_win_close(self.window, true) end
     self.window = nil
     self:update_animation()
+    return
+  end
+  if self.content_width ~= vim.api.nvim_win_get_width(self.window or options.transcript_window) then
+    self:render()
     return
   end
   local composer = options.composer_window

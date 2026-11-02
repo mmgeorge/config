@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::{Result, ensure};
@@ -111,6 +114,8 @@ impl SubmissionStore {
             id: id.into(),
             record: Mutex::new(record),
             acceptance: tokio::sync::watch::channel(accepted).0,
+            steering_queued: tokio::sync::watch::channel(false).0,
+            steering_active: AtomicBool::new(false),
             accepted_action: Mutex::new(None),
         });
         live.retain(|_, entry| entry.strong_count() > 0);
@@ -293,6 +298,8 @@ impl SubmissionStore {
             id: record.id.clone(),
             record: Mutex::new(record),
             acceptance: tokio::sync::watch::channel(false).0,
+            steering_queued: tokio::sync::watch::channel(false).0,
+            steering_active: AtomicBool::new(false),
             accepted_action: Mutex::new(None),
         });
         let mut live = self
@@ -440,7 +447,18 @@ pub struct Submission {
     id: String,
     record: Mutex<SubmissionRecord>,
     acceptance: tokio::sync::watch::Sender<bool>,
+    steering_queued: tokio::sync::watch::Sender<bool>,
+    steering_active: AtomicBool,
     accepted_action: Mutex<Option<AcceptedAction>>,
+}
+
+/// Keeps live steering distinct from a lost acknowledgment until its worker settles.
+pub(crate) struct SteeringFlight(Arc<Submission>);
+
+impl Drop for SteeringFlight {
+    fn drop(&mut self) {
+        self.0.steering_active.store(false, Ordering::Release);
+    }
 }
 
 struct AcceptedAction(Arc<dyn Fn() -> Result<()> + Send + Sync>);
@@ -452,6 +470,32 @@ impl std::fmt::Debug for AcceptedAction {
 }
 
 impl Submission {
+    /// Own this live steering attempt without authorizing replay of uncertain input.
+    pub(crate) fn begin_steering(self: &Arc<Self>) -> Result<SteeringFlight> {
+        ensure!(
+            self.record()?.delivery == SubmissionState::Prepared,
+            "steering input was already dispatched"
+        );
+        ensure!(
+            self.steering_active
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok(),
+            "steering input already has a worker"
+        );
+        self.steering_queued.send_replace(false);
+        Ok(SteeringFlight(self.clone()))
+    }
+
+    /// Observe FIFO handoff independently from the provider's acknowledgment.
+    pub(crate) fn steering_queued(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.steering_queued.subscribe()
+    }
+
+    /// Publish handoff only after the active turn's FIFO owns this input.
+    pub(crate) fn mark_steering_queued(&self) {
+        self.steering_queued.send_replace(true);
+    }
+
     /// Runs committed-state activation before acceptance becomes visible to consumers.
     pub(crate) fn on_accepted(
         &self,
@@ -660,12 +704,27 @@ impl Submission {
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut record = self.record()?;
+        let was_prepared = record.delivery == SubmissionState::Prepared;
         change(&mut record)?;
-        if matches!(record.delivery, SubmissionState::Sending { .. }) {
-            let unresolved: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM submission AS other JOIN submission AS current ON current.id=?1 WHERE other.id<>current.id AND other.runtime=current.runtime AND other.provider=current.provider AND json_extract(other.payload,'$.delivery.state')='sending')",
-                [&self.id], |row| row.get(0),
+        if was_prepared && matches!(record.delivery, SubmissionState::Sending { .. }) {
+            let mut statement = transaction.prepare(
+                "SELECT other.id FROM submission AS other JOIN submission AS current ON current.id=?1 WHERE other.id<>current.id AND other.runtime=current.runtime AND other.provider=current.provider AND json_extract(other.payload,'$.delivery.state')='sending'",
             )?;
+            let sending = statement
+                .query_map([&self.id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let live = self
+                .store
+                .live
+                .lock()
+                .map_err(|_| anyhow::anyhow!("submission registry lock poisoned"))?;
+            let unresolved = sending.iter().any(|id| {
+                !self.steering_active.load(Ordering::Acquire)
+                    || !live
+                        .get(id)
+                        .and_then(Weak::upgrade)
+                        .is_some_and(|other| other.steering_active.load(Ordering::Acquire))
+            });
             ensure!(
                 !unresolved,
                 "an earlier submission has uncertain delivery; input remains saved"
@@ -744,6 +803,44 @@ mod tests {
         BackendKind, PromptMode,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn live_steering_can_overlap_but_lost_acknowledgments_block_new_dispatch() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let first = store.prepare(&request("first"), BackendKind::Codex)?;
+        let second = store.prepare(&request("second"), BackendKind::Codex)?;
+        let third = store.prepare(&request("third"), BackendKind::Codex)?;
+        let first_flight = first.begin_steering()?;
+        assert!(first.begin_steering().is_err());
+        let second_flight = second.begin_steering()?;
+        let third_flight = third.begin_steering()?;
+        let target = SubmissionTarget::Codex {
+            thread_id: "thread".into(),
+        };
+        first.sending(target.clone())?;
+        second.sending(target.clone())?;
+        second.accepted("second accepted first".into())?;
+        drop(second_flight);
+        assert!(matches!(
+            first.record()?.delivery,
+            SubmissionState::Sending { .. }
+        ));
+        drop(first_flight);
+        first.failed("connection dropped".into())?;
+        assert_eq!(first.record()?.error.as_deref(), Some("connection dropped"));
+        assert!(
+            first.begin_steering().is_err(),
+            "uncertain input cannot be replayed"
+        );
+        let error = third.sending(target.clone()).unwrap_err();
+        assert!(error.to_string().contains("uncertain delivery"));
+        assert_eq!(third.record()?.delivery, SubmissionState::Prepared);
+        first.accepted("late first acknowledgment".into())?;
+        third.sending(target)?;
+        drop(third_flight);
+        Ok(())
+    }
 
     #[test]
     fn pending_uses_unfinished_index_and_does_not_decode_completed_history() -> Result<()> {

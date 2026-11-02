@@ -37,20 +37,13 @@ impl PlanPrompt {
 
     /// Build a decision-complete planning request for one user objective.
     pub fn draft(request: &str) -> String {
-        format!(
-            r#"You are planning a software change as a Harness Plan task. The permission for this turn controls repository access. You may read source but must not change project files.
-
-{PLANNING_CONTRACT}
-
-User request:
-{request}"#
-        )
+        format!("{PLANNING_CONTRACT}\n\nUser request:\n{request}")
     }
 
     /// Continue one paused planning conversation with the user's selected feedback.
     pub fn feedback(request: &str, answer: &str) -> String {
         format!(
-            r#"Continue the existing Harness Plan task. Harness has already recorded the user's answers below. Do not answer or withdraw those resolved questions. Apply the answers with design_patch edits, settle any remaining decision according to the user's question preferences, then call plan_submit with the exact plan ID and version.
+            r#"Continue the existing Harness Plan task. Harness has already recorded the user's answers below. Do not answer or withdraw those resolved questions. Apply the answers with plan_file_edit and plan_overview_edit, settle any remaining decision according to the user's question preferences, then call plan_submit with the exact plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -81,7 +74,7 @@ Original request:
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("None");
         format!(
-            r#"Revise the saved plan in the Harness Plan task. Address every review comment and the overall comment, making the requested design changes with design_patch. When a comment needs no change or conflicts with another requirement, explain why instead of making an edit just to close it. Then call plan_submit with the resulting plan ID and version.
+            r#"Revise the saved plan in the Harness Plan task. Address every review comment and the overall comment, making the requested changes with plan_file_edit and plan_overview_edit. When a comment needs no change or conflicts with another requirement, explain why instead of making an edit just to close it. Then call plan_submit with the resulting plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -134,7 +127,7 @@ Review comments:
     /// Keep review discussion read-only until the user requests a canonical plan revision.
     pub fn discussion(prompt: &str) -> String {
         format!(
-            "Continue discussing the active plan in the Harness Plan task. Answer questions without editing or resubmitting the plan. When the user asks for changes, revise the existing plan with design_patch and submit the resulting plan ID and version with plan_submit. A successful edit starts a new revision of the same plan. Settle pending questions before editing, according to the user's question preferences. Do not implement the plan or change project files. The planning contract below applies only when the user asks for a revision.\n\n{PLANNING_CONTRACT}\n\nUser request:\n{prompt}"
+            "Continue discussing the active plan in the Harness Plan task. Answer questions without editing or resubmitting the plan. When the user asks for changes, revise the existing plan with plan_file_edit and plan_overview_edit, and submit the resulting plan ID and version with plan_submit. A successful edit starts a new revision of the same plan. Settle pending questions before editing, according to the user's question preferences. Do not implement the plan or change project files. The planning contract below applies only when the user asks for a revision.\n\n{PLANNING_CONTRACT}\n\nUser request:\n{prompt}"
         )
     }
 }
@@ -156,8 +149,6 @@ fn mutable_elicitation_prompt(
         r#"The user is replying while Harness questions are still pending. The pending questions are open decisions that can change, not a lock on the conversation.
 
 The permission for this turn controls repository access. Answer the user's reply directly, using the repository when it helps. {workflow_boundary}
-
-Use question_reply to attach an explanation to a clarification message. Use question_revise to update one pending question, and question_withdraw only when its decision no longer affects the work. Use question_ask to append a new decision, with an explicit optional or required requirement. Keep existing questions and stable identities rather than replacing the entire set.
 
 Only Harness records explicit user answers. Never choose an option on the user's behalf or treat a recommendation as consent. Tentative language such as "I'm leaning toward" is not an answer. This discussion does not resume work; Harness owns the continuation after required decisions resolve.
 {planning_context}
@@ -201,41 +192,6 @@ mod test {
     }
 
     #[test]
-    fn planning_patch_example_applies_to_virtual_declarations() {
-        let workspace = tempfile::tempdir().unwrap();
-        let contract = PLANNING_CONTRACT.replace("\r\n", "\n");
-        let examples = contract
-            .split("```text\n")
-            .skip(1)
-            .map(|part| part.split_once("\n```").unwrap().0)
-            .filter(|example| example.starts_with("*** Begin Patch\n"))
-            .collect::<Vec<_>>();
-        let example = examples.last().unwrap();
-        let mut design = crate::plan::DeclarationDesign::default();
-        design.proposed.insert("src/textures.rs".into(), "impl Texture {\n  pub fn request(texture: TextureId) -> TextureHandle;\n\n  pub fn status(request: RequestId) -> RequestStatus;\n}\n".into());
-        let described = design
-            .patch(workspace.path(), &Default::default(), examples[0])
-            .unwrap();
-        assert!(
-            described
-                .document
-                .usage
-                .as_deref()
-                .is_some_and(|usage| !usage.is_empty())
-        );
-        assert!(!described.document.objective.is_empty());
-        let changed = described
-            .patch(workspace.path(), &Default::default(), example)
-            .unwrap();
-        assert!(changed.proposed["src/textures.rs"].contains("-> TextureRequest;"));
-        assert!(
-            changed.proposed["src/textures.rs"]
-                .contains("pub fn cancel(request: RequestId) -> bool;")
-        );
-        assert_eq!(design.baseline, changed.baseline);
-    }
-
-    #[test]
     fn active_artifact_context_exposes_the_canonical_document() {
         let prompt = PlanPrompt::with_active_document("Why?".into(), "{\"plan_id\":\"plan\"}");
         assert!(prompt.contains("\"plan_id\":\"plan\""));
@@ -254,7 +210,7 @@ mod test {
         assert!(prompt.contains("Review comments"));
         assert!(prompt.contains("8: Why replace direction with velocity?"));
         assert!(!prompt.contains("Semantic annotations"));
-        assert!(prompt.contains("design_patch"));
+        assert!(prompt.contains("plan_file_edit"));
         assert!(!prompt.contains("Current rendered plan"));
     }
 
@@ -262,11 +218,11 @@ mod test {
     fn clarification_preserves_the_pending_decision_boundary() {
         let prompt = PlanPrompt::clarification("Refactor", "{\"question\":\"Migration?\"}", "Why?");
         assert!(prompt.contains("open decisions that can change"));
-        assert!(prompt.contains("question_reply"));
-        assert!(prompt.contains("question_revise"));
+        assert!(!prompt.contains("question_reply"));
+        assert!(!prompt.contains("question_revise"));
         assert!(!prompt.contains("question_answer"));
-        assert!(prompt.contains("question_ask"));
-        assert!(prompt.contains("question_withdraw"));
+        assert!(!prompt.contains("question_ask"));
+        assert!(!prompt.contains("question_withdraw"));
         assert!(prompt.contains("Tentative language"));
         assert!(prompt.contains("Why?"));
         assert!(prompt.contains("Migration?"));

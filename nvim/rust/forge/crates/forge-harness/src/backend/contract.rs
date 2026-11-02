@@ -686,7 +686,7 @@ pub struct BackendCompletion {
     #[serde(default)]
     pub plan_edit: Vec<crate::plan::PlanEditRequest>,
     #[serde(default)]
-    pub design_patch: Vec<crate::plan::DesignPatchRequest>,
+    pub design_patch: Vec<crate::plan::DesignEditRequest>,
     pub plan_submit: Option<PlanSubmitRequest>,
     pub plan_read: Option<String>,
     #[serde(default)]
@@ -1743,7 +1743,7 @@ impl Backend for MockBackend {
             };
             let proposed =
                 document.patch_design(std::path::Path::new(&request.workspace), change.clone())?;
-            return Ok(BackendCompletion { backend_session_id: request.backend_session_id.or(Some("mock-session".into())), design_patch: vec![change], plan_submit: Some(PlanSubmitRequest {
+            return Ok(BackendCompletion { backend_session_id: request.backend_session_id.or(Some("mock-session".into())), design_patch: vec![change.into()], plan_submit: Some(PlanSubmitRequest {
                     plan_id: document.plan_id.clone(),
                     expected_version: proposed.version,
                 }), structured_plan: true, capability: mock_capability(), ..Default::default() });
@@ -2184,7 +2184,7 @@ mod test {
     #[test]
     fn provider_instructions_describe_staged_edits_and_revision_scoped_reports() {
         let prompt = super::HARNESS_SYSTEM_MESSAGE;
-        assert!(prompt.contains("design_patch"));
+        assert!(prompt.contains("plan_file_edit"));
         assert!(!prompt.contains("harness_plan_task_report"));
         assert!(!prompt.contains("harness_plan_edit"));
     }

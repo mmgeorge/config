@@ -12,6 +12,7 @@ assert(buffer.apply_snapshot(transcript, { document = "status-test", revision = 
 } }).kind == "Applied")
 local commands = require("forge.shared.view_command_set").new()
 require("forge.shared.view_command_set").register(commands, "cancel", function() end)
+require("forge.shared.view_command_set").register(commands, "reopen_question", function() end)
 local view = StatusView.new({ transcript = transcript, transcript_window = transcript_window,
   composer_window = composer_window, alive = function() return true end,
   notice = function(message) error(message) end, recover = function() error("unexpected recovery") end })
@@ -91,6 +92,43 @@ view:render({ rename_status = "Renaming" }, commands)
 assert(view.window ~= nil)
 view:render({}, commands)
 assert(view.window == nil)
+-- Question previews reflow in the real status window without stealing composer focus.
+local question_context = { questions = { revision = 1, questions = {
+  { content = { question = ("Choose the function behavior "):rep(12) }, resolution = { kind = "pending" } },
+  { content = { question = ("Choose the empty input behavior "):rep(12) }, resolution = { kind = "pending" } },
+} } }
+local preview_cursor = vim.api.nvim_win_get_cursor(transcript_window)
+vim.cmd("topleft vnew")
+local preview_neighbor = vim.api.nvim_get_current_win()
+local preview_buffer = vim.api.nvim_get_current_buf()
+vim.api.nvim_win_set_width(preview_neighbor, 52)
+vim.api.nvim_set_current_win(composer_window)
+view:render(question_context, commands)
+assert(view.window ~= nil and #view.content.lines == 5)
+assert(view.content.lines[3]:find("  │  ", 1, true) == 1)
+assert(view.content.lines[5]:find("     ", 1, true) == 1)
+local narrow_preview = view.content.lines[2]
+vim.api.nvim_win_set_width(preview_neighbor, 20)
+view:resize()
+assert(view.content.lines[2] ~= narrow_preview, "resizing did not reflow the question preview: " .. vim.inspect({
+  columns = vim.o.columns, width = vim.api.nvim_win_get_width(view.window), previous = narrow_preview,
+  current = view.content.lines[2],
+}))
+assert(view.content.lines[5]:sub(-#"…") == "…")
+for index = 2, 5 do
+  local line_width = vim.api.nvim_win_call(view.window, function()
+    return vim.fn.strdisplaywidth(view.content.lines[index])
+  end)
+  assert(line_width <= vim.api.nvim_win_get_width(view.window), view.content.lines[index])
+end
+assert(vim.api.nvim_win_text_height(view.window, { start_row = 1 }).all == 4,
+  "question branches wrapped into more than two display lines each")
+assert(vim.api.nvim_get_current_win() == composer_window, "question preview changed focus")
+assert(vim.deep_equal(preview_cursor, vim.api.nvim_win_get_cursor(transcript_window)), "question preview moved transcript cursor")
+view:render({}, commands)
+assert(view.window == nil, "resolved questions left the status window open")
+vim.api.nvim_win_close(preview_neighbor, true)
+vim.api.nvim_buf_delete(preview_buffer, { force = true })
 vim.api.nvim_buf_delete(view.buffer, { force = true })
 assert(view.closed)
 view:close()

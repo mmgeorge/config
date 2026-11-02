@@ -469,7 +469,7 @@ impl PlanExecutionRecord {
                 "Harness runs the declaration and accepted checks locally. No model turn runs in this phase."
             }
             PlanPhase::Verify => {
-                "Perform only the accepted plan's manual verification actions, in order. Harness has already passed the declaration and automated checks. Do not rerun automated checks, edit source, or revise the plan. Report each manual action as passed, failed, or blocked, with observations and tool evidence, and report blockers honestly. Observed defects go to Resolve. Get the exact evidence IDs with plan_read before submitting results."
+                "Perform only the accepted plan's manual verification actions, in order. Harness has already passed the declaration and automated checks. Do not rerun automated checks, edit source, or revise the plan. Report each manual action as passed, failed, or blocked, with observations and tool evidence, and report blockers honestly. Observed defects go to Resolve. Get the exact evidence IDs with plan_overview_read before submitting results."
             }
         };
         let reporting = if self.phase == PlanPhase::Verify {
@@ -478,7 +478,7 @@ impl PlanExecutionRecord {
             ""
         };
         format!(
-            "{work}{reporting} Phase: {:?}. Accepted revision: {}. Read the plan with plan_read. Call plan_phase_done with this phase and revision when the phase's work is finished, then end the turn after it succeeds. Harness records the transition and supplies the next phase. Ending a turn does not end the phase. Do not call goal_complete for this execution.",
+            "{work}{reporting} Phase: {:?}. Accepted revision: {}. Read the plan with plan_overview_read. Call plan_phase_done with this phase and revision when the phase's work is finished, then end the turn after it succeeds. Harness records the transition and supplies the next phase. Ending a turn does not end the phase. Do not call goal_complete for this execution.",
             self.phase, self.revision
         )
     }
@@ -1077,7 +1077,12 @@ mod revision_policy_tests {
                 phase == PlanPhase::Resolve
             );
             let tools = crate::control_tools::ControlToolRegistry.definition_list_for(Some(phase));
-            for name in ["design_patch", "plan_submit"] {
+            for name in [
+                "plan_file_edit",
+                "plan_overview_edit",
+                "plan_checks_add",
+                "plan_submit",
+            ] {
                 assert_eq!(
                     tools.iter().any(|tool| tool.name == name),
                     phase == PlanPhase::Resolve

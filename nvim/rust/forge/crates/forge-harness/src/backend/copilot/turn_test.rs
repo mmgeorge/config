@@ -654,7 +654,7 @@ async fn copilot_disables_tool_search_and_binds_session_files_on_create_and_resu
                     .as_array()
                     .context("missing control tools")?
                     .iter()
-                    .any(|tool| tool["name"] == "plan_read")
+                    .any(|tool| tool["name"] == "plan_file_read")
             );
             let session_id = message["params"]["sessionId"]
                 .as_str()

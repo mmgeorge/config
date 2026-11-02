@@ -831,8 +831,9 @@ impl PlanDocument {
     pub fn patch_design(
         &self,
         workspace: &std::path::Path,
-        request: super::DesignPatchRequest,
+        request: impl Into<super::DesignEditRequest>,
     ) -> Result<Self> {
+        let request = request.into().into_patch(self, workspace)?;
         anyhow::ensure!(
             request.plan_id == self.plan_id,
             "design plan id does not match the active plan"
@@ -965,6 +966,18 @@ impl PlanDocument {
         Ok(super::codec::to_string_pretty(&self.model_value()?)?)
     }
 
+    /// Read the descriptive overview and file inventory without exposing an internal document path.
+    pub fn overview_json(&self) -> Result<String> {
+        let design = self
+            .design
+            .as_ref()
+            .context("plan has no semantic structure")?;
+        Ok(super::codec::to_string_pretty(&serde_json::json!({
+            "plan_id": self.plan_id, "version": self.version, "title": self.title,
+            "request": self.prompt, "overview": design.document, "files": design.file_inventory()
+        }))?)
+    }
+
     /// Omit deferred verification instructions from code-writing handoffs.
     pub(crate) fn execution_json(&self, phase: super::PlanPhase) -> Result<String> {
         let mut value = self.model_value()?;
@@ -983,7 +996,7 @@ impl PlanDocument {
 
     fn model_value(&self) -> Result<serde_json::Value> {
         if let Some(design) = &self.design {
-            let mut value = serde_json::json!({"plan_id":self.plan_id,"version":self.version,"title":self.title,"request":self.prompt,"declaration_files":design.read(None,false)?});
+            let mut value = serde_json::json!({"plan_id":self.plan_id,"version":self.version,"title":self.title,"request":self.prompt,"declaration_files":design.file_inventory()});
             value["document"] = super::codec::to_value(&design.document)?;
             return Ok(value);
         }

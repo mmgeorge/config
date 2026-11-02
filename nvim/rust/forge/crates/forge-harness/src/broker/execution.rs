@@ -555,7 +555,7 @@ impl HarnessBroker {
                             tools
                                 .iter()
                                 .any(|tool| tool["id"].as_str() == Some(reference.as_str())),
-                            "verification evidence {reference} is not a completed tool result in this execution. Call plan_read with only plan_id and use exact IDs from execution.verification_evidence."
+                            "verification evidence {reference} is not a completed tool result in this execution. Call plan_overview_read with plan_id and use exact IDs from execution.verification_evidence."
                         );
                         if let Some(call_id) = tools
                             .iter()

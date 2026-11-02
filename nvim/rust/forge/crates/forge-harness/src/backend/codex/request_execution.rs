@@ -181,7 +181,7 @@ impl RequestExecutor {
                 Ok(json!({
                     "contentItems": [{
                         "type": "inputText",
-                        "text": "Harness has already recorded this planning feedback. Continue with design_patch, question_ask, or plan_submit."
+                        "text": "Harness has already recorded this planning feedback. Continue with plan_file_edit, plan_overview_edit, question_ask, or plan_submit."
                     }],
                     "success": false
                 }))
@@ -279,7 +279,7 @@ impl RequestExecutor {
                                     .map(|document| document.version)
                                     .unwrap_or_default()
                             ),
-                            "plan_read" => self
+                            "plan_file_read" => self
                                 .plan_document
                                 .as_ref()
                                 .map(serde_json::to_string_pretty)
@@ -332,9 +332,9 @@ impl RequestExecutor {
                 anyhow::bail!("phase completion requires an active execution control context");
             }
             "harness_plan_edit" => {
-                anyhow::bail!("obsolete plan edit tool. Use design_patch");
+                anyhow::bail!("obsolete plan edit tool. Use plan_file_edit");
             }
-            "design_patch" => {
+            "plan_file_edit" | "plan_overview_edit" | "plan_checks_add" => {
                 let request = output
                     .design_patch
                     .pop()
@@ -350,7 +350,7 @@ impl RequestExecutor {
                     self.plan_document.as_ref().unwrap().version
                 )));
             }
-            "plan_read" => {
+            "plan_file_read" | "plan_overview_read" => {
                 let requested_plan_id = output
                     .plan_read
                     .as_deref()
@@ -363,6 +363,9 @@ impl RequestExecutor {
                     requested_plan_id == document.plan_id,
                     "requested plan id does not match the active plan"
                 );
+                if invocation.name == "plan_overview_read" {
+                    return Ok(Some(document.overview_json()?));
+                }
                 if let Some(design) = &document.design {
                     let value = design.inspect(
                         Path::new(&self.workspace),
@@ -548,13 +551,10 @@ mod tests {
                 },
             })
         };
-        let draft = json!({"header":"Layout", "question":"Which layout?", "requirement":"required", "options":[]});
+        let draft = json!({"header":"Layout", "question":"Which layout?", "options":[]});
         let result = executor
             .execute(
-                execute(
-                    "question_ask",
-                    json!({"id":"ask", "questions":[draft.clone()]}),
-                ),
+                execute("question_ask", json!({"questions":[draft.clone()]})),
                 Instant::now(),
             )
             .await;
@@ -575,15 +575,15 @@ mod tests {
         for (tool, arguments) in [
             (
                 "question_reply",
-                json!({"operation_id":"reply", "question_id":question_id, "revision":1, "message_id":"clarify", "text":"Only new sessions."}),
+                json!({"question_id":question_id, "revision":1, "message_id":"clarify", "text":"Only new sessions."}),
             ),
             (
                 "question_revise",
-                json!({"operation_id":"revise", "question_id":question_id, "revision":1, "draft":draft}),
+                json!({"question_id":question_id, "revision":1, "draft":draft}),
             ),
             (
                 "question_withdraw",
-                json!({"operation_id":"withdraw", "question_id":question_id, "revision":2, "reason":"No longer needed"}),
+                json!({"question_id":question_id, "revision":2, "reason":"No longer needed"}),
             ),
         ] {
             let result = executor

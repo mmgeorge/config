@@ -23,7 +23,7 @@ local snapshot = { document = replica.document, revision = 0, block = {
   block("comment", { "CloudServiceSettings rename to CloudServiceConfig" }, 4),
   block("commentary", { "○ Replacing the declaration and its owning task." }, 2),
   block("tools", { "▸ Ran 4 tools" }, 2, "last-tool"),
-  block("first-tool", { "• plan_read", "  └ Plan read accepted" }, 4),
+  block("first-tool", { "• plan_file_read", "  └ Plan read accepted" }, 4),
   block("last-tool", { "• plan_submit" }, 4),
   block("response", { "Resolved the configuration name." }, 0),
 } }

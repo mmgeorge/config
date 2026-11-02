@@ -324,9 +324,13 @@ local function render_view(instance)
   local help_only = instance.spec.hint_mode == "help"
   local footer = help_only and (table.concat(picker_keys(instance, "help"), "/") .. " help")
     or instance.spec.page_navigation and Picker._navigation_footer(instance) or page.footer
-  if not input_visible and not help_only then
-    for _, action in ipairs(instance.spec.host.action_list or {}) do
-      if action.key and action.label then footer = (footer or "") .. "  " .. action.key .. " " .. action.label end
+  if not input_visible then
+    local footer_actions = help_only and action_list(instance) or (instance.spec.host.action_list or {})
+    for _, action in ipairs(footer_actions) do
+      local key = action.command and picker_keys(instance, action.command)[1] or action.key
+      if key and action.label and (not help_only or action.show_in_help_footer) then
+        footer = (footer or "") .. "  " .. key .. " " .. action.label
+      end
     end
   end
   local available_height = window_height(instance.spec, math.huge, bounds.height)
@@ -714,7 +718,8 @@ end
 ---@field modes? string|string[]
 ---@field desc? string
 ---@field input? boolean Apply this action inside the freeform editor, overriding matching input bindings.
----@field label? string Short label used in the freeform editor footer.
+---@field label? string Short label used in picker footers.
+---@field show_in_help_footer? boolean Show this action beside help in the compact Normal-mode footer.
 ---@field callback? fun(context: ForgePickerSelectionContext, picker: table)
 
 ---@param instance table
@@ -932,10 +937,6 @@ end
 ---@param spec ForgePickerSpec
 function Picker.update(spec)
   if not active then return end
-  local input_focused = spec.preserve_input and valid_window(active.input_win)
-    and vim.api.nvim_get_current_win() == active.input_win
-  local previous_input_kind = active.input_kind
-  local previous_input_cursor = input_focused and vim.api.nvim_win_get_cursor(active.input_win) or nil
   local search_focused = valid_window(active.search_win) and vim.api.nvim_get_current_win() == active.search_win
   local help_focused = valid_window(active.help_win) and vim.api.nvim_get_current_win() == active.help_win
   local editor_focused = active.field_editor and valid_window(active.field_editor.window)
@@ -943,12 +944,18 @@ function Picker.update(spec)
   if active.field_editor and spec.owner ~= active.spec.owner then close_field_editor(active) end
   local previous_page_id = picker_state.page(active.state, active.spec).id
   local snapshot = assert(Picker.capture_state(), "active picker must provide navigation state")
-  close_input(active)
+  local next_state = picker_state.new(spec)
+  picker_state.restore(next_state, spec, snapshot)
+  local next_page = picker_state.page(next_state, spec)
+  local next_option = picker_state.selected_option(next_state, spec)
+  local next_option_id = next_option and (next_option.id or next_option.value)
+  local retained_input = spec.preserve_input and valid_window(active.input_win)
+    and spec.owner == active.spec.owner and next_page.id == previous_page_id and next_page.allow_input
+    and next_option_id ~= nil and tostring(next_option_id) == snapshot.selected_option_id_by_page[previous_page_id]
+  if not retained_input then close_input(active) end
   clear_modal_keymaps(active)
   active.spec = spec
   update_deadline_timer(active)
-  local next_state = picker_state.new(spec)
-  picker_state.restore(next_state, spec, snapshot)
   active.state = next_state
   if picker_state.page(next_state, spec).id ~= previous_page_id then close_search(active) end
   active.notified_identity = nil
@@ -969,19 +976,13 @@ function Picker.update(spec)
     end
   else
     close_search(active)
-    focus_picker(active)
-    if spec.initial_input_kind then open_input(active, spec.initial_input_kind) end
+    if not retained_input then
+      focus_picker(active)
+      if spec.initial_input_kind then open_input(active, spec.initial_input_kind) end
+    end
   end
   if help_focused and valid_window(active.help_win) then vim.api.nvim_set_current_win(active.help_win) end
   if editor_focused and active.field_editor then field_input.focus(active.field_editor) end
-  if input_focused and picker_state.page(active.state, active.spec).id == previous_page_id then
-    open_input(active, previous_input_kind)
-    if previous_input_cursor and valid_window(active.input_win) then
-      local row = math.min(previous_input_cursor[1], vim.api.nvim_buf_line_count(active.input_buf))
-      local line = vim.api.nvim_buf_get_lines(active.input_buf, row - 1, row, false)[1] or ""
-      vim.api.nvim_win_set_cursor(active.input_win, { row, math.min(previous_input_cursor[2], #line) })
-    end
-  end
 end
 
 ---@param notify? boolean

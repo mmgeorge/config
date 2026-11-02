@@ -146,6 +146,7 @@ M.view_specs = {
     { id = "open_timeline", label = "open", desc = "Open the item linked by this timeline row", modes = "n", pinned = false },
     { id = "reopen_question", label = "feedback", desc = "Reopen pending Harness questions", modes = "n", pinned = false,
       hints = { question_status = function() return "open question" end,
+        pending_question_status = function() return "answer questions" end,
         permission_status = function() return "review permission" end } },
     { id = "model", label = "model", desc = "Select the model at the next safe boundary", modes = "n", pinned = false },
     { id = "effort_down", label = "effort-", desc = "Decrease reasoning effort", modes = { "n", "i" }, pinned = false },

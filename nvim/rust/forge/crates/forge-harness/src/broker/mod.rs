@@ -11627,7 +11627,7 @@ let sink = Some(sink);
                     runtime
                         .invoke(crate::control_tools::ControlToolInvocation {
                             task_permit: None,
-                            name: "plan_read".into(),
+                            name: "plan_overview_read".into(),
                             arguments: json!({"plan_id":plan_id}),
                         })
                         .await?;
@@ -11847,7 +11847,7 @@ let sink = Some(sink);
             };
             let mut arguments = json!({"phase":phase,"revision":self.revision,"summary":"Checked planned behavior"});
             if turn == 0 {
-                let rejected = runtime.invoke(ControlToolInvocation { task_permit: None, name: "design_patch".into(), arguments: json!({
+                let rejected = runtime.invoke(ControlToolInvocation { task_permit: None, name: "plan_file_edit".into(), arguments: json!({
                     "plan_id":document.plan_id, "expected_version":document.version, "patch":"*** Begin Patch\n*** End Patch"}) }).await.unwrap_err();
                 assert!(rejected.to_string().contains("Resolve"));
                 for (path, overview) in &document.design.as_ref().unwrap().proposed {
@@ -11890,7 +11890,7 @@ let sink = Some(sink);
                 let read = runtime
                     .invoke(ControlToolInvocation {
                         task_permit: None,
-                        name: "plan_read".into(),
+                        name: "plan_overview_read".into(),
                         arguments: json!({"plan_id":document.plan_id}),
                     })
                     .await
@@ -13971,7 +13971,7 @@ let sink = Some(sink);
             let read = runtime
                 .invoke(ControlToolInvocation {
                     task_permit: None,
-                    name: "plan_read".into(),
+                    name: "plan_overview_read".into(),
                     arguments: json!({"plan_id":document.plan_id}),
                 })
                 .await?;
@@ -13983,7 +13983,7 @@ let sink = Some(sink);
                 }
                 3 => {
                     let edit = runtime.invoke(ControlToolInvocation { task_permit: None,
-                        name: "design_patch".into(),
+                        name: "plan_file_edit".into(),
                         arguments: json!({"plan_id":document.plan_id, "expected_version":document.version,
                             "patch":"*** Begin Patch\n*** Add File: src/controls.rs\n+pub fn keyboard_movement();\n+Algorithm\n+  update_movement(keyboard_input())\n*** End Patch"}),
                     }).await?;
@@ -14304,7 +14304,7 @@ let sink = Some(sink);
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
         assert!(!names.contains(&"plan_review_answer"));
-        assert!(!names.contains(&"design_patch"));
+        assert!(!names.contains(&"plan_file_edit"));
         assert!(!names.contains(&"question_ask"));
         assert!(
             broker.plan_review.annotations(&document).unwrap()[0]
@@ -14465,7 +14465,7 @@ let sink = Some(sink);
         let changed = document
             .patch_design(Path::new(&request.workspace), change.clone())
             .unwrap();
-        output.design_patch.push(change);
+        output.design_patch.push(change.into());
         output.plan_submit = Some(crate::backend::PlanSubmitRequest {
             plan_id: document.plan_id.clone(),
             expected_version: changed.version,

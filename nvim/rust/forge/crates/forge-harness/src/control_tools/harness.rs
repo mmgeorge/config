@@ -472,7 +472,8 @@ impl HarnessInspectionScope {
         if let Some(snapshot) = LogSnapshot::open(&current)? {
             page.attach_log(
                 snapshot,
-                limit.unwrap_or(NonZeroUsize::new(100).expect("default log page size is positive")),
+                limit
+                    .unwrap_or(NonZeroUsize::new(1000).expect("default log page size is positive")),
             );
         } else {
             page.push(json!({"session_id":session.id,"unavailable":"logs","reason":"No retained session log"}))?;

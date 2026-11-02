@@ -368,7 +368,11 @@ pub(crate) fn control_tool_failure_json(
     let active_version = document.map(|plan| plan.version);
     let retry = matches!(
         invocation.name.as_str(),
-        "design_patch" | "harness_plan_edit" | "plan_submit"
+        "plan_file_edit"
+            | "plan_overview_edit"
+            | "plan_checks_add"
+            | "harness_plan_edit"
+            | "plan_submit"
     )
     .then_some(ControlToolRetry {
         action: "correct_and_retry",

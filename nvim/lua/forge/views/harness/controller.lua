@@ -234,12 +234,6 @@ local function status_text()
   end
   local selected_run = selected_agent_run(state)
   if selected_run then append_status(selected_run.nickname or selected_run.definition, "ForgeStatusLabel") end
-  local question_count, required_count = require("forge.views.harness.questions").count(state)
-  if question_count > 0 then
-    local text = required_count > 0 and ("waiting · %d required question%s need%s an answer"):format(required_count, required_count == 1 and "" or "s", required_count == 1 and "s" or "")
-      or (question_count == 1 and "1 question needs an answer" or ("%d questions need answers"):format(question_count))
-    append_status(text, "ForgeStatusLabel")
-  end
   if state.connection_error then
     append_status(state.connection_error, "ForgeHarnessGoal")
   elseif state.sync_error then
@@ -308,6 +302,7 @@ render_status_hint = function(state)
       restore_recovery = state.restore_recovery, recap = state.recap, rename_status = state.rename_status,
       message_notice = diagnostic.get(state, "execution_notice", "warning"),
       status_notice = require("forge.views.harness.health").notice(state),
+      questions = state.questions,
     }
     if state.presentation.set_staging then
       state.presentation.set_staging(queue_editor.staging(state, composer_text(state.composer_buf), state.queue or {}),

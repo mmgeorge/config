@@ -135,6 +135,9 @@ pub enum ActiveTurnOperation {
 }
 
 impl SteeringLane {
+    /// Maximum number of ordinary controls owned by an active turn.
+    pub(crate) const CAPACITY: usize = MAX_STEERING_REQUESTS;
+
     /// Reports whether a provider turn or Harness continuation owns the input receiver.
     pub(crate) fn is_active(&self) -> bool {
         self.state
@@ -238,7 +241,7 @@ impl SteeringLane {
                 _admission: admission,
                 text,
                 attachments,
-                submission,
+                submission: submission.clone(),
                 target,
                 operation,
                 completion: Some(completion),
@@ -247,6 +250,9 @@ impl SteeringLane {
                 task_start,
             })
             .map_err(|_| anyhow::anyhow!("active turn completed before steering input was sent"))?;
+        if let Some(submission) = submission {
+            submission.mark_steering_queued();
+        }
         response
             .await
             .context("active turn completed before steering input was acknowledged")?

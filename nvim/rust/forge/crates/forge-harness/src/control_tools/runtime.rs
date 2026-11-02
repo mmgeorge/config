@@ -117,10 +117,14 @@ impl ControlToolRuntime {
     }
 
     /// Validate a control invocation and await broker persistence for execution controls.
-    pub async fn invoke(
-        &mut self,
-        mut invocation: ControlToolInvocation,
-    ) -> Result<ControlToolResult> {
+    pub async fn invoke(&mut self, invocation: ControlToolInvocation) -> Result<ControlToolResult> {
+        if invocation.name == "question_ask" && invocation.arguments["wait"].as_bool() == Some(true)
+        {
+            anyhow::ensure!(
+                self.context.questions.is_some(),
+                "waiting questions require the session question controller"
+            );
+        }
         if self.context.question_discussion {
             anyhow::ensure!(
                 matches!(
@@ -129,7 +133,8 @@ impl ControlToolRuntime {
                         | "question_reply"
                         | "question_revise"
                         | "question_withdraw"
-                        | "plan_read"
+                        | "plan_file_read"
+                        | "plan_overview_read"
                 ) || super::harness::is_tool(&invocation.name)
                     || super::lsp::is_tool(&invocation.name),
                 "question discussion cannot change task state or workspace content"
@@ -166,19 +171,34 @@ impl ControlToolRuntime {
                 None
             };
             if invocation.name == "question_ask" {
-                let drafts: Vec<crate::question::QuestionDraft> =
+                let mut drafts: Vec<crate::question::QuestionDraft> =
                     serde_json::from_value(invocation.arguments["questions"].clone())?;
-                let required = drafts.iter().any(|draft| {
-                    draft.requirement == crate::question::QuestionRequirement::Required
-                });
+                let wait = invocation.arguments["wait"].as_bool().unwrap_or(false);
+                for draft in &mut drafts {
+                    draft.requirement = if wait {
+                        crate::question::QuestionRequirement::Required
+                    } else {
+                        crate::question::QuestionRequirement::Optional
+                    };
+                }
+                let operation_id = uuid::Uuid::new_v4().to_string();
+                let exchange_id = self
+                    .context
+                    .question_exchange_id
+                    .as_deref()
+                    .context("question has no originating exchange")?;
+                if wait {
+                    let answers = controller
+                        .ask_wait(&operation_id, exchange_id, task.as_ref(), drafts)
+                        .await?;
+                    return Ok(ControlToolResult {
+                        invocation: None,
+                        message: serde_json::json!({"answers": answers}).to_string(),
+                    });
+                }
                 let ids = controller.ask(
-                    invocation.arguments["id"]
-                        .as_str()
-                        .context("question operation id required")?,
-                    self.context
-                        .question_exchange_id
-                        .as_deref()
-                        .context("question has no originating exchange")?,
+                    &operation_id,
+                    exchange_id,
                     if self.context.question_discussion {
                         crate::question::QuestionOrigin::Discussion(task.as_ref())
                     } else {
@@ -189,8 +209,10 @@ impl ControlToolRuntime {
                     },
                     drafts,
                 )?;
-                self.terminal |= required;
-                return Ok(ControlToolResult { invocation: None, message: serde_json::json!({"question_ids":ids,"required":required,"instruction":if required { "Required questions accepted. Stop task work until answered or withdrawn." } else { "Questions saved. Continue useful work; recommendations are not user answers." }}).to_string() });
+                return Ok(ControlToolResult {
+                    invocation: None,
+                    message: serde_json::json!({"question_ids":ids}).to_string(),
+                });
             }
             let action = match invocation.name.as_str() {
                 "question_reply" => crate::question::QuestionAction::Reply {
@@ -204,7 +226,21 @@ impl ControlToolRuntime {
                         .into(),
                 },
                 "question_revise" => crate::question::QuestionAction::Revise {
-                    draft: serde_json::from_value(invocation.arguments["draft"].clone())?,
+                    draft: {
+                        let mut draft: crate::question::QuestionDraft =
+                            serde_json::from_value(invocation.arguments["draft"].clone())?;
+                        draft.requirement = controller
+                            .snapshot()?
+                            .questions
+                            .iter()
+                            .find(|question| {
+                                Some(question.id.as_str())
+                                    == invocation.arguments["question_id"].as_str()
+                            })
+                            .context("question does not belong to this session")?
+                            .requirement;
+                        draft
+                    },
                 },
                 "question_withdraw" => crate::question::QuestionAction::Withdraw {
                     reason: invocation.arguments["reason"]
@@ -215,10 +251,7 @@ impl ControlToolRuntime {
                 _ => unreachable!(),
             };
             let snapshot = controller.apply(crate::question::QuestionCommand {
-                operation_id: invocation.arguments["operation_id"]
-                    .as_str()
-                    .context("question operation id required")?
-                    .into(),
+                operation_id: uuid::Uuid::new_v4().to_string(),
                 question_id: invocation.arguments["question_id"]
                     .as_str()
                     .context("question identity required")?
@@ -235,64 +268,6 @@ impl ControlToolRuntime {
             });
         }
         let adding_checks = invocation.name == "plan_checks_add";
-        if adding_checks {
-            super::validate_arguments(&invocation)?;
-            self.require_readable_plan()?;
-            anyhow::ensure!(
-                !self.context.has_active_elicitation,
-                "resolve pending Harness questions before editing the plan"
-            );
-            let document = self.plan_document.as_ref().context("no active plan")?;
-            anyhow::ensure!(
-                invocation.arguments["plan_id"].as_str() == Some(document.plan_id.as_str())
-                    && invocation.arguments["expected_version"].as_u64() == Some(document.version),
-                "plan identity or version changed"
-            );
-            let original_design = document
-                .design
-                .as_ref()
-                .context("plan has no declaration design")?;
-            let mut design = original_design.clone();
-            let ids: Vec<String> =
-                serde_json::from_value(invocation.arguments["check_ids"].clone())?;
-            let workspace = self
-                .context
-                .workspace_root
-                .as_deref()
-                .context("plan has no workspace")?;
-            let snapshot = crate::checks::ConfigSnapshot::load(workspace)?;
-            snapshot.config.validate_selection(&ids)?;
-            design.document.set_checks(
-                &snapshot.config,
-                &ids.into_iter().map(|id| (id, true)).collect(),
-            )?;
-            if design.document == original_design.document {
-                return Ok(ControlToolResult {
-                    invocation: None,
-                    message: self.plan_version_message("Checks already selected"),
-                });
-            }
-            let before = serde_json::to_string_pretty(&original_design.document)?;
-            let after = serde_json::to_string_pretty(&design.document)?;
-            let patch = format!(
-                "*** Begin Patch\n*** Update File: plan.json\n@@\n{}\n{}\n*** End Patch",
-                before
-                    .lines()
-                    .map(|line| format!("-{line}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                after
-                    .lines()
-                    .map(|line| format!("+{line}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            );
-            invocation = ControlToolInvocation {
-                task_permit: None,
-                name: "design_patch".into(),
-                arguments: serde_json::json!({"plan_id":document.plan_id,"expected_version":document.version,"patch":patch}),
-            };
-        }
         let mut output = BackendCompletion::default();
         apply_invocation(&invocation, &mut output)?;
         let mut result = self.invoke_decoded(invocation, output).await?;
@@ -321,9 +296,6 @@ impl ControlToolRuntime {
         mut invocation: ControlToolInvocation,
         mut output: BackendCompletion,
     ) -> Result<ControlToolResult> {
-        if invocation.name == "plan_checks_add" {
-            return Box::pin(self.invoke(invocation)).await;
-        }
         invocation.admit_turn_control(
             self.context.task_controller.as_deref(),
             self.context.task_permit.as_ref(),
@@ -350,8 +322,10 @@ impl ControlToolRuntime {
             !self.terminal,
             "this provider turn already reached a terminal control action"
         );
-        if matches!(invocation.name.as_str(), "design_patch" | "plan_submit")
-            && let Some(execution) = &self.context.execution
+        if matches!(
+            invocation.name.as_str(),
+            "plan_file_edit" | "plan_overview_edit" | "plan_checks_add" | "plan_submit"
+        ) && let Some(execution) = &self.context.execution
         {
             execution.require_revision_phase()?;
         }
@@ -430,16 +404,16 @@ impl ControlToolRuntime {
                     message,
                 })
             }
-            "design_patch" => {
+            "plan_file_edit" | "plan_overview_edit" | "plan_checks_add" => {
                 self.require_readable_plan()?;
                 anyhow::ensure!(
                     !self.context.has_active_elicitation,
                     "resolve pending Harness questions before editing the design"
                 );
-                let mut request = output
+                let edit = output
                     .design_patch
                     .pop()
-                    .context("design patch has no request")?;
+                    .context("plan edit has no request")?;
                 let document = self
                     .plan_document
                     .as_ref()
@@ -449,6 +423,7 @@ impl ControlToolRuntime {
                     .workspace_root
                     .as_deref()
                     .context("design patch has no workspace root")?;
+                let mut request = edit.into_patch(document, workspace)?;
                 for (path, digest) in &self.inspected {
                     request
                         .source_digests
@@ -456,6 +431,12 @@ impl ControlToolRuntime {
                         .or_insert_with(|| digest.clone());
                 }
                 let updated = document.patch_design(workspace, request.clone())?;
+                if updated.version == document.version {
+                    return Ok(ControlToolResult {
+                        invocation: None,
+                        message: self.plan_version_message("Plan unchanged"),
+                    });
+                }
                 let updated_design = updated
                     .design
                     .as_ref()
@@ -473,8 +454,10 @@ impl ControlToolRuntime {
                 }
                 self.patch_source_digests
                     .insert(request.expected_version, request.source_digests.clone());
-                invocation.arguments["source_digests"] =
-                    serde_json::to_value(&request.source_digests)?;
+                if invocation.name == "plan_file_edit" {
+                    invocation.arguments["source_digests"] =
+                        serde_json::to_value(&request.source_digests)?;
+                }
                 let delta = crate::plan::revision::DeclarationDelta::between(
                     Some(document),
                     updated_design,
@@ -514,7 +497,7 @@ impl ControlToolRuntime {
                     invocation: Some(invocation),
                     message: format!(
                         "{}\n{confirmation}",
-                        self.plan_version_message("Declaration patch accepted")
+                        self.plan_version_message("Plan edit accepted")
                     ),
                 })
             }
@@ -531,7 +514,7 @@ impl ControlToolRuntime {
                     message,
                 })
             }
-            "plan_read" => {
+            "plan_file_read" | "plan_overview_read" => {
                 self.require_readable_plan()?;
                 let document = self
                     .plan_document
@@ -541,41 +524,34 @@ impl ControlToolRuntime {
                     output.plan_read.as_deref() == Some(&document.plan_id),
                     "requested plan id does not match the active plan"
                 );
-                let message = if let Some(design) = &document.design {
+                let overview = invocation.name == "plan_overview_read";
+                let message = if overview {
+                    document.overview_json()?
+                } else {
+                    let design = document
+                        .design
+                        .as_ref()
+                        .context("plan has no semantic structure")?;
                     let workspace = self
                         .context
                         .workspace_root
                         .as_deref()
-                        .context("design read has no workspace root")?;
+                        .context("file read has no workspace root")?;
+                    let path = invocation.arguments["path"]
+                        .as_str()
+                        .context("file read requires a path")?;
                     let file = design.inspect(
                         workspace,
-                        invocation
-                            .arguments
-                            .get("path")
-                            .and_then(serde_json::Value::as_str),
-                        invocation
-                            .arguments
-                            .get("baseline")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false),
+                        Some(path),
+                        invocation.arguments["baseline"].as_bool().unwrap_or(false),
                     )?;
                     let message = read_design(document, &file, &invocation.arguments)?;
-                    if let (Some(path), Some(digest)) =
-                        (file["path"].as_str(), file["source_digest"].as_str())
-                    {
+                    if let Some(digest) = file["source_digest"].as_str() {
                         self.inspected.insert(path.into(), digest.into());
                     }
                     message
-                } else {
-                    document.model_json()?
                 };
-                if invocation
-                    .arguments
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .is_none()
-                    && let Some(execution) = &self.context.execution
-                {
+                if overview && let Some(execution) = &self.context.execution {
                     let state = execution
                         .send(crate::plan::execution::ExecutionOperation::Inspect)
                         .await?;
@@ -877,27 +853,42 @@ mod test {
             context.questions = Some(controller.clone());
             context.question_exchange_id = Some("exchange".into());
             let mut runtime = ControlToolRuntime::new(context);
-            for operation in ["first", "second"] {
-                runtime.invoke(ControlToolInvocation { task_permit: None, name: "question_ask".into(), arguments: serde_json::json!({
-                    "id": operation, "questions": [{"header":"Layout", "question":"Choose a layout", "requirement":"optional", "options":[]}]
+            let mut returned_ids = Vec::new();
+            for _ in 0..2 {
+                let result = runtime.invoke(ControlToolInvocation { task_permit: None, name: "question_ask".into(), arguments: serde_json::json!({
+                    "questions": [{"header":"Layout", "question":"Choose a layout", "options":[]}]
                 }) }).await?;
+                let result: serde_json::Value = serde_json::from_str(&result.message)?;
+                returned_ids.push(result["question_ids"][0].as_str().unwrap().to_owned());
                 assert!(!runtime.terminal);
             }
             assert_eq!(controller.snapshot()?.questions.len(), 2);
-            runtime.invoke(ControlToolInvocation { task_permit: None, name: "question_ask".into(), arguments: serde_json::json!({
-                "id":"required", "questions":[{"header":"Target", "question":"Choose the target", "requirement":"required", "options":[]}]
-            }) }).await?;
-            assert!(runtime.terminal);
+            assert_ne!(returned_ids[0], returned_ids[1]);
+            let mut pending = Box::pin(runtime.invoke(ControlToolInvocation { task_permit: None, name: "question_ask".into(), arguments: serde_json::json!({
+                "wait":true, "questions":[{"header":"Target", "question":"Choose the target", "options":[]}]
+            }) }));
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
             assert!(controller.snapshot()?.required_pending());
-            let failure = runtime
-                .invoke(ControlToolInvocation {
-                    task_permit: None,
-                    name: "goal_complete".into(),
-                    arguments: serde_json::json!({"summary":"not allowed"}),
-                })
-                .await
-                .unwrap_err();
-            assert!(failure.to_string().contains("required questions"));
+            assert!(!controller.snapshot()?.required_in_exchange("exchange"));
+            let id = controller.snapshot()?.questions[2].id.clone();
+            controller.apply(crate::question::QuestionCommand {
+                operation_id: "answer".into(),
+                question_id: id,
+                revision: 1,
+                action: crate::question::QuestionAction::Answer {
+                    answer: crate::question::QuestionAnswer::Other {
+                        text: "Desktop".into(),
+                    },
+                },
+            })?;
+            let result: serde_json::Value = serde_json::from_str(&pending.await?.message)?;
+            assert_eq!(
+                result["answers"][0]["resolution"]["answer"]["text"],
+                "Desktop"
+            );
+            assert!(controller.outbox()?.is_empty());
+            assert!(!controller.snapshot()?.required_pending());
+            assert!(!runtime.terminal);
         }
         Ok(())
     }
@@ -1005,9 +996,7 @@ mod test {
             .await
             .unwrap_err();
         assert!(
-            stale
-                .to_string()
-                .contains("plan identity or version changed"),
+            stale.to_string().contains("design version conflict"),
             "{stale:#}"
         );
         let missing = runtime
@@ -1061,7 +1050,7 @@ mod test {
         let mut runtime = ControlToolRuntime::new(context);
         let read = ControlToolInvocation {
             task_permit: None,
-            name: "plan_read".into(),
+            name: "plan_file_read".into(),
             arguments: json!({"plan_id":"plan","path":"Foo.rs"}),
         };
         let inspected = runtime.invoke(read.clone()).await.unwrap();
@@ -1069,7 +1058,7 @@ mod test {
         assert_eq!(runtime.plan_document(), Some(&initial));
         let edit = ControlToolInvocation {
             task_permit: None,
-            name: "design_patch".into(),
+            name: "plan_file_edit".into(),
             arguments: json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: Foo.rs\n@@\n-pub struct Foo;\n+pub struct Revised;\n*** End Patch"}),
         };
         std::fs::write(
@@ -1091,7 +1080,10 @@ mod test {
         let mut output = BackendCompletion::default();
         apply_invocation(&accepted, &mut output).unwrap();
         let request = output.design_patch.pop().unwrap();
-        assert!(request.source_digests.contains_key("Foo.rs"));
+        let crate::plan::DesignEditRequest::File(file) = &request else {
+            panic!("expected file edit")
+        };
+        assert!(file.source_digests.contains_key("Foo.rs"));
         let replayed = initial.patch_design(&workspace, request.clone()).unwrap();
         assert_eq!(runtime.plan_document(), Some(&replayed));
         std::fs::write(
@@ -1100,6 +1092,110 @@ mod test {
         )
         .unwrap();
         assert!(initial.patch_design(&workspace, request).is_err());
+    }
+
+    #[tokio::test]
+    async fn overview_edits_preserve_files_checks_and_replay_partial_fields() {
+        let mut context = planning_context();
+        let workspace = context.workspace_root.clone().unwrap();
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.objective = "Original objective".into();
+        design.document.background = "Existing behavior".into();
+        design.document.design = "Keep ownership local".into();
+        design.document.usage = Some("Old example".into());
+        design.document.requirements = vec!["Old requirement".into()];
+        design.document.checks = vec!["manual".into()];
+        design.document.disabled_checks = vec!["optional".into()];
+        design
+            .proposed
+            .insert("owner.rs".into(), "pub struct Owner;\n".into());
+        context.plan_document.as_mut().unwrap().design = Some(design);
+        let original = context.plan_document.clone().unwrap();
+        let mut runtime = ControlToolRuntime::new(context);
+        let edited = runtime
+            .invoke(ControlToolInvocation {
+                task_permit: None,
+                name: "plan_overview_edit".into(),
+                arguments: json!({"plan_id":"plan", "expected_version":1,
+                "title":"Reviewed design", "objective":"Revised objective",
+                "usage":null, "requirements":[]}),
+            })
+            .await
+            .unwrap();
+        let saved = runtime.plan_document().unwrap().clone();
+        let saved_design = saved.design.as_ref().unwrap();
+        assert_eq!(saved.version, 2);
+        assert_eq!(saved.title, "Reviewed design");
+        assert_eq!(saved_design.document.objective, "Revised objective");
+        assert_eq!(saved_design.document.background, "Existing behavior");
+        assert!(saved_design.document.usage.is_none());
+        assert!(saved_design.document.requirements.is_empty());
+        assert_eq!(
+            saved_design.proposed,
+            original.design.as_ref().unwrap().proposed
+        );
+        assert_eq!(saved_design.document.checks, ["manual"]);
+        assert_eq!(saved_design.document.disabled_checks, ["optional"]);
+        let mut replay = BackendCompletion::default();
+        apply_invocation(&edited.invocation.unwrap(), &mut replay).unwrap();
+        assert_eq!(
+            original
+                .patch_design(&workspace, replay.design_patch.pop().unwrap())
+                .unwrap(),
+            saved
+        );
+
+        let read = runtime
+            .invoke(ControlToolInvocation {
+                task_permit: None,
+                name: "plan_overview_read".into(),
+                arguments: json!({"plan_id":"plan"}),
+            })
+            .await
+            .unwrap();
+        let overview: serde_json::Value = serde_json::from_str(&read.message).unwrap();
+        assert_eq!(overview["overview"]["objective"], "Revised objective");
+        assert_eq!(overview["files"]["paths"], json!(["owner.rs"]));
+        assert!(!read.message.contains("plan.json"));
+
+        for invocation in [
+            ControlToolInvocation {
+                task_permit: None,
+                name: "plan_overview_edit".into(),
+                arguments: json!({"plan_id":"plan","expected_version":1,"objective":"Stale"}),
+            },
+            ControlToolInvocation {
+                task_permit: None,
+                name: "plan_overview_edit".into(),
+                arguments: json!({"plan_id":"plan","expected_version":2,"title":""}),
+            },
+            ControlToolInvocation {
+                task_permit: None,
+                name: "plan_overview_edit".into(),
+                arguments: json!({"plan_id":"plan","expected_version":2,"patch":"ignored"}),
+            },
+            ControlToolInvocation {
+                task_permit: None,
+                name: "plan_file_read".into(),
+                arguments: json!({"plan_id":"plan","path":"plan.json"}),
+            },
+            ControlToolInvocation {
+                task_permit: None,
+                name: "plan_file_edit".into(),
+                arguments: json!({"plan_id":"plan","expected_version":2,"patch":"*** Begin Patch\n*** Add File: other.rs\n+pub struct Other;\n*** Update File: plan.json\n@@\n*** End Patch"}),
+            },
+        ] {
+            assert!(runtime.invoke(invocation).await.is_err());
+            assert_eq!(runtime.plan_document(), Some(&saved));
+        }
+        let unchanged = runtime.invoke(ControlToolInvocation {
+            task_permit: None, name:"plan_overview_edit".into(),
+            arguments:json!({"plan_id":"plan","expected_version":2,"objective":"Revised objective"}),
+        }).await.unwrap();
+        assert!(unchanged.invocation.is_none());
+        assert_eq!(runtime.plan_document(), Some(&saved));
+        assert!(!workspace.join("owner.rs").exists());
+        assert!(!workspace.join("other.rs").exists());
     }
 
     fn planning_context() -> ControlTurnContext {
@@ -1167,7 +1263,7 @@ mod test {
             .document
             .requirements = vec!["Preserve the declared behavior and ownership.".into()];
         let mut runtime = ControlToolRuntime::new(context);
-        let patch = "*** Begin Patch\n*** Add File: src/lib.rs\n+pub struct Owner;\n*** Update File: plan.json\n@@\n-  \"design\": \"\",\n+  \"design\": \"Introduce an owner for private state.\",\n*** End Patch";
+        let patch = "*** Begin Patch\n*** Add File: src/lib.rs\n+pub struct Owner;\n*** End Patch";
         assert!(
             runtime
                 .invoke(ControlToolInvocation {
@@ -1180,7 +1276,7 @@ mod test {
         );
         let change = |version, patch: &str| ControlToolInvocation {
             task_permit: None,
-            name: "design_patch".into(),
+            name: "plan_file_edit".into(),
             arguments: json!({"plan_id":"plan","expected_version":version,"patch":patch}),
         };
         assert!(runtime.invoke(change(99, patch)).await.is_err());
@@ -1197,29 +1293,35 @@ mod test {
         let inventory = runtime
             .invoke(ControlToolInvocation {
                 task_permit: None,
-                name: "plan_read".into(),
+                name: "plan_overview_read".into(),
                 arguments: json!({"plan_id":"plan"}),
             })
             .await
             .unwrap();
-        assert!(inventory.message.contains("plan.json"));
+        assert!(!inventory.message.contains("plan.json"));
         runtime.invoke(change(1, patch)).await.unwrap();
+        let overview_edit = |version| ControlToolInvocation {
+            task_permit: None,
+            name: "plan_overview_edit".into(),
+            arguments: json!({"plan_id":"plan","expected_version":version,"design":"Introduce an owner for private state."}),
+        };
+        runtime.invoke(overview_edit(2)).await.unwrap();
         let metadata = runtime
             .invoke(ControlToolInvocation {
                 task_permit: None,
-                name: "plan_read".into(),
-                arguments: json!({"plan_id":"plan","path":"plan.json"}),
+                name: "plan_overview_read".into(),
+                arguments: json!({"plan_id":"plan"}),
             })
             .await
             .unwrap();
         assert!(metadata.message.contains("Introduce an owner"));
-        runtime.invoke(change(2,"*** Begin Patch\n*** Update File: plan.json\n@@\n   \"design\": \"Introduce an owner for private state.\",\n*** End Patch")).await.unwrap();
-        assert_eq!(runtime.plan_document().unwrap().version, 2);
-        runtime.invoke(change(2,"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub struct Owner;\n+pub struct Owner { private: u64 }\n*** End Patch")).await.unwrap();
+        runtime.invoke(overview_edit(3)).await.unwrap();
+        assert_eq!(runtime.plan_document().unwrap().version, 3);
+        runtime.invoke(change(3,"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub struct Owner;\n+pub struct Owner { private: u64 }\n*** End Patch")).await.unwrap();
         let read = runtime
             .invoke(ControlToolInvocation {
                 task_permit: None,
-                name: "plan_read".into(),
+                name: "plan_file_read".into(),
                 arguments: json!({"plan_id":"plan","path":"src/lib.rs"}),
             })
             .await
@@ -1230,7 +1332,7 @@ mod test {
             .invoke(ControlToolInvocation {
                 task_permit: None,
                 name: "plan_submit".into(),
-                arguments: json!({"plan_id":"plan","expected_version":3}),
+                arguments: json!({"plan_id":"plan","expected_version":4}),
             })
             .await
             .unwrap_err();
@@ -1247,12 +1349,12 @@ mod test {
             "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n {}\n+\n+pub fn inspect(owner: &Owner);\n+Algorithm\n+  inspect_value(owner.private)\n+Accesses\n+  Owner::private\n*** End Patch",
             declaration.lines().last().unwrap()
         );
-        runtime.invoke(change(3, &repair_patch)).await.unwrap();
+        runtime.invoke(change(4, &repair_patch)).await.unwrap();
         runtime
             .invoke(ControlToolInvocation {
                 task_permit: None,
                 name: "plan_submit".into(),
-                arguments: json!({"plan_id":"plan","expected_version":4}),
+                arguments: json!({"plan_id":"plan","expected_version":5}),
             })
             .await
             .unwrap();
@@ -1260,7 +1362,7 @@ mod test {
         runtime
             .invoke(ControlToolInvocation {
                 task_permit: None,
-                name: "plan_read".into(),
+                name: "plan_overview_read".into(),
                 arguments: json!({"plan_id":"plan"}),
             })
             .await
@@ -1304,14 +1406,14 @@ mod test {
         let read = runtime
             .invoke(ControlToolInvocation {
                 task_permit: None,
-                name: "plan_read".into(),
+                name: "plan_file_read".into(),
                 arguments: json!({"plan_id":"plan","path":"api.rs"}),
             })
             .await
             .unwrap();
         assert!(read.message.contains("return 0"));
         let accepted = runtime.invoke(ControlToolInvocation { task_permit: None,
-            name: "design_patch".into(), arguments: json!({"plan_id":"plan","expected_version":1,
+            name: "plan_file_edit".into(), arguments: json!({"plan_id":"plan","expected_version":1,
                 "patch":"*** Begin Patch\n*** Update File: api.rs\n@@\n-  return 0\n+  return 1\n*** End Patch"}),
         }).await.unwrap();
         apply_invocation(&accepted.invocation.unwrap(), &mut output).unwrap();
@@ -1370,7 +1472,7 @@ mod test {
         let mut runtime = ControlToolRuntime::new(context);
         let read = |arguments| ControlToolInvocation {
             task_permit: None,
-            name: "plan_read".into(),
+            name: "plan_file_read".into(),
             arguments,
         };
         let result = runtime
@@ -1391,7 +1493,7 @@ mod test {
         ] {
             assert!(runtime.invoke(read(arguments)).await.is_err());
         }
-        let result = runtime.invoke(ControlToolInvocation { task_permit: None, name:"design_patch".into(), arguments:json!({"plan_id":"plan", "expected_version":1, "patch":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn collectible_count() -> u32;\n+pub fn get_collectable_count() -> u32;\n+Algorithm\n+  return count(targets)\n*** End Patch"}) }).await.unwrap();
+        let result = runtime.invoke(ControlToolInvocation { task_permit: None, name:"plan_file_edit".into(), arguments:json!({"plan_id":"plan", "expected_version":1, "patch":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn collectible_count() -> u32;\n+pub fn get_collectable_count() -> u32;\n+Algorithm\n+  return count(targets)\n*** End Patch"}) }).await.unwrap();
         assert!(
             result.message.contains("version is 2")
                 && result.message.contains(
@@ -1493,7 +1595,7 @@ mod test {
             .map(|line| format!("+{line}\n"))
             .collect::<String>();
         let mut runtime = ControlToolRuntime::new(context);
-        let confirmed = runtime.invoke(ControlToolInvocation { task_permit: None, name:"design_patch".into(), arguments:json!({"plan_id":"plan","expected_version":1,"patch":format!("*** Begin Patch\n*** Add File: src/response.rs\n{added}*** End Patch")}) }).await.unwrap();
+        let confirmed = runtime.invoke(ControlToolInvocation { task_permit: None, name:"plan_file_edit".into(), arguments:json!({"plan_id":"plan","expected_version":1,"patch":format!("*** Begin Patch\n*** Add File: src/response.rs\n{added}*** End Patch")}) }).await.unwrap();
         assert!(!confirmed.message.contains("Applied diff truncated"));
         assert!(confirmed.message.len() > 17 * 1024);
         assert!(confirmed.message.contains("response_499"));
@@ -1550,7 +1652,7 @@ mod test {
                 .unwrap()
                 .starts_with("api.ts:")
         );
-        runtime.invoke(ControlToolInvocation { task_permit: None, name:"design_patch".into(),arguments:serde_json::json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: api.ts\n@@\n-import { Missing } from './model';\n-export interface Api { item: Missing; }\n+import { Item } from './model';\n+export interface Api { item: Item; }\n*** End Patch"}) }).await.unwrap();
+        runtime.invoke(ControlToolInvocation { task_permit: None, name:"plan_file_edit".into(),arguments:serde_json::json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: api.ts\n@@\n-import { Missing } from './model';\n-export interface Api { item: Missing; }\n+import { Item } from './model';\n+export interface Api { item: Item; }\n*** End Patch"}) }).await.unwrap();
         runtime.invoke(submit(2)).await.unwrap();
         assert!(
             runtime
@@ -1695,7 +1797,7 @@ mod test {
                 name: "question_ask".into(),
                 arguments: json!({
                     "questions": [{
-                    "id": "provider_changed_id", "header": "Scope", "question": "Which scope?",
+                    "header": "Scope", "question": "Which scope?",
                     "allow_freeform": false,
                     "options": [
                         { "label": "Narrow", "description": "Keep it narrow." },

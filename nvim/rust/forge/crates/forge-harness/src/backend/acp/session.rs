@@ -1453,7 +1453,7 @@ mod test {
         *state.active.write().await = None;
         assert!(
             state
-                .request("forge/control", json!({"name":"plan_read"}))
+                .request("forge/control", json!({"name":"plan_file_read"}))
                 .await
                 .is_err()
         );

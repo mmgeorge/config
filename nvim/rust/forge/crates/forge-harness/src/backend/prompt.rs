@@ -40,14 +40,14 @@ impl BackendRequest {
                 "Address the supplied review in the current workspace. Keep unrelated work, and verify the affected behavior."
             }
         };
-        let question = if self
+        let planning_feedback = if self
             .control_context
             .as_ref()
             .is_some_and(|context| context.planning_feedback)
         {
             "Harness has already recorded the supplied planning answers. Apply those answers without reopening their questions."
         } else {
-            "Use question_ask for persistent questions, with a unique id and an explicit optional or required requirement for each question. Optional questions do not pause work; continue useful work and distinguish assumptions from user answers. Required questions stop work immediately. Use question_reply to answer a clarification, question_revise to update one pending question, and question_withdraw only when that decision is no longer needed. Reuse the operation identity when retrying the same mutation. Only the user can submit an answer."
+            ""
         };
         let shell = self
             .control_context
@@ -93,7 +93,7 @@ impl BackendRequest {
             String::new()
         };
         format!(
-            "Current Harness interaction\nTool approval: {}.{approval_guidance}\nAccess configuration: {}.\nWhen write_access is off, file writes are rejected in every approval mode, and only the user can turn writes on with /write.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}, so setup commands must target that shell. Read check_definition_list for the live automatic_checks and check_timing settings. Automatic completion checks are off unless the user enables them. When they are on, they run at the configured point in the work queue. When they are off, run required validation with check_run. Read results with check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run the checks. A delegated agent without check tools leaves validation to its parent.\n{question}{lsp}{harness}",
+            "Current Harness interaction\nTool approval: {}.{approval_guidance}\nAccess configuration: {}.\nWhen write_access is off, file writes are rejected in every approval mode, and only the user can turn writes on with /write.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}, so setup commands must target that shell. Read check_definition_list for the live automatic_checks and check_timing settings. Automatic completion checks are off unless the user enables them. When they are on, they run at the configured point in the work queue. When they are off, run required validation with check_run. Read results with check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run the checks. A delegated agent without check tools leaves validation to its parent.\n{planning_feedback}{lsp}{harness}",
             self.approval_mode.label(),
             serde_json::to_string(&self.access).expect("access policy serializes")
         )
@@ -149,7 +149,7 @@ mod test {
                 contract.contains(REJECT_ALL_GUIDANCE),
                 permission == ApprovalMode::Deny
             );
-            assert!(contract.contains("currently pending question"));
+            assert!(!contract.contains("question_ask"));
             assert!(!contract.contains("already recorded"));
         }
         request.mode = PromptMode::Plan;
@@ -159,11 +159,7 @@ mod test {
                 .interaction_contract()
                 .contains("already recorded the supplied planning answers")
         );
-        assert!(
-            !request
-                .interaction_contract()
-                .contains("currently pending question")
-        );
+        assert!(!request.interaction_contract().contains("question_ask"));
         for (mode, expected) in [
             (PromptMode::Plan, "virtual proposals only"),
             (

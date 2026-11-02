@@ -180,7 +180,7 @@ mod test {
             .unwrap();
         let permit = task.permit();
         let mut invocation = ControlToolInvocation {
-            name: "plan_read".into(),
+            name: "plan_overview_read".into(),
             arguments: serde_json::json!({"plan_id":"plan"}),
             task_permit: None,
         };

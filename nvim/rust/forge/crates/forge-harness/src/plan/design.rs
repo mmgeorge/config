@@ -440,6 +440,16 @@ impl DeclarationDesign {
         Ok(())
     }
 
+    /// List project files represented by the plan without exposing internal metadata paths.
+    pub(crate) fn file_inventory(&self) -> serde_json::Value {
+        let paths = self
+            .baseline
+            .keys()
+            .chain(self.proposed.keys())
+            .collect::<BTreeSet<_>>();
+        serde_json::json!({"paths":paths,"changed_paths":self.changed_paths()})
+    }
+
     /// Read one virtual overview or list paths without sending the complete snapshot.
     pub fn read(&self, path: Option<&str>, baseline: bool) -> Result<serde_json::Value> {
         if let Some(path) = path {

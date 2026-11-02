@@ -8718,6 +8718,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_burst_reaches_the_active_turn_before_any_acknowledgment() -> Result<()> {
+        use crate::backend::submission::SubmissionTarget;
+        use crate::input::{InputDelivery, InputIntent, InputOperation};
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let registry = service.registry().await?;
+        let controller = registry.resolve(registry.initial_session_id()).await?;
+        let execution = controller
+            .coordinator
+            .execution
+            .clone()
+            .acquire_owned()
+            .await?;
+        let mut active = controller.parent_input.activate(None)?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let reader = tokio::spawn(async move {
+            while output.recv().await?.is_some() {}
+            Ok::<(), anyhow::Error>(())
+        });
+        for (id, intent) in [
+            ("queued", InputIntent::Queue),
+            ("first", InputIntent::Auto),
+            ("second", InputIntent::Auto),
+            ("third", InputIntent::Auto),
+        ] {
+            let operation: InputOperation = serde_json::from_value(json!({
+                "id": format!("submit-{id}"), "action": {"kind":"submit", "message": {
+                    "id":id, "text": format!("steering {id}"), "intent":intent
+                }}
+            }))?;
+            controller.coordinator.submissions.apply(operation)?;
+        }
+        controller.attach_input(&sink).await?;
+        let mut commands = Vec::new();
+        for id in ["first", "second", "third"] {
+            let command = tokio::time::timeout(Duration::from_secs(5), active.receive())
+                .await?
+                .context("steering lane closed")?;
+            assert_eq!(command.text, format!("steering {id}"));
+            let submission = command
+                .submission
+                .as_ref()
+                .context("missing input identity")?;
+            assert_eq!(submission.record()?.input_message_id.as_deref(), Some(id));
+            submission.sending(SubmissionTarget::Untracked)?;
+            commands.push(command);
+        }
+        let snapshot = controller.coordinator.submissions.snapshot()?;
+        assert_eq!(
+            snapshot
+                .messages
+                .iter()
+                .filter(|message| message.delivery == InputDelivery::Delivering)
+                .count(),
+            3
+        );
+        assert!(
+            snapshot
+                .messages
+                .iter()
+                .any(|message| message.id == "queued" && message.delivery == InputDelivery::Queued)
+        );
+        // Acknowledgments may arrive in a different order from FIFO dispatch.
+        for index in [1, 0, 0] {
+            let command = commands.remove(index);
+            let id = command
+                .submission
+                .as_ref()
+                .unwrap()
+                .record()?
+                .input_message_id
+                .unwrap();
+            command
+                .submission
+                .as_ref()
+                .unwrap()
+                .accepted(format!("accepted {id}"))?;
+            command.complete(Ok(())).await;
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = controller.coordinator.submissions.snapshot()?;
+                if snapshot.messages.len() == 1 && snapshot.messages[0].id == "queued" {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        controller.coordinator.submissions.suspend(true, None)?;
+        drop(active);
+        drop(execution);
+        service.shutdown(Duration::from_secs(5)).await?;
+        drop(sink);
+        reader.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Result<()> {
         use crate::backend::mock_response::MockResponseCommand;
         use crate::input::{InputAction, InputEdit, InputIntent, InputMessage, InputOperation};

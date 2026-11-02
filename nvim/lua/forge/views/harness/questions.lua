@@ -54,7 +54,7 @@ local function submit(state, question, action)
       require("forge.infra.notifications").error(failure, "Harness question")
       refresh_picker(state)
     else
-      M.receive(state, result)
+      if not M.receive(state, result) then refresh_picker(state) end
     end
   end)
 end
@@ -63,6 +63,7 @@ local function page(state, question)
   local required = question.requirement == "required"
   local pending = question.resolution.kind == "pending"
   local content = question.content
+  local title = content.header .. " · " .. (required and "Required" or "Optional")
   local options = {}
   if pending then
     for index, option in ipairs(content.options or {}) do
@@ -74,7 +75,7 @@ local function page(state, question)
   elseif question.resolution.kind == "answered" then
     options[#options + 1] = { id = "correct", key = "c", label = "Correct answer…", detail = "Send a correction; preserve the earlier answer.", input_kind = "other" }
   end
-  local details = { { text = content.header .. (required and " · Required" or ""), group = "ForgePickerQuestion" } }
+  local details = { { text = title, group = "ForgePickerQuestion" } }
   if required and pending then
     local _, required_count = M.count(state)
     details[#details + 1] = { text = required_count > 1
@@ -88,12 +89,13 @@ local function page(state, question)
   end
   if state.question_failure then details[#details + 1] = { text = "Not saved: " .. state.question_failure, group = "ForgeHarnessToolFailure" } end
   if (state.question_saving or {})[question.id] then details[#details + 1] = { text = "Saving…", group = "ForgePickerHint" } end
-  return { id = question.id, title = content.header .. (required and " · Required" or ""),
+  return { id = question.id, title = title,
     content_list = details, option_list = options, column_headers = { "Answer", "Description" },
     flexible_column = 2, wrap_column = 2, allow_input = true,
     input_height = config.options.picker.input_height,
     action_list = pending and not required and {
-      { id = "dismiss", key = "d", desc = "Dismiss optional question", callback = function() submit(state, question, { kind = "dismiss" }) end },
+      { id = "dismiss", key = "d", label = "ignore", desc = "Ignore optional question", show_in_help_footer = true,
+        callback = function() submit(state, question, { kind = "dismiss" }) end },
     } or {},
   }
 end
@@ -152,11 +154,14 @@ end
 
 ---@param state ForgeHarnessPresentationState
 ---@param snapshot ForgeQuestionView
+---@return boolean content_changed
 function M.receive(state, snapshot)
-  if not snapshot or snapshot == vim.NIL then return end
-  if state.questions and (state.questions.revision or 0) > (snapshot.revision or 0) then return end
+  if not snapshot or snapshot == vim.NIL then return false end
+  if state.questions and (state.questions.revision or 0) >= (snapshot.revision or 0) then return false end
+  local content_changed = not state.questions or not vim.deep_equal(state.questions.questions, snapshot.questions)
   state.questions = snapshot
-  refresh_picker(state)
+  if content_changed then refresh_picker(state) end
+  return content_changed
 end
 
 return M

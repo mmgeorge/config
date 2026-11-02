@@ -16,7 +16,8 @@ Forge records evidence ahead of time, because a failed session or a vanished edi
 The detailed files can contain prompts, responses, tool arguments/results, and
 provider events. Credential redaction does not make them metadata-only. The
 `harness_session_log` tool exposes only allowlisted diagnostic metadata and reads
-100 entries per page by default, with a positive `limit` override. Its cursor keeps
+up to 1,000 complete entries per page by default, newest-first, with a positive
+`limit` override. Log pages are not split by the response byte budget. Its cursor keeps
 the captured file extents and excludes later appends. Rotation renames the retained
 files so an open cursor can finish reading its original segments. The aggregate
 metadata file starts over at its 15 MiB threshold without keeping an older segment.

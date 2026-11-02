@@ -13,6 +13,7 @@ pub(crate) use authority::TaskAuthority;
 mod failure;
 pub(crate) mod harness;
 pub(crate) mod lsp;
+mod plan;
 pub mod repository;
 mod runtime;
 pub(crate) use executor::ControlToolExecutor;
@@ -164,37 +165,6 @@ impl ControlToolRegistry {
                 input_schema: repository_input_schema(true, true),
             },
             ControlToolDefinition {
-                name: "design_patch",
-                description: "Atomically edit virtual declaration overviews, complete JSON/JSONC, TOML, YAML, XML, and .gitignore proposals, and plan.json metadata. Never writes workspace files. Use *** Begin Patch / Add File / Update File / Delete File / Move to / @@ syntax with project-relative paths. Source proposals contain signatures, explanatory comments, Algorithm blocks for new callables, one-to-two-sentence Change summaries only for modified callables, Calls, Constructs, and Accesses, never executable bodies. New callables require a nonempty Algorithm at submission. Write academic pseudocode as high-level and compact as possible while preserving required behavior. Configuration retains complete values. Read affected text through plan_read when exact text or version is unavailable and omit its displayed line numbers from patches. Read an existing workspace file before its first edit. The first successful Update, Delete, or Move captures its immutable baseline. Add requires an absent destination. Later edits use the saved proposal. Optional source_digests maps paths to inspected hashes for stale-read checks across turns. Success returns the new version and the complete applied diff. Use that confirmation instead of rereading unchanged files. plan.json already exists and accepts Update File only. Its fields are objective, optional usage, requirements, background, decisions, design, flows, verification, and tests. Submission requires nonempty objective, background, and design. Requirements identify the 2-4 key delivered outcomes and acceptance constraints and may be empty for bug fixes. Keep routine validation and implementation safeguards in Design or declarations unless explicitly requested or essential to task-specific acceptance. Background records relevant starting conditions. Decisions is an array of {decision, rationale} objects for consequential choices with task-specific reasons, or [] when none apply. Design explains the solution and ownership. Flows is an array of {title, description, trigger, steps}, or [] when none apply. Each flow has one explicit initiating event. Steps run in order and contain action, optional effects, and optional branches. Each effect has exactly target and change and is terminal: never put actions, steps, children, branches, or triggers inside effects. Each branch has condition and nonempty steps evaluated during this execution. Later independent events require separate flows, even when they consume state produced by another flow. Branches do not imply parallel execution. Use descriptive labels and exact declaration names. Harness owns presentation formatting, label whitespace, column widths, and wrapping. Do not shorten content to fit a display. Harness generates the diagram after Design. Do not put a Flows heading or hand-formatted diagrams in design. Do not duplicate repository instructions, milestones, or execution progress in plan prose. Propose concrete supported file changes, including needed .gitignore rules, and describe generated artifacts or unsupported file changes in Design. Do not create placeholder lockfiles. Automated checks belong to saved .forge.json configuration, not plan.json. If submission reports checks_not_configured, use the check setup tool and retry the same plan. verification is an array of manual actions and expected observations, performed only after Checking passes. Manual verification may be empty. The required tests array groups {file, cases} by project-relative forward-slash path. Each case has name, change (new, modified, removed, or reused), and description (scenario and expected result or removal rationale). Include inline and separate-file tests and reused coverage, omit unrelated tests, and use [] when none apply. The inventory records intended coverage, not results. Keep all metadata and proposals consistent. Optional title names the design.",
-                input_schema: strict_object_input_schema(
-                    vec![
-                        ("plan_id", string_schema()),
-                        ("expected_version", json!({"type":"integer","minimum":1})),
-                        ("patch", string_schema()),
-                        ("title", string_schema()),
-                        (
-                            "source_digests",
-                            json!({"type":"object","additionalProperties":{"type":"string"}}),
-                        ),
-                    ],
-                    &["plan_id", "expected_version", "patch"],
-                ),
-            },
-            ControlToolDefinition {
-                name: "plan_read",
-                description: "List captured/proposed declaration and configuration paths and plan.json, or read one file as plain text with 1-based line numbers and the active version. Optional start_line and end_line select an inclusive range and require path. Omitted bounds select the beginning or end of the file. Line-number prefixes are presentation only, omit them from patches. plan.json contains objective, optional usage, requirements, background, decisions, design, flows, verification (manual actions), and tests (planned coverage) and has no baseline. Omit path for the inventory and, during execution, current phase, findings, and verification_evidence with completed tool-call IDs. Set baseline true to inspect immutable current-code declarations or complete configuration. For an uncaptured path, extracts only that workspace file and returns its source digest without saving a baseline or changing the version. Read existing files before editing them. Does not return implementation bodies.",
-                input_schema: strict_object_input_schema(
-                    vec![
-                        ("plan_id", string_schema()),
-                        ("path", string_schema()),
-                        ("baseline", json!({"type":"boolean"})),
-                        ("start_line", json!({"type":"integer","minimum":1})),
-                        ("end_line", json!({"type":"integer","minimum":1})),
-                    ],
-                    &["plan_id"],
-                ),
-            },
-            ControlToolDefinition {
                 name: "plan_checks_add",
                 description: "Add existing project check IDs to the active plan during authoring or Resolve. Requires the current plan ID and version. Returns the updated plan version and check preview without changing project settings or executing checks. Repeated IDs are deduplicated, and already-selected checks leave the version unchanged.",
                 input_schema: strict_object_input_schema(
@@ -226,7 +196,7 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "plan_phase_done",
-                description: "Finish the current Implement, Verify, or Resolve phase of the active accepted semantic plan. Forge validates the expected phase and revision, commits the transition, and returns the next instructions. Implement and Resolve finish without conformance checks. Verify collects required declaration and public API differences together. Extra internal helpers and Calls/Constructs/Accesses never gate completion. End the turn after success. Verification findings enter Resolve, where code defects can be fixed and intentional contract changes can be submitted together. Verify requires an agent assessment and exact completed tool-call IDs in verification.evidence. After running checks, call plan_read with only plan_id to obtain execution.verification_evidence IDs and output previews. Passed cannot bypass semantic conformance. Failed enters Resolve. Blocked preserves Verify.",
+                description: "Finish the current Implement, Verify, or Resolve phase of the active accepted semantic plan. Forge validates the expected phase and revision, commits the transition, and returns the next instructions. Implement and Resolve finish without conformance checks. Verify collects required declaration and public API differences together. Extra internal helpers and Calls/Constructs/Accesses never gate completion. End the turn after success. Verification findings enter Resolve, where code defects can be fixed and intentional contract changes can be submitted together. Verify requires an agent assessment and exact completed tool-call IDs in verification.evidence. After running checks, call plan_overview_read with plan_id to obtain execution.verification_evidence IDs and output previews. Passed cannot bypass semantic conformance. Failed enters Resolve. Blocked preserves Verify.",
                 input_schema: strict_object_input_schema(
                     vec![
                         (
@@ -255,7 +225,7 @@ impl ControlToolRegistry {
                                     ),
                                     (
                                         "evidence",
-                                        json!({"type":"array","description":"Exact completed tool-call IDs from plan_read execution.verification_evidence", "items":{"type":"string"}}),
+                                        json!({"type":"array","description":"Exact completed tool-call IDs from plan_overview_read execution.verification_evidence", "items":{"type":"string"}}),
                                     ),
                                     (
                                         "findings",
@@ -273,35 +243,27 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "question_ask",
-                description: "Ask persistent questions. Set each requirement to optional to continue work, or required to stop work immediately until answered or withdrawn. Never treat a recommended choice as user consent.",
+                description: "Ask the user one or more concise, self-contained questions for missing information, preferences, constraints, clarification, or approval. Respect requests not to ask questions. By default, returns Harness-generated question_ids immediately without ending the turn; keep working while answers arrive asynchronously as new user messages. Set wait:true only for important decisions that block progress: the tool stays pending and returns the resolved answers instead of sending them separately. Never invent IDs or treat recommended choices or assumptions as user answers. New questions have revision 1. Use the returned question IDs with question_reply, question_revise, or question_withdraw.",
                 input_schema: plan_question_input_schema(),
             },
             ControlToolDefinition {
                 name: "question_reply",
-                description: "Reply to an explicit clarification message on a Harness question. This explains the question without resolving it.",
+                description: "Reply to an explicit clarification message on a Harness question using its existing question_id, revision, and message_id. This explains the question without resolving it. Only the user can submit an answer.",
                 input_schema: strict_object_input_schema(
                     vec![
-                        ("operation_id", string_schema()),
                         ("question_id", string_schema()),
                         ("revision", json!({"type":"integer","minimum":1})),
                         ("message_id", string_schema()),
                         ("text", string_schema()),
                     ],
-                    &[
-                        "operation_id",
-                        "question_id",
-                        "revision",
-                        "message_id",
-                        "text",
-                    ],
+                    &["question_id", "revision", "message_id", "text"],
                 ),
             },
             ControlToolDefinition {
                 name: "question_revise",
-                description: "Revise a pending question's wording or choices while preserving its requirement and discussion. Do not revise an answered question.",
+                description: "Revise a pending question's wording or choices using its existing question_id and revision. Preserve its waiting behavior and discussion. Do not revise an answered question or invent a new ID.",
                 input_schema: strict_object_input_schema(
                     vec![
-                        ("operation_id", string_schema()),
                         ("question_id", string_schema()),
                         ("revision", json!({"type":"integer","minimum":1})),
                         (
@@ -310,7 +272,7 @@ impl ControlToolRegistry {
                                 .clone(),
                         ),
                     ],
-                    &["operation_id", "question_id", "revision", "draft"],
+                    &["question_id", "revision", "draft"],
                 ),
             },
             ControlToolDefinition {
@@ -391,6 +353,7 @@ impl ControlToolRegistry {
                 input_schema: strict_object_input_schema(vec![("run_id", string_schema())], &["run_id"]),
             },
         ]);
+        definitions.extend(plan::definitions());
         definitions.extend(lsp::definitions());
         definitions.extend(harness::definitions());
         definitions
@@ -407,7 +370,7 @@ impl ControlToolRegistry {
                 !is_agent_tool(definition.name)
                     && (!matches!(
                         definition.name,
-                        "plan_checks_add" | "design_patch" | "plan_submit"
+                        "plan_checks_add" | "plan_file_edit" | "plan_overview_edit" | "plan_submit"
                     ) || phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve))
             })
             .collect()
@@ -462,7 +425,7 @@ impl ControlToolRegistry {
                 }
                 !matches!(
                     definition.name,
-                    "plan_checks_add" | "design_patch" | "plan_submit"
+                    "plan_checks_add" | "plan_file_edit" | "plan_overview_edit" | "plan_submit"
                 ) || phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve)
             })
             .map(|mut definition| {
@@ -552,7 +515,7 @@ impl ControlToolInvocation {
         let scoped = self.name.starts_with("plan_")
             || matches!(
                 self.name.as_str(),
-                "design_patch"
+                "plan_file_edit"
                     | "question_ask"
                     | "question_reply"
                     | "question_revise"
@@ -599,16 +562,40 @@ pub fn apply_invocation(
 ) -> Result<()> {
     validate_arguments(invocation)?;
     match invocation.name.as_str() {
-        "design_patch" => {
-            output
-                .design_patch
-                .push(decode_arguments::<crate::plan::DesignPatchRequest>(
-                    invocation,
-                )?);
+        "plan_file_edit" => {
+            let request = decode_arguments::<crate::plan::DesignPatchRequest>(invocation)?;
+            crate::plan::ensure_file_patch(&request.patch)?;
+            output.design_patch.push(request.into());
             output.plan_submit = None;
             output.structured_plan = true;
         }
-        "plan_read" => {
+        "plan_overview_edit" => {
+            output
+                .design_patch
+                .push(crate::plan::DesignEditRequest::Overview(
+                    decode_arguments::<crate::plan::PlanOverviewEditRequest>(invocation)?,
+                ));
+            output.plan_submit = None;
+            output.structured_plan = true;
+        }
+        "plan_checks_add" => {
+            output
+                .design_patch
+                .push(crate::plan::DesignEditRequest::Checks(decode_arguments::<
+                    crate::plan::PlanChecksEditRequest,
+                >(
+                    invocation
+                )?));
+            output.plan_submit = None;
+            output.structured_plan = true;
+        }
+        "plan_file_read" | "plan_overview_read" => {
+            if invocation.name == "plan_file_read" {
+                anyhow::ensure!(
+                    invocation.arguments["path"].as_str() != Some("plan.json"),
+                    "use plan_overview_read to read the plan overview"
+                );
+            }
             output.plan_read = invocation
                 .arguments
                 .get("plan_id")
@@ -643,7 +630,6 @@ pub fn apply_invocation(
         | "lsp_paths"
         | "lsp_diagnostics"
         | "lsp_status"
-        | "plan_checks_add"
         | "plan_phase_done"
         | "check_definition_list"
         | "check_definition_edit"
@@ -790,21 +776,19 @@ fn strict_object_input_schema(
     })
 }
 
-/// Build the shared structured-input contract for planning feedback.
+/// Build the shared question contract with explicit waiting and host-owned identities.
 pub fn plan_question_input_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "id": { "type": "string" },
+            "wait": { "type": "boolean", "default": false, "description": "Wait for answers only when an important decision blocks progress. Otherwise return IDs immediately and continue work." },
             "questions": {
                 "type": "array",
                 "minItems": 1,
                 "items": {
                     "type": "object",
                     "properties": {
-                        "id": { "type": "string" },
                         "header": { "type": "string" },
-                        "requirement": { "type": "string", "enum": ["optional", "required"] },
                         "question": { "type": "string" },
                         "options": {
                             "type": "array",
@@ -821,12 +805,12 @@ pub fn plan_question_input_schema() -> Value {
                         },
                         "allow_freeform": { "type": "boolean" }
                     },
-                    "required": ["header", "question", "requirement", "options"],
+                    "required": ["header", "question", "options"],
                     "additionalProperties": false
                 }
             }
         },
-        "required": ["id", "questions"],
+        "required": ["questions"],
         "additionalProperties": false
     })
 }
@@ -858,12 +842,11 @@ pub fn question_answer_input_schema() -> Value {
 pub fn question_withdraw_input_schema() -> Value {
     strict_object_input_schema(
         vec![
-            ("operation_id", string_schema()),
             ("question_id", string_schema()),
             ("revision", json!({"type":"integer","minimum":1})),
             ("reason", string_schema()),
         ],
-        &["operation_id", "question_id", "revision", "reason"],
+        &["question_id", "revision", "reason"],
     )
 }
 
@@ -917,6 +900,63 @@ pub async fn run_stdio() -> Result<()> {
 
 #[cfg(test)]
 mod test {
+    /// Accept host-owned question identities and expose waiting only as an explicit choice.
+    #[test]
+    fn question_tools_generate_ids_and_expose_waiting() {
+        let arguments =
+            json!({"questions":[{"header":"Layout", "question":"Which layout?", "options":[]}]});
+        for wait in [None, Some(false), Some(true)] {
+            let mut arguments = arguments.clone();
+            if let Some(wait) = wait {
+                arguments["wait"] = json!(wait);
+            }
+            validate_arguments(&ControlToolInvocation {
+                task_permit: None,
+                name: "question_ask".into(),
+                arguments,
+            })
+            .unwrap();
+        }
+        for extra in ["id", "operation_id"] {
+            let mut invalid = arguments.clone();
+            invalid[extra] = json!("model-owned");
+            assert!(
+                validate_arguments(&ControlToolInvocation {
+                    task_permit: None,
+                    name: "question_ask".into(),
+                    arguments: invalid
+                })
+                .is_err()
+            );
+        }
+        let mut invalid = arguments;
+        invalid["questions"][0]["id"] = json!("model-owned");
+        assert!(
+            validate_arguments(&ControlToolInvocation {
+                task_permit: None,
+                name: "question_ask".into(),
+                arguments: invalid
+            })
+            .is_err()
+        );
+        for tool in ControlToolRegistry
+            .definition_list()
+            .into_iter()
+            .filter(|tool| {
+                matches!(
+                    tool.name,
+                    "question_reply" | "question_revise" | "question_withdraw"
+                )
+            })
+        {
+            assert!(
+                tool.input_schema["properties"]
+                    .get("operation_id")
+                    .is_none()
+            );
+        }
+    }
+
     #[test]
     fn repository_schema_preserves_complete_offsets_and_path_identities() {
         assert!(
@@ -1111,16 +1151,28 @@ mod test {
     }
 
     #[test]
-    fn design_patch_contract_replaces_legacy_authoring_tools() {
+    fn plan_tools_separate_files_and_overview() {
         let definition = ControlToolRegistry.definition_list();
-        assert!(definition.iter().any(|tool| tool.name == "design_patch"));
+        for name in [
+            "plan_file_read",
+            "plan_file_edit",
+            "plan_overview_read",
+            "plan_overview_edit",
+        ] {
+            assert!(definition.iter().any(|tool| tool.name == name));
+        }
         assert!(!definition.iter().any(|tool| matches!(
             tool.name,
-            "harness_plan_edit" | "harness_plan_deviation" | "harness_plan_task_report"
+            "design_patch"
+                | "plan_patch"
+                | "plan_read"
+                | "harness_plan_edit"
+                | "harness_plan_deviation"
+                | "harness_plan_task_report"
         )));
         let invocation = ControlToolInvocation {
             task_permit: None,
-            name: "design_patch".into(),
+            name: "plan_file_edit".into(),
             arguments: json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Add File: lib.rs\n+pub struct Owner;\n*** End Patch"}),
         };
         let mut output = BackendCompletion::default();
@@ -1147,7 +1199,7 @@ mod test {
                 "repository_diff",
                 "repository_file_diff",
                 "harness_plan_edit",
-                "plan_read",
+                "plan_file_read",
                 "plan_submit",
                 "harness_plan_deviation",
                 "harness_plan_task_report",

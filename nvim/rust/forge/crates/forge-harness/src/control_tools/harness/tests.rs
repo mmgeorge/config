@@ -306,11 +306,19 @@ fn log_metadata_excludes_private_content_and_reports_absence() -> Result<()> {
 
 /// Keep large log reads responsive while preserving every record across continuation pages.
 #[tokio::test]
-async fn large_log_snapshot_completes_and_preserves_every_record() -> Result<()> {
+async fn log_snapshot_completes_and_preserves_every_record() -> Result<()> {
     use std::io::{BufWriter, Write};
     use std::time::Duration;
 
     let fixture = Fixture::new()?;
+    let definition = definitions()
+        .into_iter()
+        .find(|definition| definition.name == "harness_session_log")
+        .unwrap();
+    assert_eq!(
+        definition.input_schema["properties"]["limit"]["default"],
+        1000
+    );
     let path = PathBuf::from(fixture.scope.trace.session_status("current").path);
     std::fs::create_dir_all(path.parent().unwrap())?;
     let mut file = BufWriter::new(std::fs::File::create(&path)?);
@@ -331,12 +339,16 @@ async fn large_log_snapshot_completes_and_preserves_every_record() -> Result<()>
         fixture.scope.cancelled.store(true, Ordering::Release);
     }
     let mut response: Value = serde_json::from_str(&result??)?;
-    assert_eq!(response["items"].as_array().unwrap().len(), 100);
+    assert_eq!(response["items"].as_array().unwrap().len(), 1000);
+    assert!(serde_json::to_vec(&response)?.len() > 24 * 1024);
     let mut observed_count = 0;
     loop {
-        assert!(response["items"].as_array().unwrap().len() <= 100);
+        assert_eq!(response["items"].as_array().unwrap().len(), 1000);
         for record in response["items"].as_array().unwrap() {
-            assert_eq!(record["payload"]["count"], observed_count);
+            assert_eq!(
+                record["payload"]["count"],
+                record_count - observed_count - 1
+            );
             assert_eq!(record["payload"]["method"], "雪");
             assert!(record["payload"].get("body").is_none());
             observed_count += 1;
@@ -350,7 +362,7 @@ async fn large_log_snapshot_completes_and_preserves_every_record() -> Result<()>
     Ok(())
 }
 
-/// Stop at the requested page boundary before decoding malformed later records.
+/// Stop at the requested page boundary before decoding malformed older records.
 #[test]
 fn log_pages_read_lazily_and_invalidate_failed_cursors() -> Result<()> {
     let fixture = Fixture::new()?;
@@ -358,17 +370,17 @@ fn log_pages_read_lazily_and_invalidate_failed_cursors() -> Result<()> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(
         &path,
-        "{\"event\":\"first\"}\n{\"event\":\"second\"}\ninvalid\n",
+        "invalid\n{\"event\":\"first\"}\n{\"event\":\"second\"}\n",
     )?;
     let first = fixture.invoke("harness_session_log", json!({"limit":1}))?;
     assert_eq!(first["items"].as_array().unwrap().len(), 1);
-    assert_eq!(first["items"][0]["event"], "first");
+    assert_eq!(first["items"][0]["event"], "second");
     let first_cursor = first["next_cursor"].as_str().unwrap();
     let second = fixture.invoke(
         "harness_session_log",
         json!({"limit":1,"cursor":first_cursor}),
     )?;
-    assert_eq!(second["items"][0]["event"], "second");
+    assert_eq!(second["items"][0]["event"], "first");
     assert_eq!(
         fixture.invoke(
             "harness_session_log",
@@ -408,18 +420,19 @@ fn log_pages_survive_rotation_and_exclude_new_appends() -> Result<()> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(&path, "{\"event\":\"first\"}\n{\"event\":\"second\"}\n")?;
     let first = fixture.invoke("harness_session_log", json!({"limit":1}))?;
+    assert_eq!(first["items"][0]["event"], "second");
     std::fs::rename(&path, path.with_extension("jsonl.1"))?;
     std::fs::write(&path, "{\"event\":\"new\"}\n")?;
     let second = fixture.invoke(
         "harness_session_log",
         json!({"limit":1,"cursor":first["next_cursor"]}),
     )?;
-    assert_eq!(second["items"][0]["event"], "second");
+    assert_eq!(second["items"][0]["event"], "first");
     assert!(second.get("next_cursor").is_none());
     Ok(())
 }
 
-/// Preserve oversized Unicode metadata through fragments without skipping the next record.
+/// Preserve oversized Unicode metadata in one complete entry without fragmenting a page.
 #[test]
 fn log_pages_preserve_large_entries_and_replayed_cursors() -> Result<()> {
     use std::io::Write;
@@ -434,18 +447,16 @@ fn log_pages_preserve_large_entries_and_replayed_cursors() -> Result<()> {
         json!({"event":"large","payload":{"method":method}})
     )?;
     writeln!(file, "{}", json!({"event":"next"}))?;
-    let mut response = fixture.invoke("harness_session_log", json!({"limit":1}))?;
-    let mut encoded = String::new();
-    while let Some(fragment) = response["fragment"].as_str() {
-        encoded.push_str(fragment);
-        let cursor = response["next_cursor"].as_str().unwrap().to_owned();
-        response = fixture.invoke("harness_session_log", json!({"limit":1,"cursor":cursor}))?;
-    }
+    let first = fixture.invoke("harness_session_log", json!({"limit":1}))?;
+    assert_eq!(first["items"][0]["event"], "next");
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let response = fixture.invoke("harness_session_log", json!({"limit":1,"cursor":cursor}))?;
+    assert!(response.get("fragment").is_none());
+    assert_eq!(response["items"][0]["payload"]["method"], method);
     assert_eq!(
-        serde_json::from_str::<Value>(&encoded)?["payload"]["method"],
-        method
+        fixture.invoke("harness_session_log", json!({"limit":1,"cursor":cursor}))?,
+        response
     );
-    assert_eq!(response["items"][0]["event"], "next");
     assert!(response.get("next_cursor").is_none());
     Ok(())
 }

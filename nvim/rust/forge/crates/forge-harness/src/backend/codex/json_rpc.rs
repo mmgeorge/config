@@ -1080,7 +1080,7 @@ impl CodexJsonRpc {
             } else {
                 apply_control_request_result(&message, output, response_success)?;
             }
-            if let (Some(digests), Some(request)) =
+            if let (Some(digests), Some(crate::plan::DesignEditRequest::File(request))) =
                 (source_digests, output.completion.design_patch.last_mut())
             {
                 request.source_digests = digests;
@@ -2487,9 +2487,8 @@ mod test {
             ),
             (
                 2,
-                "design_patch",
-                json!({"plan_id":"plan","expected_version":5,
-                "patch":"*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"objective\": \"\",\n+  \"objective\": \"Restart fixture\",\n*** End Patch"}),
+                "plan_overview_edit",
+                json!({"plan_id":"plan","expected_version":5,"objective":"Restart fixture"}),
             ),
             (
                 3,
@@ -2951,7 +2950,7 @@ mod test {
                     "item": {
                         "id": overview,
                         "type": "dynamicToolCall",
-                        "tool": "design_patch",
+                        "tool": "plan_file_edit",
                         "arguments": {
                             "plan_id": "plan-1",
                             "expected_version": 1,
@@ -3012,7 +3011,11 @@ mod test {
         .await;
 
         assert_eq!(output.completion.design_patch.len(), 1);
-        assert_eq!(output.completion.design_patch[0].patch, "corrected");
+        let crate::plan::DesignEditRequest::File(request) = &output.completion.design_patch[0]
+        else {
+            panic!("expected file edit")
+        };
+        assert_eq!(request.patch, "corrected");
     }
 
     #[tokio::test]
@@ -3393,8 +3396,8 @@ mod test {
                             "item": {
                                 "id": call_id,
                                 "type": "dynamicToolCall",
-                                "tool": "plan_read",
-                                "arguments": { "plan_id": "plan", "path": "plan.json" },
+                                "tool": "plan_overview_read",
+                                "arguments": { "plan_id": "plan" },
                                 "status": status
                             }
                         }

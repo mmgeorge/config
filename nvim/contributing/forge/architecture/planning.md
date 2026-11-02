@@ -6,19 +6,21 @@ This chapter follows a plan from authoring through acceptance and execution. [Pl
 
 ## Prompts
 
-Three files define what the model is told. `plan/prompts/planning.md` owns the authoring procedure, metadata fields, declaration syntax, and patch examples. `plan/prompts/system.md` defines the stable Harness conventions. `backend/prompt.rs` adds the current permission and interaction purpose for each request. A test applies the patch examples in `planning.md` to real declarations, so keep them valid.
+Three files define what the model is told. `plan/prompts/planning.md` introduces semantic structure and the authoring workflow; the planning tools describe file patch syntax and overview fields. `plan/prompts/system.md` introduces the Harness environment. `backend/prompt.rs` adds the current permission and interaction purpose for each request.
 
 ## Plan documents
 
-`DeclarationDesign` persists baseline text, original source digests, proposed text, and explicit moves in `plans/<session>/<plan>/working.json`. A new plan starts with no captured files. The provider receives the plan identity, version, request, and path inventory, and edits the plan only through three control tools:
+`DeclarationDesign` persists baseline text, original source digests, proposed text, and explicit moves in `plans/<session>/<plan>/working.json`. A new plan starts with no captured files. The provider receives the plan identity, version, request, and path inventory, and edits the plan through separate file and overview tools:
 
 | Tool | Behavior |
 | --- | --- |
-| `plan_read` | Returns one virtual file or its baseline as numbered text, optionally within line bounds. Reading an uncaptured path returns its digest without changing the design. |
-| `design_patch` | Applies Add, Update, Delete, Move, and context chunks atomically. The first edit of a path captures its baseline and digest. Invalid syntax, paths, versions, or context change nothing. |
+| `plan_file_read` | Returns a source file's semantic structure or a complete configuration file as numbered text, optionally within line bounds. Reading an uncaptured path returns its digest without changing the design. |
+| `plan_file_edit` | Applies Add, Update, Delete, Move, and context chunks atomically. The first edit of a path captures its baseline and digest. Invalid syntax, paths, versions, or context change nothing. |
+| `plan_overview_read` | Returns the descriptive overview, shared version, file inventory, and any current execution evidence. |
+| `plan_overview_edit` | Updates supplied overview fields atomically. Omitted fields remain unchanged, arrays replace their previous values, and `usage: null` removes the example. File proposals and check selections are preserved. |
 | `plan_submit` | Validates the complete document and freezes an immutable revision. |
 
-Optional `source_digests` carry read identities across turns, so a patch is rejected if the source changed after the read. Every effective patch increments the version.
+Optional `source_digests` carry read identities across turns, so a patch is rejected if the source changed after the read. File edits and overview edits share one version. Every effective edit increments it; a no-op leaves it unchanged. The model does not edit internal `plan.json` storage through the file tools.
 
 Harness captures nonignored Rust, TypeScript, TSX, Lua, JSON, JSONC, TOML, YAML, and XML files. Language adapters extract declarations with complete signatures, fields, visibility, generics, imports, and documentation, and omit executable bodies. Configuration keeps complete values. Harness owns layout, so agents supply content and nesting. `declaration_line_width` is a preference, never a validation limit.
 
@@ -36,7 +38,7 @@ Function-body references use three sections: `Calls`, `Constructs`, and `Accesse
 
 Adapters add a control call to durable replay only after its provider request succeeds, so a rejected call stays visible as a failed activity without poisoning a later corrected plan. Lifecycle notifications update the rendered activity but never authorize a mutation, because they can arrive before validation. Names printed in prose or command output never count as control calls. Copilot's concurrent SDK handlers share one asynchronously locked runtime and verify turn ownership after acquiring it.
 
-`question_ask` appends session-owned decisions with an explicit optional or required requirement. Optional questions permit continued work; required questions stop execution without changing the workflow phase. Questions retain their originating exchange and optional task ID. If Codex edits a plan but ends without submitting or asking, the backend runs one bounded corrective turn inside the same interaction.
+`question_ask` appends session-owned questions and returns generated IDs immediately by default. With `wait: true`, the tool remains pending and returns the resolved answers. Questions retain their originating exchange and optional task ID. If Codex edits a plan but ends without submitting or asking, the backend runs one bounded corrective turn inside the same interaction.
 
 ## Reference validation
 

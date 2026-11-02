@@ -58,6 +58,12 @@ impl InspectionPage {
         self.file.flush()?;
         let mut length = self.file.get_ref().as_file().metadata()?.len();
         ensure!(offset <= length, "inspection cursor exceeds snapshot");
+        if let Some(log) = &self.log {
+            ensure!(
+                offset == 0 || log.boundaries.contains(&offset),
+                "invalid log page boundary"
+            );
+        }
         if offset == length
             && let Some(log) = &mut self.log
         {
@@ -101,10 +107,15 @@ impl InspectionPage {
         };
         file.seek(SeekFrom::Start(offset))?;
         let mut bytes = Vec::new();
+        let page_bytes = if self.log.is_some() {
+            usize::try_from(end - offset)?
+        } else {
+            PAGE_BYTES
+        };
         file.as_file_mut()
-            .take(u64::try_from(PAGE_BYTES + 4)?.min(end - offset))
+            .take(u64::try_from(page_bytes.saturating_add(4))?.min(end - offset))
             .read_to_end(&mut bytes)?;
-        let mut end = bytes.len().min(PAGE_BYTES);
+        let mut end = bytes.len().min(page_bytes);
         while std::str::from_utf8(&bytes[..end]).is_err() {
             end -= 1;
         }

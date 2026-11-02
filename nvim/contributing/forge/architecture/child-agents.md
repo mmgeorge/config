@@ -31,9 +31,10 @@ The root interaction exposes `harness_config` and seven `harness_session_*` tool
 Inspection uses read-only SQLite connections without migrations or leases. Reading another session requires authorization against its workspace, and that session's saved permissions never authorize the caller. Results go to a private temporary snapshot with opaque continuations, and page budgets bound each delivery, not the total size. Log inspection exposes only allowlisted diagnostic metadata, never prompts, credentials, or private reasoning.
 
 The log reader captures each retained segment's byte length and keeps its open file
-handle. Each request decodes at most `limit` entries, defaulting to 100; continuations
-consume the next batch without scanning the full log first. The existing response
-byte budget may split a batch or a large Unicode record across multiple responses.
+handle. It reads backwards from the current file into older rotations. Each request
+decodes at most `limit` entries, defaulting to 1,000; continuations consume the next
+older batch without scanning the full log first. Each log batch is returned complete,
+including large Unicode records, independently of other inspection tools' byte budget.
 Completed batches retain their boundaries so replaying a cursor returns the same page.
 Concurrent appends stay outside the captured extent, and rotation renames files so
 readers retain their original segments. Cancellation is checked between records;

@@ -35,14 +35,32 @@ impl QuestionId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Derive a question identity from its host-owned operation and position.
+    fn for_operation(operation_id: &str, index: usize) -> Self {
+        Self(format!(
+            "{}:{index}",
+            crate::plan::digest(operation_id.as_bytes())
+        ))
+    }
 }
 
 /// Specify whether unresolved input blocks execution.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum QuestionRequirement {
+    #[default]
     Optional,
     Required,
+}
+
+/// Select whether an answer resumes a waiting tool or enters the input journal.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QuestionDelivery {
+    #[default]
+    Message,
+    ToolResult,
 }
 
 /// Describe a choice independently of its user-visible label.
@@ -60,6 +78,7 @@ pub(crate) struct QuestionOption {
 pub(crate) struct QuestionDraft {
     pub(crate) header: String,
     pub(crate) question: String,
+    #[serde(default)]
     pub(crate) requirement: QuestionRequirement,
     #[serde(default)]
     pub(crate) options: Vec<crate::plan::PlanQuestionOption>,
@@ -132,6 +151,9 @@ pub(crate) struct QuestionRecord {
     pub(crate) task_id: Option<String>,
     pub(crate) phase: Option<crate::task::TaskPhase>,
     pub(crate) requirement: QuestionRequirement,
+    /// Answer destination chosen when the question was created.
+    #[serde(default)]
+    pub(crate) delivery: QuestionDelivery,
     pub(crate) content: QuestionContent,
     pub(crate) previous: Vec<QuestionContent>,
     pub(crate) resolution: QuestionResolution,
@@ -158,6 +180,7 @@ impl QuestionSnapshot {
         self.questions.iter().any(|question| {
             question.exchange_id == exchange_id
                 && question.requirement == QuestionRequirement::Required
+                && question.delivery == QuestionDelivery::Message
         })
     }
 
@@ -223,6 +246,7 @@ pub(crate) enum QuestionOrigin<'task> {
     Chat,
     Task(&'task crate::task::Task),
     Discussion(Option<&'task crate::task::Task>),
+    Tool(Option<&'task crate::task::Task>),
 }
 
 impl QuestionOrigin<'_> {
@@ -231,7 +255,7 @@ impl QuestionOrigin<'_> {
         match self {
             Self::Chat => None,
             Self::Task(task) => Some(task),
-            Self::Discussion(task) => *task,
+            Self::Discussion(task) | Self::Tool(task) => *task,
         }
     }
 }
@@ -239,6 +263,7 @@ impl QuestionOrigin<'_> {
 /// Serialize question changes in their own transaction, without an execution lock.
 pub(crate) struct QuestionController {
     connection: Mutex<Connection>,
+    waiting: Mutex<Vec<QuestionId>>,
     session_id: String,
     pub(crate) changed: tokio::sync::watch::Sender<u64>,
 }
@@ -251,6 +276,7 @@ impl QuestionController {
         connection.execute_batch("CREATE TABLE IF NOT EXISTS session_question_state(session_id TEXT PRIMARY KEY REFERENCES session_record(id) ON DELETE CASCADE,format_version INTEGER NOT NULL,payload TEXT NOT NULL);")?;
         Ok(Self {
             connection: Mutex::new(connection),
+            waiting: Mutex::new(Vec::new()),
             session_id: session_id.into(),
             changed: tokio::sync::watch::channel(0).0,
         })
@@ -336,7 +362,7 @@ impl QuestionController {
         ))
     }
 
-    /// Retire unfinished chat questions while retaining questions from completed work.
+    /// Revoke cancelled chat continuations while keeping optional questions answerable.
     pub(crate) fn cancel_chat(&self, active_exchange: Option<&str>) -> Result<()> {
         self.update(|state| {
             let mut cancelled = std::collections::BTreeSet::new();
@@ -354,7 +380,10 @@ impl QuestionController {
             }
             let mut retired = std::collections::BTreeSet::new();
             for question in &mut state.snapshot.questions {
-                if question.task_id.is_none() && cancelled.contains(&question.exchange_id) {
+                if question.task_id.is_none()
+                    && cancelled.contains(&question.exchange_id)
+                    && question.requirement == QuestionRequirement::Required
+                {
                     retired.insert(question.id.as_str().to_owned());
                     if question.pending() {
                         question.resolution = QuestionResolution::Retired {
@@ -384,6 +413,11 @@ impl QuestionController {
         );
         ensure!(!drafts.is_empty(), "at least one question is required");
         let continues_chat = matches!(origin, QuestionOrigin::Chat);
+        let delivery = if matches!(origin, QuestionOrigin::Tool(_)) {
+            QuestionDelivery::ToolResult
+        } else {
+            QuestionDelivery::Message
+        };
         let task = origin.task();
         let request = serde_json::to_string(&(exchange_id, continues_chat, &drafts))?;
         self.update_guarded(task, |state| {
@@ -407,10 +441,7 @@ impl QuestionController {
             }
             let mut ids = Vec::new();
             for (index, draft) in drafts.into_iter().enumerate() {
-                let id = QuestionId::try_from(format!(
-                    "{}:{index}",
-                    crate::plan::digest(operation_id.as_bytes())
-                ))?;
+                let id = QuestionId::for_operation(operation_id, index);
                 let requirement = draft.requirement;
                 let content = content(draft, 1)?;
                 if continues_chat && requirement == QuestionRequirement::Required {
@@ -426,6 +457,7 @@ impl QuestionController {
                     task_id: task.map(|task| task.id.as_str().into()),
                     phase: task.map(crate::task::Task::phase),
                     requirement,
+                    delivery,
                     content,
                     previous: Vec::new(),
                     resolution: QuestionResolution::Pending,
@@ -435,6 +467,43 @@ impl QuestionController {
             state.operations.insert(operation_id.into(), request);
             Ok(ids)
         })
+    }
+
+    /// Keep the calling tool pending until every question is answered or withdrawn.
+    /// Dropping the future releases its answer destinations so later answers use normal delivery.
+    pub(crate) async fn ask_wait(
+        &self,
+        operation_id: &str,
+        exchange_id: &str,
+        task: Option<&crate::task::Task>,
+        drafts: Vec<QuestionDraft>,
+    ) -> Result<Vec<QuestionRecord>> {
+        let ids = (0..drafts.len())
+            .map(|index| QuestionId::for_operation(operation_id, index))
+            .collect();
+        let mut changed = self.changed.subscribe();
+        let waiting = QuestionWait::new(self, ids)?;
+        self.ask(
+            operation_id,
+            exchange_id,
+            QuestionOrigin::Tool(task),
+            drafts,
+        )?;
+        loop {
+            let questions = self
+                .snapshot()?
+                .questions
+                .into_iter()
+                .filter(|question| waiting.ids.contains(&question.id))
+                .collect::<Vec<_>>();
+            if questions.iter().all(|question| !question.pending()) {
+                return Ok(questions);
+            }
+            changed
+                .changed()
+                .await
+                .context("question controller closed while waiting for answers")?;
+        }
     }
 
     /// Commit an explicit decision or discussion item together with its delivery intent.
@@ -495,8 +564,23 @@ impl QuestionController {
             }
             if let Some((kind, text)) = outbound {
                 question.discussion.push(QuestionMessage { id: message_id.clone(), kind, text: text.clone(), reply_to: None });
-                let instruction = if kind == QuestionMessageKind::Clarification { "This is a read-only question discussion. Explain this question with question_reply, targeting the clarification message ID. Leave the question unanswered. Honor any explicit constraint in the user's text. Do not perform the original work; Harness owns its continuation." } else { "This is a read-only question discussion. Acknowledge this explicit user response. Do not perform the original work or resume a paused task; Harness owns eligible work continuation." };
-                let rendered = format!("Harness question {} revision {}\n{}\nChoices: {}\nUser {:?} (message {}): {}\n{}", question.id.as_str(), question.content.revision, question.content.question, serde_json::to_string(&question.content.options)?, kind, message_id, text, instruction);
+                let waiting = question.delivery == QuestionDelivery::ToolResult
+                    && self.waiting.lock().map_err(|_| anyhow::anyhow!("question wait registry poisoned"))?.contains(&question.id);
+                if waiting && matches!(kind, QuestionMessageKind::Answer | QuestionMessageKind::Correction) {
+                    state.operations.insert(command.operation_id, encoded);
+                    return Ok(state.snapshot.clone());
+                }
+                let rendered = if kind == QuestionMessageKind::Clarification {
+                    format!("Harness question {} revision {}\n{}\nChoices: {}\nUser {:?} (message {}): {}\nThis is a read-only question discussion. Explain this question with question_reply, targeting the clarification message ID. Leave the question unanswered. Honor any explicit constraint in the user's text. Do not perform the original work; Harness owns its continuation.", question.id.as_str(), question.content.revision, question.content.question, serde_json::to_string(&question.content.options)?, kind, message_id, text)
+                } else {
+                    let end = question.content.question.floor_char_boundary(question.content.question.len().min(512));
+                    let replies = serde_json::json!([{
+                        "answer": text,
+                        "question": question.content.question[..end].replace(['\n', '\r'], " "),
+                        "questionItemId": question.id.as_str(),
+                    }]);
+                    format!("<send_user_message_question_reply>\n{replies}\n</send_user_message_question_reply>")
+                };
                 state.outbox.push(QuestionOutbox { id: message_id, question_id: question.id.clone(), task_id: question.task_id.clone(), kind, text: rendered });
             }
             state.operations.insert(command.operation_id, encoded);
@@ -585,6 +669,33 @@ impl QuestionController {
         transaction.commit()?;
         self.changed.send_replace(state.snapshot.revision);
         Ok(result)
+    }
+}
+
+/// Release live answer destinations when a waiting tool completes or is cancelled.
+struct QuestionWait<'controller> {
+    controller: &'controller QuestionController,
+    ids: Vec<QuestionId>,
+}
+
+impl<'controller> QuestionWait<'controller> {
+    /// Register all destinations before publishing questions so fast answers cannot bypass the tool.
+    fn new(controller: &'controller QuestionController, ids: Vec<QuestionId>) -> Result<Self> {
+        controller
+            .waiting
+            .lock()
+            .map_err(|_| anyhow::anyhow!("question wait registry poisoned"))?
+            .extend(ids.iter().cloned());
+        Ok(Self { controller, ids })
+    }
+}
+
+impl Drop for QuestionWait<'_> {
+    /// Restore normal message delivery when no live tool owns these answers.
+    fn drop(&mut self) {
+        if let Ok(mut waiting) = self.controller.waiting.lock() {
+            waiting.retain(|id| !self.ids.contains(id));
+        }
     }
 }
 
@@ -754,6 +865,66 @@ pub(crate) fn project(
 mod tests {
     use super::*;
 
+    /// Keep partial answers inside a waiting call and fall back to messages after cancellation.
+    #[tokio::test]
+    async fn waiting_tools_collect_answers_and_release_cancelled_destinations() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let mut pending = Box::pin(controller.ask_wait(
+            "wait",
+            "exchange",
+            None,
+            vec![
+                draft(QuestionRequirement::Required),
+                draft(QuestionRequirement::Required),
+            ],
+        ));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        let questions = controller.snapshot()?.questions;
+        controller.apply(command(
+            &questions[0].id,
+            "first-answer",
+            QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "Tabs".into(),
+                },
+            },
+        ))?;
+        assert!(controller.outbox()?.is_empty());
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        controller.apply(command(
+            &questions[1].id,
+            "withdraw",
+            QuestionAction::Withdraw {
+                reason: "The first answer settles this too".into(),
+            },
+        ))?;
+        let answers = pending.await?;
+        assert_eq!(answers.len(), 2);
+        assert!(answers.iter().all(|question| !question.pending()));
+        assert!(controller.ready_chat_continuations()?.is_empty());
+        let mut cancelled = Box::pin(controller.ask_wait(
+            "cancelled",
+            "exchange",
+            None,
+            vec![draft(QuestionRequirement::Required)],
+        ));
+        assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+        let id = controller.snapshot()?.questions[2].id.clone();
+        drop(cancelled);
+        controller.apply(command(
+            &id,
+            "late-answer",
+            QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "Sidebar".into(),
+                },
+            },
+        ))?;
+        assert_eq!(controller.outbox()?.len(), 1);
+        Ok(())
+    }
+
     fn draft(requirement: QuestionRequirement) -> QuestionDraft {
         QuestionDraft {
             header: "Layout".into(),
@@ -834,12 +1005,13 @@ mod tests {
         Ok(())
     }
 
+    /// Preserve optional answers after cancellation without reviving the original work.
     #[test]
-    fn cancelled_chat_retires_questions_and_revokes_queued_continuation() -> Result<()> {
+    fn cancelled_chat_keeps_optional_questions_and_revokes_queued_continuation() -> Result<()> {
         for admitted in [false, true] {
             let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
             let controller = QuestionController::open(root.path(), "session")?;
-            controller.ask(
+            let ids = controller.ask(
                 "cancelled",
                 "request",
                 QuestionOrigin::Chat,
@@ -856,30 +1028,45 @@ mod tests {
             let restored = QuestionController::open(root.path(), "session")?;
             assert!(!restored.chat_continuation_is_current("request")?);
             assert!(restored.ready_chat_continuations()?.is_empty());
-            assert!(
-                restored
-                    .snapshot()?
-                    .questions
-                    .iter()
-                    .all(|question| matches!(
-                        question.resolution,
-                        QuestionResolution::Retired { .. }
-                    ))
-            );
-            restored.ask(
+            let snapshot = restored.snapshot()?;
+            assert!(matches!(
+                snapshot.questions[0].resolution,
+                QuestionResolution::Retired { .. }
+            ));
+            assert!(snapshot.questions[1].pending());
+            assert!(!snapshot.required_pending());
+            restored.apply(command(
+                &ids[1],
+                "answer-after-cancellation",
+                QuestionAction::Answer {
+                    answer: QuestionAnswer::Other {
+                        text: "Use tabs".into(),
+                    },
+                },
+            ))?;
+            assert_eq!(restored.outbox()?.len(), 1);
+            restored.admitted("answer-after-cancellation")?;
+            assert!(restored.ready_chat_continuations()?.is_empty());
+            assert!(!restored.chat_continuation_is_current("request")?);
+            let active_ids = restored.ask(
                 "active-optional",
                 "active",
                 QuestionOrigin::Chat,
                 vec![draft(QuestionRequirement::Optional)],
             )?;
             restored.cancel_chat(Some("active"))?;
-            assert!(
-                restored
-                    .snapshot()?
-                    .questions
-                    .iter()
-                    .all(|question| !question.pending())
-            );
+            assert!(restored.snapshot()?.questions[2].pending());
+            restored.apply(command(
+                &active_ids[0],
+                "withdraw-after-cancellation",
+                QuestionAction::Withdraw {
+                    reason: "The cancelled work no longer needs this decision".into(),
+                },
+            ))?;
+            assert!(matches!(
+                restored.snapshot()?.questions[2].resolution,
+                QuestionResolution::Withdrawn { .. }
+            ));
         }
         Ok(())
     }
@@ -1083,13 +1270,26 @@ mod tests {
             "answer",
             QuestionAction::Answer {
                 answer: QuestionAnswer::Other {
-                    text: "Tabs".into(),
+                    text: "Tabs \"wide\"\nwith details".into(),
                 },
             },
         );
         first.apply(answer.clone())?;
         second.apply(answer)?;
         assert_eq!(second.outbox()?.len(), 1);
+        let delivered = &second.outbox()?[0].text;
+        let payload = delivered
+            .strip_prefix("<send_user_message_question_reply>\n")
+            .and_then(|text| text.strip_suffix("\n</send_user_message_question_reply>"))
+            .context("answer must use the native Codex envelope without extra instructions")?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(payload)?,
+            serde_json::json!([{
+                "answer": "Tabs \"wide\"\nwith details",
+                "question": "Which layout?",
+                "questionItemId": id.as_str(),
+            }])
+        );
         first.admitted("answer")?;
         assert!(second.outbox()?.is_empty());
         assert!(matches!(
@@ -1104,6 +1304,19 @@ mod tests {
             },
         ))?;
         assert_eq!(second.snapshot()?.questions[0].discussion.len(), 2);
+        let delivered = &second.outbox()?[0].text;
+        let payload = delivered
+            .strip_prefix("<send_user_message_question_reply>\n")
+            .and_then(|text| text.strip_suffix("\n</send_user_message_question_reply>"))
+            .context("correction must use the native Codex envelope without extra instructions")?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(payload)?,
+            serde_json::json!([{
+                "answer": "Use a sidebar instead",
+                "question": "Which layout?",
+                "questionItemId": id.as_str(),
+            }])
+        );
         assert!(matches!(
             second.snapshot()?.questions[0].resolution,
             QuestionResolution::Answered { .. }

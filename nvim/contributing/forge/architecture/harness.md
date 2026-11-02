@@ -67,6 +67,16 @@ separate presentation concern, and other buffers retain Blink's default sorting.
 
 Accepted input must survive a closed window or a crash without ever being sent twice. `SessionCoordinator` owns accepted messages through `SessionInputQueue`, and the `session.input.*` methods work without the provider execution lock. Ctrl-S sends input that steers an active turn as soon as the provider allows, and Ctrl-Q queues an explicit follow-up. Each group stays in FIFO order. Steering never bypasses uncertain delivery, pending configuration, or a pause.
 
+An active `SteeringLane` accepts consecutive steering messages in FIFO order
+without waiting for earlier provider acknowledgments. The input worker holds an
+ordering permit through attachment preparation and queue handoff, then releases
+it while retaining each message's independent delivery receipt. The number of
+workers is bounded by the steering lane capacity. Adapters without a queue
+handoff signal retain the permit until their steering call completes.
+`SteeringFlight` distinguishes these live workers from abandoned `Sending`
+records: overlapping live sends are permitted, but an unacknowledged send whose
+worker has ended continues to block further dispatch and cannot be replayed.
+
 Ctrl-Q retains `/model` arguments as configuration on the queued entry, including
 configuration-only entries with empty prompt text. Lua reconstructs the command
 for queue display and editing. Rust applies the configuration only when that entry
@@ -154,18 +164,30 @@ remains owned by the submission journal. A crash before transfer repeats admissi
 a crash after admission reuses its receipt. Unknown provider delivery requires
 reconciliation and never authorizes blind replay.
 
-Optional questions do not gate tasks. Required questions stop active provider work
-through the shared cleanup boundary and block automatic input and checks. Answers
-and clarification can run discussion-only turns with writes disabled; task
-continuation waits for required resolution and outstanding answer delivery.
+The question tools own their usage guidance; general prompts do not duplicate it.
+`question_ask` defaults to returning Harness-generated question IDs immediately,
+while answers arrive through normal user-input delivery. With `wait: true`, it
+keeps the tool call pending until every requested question is answered or withdrawn.
+These questions appear as required, but do not trigger provider cleanup or a second
+chat continuation. The tool returns their resolved records, without also sending
+the answers through the input journal. Its live registration ends on completion or
+cancellation; a later answer without a waiting tool uses ordinary message delivery.
+The model supplies neither question IDs nor mutation operation IDs. Existing IDs
+and revisions select questions for replies, revisions, and withdrawals.
+
+Legacy required questions stop active provider work through the shared cleanup
+boundary and block automatic input and checks. Answers and clarification can run
+discussion-only turns with writes disabled; task continuation waits for required
+resolution and outstanding answer delivery.
 Exchange completion retains questions. Task cancellation/replacement retires its
 pending questions, and late answers cannot target the replacement task.
 
-A required question in plain chat retains one continuation for its original
+A legacy required question in plain chat retains one continuation for its original
 exchange. Once required decisions resolve, the input worker admits user responses
 first and then queues that continuation through the same journal. It cannot steer
 into a read-only discussion turn or replay after acknowledgment. An optional
 answer never creates a continuation for completed work. Each idle question delivery
 admits a new discussion exchange instead of reopening the completed source exchange.
-Cancellation revokes unfinished chat continuations and retires their pending
-questions; optional questions from normally completed work remain answerable.
+Cancellation revokes unfinished chat continuations and retires their required
+questions. Optional chat questions remain answerable after cancellation or normal
+completion; late answers enter discussion without resuming the original work.

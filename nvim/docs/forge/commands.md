@@ -27,11 +27,11 @@ history tools. Configuration inspection and the `harness-sessions` skill remain
 available when history is off. Session-specific reads default to the current
 session. Unfiltered listing/search considers all accessible sessions.
 
-`harness_session_log` reads at most 100 entries per page by default. Its optional
-positive integer `limit` selects another page size. Follow `next_cursor` with the
-same arguments to continue chronologically through the captured log; the reader
-excludes later appends. Large entries can span response fragments without losing
-content. The first request reads only its batch, not the entire retained log.
+`harness_session_log` reads newest-first and returns up to 1,000 complete entries
+per page by default. Its optional positive integer `limit` selects another page
+size. Follow `next_cursor` with the same arguments to read older records; the
+reader excludes later appends. The response byte budget does not split log pages
+or large entries. The first request reads only its batch, not the entire retained log.
 
 ## Git review
 
@@ -412,6 +412,9 @@ Explicit steering sends the current composer text to the active response while
 preserving queued follow-ups. If the active turn ends before dispatch, the message
 keeps its priority for the next eligible interaction. Harness never automatically
 resends a message whose delivery is unconfirmed.
+Consecutive messages sent to an active steering queue are handed off in order
+without waiting for earlier acknowledgments. Each keeps its own delivery status;
+explicitly queued follow-ups still wait for the active work to finish.
 `Ctrl-C` only interrupts active work. It never submits or steers the composer,
 including while editing a queued message. Drafts and queued follow-ups remain
 unsent while the task is paused. With a child timeline selected, it interrupts
@@ -531,12 +534,18 @@ Automatic plan acceptance belongs to the active task and is controlled only by
 `/plan accept on/off`; it has no global configuration setting.
 New sessions start in Ask. Plan → Execute retains the current session and its
 tool-approval mode unless plan acceptance explicitly selects a different mode.
-Questions have no timeout. Optional questions remain available while work continues;
-questions marked **Required** pause work until answered or withdrawn. Open them with
+Questions have no timeout. By default, the agent receives question IDs immediately
+and can keep working while you answer. For an important decision that blocks
+progress, the agent can request `wait: true`; the question appears as **Required**
+and its tool call waits for the answers. Open questions with
 `oe` or `/questions`; Tab and Shift-Tab switch questions. Enter submits one answer
 immediately, and **Ask…** requests clarification without answering. Closing the
-picker retains pending questions and drafts. Questions survive completed exchanges;
-`H` in the picker includes answered history and allows explicit corrections.
+picker retains pending questions and drafts. Pending questions branch beneath the
+status text, with previews capped at two display lines and the answer hotkey beside
+interrupt. The picker retains the full text. Optional questions remain answerable
+after work finishes or chat execution is cancelled; late answers do not restart the
+cancelled work. The agent can retract a pending question with `question_withdraw`
+and a reason. `H` in the picker includes answered history and allows explicit corrections.
 **Tools** contains toggles for Subagents, LSP, and Session history.
 Both timeout settings show one value, such as `10m`. Enter opens an
 inline editor: Up/Down adjust the duration, Enter saves, and Esc cancels. Values

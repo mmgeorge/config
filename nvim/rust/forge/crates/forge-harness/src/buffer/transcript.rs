@@ -985,7 +985,7 @@ mod test {
 
     #[test]
     fn long_json_response_starts_beside_branch_in_preview_and_expansion() -> Result<()> {
-        let response = r#"{"ok":false,"tool":"plan_read","phase":"semantic_execution","code":"semantic_execution_failed","message":"plan controls require Harness Plan mode"}"#;
+        let response = r#"{"ok":false,"tool":"plan_file_read","phase":"semantic_execution","code":"semantic_execution_failed","message":"plan controls require Harness Plan mode"}"#;
         for columns in [40, 70, 120] {
             let profile = WidthProfile {
                 columns,
@@ -1000,7 +1000,7 @@ mod test {
                         kind: "tool_call",
                         elapsed_ms: Some(2000),
                         failed: true,
-                        title: "plan_read",
+                        title: "plan_file_read",
                         expanded,
                     },
                     &ToolOutputPreview {
