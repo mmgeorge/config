@@ -35,6 +35,7 @@ async fn isolated_commit_generation_uses_existing_login_without_starting_shared_
         provider
             .active_session_id_for(&request.harness_session_id)
             .await
+            .unwrap()
             .is_none()
     );
     provider.shutdown().await.unwrap();
@@ -115,6 +116,7 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
     let session_id = provider
         .active_session_id_for(&request.harness_session_id)
         .await
+        .unwrap()
         .unwrap();
     let server = provider.mcp_list(request.clone()).await.unwrap();
     assert_eq!(
@@ -129,7 +131,9 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
         provider
             .active_session_id_for(&request.harness_session_id)
             .await
-            .as_deref(),
+            .unwrap()
+            .as_ref()
+            .map(|id| id.as_str()),
         Some(session_id.as_str())
     );
     let terminals = tokio::time::timeout(

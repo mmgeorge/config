@@ -53,7 +53,8 @@ async fn goal_command_aliases_preserve_held_provider_and_idempotent_receipts() -
         let registry = service.registry().await?;
         let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
-        let control = controller.provider.mock_response_control().unwrap();
+        let mock_provider = controller.provider_handle();
+        let control = mock_provider.mock_response_control().unwrap();
         let hold = control
             .dispatch(
                 &session_id,
@@ -230,7 +231,8 @@ async fn goal_continue_aliases_reuse_the_completed_source_and_receipt() -> Resul
             ))),
             1,
         )?;
-        let control = controller.provider.mock_response_control().unwrap();
+        let mock_provider = controller.provider_handle();
+        let control = mock_provider.mock_response_control().unwrap();
         let hold = control
             .dispatch(
                 &session_id,
@@ -313,8 +315,8 @@ async fn goal_continue_aliases_reuse_the_completed_source_and_receipt() -> Resul
 
 #[tokio::test]
 async fn queued_input_edited_to_goal_is_a_state_command_with_one_receipt() -> Result<()> {
-    use crate::provider::mock_response::MockResponseCommand;
     use crate::input::{InputAction, InputEdit, InputIntent, InputMessage, InputOperation};
+    use crate::provider::mock_response::MockResponseCommand;
     let fixture = tempfile::tempdir()?;
     crate::checks::configure_fixture(fixture.path());
     let service = service();
@@ -324,7 +326,8 @@ async fn queued_input_edited_to_goal_is_a_state_command_with_one_receipt() -> Re
     let registry = service.registry().await?;
     let session_id = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session_id).await?;
-    let control = controller.provider.mock_response_control().unwrap();
+    let mock_provider = controller.provider_handle();
+    let control = mock_provider.mock_response_control().unwrap();
     let hold = control
         .dispatch(
             &session_id,
@@ -566,8 +569,8 @@ async fn queued_input_edited_to_goal_is_a_state_command_with_one_receipt() -> Re
 
 #[tokio::test]
 async fn plan_replacement_waits_for_turn_boundary_without_cancelling() -> Result<()> {
-    use crate::provider::mock_response::MockResponseCommand;
     use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
+    use crate::provider::mock_response::MockResponseCommand;
     for planning in [false, true] {
         let fixture = tempfile::tempdir()?;
         crate::checks::configure_fixture(fixture.path());
@@ -578,7 +581,8 @@ async fn plan_replacement_waits_for_turn_boundary_without_cancelling() -> Result
         let registry = service.registry().await?;
         let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
-        let control = controller.provider.mock_response_control().unwrap();
+        let mock_provider = controller.provider_handle();
+        let control = mock_provider.mock_response_control().unwrap();
         let held = control
             .dispatch(
                 &session_id,
@@ -722,7 +726,8 @@ async fn goal_continuation_uses_durable_input_and_yields_to_user_queue() -> Resu
         let registry = service.registry().await?;
         let session_id = registry.initial_session_id().to_owned();
         let controller = registry.resolve(&session_id).await?;
-        let control = controller.provider.mock_response_control().unwrap();
+        let mock_provider = controller.provider_handle();
+        let control = mock_provider.mock_response_control().unwrap();
         let held = control
             .dispatch(
                 &session_id,
@@ -871,7 +876,8 @@ async fn task_recovery_keeps_one_unsent_continuation() -> Result<()> {
             &sink,
         )
         .await?;
-    let control = controller.provider.mock_response_control().unwrap();
+    let mock_provider = controller.provider_handle();
+    let control = mock_provider.mock_response_control().unwrap();
     let held = control
         .dispatch(
             &session_id,
@@ -976,11 +982,22 @@ async fn task_recovery_keeps_one_unsent_continuation() -> Result<()> {
     controller.attach_input(&sink).await?;
     tokio::task::yield_now().await;
     let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
-    assert_eq!(store.list_exchange(&session_id)?.len(), 1, "restart dispatched without explicit resume");
-    recovered_service.dispatch(Some(session_id.clone()), Request {
-        id: 5, method: "session.command.apply".into(),
-        params: json!({"operation_id":"explicit-recovery-resume","action":"resume"}),
-    }, &sink).await?;
+    assert_eq!(
+        store.list_exchange(&session_id)?.len(),
+        1,
+        "restart dispatched without explicit resume"
+    );
+    recovered_service
+        .dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 5,
+                method: "session.command.apply".into(),
+                params: json!({"operation_id":"explicit-recovery-resume","action":"resume"}),
+            },
+            &sink,
+        )
+        .await?;
     let resumed = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if controller.task_controller.current()?.is_some_and(|task| {
@@ -1012,7 +1029,10 @@ async fn task_recovery_keeps_one_unsent_continuation() -> Result<()> {
         exchanges.last().unwrap().origin,
         crate::exchange::ExchangeOrigin::TaskContinuation { .. }
     ));
-    assert_eq!(exchanges.last().unwrap().prompt, pending.work.instruction().unwrap());
+    assert_eq!(
+        exchanges.last().unwrap().prompt,
+        pending.work.instruction().unwrap()
+    );
     recovered_service.shutdown(Duration::from_secs(2)).await?;
     drop(sink);
     tokio::time::timeout(Duration::from_secs(2), reader).await???;
@@ -1021,8 +1041,8 @@ async fn task_recovery_keeps_one_unsent_continuation() -> Result<()> {
 
 #[tokio::test]
 async fn running_goal_promotion_steers_without_cancelling() -> Result<()> {
-    use crate::provider::mock_response::MockResponseCommand;
     use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
+    use crate::provider::mock_response::MockResponseCommand;
     let fixture = tempfile::tempdir()?;
     let service = service();
     service
@@ -1031,7 +1051,8 @@ async fn running_goal_promotion_steers_without_cancelling() -> Result<()> {
     let registry = service.registry().await?;
     let session_id = registry.initial_session_id().to_owned();
     let controller = registry.resolve(&session_id).await?;
-    let control = controller.provider.mock_response_control().unwrap();
+    let mock_provider = controller.provider_handle();
+    let control = mock_provider.mock_response_control().unwrap();
     let held = control
         .dispatch(
             &session_id,
@@ -1317,7 +1338,8 @@ async fn plan_accept_policy_controls_initial_submission() -> Result<()> {
             Ok::<(), anyhow::Error>(())
         });
         controller.attach_input(&sink).await?;
-        let control = controller.provider.mock_response_control().unwrap();
+        let mock_provider = controller.provider_handle();
+        let control = mock_provider.mock_response_control().unwrap();
         let hold = control
             .dispatch(
                 &session_id,
@@ -1350,7 +1372,10 @@ async fn plan_accept_policy_controls_initial_submission() -> Result<()> {
         )
         .await??;
         let before = controller.task_controller.current()?.unwrap();
-        assert!(!before.auto_accept_plan, "new Plan tasks must require review");
+        assert!(
+            !before.auto_accept_plan,
+            "new Plan tasks must require review"
+        );
         for selected in match policy {
             "on" => vec![true],
             "off" => vec![true, false],
@@ -1391,9 +1416,17 @@ async fn plan_accept_policy_controls_initial_submission() -> Result<()> {
             .await??;
             let task = controller.task_controller.current()?.unwrap();
             assert!(task.auto_accept_plan);
-            assert_eq!(task.id, before.id, "Plan acceptance replaced the durable task");
-            let crate::task::WorkflowSnapshot::Execute { execution } = &task.workflow else { unreachable!() };
-            assert_eq!(execution.continuation.turn_count, 1, "Plan acceptance lost its completed model turn");
+            assert_eq!(
+                task.id, before.id,
+                "Plan acceptance replaced the durable task"
+            );
+            let crate::task::WorkflowSnapshot::Execute { execution } = &task.workflow else {
+                unreachable!()
+            };
+            assert_eq!(
+                execution.continuation.turn_count, 1,
+                "Plan acceptance lost its completed model turn"
+            );
             assert!(matches!(
                 task.workflow.clone(),
                 crate::task::WorkflowSnapshot::Execute { .. }
@@ -1468,7 +1501,8 @@ async fn accepted_inline_feedback_revises_before_execution_without_changing_poli
         } else {
             json!([{"start_line":line,"end_line":line,"body":feedback}])
         };
-        let control = controller.provider.mock_response_control().unwrap();
+        let mock_provider = controller.provider_handle();
+        let control = mock_provider.mock_response_control().unwrap();
         let hold = control
             .dispatch(
                 &session_id,
@@ -1661,7 +1695,8 @@ async fn execute_promotion_queues_without_cancelling_and_clear_rejects_receipt()
                 &sink,
             )
             .await?;
-        let control = controller.provider.mock_response_control().unwrap();
+        let mock_provider = controller.provider_handle();
+        let control = mock_provider.mock_response_control().unwrap();
         let held = control
             .dispatch(
                 &session_id,
@@ -1687,10 +1722,17 @@ async fn execute_promotion_queues_without_cancelling_and_clear_rejects_receipt()
                 &sink,
             )
             .await?;
-        service.dispatch(Some(session_id.clone()), Request {
-            id: 99, method: "session.command.apply".into(),
-            params: json!({"operation_id":"resume-fixture-input", "action":"resume"}),
-        }, &sink).await?;
+        service
+            .dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 99,
+                    method: "session.command.apply".into(),
+                    params: json!({"operation_id":"resume-fixture-input", "action":"resume"}),
+                },
+                &sink,
+            )
+            .await?;
         tokio::time::timeout(
             Duration::from_secs(5),
             control.dispatch(
@@ -1879,7 +1921,8 @@ async fn saved_plan_actions_preserve_held_provider_and_reject_foreign_artifacts(
                 &sink,
             )
             .await?;
-        let control = controller.provider.mock_response_control().unwrap();
+        let mock_provider = controller.provider_handle();
+        let control = mock_provider.mock_response_control().unwrap();
         let held = control
             .dispatch(
                 &session_id,
@@ -1896,10 +1939,17 @@ async fn saved_plan_actions_preserve_held_provider_and_reject_foreign_artifacts(
                 "id":"held-plan-action-chat","text":"Inspect current workspace","intent":"auto",
                 "attachments":[],"config":null,"reservation":null,"submission_id":null,"error":null}}}),
         }, RuntimeMethod::SessionInputApply, &sink).await?;
-        service.dispatch(Some(session_id.clone()), Request {
-            id: 99, method: "session.command.apply".into(),
-            params: json!({"operation_id":"resume-fixture-input", "action":"resume"}),
-        }, &sink).await?;
+        service
+            .dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 99,
+                    method: "session.command.apply".into(),
+                    params: json!({"operation_id":"resume-fixture-input", "action":"resume"}),
+                },
+                &sink,
+            )
+            .await?;
         tokio::time::timeout(
             Duration::from_secs(5),
             control.dispatch(
@@ -2099,7 +2149,12 @@ async fn checking_continuation_returns_to_verify_without_provider_exchange() -> 
         &task.entry.as_ref().unwrap().id,
         101,
     )?;
-    controller.broker.lock().await.ensure_execution_baseline().await?;
+    controller
+        .broker
+        .lock()
+        .await
+        .ensure_execution_baseline()
+        .await?;
     controller
         .task_controller
         .update(&mut store, &task.permit(), 102, |task| {
@@ -2133,7 +2188,37 @@ async fn checking_continuation_returns_to_verify_without_provider_exchange() -> 
             .work,
         crate::task::TaskWork::Checks
     );
-    controller.broker.lock().await.run_task_checks().await?;
+    let (mut checking, scan) = controller.broker.lock().await.begin_owned_task_checks()?;
+    let scanned = scan.run().await?;
+    let run = controller
+        .broker
+        .lock()
+        .await
+        .prepare_owned_task_check_run(&mut checking, scanned)?;
+    let checked = run.run().await?;
+    let post = controller
+        .broker
+        .lock()
+        .await
+        .prepare_task_check_postscan(&checking)?;
+    let scanned = post.run().await?;
+    let mut finish = controller
+        .broker
+        .lock()
+        .await
+        .prepare_task_check_finalization(checking, checked, scanned)?;
+    let report = finish.capture_report().await?;
+    let delivery = controller
+        .broker
+        .lock()
+        .await
+        .commit_task_check_finalization(finish, report)?;
+    let (_, acknowledgment) = delivery.run().await?;
+    controller
+        .broker
+        .lock()
+        .await
+        .acknowledge_owned_task_check(acknowledgment)?;
     let after = controller.task_controller.current()?.unwrap();
     assert!(
         matches!(&after.workflow, crate::task::WorkflowSnapshot::Execute { execution }
@@ -2292,6 +2377,7 @@ async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Resul
 
 /// Hold native acknowledgments so service task changes can overtake transport completion.
 struct ControlledGoalTransport {
+    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
     request: tokio::sync::mpsc::UnboundedSender<(
         crate::provider::NativeGoalUpdate,
         tokio::sync::oneshot::Sender<()>,
@@ -2315,14 +2401,34 @@ impl crate::provider::ProviderAdapter for ControlledGoalTransport {
             capability,
         }
     }
-    /// Reject unrelated execution in the goal transport fixture.
-    async fn prompt_stream(
+    /// Transfer the goal fixture's owned observation stream to its execution engine.
+    async fn session_events(
         &self,
-        _: crate::provider::ProviderRequest,
-        _: crate::provider::ProviderEventSink,
-    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-        Err(anyhow::anyhow!("goal fixture does not execute prompts").into())
+        owner: crate::provider::ExecutionOwner,
+    ) -> std::result::Result<
+        crate::provider::events::ProviderEventStream,
+        crate::provider::ProviderError,
+    > {
+        let stream = self.fixture_events.subscribe(owner.clone())?;
+        Ok(stream)
     }
+
+    async fn session_prompt(
+        self: std::sync::Arc<Self>,
+        request: crate::provider::ProviderRequest,
+        scope: crate::provider::InvocationScope,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let events = self.fixture_events.clone();
+        events
+            .submit(
+                request,
+                scope,
+                crate::provider::TerminalBoundary::LocalFixture,
+                move |request, sink| async move { self.run_native(request, sink).await },
+            )
+            .await
+    }
+
     /// Report the fixture's idle turn lane.
     async fn has_active_turn(&self, _: &str) -> bool {
         false
@@ -2332,8 +2438,11 @@ impl crate::provider::ProviderAdapter for ControlledGoalTransport {
         Ok(())
     }
     /// Identify the native conversation retained by the fixture.
-    async fn active_session_id_for(&self, _: &str) -> Option<String> {
-        Some("native-thread".into())
+    async fn active_session_id_for(
+        &self,
+        _: &str,
+    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+        Ok(Some("native-thread".to_owned().try_into()?))
     }
     /// Delay a native write acknowledgment until the test releases its transport barrier.
     async fn goal_status(
@@ -2352,6 +2461,16 @@ impl crate::provider::ProviderAdapter for ControlledGoalTransport {
     }
 }
 
+impl ControlledGoalTransport {
+    async fn run_native(
+        &self,
+        _: crate::provider::ProviderRequest,
+        _: crate::provider::ProviderEventSink,
+    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
+        Err(anyhow::anyhow!("goal fixture does not execute prompts").into())
+    }
+}
+
 /// Prevent cancellation from clearing a paused native goal and repair superseded acknowledgments.
 #[tokio::test]
 async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -> Result<()> {
@@ -2359,11 +2478,12 @@ async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -
     use crate::task::{Task, TaskChange, WorkflowSnapshot};
     let fixture = tempfile::tempdir()?;
     let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
-    let mut controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker)?;
     let (request, mut received) = tokio::sync::mpsc::unbounded_channel();
-    Arc::get_mut(&mut controller)
-        .context("fixture controller is uniquely owned")?
-        .provider = Arc::new(ControlledGoalTransport { request });
+    *controller.provider.write().unwrap() = Arc::new(ControlledGoalTransport {
+        fixture_events: Default::default(),
+        request,
+    });
     let (sink, _output) = forge_protocol::outbound::channel();
     controller.start_provider(&sink).await;
     while !controller.provider_ready().await {

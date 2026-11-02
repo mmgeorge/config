@@ -18,6 +18,7 @@ pub struct AgentToolScope {
     expired: watch::Sender<bool>,
     invocation: AtomicU64,
     identity: String,
+    task: std::sync::RwLock<Option<crate::tools::TaskAuthority>>,
 }
 
 /// Revokes a provider turn's authority even when its prompt future is cancelled.
@@ -51,6 +52,7 @@ impl AgentToolScope {
             expired,
             invocation: AtomicU64::new(0),
             identity: uuid::Uuid::new_v4().to_string(),
+            task: std::sync::RwLock::new(None),
         });
         Ok((scope.clone(), AgentToolLease(scope)))
     }
@@ -59,11 +61,30 @@ impl AgentToolScope {
         self.owner.is_root() && !*self.expired.borrow() && self.coordinator.enabled()
     }
 
+    pub(crate) fn bind_task_authority(
+        &self,
+        authority: Option<crate::tools::TaskAuthority>,
+    ) -> Result<()> {
+        *self
+            .task
+            .write()
+            .map_err(|_| anyhow::anyhow!("agent authority lock poisoned"))? = authority;
+        Ok(())
+    }
+
     pub fn profile_schema(&self) -> Option<Value> {
         self.coordinator.profile_schema()
     }
 
     pub async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {
+        if let Some(authority) = self
+            .task
+            .read()
+            .map_err(|_| anyhow::anyhow!("agent authority lock poisoned"))?
+            .as_ref()
+        {
+            authority.validate_scope()?;
+        }
         ensure!(
             self.available(),
             "agent tools require an enabled authenticated active root turn"
@@ -132,6 +153,14 @@ impl AgentToolScope {
     }
 
     async fn request(&self, operation: AgentOperation) -> Result<Value> {
+        let task = self
+            .task
+            .read()
+            .map_err(|_| anyhow::anyhow!("agent authority lock poisoned"))?
+            .clone();
+        if let Some(authority) = &task {
+            authority.validate_scope()?;
+        }
         let operation_id = format!(
             "{}:{}",
             self.identity,
@@ -143,7 +172,7 @@ impl AgentToolScope {
             biased;
             _ = expired.changed() => anyhow::bail!("agent tool context expired"),
             response = sender.request_authenticated(AgentRequest {operation_id,source:AgentSource::Model,operation},
-                super::coordinator::AgentRequestAuthority {owner:self.owner.clone(),parent_exchange_id:self.parent_exchange_id.clone(),expired:self.expired.subscribe()}) => response,
+                super::coordinator::AgentRequestAuthority {owner:self.owner.clone(),parent_exchange_id:self.parent_exchange_id.clone(),expired:self.expired.subscribe(),task}) => response,
         }
     }
 }
@@ -152,6 +181,37 @@ impl AgentToolScope {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn replaced_task_cannot_enqueue_retained_agent_callback() -> Result<()> {
+        let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+        let task = controller.current()?.unwrap();
+        let mut context =
+            crate::tools::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        context.bind_test_task_controller(controller.clone());
+        let coordinator = AgentCoordinator::new("session".into());
+        coordinator.set_enabled(true);
+        let (scope, _lease) = AgentToolScope::new(
+            ExecutionOwner::root("session"),
+            "parent".into(),
+            coordinator.clone(),
+        )?;
+        scope.bind_task_authority(crate::tools::TaskAuthority::capture(&context))?;
+        controller.change(
+            &mut store,
+            Some(&task.revision),
+            crate::task::TaskChange::Clear,
+            2,
+        )?;
+        assert!(
+            scope
+                .invoke("agent_spawn", json!({"text":"stale work"}))
+                .await
+                .is_err()
+        );
+        assert!(coordinator.try_receive().is_none());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn tool_authority_rejects_children_foreign_roots_disabled_and_expired_turns() {

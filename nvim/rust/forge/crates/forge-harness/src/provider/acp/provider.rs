@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 
 /// Owns ACP root-session processes and adapts provider-specific configuration.
 pub(crate) struct AcpProvider {
+    session_events: Arc<crate::provider::session_events::SessionEvents>,
     kind: ProviderKind,
     runtime: AcpRuntime,
     permission: Arc<PermissionCoordinator>,
@@ -35,8 +36,14 @@ struct AcpSession {
     permission: Arc<AcpPermissionContext>,
     _control: ControlServer,
     control: Arc<ControlSession>,
-    turn: Mutex<()>,
+    turn: Mutex<PromptEvidence>,
     _profile: Option<ResourceProfile>,
+}
+
+/// Retain validated native terminal evidence under the same lock as its prompt worker.
+enum PromptEvidence {
+    Unavailable,
+    Validated,
 }
 
 impl AcpProvider {
@@ -50,6 +57,7 @@ impl AcpProvider {
         ensure!(!command.is_empty(), "ACP command is required");
         let runtime = AcpRuntime::new(kind, command, &settings_root);
         Ok(Self {
+            session_events: Default::default(),
             kind,
             runtime,
             permission,
@@ -106,7 +114,7 @@ impl AcpProvider {
                 !session.native.state().has_active_work().await,
                 "Tool profile changes require active execution cleanup"
             );
-            request.provider_session_id = Some(session.native.id().to_owned());
+            request.provider_session_id = Some(session.native.id().to_owned().try_into()?);
             session.native.shutdown().await?;
             self.session.lock().await.remove(&runtime_key);
         }
@@ -116,7 +124,9 @@ impl AcpProvider {
                 .lock()
                 .await
                 .get(&request.runtime_key()?)
-                .cloned();
+                .cloned()
+                .map(TryInto::try_into)
+                .transpose()?;
         }
         let has_history = request.provider_session_id.is_some();
         let permission = Arc::new(AcpPermissionContext::new(self.permission.clone()));
@@ -203,7 +213,7 @@ impl AcpProvider {
             ConversationOptions {
                 kind: self.kind,
                 workspace: request.workspace.clone(),
-                session_id: request.provider_session_id,
+                session_id: request.provider_session_id.map(Into::into),
                 control_url: control.url.clone(),
                 mcp_servers: resources.acp()?,
                 resources: resources.mcp.clone(),
@@ -220,7 +230,7 @@ impl AcpProvider {
             permission,
             _control: control,
             control: controls,
-            turn: Mutex::new(()),
+            turn: Mutex::new(PromptEvidence::Unavailable),
             _profile: Some(profile),
         });
         if has_history {
@@ -451,16 +461,28 @@ impl crate::provider::ProviderAdapter for AcpProvider {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        for session in self
+        let mut failure = self
+            .session_events
+            .shutdown()
+            .await
+            .err()
+            .map(anyhow::Error::from);
+        let sessions: Vec<_> = self
             .session
             .lock()
             .await
             .drain()
             .map(|(_, session)| session)
-        {
-            session.native.shutdown().await?;
+            .collect();
+        for session in sessions {
+            if let Err(error) = session.native.shutdown().await {
+                failure.get_or_insert(error.into());
+            }
         }
-        Ok(())
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     async fn skill_list(&self, request: ProviderCatalogRequest) -> Result<Vec<SkillDefinition>> {
@@ -583,7 +605,378 @@ impl crate::provider::ProviderAdapter for AcpProvider {
         Ok(definition)
     }
 
-    async fn prompt_stream(
+    async fn session_events(
+        &self,
+        owner: crate::provider::ExecutionOwner,
+    ) -> Result<crate::provider::events::ProviderEventStream, crate::provider::ProviderError> {
+        self.session_events.subscribe(owner)
+    }
+
+    async fn session_steer(
+        self: std::sync::Arc<Self>,
+        owner: &crate::provider::ExecutionOwner,
+        scope: crate::provider::InvocationScope,
+        input: crate::provider::SteeringInput,
+    ) -> Result<(), crate::provider::ProviderError> {
+        if scope.owner != *owner {
+            return Err(crate::provider::ProviderError::Rejected {
+                message: "steering scope belongs to another owner".into(),
+            });
+        }
+        if !self.session_events.running(&scope).await? {
+            let request = self.session_events.continuation(&scope, input)?;
+            return self.session_prompt(request, scope).await;
+        }
+        let events = self.session_events.clone();
+        let provider = self.clone();
+        let continuation = input.clone();
+        let result = events
+            .steer(&scope, input, |input| async move {
+                provider
+                    .steer_native(&owner.runtime_key(), input)
+                    .await
+                    .map_err(crate::provider::ProviderError::from)
+            })
+            .await;
+        if matches!(
+            &result,
+            Err(crate::provider::ProviderError::NotConsumed { .. })
+        ) {
+            events.wait_closed(&scope).await?;
+            let request = events.continuation(&scope, continuation)?;
+            return self.session_prompt(request, scope).await;
+        }
+        result
+    }
+
+    async fn session_prompt(
+        self: Arc<Self>,
+        request: ProviderRequest,
+        scope: crate::provider::InvocationScope,
+    ) -> Result<(), crate::provider::ProviderError> {
+        let events = self.session_events.clone();
+        events
+            .submit(
+                request,
+                scope,
+                crate::provider::TerminalBoundary::AcpPrompt,
+                move |request, sink| async move { self.run_native(request, sink).await },
+            )
+            .await
+    }
+
+    async fn model_list(&self, request: ProviderRequest) -> Result<Vec<ProviderModel>> {
+        let session = self.session(catalog_request(&request), None, None).await?;
+        session.native.models().await
+    }
+
+    async fn fork(&self, request: ProviderForkRequest) -> Result<ProviderForkResult> {
+        ensure!(
+            self.kind == ProviderKind::Claude,
+            "Antigravity does not implement native session fork"
+        );
+        let session = self
+            .session(catalog_request(&request.source), None, None)
+            .await?;
+        Ok(ProviderForkResult::unprofiled(
+            session
+                .native
+                .fork(&request.source.workspace)
+                .await?
+                .try_into()?,
+        ))
+    }
+
+    async fn compact(&self, request: ProviderCompactionRequest) -> Result<ProviderOutput> {
+        ensure!(
+            self.kind == ProviderKind::Claude,
+            "Antigravity has no manual compaction operation"
+        );
+        let scope = EventScope::SessionOperation {
+            owner: request.request.owner()?,
+            operation_id: request.id,
+        };
+        let request = request.request;
+        let session = self.session(catalog_request(&request), None, None).await?;
+        let mut turn = session
+            .turn
+            .try_lock()
+            .context("ACP session already owns active work")?;
+        *turn = PromptEvidence::Unavailable;
+        session
+            .native
+            .configure(&request.model, &request.effort, request.mode)
+            .await?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.cancellation
+            .lock()
+            .await
+            .insert(request.runtime_key()?, cancelled.clone());
+        let (sink, mut stream) = events::channel(scope);
+        session
+            .native
+            .state()
+            .begin_compaction(session.native.id(), sink)
+            .await?;
+        self.conversation
+            .lock()
+            .await
+            .insert(request.runtime_key()?, session.native.id().to_owned());
+        let mut event = Vec::new();
+        let execution = session.native.request(
+            "session/prompt",
+            json!({"sessionId":session.native.id(),"prompt":[{"type":"text","text":"/compact"}]}),
+        );
+        tokio::pin!(execution);
+        let mut stream_open = true;
+        let result = loop {
+            tokio::select! {
+                update = stream.recv(), if stream_open => match update {
+                    Ok(Some(update)) => event.push(update),
+                    Ok(None) => stream_open = false,
+                    Err(error) => {
+                        let cleanup = session.native.shutdown().await;
+                        let error: anyhow::Error = error.into();
+                        break Err(match cleanup {
+                            Ok(()) => error,
+                            Err(cleanup) => error.context(format!("ACP compaction cleanup also failed: {cleanup:#}")),
+                        });
+                    }
+                },
+                result = &mut execution => break result.map_err(anyhow::Error::from),
+            }
+        };
+        session.native.state().finish_compaction().await;
+        while let Some(update) = stream.try_next()? {
+            event.push(update);
+        }
+        let response = result?;
+        forge_providers::acp::validate_prompt_response(response.clone()).map_err(|error| {
+            ProviderError::Protocol {
+                message: format!(
+                    "ACP compaction response does not confirm a completed turn: {error}"
+                ),
+            }
+        })?;
+        *turn = PromptEvidence::Validated;
+        if cancelled.load(Ordering::Acquire) || response["stopReason"] == "cancelled" {
+            return Err(crate::broker::TurnCancelled.into());
+        }
+        let mut completion =
+            ProviderCompletion::from(session.native.state().take_completion().await);
+        completion.provider_session_id = Some(session.native.id().to_owned().try_into()?);
+        completion.capability = session
+            .native
+            .capabilities(self.descriptor().capability)
+            .await;
+        let catalog = session.native.state().catalog().await;
+        completion.runtime = ProviderRuntime {
+            provider: self.descriptor().label,
+            model: catalog
+                .pointer("/models/currentModelId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    find_option(&catalog, "model")
+                        .and_then(|option| option["currentValue"].as_str())
+                        .map(str::to_owned)
+                }),
+        };
+        Ok(ProviderOutput { event, completion })
+    }
+
+    async fn has_active_turn(&self, id: &str) -> bool {
+        let session = self.session.lock().await.get(id).cloned();
+        match session {
+            Some(session) => session.native.state().has_active_work().await,
+            None => false,
+        }
+    }
+
+    /// Interrupt native work and collect its validated terminal response without retiring the reader.
+    async fn cancel_session(&self, id: &str) -> Result<()> {
+        if let Some(cancelled) = self.cancellation.lock().await.get(id) {
+            cancelled.store(true, Ordering::Release);
+        }
+        let session = self.session.lock().await.get(id).cloned();
+        if let Some(session) = session {
+            session.control.cancel().await;
+            session.permission.close().await;
+            if session.native.state().has_active_work().await {
+                let terminal = async {
+                    session.native.cancel()?;
+                    let turn = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        session.turn.lock(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        ProviderError::Observation(
+                            forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
+                        )
+                    })?;
+                    match &*turn {
+                        PromptEvidence::Validated => Ok(()),
+                        PromptEvidence::Unavailable => Err(ProviderError::Observation(
+                            forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
+                        )),
+                    }
+                }
+                .await;
+                if let Err(failure) = terminal {
+                    return match self.cleanup_execution(id).await {
+                        Ok(()) => Err(failure.into()),
+                        Err(cleanup) => Err(anyhow::Error::new(failure)
+                            .context(format!("ACP cancellation cleanup also failed: {cleanup:#}"))),
+                    };
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn cleanup_execution(&self, id: &str) -> Result<()> {
+        if let Some(cancelled) = self.cancellation.lock().await.get(id) {
+            cancelled.store(true, Ordering::Release);
+        }
+        let session = self.session.lock().await.get(id).cloned();
+        if let Some(session) = session {
+            session.control.cancel().await;
+            session.permission.close().await;
+            let result = session.native.shutdown().await;
+            session.control.close().await;
+            let finalized = session
+                .native
+                .state()
+                .finish(crate::turn::TurnOutcome::Cancelled)
+                .await;
+            finalized?;
+            result?;
+            self.session.lock().await.remove(id);
+        }
+        Ok(())
+    }
+
+    async fn reset_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
+        self.cleanup_execution(&owner.runtime_key()).await?;
+        self.session_events.reset_owner(owner).await?;
+        Ok(())
+    }
+
+    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
+        self.cleanup_execution(&owner.runtime_key()).await
+    }
+
+    async fn active_session_id_for(
+        &self,
+        id: &str,
+    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+        Ok(self
+            .conversation
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .map(TryInto::try_into)
+            .transpose()?)
+    }
+}
+
+impl AcpProvider {
+    async fn steer_native(&self, id: &str, input: crate::provider::SteeringInput) -> Result<()> {
+        let text = input.text();
+        let session = self
+            .session
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .context("ACP conversation is not active")?;
+        ensure!(
+            self.kind == ProviderKind::Claude
+                && session
+                    .native
+                    .capabilities(self.descriptor().capability)
+                    .await
+                    .native_steer,
+            "ACP agent did not advertise steering support"
+        );
+        let image_supported = session.native.supports_images();
+        let prompt = crate::provider::acp::attachments::input(
+            text.to_owned(),
+            input.attachments(),
+            image_supported,
+        )
+        .await?;
+        let submission = input.submission();
+        let scope = session.native.state().scope().await?;
+        let acceptance = session
+            .native
+            .steer(
+                json!({"sessionId":session.native.id(),
+            "prompt":prompt,"_meta":{"steering":{"idleBehavior":"promptRequired"}}}),
+                submission.as_ref().map(|receipt| {
+                    receipt.clone() as Arc<dyn forge_provider_api::submission::InputReceipt>
+                }),
+            )
+            .await?;
+        if acceptance == forge_providers::acp::submission::SteeringAcceptance::UnobservableExecution
+        {
+            let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
+                scope.clone(),
+                forge_provider_api::lifecycle::ExecutionUpdate::ObservationLost {
+                    failure:
+                        forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
+                    completion: None,
+                },
+            )
+            .map_err(|error| ProviderError::Protocol {
+                message: error.to_string(),
+            })?;
+            let _ = session
+                .native
+                .state()
+                .emit(ProviderEvent::Execution { observation })
+                .await;
+            if let Err(error) = self.cleanup_execution(id).await {
+                let _ = session
+                    .native
+                    .state()
+                    .emit(ProviderEvent::Diagnostic {
+                        scope: scope.into(),
+                        diagnostic: ProviderDiagnostic {
+                            code: Some("lifecycle_cleanup_failed".into()),
+                            message: format!("{error:#}"),
+                            fatal: true,
+                        },
+                    })
+                    .await;
+            }
+            return Ok(());
+        }
+        if let Some(start) = input.task_start() {
+            let input_id = submission
+                .as_ref()
+                .map(|submission| submission.record())
+                .transpose()?
+                .and_then(|record| record.input_message_id);
+            let event = ProviderEvent::InputAccepted {
+                scope: session.native.state().scope().await?,
+                acknowledgement: InputAcknowledgement::TaskStarted {
+                    input_id,
+                    start: start.clone(),
+                    prompt: input.text().to_owned(),
+                },
+            };
+            session.native.state().emit(event).await?;
+        }
+        Ok(())
+    }
+}
+
+impl AcpProvider {
+    /// Drive admitted native work inside the session-owned task.
+    async fn run_native(
         &self,
         request: ProviderRequest,
         sink: ProviderEventSink,
@@ -618,10 +1011,11 @@ impl crate::provider::ProviderAdapter for AcpProvider {
             let session = self
                 .session(catalog_request(&request), Some(tools), Some(&cancelled))
                 .await?;
-            let _turn = session
+            let mut turn = session
                 .turn
                 .try_lock()
                 .context("ACP session already owns active work")?;
+            *turn = PromptEvidence::Unavailable;
             session
                 .native
                 .configure(&request.model, &request.effort, request.mode)
@@ -700,6 +1094,11 @@ impl crate::provider::ProviderAdapter for AcpProvider {
                 .lock()
                 .await
                 .insert(request.runtime_key()?, session.native.id().to_owned());
+            let _dispatch = request
+                .submission
+                .as_ref()
+                .map(|submission| submission.begin_prompt())
+                .transpose()?;
             let response = session
                 .native
                 .submit(
@@ -711,10 +1110,27 @@ impl crate::provider::ProviderAdapter for AcpProvider {
                     }),
                 )
                 .await;
-            let outcome = if cancelled.load(Ordering::Acquire)
-                || response
-                    .as_ref()
-                    .is_ok_and(|response| response["stopReason"] == "cancelled")
+            if response.is_ok() {
+                *turn = PromptEvidence::Validated;
+            }
+            if response.is_ok()
+                && let Some(address) = session.native.state().address(session.native.id()).await
+            {
+                let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
+                    address.scope.clone(),
+                    forge_provider_api::lifecycle::ExecutionUpdate::Started { address },
+                )?;
+                session
+                    .native
+                    .state()
+                    .emit(ProviderEvent::Execution { observation })
+                    .await?;
+            }
+            let outcome = if response.is_ok()
+                && (cancelled.load(Ordering::Acquire)
+                    || response
+                        .as_ref()
+                        .is_ok_and(|response| response["stopReason"] == "cancelled"))
             {
                 crate::turn::TurnOutcome::Cancelled
             } else if response.is_ok() {
@@ -738,7 +1154,7 @@ impl crate::provider::ProviderAdapter for AcpProvider {
             output.native.evidence.structured_blocked |= evidence.structured_blocked;
             output.native.evidence.tool_called |= evidence.tool_called;
             output.native.evidence.workspace_changed |= evidence.workspace_changed;
-            output.provider_session_id = Some(session.native.id().to_owned());
+            output.provider_session_id = Some(session.native.id().to_owned().try_into()?);
             output.capability = session
                 .native
                 .capabilities(self.descriptor().capability)
@@ -760,212 +1176,6 @@ impl crate::provider::ProviderAdapter for AcpProvider {
         }
         .await;
         output.map_err(ProviderError::from)
-    }
-
-    async fn model_list(&self, request: ProviderRequest) -> Result<Vec<ProviderModel>> {
-        let session = self.session(catalog_request(&request), None, None).await?;
-        session.native.models().await
-    }
-
-    async fn fork(&self, request: ProviderForkRequest) -> Result<ProviderForkResult> {
-        ensure!(
-            self.kind == ProviderKind::Claude,
-            "Antigravity does not implement native session fork"
-        );
-        let session = self
-            .session(catalog_request(&request.source), None, None)
-            .await?;
-        Ok(ProviderForkResult::unprofiled(
-            session.native.fork(&request.source.workspace).await?,
-        ))
-    }
-
-    async fn compact(&self, request: ProviderCompactionRequest) -> Result<ProviderOutput> {
-        ensure!(
-            self.kind == ProviderKind::Claude,
-            "Antigravity has no manual compaction operation"
-        );
-        let scope = EventScope::SessionOperation {
-            owner: request.request.owner()?,
-            operation_id: request.id,
-        };
-        let request = request.request;
-        let session = self.session(catalog_request(&request), None, None).await?;
-        let _turn = session
-            .turn
-            .try_lock()
-            .context("ACP session already owns active work")?;
-        session
-            .native
-            .configure(&request.model, &request.effort, request.mode)
-            .await?;
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.cancellation
-            .lock()
-            .await
-            .insert(request.runtime_key()?, cancelled.clone());
-        let (sink, mut stream) = events::channel(scope);
-        session
-            .native
-            .state()
-            .begin_compaction(session.native.id(), sink)
-            .await?;
-        self.conversation
-            .lock()
-            .await
-            .insert(request.runtime_key()?, session.native.id().to_owned());
-        let mut event = Vec::new();
-        let execution = session.native.request(
-            "session/prompt",
-            json!({"sessionId":session.native.id(),"prompt":[{"type":"text","text":"/compact"}]}),
-        );
-        tokio::pin!(execution);
-        let mut stream_open = true;
-        let result = loop {
-            tokio::select! {
-                update = stream.recv(), if stream_open => match update {
-                    Ok(Some(update)) => event.push(update),
-                    Ok(None) => stream_open = false,
-                    Err(error) => {
-                        let cleanup = session.native.shutdown().await;
-                        let error: anyhow::Error = error.into();
-                        break Err(match cleanup {
-                            Ok(()) => error,
-                            Err(cleanup) => error.context(format!("ACP compaction cleanup also failed: {cleanup:#}")),
-                        });
-                    }
-                },
-                result = &mut execution => break result.map_err(anyhow::Error::from),
-            }
-        };
-        session.native.state().finish_compaction().await;
-        while let Some(update) = stream.try_next()? {
-            event.push(update);
-        }
-        if cancelled.load(Ordering::Acquire) {
-            return Err(crate::broker::TurnCancelled.into());
-        }
-        let response = result?;
-        forge_providers::acp::validate_prompt_response(response.clone()).map_err(|error| {
-            ProviderError::Protocol {
-                message: format!(
-                    "ACP compaction response does not confirm a completed turn: {error}"
-                ),
-            }
-        })?;
-        if response["stopReason"] == "cancelled" {
-            return Err(crate::broker::TurnCancelled.into());
-        }
-        let mut completion =
-            ProviderCompletion::from(session.native.state().take_completion().await);
-        completion.provider_session_id = Some(session.native.id().to_owned());
-        completion.capability = session
-            .native
-            .capabilities(self.descriptor().capability)
-            .await;
-        let catalog = session.native.state().catalog().await;
-        completion.runtime = ProviderRuntime {
-            provider: self.descriptor().label,
-            model: catalog
-                .pointer("/models/currentModelId")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| {
-                    find_option(&catalog, "model")
-                        .and_then(|option| option["currentValue"].as_str())
-                        .map(str::to_owned)
-                }),
-        };
-        Ok(ProviderOutput { event, completion })
-    }
-
-    async fn has_active_turn(&self, id: &str) -> bool {
-        let session = self.session.lock().await.get(id).cloned();
-        match session {
-            Some(session) => session.native.state().has_active_work().await,
-            None => false,
-        }
-    }
-
-    async fn steer_session(&self, id: &str, input: crate::provider::SteeringInput) -> Result<()> {
-        let text = input.text();
-        let session = self
-            .session
-            .lock()
-            .await
-            .get(id)
-            .cloned()
-            .context("ACP conversation is not active")?;
-        ensure!(
-            self.kind == ProviderKind::Claude
-                && session
-                    .native
-                    .capabilities(self.descriptor().capability)
-                    .await
-                    .native_steer,
-            "ACP agent did not advertise steering support"
-        );
-        let image_supported = session.native.supports_images();
-        let prompt = crate::provider::acp::attachments::input(
-            text.to_owned(),
-            input.attachments(),
-            image_supported,
-        )
-        .await?;
-        let submission = input.submission();
-        session
-            .native
-            .submit(
-                forge_providers::acp::submission::AcpSubmission::Steering,
-                json!({"sessionId":session.native.id(),
-            "prompt":prompt,"_meta":{"steering":{"idleBehavior":"promptRequired"}}}),
-                submission.as_ref().map(|receipt| {
-                    receipt.clone() as Arc<dyn forge_provider_api::submission::InputReceipt>
-                }),
-            )
-            .await?;
-        if let Some(start) = input.task_start() {
-            let input_id = submission
-                .as_ref()
-                .map(|submission| submission.record())
-                .transpose()?
-                .and_then(|record| record.input_message_id);
-            let event = ProviderEvent::InputAccepted {
-                scope: session.native.state().scope().await?,
-                acknowledgement: InputAcknowledgement::TaskStarted {
-                    input_id,
-                    start: start.clone(),
-                    prompt: input.text().to_owned(),
-                },
-            };
-            session.native.state().emit(event).await?;
-        }
-        Ok(())
-    }
-
-    async fn cleanup_execution(&self, id: &str) -> Result<()> {
-        if let Some(cancelled) = self.cancellation.lock().await.get(id) {
-            cancelled.store(true, Ordering::Release);
-        }
-        let session = self.session.lock().await.remove(id);
-        if let Some(session) = session {
-            session.control.cancel().await;
-            session.permission.close().await;
-            let result = session.native.shutdown().await;
-            session.control.close().await;
-            let finalized = session
-                .native
-                .state()
-                .finish(crate::turn::TurnOutcome::Cancelled)
-                .await;
-            finalized?;
-            result?;
-        }
-        Ok(())
-    }
-
-    async fn active_session_id_for(&self, id: &str) -> Option<String> {
-        self.conversation.lock().await.get(id).cloned()
     }
 }
 

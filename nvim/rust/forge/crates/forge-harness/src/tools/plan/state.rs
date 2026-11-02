@@ -75,9 +75,9 @@ pub(super) async fn apply_edit(
             });
         }
         let saved = execution
-            .send(crate::plan::execution::ExecutionOperation::Draft(
+            .send(crate::plan::execution::ExecutionOperation::Draft(Box::new(
                 updated.clone(),
-            ))
+            )))
             .await?;
         let updated: PlanDocument = serde_json::from_value(saved["document"].clone())?;
         runtime.context.plan_state = Some(PlanState::Revising);

@@ -830,19 +830,23 @@ mod tests {
                     &execution.id,
                     execution.generation,
                     &task.permit(),
-                    ExecutionOperation::Draft(document.clone()),
+                    ExecutionOperation::Draft(Box::new(document.clone())),
                     &mut exchange,
                 )
                 .await?;
             let task = broker.task_controller.current()?.unwrap();
             let execution = broker.current_execution()?.unwrap();
+            let baseline = broker
+                .plan_file
+                .read_working_document(&broker.session.id, &plan.id)?;
             broker
                 .handle_execution_control(
                     &execution.id,
                     execution.generation,
                     &task.permit(),
                     ExecutionOperation::Submit {
-                        document,
+                        baseline: Box::new(baseline),
+                        document: Box::new(document),
                         reason: "Clarify ownership".into(),
                     },
                     &mut exchange,

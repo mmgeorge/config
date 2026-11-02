@@ -1,276 +1,409 @@
 use super::*;
 
-impl HarnessBroker {
-    pub(super) async fn run_interaction_input_inner(
-        &mut self,
-        text: String,
-        mode: PromptMode,
-        admission: Option<ExchangeAdmission>,
-        input: ProviderInput,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        let admitted_task = self
-            .task_controller
-            .current()?
-            .filter(|task| {
-                matches!(
-                    mode,
-                    PromptMode::ExecutePlan | PromptMode::GoalContinuation | PromptMode::Plan
-                ) || task.entry_accepted()
-                    || matches!(&task.workflow, crate::task::WorkflowSnapshot::Plan { plan }
-                        if plan.artifact.state == PlanState::ConfiguringChecks)
+/// Retain validated completion metadata and its exact outstanding host effects.
+pub(crate) struct StagedHostCompletion {
+    pub(crate) output: crate::provider::ProviderCompletion,
+    pub(crate) mode: PromptMode,
+    pub(crate) settlement: Option<Arc<crate::provider::session_execution::SettlementCell>>,
+    pub(crate) batches: Option<Vec<crate::provider::HostEffectBatch>>,
+    pub(crate) expected_effects: Vec<crate::provider::session_execution::HostEffectId>,
+    pub(crate) refresh_elicitation: bool,
+}
+
+pub(crate) struct AppliedQuestionEffect {
+    pub(crate) id: crate::provider::session_execution::HostEffectId,
+    pub(crate) events: Vec<SessionEvent>,
+    pub(crate) needs_publication: bool,
+}
+enum QuestionEffect {
+    Ask(crate::plan::PlanQuestionSet),
+    Answer(crate::plan::PlanQuestionAnswer),
+    Withdraw(crate::plan::PlanQuestionWithdrawal),
+}
+
+/// Restore an unapplied in-memory plan snapshot without overwriting newer durable progress.
+pub(super) fn reconcile_plan_effect(
+    current: &mut PlanRecord,
+    recorded: Option<PlanRecord>,
+) -> Result<()> {
+    let recorded = recorded.context("applied plan effect has no retained plan state")?;
+    anyhow::ensure!(
+        current.id == recorded.id,
+        "plan effect receipt belongs to another plan"
+    );
+    let older = current.model_revision < recorded.model_revision
+        || current.user_revision < recorded.user_revision
+        || current.document_version < recorded.document_version;
+    let newer = current.model_revision > recorded.model_revision
+        || current.user_revision > recorded.user_revision
+        || current.document_version > recorded.document_version;
+    anyhow::ensure!(
+        !(older && newer),
+        "plan effect receipt conflicts with durable plan progress"
+    );
+    if older {
+        *current = recorded;
+    } else if !newer {
+        anyhow::ensure!(
+            current.state == recorded.state,
+            "plan effect receipt conflicts with durable plan state"
+        );
+    }
+    Ok(())
+}
+
+/// Identify every finalization mutation in the cumulative host completion.
+fn applicable_host_effects(
+    output: &crate::provider::ProviderCompletion,
+    batches: &[crate::provider::HostEffectBatch],
+    mode: PromptMode,
+    discarded_planning: bool,
+) -> Result<Vec<crate::provider::session_execution::HostEffectId>> {
+    use crate::provider::session_execution::{HostEffectId, HostEffectKind};
+    let crate::provider::ProviderCompletion {
+        native,
+        plan_edit,
+        design_patch,
+        plan_submit,
+        plan_read,
+        plan_question,
+        question_answer,
+        question_withdrawal,
+        control_error,
+        goal_control,
+        dispatched_task_permit,
+        dispatched_execution_id,
+        dispatched_entry_id,
+        structured_plan,
+    } = output;
+    // Native metadata and authorization fields are consumed by the existing idempotent state path.
+    let _ = (
+        native,
+        plan_read,
+        control_error,
+        dispatched_task_permit,
+        dispatched_execution_id,
+        dispatched_entry_id,
+        structured_plan,
+    );
+    anyhow::ensure!(
+        matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion)
+            || (plan_edit.is_empty() && design_patch.is_empty() && plan_submit.is_none()),
+        "planning effects are not authorized for this interaction"
+    );
+    anyhow::ensure!(
+        usize::from(plan_submit.is_some())
+            + usize::from(plan_question.is_some())
+            + usize::from(question_answer.is_some())
+            + usize::from(question_withdrawal.is_some())
+            <= 1,
+        "multiple terminal host controls cannot settle together"
+    );
+    let mut expected = Vec::new();
+    for batch in batches.iter().filter(|_| !discarded_planning) {
+        expected.extend(
+            (0..batch.completion.plan_edit.len()).map(|ordinal| HostEffectId {
+                batch_revision: batch.revision,
+                kind: HostEffectKind::PlanEdit,
+                ordinal,
+            }),
+        );
+        expected.extend(
+            (0..batch.completion.design_patch.len()).map(|ordinal| HostEffectId {
+                batch_revision: batch.revision,
+                kind: HostEffectKind::DesignPatch,
+                ordinal,
+            }),
+        );
+    }
+    anyhow::ensure!(
+        expected
+            .iter()
+            .filter(|id| id.kind == HostEffectKind::PlanEdit)
+            .count()
+            == plan_edit.len()
+            && expected
+                .iter()
+                .filter(|id| id.kind == HostEffectKind::DesignPatch)
+                .count()
+                == design_patch.len(),
+        "host effect batches do not match the cumulative completion"
+    );
+    let terminal = if plan_submit.is_some() {
+        Some(HostEffectKind::PlanSubmit)
+    } else if plan_question.is_some() {
+        Some(HostEffectKind::PlanQuestion)
+    } else if question_answer.is_some() {
+        Some(HostEffectKind::QuestionAnswer)
+    } else if question_withdrawal.is_some() {
+        Some(HostEffectKind::QuestionWithdrawal)
+    } else {
+        None
+    };
+    if let Some(kind) = terminal {
+        let batch = batches
+            .iter()
+            .rev()
+            .find(|batch| match kind {
+                HostEffectKind::PlanSubmit => batch.completion.plan_submit.is_some(),
+                HostEffectKind::PlanQuestion => batch.completion.plan_question.is_some(),
+                HostEffectKind::QuestionAnswer => batch.completion.question_answer.is_some(),
+                HostEffectKind::QuestionWithdrawal => {
+                    batch.completion.question_withdrawal.is_some()
+                }
+                HostEffectKind::PlanEdit
+                | HostEffectKind::DesignPatch
+                | HostEffectKind::GoalEvidence => false,
             })
-            .map(|task| task.permit());
-        let mut preparation_event = Vec::new();
-        if let Some(task) = self.task_controller.current()?
-            && let Some(entry) = &task.entry
-            && let Some(preparation) = &entry.execution
-            && self
-                .input_submission
-                .as_ref()
-                .map(|submission| submission.record())
-                .transpose()?
-                .and_then(|record| record.input_message_id)
-                .as_deref()
-                == Some(entry.id.as_str())
-        {
-            if preparation.executor.enabled {
-                self.validate_plan_executor(&preparation.executor).await?;
-            }
-            task.permit()
-                .validate(self.task_controller.current()?.as_ref())?;
-            if preparation.compact {
-                preparation_event = Box::pin(self.compact_session(true)).await?.1;
-            }
-            task.permit()
-                .validate(self.task_controller.current()?.as_ref())?;
-            if preparation.executor.enabled {
-                self.session.model = preparation
-                    .executor
-                    .model
-                    .clone()
-                    .context("executor model is missing")?;
-                self.session.resolved_model = Some(self.session.model.clone());
-                self.session.effort = preparation
-                    .executor
-                    .effort
-                    .clone()
-                    .context("executor thinking is missing")?;
-                self.session.context_window = None;
-            }
-            self.session.approval_mode = preparation.approval_mode;
-            self.save_session()?;
-            self.task_controller.apply(
-                &mut self.store,
-                &task.permit(),
-                crate::task::TaskEvent::EntryPreparationFinished,
-                self.clock.now_ms(),
-            )?;
+            .context("terminal host effect has no batch provenance")?;
+        expected.push(HostEffectId {
+            batch_revision: batch.revision,
+            kind,
+            ordinal: 0,
+        });
+    }
+    if goal_control.is_some() {
+        let batch = batches
+            .iter()
+            .rev()
+            .find(|batch| batch.completion.goal_control.is_some())
+            .context("goal control has no host effect batch")?;
+        expected.push(HostEffectId {
+            batch_revision: batch.revision,
+            kind: HostEffectKind::GoalEvidence,
+            ordinal: 0,
+        });
+    }
+    Ok(expected)
+}
+
+/// Omit only terminal effects whose exact retained batch has already been published.
+fn discard_published_terminal_effects(
+    output: &mut crate::provider::ProviderCompletion,
+    batches: &[crate::provider::HostEffectBatch],
+    cell: &crate::provider::session_execution::SettlementCell,
+) -> Result<()> {
+    use crate::provider::session_execution::{HostEffectId, HostEffectKind};
+    let published = |kind| -> Result<bool> {
+        let batch = batches.iter().rev().find(|batch| match kind {
+            HostEffectKind::PlanSubmit => batch.completion.plan_submit.is_some(),
+            HostEffectKind::PlanQuestion => batch.completion.plan_question.is_some(),
+            HostEffectKind::QuestionAnswer => batch.completion.question_answer.is_some(),
+            HostEffectKind::QuestionWithdrawal => batch.completion.question_withdrawal.is_some(),
+            HostEffectKind::PlanEdit
+            | HostEffectKind::DesignPatch
+            | HostEffectKind::GoalEvidence => false,
+        });
+        match batch {
+            Some(batch) => Ok(cell.effect_published(HostEffectId {
+                batch_revision: batch.revision,
+                kind,
+                ordinal: 0,
+            })?),
+            None => Ok(false),
         }
-        let submission_store = self.submission_store.clone();
-        let submission = match self.input_submission.take() {
-            Some(submission) => submission,
-            None => submission_store.prepare(
-                &self.provider_request(input.clone(), mode),
-                self.provider.descriptor().kind,
-            )?,
+    };
+    if published(HostEffectKind::PlanSubmit)? {
+        output.plan_submit.take();
+    }
+    if published(HostEffectKind::PlanQuestion)? {
+        output.plan_question.take();
+    }
+    if published(HostEffectKind::QuestionAnswer)? {
+        output.question_answer.take();
+    }
+    if published(HostEffectKind::QuestionWithdrawal)? {
+        output.question_withdrawal.take();
+    }
+    if let Some(batch) = batches
+        .iter()
+        .rev()
+        .find(|batch| batch.completion.goal_control.is_some())
+    {
+        let id = HostEffectId {
+            batch_revision: batch.revision,
+            kind: HostEffectKind::GoalEvidence,
+            ordinal: 0,
         };
-        let (mut interaction, new_runtime, mut event) = Box::pin(self.admit_interaction(
-            &text,
-            mode,
-            admission.as_ref(),
-            submission.record()?.input_message_id,
-        ))
-        .await?;
-        preparation_event.append(&mut event);
-        let mut event = preparation_event;
+        if cell.effect_published(id)? {
+            output.goal_control.take();
+        }
+    }
+    Ok(())
+}
 
-        let admission_result = if mode == PromptMode::ExecutePlan {
-            async {
-                self.collect_active_initial_checkpoint(&mut interaction).await?;
-                self.ensure_execution_baseline().await
-            }.await
-        } else if self.task_controller.current()?.is_some_and(|task|
-            matches!(&task.workflow, crate::task::WorkflowSnapshot::Goal { goal } if goal.observed_checkpoint.is_none())) {
-            self.observe_goal_workspace().await.map(|_| ())
+/// Identify the batch that owns explicit goal control, or the latest native evidence batch.
+pub(super) fn goal_evidence_id(
+    staged: &StagedHostCompletion,
+) -> Result<crate::provider::session_execution::HostEffectId> {
+    use crate::provider::session_execution::{HostEffectId, HostEffectKind};
+    let batches = staged
+        .batches
+        .as_ref()
+        .context("goal evidence has no batch provenance")?;
+    let batch = if staged.output.goal_control.is_some() {
+        batches
+            .iter()
+            .rev()
+            .find(|batch| batch.completion.goal_control.is_some())
+    } else {
+        batches.last()
+    }
+    .context("goal evidence has no batch provenance")?;
+    Ok(HostEffectId {
+        batch_revision: batch.revision,
+        kind: HostEffectKind::GoalEvidence,
+        ordinal: 0,
+    })
+}
+
+impl HarnessBroker {
+    /// Apply a non-planning question control once and retain its exact presentation.
+    pub(crate) fn apply_owned_question_effect(
+        &mut self,
+        interaction: &mut Exchange,
+        staged: &mut StagedHostCompletion,
+    ) -> Result<Option<AppliedQuestionEffect>> {
+        use crate::provider::session_execution::{
+            HostEffectId, HostEffectKind, HostEffectOutput, ResultEffectAdmission,
+        };
+        let effect = if let Some(question) = staged.output.plan_question.take() {
+            Some(QuestionEffect::Ask(question.normalize()?))
+        } else if let Some(answer) = staged.output.question_answer.take() {
+            Some(QuestionEffect::Answer(answer))
         } else {
-            Ok(())
+            staged
+                .output
+                .question_withdrawal
+                .take()
+                .map(QuestionEffect::Withdraw)
         };
-
-        let output = match admission_result {
-            Ok(()) => {
-                self.run_admitted_provider(
-                    mode,
-                    input,
-                    submission.clone(),
-                    new_runtime,
-                    &mut interaction,
-                    &mut event,
-                )
-                .await
-            }
-            Err(error) => Err(error),
+        let Some(effect) = effect else {
+            return Ok(None);
         };
-        let output = match output {
-            Ok(output) => output,
-            Err(error) => {
-                if let Some(permit) = &admitted_task
-                    && let Some(task) = self.task_controller.current()?
-                    && permit.validate_observation(Some(&task)).is_ok()
-                    && task.status() == crate::task::TaskStatus::Running
-                {
-                    self.task_controller.change(
-                        &mut self.store,
-                        Some(&task.revision),
-                        crate::task::TaskChange::Pause,
-                        self.clock.now_ms(),
-                    )?;
-                }
-                self.trace.record(
-                    &self.session.id,
-                    "model.failed",
-                    json!({ "error": format!("{error:#}") }),
-                );
-                let cancelled = error.downcast_ref::<TurnCancelled>().is_some();
-                if cancelled && !self.turn_cancellation.restart.load(Ordering::Acquire) {
-                    if admitted_task.is_none() && !self.question_discussion {
-                        self.questions.cancel_chat(Some(&interaction.id))?;
+        let kind = match &effect {
+            QuestionEffect::Ask(_) => HostEffectKind::PlanQuestion,
+            QuestionEffect::Answer(_) => HostEffectKind::QuestionAnswer,
+            QuestionEffect::Withdraw(_) => HostEffectKind::QuestionWithdrawal,
+        };
+        let batch = staged
+            .batches
+            .as_ref()
+            .and_then(|batches| {
+                batches.iter().rev().find(|batch| match kind {
+                    HostEffectKind::PlanQuestion => batch.completion.plan_question.is_some(),
+                    HostEffectKind::QuestionAnswer => batch.completion.question_answer.is_some(),
+                    HostEffectKind::QuestionWithdrawal => {
+                        batch.completion.question_withdrawal.is_some()
                     }
-                    submission.cancel()?;
+                    HostEffectKind::PlanEdit
+                    | HostEffectKind::DesignPatch
+                    | HostEffectKind::PlanSubmit
+                    | HostEffectKind::GoalEvidence => false,
+                })
+            })
+            .context("question effect has no batch provenance")?;
+        let id = HostEffectId {
+            batch_revision: batch.revision,
+            kind,
+            ordinal: 0,
+        };
+        let cell = staged
+            .settlement
+            .as_ref()
+            .context("question effect has no settlement owner")?;
+        let events = match cell.begin_result_effect(id)? {
+            ResultEffectAdmission::Applied(output) => {
+                for node in output.nodes {
+                    if !interaction
+                        .node_list
+                        .iter()
+                        .any(|existing| existing.id() == node.id())
+                    {
+                        interaction.node_list.push(node);
+                    }
                 }
-                if self
-                    .exchange_runtime
-                    .as_ref()
-                    .is_none_or(|runtime| runtime.exchange_id != interaction.id)
-                {
-                    interaction.finish(
-                        if cancelled {
-                            crate::exchange::ExchangeOutcome::Cancelled
-                        } else {
-                            crate::exchange::ExchangeOutcome::Failed
-                        },
-                        self.clock.now_ms(),
-                    )?;
-                    self.store.save_exchange(&interaction)?;
-                    self.emit_live_interaction(
-                        publication::LiveUpdate::StateChanged,
-                        &interaction,
-                        &mut event,
-                    )
-                    .await?;
-                    return Err(error);
+                if interaction.elicitation().is_none() && output.elicitation.is_some() {
+                    interaction.set_elicitation(output.elicitation);
+                    interaction.set_awaiting_input(output.awaiting_input);
                 }
-                if cancelled
-                    && let Some(provider_session_id) =
-                        self.provider.active_session_id_for(&self.session.id).await
-                {
-                    self.session.provider_session_id = Some(provider_session_id);
-                }
-                if cancelled && self.turn_cancellation.restart.load(Ordering::Acquire) {
-                    Box::pin(self.park_exchange_for_restart(&mut interaction)).await?;
-                    return Err(error);
-                }
-                let outcome = if cancelled {
-                    crate::exchange::ExchangeOutcome::Cancelled
+                if output.publication_drained {
+                    Vec::new()
                 } else {
-                    crate::exchange::ExchangeOutcome::Failed
-                };
-                if !cancelled {
-                    Box::pin(self.record_execution_failure(&mut interaction, format!("{error:#}")))
-                        .await?;
+                    output.events
                 }
-                let retract_before_tools = cancelled
-                    && self.turn_cancellation.restores_prompt()
-                    && self.capability.native_turn_rollback
-                    && self
-                        .exchange_runtime
-                        .as_ref()
-                        .is_some_and(ExchangeRuntime::retractable_before_tools);
-                if retract_before_tools
-                    && Box::pin(self.retract_cancelled_interaction(&interaction, &mut event))
-                        .await?
-                {
-                    return Err(anyhow::Error::new(TurnRetracted {
-                        prompt: interaction.prompt,
-                    }));
+            }
+            ResultEffectAdmission::Apply(mut guard) => {
+                let node_start = interaction.node_list.len();
+                let mut events = Vec::new();
+                match effect {
+                    QuestionEffect::Ask(question) => {
+                        let plan_waiting = self.active_plan_awaits_input()?;
+                        guard.begin_mutation();
+                        if !plan_waiting {
+                            interaction.node_list.push(ExchangeNode::QuestionPresented {
+                                id: format!("{}:question:{}", interaction.id, Uuid::new_v4()),
+                                question: question.clone(),
+                                answer: None,
+                            });
+                        }
+                        if !self.replace_active_elicitation(question.clone(), &mut events)? {
+                            interaction.set_awaiting_input(true);
+                            interaction.set_elicitation(Some(PlanElicitation::new(question)));
+                            self.store.save_exchange(interaction)?;
+                            events.push(self.event("question", json!({"owner":"interaction","plan_id":self.current_plan_id()?,
+                                "exchange_id":interaction.id,"elicitation":interaction.elicitation()}))?);
+                        }
+                    }
+                    QuestionEffect::Answer(answer) => {
+                        guard.begin_mutation();
+                        self.answer_active_elicitation_from_model(answer, &mut events)?;
+                    }
+                    QuestionEffect::Withdraw(withdrawal) => {
+                        guard.begin_mutation();
+                        self.withdraw_active_elicitation(withdrawal, &mut events)?;
+                    }
                 }
-                let final_checkpoint_id =
-                    Box::pin(self.capture_final_checkpoint(&mut interaction, outcome))
-                        .await
-                        .context("finalize stopped interaction")?;
-                let workspace_unchanged = if let (Some(before), Some(after)) =
-                    (&interaction.checkpoint_before, &final_checkpoint_id)
-                {
-                    let before = self
-                        .store
-                        .load_checkpoint(before)?
-                        .context("initial checkpoint disappeared")?;
-                    let after = self
-                        .store
-                        .load_checkpoint(after)?
-                        .context("final checkpoint disappeared")?;
-                    let objects = self.store.objects.clone();
-                    tokio::task::spawn_blocking(move || before.equivalent(&after, &objects))
-                        .await
-                        .context("checkpoint comparison worker failed")??
-                } else {
-                    false
-                };
-                let retraction_eligible = !retract_before_tools
-                    && cancelled
-                    && self.turn_cancellation.restores_prompt()
-                    && self.capability.native_turn_rollback
-                    && workspace_unchanged
-                    && self
-                        .exchange_runtime
-                        .as_ref()
-                        .is_some_and(|runtime| runtime.retraction_eligible);
-                if retraction_eligible
-                    && Box::pin(self.retract_cancelled_interaction(&interaction, &mut event))
-                        .await?
-                {
-                    return Err(anyhow::Error::new(TurnRetracted {
-                        prompt: interaction.prompt,
-                    }));
-                }
-                self.exchange_runtime.take();
-                let outcome = if cancelled {
-                    crate::exchange::ExchangeOutcome::Cancelled
-                } else {
-                    crate::exchange::ExchangeOutcome::Failed
-                };
-                interaction.finish(outcome, self.clock.now_ms())?;
-                self.store
-                    .save_exchange(&interaction)
-                    .context("persist stopped interaction")?;
-                Box::pin(self.pause_goal_after_turn_failure()).await?;
-                self.save_session().context("persist stopped session")?;
-                if cancelled {
-                    Box::pin(self.emit_live_interaction(
-                        publication::LiveUpdate::StateChanged,
-                        &interaction,
-                        &mut event,
-                    ))
-                    .await?;
-                    return Err(error);
-                }
-                return Err(error).context("provider turn failed");
+                guard.commit_output(HostEffectOutput {
+                    nodes: interaction.node_list[node_start..].to_vec(),
+                    events: events.clone(),
+                    elicitation: interaction.elicitation().cloned(),
+                    awaiting_input: interaction.awaiting_input(),
+                    publication_drained: false,
+                    plan_document: None,
+                    continuing: None,
+                    plan_record: None,
+                })?;
+                events
             }
         };
-        Box::pin(self.complete_interaction(interaction, output, mode, event)).await
+        if staged.refresh_elicitation {
+            let owner = self
+                .store
+                .load_exchange_metadata(&interaction.id)?
+                .context("question control lost its owning exchange")?;
+            interaction.set_elicitation(owner.elicitation().cloned());
+            interaction.set_awaiting_input(owner.awaiting_input());
+        }
+        let needs_publication = cell.pending_effect_publications()?.contains(&id);
+        Ok(Some(AppliedQuestionEffect {
+            id,
+            events,
+            needs_publication,
+        }))
     }
 
-    async fn admit_interaction(
+    /// Apply interaction admission and retain all presentation for ordered delivery.
+    pub(super) fn stage_admit_interaction(
         &mut self,
         text: &str,
         mode: PromptMode,
         admission: Option<&ExchangeAdmission>,
         input_message_id: Option<String>,
-    ) -> Result<(Exchange, bool, Vec<SessionEvent>)> {
-        let mut event = Vec::new();
+    ) -> Result<(Exchange, bool, Vec<SessionEvent>, Vec<AppliedProviderEvent>)> {
         let now_ms = self.clock.now_ms();
         let admitted_prompt = admission.map(|value| value.prompt.as_str()).unwrap_or(text);
-        let automatic_repair =
-            admission.is_some_and(|admission| admission.automatic_owner.is_some());
+        let automatic_repair = admission.is_some_and(|value| value.automatic_owner.is_some());
         if automatic_repair {
             let mut previous = self
                 .store
@@ -278,20 +411,18 @@ impl HarnessBroker {
                 .context("automatic repair has no originating exchange")?;
             anyhow::ensure!(
                 previous.check_owner.as_ref()
-                    == admission.and_then(|admission| admission.check_owner.as_ref()),
+                    == admission.and_then(|value| value.check_owner.as_ref()),
                 "automatic repair check ownership changed"
             );
             previous.repair_checks(now_ms)?;
             self.store.save_exchange(&previous)?;
         }
-        let (mut interaction, new_interaction, mut admission_event) =
-            Box::pin(self.interaction_for_turn(
+        let (mut interaction, new_interaction, events, mut effects) = self
+            .stage_interaction_for_turn(
                 admitted_prompt,
                 admission.is_some() && !automatic_repair,
                 now_ms,
-            ))
-            .await?;
-        event.append(&mut admission_event);
+            )?;
         interaction.input_message_id = input_message_id;
         interaction.approval_mode = Some(self.session.approval_mode);
         if new_interaction && let Some(admission) = admission {
@@ -318,9 +449,7 @@ impl HarnessBroker {
             }
         }
         if new_interaction {
-            if let Some(event_id) =
-                admission.and_then(|admission| admission.plan_event_id.as_deref())
-            {
+            if let Some(event_id) = admission.and_then(|value| value.plan_event_id.as_deref()) {
                 let mut lifecycle = self
                     .store
                     .list_plan_lifecycle(&self.session.id)?
@@ -332,33 +461,28 @@ impl HarnessBroker {
             }
             if let Some(task) = self.task_controller.current()?
                 && matches!(&task.workflow, crate::task::WorkflowSnapshot::Execute { execution } if execution.record.baseline_checkpoint.is_none())
+                && let Some(checkpoint) = interaction.checkpoint_before.clone()
             {
-                let checkpoint = interaction.checkpoint_before.clone();
-                if let Some(checkpoint) = checkpoint {
-                    self.task_controller.apply(
-                        &mut self.store,
-                        &task.permit(),
-                        crate::task::TaskEvent::ExecutionBaselineCaptured(checkpoint),
-                        now_ms,
-                    )?;
-                }
+                self.task_controller.apply(
+                    &mut self.store,
+                    &task.permit(),
+                    crate::task::TaskEvent::ExecutionBaselineCaptured(checkpoint),
+                    now_ms,
+                )?;
             }
         }
         interaction.resume(self.clock.now_ms())?;
         self.store.save_exchange(&interaction)?;
-        Box::pin(self.settle_prompt_admission(true, &mut event)).await?;
-        if let Some(owner) = admission.and_then(|admission| admission.automatic_owner.as_deref()) {
+        effects.push(self.prepare_prompt_admission(true)?);
+        if let Some(owner) = admission.and_then(|value| value.automatic_owner.as_deref()) {
             let mut automatic =
                 crate::checks::AutomaticChecks::open(&self.check_runner.root, owner)?;
             automatic.repair_exchange = Some(interaction.id.clone());
             automatic.save()?;
         }
-        Box::pin(self.emit_live_interaction(
-            publication::LiveUpdate::StateChanged,
-            &interaction,
-            &mut event,
-        ))
-        .await?;
+        effects.push(
+            self.prepare_live_interaction(publication::LiveUpdate::StateChanged, &interaction)?,
+        );
         self.trace.record(
             &self.session.id,
             "turn.state",
@@ -367,40 +491,54 @@ impl HarnessBroker {
                 "from_state":"queued","to_state":"working",
             }),
         );
-
-        if mode == PromptMode::Plan
-            || admission.is_some_and(|admission| admission.plan_event_id.is_some())
+        if mode == PromptMode::Plan || admission.is_some_and(|value| value.plan_event_id.is_some())
         {
-            let patch = self.reconcile_timeline()?;
-            Box::pin(self.emit_timeline_patch(patch, &mut event)).await?;
+            effects.push(AppliedProviderEvent::Timeline(self.reconcile_timeline()?));
         }
-
         self.session.active_task = self.task_controller.current()?;
-        Box::pin(self.emit_session_update(
+        effects.push(AppliedProviderEvent::Update(
             SessionUpdate::ExecutionState {
                 session: Box::new(self.session_view()?),
             },
-            &mut event,
-        ))
-        .await?;
-
-        Ok((interaction, new_interaction, event))
+        ));
+        Ok((interaction, new_interaction, events, effects))
     }
 
-    async fn complete_interaction(
+    pub(super) async fn run_interaction_input_inner(
         &mut self,
-        mut interaction: Exchange,
+        text: String,
+        mode: PromptMode,
+        admission: Option<ExchangeAdmission>,
+        input: ProviderInput,
+    ) -> Result<(Value, Vec<SessionEvent>)> {
+        let (sink, updates) = publication::channel();
+        let dispatch = self.begin_local_interaction_dispatch(text, mode, admission, input, sink)?;
+        let result = self.drive_local_foreground(dispatch, updates).await?;
+        let value = result.response.result().cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "local foreground dispatch failed: {:?}",
+                result.response.error()
+            )
+        })?;
+        Ok((value, result.event))
+    }
+
+    /// Apply completion metadata and derive the exact host effect set under broker ownership.
+    pub(crate) fn stage_host_completion(
+        &mut self,
+        interaction: &mut Exchange,
         mut output: crate::provider::ProviderCompletion,
         mut mode: PromptMode,
-        mut event: Vec<SessionEvent>,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
+    ) -> Result<Box<StagedHostCompletion>> {
         let current = self.task_controller.current()?;
+        let mut discarded_planning = false;
         if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion)
             && output
                 .dispatched_task_permit
                 .as_ref()
                 .is_some_and(|permit| permit.validate(current.as_ref()).is_err())
         {
+            discarded_planning = true;
             output.plan_edit.clear();
             output.design_patch.clear();
             output.plan_read = None;
@@ -424,7 +562,7 @@ impl HarnessBroker {
             self.session.context_usage = Some(context_usage);
             self.context_usage_fresh = true;
         }
-        self.session.provider_session_id = output.provider_session_id.clone();
+        self.session.provider_session_id = output.provider_session_id.clone().map(Into::into);
         self.session.provider_checkpoint_id = output.provider_checkpoint_id.clone();
         if !output.runtime.provider.is_empty() {
             self.session.provider_label = output.runtime.provider.clone();
@@ -437,6 +575,11 @@ impl HarnessBroker {
             anyhow::bail!(control_error);
         }
 
+        let settlement = self.host_settlement();
+        let batches = settlement.as_ref().map(|cell| cell.batches()).transpose()?;
+        if let (Some(cell), Some(batches)) = (&settlement, &batches) {
+            discard_published_terminal_effects(&mut output, batches, cell)?;
+        }
         let elicitation_control_count = usize::from(output.plan_question.is_some())
             + usize::from(output.question_answer.is_some())
             + usize::from(output.question_withdrawal.is_some());
@@ -453,460 +596,102 @@ impl HarnessBroker {
             );
         }
 
-        if mode == PromptMode::Plan
-            || (mode == PromptMode::PlanDiscussion
-                && (!output.plan_edit.is_empty()
-                    || !output.design_patch.is_empty()
-                    || output.plan_submit.is_some()))
-        {
-            let mut plan = self
-                .current_plan_id()?
-                .as_deref()
-                .map(|plan_id| self.store.load_plan(plan_id))
-                .transpose()?
-                .flatten()
-                .filter(|plan| {
-                    matches!(
-                        plan.state,
-                        PlanState::Generating
-                            | PlanState::Revising
-                            | PlanState::AwaitingInput
-                            | PlanState::AwaitingReview
-                    )
-                })
-                .context("planning turn has no active canonical plan")?;
-            self.record_plan_trace(
-                "plan_output_received",
-                json!({
-                    "plan": plan_trace_fields(&plan),
-                    "edit_count": output.plan_edit.len(),
-                    "declaration_patch_count": output.design_patch.len(),
-                    "read": output.plan_read.is_some(),
-                    "submitted": output.plan_submit.is_some(),
-                    "questioned": output.plan_question.is_some(),
-                }),
-            );
-
-            for edit_request in std::mem::take(&mut output.plan_edit) {
-                anyhow::ensure!(
-                    edit_request.plan_id == plan.id,
-                    "edited plan id does not match active plan"
-                );
-                let result = self
-                    .plan_file
-                    .edit_working_document(&self.session.id, edit_request)?;
-                if plan.state == PlanState::AwaitingReview {
-                    PlanStateMachine::apply(
-                        &mut plan,
-                        PlanEvent::ChangesRequested,
-                        self.clock.now_ms(),
-                    )?;
-                    plan.acceptance = None;
-                    plan.user_revision += 1;
-                    plan.generation.reset_no_progress();
-                }
-                plan.document_version = result.version;
-                plan.title = result.document.title;
-                plan.updated_at_ms = self.clock.now_ms();
-            }
-            for request in std::mem::take(&mut output.design_patch) {
-                let document = self
-                    .plan_file
-                    .read_working_document(&self.session.id, &plan.id)?;
-                let updated = document.patch_design(Path::new(&self.session.workspace), request)?;
-                self.plan_file
-                    .write_working_document(&self.session.id, &plan.id, &updated)?;
-                if plan.state == PlanState::AwaitingReview {
-                    PlanStateMachine::apply(
-                        &mut plan,
-                        PlanEvent::ChangesRequested,
-                        self.clock.now_ms(),
-                    )?;
-                    plan.acceptance = None;
-                    plan.user_revision += 1;
-                    plan.generation.reset_no_progress();
-                }
-                plan.document_version = updated.version;
-                plan.title = updated.title;
-                plan.updated_at_ms = self.clock.now_ms();
-            }
-            if let Some(read_plan_id) = output.plan_read.take() {
-                anyhow::ensure!(read_plan_id == plan.id, "requested plan is not active");
-            }
-
-            if let Some(submission) = output.plan_submit.take() {
-                anyhow::ensure!(
-                    submission.plan_id == plan.id,
-                    "submitted plan id does not match active plan"
-                );
-                let mut validated_document = self
-                    .plan_file
-                    .read_working_document(&self.session.id, &plan.id)?;
-                anyhow::ensure!(
-                    validated_document.version == submission.expected_version,
-                    "plan version changed before submission validation"
-                );
-                let validation_warning = if let Some(design) = &mut validated_document.design {
-                    let validated = design.validated(Path::new(&self.session.workspace)).await?;
-                    let warnings = validated.warnings();
-                    *design = validated.into_design();
-                    warnings
-                } else {
-                    Vec::new()
-                };
-                let previous_document = if plan.model_revision == 0 {
-                    None
-                } else {
-                    Some(self.plan_file.read_submitted_document(
-                        &self.session.id,
-                        &plan.id,
-                        plan.model_revision,
-                    )?)
-                };
-                let lifecycle_kind = if plan.model_revision == 0 {
-                    PlanLifecycleKind::Created
-                } else {
-                    PlanLifecycleKind::RevisionCreated
-                };
-                plan.model_revision += 1;
-                let (document, rendered, digest) =
-                    self.plan_file.submit_validated_document_revision(
-                        &self.session.id,
-                        &plan.id,
-                        plan.model_revision,
-                        submission.expected_version,
-                        validated_document,
-                    )?;
-                plan.document_version = document.version;
-                plan.submitted_version = Some(document.version);
-                plan.acceptance = None;
-                plan.title = document.title.clone();
-                plan.review_digest = Some(digest);
-                plan.validation_warning = validation_warning;
-                PlanStateMachine::apply(&mut plan, PlanEvent::PlanSubmitted, self.clock.now_ms())?;
-                self.persist_plan_output(&plan, output.dispatched_entry_id.as_ref())?;
-                self.record_plan_trace("plan_submitted", plan_trace_fields(&plan));
-                if lifecycle_kind == PlanLifecycleKind::RevisionCreated {
-                    let lifecycle = self
-                        .store
-                        .list_plan_lifecycle(&self.session.id)?
-                        .into_iter()
-                        .rev()
-                        .find(|lifecycle| {
-                            lifecycle.plan_id == plan.id
-                                && lifecycle.kind == PlanLifecycleKind::ChangesRequested
-                                && lifecycle.user_revision == plan.user_revision
-                        });
-                    if let Some(lifecycle) =
-                        lifecycle.filter(|lifecycle| !lifecycle.annotation.is_empty())
-                    {
-                        interaction
-                            .node_list
-                            .push(ExchangeNode::PlanCommentResolution {
-                                resolution: crate::exchange::PlanCommentResolution {
-                                    id: format!(
-                                        "{}:resolved-comments:{}",
-                                        interaction.id, plan.user_revision
-                                    ),
-                                    annotation: lifecycle.annotation,
-                                    created_at_ms: self.clock.now_ms(),
-                                },
-                            });
-                    }
-                }
-                let (diff_text, declaration) = if let Some(design) = &document.design {
-                    let delta = crate::plan::revision::DeclarationDelta::between(
-                        previous_document.as_ref(),
-                        design,
-                    )?;
-                    (
-                        delta.files,
-                        Some(crate::exchange::DeclarationRevision {
-                            plan_id: plan.id.clone(),
-                            revision: plan.model_revision,
-                            document_diff: delta.document,
-                            baseline_paths: delta.baseline_paths,
-                        }),
-                    )
-                } else {
-                    let previous_markdown = previous_document
-                        .as_ref()
-                        .map(|document| {
-                            crate::plan::render_plan_at(
-                                document,
-                                Path::new(&self.session.workspace),
-                            )
-                        })
-                        .transpose()?
-                        .map(|rendered| rendered.markdown)
-                        .unwrap_or_default();
-                    (
-                        crate::plan::render_plan_delta(
-                            &plan.working_path,
-                            &previous_markdown,
-                            &rendered.markdown,
-                        ),
-                        None,
-                    )
-                };
-                interaction.node_list.push(ExchangeNode::ArtifactChange {
-                    change: crate::exchange::ArtifactChange {
-                        id: format!("{}:artifact:{}", interaction.id, plan.model_revision),
-                        path: plan.working_path.clone(),
-                        revision_request: false,
-                        diff_text,
-                        declaration,
-                        created_at_ms: self.clock.now_ms(),
-                    },
-                });
-                let lifecycle = PlanLifecycleRecord {
-                    title: plan.title.clone(),
-                    anchor: Some(crate::plan::ExchangeAnchor::capture(&interaction)),
-                    id: Uuid::new_v4().to_string(),
-                    session_id: self.session.id.clone(),
-                    plan_id: plan.id.clone(),
-                    kind: lifecycle_kind,
-                    model_revision: plan.model_revision,
-                    user_revision: plan.user_revision,
-                    overall_comment: None,
-                    annotation: Vec::new(),
-                    question: None,
-                    answer: None,
-                    created_at_ms: self.clock.now_ms(),
-                };
-                self.store.save_plan_lifecycle(&lifecycle)?;
-                event.push(self.event(
-                    if lifecycle_kind == PlanLifecycleKind::Created {
-                        "plan_created"
-                    } else {
-                        "plan_revision_created"
-                    },
-                    json!({
-                        "plan": plan,
-                        "lifecycle": lifecycle,
-                        "document": document,
-                        "content": rendered.markdown,
-                        "navigation": rendered.navigation
-                    }),
-                )?);
-            } else if let Some(question) = output.plan_question.take() {
-                let question = question.normalize()?;
-                if let Some(question) = plan.question_ledger.unresolved(question) {
-                    match plan.elicitation.as_mut() {
-                        Some(elicitation) => elicitation.replace_question_set(question.clone()),
-                        None => {
-                            let elicitation = PlanElicitation::new(question.clone());
-                            plan.elicitation = Some(elicitation);
-                        }
-                    }
-                    PlanStateMachine::apply(
-                        &mut plan,
-                        PlanEvent::QuestionAsked,
-                        self.clock.now_ms(),
-                    )?;
-                    self.persist_plan_output(&plan, output.dispatched_entry_id.as_ref())?;
-                    self.record_plan_trace("plan_question_asked", plan_trace_fields(&plan));
-                    interaction.set_awaiting_input(true);
-                    let lifecycle = PlanLifecycleRecord {
-                        title: plan.title.clone(),
-                        anchor: Some(crate::plan::ExchangeAnchor::capture(&interaction)),
-                        id: Uuid::new_v4().to_string(),
-                        session_id: self.session.id.clone(),
-                        plan_id: plan.id.clone(),
-                        kind: PlanLifecycleKind::QuestionAsked,
-                        model_revision: plan.model_revision,
-                        user_revision: plan.user_revision,
-                        overall_comment: None,
-                        annotation: Vec::new(),
-                        question: Some(question.clone()),
-                        answer: None,
-                        created_at_ms: self.clock.now_ms(),
-                    };
-                    self.store.save_plan_lifecycle(&lifecycle)?;
-                    event.push(self.event(
-                        "plan_question",
-                        json!({ "plan": plan, "lifecycle": lifecycle, "question": question }),
-                    )?);
-                } else {
-                    plan.updated_at_ms = self.clock.now_ms();
-                    self.persist_plan_output(&plan, output.dispatched_entry_id.as_ref())?;
-                    self.record_plan_trace(
-                        "resolved_plan_question_suppressed",
-                        plan_trace_fields(&plan),
-                    );
-                }
-            } else {
-                plan.updated_at_ms = self.clock.now_ms();
-                self.persist_plan_output(&plan, output.dispatched_entry_id.as_ref())?;
-                self.record_plan_trace(
-                    "plan_turn_without_terminal_control",
-                    plan_trace_fields(&plan),
-                );
-            }
-        } else {
-            if let Some(question) = output.plan_question.take() {
-                let question = question.normalize()?;
-                if !self.active_plan_awaits_input()? {
-                    interaction.node_list.push(ExchangeNode::QuestionPresented {
-                        id: format!("{}:question:{}", interaction.id, Uuid::new_v4()),
-                        question: question.clone(),
-                        answer: None,
-                    });
-                }
-                if !self.replace_active_elicitation(question.clone(), &mut event)? {
-                    interaction.set_awaiting_input(true);
-                    let elicitation = PlanElicitation::new(question.clone());
-                    interaction.set_elicitation(Some(elicitation));
-                    self.store.save_exchange(&interaction)?;
-                    event.push(self.event(
-                        "question",
-                        json!({
-                            "owner": "interaction",
-                            "plan_id": self.current_plan_id()?,
-                            "exchange_id": interaction.id,
-                            "elicitation": interaction.elicitation(),
-                        }),
-                    )?);
-                }
-            } else if let Some(answer) = output.question_answer.take() {
-                self.answer_active_elicitation_from_model(answer, &mut event)?;
-            } else if let Some(withdrawal) = output.question_withdrawal.take() {
-                self.withdraw_active_elicitation(withdrawal, &mut event)?;
-            }
-        }
-
-        if refresh_elicitation {
-            let owner = self
-                .store
-                .load_exchange_metadata(&interaction.id)?
-                .context("question control lost its owning exchange")?;
-            interaction.set_elicitation(owner.elicitation().cloned());
-            interaction.set_awaiting_input(owner.awaiting_input());
-        }
-        let question_snapshot = self.questions.snapshot()?;
-        let required_question_stop =
-            question_snapshot.required_in_exchange(&interaction.id) && !self.question_discussion;
-        let execution_paused = interaction.awaiting_input()
-            || question_snapshot.required_pending()
-            || required_question_stop;
-        let observed_task = self.task_controller.current()?;
-        if mode == PromptMode::ExecutePlan {
-            output.evidence.structured_complete = false;
-            output.evidence.tool_called = false;
-            output.evidence.workspace_changed = if output
-                .dispatched_task_permit
-                .as_ref()
-                .is_some_and(|permit| permit.validate_observation(observed_task.as_ref()).is_ok())
-            {
-                self.observe_plan_progress(&interaction).await?
-            } else {
-                false
-            };
-        } else if output
-            .dispatched_task_permit
-            .as_ref()
-            .is_some_and(|permit| permit.validate_observation(observed_task.as_ref()).is_ok())
-        {
-            output.evidence.workspace_changed = self.observe_goal_workspace().await?;
-        }
-        self.session.updated_at_ms = self.clock.now_ms();
-        self.save_session()?;
-        let (evidence, permit) = output.goal_evidence();
-        let completed_turn = crate::task::TaskTurnId {
-            exchange_ordinal: interaction.ordinal,
-            turn_ordinal: interaction.turn.len(),
+        let expected_effects = match &batches {
+            Some(batches) => applicable_host_effects(&output, batches, mode, discarded_planning)?,
+            None => Vec::new(),
         };
-        if required_question_stop
-            && let Some(task) = self.task_controller.current()?
-            && task.status() == crate::task::TaskStatus::Running
-            && task.entry_accepted()
-        {
-            if task.kind() == crate::task::TaskKind::Execute {
-                self.reserve_execution_continuation(completed_turn.clone())?;
-            } else {
-                self.task_controller.reserve_continuation(&mut self.store, &task.permit(), completed_turn.clone(),
-                    "Continue the current task at its preserved phase using the recorded user answers. Do not repeat resolved questions.".into(),
-                    "Continue after required questions are resolved".into(), self.clock.now_ms())?;
-            }
-        }
-        let continuing = if execution_paused || self.question_discussion {
-            false
-        } else {
-            Box::pin(self.apply_goal_evidence(evidence, permit, completed_turn, &mut event)).await?
-        };
-        let runtime = self
-            .exchange_runtime
-            .take()
-            .context("active interaction timeline is missing")?;
-        let remains_open = interaction.awaiting_input();
-        if remains_open {
-            self.exchange_runtime = Some(runtime);
-        } else {
-            let outcome = crate::exchange::ExchangeOutcome::Complete;
-            Box::pin(self.capture_final_checkpoint(&mut interaction, outcome)).await?;
-            interaction.finish(outcome, self.clock.now_ms())?;
-        }
-        self.store.save_exchange(&interaction)?;
-        if !remains_open
-            && let Some(task) = self.task_controller.current()?
-            && let crate::task::WorkflowSnapshot::Execute { execution } = &task.workflow
-            && output.dispatched_execution_id.as_deref() == Some(execution.record.id.as_str())
-            && task.entry.as_ref().map(|entry| &entry.id) == output.dispatched_entry_id.as_ref()
-        {
-            self.reserve_execution_continuation(crate::task::TaskTurnId {
-                exchange_ordinal: interaction.ordinal,
-                turn_ordinal: interaction.turn.len(),
-            })?;
-        }
-        let can_finalize_incrementally = !continuing
-            && mode == PromptMode::Chat
-            && self.current_plan_id()?.is_none()
-            && interaction.elicitation().is_none()
-            && !interaction.awaiting_input()
-            && !self.agent_registry.list().iter().any(|run| {
-                self.agent_registry
-                    .execution(&run.id)
-                    .and_then(|execution| execution.parent_exchange_id.as_deref())
-                    == Some(interaction.id.as_str())
-            });
-        if can_finalize_incrementally {
-            self.active_wait_projection = None;
-            let timeline_patch = self.reconcile_live_interaction(Some(&interaction), None)?;
-            Box::pin(self.emit_timeline_patch(timeline_patch, &mut event)).await?;
-            self.timeline_reconciled_after_dispatch = true;
-        }
-        event.push(self.event(
-            if remains_open {
-                "exchange_updated"
-            } else {
-                "exchange_complete"
-            },
-            json!({"id": interaction.id, "state": interaction.state()}),
-        )?);
-        Ok((
-            json!({ "exchange": {"id": interaction.id, "state": interaction.state()}, "session": self.session_view()?, "capability": self.capability }),
-            event,
-        ))
+        Ok(Box::new(StagedHostCompletion {
+            output,
+            mode,
+            settlement,
+            batches,
+            expected_effects,
+            refresh_elicitation,
+        }))
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn plan_receipt_restores_missing_progress_without_overwriting_newer_progress() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let workspace = tempfile::tempdir()?;
+        let store = crate::plan::PlanFileStore::new(root.path(), workspace.path());
+        let original = store
+            .prepare_entry("session", "objective".into(), None, 1)?
+            .record;
+        let mut recorded = original.clone();
+        recorded.user_revision += 1;
+        recorded.document_version += 1;
+        let mut current = original;
+        reconcile_plan_effect(&mut current, Some(recorded.clone()))?;
+        assert_eq!(current.user_revision, recorded.user_revision);
+        assert_eq!(current.document_version, recorded.document_version);
+        current.document_version += 1;
+        reconcile_plan_effect(&mut current, Some(recorded.clone()))?;
+        assert_eq!(current.document_version, recorded.document_version + 1);
+        current.user_revision -= 1;
+        assert!(reconcile_plan_effect(&mut current, Some(recorded)).is_err());
+        Ok(())
     }
 
-    fn persist_plan_output(
-        &mut self,
-        plan: &PlanRecord,
-        entry_id: Option<&crate::task::TaskInputId>,
-    ) -> Result<()> {
-        let task = self
-            .task_controller
-            .current()?
-            .context("planning task disappeared")?;
-        anyhow::ensure!(
-            task.entry.as_ref().map(|entry| &entry.id) == entry_id,
-            "planning task entry changed"
-        );
-        self.task_controller.apply(
-            &mut self.store,
-            &task.permit(),
-            crate::task::TaskEvent::PlanArtifactUpdated(plan.clone()),
-            self.clock.now_ms(),
-        )
+    #[test]
+    fn published_terminal_effect_is_filtered_without_dropping_a_newer_control() -> Result<()> {
+        use crate::provider::session_execution::{
+            HostEffectId, HostEffectKind, HostEffectOutput, ResultEffectAdmission, SettlementCell,
+        };
+        let cell = Arc::new(SettlementCell::default());
+        let old_id = HostEffectId {
+            batch_revision: 1,
+            kind: HostEffectKind::PlanSubmit,
+            ordinal: 0,
+        };
+        let ResultEffectAdmission::Apply(guard) = cell.begin_result_effect(old_id)? else {
+            panic!("new effect must be reserved")
+        };
+        guard.commit_output(HostEffectOutput {
+            nodes: Vec::new(),
+            events: Vec::new(),
+            elicitation: None,
+            awaiting_input: false,
+            publication_drained: false,
+            plan_document: None,
+            continuing: None,
+            plan_record: None,
+        })?;
+        cell.acknowledge_effect_publication(old_id)?;
+        let first = ProviderCompletion {
+            plan_submit: Some(crate::provider::PlanSubmitRequest {
+                plan_id: "plan".into(),
+                expected_version: 1,
+            }),
+            ..Default::default()
+        };
+        let second = ProviderCompletion {
+            plan_question: Some(PlanQuestionSet {
+                id: "question".into(),
+                questions: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let mut output = first.clone();
+        output.merge_execution(second.clone());
+        let batches = vec![
+            crate::provider::HostEffectBatch {
+                revision: 1,
+                completion: first,
+            },
+            crate::provider::HostEffectBatch {
+                revision: 2,
+                completion: second,
+            },
+        ];
+        discard_published_terminal_effects(&mut output, &batches, &cell)?;
+        assert!(output.plan_submit.is_none());
+        assert!(output.plan_question.is_some());
+        Ok(())
     }
 }

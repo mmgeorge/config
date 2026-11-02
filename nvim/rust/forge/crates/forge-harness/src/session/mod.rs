@@ -207,6 +207,8 @@ pub trait SessionStore {
     fn delete_session(&mut self, session_id: &str) -> Result<()>;
 }
 
+pub use forge_provider_api::{approval::ApprovalMode, context::ContextUsage};
+
 #[cfg(test)]
 mod context_usage_test {
     use super::ContextUsage;
@@ -226,5 +228,3 @@ mod context_usage_test {
         assert_eq!(usage.remaining_percent, 22);
     }
 }
-
-pub use forge_provider_api::{approval::ApprovalMode, context::ContextUsage};

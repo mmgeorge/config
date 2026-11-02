@@ -1,24 +1,49 @@
 #[cfg(test)]
 use crate::provider::ProviderAdapter as _;
 mod acceptance;
-mod admission;
 #[cfg(test)]
 mod cancellation_test;
 #[cfg(test)]
 mod change_results_test;
+mod checkpoint_settlement;
 mod checks;
+pub(crate) use checkpoint_settlement::FinalCheckpointCommit;
+pub(crate) use checks::OwnedTaskChecks;
+mod compaction;
 mod configuration;
+pub(crate) use compaction::CompactionProvenance;
 mod execution;
+mod execution_progress;
+mod foreground_completion;
+mod foreground_failure;
+mod foreground_finalization;
+mod foreground_goal_effect;
+mod foreground_local;
+mod foreground_plan_effect;
+mod foreground_undo;
 mod fork;
 mod interaction;
+mod prior_finalization;
+pub(crate) use prior_finalization::PriorFinalizationAction;
+mod foreground_dispatch;
+mod foreground_start;
+mod foreground_step;
+mod foreground_workspace;
+use foreground_dispatch::ForegroundAdmission;
+pub(crate) use foreground_dispatch::ForegroundDispatch;
 pub mod publication;
 use publication::{ConfigurationProgressState, SessionUpdate, TimelineUpdate};
+mod check_admission;
+mod check_completion;
 mod new_session;
 mod observation;
+mod plan_checks_update;
 pub(crate) mod plan_entry;
 mod project_checks;
+pub(crate) use check_admission::AutomaticCheckAction;
+pub(crate) use plan_checks_update::{PlanChecksUpdateJob, PlanChecksUpdateResult};
+mod reopening;
 mod review_question;
-pub(crate) mod session_events;
 pub(crate) use observation::BrokerObserver;
 
 pub use fork::{ForkPreparation, prepare_provider_fork};
@@ -41,13 +66,14 @@ use crate::plan::{
     PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanState,
 };
 use crate::protocol::RuntimeMethod;
+#[cfg(test)]
+use crate::provider::ProviderForkRequest;
 use crate::provider::approval::{ApprovalRequestView, PermissionCoordinator};
 use crate::provider::{
-    PromptMode, Provider, ProviderCapability, ProviderCatalogRequest, ProviderEvent, ProviderInput,
-    ProviderLaunch, ProviderRequest,
+    PromptMode, Provider, ProviderCapability, ProviderCatalogRequest, ProviderCompletion,
+    ProviderError, ProviderEvent, ProviderEventSink, ProviderInput, ProviderLaunch,
+    ProviderRequest,
 };
-#[cfg(test)]
-use crate::provider::{ProviderEventSink, ProviderForkRequest};
 use crate::session::{
     ApprovalMode, ContextUsage, HarnessPreference, HarnessSession, ModelSetting, PlanExecutor,
     ProviderForkState, SessionStore,
@@ -251,13 +277,1106 @@ pub struct ActiveElicitation {
     pub elicitation: PlanElicitation,
 }
 
-struct ProviderSteering<'turn> {
-    active: &'turn mut crate::provider::ActiveSteering,
-    deferred: &'turn mut std::collections::VecDeque<crate::provider::SteerCommand>,
-    continuation: Option<crate::provider::SteerCommand>,
+/// Preserve update ordering after durable state has been applied.
+pub(crate) struct PendingLivePublication {
+    /// Notification emitted before the timeline patch.
+    pub(crate) update: SessionUpdate,
+    /// Timeline patch captured after applying the event.
+    pub(crate) timeline: TimelinePatch,
 }
 
-struct ExchangeRuntime {
+/// Separate durable provider event application from ordered publication.
+pub(crate) enum AppliedProviderEvent {
+    /// State application produced no publication.
+    None,
+    /// Publish one session update.
+    Update(SessionUpdate),
+    /// Publish an update followed by its timeline patch.
+    Live(PendingLivePublication),
+    /// Publish a timeline patch.
+    Timeline(TimelinePatch),
+    /// Publish multiple already-applied effects in their original order.
+    Effects(Vec<AppliedProviderEvent>),
+    /// Continue an active native goal through its checkpoint transition.
+    NativeGoalContinuation(ProviderEvent),
+}
+
+/// Own ordered presentation delivery independently of mutable broker state.
+pub(crate) struct PendingProviderDelivery {
+    sink: Option<publication::SessionUpdateSink>,
+    updates: Vec<SessionUpdate>,
+    events: Vec<SessionEvent>,
+}
+
+impl PendingProviderDelivery {
+    /// Deliver queued updates in order and collect events for non-streaming callers.
+    pub(crate) async fn deliver(self) -> Result<Vec<SessionEvent>> {
+        if let Some(sink) = self.sink {
+            for update in self.updates {
+                sink.send_wait(update).await?;
+            }
+        }
+        Ok(self.events)
+    }
+
+    /// Wait until the external forwarder has consumed every update in this batch.
+    pub(crate) async fn deliver_and_flush(self) -> Result<Vec<SessionEvent>> {
+        let sink = self.sink.clone();
+        let events = self.deliver().await?;
+        if let Some(sink) = sink {
+            sink.flush().await?;
+        }
+        Ok(events)
+    }
+}
+
+pub(crate) struct ProviderSteering {
+    pub(crate) active: crate::provider::ActiveSteering,
+    pub(crate) deferred: std::collections::VecDeque<crate::provider::SteerCommand>,
+}
+
+/// Own the mutable exchange and its runtime while the service waits for provider work.
+pub(crate) struct OwnedForegroundTransaction {
+    scope: crate::provider::InvocationScope,
+    interaction: Exchange,
+    runtime: Option<ExchangeRuntime>,
+}
+
+/// Distinguish native completion from a deliberate required-question handoff.
+pub(crate) enum ForegroundOutcome {
+    NativeReady(Result<crate::provider::ProviderCompletion, crate::provider::ProviderError>),
+    RequiredQuestion {
+        ready: Result<crate::provider::ProviderCompletion, crate::provider::ProviderError>,
+        completion: Box<crate::provider::ProviderCompletion>,
+    },
+}
+
+/// Own native waiting resources independently of the broker mutex.
+pub(crate) struct ForegroundWait<T: Send + 'static> {
+    events: crate::provider::events::ProviderEventStream,
+    task: tokio::task::JoinSet<Result<T>>,
+    cancellation: Arc<TurnCancellation>,
+    watchdog: Arc<crate::provider::tool_timeout::ToolWatchdog>,
+    stream_open: bool,
+}
+
+/// Describe one event returned by the independently owned native wait.
+pub(crate) enum NativeForegroundSignal<T> {
+    Cancelled,
+    ToolExpired(crate::provider::tool_timeout::ToolTimeout),
+    ProviderEvent(ProviderEvent),
+    NativeReady(T),
+}
+
+impl<T: Send + 'static> ForegroundWait<T> {
+    /// Start an owned provider future and attach its native event stream.
+    pub(crate) fn start(
+        events: crate::provider::events::ProviderEventStream,
+        submission: impl std::future::Future<Output = Result<T>> + Send + 'static,
+        cancellation: Arc<TurnCancellation>,
+        watchdog: Arc<crate::provider::tool_timeout::ToolWatchdog>,
+    ) -> Self {
+        let mut task = tokio::task::JoinSet::new();
+        task.spawn(submission);
+        Self {
+            events,
+            task,
+            cancellation,
+            watchdog,
+            stream_open: true,
+        }
+    }
+
+    /// Continue the same invocation without replacing its event stream or watchdog.
+    pub(crate) fn restart(
+        &mut self,
+        submission: impl std::future::Future<Output = Result<T>> + Send + 'static,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.task.is_empty(),
+            "previous provider attempt is still running"
+        );
+        self.task.spawn(submission);
+        Ok(())
+    }
+
+    /// Wait for native progress without retaining broker state or a presentation lock.
+    pub(crate) async fn next(&mut self) -> Result<NativeForegroundSignal<T>> {
+        loop {
+            tokio::select! {
+                biased;
+                () = self.cancellation.cancelled() => return Ok(NativeForegroundSignal::Cancelled),
+                expired = self.watchdog.expired() => {
+                    return Ok(NativeForegroundSignal::ToolExpired(expired?.context("tool watchdog ended during foreground execution")?));
+                }
+                event = self.events.recv(), if self.stream_open => match event {
+                    Ok(Some(event)) => return Ok(NativeForegroundSignal::ProviderEvent(event)),
+                    Ok(None) => self.stream_open = false,
+                    Err(error) => return Err(error.into()),
+                },
+                result = self.task.join_next() => {
+                    return Ok(NativeForegroundSignal::NativeReady(result.context("provider task ended without an outcome")?.context("provider task failed")??));
+                }
+            }
+        }
+    }
+}
+
+/// Own all resources polled during one foreground request outside the broker lock.
+pub(crate) struct ForegroundTransaction {
+    pub(crate) state: OwnedForegroundTransaction,
+    pub(crate) request: ProviderRequest,
+    pub(crate) mode: PromptMode,
+    pub(crate) settlement: Arc<crate::provider::session_execution::SettlementCell>,
+    pub(crate) continuation_count: u32,
+    pub(crate) dispatched_task_permit: Option<crate::task::TaskPermit>,
+    pub(crate) dispatched_execution_id: Option<String>,
+    pub(crate) dispatched_entry_id: Option<crate::task::TaskInputId>,
+    pub(crate) _repository_lease: crate::tools::repository::RepositoryToolLease,
+    pub(crate) _inspection_lease: crate::tools::session::InspectionLease,
+    pub(crate) _lsp_lease: crate::tools::lsp::LspLease,
+    pub(crate) native: ForegroundWait<ProviderAttempt>,
+    pub(crate) native_open: bool,
+    pub(crate) idle_native_active: bool,
+    pub(crate) provider_event_sink: ProviderEventSink,
+    pub(crate) engine: Arc<crate::provider::session_execution::SessionExecution>,
+    pub(crate) steering: ProviderSteering,
+    pub(crate) agent_revision: tokio::sync::watch::Receiver<u64>,
+    pub(crate) question_changes: tokio::sync::watch::Receiver<u64>,
+    pub(crate) cleanup: tokio::sync::watch::Receiver<ExecutionCleanup>,
+    pub(crate) execution_receiver:
+        tokio::sync::mpsc::Receiver<crate::plan::execution::ExecutionControl>,
+    pub(crate) pending_revision: Option<(
+        tokio::sync::oneshot::Sender<Result<Value>>,
+        crate::plan::revision_review::RevisionReviewWait,
+    )>,
+    pub(crate) task_authority: Option<crate::tools::TaskAuthority>,
+    pub(crate) revision_job_active: bool,
+    pub(crate) agent_command_active: bool,
+    pub(crate) result_delivery: tokio::task::JoinSet<(crate::agent::AgentTask, Result<()>)>,
+    pub(crate) attached_results: Vec<crate::agent::AgentTask>,
+    pub(crate) attempted_results: std::collections::HashSet<String>,
+    pub(crate) pending_agent_launch: std::collections::VecDeque<PendingAgentLaunch>,
+    pub(crate) pending_agent_reply: Option<(tokio::sync::oneshot::Sender<Result<Value>>, Value)>,
+    pub(crate) pending_agent_interrupt: Option<(Vec<String>, OwnedAgentRequest, Value)>,
+    pub(crate) user_delivery: tokio::task::JoinSet<(crate::provider::SteerCommand, Result<()>)>,
+    pub(crate) session_events: Arc<crate::provider::session_execution::SessionObservationInbox>,
+    pub(crate) delivery_sink: Option<publication::SessionUpdateSink>,
+    pub(crate) scan_interval: tokio::time::Interval,
+    pub(crate) execution_id: Option<String>,
+    pub(crate) question_enabled: bool,
+    pub(crate) question_stop_pending: bool,
+    pub(crate) question_override: Option<ProviderCompletion>,
+    pub(crate) pending_native_ready: Option<Result<ProviderCompletion, ProviderError>>,
+    pub(crate) scan_enabled: bool,
+    pub(crate) cleanup_open: bool,
+    pub(crate) execution_open: bool,
+    pub(crate) _agent_lease: crate::agent::AgentToolLease,
+    pub(crate) _check_lease: crate::checks::CheckToolLease,
+    pub(crate) native_goal: Option<NativeGoalTransition>,
+    pub(crate) pending_goal_effects: Vec<AppliedProviderEvent>,
+    pub(crate) pending_goal_events: Vec<SessionEvent>,
+    pub(crate) pending_session_observations: std::collections::VecDeque<ProviderEvent>,
+    pub(crate) observation_publication_in_flight: bool,
+    pub(crate) finalization: Option<Box<foreground_finalization::ForegroundFinalization>>,
+    pub(crate) failure_cleanup_active: bool,
+    pub(crate) failure_inbox_open: bool,
+    pub(crate) failure: Option<foreground_failure::ForegroundFailure>,
+    pub(crate) failure_secondary: Vec<String>,
+}
+
+/// Track checkpoint phases for an authorized native-goal continuation.
+pub(crate) enum NativeGoalTransition {
+    Initial {
+        observation: ProviderEvent,
+        outcome: crate::exchange::ExchangeOutcome,
+    },
+    Final {
+        observation: ProviderEvent,
+        outcome: crate::exchange::ExchangeOutcome,
+    },
+    ContinuationInitial {
+        observation: ProviderEvent,
+    },
+}
+
+/// Describe a single owned foreground wait result for a short broker state step.
+pub(crate) enum ForegroundSignal {
+    AdmissionWorkspaceCompleted(Box<foreground_workspace::AdmissionWorkspaceResult>),
+    AdmissionRequested,
+    AdmissionPrepared,
+    FinalizeEffectsRequested,
+    PublicationDrained,
+    QuestionCatalog(Result<Vec<crate::provider::ProviderModel>>),
+    ProviderPrepared(Result<Arc<crate::provider::session_execution::SessionExecution>>),
+    Native(NativeForegroundSignal<ProviderAttempt>),
+    QuestionChanged,
+    QuestionStopped(Box<Result<ProviderCompletion>>),
+    Checkpoint(Result<crate::checkpoint::CheckpointRecord>),
+    UserInput(crate::provider::SteerCommand),
+    UserDelivery((crate::provider::SteerCommand, Result<()>)),
+    AgentChanged,
+    AgentDelivery(Box<(crate::agent::AgentTask, Result<()>)>),
+    AgentResultDelivered {
+        task: Box<crate::agent::AgentTask>,
+        result: Result<()>,
+    },
+    AgentApprovalsCancelled {
+        completion: Box<AgentCompletion>,
+        result: Result<()>,
+    },
+    AgentInterrupted {
+        operation: AgentInterrupt,
+        completed: usize,
+        result: Result<()>,
+    },
+    AgentSpawnSelected {
+        request: OwnedAgentRequest,
+        selection: Box<Result<crate::agent::AgentSelection>>,
+    },
+    AgentMessageSteered {
+        request: OwnedAgentRequest,
+        registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
+        owner: crate::provider::ExecutionOwner,
+        result: Result<()>,
+    },
+    ExecutionControl(crate::plan::execution::ExecutionControl),
+    ExecutionControlEvidence {
+        response: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
+        submission: bool,
+        result: Box<Result<execution::ExecutionControlEvidence>>,
+    },
+    ExecutionControlReport {
+        response: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
+        submission: bool,
+        result: Box<Result<execution::ExecutionControlReport>>,
+    },
+    RevisionReview(crate::plan::revision_review::RevisionReviewRequest),
+    RevisionChecksUpdated {
+        response: tokio::sync::oneshot::Sender<Result<(Value, Vec<SessionEvent>)>>,
+        result: Box<Result<PlanChecksUpdateResult>>,
+    },
+    PlanScan,
+    PlanScanned(Box<Result<execution::ExecutionScanResult>>),
+    PlanMutationCompleted(Result<foreground_plan_effect::PlanMutationResult>),
+    FinalCheckpoint(Result<checkpoint_settlement::FinalCheckpointResult>),
+    AutomaticCheckRefreshed(Box<Result<check_admission::AutomaticCheckRefreshResult>>),
+    AutomaticCheckCompleted(Box<Result<check_admission::AutomaticCheckResult>>),
+    SettlementReady {
+        checkout: crate::provider::session_execution::SettlementCheckout,
+        ready: Box<Result<crate::provider::session_execution::NativeReady, ProviderError>>,
+    },
+    SettlementCommitted(Result<(), crate::provider::session_execution::SettlementError>),
+    Cleanup(ExecutionCleanup),
+    SessionObservationsReady,
+    PublicationFailed(std::io::Error),
+    EffectFailed(anyhow::Error),
+    CleanupCompleted {
+        original: anyhow::Error,
+        cleanup: Result<(), ProviderError>,
+    },
+    FailurePublicationCompleted(Result<Vec<SessionEvent>>),
+    FailurePublicationNeedsForward {
+        events: Vec<SessionEvent>,
+    },
+    FailureAdmissionEventsNeedForward {
+        events: Vec<SessionEvent>,
+    },
+    FailureAdmissionEventsForwarded(Result<()>),
+    AdmissionEventsNeedForward {
+        events: Vec<SessionEvent>,
+    },
+    AdmissionEventsForwarded(Result<()>),
+    CommandEventsNeedForward {
+        events: Vec<SessionEvent>,
+    },
+    CommandEventsForwarded(Result<()>),
+    AdmissionCleanupCompleted(foreground_failure::AdmissionCleanupResult),
+    AdmissionFailureCheckpointCompleted(Result<checkpoint_settlement::FinalCheckpointResult>),
+    FailureCheckpointCompleted(Result<checkpoint_settlement::FinalCheckpointResult>),
+    CancelledTurnRollbackCompleted(foreground_failure::CancelledTurnRollbackResult),
+    RetractionGoalRestored(Result<()>),
+    PlanSubmissionCompleted(Result<foreground_plan_effect::PlanSubmissionResult>),
+    PlanQuestionCompleted(Result<foreground_plan_effect::PlanQuestionResult>),
+    GoalProgressCompleted(Box<Result<foreground_goal_effect::GoalProgressResult>>),
+    ExecutionProgressCompleted(Box<Result<foreground_goal_effect::ExecutionProgressResult>>),
+    TaskCompacted(Box<Result<crate::provider::ProviderOutput>>),
+    CompactionCompleted(Box<compaction::CompactionResult>),
+    FinalizeChecksRequested,
+    FinalizeCheckContinuationRequested,
+    FinalResponseNeedsForward {
+        events: Vec<SessionEvent>,
+    },
+    FinalResponsePublished(Result<Vec<SessionEvent>>),
+    ClarificationNeedsForward {
+        events: Vec<SessionEvent>,
+    },
+    ClarificationPublished(Result<Vec<SessionEvent>>),
+    CheckRepairNeedsForward {
+        events: Vec<SessionEvent>,
+    },
+    CheckRepairPublished(Result<Vec<SessionEvent>>),
+    PermissionNeedsForward {
+        events: Vec<SessionEvent>,
+    },
+    PermissionPublished(Result<Vec<SessionEvent>>),
+    CommandNeedsForward {
+        events: Vec<SessionEvent>,
+    },
+    CommandPublished(Result<Vec<SessionEvent>>),
+    AutoCompactionNeedsForward {
+        events: Vec<SessionEvent>,
+    },
+    AutoCompactionPublished(Result<Vec<SessionEvent>>),
+    ObservationPublicationDelivered(Result<Vec<SessionEvent>>),
+    ObservationPublicationNeedsForward {
+        events: Vec<SessionEvent>,
+    },
+    PublicationDelivered(Vec<SessionEvent>),
+    PlanTerminalPublished(Result<Vec<SessionEvent>>),
+    PlanTerminalNeedsForward {
+        events: Vec<SessionEvent>,
+        receipts: OwnedEffectReceipts,
+    },
+    PriorObservationReady(Result<()>),
+    PriorInitialCompleted(Result<crate::checkpoint::CheckpointRecord>),
+    PriorFinalCompleted(Result<checkpoint_settlement::FinalCheckpointResult>),
+    UserDeliverySettled(Option<crate::provider::SteerCommand>),
+}
+
+/// Describe the next service action after a short broker state transition.
+pub(crate) enum ForegroundAction {
+    Wait,
+    CancelJobsAndEffect(ForegroundJob),
+    WaitForPublicationDrain,
+    Effect(ForegroundJob),
+    Finish,
+    FinishFailure(anyhow::Error),
+}
+
+/// Retain effect receipts until a caller has forwarded their session events.
+pub(crate) struct OwnedEffectReceipts {
+    cell: Arc<crate::provider::session_execution::SettlementCell>,
+    ids: Vec<crate::provider::session_execution::HostEffectId>,
+}
+
+impl OwnedEffectReceipts {
+    /// Mark effects published only after their outbound delivery succeeds.
+    pub(crate) fn acknowledge(self) -> Result<()> {
+        for id in self.ids {
+            self.cell.acknowledge_effect_publication(id)?;
+        }
+        Ok(())
+    }
+}
+
+/// Distinguish an applied provider event from a goal checkpoint transition.
+pub(crate) enum ForegroundEventApplication {
+    Publication(Box<ForegroundJob>),
+    NativeGoalContinuation(Box<ProviderEvent>),
+}
+
+/// Retain a child launch and the response that becomes valid after it starts.
+pub(crate) struct PendingAgentLaunch {
+    work: crate::agent::AgentWork,
+    reply: Option<(tokio::sync::oneshot::Sender<Result<Value>>, Value)>,
+}
+
+/// Child completion and the approvals observed before unlocked cancellation.
+pub(crate) struct AgentCompletion {
+    owner: crate::provider::ExecutionOwner,
+    task_id: String,
+    output: Result<crate::provider::ProviderCompletion>,
+    cleanup_error: Option<String>,
+    approvals: Vec<ApprovalRequestView>,
+}
+
+/// Retain interruption ownership and its reply while child cleanup runs unlocked.
+pub(crate) struct AgentInterrupt {
+    items: Vec<AgentInterruptItem>,
+    remaining: Vec<String>,
+    request: OwnedAgentRequest,
+    result: Value,
+}
+
+/// Keep child request ownership and reply while provider work runs unlocked.
+pub(crate) struct OwnedAgentRequest {
+    request: crate::agent::AgentRequest,
+    authority: Option<crate::agent::AgentRequestAuthority>,
+    response: tokio::sync::oneshot::Sender<Result<Value>>,
+    parent_id: String,
+}
+
+struct AgentInterruptItem {
+    agent: Agent,
+    owner: crate::provider::ExecutionOwner,
+    cancelled: Vec<crate::agent::AgentTask>,
+    cleanup: Option<crate::agent::AgentTask>,
+    provider: Option<Arc<Provider>>,
+    approvals: Vec<ApprovalRequestView>,
+}
+
+/// Own provider work that can run without retaining a broker guard.
+pub(crate) enum ForegroundJob {
+    AdmissionWorkspace(foreground_workspace::AdmissionWorkspaceJob),
+    ProviderPrepare(foreground_dispatch::ProviderPrepareJob),
+    QuestionCatalog(Box<foreground_dispatch::QuestionModelCatalogJob>),
+    Publication(PendingProviderDelivery),
+    FailurePublication(PendingProviderDelivery),
+    FailureAdmissionEvents(Vec<SessionEvent>),
+    AdmissionEvents(Vec<SessionEvent>),
+    CommandEvents(Vec<SessionEvent>),
+    AdmissionCleanup(foreground_failure::AdmissionCleanupJob),
+    AdmissionFailureCheckpoint(Box<checkpoint_settlement::FinalCheckpointJob>),
+    FinalResponsePublication(PendingProviderDelivery),
+    ClarificationPublication(PendingProviderDelivery),
+    CheckRepairPublication(PendingProviderDelivery),
+    PermissionPublication(PendingProviderDelivery),
+    CommandPublication(PendingProviderDelivery),
+    AutoCompactionPublication(PendingProviderDelivery),
+    ObservationPublication(PendingProviderDelivery),
+    FailureCheckpoint(Box<checkpoint_settlement::FinalCheckpointJob>),
+    CancelledTurnRollback(foreground_failure::CancelledTurnRollbackJob),
+    RetractionGoal(Box<foreground_failure::RetractionGoalJob>),
+    PlanSubmission(Box<foreground_plan_effect::PlanSubmissionJob>),
+    PlanQuestion(Box<foreground_plan_effect::PlanQuestionJob>),
+    GoalProgress(Box<foreground_goal_effect::GoalProgressJob>),
+    ExecutionProgress(Box<foreground_goal_effect::ExecutionProgressJob>),
+    TaskCompaction(Box<foreground_dispatch::TaskCompactionJob>),
+    Compaction(Box<compaction::CompactionJob>),
+    CleanupForeground {
+        engine: Arc<crate::provider::session_execution::SessionExecution>,
+        native: tokio::task::JoinSet<Result<ProviderAttempt>>,
+        original: anyhow::Error,
+    },
+    QuestionStop {
+        provider: Arc<Provider>,
+        session_id: String,
+        fallback: Option<forge_provider_api::ProviderSessionId>,
+        checkpoint: Option<String>,
+        capability: ProviderCapability,
+    },
+    PlanTerminalPublication {
+        delivery: PendingProviderDelivery,
+        cell: Arc<crate::provider::session_execution::SettlementCell>,
+        id: crate::provider::session_execution::HostEffectId,
+    },
+    PriorObservation(prior_finalization::PriorObservationJob),
+    PriorInitial(prior_finalization::PriorInitialJob),
+    PriorFinal(Box<prior_finalization::PriorFinalJob>),
+    PlanScan(Box<execution::ExecutionScanJob>),
+    PlanMutation(Box<foreground_plan_effect::PlanMutationJob>),
+    ExecutionControl {
+        job: Box<execution::ExecutionControlJob>,
+        response: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
+        submission: bool,
+    },
+    ExecutionControlReport {
+        job: Box<execution::ExecutionControlReportJob>,
+        response: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
+        submission: bool,
+    },
+    RevisionChecksUpdate {
+        job: Box<PlanChecksUpdateJob>,
+        response: tokio::sync::oneshot::Sender<Result<(Value, Vec<SessionEvent>)>>,
+    },
+    AgentResult {
+        engine: Arc<crate::provider::session_execution::SessionExecution>,
+        scope: crate::provider::InvocationScope,
+        task: Box<crate::agent::AgentTask>,
+        message: String,
+    },
+    AgentCancelApprovals {
+        coordinator: Arc<PermissionCoordinator>,
+        completion: Box<AgentCompletion>,
+    },
+    AgentInterrupt {
+        coordinator: Arc<PermissionCoordinator>,
+        operation: AgentInterrupt,
+    },
+    AgentSpawnSelect {
+        factory: crate::agent::AgentProviderFactory,
+        root: Box<ProviderRequest>,
+        root_provider: crate::provider::ProviderKind,
+        spawn: crate::agent::SpawnAgentRequest,
+        request: OwnedAgentRequest,
+    },
+    AgentMessageSteer {
+        registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
+        owner: crate::provider::ExecutionOwner,
+        message: String,
+        request: OwnedAgentRequest,
+    },
+    FinalCheckpoint(Box<checkpoint_settlement::FinalCheckpointJob>),
+    AutomaticCheckRefresh(Box<check_admission::AutomaticCheckRefresh>),
+    AutomaticCheckRun(Box<check_admission::AutomaticCheckRun>),
+    SettlementRefresh {
+        engine: Arc<crate::provider::session_execution::SessionExecution>,
+        scope: crate::provider::InvocationScope,
+        checkout: crate::provider::session_execution::SettlementCheckout,
+    },
+    SettlementCommit(Arc<crate::provider::session_execution::SettlementCell>),
+    UserSteering {
+        engine: Arc<crate::provider::session_execution::SessionExecution>,
+        scope: crate::provider::InvocationScope,
+        input: crate::provider::SteerCommand,
+    },
+    SettleUserDelivery {
+        input: crate::provider::SteerCommand,
+        result: Result<()>,
+    },
+}
+
+impl ForegroundJob {
+    /// Identify presentation batches that must be delivered in session order.
+    pub(crate) fn is_publication(&self) -> bool {
+        matches!(
+            self,
+            Self::Publication(_)
+                | Self::ObservationPublication(_)
+                | Self::FailurePublication(_)
+                | Self::FailureAdmissionEvents(_)
+                | Self::AdmissionEvents(_)
+                | Self::CommandEvents(_)
+                | Self::FinalResponsePublication(_)
+                | Self::ClarificationPublication(_)
+                | Self::CheckRepairPublication(_)
+                | Self::PermissionPublication(_)
+                | Self::CommandPublication(_)
+                | Self::AutoCompactionPublication(_)
+                | Self::PlanTerminalPublication { .. }
+        )
+    }
+
+    /// Run one owned action and return its result to the serialized broker step.
+    pub(crate) async fn run(self) -> Result<ForegroundSignal> {
+        match self {
+            Self::PriorObservation(job) => {
+                Ok(ForegroundSignal::PriorObservationReady(job.run().await))
+            }
+            Self::PriorInitial(job) => Ok(ForegroundSignal::PriorInitialCompleted(job.run().await)),
+            Self::PriorFinal(job) => Ok(ForegroundSignal::PriorFinalCompleted(job.run().await)),
+            Self::PlanTerminalPublication { delivery, cell, id } => {
+                let events = match delivery.deliver_and_flush().await {
+                    Ok(events) => events,
+                    Err(error) => return Ok(ForegroundSignal::PlanTerminalPublished(Err(error))),
+                };
+                let receipts = OwnedEffectReceipts {
+                    cell,
+                    ids: vec![id],
+                };
+                if !events.is_empty() {
+                    return Ok(ForegroundSignal::PlanTerminalNeedsForward { events, receipts });
+                }
+                Ok(ForegroundSignal::PlanTerminalPublished(
+                    receipts.acknowledge().map(|()| events),
+                ))
+            }
+            Self::AdmissionWorkspace(job) => Ok(ForegroundSignal::AdmissionWorkspaceCompleted(
+                Box::new(job.run().await),
+            )),
+            Self::CleanupForeground {
+                engine,
+                mut native,
+                original,
+            } => {
+                let mut cleanup = engine.close().await;
+                while let Some(result) = native.join_next().await {
+                    if let Err(error) = result
+                        && cleanup.is_ok()
+                    {
+                        cleanup = Err(ProviderError::Protocol {
+                            message: format!("provider task join failed: {error}"),
+                        });
+                    }
+                }
+                Ok(ForegroundSignal::CleanupCompleted { original, cleanup })
+            }
+            Self::CancelledTurnRollback(job) => Ok(
+                ForegroundSignal::CancelledTurnRollbackCompleted(job.run().await),
+            ),
+            Self::FailurePublication(delivery) => match delivery.deliver_and_flush().await {
+                Ok(events) if !events.is_empty() => {
+                    Ok(ForegroundSignal::FailurePublicationNeedsForward { events })
+                }
+                Ok(events) => Ok(ForegroundSignal::FailurePublicationCompleted(Ok(events))),
+                Err(error) => Ok(ForegroundSignal::FailurePublicationCompleted(Err(error))),
+            },
+            Self::FailureAdmissionEvents(events) => {
+                Ok(ForegroundSignal::FailureAdmissionEventsNeedForward { events })
+            }
+            Self::AdmissionEvents(events) => {
+                Ok(ForegroundSignal::AdmissionEventsNeedForward { events })
+            }
+            Self::CommandEvents(events) => {
+                Ok(ForegroundSignal::CommandEventsNeedForward { events })
+            }
+            Self::AdmissionCleanup(job) => {
+                Ok(ForegroundSignal::AdmissionCleanupCompleted(job.run().await))
+            }
+            Self::AdmissionFailureCheckpoint(job) => Ok(
+                ForegroundSignal::AdmissionFailureCheckpointCompleted(job.run().await),
+            ),
+            Self::ObservationPublication(delivery) => match delivery.deliver_and_flush().await {
+                Ok(events) if !events.is_empty() => {
+                    Ok(ForegroundSignal::ObservationPublicationNeedsForward { events })
+                }
+                Ok(events) => Ok(ForegroundSignal::ObservationPublicationDelivered(Ok(
+                    events,
+                ))),
+                Err(error) => Ok(ForegroundSignal::ObservationPublicationDelivered(Err(
+                    error,
+                ))),
+            },
+            Self::FinalResponsePublication(delivery) => match delivery.deliver_and_flush().await {
+                Ok(events) if !events.is_empty() => {
+                    Ok(ForegroundSignal::FinalResponseNeedsForward { events })
+                }
+                Ok(events) => Ok(ForegroundSignal::FinalResponsePublished(Ok(events))),
+                Err(error) => Ok(ForegroundSignal::FinalResponsePublished(Err(error))),
+            },
+            Self::ClarificationPublication(delivery) => match delivery.deliver_and_flush().await {
+                Ok(events) if !events.is_empty() => {
+                    Ok(ForegroundSignal::ClarificationNeedsForward { events })
+                }
+                Ok(events) => Ok(ForegroundSignal::ClarificationPublished(Ok(events))),
+                Err(error) => Ok(ForegroundSignal::ClarificationPublished(Err(error))),
+            },
+            Self::CheckRepairPublication(delivery) => match delivery.deliver_and_flush().await {
+                Ok(events) if !events.is_empty() => {
+                    Ok(ForegroundSignal::CheckRepairNeedsForward { events })
+                }
+                Ok(events) => Ok(ForegroundSignal::CheckRepairPublished(Ok(events))),
+                Err(error) => Ok(ForegroundSignal::CheckRepairPublished(Err(error))),
+            },
+            Self::PermissionPublication(delivery) => match delivery.deliver_and_flush().await {
+                Ok(events) if !events.is_empty() => {
+                    Ok(ForegroundSignal::PermissionNeedsForward { events })
+                }
+                Ok(events) => Ok(ForegroundSignal::PermissionPublished(Ok(events))),
+                Err(error) => Ok(ForegroundSignal::PermissionPublished(Err(error))),
+            },
+            Self::CommandPublication(delivery) => match delivery.deliver_and_flush().await {
+                Ok(events) if !events.is_empty() => {
+                    Ok(ForegroundSignal::CommandNeedsForward { events })
+                }
+                Ok(events) => Ok(ForegroundSignal::CommandPublished(Ok(events))),
+                Err(error) => Ok(ForegroundSignal::CommandPublished(Err(error))),
+            },
+            Self::AutoCompactionPublication(delivery) => match delivery.deliver_and_flush().await {
+                Ok(events) if !events.is_empty() => {
+                    Ok(ForegroundSignal::AutoCompactionNeedsForward { events })
+                }
+                Ok(events) => Ok(ForegroundSignal::AutoCompactionPublished(Ok(events))),
+                Err(error) => Ok(ForegroundSignal::AutoCompactionPublished(Err(error))),
+            },
+            Self::FailureCheckpoint(job) => Ok(ForegroundSignal::FailureCheckpointCompleted(
+                job.run().await,
+            )),
+            Self::RetractionGoal(job) => {
+                use futures_util::FutureExt;
+                let result = std::panic::AssertUnwindSafe(job.run())
+                    .catch_unwind()
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!("native retraction goal restore panicked"))
+                    });
+                Ok(ForegroundSignal::RetractionGoalRestored(result))
+            }
+            Self::PlanSubmission(job) => {
+                Ok(ForegroundSignal::PlanSubmissionCompleted(job.run().await))
+            }
+            Self::PlanQuestion(job) => Ok(ForegroundSignal::PlanQuestionCompleted(job.run().await)),
+            Self::GoalProgress(job) => Ok(ForegroundSignal::GoalProgressCompleted(Box::new(
+                job.run().await,
+            ))),
+            Self::ExecutionProgress(job) => Ok(ForegroundSignal::ExecutionProgressCompleted(
+                Box::new(job.run().await),
+            )),
+            Self::TaskCompaction(job) => {
+                Ok(ForegroundSignal::TaskCompacted(Box::new(job.run().await)))
+            }
+            Self::Compaction(job) => Ok(ForegroundSignal::CompactionCompleted(Box::new(
+                job.run().await,
+            ))),
+            Self::ProviderPrepare(job) => Ok(ForegroundSignal::ProviderPrepared(job.run().await)),
+            Self::PlanMutation(job) => Ok(ForegroundSignal::PlanMutationCompleted(job.run().await)),
+            Self::QuestionStop {
+                provider,
+                session_id,
+                fallback,
+                checkpoint,
+                capability,
+            } => {
+                let result = async {
+                    let provider_session_id = provider
+                        .active_session_id_for(&session_id)
+                        .await?
+                        .or(fallback);
+                    provider
+                        .cleanup_execution(&session_id)
+                        .await
+                        .context("stop execution for required questions")?;
+                    Ok(ProviderCompletion {
+                        native: forge_provider_api::completion::ProviderCompletion {
+                            provider_session_id,
+                            provider_checkpoint_id: checkpoint,
+                            capability,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                }
+                .await;
+                Ok(ForegroundSignal::QuestionStopped(Box::new(result)))
+            }
+            Self::QuestionCatalog(job) => Ok(ForegroundSignal::QuestionCatalog(job.run().await)),
+            Self::Publication(delivery) => Ok(match delivery.deliver().await {
+                Ok(events) => ForegroundSignal::PublicationDelivered(events),
+                Err(error) => ForegroundSignal::EffectFailed(error),
+            }),
+            Self::PlanScan(job) => Ok(ForegroundSignal::PlanScanned(Box::new(job.run().await))),
+            Self::ExecutionControl {
+                job,
+                response,
+                submission,
+            } => Ok(ForegroundSignal::ExecutionControlEvidence {
+                response,
+                submission,
+                result: Box::new(job.run().await),
+            }),
+            Self::ExecutionControlReport {
+                job,
+                response,
+                submission,
+            } => Ok(ForegroundSignal::ExecutionControlReport {
+                response,
+                submission,
+                result: Box::new(job.run().await),
+            }),
+            Self::RevisionChecksUpdate { job, response } => {
+                Ok(ForegroundSignal::RevisionChecksUpdated {
+                    response,
+                    result: Box::new(job.run().await),
+                })
+            }
+            Self::AgentResult {
+                engine,
+                scope,
+                task,
+                message,
+            } => {
+                let result = engine
+                    .steer(scope, crate::provider::SteeringInput::AgentResult(message))
+                    .await
+                    .map_err(anyhow::Error::from);
+                Ok(ForegroundSignal::AgentResultDelivered { task, result })
+            }
+            Self::AgentCancelApprovals {
+                coordinator,
+                completion,
+            } => {
+                let result = coordinator.cancel_owner(&completion.owner, None).await;
+                Ok(ForegroundSignal::AgentApprovalsCancelled { completion, result })
+            }
+            Self::AgentInterrupt {
+                coordinator,
+                operation,
+            } => {
+                let mut completed = 0;
+                let authority = operation
+                    .request
+                    .authority
+                    .as_ref()
+                    .and_then(|authority| authority.task.clone());
+                let result = async {
+                    for item in &operation.items {
+                        match &authority {
+                            Some(authority) => authority
+                                .commit(|| coordinator.cancel_owner_immediate(&item.owner))?,
+                            None => coordinator.cancel_owner_immediate(&item.owner)?,
+                        }
+                        completed += 1;
+                        if let Some(provider) = &item.provider {
+                            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                                provider.cancel_session(&item.owner.runtime_key()).await?;
+                                provider
+                                    .cleanup_execution(&item.owner.runtime_key())
+                                    .await?;
+                                provider.shutdown().await
+                            })
+                            .await
+                            .context("child cleanup retry exceeded 30 seconds")??;
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+                Ok(ForegroundSignal::AgentInterrupted {
+                    operation,
+                    completed,
+                    result,
+                })
+            }
+            Self::AgentSpawnSelect {
+                factory,
+                root,
+                root_provider,
+                spawn,
+                request,
+            } => {
+                let selection = factory.resolve(&root, root_provider, &spawn).await;
+                Ok(ForegroundSignal::AgentSpawnSelected {
+                    request,
+                    selection: Box::new(selection),
+                })
+            }
+            Self::AgentMessageSteer {
+                registry,
+                owner,
+                message,
+                request,
+            } => {
+                let authority = request
+                    .authority
+                    .as_ref()
+                    .and_then(|authority| authority.task.clone());
+                let result = match registry.owner(owner.clone()).await {
+                    Ok(engine) => engine
+                        .steer_current_authorized(message.into(), authority)
+                        .await
+                        .map_err(anyhow::Error::from),
+                    Err(error) => Err(error.into()),
+                };
+                Ok(ForegroundSignal::AgentMessageSteered {
+                    request,
+                    registry,
+                    owner,
+                    result,
+                })
+            }
+            Self::FinalCheckpoint(job) => Ok(ForegroundSignal::FinalCheckpoint(job.run().await)),
+            Self::AutomaticCheckRefresh(job) => Ok(ForegroundSignal::AutomaticCheckRefreshed(
+                Box::new(job.run().await),
+            )),
+            Self::AutomaticCheckRun(job) => Ok(ForegroundSignal::AutomaticCheckCompleted(
+                Box::new(job.run().await),
+            )),
+            Self::SettlementRefresh {
+                engine,
+                scope,
+                checkout,
+            } => Ok(ForegroundSignal::SettlementReady {
+                checkout,
+                ready: Box::new(engine.wait_ready(scope).await),
+            }),
+            Self::SettlementCommit(cell) => {
+                use crate::provider::session_execution::SettlementError;
+                if let Err(error) = cell.validate_effects_settled() {
+                    return Ok(ForegroundSignal::SettlementCommitted(Err(
+                        SettlementError::Provider(error),
+                    )));
+                }
+                let mut checkout = match cell.checkout() {
+                    Ok(checkout) => checkout,
+                    Err(error) => {
+                        return Ok(ForegroundSignal::SettlementCommitted(Err(
+                            SettlementError::Provider(error),
+                        )));
+                    }
+                };
+                let result = match checkout.ticket() {
+                    Some(ticket) => ticket.commit().await,
+                    None => Err(SettlementError::Unavailable),
+                };
+                if result.is_ok() {
+                    checkout.take();
+                }
+                Ok(ForegroundSignal::SettlementCommitted(result))
+            }
+            Self::UserSteering {
+                engine,
+                scope,
+                input,
+            } => {
+                let result = engine
+                    .steer(scope, input.input())
+                    .await
+                    .map_err(anyhow::Error::from);
+                Ok(match input.settle_delivery(result).await {
+                    Ok(input) => ForegroundSignal::UserDeliverySettled(input),
+                    Err(error) => ForegroundSignal::EffectFailed(error),
+                })
+            }
+            Self::SettleUserDelivery { input, result } => {
+                Ok(match input.settle_delivery(result).await {
+                    Ok(input) => ForegroundSignal::UserDeliverySettled(input),
+                    Err(error) => ForegroundSignal::EffectFailed(error),
+                })
+            }
+        }
+    }
+}
+
+impl ForegroundTransaction {
+    /// Wait for one source without retaining the broker or presentation lock.
+    pub(crate) async fn next(&mut self) -> Result<ForegroundSignal> {
+        loop {
+            if self.failure_cleanup_active {
+                if !self.pending_session_observations.is_empty() {
+                    return Ok(ForegroundSignal::SessionObservationsReady);
+                }
+                tokio::select! {
+                    checkpoint = async {
+                        match self.state.runtime.as_mut().and_then(|runtime| runtime.checkpoint.as_mut()) {
+                            Some(task) => (&mut task.0).await.context("checkpoint worker failed").and_then(|result| result),
+                            None => std::future::pending().await,
+                        }
+                    } => return Ok(ForegroundSignal::Checkpoint(checkpoint)),
+                    event = self.native.events.recv(), if self.native.stream_open => match event {
+                        Ok(Some(event)) => return Ok(ForegroundSignal::Native(NativeForegroundSignal::ProviderEvent(event))),
+                        Ok(None) => { self.native.stream_open = false; continue; }
+                        Err(error) => { self.native.stream_open = false; return Ok(ForegroundSignal::EffectFailed(error.into())); }
+                    },
+                    ready = self.session_events.notified(), if self.failure_inbox_open => match ready {
+                        Ok(()) => { if self.session_events.is_closed() { self.failure_inbox_open = false; } return Ok(ForegroundSignal::SessionObservationsReady); },
+                        Err(_) => { self.failure_inbox_open = false; continue; }
+                    },
+                    else => std::future::pending::<()>().await,
+                }
+                continue;
+            }
+            if self.native_goal.is_none() && !self.pending_session_observations.is_empty() {
+                return Ok(ForegroundSignal::SessionObservationsReady);
+            }
+            if self.native_goal.is_none()
+                && !self.question_stop_pending
+                && let Some(ready) = self.pending_native_ready.take()
+            {
+                return Ok(ForegroundSignal::Native(
+                    NativeForegroundSignal::NativeReady(ProviderAttempt::Ready(Box::new(ready))),
+                ));
+            }
+            let cancellation = self.native.cancellation.clone();
+            let watchdog = self.native.watchdog.clone();
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Ok(ForegroundSignal::Native(NativeForegroundSignal::Cancelled)),
+                () = cancellation.native_cancel_expired() => return Ok(ForegroundSignal::EffectFailed(
+                    ProviderError::DeliveryUncertain { message: "native cancellation did not produce a terminal observation within 30 seconds".into() }.into(),
+                )),
+                expired = watchdog.expired() => {
+                    return Ok(ForegroundSignal::Native(NativeForegroundSignal::ToolExpired(expired?.context("tool watchdog ended during foreground execution")?)));
+                }
+                changed = self.question_changes.changed(), if self.question_enabled => {
+                    changed.context("question controller closed during execution")?;
+                    return Ok(ForegroundSignal::QuestionChanged);
+                }
+                checkpoint = async {
+                    match self.state.runtime.as_mut().and_then(|runtime| runtime.checkpoint.as_mut()) {
+                        Some(task) => (&mut task.0).await.context("checkpoint worker failed").and_then(|result| result),
+                        None => std::future::pending().await,
+                    }
+                } => return Ok(ForegroundSignal::Checkpoint(checkpoint)),
+                input = self.steering.active.receive(), if self.user_delivery.is_empty() && self.steering.deferred.is_empty() => {
+                    return Ok(ForegroundSignal::UserInput(input.context("parent input receiver closed")?));
+                }
+                delivery = self.user_delivery.join_next(), if !self.user_delivery.is_empty() => {
+                    return Ok(ForegroundSignal::UserDelivery(delivery.context("parent input delivery disappeared")?.context("parent input delivery failed")?));
+                }
+                changed = self.agent_revision.changed(), if !self.agent_command_active => {
+                    changed.context("agent coordinator closed during root execution")?;
+                    return Ok(ForegroundSignal::AgentChanged);
+                }
+                delivery = self.result_delivery.join_next(), if !self.result_delivery.is_empty() => {
+                    return Ok(ForegroundSignal::AgentDelivery(Box::new(delivery.context("parent result delivery disappeared")?.context("parent result delivery task failed")?)));
+                }
+                control = self.execution_receiver.recv(), if self.execution_open => match control {
+                    Some(control) => return Ok(ForegroundSignal::ExecutionControl(control)),
+                    None => self.execution_open = false,
+                },
+                review = async {
+                    match &mut self.pending_revision { Some((_, wait)) => wait.receiver.recv().await, None => std::future::pending().await }
+                }, if !self.revision_job_active => return Ok(ForegroundSignal::RevisionReview(review.context("revision review request lane closed")?)),
+                _ = self.scan_interval.tick(), if self.scan_enabled && self.pending_revision.is_none() => return Ok(ForegroundSignal::PlanScan),
+                changed = self.cleanup.changed(), if self.cleanup_open => {
+                    if changed.is_err() { self.cleanup_open = false; continue; }
+                    let state = self.cleanup.borrow_and_update().clone();
+                    if !matches!(state, ExecutionCleanup::Idle) { return Ok(ForegroundSignal::Cleanup(state)); }
+                }
+                native = self.native.next(), if self.native_open => {
+                    let native = native?;
+                    if matches!(&native, NativeForegroundSignal::NativeReady(_)) { self.native_open = false; }
+                    return Ok(ForegroundSignal::Native(native));
+                },
+                ready = self.session_events.notified() => { ready?; return Ok(ForegroundSignal::SessionObservationsReady); }
+                error = publication::failed(self.delivery_sink.as_ref()) => return Ok(ForegroundSignal::PublicationFailed(error)),
+            }
+        }
+    }
+}
+
+/// Move provider submission and its dependencies out of broker state before polling.
+pub(crate) enum ProviderAttempt {
+    Ready(Box<Result<ProviderCompletion, ProviderError>>),
+    Stale {
+        request: Box<ProviderRequest>,
+        command: Option<Box<crate::provider::SteerCommand>>,
+        retry: crate::provider::retry::RetryState,
+    },
+}
+
+pub(crate) struct ProviderSubmission {
+    request: ProviderRequest,
+    provider: Arc<Provider>,
+    engine: Arc<crate::provider::session_execution::SessionExecution>,
+    sink: crate::provider::ProviderEventSink,
+    trace: Arc<TraceStore>,
+    store: Arc<crate::provider::submission::SubmissionStore>,
+    continuation: Option<crate::provider::SteerCommand>,
+    settlement: Arc<crate::provider::session_execution::SettlementCell>,
+    retry: crate::provider::retry::RetryState,
+}
+
+impl ProviderSubmission {
+    /// Submit one attempt after any required host checkpoint gate opens.
+    pub(crate) async fn run(self) -> Result<ProviderAttempt> {
+        if !self.provider.checkpoint_tool_gate()
+            && let Some(gate) = self
+                .request
+                .control_context
+                .as_ref()
+                .and_then(|context| context.checkpoint.as_ref())
+        {
+            gate.wait().await?;
+        }
+        let acceptance_sink = self.sink.clone();
+        let response = crate::provider::retry::execute_until_ready(
+            self.engine.as_ref(),
+            self.request,
+            self.sink,
+            &self.trace,
+            &self.store,
+            self.settlement,
+            self.retry,
+        );
+        let (attempt, command) = if let Some(command) = self.continuation {
+            command.complete_with(response, acceptance_sink).await
+        } else {
+            response.await.map(|attempt| (attempt, None))
+        }?;
+        Ok(match attempt {
+            crate::provider::retry::RetryAttempt::Ready(result) => ProviderAttempt::Ready(result),
+            crate::provider::retry::RetryAttempt::Stale(request, retry) => ProviderAttempt::Stale {
+                request,
+                command: command.map(Box::new),
+                retry,
+            },
+        })
+    }
+}
+
+pub(crate) struct ExchangeRuntime {
     task_permit: Option<crate::task::TaskPermit>,
     checkpoint: Option<crate::checkpoint::CheckpointTask>,
     tool_gate: Option<crate::checkpoint::ToolGate>,
@@ -268,10 +1387,6 @@ struct ExchangeRuntime {
 }
 
 impl ExchangeRuntime {
-    fn retractable_before_tools(&self) -> bool {
-        self.retraction_eligible && self.tools_blocked()
-    }
-
     fn tools_blocked(&self) -> bool {
         self.tool_gate.as_ref().is_some_and(|gate| !gate.ready())
     }
@@ -303,10 +1418,52 @@ pub struct BrokerRuntime {
     diff: Arc<forge_diff::engine::DiffEngine>,
     workspace_kind: WorkspaceKind,
     provider: Arc<Provider>,
+    execution_registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
     pub(crate) permission_store: Arc<RwLock<PermissionStore>>,
     pub(crate) profiles: Arc<crate::agent::AgentProfileStore>,
     permission_coordinator: Arc<PermissionCoordinator>,
     trace: Arc<TraceStore>,
+}
+
+#[derive(Debug)]
+struct RuntimeShutdownFailure {
+    fence: Option<ProviderError>,
+    native: Option<anyhow::Error>,
+    execution: Option<crate::provider::session_execution::RegistryError>,
+}
+
+impl std::fmt::Display for RuntimeShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "provider shutdown did not fully complete")?;
+        if let Some(error) = &self.fence {
+            write!(formatter, "; admission fence: {error}")?;
+        }
+        if let Some(error) = &self.native {
+            write!(formatter, "; native shutdown: {error:#}")?;
+        }
+        if let Some(error) = &self.execution {
+            write!(formatter, "; execution collection: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for RuntimeShutdownFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.fence
+            .as_ref()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+            .or_else(|| {
+                self.native
+                    .as_ref()
+                    .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))
+            })
+            .or_else(|| {
+                self.execution
+                    .as_ref()
+                    .map(|error| error as &(dyn std::error::Error + 'static))
+            })
+    }
 }
 
 impl BrokerRuntime {
@@ -353,6 +1510,9 @@ impl BrokerRuntime {
             repositories,
             diff,
             workspace_kind,
+            execution_registry: Arc::new(
+                crate::provider::session_execution::SessionExecutionRegistry::new(provider.clone()),
+            ),
             provider,
             permission_store,
             profiles,
@@ -366,6 +1526,23 @@ impl BrokerRuntime {
         Arc::clone(&self.provider)
     }
 
+    /// Fence admission, drain provider shutdown evidence, then collect execution owners.
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        let fence = self.execution_registry.begin_orderly_shutdown().await;
+        let native = self.provider.shutdown().await;
+        let execution = self.execution_registry.close().await;
+        let failure = RuntimeShutdownFailure {
+            fence: fence.err(),
+            native: native.err(),
+            execution: execution.err(),
+        };
+        if failure.fence.is_some() || failure.native.is_some() || failure.execution.is_some() {
+            Err(failure.into())
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn trace(&self) -> Arc<TraceStore> {
         Arc::clone(&self.trace)
     }
@@ -373,7 +1550,7 @@ impl BrokerRuntime {
 
 /// Coordinates an out-of-band cancellation request with the active provider turn.
 #[derive(Clone, Debug, Default)]
-enum ExecutionCleanup {
+pub(crate) enum ExecutionCleanup {
     #[default]
     Idle,
     Pending,
@@ -391,6 +1568,8 @@ pub struct TurnCancellation {
     cleanup: tokio::sync::watch::Sender<ExecutionCleanup>,
     retraction_allowed: AtomicBool,
     notify: Notify,
+    native_cancel_deadline: std::sync::Mutex<Option<tokio::time::Instant>>,
+    native_cancel_notify: Notify,
     state: tokio::sync::watch::Sender<bool>,
 }
 
@@ -405,6 +1584,8 @@ impl TurnCancellation {
             cleanup: tokio::sync::watch::channel(ExecutionCleanup::Idle).0,
             retraction_allowed: AtomicBool::new(false),
             notify: Notify::new(),
+            native_cancel_deadline: std::sync::Mutex::new(None),
+            native_cancel_notify: Notify::new(),
             state: tokio::sync::watch::channel(false).0,
         }
     }
@@ -418,6 +1599,11 @@ impl TurnCancellation {
         self.cleanup.send_replace(ExecutionCleanup::Idle);
         self.retraction_allowed
             .store(retraction_allowed, Ordering::Release);
+        *self
+            .native_cancel_deadline
+            .lock()
+            .expect("native cancellation deadline poisoned") = None;
+        self.native_cancel_notify.notify_one();
         self.state.send_replace(false);
     }
 
@@ -429,6 +1615,48 @@ impl TurnCancellation {
         self.requested.store(true, Ordering::Release);
         self.state.send_replace(true);
         self.notify.notify_waiters();
+    }
+
+    /// Fence queued admission while the native owner settles its cancellation terminal.
+    pub(crate) fn request_native_cancel(&self, restore_prompt: bool) {
+        self.request_revision.fetch_add(1, Ordering::AcqRel);
+        self.submission_cancelled.store(true, Ordering::Release);
+        self.restore_prompt.store(restore_prompt, Ordering::Release);
+        self.native_cancel_deadline
+            .lock()
+            .expect("native cancellation deadline poisoned")
+            .get_or_insert_with(|| {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(30)
+            });
+        self.native_cancel_notify.notify_one();
+        self.state.send_replace(true);
+    }
+
+    /// Retire the timeout after the owned native terminal is observed.
+    pub(crate) fn native_cancel_settled(&self) {
+        *self
+            .native_cancel_deadline
+            .lock()
+            .expect("native cancellation deadline poisoned") = None;
+        self.native_cancel_notify.notify_one();
+    }
+
+    /// Wait for a native cancellation that never produced a terminal observation.
+    async fn native_cancel_expired(&self) {
+        loop {
+            let changed = self.native_cancel_notify.notified();
+            let deadline = *self
+                .native_cancel_deadline
+                .lock()
+                .expect("native cancellation deadline poisoned");
+            match deadline {
+                Some(deadline) => tokio::select! {
+                    () = tokio::time::sleep_until(deadline) => return,
+                    () = changed => {}
+                },
+                None => changed.await,
+            }
+        }
     }
 
     /// Interrupt provider execution while retaining the current exchange for resumption.
@@ -455,11 +1683,6 @@ impl TurnCancellation {
     pub(crate) fn fail_cleanup(&self, error: &anyhow::Error) {
         self.cleanup
             .send_replace(ExecutionCleanup::Failed(format!("{error:#}")));
-    }
-
-    fn restores_prompt(&self) -> bool {
-        self.restore_prompt.load(Ordering::Acquire)
-            && self.retraction_allowed.load(Ordering::Acquire)
     }
 
     async fn cancelled(&self) {
@@ -522,6 +1745,12 @@ struct PromptControlSnapshot {
     plan: Vec<PlanRecord>,
 }
 
+/// Retain submission admission and rollback state across independently awaited work.
+pub(crate) struct PromptSubmission {
+    snapshot: PromptControlSnapshot,
+    submitted_prompt: Option<(Option<forge_buffer::identity::DocumentId>, u64)>,
+}
+
 impl ExchangeAdmission {
     fn chat(prompt: String) -> Self {
         Self {
@@ -561,6 +1790,7 @@ pub struct HarnessBroker {
     client_id: String,
     provider_launch: ProviderLaunch,
     provider: Arc<Provider>,
+    execution_registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
     session: HarnessSession,
     capability: ProviderCapability,
     pub(crate) goal_max_turns: u32,
@@ -570,10 +1800,17 @@ pub struct HarnessBroker {
     event_sink: Option<publication::SessionUpdateSink>,
     clock: Box<dyn Clock>,
     exchange_runtime: Option<ExchangeRuntime>,
+    reopened_execution: reopening::ReopenedExecutions,
+    retained_foregrounds:
+        std::collections::HashMap<crate::provider::InvocationId, reopening::RetainedForeground>,
+    pending_host_settlement: Option<Arc<crate::provider::session_execution::SettlementCell>>,
+    settlement_events: Vec<SessionEvent>,
     agent_registry: AgentRegistry,
     agent_coordinator: Arc<crate::agent::AgentCoordinator>,
     pub(crate) agent_provider_factory: crate::agent::AgentProviderFactory,
     child_provider_by_agent: HashMap<String, Arc<Provider>>,
+    child_execution_by_agent:
+        HashMap<String, Arc<crate::provider::session_execution::SessionExecutionRegistry>>,
     diagnostic_native_thread: HashSet<String>,
     mcp_notice: HashMap<String, String>,
     child_exchange_runtime_by_agent: HashMap<String, ChildExchangeRuntime>,
@@ -591,6 +1828,53 @@ pub struct HarnessBroker {
 }
 
 impl HarnessBroker {
+    /// Install a fixture provider before its execution owner is opened.
+    #[cfg(test)]
+    pub(crate) fn set_provider_for_test(&mut self, provider: Arc<crate::provider::Provider>) {
+        self.provider = provider;
+    }
+
+    pub(crate) fn execution_registry(
+        &mut self,
+    ) -> Arc<crate::provider::session_execution::SessionExecutionRegistry> {
+        if !self.execution_registry.matches(&self.provider) {
+            self.execution_registry = Arc::new(
+                crate::provider::session_execution::SessionExecutionRegistry::with_observer(
+                    self.provider.clone(),
+                    crate::provider::ExecutionOwner::root(&self.session.id),
+                    self.observer.session_events(),
+                ),
+            );
+        }
+        self.execution_registry.clone()
+    }
+
+    /// Get the retained host settlement owner without transferring its ticket.
+    pub(crate) fn host_settlement(
+        &self,
+    ) -> Option<Arc<crate::provider::session_execution::SettlementCell>> {
+        self.pending_host_settlement.clone()
+    }
+
+    /// Clear an exhausted settlement cell after its ticket has been committed or collected.
+    pub(crate) fn clear_host_settlement(
+        &mut self,
+        settlement: &Arc<crate::provider::session_execution::SettlementCell>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.pending_host_settlement
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, settlement)),
+            "host settlement belongs to another transaction"
+        );
+        anyhow::ensure!(
+            settlement.is_empty()?,
+            "host settlement ticket is still retained"
+        );
+        self.pending_host_settlement = None;
+        Ok(())
+    }
+
     /// Initialize the broker and acquire one writable session lease.
     pub fn initialize(request: InitializeRequest) -> Result<Self> {
         Self::initialize_with_clock(request, Box::new(SystemClock))
@@ -763,6 +2047,11 @@ impl HarnessBroker {
             "session_selected_ms",
             startup_started.elapsed().as_secs_f64() * 1000.0,
         );
+        if !created_session && store.recover_configuration_intent(&data_root, &session.id)? {
+            session = store
+                .load_session(&session.id)?
+                .context("recovered configuration session is missing")?;
+        }
         if session.provider_label.is_empty() {
             session.provider_label = provider_descriptor.label.clone();
         }
@@ -882,7 +2171,11 @@ impl HarnessBroker {
                 shared.desired.check_editing.unwrap_or(false),
             )),
             completion_queue: Default::default(),
-            session_events: Default::default(),
+            session_events: RwLock::new(
+                runtime
+                    .execution_registry
+                    .observer(crate::provider::ExecutionOwner::root(&session.id))?,
+            ),
             data_root: data_root.clone(),
             session_id: session.id.clone(),
             runtime_epoch: Uuid::new_v4().to_string(),
@@ -936,6 +2229,7 @@ impl HarnessBroker {
             data_root,
             client_id: request.client_id,
             provider_launch: request.provider,
+            execution_registry: runtime.execution_registry.clone(),
             provider,
             session,
             capability,
@@ -948,10 +2242,15 @@ impl HarnessBroker {
             event_sink: None,
             clock,
             exchange_runtime: None,
+            reopened_execution: Default::default(),
+            retained_foregrounds: Default::default(),
+            pending_host_settlement: None,
+            settlement_events: Vec::new(),
             agent_registry,
             agent_coordinator,
             agent_provider_factory,
             child_provider_by_agent: HashMap::new(),
+            child_execution_by_agent: HashMap::new(),
             diagnostic_native_thread: HashSet::new(),
             mcp_notice: HashMap::new(),
             child_exchange_runtime_by_agent: HashMap::new(),
@@ -1006,23 +2305,29 @@ impl HarnessBroker {
     }
 
     /// Build the stable provider-catalog identity used outside serialized broker dispatch.
-    pub fn provider_catalog_request(&self) -> ProviderCatalogRequest {
-        ProviderCatalogRequest {
+    pub fn provider_catalog_request(&self) -> Result<ProviderCatalogRequest> {
+        Ok(ProviderCatalogRequest {
             execution_owner: None,
             harness_session_id: self.session.id.clone(),
             workspace: self.session.workspace.clone(),
             access: self.session.access.clone(),
             approval_mode: self.session.approval_mode,
-            provider_session_id: self.session.provider_session_id.clone(),
-        }
+            provider_session_id: self
+                .session
+                .provider_session_id
+                .clone()
+                .map(TryInto::try_into)
+                .transpose()?,
+        })
     }
 
     /// Capture interactive startup settings without creating an exchange or task.
-    pub(crate) fn initialization_request(&self) -> Option<ProviderRequest> {
+    pub(crate) fn initialization_request(&self) -> Result<Option<ProviderRequest>> {
         (self.session.background.is_none()
             && self.session.purpose == crate::session::SessionPurpose::Conversation
             && self.provider_fork_state() == crate::session::ProviderForkState::Ready)
             .then(|| self.provider_request(ProviderInput::from_text(""), PromptMode::Chat))
+            .transpose()
     }
 
     /// Persist an initialized provider conversation only while its captured settings remain current.
@@ -1032,7 +2337,8 @@ impl HarnessBroker {
         provider_id: String,
     ) -> Result<Option<BrokerSnapshot>> {
         if self.session.id != request.harness_session_id
-            || self.session.provider_session_id != request.provider_session_id
+            || self.session.provider_session_id.as_deref()
+                != request.provider_session_id.as_ref().map(|id| id.as_str())
             || self.session.model != request.model
             || self.session.effort != request.effort
             || self.session.access != request.access
@@ -1049,7 +2355,20 @@ impl HarnessBroker {
 
     fn control_turn_context(&self, mode: PromptMode) -> Option<crate::tools::ControlTurnContext> {
         if mode == PromptMode::Background {
-            return Some(crate::tools::ControlTurnContext::inactive(mode));
+            let mut context = crate::tools::ControlTurnContext::inactive(mode);
+            context.task_controller = Some(self.task_controller.clone());
+            context.permission_required = true;
+            context.permission_snapshot = self.permission_store.read().ok().map(|store| {
+                crate::tools::PermissionAuthoritySnapshot::capture(
+                    self.permission_store.clone(),
+                    &store,
+                )
+            });
+            if let Ok((generation, task)) = self.task_controller.callback_snapshot() {
+                context.task_generation = Some(generation);
+                context.task_permit = task.map(|task| task.permit());
+            }
+            return Some(context);
         }
         let plan = self
             .current_plan_id()
@@ -1062,7 +2381,15 @@ impl HarnessBroker {
                 .read_working_document(&self.session.id, &plan.id)
                 .ok()
         });
+        let callback_snapshot = self.task_controller.callback_snapshot().ok();
+        let permission_snapshot = self.permission_store.read().ok().map(|store| {
+            crate::tools::PermissionAuthoritySnapshot::capture(
+                self.permission_store.clone(),
+                &store,
+            )
+        });
         Some(crate::tools::ControlTurnContext {
+            provider_completion: Default::default(),
             questions: Some(self.questions.clone()),
             question_exchange_id: self
                 .exchange_runtime
@@ -1084,12 +2411,12 @@ impl HarnessBroker {
             } else {
                 None
             },
-            task_permit: self
-                .task_controller
-                .current()
-                .ok()
-                .flatten()
-                .map(|task| task.permit()),
+            task_permit: callback_snapshot
+                .as_ref()
+                .and_then(|(_, task)| task.as_ref().map(|task| task.permit())),
+            task_generation: callback_snapshot.map(|(generation, _)| generation),
+            permission_snapshot,
+            permission_required: true,
             submission_cancelled: Some(Arc::clone(&self.turn_cancellation.submission_cancelled)),
             checkpoint: self
                 .exchange_runtime
@@ -1317,6 +2644,9 @@ impl HarnessBroker {
                 };
             }
         };
+        if method == RuntimeMethod::SessionPromptSubmit {
+            return self.dispatch_local_prompt(request).await;
+        }
         let edit_trace = matches!(
             method,
             RuntimeMethod::SessionPlanEntityRename
@@ -1738,7 +3068,7 @@ impl HarnessBroker {
                         self.provider_request(
                             ProviderInput::from_text(String::new()),
                             PromptMode::Chat,
-                        ),
+                        )?,
                     )
                     .await?;
                 Ok((serde_json::to_value(model)?, Vec::new()))
@@ -1936,41 +3266,10 @@ impl HarnessBroker {
         Ok(())
     }
 
+    /// Drive a test's pending local verification through production check stages.
+    #[cfg(test)]
     pub(crate) async fn run_task_checks(&mut self) -> Result<Vec<SessionEvent>> {
-        let task = self
-            .task_controller
-            .current()?
-            .context("check task was cleared")?;
-        let turn = task
-            .turn
-            .as_ref()
-            .context("check work has no source turn")?;
-        let work = turn
-            .continuation
-            .as_ref()
-            .context("check work was removed")?;
-        anyhow::ensure!(work.work.is_checks(), "pending work is not checks");
-        let source = turn.id.clone();
-        let id = work.id.clone();
-        let events = self.run_checks().await?;
-        let Some(current) = self.task_controller.current()? else {
-            return Ok(events);
-        };
-        if current.entry.as_ref().map(|entry| &entry.id)
-            != task.entry.as_ref().map(|entry| &entry.id)
-            || !matches!((&task.workflow, &current.workflow),
-                (crate::task::WorkflowSnapshot::Execute { execution: original }, crate::task::WorkflowSnapshot::Execute { execution: current }) if original.record.id == current.record.id)
-        {
-            return Ok(events);
-        }
-        self.task_controller.acknowledge_continuation(
-            &mut self.store,
-            &current.revision,
-            &id,
-            self.clock.now_ms(),
-        )?;
-        self.reserve_execution_continuation(source)?;
-        Ok(events)
+        self.run_checks().await
     }
 
     fn current_task_is_plan(&self) -> Result<bool> {
@@ -2339,22 +3638,16 @@ impl HarnessBroker {
                     return Ok(serde_json::to_value(existing)?);
                 }
                 let mut delivery = crate::agent::MessageDelivery::Queued;
-                if let Some(provider) = self.child_provider_by_agent.get(&agent.id)
-                    && provider.descriptor().capability.native_steer
-                    && provider
-                        .has_active_turn(
-                            &crate::provider::ExecutionOwner {
-                                session_id: (self.session.id.clone()).into(),
-                                agent_id: (agent.id.clone()).into(),
-                            }
-                            .runtime_key(),
-                        )
-                        .await
-                {
-                    match provider.steer_session(&crate::provider::ExecutionOwner {session_id: (self.session.id.clone()).into(),agent_id: (agent.id.clone()).into()}.runtime_key(), message.clone().into()).await {
+                if let Some(registry) = self.child_execution_by_agent.get(&agent.id) {
+                    let owner = crate::provider::ExecutionOwner {
+                        session_id: self.session.id.clone().into(),
+                        agent_id: agent.id.clone().into(),
+                    };
+                    let engine = registry.owner(owner).await?;
+                    match engine.steer_current(message.clone().into()).await {
                         Ok(()) => delivery = crate::agent::MessageDelivery::Steered,
-                        Err(error) => self.trace.record(&self.session.id,"agent.message_queued",json!({
-                            "agent_id":agent.id,"reason":"steering_not_accepted","error":format!("{error:#}")})),
+                        Err(error) => self.trace.record(&self.session.id, "agent.message_queued", json!({
+                            "agent_id":agent.id,"reason":"steering_not_accepted","error":error.to_string()})),
                     }
                 }
                 let message = crate::agent::AgentMessage {
@@ -2405,7 +3698,7 @@ impl HarnessBroker {
         let admission = match work {
             ChildWork::Spawn(spawn) => {
                 let mut root = self
-                    .provider_request(ProviderInput::from_text(String::new()), PromptMode::Chat);
+                    .provider_request(ProviderInput::from_text(String::new()), PromptMode::Chat)?;
                 if root.model == "default"
                     && let Some(model) = &self.session.resolved_model
                 {
@@ -2490,14 +3783,17 @@ impl HarnessBroker {
     }
 
     async fn publish_agent_state(&mut self, event: &mut Vec<SessionEvent>) -> Result<()> {
+        let effects = self.prepare_agent_state()?;
+        event.extend(self.prepare_provider_delivery(effects)?.deliver().await?);
+        Ok(())
+    }
+
+    /// Stage the agent snapshot and timeline in their original delivery order.
+    fn prepare_agent_state(&mut self) -> Result<AppliedProviderEvent> {
         let snapshot = self.snapshot()?;
-        self.emit_session_update(
-            SessionUpdate::Agent {
-                snapshot: snapshot.agent,
-            },
-            event,
-        )
-        .await?;
+        let update = SessionUpdate::Agent {
+            snapshot: snapshot.agent,
+        };
         let patch = self
             .presentation
             .lock()
@@ -2506,7 +3802,10 @@ impl HarnessBroker {
                 snapshot.timeline,
                 self.observer.status_thoughts.load(Ordering::Relaxed),
             )?;
-        self.emit_timeline_patch(patch, event).await
+        Ok(AppliedProviderEvent::Effects(vec![
+            AppliedProviderEvent::Update(update),
+            AppliedProviderEvent::Timeline(patch),
+        ]))
     }
 
     async fn cancel_agent_approvals(
@@ -2598,6 +3897,8 @@ impl HarnessBroker {
             self.agent_coordinator
                 .settled(&owner.agent_id, &task.id, false)?;
             self.child_provider_by_agent.remove(owner.agent_id.as_str());
+            self.child_execution_by_agent
+                .remove(owner.agent_id.as_str());
         }
         self.publish_agent_state(event).await?;
         Ok(())
@@ -2605,9 +3906,21 @@ impl HarnessBroker {
 
     async fn launch_managed_agent(
         &mut self,
-        mut admission: crate::agent::AgentWork,
+        admission: crate::agent::AgentWork,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
+        if let Some((owner, task_id, error)) = self.begin_managed_agent(admission)? {
+            self.complete_managed_agent(owner, task_id, Err(error), None, event)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Transfer admitted child work to its owned runtime without awaiting it.
+    fn begin_managed_agent(
+        &mut self,
+        mut admission: crate::agent::AgentWork,
+    ) -> Result<Option<(crate::provider::ExecutionOwner, String, anyhow::Error)>> {
         let owner = admission.owner().clone();
         anyhow::ensure!(
             owner.session_id == self.session.id,
@@ -2629,7 +3942,8 @@ impl HarnessBroker {
                 incoming.task_id = Some(admission.task.id.clone());
             }
             let mut request = self.agent_provider_factory.request(
-                &self.provider_request(ProviderInput::from_text(String::new()), PromptMode::Chat),
+                &self
+                    .provider_request(ProviderInput::from_text(String::new()), PromptMode::Chat)?,
                 &admission,
                 message,
             )?;
@@ -2672,7 +3986,13 @@ impl HarnessBroker {
                 .retain(admission.agent.clone(), admission.task.clone())?;
             self.child_provider_by_agent
                 .insert(admission.agent.id.clone(), provider.clone());
+            let execution_registry = Arc::new(
+                crate::provider::session_execution::SessionExecutionRegistry::new(provider.clone()),
+            );
+            self.child_execution_by_agent
+                .insert(admission.agent.id.clone(), execution_registry.clone());
             Ok(crate::agent::AgentRuntime {
+                execution_registry,
                 provider,
                 tool_timeout: crate::settings::SettingsStore::read_only(&self.data_root)?
                     .get(
@@ -2713,11 +4033,10 @@ impl HarnessBroker {
                 });
             }
             Err(error) => {
-                self.complete_managed_agent(owner, admission.task.id, Err(error), None, event)
-                    .await?
+                return Ok(Some((owner, admission.task.id, error)));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Drain owned mutations through the active prompt or idle controller, never both concurrently.
@@ -2790,9 +4109,23 @@ impl HarnessBroker {
         &mut self,
         owner: crate::provider::ExecutionOwner,
         task_id: &str,
-        mut provider_event: ProviderEvent,
+        provider_event: ProviderEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
+        let effects =
+            self.apply_managed_agent_observation(owner, task_id, provider_event, event)?;
+        event.extend(self.prepare_provider_delivery(effects)?.deliver().await?);
+        Ok(())
+    }
+
+    /// Validate and apply a child observation before staging its publication.
+    fn apply_managed_agent_observation(
+        &mut self,
+        owner: crate::provider::ExecutionOwner,
+        task_id: &str,
+        mut provider_event: ProviderEvent,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<AppliedProviderEvent> {
         anyhow::ensure!(
             owner.session_id == self.session.id && !owner.is_root(),
             "child event crosses execution ownership"
@@ -2814,22 +4147,21 @@ impl HarnessBroker {
             "child event has a different task owner"
         );
         if task.completed_at_ms.is_some() {
-            return Ok(());
+            return Ok(AppliedProviderEvent::Effects(Vec::new()));
         }
         if let ProviderEvent::Agent {
             update: crate::provider::AgentUpdate::Lifecycle { event: lifecycle },
             ..
         } = &provider_event
         {
-            self.apply_agent_lifecycle(lifecycle, Some(&task.parent_exchange_id), event)
-                .await?;
-            return Ok(());
+            self.apply_agent_lifecycle(lifecycle, Some(&task.parent_exchange_id), event)?;
+            return Ok(AppliedProviderEvent::Effects(Vec::new()));
         }
         if provider_event
             .turn_address()
             .is_some_and(|address| self.diagnostic_native_thread.contains(&address.thread_id))
         {
-            return Ok(());
+            return Ok(AppliedProviderEvent::Effects(Vec::new()));
         }
         let provider_thread_id = match &provider_event {
             ProviderEvent::Agent {
@@ -2850,7 +4182,7 @@ impl HarnessBroker {
             }
         }
         if matches!(&provider_event, ProviderEvent::Agent { .. }) {
-            return Ok(());
+            return Ok(AppliedProviderEvent::Effects(Vec::new()));
         }
         if let ProviderEvent::Runtime {
             update: crate::provider::RuntimeUpdate::Resolved { runtime },
@@ -2866,7 +4198,7 @@ impl HarnessBroker {
             self.store.save_agent_run(&agent)?;
             self.agent_registry.insert(agent.clone());
             self.agent_coordinator.retain(agent, task)?;
-            return self.publish_agent_state(event).await;
+            return self.prepare_agent_state();
         }
         if task.state == ExchangeState::Queued {
             task.state = ExchangeState::Running;
@@ -2893,7 +4225,7 @@ impl HarnessBroker {
                     .load_exchange(task_id)?
                     .context("child task exchange missing")?;
                 if exchange.is_finished() {
-                    return Ok(());
+                    return Ok(AppliedProviderEvent::Effects(Vec::new()));
                 }
                 exchange.phase = crate::exchange::ExchangePhase::Running;
                 exchange.resume(self.clock.now_ms())?;
@@ -2922,7 +4254,7 @@ impl HarnessBroker {
                 else {
                     self.child_exchange_runtime_by_agent
                         .insert(owner.agent_id.to_string(), runtime);
-                    return Ok(());
+                    return Ok(AppliedProviderEvent::Effects(Vec::new()));
                 };
                 runtime.exchange.observe_blocker(
                     format!("approval:{}", approval.id),
@@ -2980,10 +4312,13 @@ impl HarnessBroker {
             .retain(self.agent_coordinator.resolve(&owner.agent_id)?, task)?;
         self.child_exchange_runtime_by_agent
             .insert(owner.agent_id.to_string(), runtime);
-        self.emit_observation(&provider_event, event).await?;
-        self.publish_agent_state(event).await?;
+        let mut effects = Vec::new();
+        if let Some(update) = SessionUpdate::from_observation(&provider_event) {
+            effects.push(AppliedProviderEvent::Update(update));
+        }
+        effects.push(self.prepare_agent_state()?);
         self.agent_coordinator.notify_activity();
-        Ok(())
+        Ok(AppliedProviderEvent::Effects(effects))
     }
 
     async fn complete_managed_agent(
@@ -2994,7 +4329,7 @@ impl HarnessBroker {
         cleanup_error: Option<String>,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
-        let mut task = self
+        let task = self
             .agent_coordinator
             .task(&task_id)
             .context("child completion has no admitted task")?;
@@ -3006,6 +4341,34 @@ impl HarnessBroker {
             return Ok(());
         }
         self.cancel_agent_approvals(&owner, event).await?;
+        let (effects, next) =
+            self.apply_managed_agent_completion(owner, task_id, output, cleanup_error)?;
+        event.extend(self.prepare_provider_delivery(effects)?.deliver().await?);
+        if let Some(next) = next {
+            Box::pin(self.launch_managed_agent(next, event)).await?;
+        }
+        Ok(())
+    }
+
+    /// Apply a settled child after its pending approvals have been collected.
+    fn apply_managed_agent_completion(
+        &mut self,
+        owner: crate::provider::ExecutionOwner,
+        task_id: String,
+        output: Result<crate::provider::ProviderCompletion>,
+        cleanup_error: Option<String>,
+    ) -> Result<(AppliedProviderEvent, Option<crate::agent::AgentWork>)> {
+        let mut task = self
+            .agent_coordinator
+            .task(&task_id)
+            .context("child completion has no admitted task")?;
+        anyhow::ensure!(
+            owner.session_id == self.session.id && task.agent_id == owner.agent_id,
+            "child completion crosses execution ownership"
+        );
+        if task.completed_at_ms.is_some() {
+            return Ok((AppliedProviderEvent::Effects(Vec::new()), None));
+        }
         let mut agent = self.agent_coordinator.resolve(&owner.agent_id)?;
         let interrupted = self
             .agent_coordinator
@@ -3031,6 +4394,7 @@ impl HarnessBroker {
             agent.provider_thread_id = output
                 .provider_session_id
                 .clone()
+                .map(Into::into)
                 .or(agent.provider_thread_id);
         }
         let runtime = self
@@ -3090,16 +4454,14 @@ impl HarnessBroker {
                 .settled(&owner.agent_id, &task_id, cleanup_error.is_some())?;
         if cleanup_error.is_none() {
             self.child_provider_by_agent.remove(owner.agent_id.as_str());
+            self.child_execution_by_agent
+                .remove(owner.agent_id.as_str());
         }
         self.trace.record(&self.session.id,"agent.completed",json!({"agent_id":owner.agent_id,"exchange_id":task_id,"state":task.state,"cleanup_error":cleanup_error}));
-        self.publish_agent_state(event).await?;
-        if let Some(next) = next {
-            Box::pin(self.launch_managed_agent(next, event)).await?;
-        }
-        Ok(())
+        Ok((self.prepare_agent_state()?, next))
     }
 
-    async fn apply_agent_lifecycle(
+    fn apply_agent_lifecycle(
         &mut self,
         lifecycle: &AgentLifecycleEvent,
         _parent_exchange_id: Option<&str>,
@@ -3119,7 +4481,7 @@ impl HarnessBroker {
     async fn list_provider_model(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let mut model_list = self
             .provider
-            .model_list(self.provider_request(ProviderInput::from_text(""), PromptMode::Chat))
+            .model_list(self.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?)
             .await?;
         let preference = self
             .store
@@ -3152,6 +4514,21 @@ impl HarnessBroker {
     }
 
     async fn submit_prompt(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let result = self
+            .dispatch_local_prompt(Request {
+                id: 0,
+                method: "session.prompt.submit".into(),
+                params,
+            })
+            .await;
+        let value = result.response.result().cloned().ok_or_else(|| {
+            anyhow::anyhow!("prompt dispatch failed: {:?}", result.response.error())
+        })?;
+        Ok((value, result.event))
+    }
+
+    /// Capture prompt admission and rollback ownership before executing its workflow.
+    pub(crate) fn begin_prompt_submission(&mut self, params: &Value) -> Result<PromptSubmission> {
         let snapshot = PromptControlSnapshot {
             session: self.session_view()?,
             goal: self.current_goal()?,
@@ -3176,415 +4553,28 @@ impl HarnessBroker {
             })
             .transpose()?;
         let submitted_prompt = self.prompt_admission.clone();
-        let mut result = Box::pin(self.submit_prompt_inner(params)).await;
-        let mut submission_event = Vec::new();
-        Box::pin(self.settle_prompt_admission(result.is_ok(), &mut submission_event)).await?;
-        if let Ok((_, event)) = &mut result {
-            event.append(&mut submission_event);
-        }
-        if result
-            .as_ref()
-            .is_err_and(|error| error.downcast_ref::<TurnRetracted>().is_some())
-        {
-            Box::pin(self.restore_retracted_control_state(snapshot)).await?;
-            if let Some((document, token)) = submitted_prompt {
-                let transition = if let Some(document) = document {
-                    self.presentation
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                        .retract_submission(&document, token)?
-                } else {
-                    Some(json!({"document":null,"token":token,"state":"retracted"}))
-                };
-                if let Some(transition) = transition {
-                    Box::pin(self.emit_session_update(
-                        SessionUpdate::Submission {
-                            transition: serde_json::from_value(transition)?,
-                        },
-                        &mut submission_event,
-                    ))
-                    .await?;
-                }
-            }
-        }
-        result
+        Ok(PromptSubmission {
+            snapshot,
+            submitted_prompt,
+        })
     }
 
-    async fn settle_prompt_admission(
-        &mut self,
-        admitted: bool,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
-        let Some((document, token)) = self.prompt_admission.take() else {
-            return Ok(());
-        };
-        let transition = if let Some(document) = document {
-            self.presentation
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                .complete_submission(&document, token, admitted)?
-        } else {
-            Some(
-                json!({"document":null,"token":token,"state":if admitted { "accepted" } else { "rejected" }}),
-            )
-        };
-        if let Some(transition) = transition {
-            self.emit_session_update(
-                SessionUpdate::Submission {
-                    transition: serde_json::from_value(transition)?,
-                },
-                event,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn submit_prompt_inner(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        self.require_restore_recovered()?;
-        let text = required_text(&params, "text")?;
-        let purpose = std::mem::take(&mut self.input_purpose);
-        if matches!(purpose, crate::input::InputPurpose::User) {
-            let operation_id = params
-                .get("operation_id")
-                .and_then(Value::as_str)
-                .or(self.active_operation_id.as_deref());
-            if let Some(command) =
-                crate::task::command::SessionCommand::parse_text(&text, operation_id)?
-            {
-                return self.commit_session_command(command);
-            }
-        }
-        anyhow::ensure!(
-            self.check_runner.active()?.is_none(),
-            "wait for or cancel the active check run before starting source work"
-        );
-        if matches!(purpose, crate::input::InputPurpose::Question { .. })
-            || self.questions.snapshot()?.required_pending()
-        {
-            let selection = crate::settings::SettingsStore::read_only(&self.data_root)?
-                .get(
-                    &self.session.workspace,
-                    &self.session.id,
-                    &self.session.provider,
-                )?
-                .ask_model()?;
-            let catalog = if selection.model.is_some() {
-                self.provider
-                    .model_list(
-                        self.provider_request(ProviderInput::from_text(""), PromptMode::Chat),
-                    )
-                    .await?
-            } else {
-                Vec::new()
-            };
-            self.question_model = Some(selection.resolve(&self.session, &catalog)?);
-            let previous_model = self.session.resolved_model.clone();
-            let previous_usage = self.session.context_usage.clone();
-            self.question_discussion = true;
-            let visible_text = if let crate::input::InputPurpose::Question {
-                question_id,
-                message_kind,
-                ..
-            } = &purpose
-            {
-                let snapshot = self.questions.snapshot()?;
-                let question = snapshot
-                    .questions
-                    .iter()
-                    .find(|question| &question.id == question_id)
-                    .context("question discussion source is missing")?;
-                let label = match message_kind {
-                    crate::question::QuestionMessageKind::Clarification => "Clarification",
-                    crate::question::QuestionMessageKind::Answer => "Answer",
-                    crate::question::QuestionMessageKind::Correction => "Correction",
-                    crate::question::QuestionMessageKind::Reply => "Reply",
-                };
-                format!("{label}: {}", question.content.header)
-            } else {
-                text.clone()
-            };
-            let result = self
-                .run_interaction_input(
-                    visible_text.clone(),
-                    PromptMode::Chat,
-                    Some(ExchangeAdmission::chat(visible_text)),
-                    ProviderInput::from_text(text),
-                )
-                .await;
-            self.question_discussion = false;
-            self.question_model = None;
-            self.session.resolved_model = previous_model;
-            self.session.context_usage = previous_usage;
-            self.save_session()?;
-            return result;
-        }
-        if let crate::input::InputPurpose::QuestionContinuation { exchange_id } = &purpose {
-            anyhow::ensure!(
-                self.task_controller.current()?.is_none(),
-                "question continuation cannot replace an active task"
-            );
-            let result = self
-                .run_interaction(
-                    text.clone(),
-                    PromptMode::Chat,
-                    Some(ExchangeAdmission::chat(text)),
-                )
-                .await;
-            if result.is_ok() {
-                self.questions.chat_continuation_completed(exchange_id)?;
-            }
-            return result;
-        }
-        if !matches!(purpose, crate::input::InputPurpose::User) {
-            let (revision, origin) = match purpose {
-                crate::input::InputPurpose::TaskEntry {
-                    revision, start, ..
-                } => (
-                    revision,
-                    crate::exchange::ExchangeOrigin::TaskStarted { start },
-                ),
-                crate::input::InputPurpose::TaskContinuation {
-                    revision, reason, ..
-                } => (
-                    revision,
-                    crate::exchange::ExchangeOrigin::task_continuation(reason),
-                ),
-                crate::input::InputPurpose::User
-                | crate::input::InputPurpose::Question { .. }
-                | crate::input::InputPurpose::QuestionContinuation { .. } => {
-                    unreachable!()
-                }
-            };
-            let task = self
-                .task_controller
-                .current()?
-                .context("task input was cleared before dispatch")?;
-            anyhow::ensure!(
-                task.revision == revision,
-                "task input was replaced before dispatch"
-            );
-            let review_exchange =
-                if matches!(&origin, crate::exchange::ExchangeOrigin::TaskStarted { .. }) {
-                    task.entry
-                        .as_ref()
-                        .and_then(|entry| entry.review_exchange.as_ref())
-                } else {
-                    None
-                };
-            if let Some(expected) = review_exchange {
-                let mut exchange = self
-                    .store
-                    .latest_exchange(&self.session.id)?
-                    .context("review exchange is missing")?;
-                anyhow::ensure!(
-                    &exchange.id == expected,
-                    "review exchange changed before revision dispatch"
-                );
-                exchange.revise_plan(self.clock.now_ms())?;
-                self.store.save_exchange(&exchange)?;
-            }
-            if let crate::task::WorkflowSnapshot::Plan { plan } = &task.workflow {
-                let mut admission = ExchangeAdmission::chat(text.clone());
-                admission.origin = origin;
-                if plan.artifact.state == PlanState::ConfiguringChecks {
-                    self.observer.set_check_editing(true)?;
-                    self.check_setup = true;
-                    let result = self
-                        .run_interaction(text, PromptMode::Chat, Some(admission))
-                        .await;
-                    self.check_setup = false;
-                    return result;
-                }
-                return self
-                    .run_planning_interaction(text, review_exchange.is_none().then_some(admission))
-                    .await;
-            }
-            let mode = if task.kind() == crate::task::TaskKind::Execute {
-                PromptMode::ExecutePlan
-            } else {
-                PromptMode::GoalContinuation
-            };
-            let mut admission = ExchangeAdmission::chat(text.clone());
-            admission.origin = origin;
-            return self
-                .run_interaction_input(
-                    text.clone(),
-                    mode,
-                    review_exchange.is_none().then_some(admission),
-                    ProviderInput::from_text(text),
-                )
-                .await;
-        }
-        if text.trim() == "/plan" {
-            return self.observer.list_replanning_choices();
-        }
-        let change = match text.as_str() {
-            "/read full" => Some(crate::task::PermissionChange::ToggleReadScope),
-            "/write" => Some(crate::task::PermissionChange::ToggleWriteEnabled),
-            "/write full" => Some(crate::task::PermissionChange::ToggleWriteScope),
-            "/ask" => Some(crate::task::PermissionChange::SetApproval {
-                mode: ApprovalMode::Ask,
-            }),
-            "/deny" => Some(crate::task::PermissionChange::SetApproval {
-                mode: ApprovalMode::Deny,
-            }),
-            "/allow" => Some(crate::task::PermissionChange::SetApproval {
-                mode: ApprovalMode::Allow,
-            }),
-            "/yolo" => Some(crate::task::PermissionChange::ToggleYolo),
-            _ => None,
-        };
-        if let Some(change) = change {
-            return Box::pin(self.transition_task(json!({"action":"permission","change":change})))
-                .await;
-        }
-        anyhow::ensure!(
-            !matches!(
-                text.split_whitespace().next(),
-                Some("/read" | "/write" | "/mode" | "/ask" | "/deny" | "/allow" | "/yolo")
-            ),
-            "Use /read full, /write, /write full, /ask, /deny, /allow, or /yolo"
-        );
-        if text == "/clear" {
-            return Box::pin(self.new_session(Value::Null)).await;
-        }
-        if self.task_controller.current()?.is_some_and(|task| {
-            task.status() == crate::task::TaskStatus::Paused || !task.entry_accepted()
-        }) {
-            return self
-                .run_interaction_input(
-                    text.clone(),
-                    PromptMode::Chat,
-                    Some(ExchangeAdmission::chat(text.clone())),
-                    ProviderInput::parse(&text),
-                )
-                .await;
-        }
-        let failed_plan_active = self
-            .current_plan_id()?
-            .as_deref()
-            .map(|plan_id| self.store.load_plan(plan_id))
-            .transpose()?
-            .flatten()
-            .is_some_and(|plan| plan.state == PlanState::Failed);
-        anyhow::ensure!(
-            !failed_plan_active,
-            "plan generation stopped; run /plan retry or /plan cancel"
-        );
-        if let Some(plan) = self
-            .current_plan_id()?
-            .as_deref()
-            .map(|plan_id| self.store.load_plan(plan_id))
-            .transpose()?
-            .flatten()
-            .filter(|plan| plan.state == PlanState::AwaitingInput)
-        {
-            let question_id = plan
-                .elicitation
-                .as_ref()
-                .map(|elicitation| {
-                    elicitation
-                        .current_question()
-                        .map(|question| question.id.clone())
-                        .unwrap_or_else(|| elicitation.question_set.id.clone())
-                })
-                .context("active plan has no elicitation state")?;
-            return Box::pin(
-                self.ask_plan_question(json!({ "question_id": question_id, "text": text })),
-            )
-            .await;
-        }
-        if let Some(interaction) = self.find_active_interaction_elicitation()? {
-            let question_id = interaction
-                .elicitation()
-                .and_then(|elicitation| {
-                    elicitation
-                        .current_question()
-                        .map(|question| question.id.clone())
-                        .or_else(|| Some(elicitation.question_set.id.clone()))
-                })
-                .context("active interaction has no elicitation state")?;
-            return Box::pin(
-                self.ask_question(json!({ "question_id": question_id, "text": text })),
-            )
-            .await;
-        }
-        if self
-            .current_plan_id()?
-            .as_deref()
-            .map(|id| self.store.load_plan(id))
-            .transpose()?
-            .flatten()
-            .is_some_and(|plan| plan.state == PlanState::ConfiguringChecks)
-        {
-            return Box::pin(self.configure_plan_checks(text)).await;
-        }
-        let active_plan = self
-            .current_plan_id()?
-            .as_deref()
-            .map(|plan_id| self.store.load_plan(plan_id))
-            .transpose()?
-            .flatten();
-        if self.current_task_is_plan()?
-            && active_plan
-                .as_ref()
-                .is_some_and(|plan| plan.state == PlanState::AwaitingReview)
-        {
-            let admission = ExchangeAdmission::chat(text.clone());
-            return Box::pin(self.run_planning_interaction(text, Some(admission))).await;
-        }
-        let prompt = match active_plan.as_ref() {
-            Some(plan) if !plan.working_path.is_empty() => {
-                let document = self
-                    .plan_file
-                    .read_working_document(&self.session.id, &plan.id)?;
-                PlanPrompt::with_active_document(text.clone(), &document.model_json()?)
-            }
-            _ => text.clone(),
-        };
-        let input = match ProviderInput::parse(&text) {
-            ProviderInput::Skill {
-                name,
-                mut arguments,
-                attachments,
-            } => {
-                if let Some(context) = prompt
-                    .strip_suffix(&text)
-                    .filter(|context| !context.is_empty())
-                {
-                    arguments = format!("{context}{arguments}");
-                }
-                ProviderInput::Skill {
-                    name,
-                    arguments,
-                    attachments,
-                }
-            }
-            ProviderInput::Text { .. } => ProviderInput::from_text(prompt.clone()),
-        };
-        let prompt_mode = if self.current_task_is_plan()?
-            && active_plan.as_ref().is_some_and(|plan| {
-                matches!(plan.state, PlanState::Generating | PlanState::Revising)
-            }) {
-            PromptMode::Plan
-        } else {
-            PromptMode::Chat
-        };
-        Box::pin(self.run_interaction_input(
-            prompt,
-            prompt_mode,
-            Some(ExchangeAdmission::chat(text)),
-            input,
-        ))
-        .await
-    }
-
-    async fn restore_retracted_control_state(
+    /// Finalize admission and rollback state after the owned prompt workflow ends.
+    fn prepare_retracted_control_restore(
         &mut self,
         snapshot: PromptControlSnapshot,
-    ) -> Result<()> {
-        let current = self.task_controller.current()?;
+    ) -> Result<Option<foreground_failure::RetractionGoalJob>> {
+        let controller = self.task_controller.clone();
+        controller
+            .with_task_snapshot(|current| self.restore_retracted_host_snapshot(snapshot, current))
+    }
+
+    /// Restore dependent artifacts while the shared task mutation gate excludes new authority.
+    fn restore_retracted_host_snapshot(
+        &mut self,
+        snapshot: PromptControlSnapshot,
+        current: Option<crate::task::Task>,
+    ) -> Result<Option<foreground_failure::RetractionGoalJob>> {
         let unchanged = match (&current, &snapshot.session.active_task) {
             (Some(current), Some(original)) => {
                 current.revision == original.revision && current.same_contract(original)
@@ -3615,24 +4605,21 @@ impl HarnessBroker {
         self.session.active_task = current;
         self.save_session()?;
         if unchanged && self.capability.native_goal && self.session.provider_session_id.is_some() {
-            let request = self.provider_request(ProviderInput::from_text(""), PromptMode::Chat);
-            match snapshot.goal {
-                Some(goal) => {
-                    self.provider
-                        .goal_status(
-                            request,
-                            crate::provider::native_goal_update(goal.objective, goal.state),
-                        )
-                        .await?
-                }
-                None => {
-                    self.provider
-                        .goal_status(request, crate::provider::NativeGoalUpdate::Absent)
-                        .await?
-                }
-            }
+            let request = self.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?;
+            let update = match snapshot.goal {
+                Some(goal) => crate::provider::native_goal_update(goal.objective, goal.state),
+                None => crate::provider::NativeGoalUpdate::Absent,
+            };
+            let registry = self.execution_registry();
+            return Ok(Some(foreground_failure::RetractionGoalJob::new(
+                self,
+                request,
+                update,
+                self.session.active_task.clone(),
+                registry,
+            )));
         }
-        Ok(())
+        Ok(None)
     }
 
     fn answer_plan_question_choice(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -4462,122 +5449,27 @@ impl HarnessBroker {
         let crate::task::WorkflowSnapshot::Plan { plan } = &task.workflow else {
             anyhow::bail!("planning requires a Plan task");
         };
-        let plan_id = plan.artifact.id.clone();
-        let before = self
-            .plan_file
-            .read_working_document(&self.session.id, &plan_id)?;
-        let before_version = before.version;
-        let discussion = plan.artifact.state == PlanState::AwaitingReview;
-        let result = self
-            .run_interaction(
-                prompt,
-                if discussion {
-                    PromptMode::PlanDiscussion
-                } else {
-                    PromptMode::Plan
-                },
-                admission,
-            )
-            .await;
-        let current = self.task_controller.current()?;
-        let Some(current) = current.filter(|current| {
-            matches!(&current.workflow,
-            crate::task::WorkflowSnapshot::Plan { plan } if plan.artifact.id == plan_id && !plan.paused)
-        }) else {
-            return result;
+        let mode = if plan.artifact.state == PlanState::AwaitingReview {
+            PromptMode::PlanDiscussion
+        } else {
+            PromptMode::Plan
         };
-        if task.permit().validate_observation(Some(&current)).is_err() {
-            return result;
-        }
-        let (mut value, mut events) = match result {
-            Ok(result) => result,
-            Err(error) => {
-                if !error.is::<TurnCancelled>() {
-                    let now_ms = self.clock.now_ms();
-                    if let Err(persistence) = self.task_controller.apply(
-                        &mut self.store,
-                        &current.permit(),
-                        crate::task::TaskEvent::PlanGenerationFailed,
-                        now_ms,
-                    ) && !persistence.is::<crate::task::StaleTask>()
-                    {
-                        return Err(persistence).context("persist planning failure");
-                    }
-                }
-                return Err(error);
-            }
-        };
-        let crate::task::WorkflowSnapshot::Plan { plan } = &current.workflow else {
-            unreachable!()
-        };
-        if discussion && plan.artifact.state == PlanState::AwaitingReview {
-            return Ok((value, events));
-        }
-        let question_snapshot = self.questions.snapshot()?;
-        if question_snapshot.required_pending()
-            || self
-                .store
-                .latest_exchange(&self.session.id)?
-                .is_some_and(|exchange| question_snapshot.required_in_exchange(&exchange.id))
-        {
-            return Ok((value, events));
-        }
-        let after = self
-            .plan_file
-            .read_working_document(&self.session.id, &plan_id)?;
-        let progress = after.version != before_version;
-        let mut completed = self
-            .store
-            .latest_exchange(&self.session.id)?
-            .context("planning progress has no completed exchange")?;
-        let observed = self.task_controller.observe_plan(
-            &mut self.store,
-            &current.permit(),
-            crate::task::TaskTurnId {
-                exchange_ordinal: completed.ordinal,
-                turn_ordinal: completed.turn.len(),
-            },
-            progress,
-            self.clock.now_ms(),
-        );
-        let Some((plan, _)) = (match observed {
-            Ok(result) => result,
-            Err(error) if error.is::<crate::task::StaleTask>() => return Ok((value, events)),
-            Err(error) => return Err(error),
-        }) else {
-            return Ok((value, events));
-        };
-        if !completed.awaiting_input() && !completed.is_finished() {
-            self.capture_final_checkpoint(
-                &mut completed,
-                crate::exchange::ExchangeOutcome::Complete,
-            )
-            .await?;
-            completed.finish(
-                crate::exchange::ExchangeOutcome::Complete,
+        let result = self.run_interaction(prompt, mode, admission).await;
+        if let Err(error) = &result
+            && !error.is::<TurnCancelled>()
+            && let Some(current) = self.task_controller.current()?
+            && task.permit().validate_observation(Some(&current)).is_ok()
+            && let Err(persistence) = self.task_controller.apply(
+                &mut self.store,
+                &current.permit(),
+                crate::task::TaskEvent::PlanGenerationFailed,
                 self.clock.now_ms(),
-            )?;
-            self.store.save_exchange(&completed)?;
-            self.exchange_runtime = None;
-            value["exchange"] = json!({"id":completed.id,"state":completed.state()});
-            events.push(self.event(
-                "exchange_complete",
-                json!({"id":completed.id,"state":completed.state()}),
-            )?);
-        }
-        if plan.state == PlanState::Failed {
-            events.push(self.event(
-                "plan_generation_failed",
-                json!({"plan":plan,
-                "reason":"planning stopped without submitting the canonical plan"}),
-            )?);
-        }
-        if let Some(task) = self.task_controller.current()?
-            && let Some(command) = crate::task::command::SessionCommand::approved_revision(&task)?
+            )
+            && !persistence.is::<crate::task::StaleTask>()
         {
-            events.extend(self.commit_session_command(command)?.1);
+            return Err(persistence).context("persist planning failure");
         }
-        Ok((value, events))
+        result
     }
 
     async fn run_interaction_input(
@@ -4588,29 +5480,7 @@ impl HarnessBroker {
         input: ProviderInput,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         self.context_usage_fresh = false;
-        match Box::pin(self.run_interaction_input_inner(text, mode, admission, input)).await {
-            Ok(result) => {
-                let mut result = Box::pin(self.settle_automatic_checks(result, mode)).await?;
-                if mode != PromptMode::Background
-                    && let Err(error) = Box::pin(self.auto_compact()).await
-                {
-                    result.1.push(self.event(
-                        "background_error",
-                        json!({"error":format!("Automatic compaction failed: {error:#}")}),
-                    )?);
-                }
-                Ok(result)
-            }
-            Err(error) if self.exchange_runtime.is_some() => {
-                match Box::pin(self.finalize_interaction_after_processing_failure()).await {
-                    Ok(()) => Err(error),
-                    Err(finalization_error) => Err(error.context(format!(
-                        "also failed to finalize the interaction: {finalization_error:#}"
-                    ))),
-                }
-            }
-            Err(error) => Err(error),
-        }
+        Box::pin(self.run_interaction_input_inner(text, mode, admission, input)).await
     }
 
     async fn settle_automatic_checks(
@@ -4628,7 +5498,7 @@ impl HarnessBroker {
         {
             return Ok(result);
         }
-        let Some(interaction) = self.store.latest_exchange(&self.session.id)? else {
+        let Some(mut interaction) = self.store.latest_exchange(&self.session.id)? else {
             return Ok(result);
         };
         if interaction.state() != ExchangeState::Complete
@@ -4732,6 +5602,13 @@ impl HarnessBroker {
             automatic.pending = true;
             automatic.save()?;
             run.context.automatic = true;
+            let check_scope = interaction
+                .turn
+                .last()
+                .map(|turn| turn.provider().scope.clone());
+            let execution_revision = check_scope
+                .as_ref()
+                .map(|scope| self.reopened_execution.revision(scope));
             let run = self
                 .check_runner
                 .run(
@@ -4740,6 +5617,14 @@ impl HarnessBroker {
                     Some(Arc::clone(&self.turn_cancellation.requested)),
                 )
                 .await?;
+            if let Some(scope) = &check_scope {
+                self.refresh_settlement(&mut interaction, scope).await?;
+                if execution_revision != Some(self.reopened_execution.revision(scope)) {
+                    result.1.extend(self.finalize_observed_execution().await?);
+                    // Saved results cannot authorize work from a newer native execution.
+                    continue;
+                }
+            }
             if run.state == CheckState::Interrupted {
                 return Err(anyhow::Error::new(TurnCancelled));
             }
@@ -4810,46 +5695,8 @@ impl HarnessBroker {
         }
     }
 
-    async fn finalize_interaction_after_processing_failure(&mut self) -> Result<()> {
-        let Some(runtime) = self.exchange_runtime.take() else {
-            return Ok(());
-        };
-        let mut interaction = self
-            .store
-            .load_exchange(&runtime.exchange_id)?
-            .context("failed interaction runtime has no durable interaction")?;
-        if interaction.state() != ExchangeState::Running {
-            return Ok(());
-        }
-
-        let now_ms = self.clock.now_ms();
-        let mut event = Vec::new();
-        self.record_execution_failure(
-            &mut interaction,
-            "Failed while processing the provider response".into(),
-        )
-        .await?;
-        self.capture_final_checkpoint(&mut interaction, crate::exchange::ExchangeOutcome::Failed)
-            .await?;
-        interaction.finish(crate::exchange::ExchangeOutcome::Failed, now_ms)?;
-        self.store.save_exchange(&interaction)?;
-        self.pause_goal_after_turn_failure().await?;
-        self.save_session()?;
-        self.active_wait_projection = None;
-        self.emit_live_interaction(
-            publication::LiveUpdate::StateChanged,
-            &interaction,
-            &mut event,
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn start_exchange_runtime(
-        &mut self,
-        interaction: &mut Exchange,
-        now_ms: i64,
-    ) -> Result<()> {
+    /// Start checkpoint acquisition and tool gating without awaiting the worker.
+    fn begin_exchange_runtime(&mut self, interaction: &mut Exchange, now_ms: i64) -> Result<()> {
         self.require_restore_recovered()?;
         let tool_gate = self
             .checkpoint
@@ -4968,23 +5815,6 @@ impl HarnessBroker {
         self.finish_initial_checkpoint(runtime, interaction, result)
     }
 
-    async fn park_exchange_for_restart(&mut self, interaction: &mut Exchange) -> Result<()> {
-        if let Err(error) = self.collect_active_initial_checkpoint(interaction).await {
-            interaction.begin_finalization(
-                crate::exchange::ExchangeOutcome::Failed,
-                self.clock.now_ms(),
-            )?;
-            interaction.finalization_error = Some(format!("{error:#}"));
-            self.store.save_exchange(interaction)?;
-            return Err(error);
-        }
-        interaction.pause_for_restart(self.clock.now_ms())?;
-        self.store.save_exchange(interaction)?;
-        self.exchange_runtime = None;
-        self.active_wait_projection = None;
-        self.save_session()
-    }
-
     async fn collect_active_initial_checkpoint(
         &mut self,
         interaction: &mut Exchange,
@@ -5042,299 +5872,6 @@ impl HarnessBroker {
             .retain(self.agent_coordinator.resolve(&task.agent_id)?, task)
     }
 
-    fn start_agent_result_delivery(
-        &self,
-        attached: &[crate::agent::AgentTask],
-        attempted: &mut std::collections::HashSet<String>,
-        delivery: &mut tokio::task::JoinSet<(crate::agent::AgentTask, Result<()>)>,
-    ) -> Result<()> {
-        if !self.provider.descriptor().capability.native_steer {
-            return Ok(());
-        }
-        for task in self.agent_coordinator.unreported_result() {
-            if attached.iter().any(|attached| attached.id == task.id)
-                || !attempted.insert(task.id.clone())
-            {
-                continue;
-            }
-            let message = self.agent_result_message(&task)?;
-            let provider = self.provider.clone();
-            let session_id = self.session.id.clone();
-            delivery.spawn(async move {
-                let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                    anyhow::ensure!(
-                        provider.has_active_turn(&session_id).await,
-                        "parent provider turn ended before delivery"
-                    );
-                    provider
-                        .steer_session(
-                            &session_id,
-                            crate::provider::SteeringInput::AgentResult(message),
-                        )
-                        .await
-                })
-                .await
-                .context("parent result delivery exceeded 30 seconds")
-                .and_then(|result| result);
-                (task, result)
-            });
-        }
-        Ok(())
-    }
-
-    fn finish_agent_result_delivery(
-        &mut self,
-        delivery: std::result::Result<
-            (crate::agent::AgentTask, Result<()>),
-            tokio::task::JoinError,
-        >,
-    ) -> Result<()> {
-        let (task, result) = delivery.context("parent result delivery task failed")?;
-        match result {
-            Ok(()) => {
-                self.trace.record(
-                    &self.session.id,
-                    "agent.result_delivered",
-                    json!({"task_id":task.id,"delivery":"steered"}),
-                );
-                self.acknowledge_agent_result(task)?;
-            }
-            Err(error) => self.trace.record(
-                &self.session.id,
-                "agent.result_queued",
-                json!({
-                "task_id":task.id,"error":format!("{error:#}")}),
-            ),
-        }
-        Ok(())
-    }
-
-    async fn prompt_with_timeline(
-        &mut self,
-        mut request: ProviderRequest,
-        interaction: &mut Exchange,
-        event: &mut Vec<SessionEvent>,
-        prepared: admission::PreparedTurn,
-    ) -> Result<crate::provider::ProviderCompletion> {
-        prepared.consume(interaction)?;
-        let mut parent_input = self.parent_input.activate(None)?;
-        let mut deferred_input = std::collections::VecDeque::new();
-        let mut continuation_command: Option<crate::provider::SteerCommand> = None;
-        let mut continuation_count = 0;
-        let mut aggregate: Option<crate::provider::ProviderCompletion> = None;
-        let mut continuation_result = self.agent_coordinator.unreported_result();
-        if !continuation_result.is_empty() {
-            let message = continuation_result
-                .iter()
-                .map(|task| self.agent_result_message(task))
-                .collect::<Result<Vec<_>>>()?
-                .join("\n\n");
-            match &mut request.input {
-                ProviderInput::Text { text, .. } => {
-                    text.push_str("\n\n");
-                    text.push_str(&message);
-                }
-                ProviderInput::Skill { arguments, .. } => {
-                    arguments.push_str("\n\n");
-                    arguments.push_str(&message);
-                }
-            }
-        }
-        loop {
-            if self.turn_cancellation.requested.load(Ordering::Acquire) {
-                return Err(anyhow::Error::new(TurnCancelled));
-            }
-            // Heap-owned child futures keep resumed repair polling within the worker stack.
-            let output = Box::pin(self.prompt_provider_with_timeline(
-                request.clone(),
-                interaction,
-                event,
-                &continuation_result,
-                ProviderSteering {
-                    active: &mut parent_input,
-                    deferred: &mut deferred_input,
-                    continuation: continuation_command.take(),
-                },
-            ))
-            .await?;
-            for task in continuation_result.drain(..) {
-                self.acknowledge_agent_result(task)?;
-            }
-            if self.exchange_runtime.is_some() {
-                self.store.save_exchange(interaction)?;
-            }
-            let user_decision = output.plan_question.is_some()
-                || output.question_withdrawal.is_some()
-                || output.plan_submit.is_some()
-                || output.control_error.is_some()
-                || output.evidence.structured_blocked
-                || interaction.awaiting_input();
-            request.provider_session_id = output
-                .provider_session_id
-                .clone()
-                .or(request.provider_session_id);
-            aggregate = Some(if let Some(mut aggregate) = aggregate {
-                aggregate.native.provider_session_id = output
-                    .native
-                    .provider_session_id
-                    .clone()
-                    .or(aggregate.native.provider_session_id);
-                aggregate.native.provider_checkpoint_id = output
-                    .native
-                    .provider_checkpoint_id
-                    .or(aggregate.native.provider_checkpoint_id);
-                aggregate.plan_edit.extend(output.plan_edit);
-                aggregate.design_patch.extend(output.design_patch);
-                aggregate.plan_deviation.extend(output.plan_deviation);
-                aggregate.plan_task_report.extend(output.plan_task_report);
-                aggregate.plan_read = output.plan_read.or(aggregate.plan_read);
-                aggregate.question_answer = output.question_answer.or(aggregate.question_answer);
-                aggregate.question_withdrawal =
-                    output.question_withdrawal.or(aggregate.question_withdrawal);
-                aggregate.structured_plan |= output.structured_plan;
-                aggregate.native.evidence.workspace_changed |=
-                    output.native.evidence.workspace_changed;
-                aggregate.native.evidence.tool_called |= output.native.evidence.tool_called;
-                aggregate.native.evidence.native_state = output
-                    .native
-                    .evidence
-                    .native_state
-                    .or(aggregate.native.evidence.native_state);
-                aggregate.native.evidence.structured_complete |=
-                    output.native.evidence.structured_complete;
-                aggregate.native.evidence.structured_blocked |=
-                    output.native.evidence.structured_blocked;
-                aggregate.goal_control = output.goal_control.or(aggregate.goal_control);
-                aggregate.native.metrics.context_usage = output
-                    .native
-                    .metrics
-                    .context_usage
-                    .or(aggregate.native.metrics.context_usage);
-                aggregate.native.metrics.native_compact_update = output
-                    .native
-                    .metrics
-                    .native_compact_update
-                    .or(aggregate.native.metrics.native_compact_update);
-                aggregate.native.capability = output.native.capability;
-                aggregate.native.runtime = output.native.runtime.clone();
-                aggregate.plan_question = output.plan_question;
-                aggregate.plan_submit = output.plan_submit;
-                aggregate.control_error = output.control_error;
-                aggregate
-            } else {
-                output
-            });
-            if user_decision {
-                break;
-            }
-            let mut revision = self.agent_coordinator.subscribe();
-            let mut continuation_input = None;
-            let mut continuation_submission = None;
-            loop {
-                if self.turn_cancellation.requested.load(Ordering::Acquire) {
-                    return Err(anyhow::Error::new(TurnCancelled));
-                }
-                event.extend(self.drain_agent_commands(Some(interaction)).await?);
-                while let Some(input) = parent_input.try_receive() {
-                    deferred_input.push_back(input);
-                }
-                if self.agent_coordinator.is_quiescing() {
-                    tokio::select! {
-                        biased;
-                        _ = self.turn_cancellation.cancelled() => return Err(anyhow::Error::new(TurnCancelled)),
-                        changed = revision.changed() => {
-                            changed.context("agent coordinator closed during child cleanup")?;
-                        }
-                    }
-                    continue;
-                }
-                if let Some(input) = deferred_input.pop_front() {
-                    continuation_input = Some(
-                        ProviderInput::from_text(input.text.clone())
-                            .with_attachments(input.attachments.clone()),
-                    );
-                    continuation_submission = input.submission.clone();
-                    continuation_command = Some(input);
-                    continuation_result = self.agent_coordinator.unreported_result();
-                    if let Some(ProviderInput::Text { text, .. }) = &mut continuation_input {
-                        for task in &continuation_result {
-                            text.push_str("\n\n");
-                            text.push_str(&self.agent_result_message(task)?);
-                        }
-                    }
-                    break;
-                }
-                if !self.agent_coordinator.has_unresolved_task(&interaction.id) {
-                    break;
-                }
-                let result = self.agent_coordinator.pending_result(&interaction.id);
-                if !self.agent_coordinator.has_active_task(&interaction.id) && !result.is_empty() {
-                    anyhow::ensure!(
-                        continuation_count < self.goal_max_turns,
-                        "child-result continuation reached the session turn limit"
-                    );
-                    continuation_count += 1;
-                    let message = result
-                        .iter()
-                        .map(|task| self.agent_result_message(task))
-                        .collect::<Result<Vec<_>>>()?
-                        .join("\n\n");
-                    continuation_input = Some(ProviderInput::from_text(format!(
-                        "Continue this same unfinished request using the child messages below. Synthesize the results and complete the original request when its required work is settled.\n\n{message}"
-                    )));
-                    continuation_result = result;
-                    self.trace.record(&self.session.id,"agent.parent_continuation",json!({"agent_id":self.session.primary_agent_id,"exchange_id":interaction.id,"turn":continuation_count}));
-                    break;
-                }
-                self.set_parent_wait(interaction, true, event).await?;
-                tokio::select! {
-                    biased;
-                    _ = self.turn_cancellation.cancelled() => return Err(anyhow::Error::new(TurnCancelled)),
-                    input = parent_input.receive() => {deferred_input.push_back(input.context("parent input receiver closed")?);}
-                    changed = revision.changed() => {changed.context("agent coordinator closed while parent awaits results")?;}
-                }
-            }
-            self.set_parent_wait(interaction, false, event).await?;
-            if let Some(input) = continuation_input {
-                request.input = input;
-                request.submission = continuation_submission;
-                request.recovered_input.clear();
-            } else {
-                break;
-            }
-        }
-        aggregate.context("provider returned no parent output")
-    }
-
-    async fn set_parent_wait(
-        &mut self,
-        interaction: &mut Exchange,
-        waiting: bool,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
-        let now_ms = self.clock.now_ms();
-        let previous = self
-            .active_wait_projection
-            .as_ref()
-            .filter(|wait| wait.exchange_id == interaction.id);
-        let started_at_ms = previous.map_or(now_ms, |wait| wait.started_at_ms);
-        if !waiting && previous.is_none() {
-            return Ok(());
-        }
-        interaction.observe_blocker("agent_wait".into(), waiting, now_ms);
-        self.active_wait_projection = waiting.then(|| ActiveWait {
-            exchange_id: interaction.id.clone(),
-            started_at_ms,
-            agent_count: self.agent_coordinator.active_count(),
-        });
-        if let Some(runtime) = &mut self.exchange_runtime {
-            runtime.active_wait = self.active_wait_projection.clone();
-        }
-        self.store.save_exchange(interaction)?;
-        let patch = self.reconcile_live_interaction(Some(interaction), None)?;
-        self.emit_timeline_patch(patch, event).await
-    }
-
     async fn notify_unavailable_mcp(
         &mut self,
         request: &ProviderCatalogRequest,
@@ -5380,573 +5917,23 @@ impl HarnessBroker {
         Ok(())
     }
 
-    async fn prompt_provider_with_timeline(
-        &mut self,
-        mut request: ProviderRequest,
-        interaction: &mut Exchange,
-        event: &mut Vec<SessionEvent>,
-        attached_result: &[crate::agent::AgentTask],
-        steering: ProviderSteering<'_>,
-    ) -> Result<crate::provider::ProviderCompletion> {
-        let ProviderSteering {
-            active: parent_input,
-            deferred: deferred_input,
-            continuation: continuation_command,
-        } = steering;
-        let turn_task_authority = request
-            .control_context
-            .as_ref()
-            .and_then(crate::tools::TaskAuthority::capture);
-        if request.mode != PromptMode::Background {
-            self.notify_unavailable_mcp(
-                &ProviderCatalogRequest {
-                    execution_owner: request.execution_owner.clone(),
-                    harness_session_id: request.harness_session_id.clone(),
-                    workspace: request.workspace.clone(),
-                    access: request.access.clone(),
-                    approval_mode: request.approval_mode,
-                    provider_session_id: request.provider_session_id.clone(),
-                },
-                event,
-            )
-            .await?;
-        }
-        let (agent_scope, _agent_lease) = crate::agent::AgentToolScope::new(
-            crate::provider::ExecutionOwner::root(&self.session.id),
-            interaction.id.clone(),
-            self.agent_coordinator.clone(),
-        )?;
-        if let Some(context) = &mut request.control_context {
-            context.agent = Some(agent_scope);
-        }
-        let mut agent_revision = self.agent_coordinator.subscribe();
-        let mut attempted_result = std::collections::HashSet::new();
-        let mut result_delivery = tokio::task::JoinSet::new();
-        let mut user_delivery = tokio::task::JoinSet::new();
-        event.extend(self.drain_agent_commands(Some(interaction)).await?);
-        let mut runtime = self
-            .exchange_runtime
-            .take()
-            .context("active interaction timeline is missing")?;
-        let provider = Arc::clone(&self.provider);
-        let cancellation = Arc::clone(&self.turn_cancellation);
-        let retry_trace = Arc::clone(&self.trace);
-        let submission_store = self.submission_store.clone();
-        let mut cleanup = cancellation.cleanup.subscribe();
-        let scope = crate::provider::InvocationScope::new(request.owner()?, interaction.id.clone());
-        let (provider_event_sink, mut provider_event_stream) =
-            crate::provider::events::channel(scope.clone());
-        let tool_timeout = crate::settings::SettingsStore::read_only(&self.data_root)?
-            .get(
-                &self.session.workspace,
-                &self.session.id,
-                &self.session.provider,
-            )?
-            .desired
-            .tool_timeout
-            .unwrap_or(self.session.tool_timeout);
-        let tool_watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
-            tool_timeout,
-        )?);
-        self.observer
-            .session_events
-            .watch_tools(&scope, &tool_watchdog)?;
-        let provider_event_sink = provider_event_sink.with_observer(tool_watchdog.clone());
-        let (execution_sender, mut execution_receiver) =
-            tokio::sync::mpsc::channel::<crate::plan::execution::ExecutionControl>(1);
-        let execution = self
-            .current_execution()?
-            .filter(|execution| execution.state == PlanExecutionState::Active);
-        if request.mode == PromptMode::ExecutePlan
-            && let (Some(context), Some(execution)) =
-                (&mut request.control_context, execution.as_ref())
-        {
-            context.execution = Some(crate::plan::execution::ExecutionControlSender {
-                task_controller: self.task_controller.clone(),
-                phase: execution.phase,
-                execution_id: execution.id.clone(),
-                generation: execution.generation,
-                sender: execution_sender.clone(),
-            });
-        }
-        let (check_scope, _check_lease) = crate::checks::CheckToolScope::open(
-            Arc::clone(&self.check_runner),
-            crate::checks::CheckAuthority {
-                data_root: self.data_root.clone(),
-                provider: self.session.provider.clone(),
-                task_id: self.task_controller.current()?.map(|task| {
-                    task.entry
-                        .as_ref()
-                        .map(|entry| entry.id.as_str())
-                        .unwrap_or(task.revision.as_str())
-                        .to_owned()
-                }),
-                shell: self.session.shell,
-                mode: request.mode,
-                permission: self.session.approval_mode,
-                permissions: Arc::clone(&self.permission_coordinator),
-                scope: scope.clone(),
-                authorization_sink: provider_event_sink.clone(),
-                editing: Arc::clone(&self.observer.check_editing),
-                setup: interaction.check_setup.is_some(),
-                can_run: interaction.check_setup.is_none()
-                    && self.agent_coordinator.active_count() == 0
-                    && execution.is_none(),
-                agent: Arc::clone(&self.agent_coordinator),
-                cancelled: Arc::clone(&self.turn_cancellation.requested),
-                sink: self.event_sink.clone(),
-            },
-        );
-        if let Some(context) = &mut request.control_context {
-            context.checks = Some(check_scope);
-            if interaction.check_setup.is_some() && request.mode == PromptMode::Chat {
-                context.resolved_question_digest_set.clear();
-                context.has_active_elicitation = interaction.elicitation().is_some();
-            }
-        }
-        let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(5));
-        scan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        scan_interval.tick().await;
-        let mut stream_open = true;
-        let mut checkpoint_failed = false;
-        let mut pending_revision: Option<(
-            tokio::sync::oneshot::Sender<Result<Value>>,
-            crate::plan::revision_review::RevisionReviewWait,
-        )> = None;
-        let delivery_sink = self.event_sink.clone();
-        let mut question_changes = self.questions.changed.subscribe();
-        let mut provider_task = tokio::task::JoinSet::new();
-        // Provider polling starts at a task boundary instead of inside the host dispatch stack.
-        provider_task.spawn(async move {
-            if !provider.checkpoint_tool_gate()
-                && let Some(gate) = request
-                    .control_context
-                    .as_ref()
-                    .and_then(|context| context.checkpoint.as_ref())
-            {
-                gate.wait().await?;
-            }
-            let acceptance_sink = provider_event_sink.clone();
-            let response = crate::provider::retry::prompt(
-                provider.as_ref(),
-                request,
-                Some(provider_event_sink),
-                &retry_trace,
-                &submission_store,
-            );
-            if let Some(command) = continuation_command {
-                command.complete_with(response, acceptance_sink).await
-            } else {
-                response.await
-            }
-        });
-        // Event-loop state must not remain inline in the provider lifecycle future.
-        let session_events = Arc::clone(&self.observer.session_events);
-        let outcome = Box::pin(async {
-            loop {
-                tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => break Err(anyhow::Error::new(TurnCancelled)),
-                    expired = tool_watchdog.expired() => {
-                        let expired = expired?.context("tool watchdog ended during foreground execution")?;
-                        cancellation.requested.store(true, Ordering::Release);
-                        let message = expired.to_string();
-                        self.process_provider_event(&mut runtime, interaction, ProviderEvent::Tool {
-                            address: expired.address.clone(),
-                            update: crate::provider::ToolUpdate::Finished {
-                                outcome: crate::provider::ToolOutcome::Failed {
-                                    diagnostic: crate::provider::ToolDiagnostic {
-                                        code: Some("tool_timeout".into()), message,
-                                    },
-                                },
-                            },
-                        }, event).await?;
-                        break Err(anyhow::Error::new(expired));
-                    }
-                    changed = question_changes.changed(), if !self.question_discussion => {
-                        changed.context("question controller closed during execution")?;
-                        if self.questions.snapshot()?.required_in_exchange(&interaction.id) {
-                            let provider_session_id = self.provider.active_session_id_for(&self.session.id).await
-                                .or_else(|| self.session.provider_session_id.clone());
-                            self.provider.cleanup_execution(&self.session.id).await
-                                .context("stop execution for required questions")?;
-                            // The controller owns this deliberate stop; it is not evidence of task completion.
-        let completion = crate::provider::ProviderCompletion {
-            native: forge_provider_api::completion::ProviderCompletion {
-                                provider_session_id,
-                                provider_checkpoint_id: self.session.provider_checkpoint_id.clone(),
-                                capability: self.capability.clone(), ..Default::default() },
-                                ..Default::default()
-                            };
-                            break Ok(completion);
-                        }
-                    }
-
-                    result = async {
-                        match runtime.checkpoint.as_mut() {
-                            Some(task) => (&mut task.0).await.context("checkpoint worker failed").and_then(|result|result),
-                            None => std::future::pending().await,
-                        }
-                    } => {
-                        if let Err(error) = self.finish_initial_checkpoint(&mut runtime, interaction, result) {
-                            checkpoint_failed = true;
-                            break Err(error);
-                        }
-                    }
-                    input = parent_input.receive(), if user_delivery.is_empty() && deferred_input.is_empty() => {
-                        let input = input.context("parent input receiver closed")?;
-                        if self.provider.descriptor().capability.native_steer {
-                            let provider = self.provider.clone();
-                            let session_id = self.session.id.clone();
-                            user_delivery.spawn(async move {
-                                // The native lane owns admission until it acknowledges or rejects
-                                // the input. A host deadline can strand a still-queued command and
-                                // incorrectly defer subsequent steering until the turn ends.
-                                let result = provider.steer_session(&session_id,input.input()).await;
-                                (input,result)
-                            });
-                        } else {deferred_input.push_back(input);}
-                    }
-                    delivery = user_delivery.join_next(), if !user_delivery.is_empty() => {
-                        let (input,result) = delivery.context("parent input delivery disappeared")?.context("parent input delivery failed")?;
-                        if let Some(input) = input.settle_delivery(result).await? { deferred_input.push_back(input); }
-                    }
-                    changed = agent_revision.changed() => {
-                        changed.context("agent coordinator closed during root execution")?;
-                        event.extend(self.drain_agent_commands(Some(interaction)).await?);
-                        self.start_agent_result_delivery(attached_result,&mut attempted_result,&mut result_delivery)?;
-                    }
-                    delivery = result_delivery.join_next(), if !result_delivery.is_empty() => {
-                        self.finish_agent_result_delivery(delivery.context("parent result delivery disappeared")?)?;
-                    }
-                    control = execution_receiver.recv() => {
-                        if let Some(control) = control {
-                            while let Ok(provider_event) = provider_event_stream.try_recv() {
-                                self.process_provider_event(&mut runtime, interaction, provider_event, event).await?;
-                            }
-                            let submission = matches!(&control.operation, crate::plan::execution::ExecutionOperation::Submit { .. });
-                            let result = self.handle_execution_control(&control.execution_id, control.generation, &control.task_permit, control.operation, interaction).await;
-                            let committed = result.is_ok();
-                            let waiting = submission && result.as_ref().is_ok_and(|response| response["status"] == "paused");
-                            if waiting {
-                                anyhow::ensure!(pending_revision.is_none(), "another revision review is already pending");
-                                let wait = self.revision_review.open()?;
-                                interaction.pause(self.clock.now_ms());
-                                interaction.set_awaiting_input(true);
-                                self.store.save_exchange(interaction)?;
-                                pending_revision = Some((control.response, wait));
-                            } else {
-                                let _ = control.response.send(result);
-                            }
-                            if committed {
-                                let patch = self.reconcile_timeline()?;
-                                self.emit_timeline_patch(patch, event).await?;
-                            }
-                        }
-                    }
-                    review = async {
-                        if let Some((_, wait)) = &mut pending_revision {
-                            wait.receiver.recv().await
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
-                        use crate::plan::revision_review::RevisionReviewRequest;
-                        match review.context("revision review request lane closed")? {
-                            RevisionReviewRequest::Capture { plan_id, digest, revision, response } => {
-                                if let Some(authority) = &turn_task_authority
-                                    && let Err(error) = authority.validate() {
-                                    let _ = response.send(Err(error));
-                                    continue;
-                                }
-                                let result = if self.current_plan_id()?.as_deref() != Some(plan_id.as_str()) {
-                                    Err(anyhow::anyhow!("review belongs to another plan"))
-                                } else if let Some(revision) = revision {
-                                    self.observer.capture_plan_revision(&plan_id, revision).and_then(|source| {
-                                        anyhow::ensure!(crate::plan::digest(&serde_json::to_vec(&source.document)?) == digest,
-                                            "plan revision changed before opening");
-                                        Ok(source)
-                                    })
-                                } else { self.observer.capture_plan_review(&plan_id, &digest) };
-                                let _ = response.send(result);
-                            }
-                            RevisionReviewRequest::Decide { method, params, response } => {
-                                if let Some(authority) = &turn_task_authority
-                                    && let Err(error) = authority.validate() {
-                                    let _ = response.send(Err(error));
-                                    continue;
-                                }
-                                let result = if params.get("plan_id").and_then(Value::as_str)
-                                    .is_some_and(|id| self.current_plan_id().ok().flatten().as_deref() != Some(id)) {
-                                    Err(anyhow::anyhow!("review decision belongs to another plan"))
-                                } else {
-                                    match method {
-                                        RuntimeMethod::SessionPlanAcceptanceBegin => self.dispatch_session_command("session.plan.acceptance.begin", params),
-                                        RuntimeMethod::SessionPlanChangesRequest => self.dispatch_session_command("session.plan.changes.request", params),
-                                        RuntimeMethod::SessionPlanCancel => self.dispatch_session_command("session.plan.cancel", params),
-                                        RuntimeMethod::SessionPlanEntityRename => self.rename_plan_entity(params),
-                                        RuntimeMethod::SessionPlanTestDelete => self.delete_plan_tests(params),
-                                        RuntimeMethod::SessionPlanCheckUpdate => Box::pin(self.update_plan_checks(params)).await,
-                                        _ => Err(anyhow::anyhow!("unsupported revision review decision")),
-                                    }
-                                };
-                                match result {
-                                    Err(error) => { let _ = response.send(Err(error)); }
-                                    Ok(result) if matches!(method, RuntimeMethod::SessionPlanEntityRename | RuntimeMethod::SessionPlanTestDelete | RuntimeMethod::SessionPlanCheckUpdate) => {
-                                        let _ = response.send(Ok(result));
-                                    }
-                                    Ok((_, mut events)) => {
-                                        interaction.set_awaiting_input(false);
-                                        interaction.resume(self.clock.now_ms())?;
-                                        self.store.save_exchange(interaction)?;
-                                        let execution_id = self.current_execution()?.context("review has no execution")?.id;
-                                        let provider_response = self.revision_review_response(&execution_id)?;
-                                        events.retain(|event| event.event != "goal_continue_requested");
-                                        let patch = self.reconcile_timeline()?;
-                                        self.emit_timeline_patch(patch, event).await?;
-                                        let snapshot = serde_json::to_value(self.snapshot()?)?;
-                                        let (provider, wait) = pending_revision.take().context("revision review lost its provider wait")?;
-                                        drop(wait);
-                                        let _ = response.send(Ok((snapshot, events)));
-                                        let _ = provider.send(Ok(provider_response));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ = scan_interval.tick(), if execution.is_some() && pending_revision.is_none() => {
-                        if let Some(execution) = &execution {
-                            match self.scan_execution(&execution.id).await {
-                                Ok(progress) => {
-                                    let patch = self.reconcile_live_interaction(Some(interaction), None)?;
-                                    self.emit_timeline_patch(patch, event).await?;
-                                    self.emit_session_update(SessionUpdate::PlanProgress { progress: serde_json::from_value(progress)? }, event).await?;
-                                },
-                                Err(error) => self.trace.record(&self.session.id, "plan.progress_failed", json!({"error":format!("{error:#}")})),
-                            }
-                        }
-                    }
-                    changed = cleanup.changed() => {
-                        if changed.is_ok() {
-                            let state = cleanup.borrow_and_update().clone();
-                            if !matches!(state, ExecutionCleanup::Idle) {
-                                if !cancellation.restart.load(Ordering::Acquire) {
-                                    interaction.begin_finalization(crate::exchange::ExchangeOutcome::Cancelled, self.clock.now_ms())?;
-                                }
-                                interaction.finalization_error = match state {
-                                    ExecutionCleanup::Failed(error) => Some(error),
-                                    _ => None,
-                                };
-                                self.store.save_exchange(interaction)?;
-                                let patch = self.reconcile_live_interaction(Some(interaction), None)?;
-                                self.emit_timeline_patch(patch, event).await?;
-                            }
-                        }
-                    }
-                    provider_event = provider_event_stream.recv(), if stream_open => {
-                        let provider_event = match provider_event {
-                            Ok(Some(event)) => event,
-                            Ok(None) => { stream_open = false; continue; },
-                            Err(error) => break Err(error.into()),
-                        };
-                        if let Err(error) = self
-                            .process_provider_event(&mut runtime, interaction, provider_event, event)
-                            .await
-                        {
-                            break Err(error);
-                        }
-                        self.start_agent_result_delivery(attached_result,&mut attempted_result,&mut result_delivery)?;
-                    }
-                    // Admit queued background lifetime markers before their session-stream completion.
-                    ready = session_events.notified() => {
-                        ready?;
-                        for observation in session_events.drain_after(&mut provider_event_stream)? {
-                            if observation.scope().invocation().is_some_and(|scope| scope.exchange_id == interaction.id) {
-                                self.process_provider_event(&mut runtime, interaction, observation, event).await?;
-                            } else if matches!(observation, ProviderEvent::Tool { .. }) {
-                                anyhow::ensure!(
-                                    observation.scope().owner() == &crate::provider::ExecutionOwner::root(&self.session.id),
-                                    "session tool event crosses execution ownership"
-                                );
-                                self.route_settled_parent_event(interaction, &observation, event).await?;
-                            } else {
-                                event.extend(self.observe_session_event(observation)?);
-                            }
-                        }
-                    }
-                    error = publication::failed(delivery_sink.as_ref()) => break Err(error.into()),
-                    result = provider_task.join_next() => {
-                        break result.context("provider task ended without an outcome")?
-                            .context("provider task failed")?;
-                    },
-                }
-            }
-        }).await;
-        provider_task.shutdown().await;
-        let outcome = if !matches!(*cancellation.cleanup.borrow(), ExecutionCleanup::Idle) {
-            Err(anyhow::Error::new(TurnCancelled))
-        } else {
-            outcome
+    /// Revoke question delivery before native cancellation can release its waiting tools.
+    pub(crate) fn cancel_question_delivery(&self) -> Result<()> {
+        let active = self
+            .store
+            .exchange_in_state(&self.session.id, ExchangeState::Running)?;
+        let active = match active {
+            Some(active) => Some(active),
+            None => self.store.latest_exchange(&self.session.id)?,
         };
-        if outcome.is_err()
-            && let Some(gate) = &runtime.tool_gate
-        {
-            gate.complete(Err(
-                "provider turn ended before checkpoint admission completed".into(),
-            ))?;
-        }
-        let tools_blocked = runtime.tools_blocked();
-        let cancelled_before_tools = outcome
-            .as_ref()
-            .is_err_and(|error| error.is::<TurnCancelled>())
-            && tools_blocked;
-        let outcome = if !cancelled_before_tools && let Some(task) = runtime.checkpoint.as_mut() {
-            let cancelled = async {
-                cancellation.cancelled().await;
-                if tools_blocked {
-                    return;
-                }
-                std::future::pending::<()>().await;
-            };
-            let result = tokio::select! {
-                biased;
-                () = cancelled => None,
-                result = &mut task.0 => Some(result.context("checkpoint worker failed").and_then(|result|result)),
-            };
-            match result {
-                Some(result) => {
-                    let saved = self.finish_initial_checkpoint(&mut runtime, interaction, result);
-                    checkpoint_failed |= saved.is_err();
-                    saved.and(outcome)
-                }
-                None => Err(anyhow::Error::new(TurnCancelled)),
-            }
-        } else {
-            outcome
-        };
-        while !result_delivery.is_empty() {
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {result_delivery.abort_all(); break;}
-                delivery = result_delivery.join_next() => {
-                    self.finish_agent_result_delivery(delivery.context("parent result delivery disappeared")?)?;
-                }
-            }
-        }
-        while !user_delivery.is_empty() {
-            tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => {user_delivery.abort_all(); break;}
-                delivery = user_delivery.join_next() => {
-                    let (input,result) = delivery.context("parent input delivery disappeared")?.context("parent input delivery failed")?;
-                    if let Some(input) = input.settle_delivery(result).await? { deferred_input.push_back(input); }
-                }
-            }
-        }
-        drop(pending_revision.take());
-        let mut outcome = if !matches!(*cancellation.cleanup.borrow(), ExecutionCleanup::Idle) {
-            Err(anyhow::Error::new(TurnCancelled))
-        } else {
-            outcome
-        };
-        loop {
-            match provider_event_stream.try_next() {
-                Ok(Some(provider_event)) => {
-                    if let Err(error) = self
-                        .process_provider_event(&mut runtime, interaction, provider_event, event)
-                        .await
-                    {
-                        outcome = Err(error);
-                    }
-                }
-                Ok(None) => break,
-                Err(error) => {
-                    outcome = Err(error.into());
-                    break;
-                }
-            }
-        }
-        if outcome.is_ok()
-            && let Err(error) = provider_event_stream.check()
-        {
-            outcome = Err(error.into());
-        }
-        if outcome.is_err()
-            && let Err(error) = self
-                .permission_coordinator
-                .cancel_owner(
-                    &crate::provider::ExecutionOwner::root(&self.session.id),
-                    None,
-                )
-                .await
-        {
-            outcome = Err(error).context("clear pending approval requests");
-        }
-        if outcome.as_ref().is_err_and(|error| {
-            checkpoint_failed
-                || error.downcast_ref::<TurnCancelled>().is_some()
-                || error
-                    .downcast_ref::<crate::provider::tool_timeout::ToolTimeout>()
-                    .is_some()
-                || error
-                    .downcast_ref::<crate::provider::events::EventDeliveryError>()
-                    .is_some()
-        }) && let Err(error) = self.provider.cancel_session(&self.session.id).await
-        {
-            outcome = Err(error).context("stop cancelled provider transport");
-        }
-        self.exchange_runtime = Some(runtime);
-        if outcome.is_ok() {
-            self.observer.session_events.monitor_background(
-                scope,
-                tool_watchdog,
-                self.provider.clone(),
-            )?;
-        }
-        outcome
-    }
-
-    async fn retract_cancelled_interaction(
-        &mut self,
-        interaction: &Exchange,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<bool> {
-        match self
-            .provider
-            .rollback_cancelled_turn_for(&self.session.id)
-            .await
-        {
-            Ok(true) => {
-                self.store.delete_exchange(&interaction.id)?;
-                self.exchange_runtime.take();
-                self.emit_live(publication::LiveUpdate::StateChanged, event)
-                    .await?;
-                Ok(true)
-            }
-            Ok(false) => Ok(false),
-            Err(error) => {
-                self.emit_live(
-                    SessionUpdate::Diagnostic {
-                        diagnostic: crate::provider::ProviderDiagnostic {
-                            code: None,
-                            message: format!("Cancelled turn could not be retracted: {error:#}"),
-                            fatal: false,
-                        },
-                    },
-                    event,
-                )
-                .await?;
-                Ok(false)
-            }
-        }
+        self.questions
+            .cancel_chat(active.as_ref().map(|exchange| exchange.id.as_str()))
     }
 
     /// Retry finalization without submitting provider input or replaying tool execution.
     async fn cancel_settled_execution(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let mut event = Vec::new();
-        if self.task_controller.current()?.is_none() {
-            self.questions.cancel_chat(None)?;
-        }
+        self.cancel_question_delivery()?;
         if self
             .current_goal()?
             .is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused))
@@ -6021,115 +6008,83 @@ impl HarnessBroker {
     ) -> Result<Option<String>> {
         interaction.begin_finalization(outcome, self.clock.now_ms())?;
         self.store.save_exchange(interaction)?;
+        let scope = interaction
+            .turn
+            .last()
+            .map(|turn| turn.provider().scope.clone());
+        if let Some(scope) = &scope {
+            self.reopened_execution.begin_settlement(scope);
+        }
         let result: Result<Option<String>> = async {
-            let descendants: Vec<_> = referenced_child_exchange_list(interaction)
-                .into_iter()
-                .map(|(_, id)| id)
-                .collect();
-            self.store
-                .require_settled_exchange_tree(&self.session.id, &descendants)?;
-            if outcome == crate::exchange::ExchangeOutcome::Cancelled
-                && let Some(runtime) = self.exchange_runtime.as_mut().filter(|runtime| {
-                    runtime.exchange_id == interaction.id && runtime.tools_blocked()
-                })
-            {
-                runtime
-                    .tool_gate
+            loop {
+                if let Some(scope) = &scope {
+                    self.refresh_settlement(interaction, scope).await?;
+                }
+                let revision = scope
                     .as_ref()
-                    .expect("blocked tool gate")
-                    .complete(Err(
-                        "turn cancelled before checkpoint admission completed".into()
-                    ))?;
-                runtime.checkpoint.take();
-                interaction.finalization_error = None;
-                interaction.finish(outcome, self.clock.now_ms())?;
-                return Ok(None);
-            }
-            self.collect_active_initial_checkpoint(interaction).await?;
-            if self.checkpoint.is_none() {
-                let mut changes = crate::exchange::ProviderDiffBuilder::default();
-                self.visit_provider_exchanges(interaction, |exchange| changes.record(exchange))?;
-                interaction.attributed_diff_text = changes.finish();
-                interaction.attributed_matches_checkpoint = false;
-                interaction.finish(outcome, self.clock.now_ms())?;
-                return Ok(None);
-            };
-            let checkpoint = self
-                .checkpoint
-                .as_ref()
-                .context("Git checkpoint adapter is missing")?
-                .capture(
-                    &self.store.objects,
-                    &self.repositories,
-                    &self.session.id,
-                    self.clock.now_ms(),
-                )
-                .await?;
-            let mut settled = interaction.clone();
-            let before = if let Some(identity) = settled.checkpoint_before.as_deref() {
+                    .map(|scope| self.reopened_execution.revision(scope));
+                let outcome = interaction.finalization_outcome().unwrap_or(outcome);
+                let descendants: Vec<_> = referenced_child_exchange_list(interaction)
+                    .into_iter()
+                    .map(|(_, id)| id)
+                    .collect();
                 self.store
-                    .load_checkpoint(identity)?
-                    .context("interaction before checkpoint is missing")?
-            } else {
-                anyhow::ensure!(
-                    outcome != crate::exchange::ExchangeOutcome::Complete,
-                    "completed interaction has no initial checkpoint"
-                );
-                // A failed initial barrier never released tools. Recovery preserves the current workspace.
-                settled.checkpoint_before = Some(checkpoint.id.clone());
-                checkpoint.clone()
-            };
-            self.populate_interaction_change_diffs(&mut settled, &before, &checkpoint)
-                .await?;
-            settled.checkpoint_after = Some(checkpoint.id.clone());
-            settled.finalization_error = None;
-            settled.finish(outcome, self.clock.now_ms())?;
-            self.store.save_checkpoint_exchange(&checkpoint, &settled)?;
-            *interaction = settled;
-            Ok(Some(checkpoint.id))
+                    .require_settled_exchange_tree(&self.session.id, &descendants)?;
+                if outcome == crate::exchange::ExchangeOutcome::Cancelled
+                    && let Some(runtime) = self.exchange_runtime.as_mut().filter(|runtime| {
+                        runtime.exchange_id == interaction.id && runtime.tools_blocked()
+                    })
+                {
+                    runtime
+                        .tool_gate
+                        .as_ref()
+                        .expect("blocked tool gate")
+                        .complete(Err(
+                            "turn cancelled before checkpoint admission completed".into()
+                        ))?;
+                    runtime.checkpoint.take();
+                    interaction.finalization_error = None;
+                    interaction.finish(outcome, self.clock.now_ms())?;
+                    return Ok(None);
+                }
+                self.collect_active_initial_checkpoint(interaction).await?;
+                if self.checkpoint.is_none() {
+                    if let Some(scope) = &scope
+                        && (self.refresh_settlement(interaction, scope).await?
+                            || revision != Some(self.reopened_execution.revision(scope)))
+                    {
+                        continue;
+                    }
+                    let mut changes = crate::exchange::ProviderDiffBuilder::default();
+                    self.visit_provider_exchanges(interaction, |exchange| {
+                        changes.record(exchange)
+                    })?;
+                    interaction.attributed_diff_text = changes.finish();
+                    interaction.attributed_matches_checkpoint = false;
+                    interaction.finish(outcome, self.clock.now_ms())?;
+                    return Ok(None);
+                };
+                let capture = self.prepare_final_checkpoint(interaction, outcome)?;
+                let captured = capture.run().await?;
+                if let Some(scope) = &scope
+                    && (self.refresh_settlement(interaction, scope).await?
+                        || revision != Some(self.reopened_execution.revision(scope)))
+                {
+                    continue;
+                }
+                match self.commit_final_checkpoint(interaction, captured)? {
+                    FinalCheckpointCommit::Committed(id) => return Ok(Some(id)),
+                    FinalCheckpointCommit::Stale => continue,
+                }
+            }
         }
         .await;
+        if let Some(scope) = &scope {
+            self.reopened_execution.end_settlement(scope);
+        }
         interaction.finalization_error = result.as_ref().err().map(|error| format!("{error:#}"));
         self.store.save_exchange(interaction)?;
         result
-    }
-
-    async fn populate_interaction_change_diffs(
-        &mut self,
-        interaction: &mut Exchange,
-        before: &crate::checkpoint::CheckpointRecord,
-        after: &crate::checkpoint::CheckpointRecord,
-    ) -> Result<()> {
-        let change_index = self.interaction_provider_change_index(interaction)?;
-        let checkpoint_diff_text = checkpoint_diff(
-            &self.store.objects,
-            &self.repositories.reads,
-            &self.diff,
-            before,
-            after,
-        )
-        .await?;
-        let attributed_diff_text = if change_index.is_empty() {
-            None
-        } else {
-            Some(
-                checkpoint_diff_for_paths(
-                    &self.store.objects,
-                    &self.repositories.reads,
-                    &self.diff,
-                    before,
-                    after,
-                    change_index.paths(),
-                )
-                .await?,
-            )
-        };
-        interaction.attributed_matches_checkpoint = attributed_diff_text
-            .as_deref()
-            .is_some_and(|diff_text| diff_text == checkpoint_diff_text);
-        interaction.attributed_diff_text = attributed_diff_text;
-        interaction.checkpoint_diff_text = Some(checkpoint_diff_text);
-        Ok(())
     }
 
     fn interaction_provider_change_index(
@@ -6167,13 +6122,1869 @@ impl HarnessBroker {
         Ok(())
     }
 
-    fn process_provider_event<'event>(
-        &'event mut self,
-        runtime: &'event mut ExchangeRuntime,
-        interaction: &'event mut Exchange,
+    #[cfg(test)]
+    async fn test_apply_provider_event(
+        &mut self,
+        runtime: &mut ExchangeRuntime,
+        interaction: &mut Exchange,
         provider_event: ProviderEvent,
-        event: &'event mut Vec<SessionEvent>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'event>> {
+        events: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
+        let applied = self.apply_provider_event(runtime, interaction, provider_event, events)?;
+        let delivery = self.prepare_provider_delivery(applied)?;
+        events.extend(delivery.deliver().await?);
+        Ok(())
+    }
+
+    /// Transfer one active exchange runtime to a service-owned foreground transaction.
+    pub(crate) fn begin_owned_foreground(
+        &mut self,
+        interaction: Exchange,
+        scope: crate::provider::InvocationScope,
+    ) -> Result<OwnedForegroundTransaction> {
+        anyhow::ensure!(
+            scope.owner == crate::provider::ExecutionOwner::root(&self.session.id)
+                && scope.exchange_id == interaction.id,
+            "foreground transaction crosses execution ownership"
+        );
+        let runtime = self
+            .exchange_runtime
+            .as_ref()
+            .context("active interaction timeline is missing")?;
+        anyhow::ensure!(
+            runtime.exchange_id == interaction.id,
+            "foreground runtime belongs to another exchange"
+        );
+        if let Some(permit) = &runtime.task_permit {
+            permit.validate(self.task_controller.current()?.as_ref())?;
+        }
+        let runtime = self
+            .exchange_runtime
+            .take()
+            .expect("runtime validated above");
+        Ok(OwnedForegroundTransaction {
+            scope,
+            interaction,
+            runtime: Some(runtime),
+        })
+    }
+
+    /// Apply one owned provider event and retain its independent presentation effects.
+    pub(crate) fn apply_owned_foreground(
+        &mut self,
+        transaction: &mut OwnedForegroundTransaction,
+        provider_event: ProviderEvent,
+    ) -> Result<(AppliedProviderEvent, Vec<SessionEvent>)> {
+        anyhow::ensure!(
+            transaction.scope.owner == crate::provider::ExecutionOwner::root(&self.session.id)
+                && provider_event.scope().owner() == &transaction.scope.owner,
+            "foreground event crosses execution ownership"
+        );
+        if let Some(scope) = provider_event.scope().invocation() {
+            anyhow::ensure!(
+                scope == &transaction.scope,
+                "foreground event crosses invocation ownership"
+            );
+        }
+        let runtime = transaction
+            .runtime
+            .as_mut()
+            .context("foreground transaction already committed")?;
+        if let Some(permit) = &runtime.task_permit {
+            permit.validate(self.task_controller.current()?.as_ref())?;
+        }
+        let mut events = Vec::new();
+        let effects = self.apply_provider_event(
+            runtime,
+            &mut transaction.interaction,
+            provider_event,
+            &mut events,
+        )?;
+        Ok((effects, events))
+    }
+
+    /// Apply one foreground observation and capture its unlocked publication job.
+    pub(crate) fn apply_foreground_observation(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        observation: ProviderEvent,
+    ) -> Result<ForegroundEventApplication> {
+        if transaction
+            .finalization
+            .as_ref()
+            .is_some_and(|finalization| finalization.submission.is_none())
+            && let ProviderEvent::Execution { observation } = observation
+        {
+            if let Some(permit) = &transaction.dispatched_task_permit {
+                permit.validate_observation(self.task_controller.current()?.as_ref())?;
+            }
+            let events = self.observe_execution_lifecycle(observation)?;
+            transaction.idle_native_active =
+                self.reopened_execution.active(&transaction.state.scope);
+            transaction.state.interaction = self
+                .store
+                .load_exchange(&transaction.state.interaction.id)?
+                .context("idle continuation exchange disappeared")?;
+            let mut delivery = self.prepare_provider_delivery(AppliedProviderEvent::None)?;
+            delivery.events = events;
+            return Ok(ForegroundEventApplication::Publication(Box::new(
+                ForegroundJob::Publication(delivery),
+            )));
+        }
+        let (applied, mut events) =
+            self.apply_owned_foreground(&mut transaction.state, observation)?;
+        match applied {
+            AppliedProviderEvent::NativeGoalContinuation(observation) => {
+                transaction.pending_goal_events.extend(events);
+                Ok(ForegroundEventApplication::NativeGoalContinuation(
+                    Box::new(observation),
+                ))
+            }
+            applied => {
+                let mut delivery = self.prepare_provider_delivery(applied)?;
+                events.append(&mut delivery.events);
+                delivery.events = events;
+                Ok(ForegroundEventApplication::Publication(Box::new(
+                    ForegroundJob::Publication(delivery),
+                )))
+            }
+        }
+    }
+
+    /// Route an admitted user input to an owned native steer or the retained queue.
+    pub(crate) fn prepare_foreground_input(
+        &self,
+        transaction: &mut ForegroundTransaction,
+        input: crate::provider::SteerCommand,
+    ) -> ForegroundAction {
+        if self.provider.descriptor().capability.native_steer {
+            ForegroundAction::Effect(ForegroundJob::UserSteering {
+                engine: transaction.engine.clone(),
+                scope: transaction.state.scope.clone(),
+                input,
+            })
+        } else {
+            transaction.steering.deferred.push_back(input);
+            ForegroundAction::Wait
+        }
+    }
+
+    /// Start an authorized native-goal continuation without waiting for checkpoint work.
+    pub(crate) fn begin_native_goal_transition(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        observation: ProviderEvent,
+    ) -> Result<ForegroundAction> {
+        anyhow::ensure!(
+            transaction.native_goal.is_none(),
+            "a native-goal transition is already pending"
+        );
+        let runtime = transaction
+            .state
+            .runtime
+            .as_ref()
+            .context("foreground transaction already committed")?;
+        anyhow::ensure!(
+            self.native_goal_continuation_needed(
+                runtime,
+                &transaction.state.interaction,
+                &observation
+            )?,
+            "native-goal continuation is no longer authorized"
+        );
+        let previous = transaction
+            .state
+            .interaction
+            .turn
+            .last()
+            .context("native goal has no prior turn")?;
+        let crate::turn::TurnState::Finished { outcome } = previous.state() else {
+            anyhow::bail!("native goal prior turn is not settled");
+        };
+        let outcome = match outcome {
+            crate::turn::TurnOutcome::Completed => crate::exchange::ExchangeOutcome::Complete,
+            crate::turn::TurnOutcome::Cancelled => crate::exchange::ExchangeOutcome::Cancelled,
+            crate::turn::TurnOutcome::Interrupted => crate::exchange::ExchangeOutcome::Interrupted,
+            crate::turn::TurnOutcome::Failed => crate::exchange::ExchangeOutcome::Failed,
+        };
+        transaction.native_goal = Some(NativeGoalTransition::Initial {
+            observation,
+            outcome,
+        });
+        if runtime.checkpoint.is_some() {
+            return Ok(ForegroundAction::Wait);
+        }
+        self.prepare_native_goal_final(transaction)
+    }
+
+    /// Commit an initial checkpoint and advance any waiting goal transition.
+    pub(crate) fn apply_foreground_checkpoint(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        result: Result<crate::checkpoint::CheckpointRecord>,
+    ) -> Result<ForegroundAction> {
+        let runtime = transaction
+            .state
+            .runtime
+            .as_mut()
+            .context("foreground runtime is missing")?;
+        self.finish_initial_checkpoint(runtime, &mut transaction.state.interaction, result)?;
+        match &transaction.native_goal {
+            Some(NativeGoalTransition::Initial { .. }) => {
+                self.prepare_native_goal_final(transaction)
+            }
+            Some(NativeGoalTransition::ContinuationInitial { .. }) => {
+                self.finish_native_goal_exchange(transaction)
+            }
+            Some(NativeGoalTransition::Final { .. }) => {
+                anyhow::bail!("unexpected baseline during final checkpoint capture")
+            }
+            None => Ok(ForegroundAction::Wait),
+        }
+    }
+
+    /// Record final checkpoint failure and release goal settlement ownership.
+    pub(crate) fn fail_native_goal_checkpoint(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        error: anyhow::Error,
+    ) -> Result<ForegroundAction> {
+        anyhow::ensure!(
+            matches!(
+                &transaction.native_goal,
+                Some(NativeGoalTransition::Final { .. })
+            ),
+            "native-goal transition is not waiting for final checkpoint evidence"
+        );
+        transaction.native_goal = None;
+        let interaction = &mut transaction.state.interaction;
+        if let Some(scope) = interaction
+            .turn
+            .last()
+            .map(|turn| turn.provider().scope.clone())
+        {
+            self.reopened_execution.end_settlement(&scope);
+        }
+        interaction.finalization_error = Some(format!("{error:#}"));
+        self.store.save_exchange(interaction)?;
+        Err(error)
+    }
+
+    /// Begin final checkpoint capture after the original baseline is durable.
+    fn prepare_native_goal_final(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+    ) -> Result<ForegroundAction> {
+        let Some(NativeGoalTransition::Initial {
+            observation,
+            outcome,
+        }) = transaction.native_goal.take()
+        else {
+            anyhow::bail!("native-goal transition is not waiting for its baseline");
+        };
+        let interaction = &mut transaction.state.interaction;
+        interaction.begin_finalization(outcome, self.clock.now_ms())?;
+        self.store.save_exchange(interaction)?;
+        if let Some(scope) = interaction
+            .turn
+            .last()
+            .map(|turn| turn.provider().scope.clone())
+        {
+            self.reopened_execution.begin_settlement(&scope);
+        }
+        if self.checkpoint.is_none() {
+            let mut changes = crate::exchange::ProviderDiffBuilder::default();
+            self.visit_provider_exchanges(interaction, |exchange| changes.record(exchange))?;
+            interaction.attributed_diff_text = changes.finish();
+            interaction.attributed_matches_checkpoint = false;
+            interaction.finish(outcome, self.clock.now_ms())?;
+            self.store.save_exchange(interaction)?;
+            return self.start_native_goal_exchange(transaction, observation);
+        }
+        let job = match self.prepare_final_checkpoint(interaction, outcome) {
+            Ok(job) => job,
+            Err(error) => {
+                if let Some(scope) = interaction
+                    .turn
+                    .last()
+                    .map(|turn| turn.provider().scope.clone())
+                {
+                    self.reopened_execution.end_settlement(&scope);
+                }
+                interaction.finalization_error = Some(format!("{error:#}"));
+                self.store.save_exchange(interaction)?;
+                return Err(error);
+            }
+        };
+        transaction.native_goal = Some(NativeGoalTransition::Final {
+            observation,
+            outcome,
+        });
+        Ok(ForegroundAction::Effect(ForegroundJob::FinalCheckpoint(
+            Box::new(job),
+        )))
+    }
+
+    /// Commit native-goal checkpoint evidence or recapture after a stale revision.
+    pub(crate) fn complete_native_goal_checkpoint(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        result: checkpoint_settlement::FinalCheckpointResult,
+    ) -> Result<ForegroundAction> {
+        let Some(NativeGoalTransition::Final {
+            observation,
+            outcome,
+        }) = transaction.native_goal.take()
+        else {
+            anyhow::bail!("native-goal transition is not waiting for final checkpoint evidence");
+        };
+        let committed =
+            match self.commit_final_checkpoint(&mut transaction.state.interaction, result) {
+                Ok(committed) => committed,
+                Err(error) => {
+                    let interaction = &mut transaction.state.interaction;
+                    if let Some(scope) = interaction
+                        .turn
+                        .last()
+                        .map(|turn| turn.provider().scope.clone())
+                    {
+                        self.reopened_execution.end_settlement(&scope);
+                    }
+                    interaction.finalization_error = Some(format!("{error:#}"));
+                    self.store.save_exchange(interaction)?;
+                    return Err(error);
+                }
+            };
+        match committed {
+            FinalCheckpointCommit::Stale => {
+                transaction.native_goal = Some(NativeGoalTransition::Initial {
+                    observation,
+                    outcome,
+                });
+                for event in self.observer.session_events().drain()? {
+                    transaction
+                        .pending_goal_events
+                        .extend(self.observe_session_event(event)?);
+                }
+                transaction.state.interaction = self
+                    .store
+                    .load_exchange(&transaction.state.interaction.id)?
+                    .context("native-goal exchange disappeared during checkpoint capture")?;
+                if transaction
+                    .state
+                    .interaction
+                    .turn
+                    .last()
+                    .is_some_and(|turn| self.reopened_execution.active(&turn.provider().scope))
+                {
+                    return Ok(ForegroundAction::Wait);
+                }
+                self.prepare_native_goal_final(transaction)
+            }
+            FinalCheckpointCommit::Committed(_) => {
+                self.start_native_goal_exchange(transaction, observation)
+            }
+        }
+    }
+
+    /// Admit the next goal exchange while its initial checkpoint worker runs independently.
+    fn start_native_goal_exchange(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        observation: ProviderEvent,
+    ) -> Result<ForegroundAction> {
+        if let Some(scope) = transaction
+            .state
+            .interaction
+            .turn
+            .last()
+            .map(|turn| turn.provider().scope.clone())
+        {
+            self.reopened_execution.end_settlement(&scope);
+        }
+        let (mut continuation, _, events, effects) =
+            self.stage_interaction_for_turn("", true, self.clock.now_ms())?;
+        continuation.origin = crate::exchange::ExchangeOrigin::task_continuation(
+            "The native goal requires another turn",
+        );
+        continuation
+            .checklist
+            .clone_from(&transaction.state.interaction.checklist);
+        self.begin_exchange_runtime(&mut continuation, self.clock.now_ms())?;
+        let runtime = self
+            .exchange_runtime
+            .take()
+            .context("continuation runtime is missing")?;
+        transaction.state.interaction = continuation;
+        transaction.state.runtime = Some(runtime);
+        transaction.pending_goal_events.extend(events);
+        transaction.pending_goal_effects.extend(effects);
+        transaction.native_goal = Some(NativeGoalTransition::ContinuationInitial { observation });
+        if transaction
+            .state
+            .runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.checkpoint.is_some())
+        {
+            return Ok(ForegroundAction::Wait);
+        }
+        self.finish_native_goal_exchange(transaction)
+    }
+
+    /// Bind the admitted native turn after the new goal baseline is durable.
+    fn finish_native_goal_exchange(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+    ) -> Result<ForegroundAction> {
+        let Some(NativeGoalTransition::ContinuationInitial { observation }) =
+            transaction.native_goal.take()
+        else {
+            anyhow::bail!("native-goal transition is not waiting for continuation admission");
+        };
+        let address = observation
+            .turn_address()
+            .context("native goal start has no turn address")?
+            .clone();
+        let interaction = &mut transaction.state.interaction;
+        interaction
+            .inherit_native_turn(address, observation.observed_at_ms(self.clock.now_ms()))?;
+        let runtime = transaction
+            .state
+            .runtime
+            .as_mut()
+            .context("continuation runtime is missing")?;
+        runtime.retraction_eligible = false;
+        self.store.save_exchange(interaction)?;
+        transaction.pending_goal_effects.push(
+            self.prepare_live_interaction(publication::LiveUpdate::StateChanged, interaction)?,
+        );
+        // The observation that opened the continuation still needs normal content
+        // handling after its native turn has been bound to the new exchange.
+        transaction
+            .pending_goal_effects
+            .push(self.apply_exchange_content(runtime, interaction, observation, false)?);
+        let effects =
+            AppliedProviderEvent::Effects(std::mem::take(&mut transaction.pending_goal_effects));
+        let mut delivery = self.prepare_provider_delivery(effects)?;
+        let mut events = std::mem::take(&mut transaction.pending_goal_events);
+        events.append(&mut delivery.events);
+        delivery.events = events;
+        Ok(ForegroundAction::Effect(ForegroundJob::Publication(
+            delivery,
+        )))
+    }
+
+    /// Capture a plan scan as owned work that can run without the broker lock.
+    pub(crate) fn apply_foreground_agent_observation(
+        &mut self,
+        owner: crate::provider::ExecutionOwner,
+        task_id: &str,
+        observation: ProviderEvent,
+    ) -> Result<ForegroundAction> {
+        let mut events = Vec::new();
+        let effects =
+            self.apply_managed_agent_observation(owner, task_id, observation, &mut events)?;
+        let mut delivery = self.prepare_provider_delivery(effects)?;
+        events.append(&mut delivery.events);
+        delivery.events = events;
+        Ok(ForegroundAction::Effect(ForegroundJob::Publication(
+            delivery,
+        )))
+    }
+
+    /// Capture a child completion and cancel only that owner's approvals unlocked.
+    pub(crate) fn prepare_foreground_agent_completion(
+        &self,
+        owner: crate::provider::ExecutionOwner,
+        task_id: String,
+        output: Result<crate::provider::ProviderCompletion>,
+        cleanup_error: Option<String>,
+    ) -> Result<ForegroundAction> {
+        let task = self
+            .agent_coordinator
+            .task(&task_id)
+            .context("child completion has no admitted task")?;
+        anyhow::ensure!(
+            owner.session_id == self.session.id && task.agent_id == owner.agent_id,
+            "child completion crosses execution ownership"
+        );
+        if task.completed_at_ms.is_some() {
+            return Ok(ForegroundAction::Wait);
+        }
+        let approvals = self
+            .permission_coordinator
+            .pending_list()?
+            .into_iter()
+            .filter(|approval| approval.execution_owner.as_ref() == Some(&owner))
+            .collect();
+        Ok(ForegroundAction::Effect(
+            ForegroundJob::AgentCancelApprovals {
+                coordinator: self.permission_coordinator.clone(),
+                completion: Box::new(AgentCompletion {
+                    owner,
+                    task_id,
+                    output,
+                    cleanup_error,
+                    approvals,
+                }),
+            },
+        ))
+    }
+
+    /// Commit child completion only after its approval cancellation has settled.
+    pub(crate) fn apply_foreground_agent_completion(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        completion: AgentCompletion,
+        result: Result<()>,
+    ) -> Result<ForegroundAction> {
+        transaction.agent_command_active = false;
+        if let Err(error) = result {
+            if let Some((response, _)) = transaction.pending_agent_reply.take() {
+                let _ = response.send(Err(anyhow::anyhow!("{error:#}")));
+            }
+            return Err(error);
+        }
+        let AgentCompletion {
+            owner,
+            task_id,
+            output,
+            cleanup_error,
+            approvals,
+        } = completion;
+        let task = self
+            .agent_coordinator
+            .task(&task_id)
+            .context("child completion disappeared")?;
+        anyhow::ensure!(
+            owner.session_id == self.session.id && task.agent_id == owner.agent_id,
+            "child completion owner changed during approval cancellation"
+        );
+        if task.completed_at_ms.is_some() {
+            return Ok(ForegroundAction::Wait);
+        }
+        anyhow::ensure!(
+            self.child_exchange_runtime_by_agent
+                .get(owner.agent_id.as_str())
+                .is_none_or(|runtime| runtime.exchange.id == task_id),
+            "late child completion cannot settle a newer child exchange"
+        );
+        let mut effects = Vec::new();
+        for approval in approvals {
+            if let Some(runtime) = self
+                .child_exchange_runtime_by_agent
+                .get_mut(owner.agent_id.as_str())
+            {
+                anyhow::ensure!(
+                    runtime.exchange.id == task_id,
+                    "child approval belongs to a newer exchange"
+                );
+                runtime.exchange.observe_blocker(
+                    format!("approval:{}", approval.id),
+                    false,
+                    self.clock.now_ms(),
+                );
+                self.store.save_exchange(&runtime.exchange)?;
+            }
+            effects.push(AppliedProviderEvent::Update(SessionUpdate::Approval {
+                update: Box::new(crate::provider::ApprovalUpdate::Cancelled(approval)),
+            }));
+        }
+        let (state, next) =
+            self.apply_managed_agent_completion(owner, task_id, output, cleanup_error)?;
+        effects.push(state);
+        if let Some(next) = next {
+            transaction
+                .pending_agent_launch
+                .push_back(PendingAgentLaunch {
+                    work: next,
+                    reply: None,
+                });
+        }
+        if let Some((response, value)) = transaction.pending_agent_reply.take() {
+            let _ = response.send(Ok(value));
+        }
+        Ok(ForegroundAction::Effect(ForegroundJob::Publication(
+            self.prepare_provider_delivery(AppliedProviderEvent::Effects(effects))?,
+        )))
+    }
+
+    /// Launch a queued child only after the previous completion was applied.
+    pub(crate) fn prepare_foreground_agent_launch(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+    ) -> Result<ForegroundAction> {
+        let Some(PendingAgentLaunch { work, reply }) = transaction.pending_agent_launch.pop_front()
+        else {
+            return Ok(ForegroundAction::Wait);
+        };
+        let started = match self.begin_managed_agent(work) {
+            Ok(started) => started,
+            Err(error) => {
+                if let Some((response, _)) = reply {
+                    let _ = response.send(Err(error));
+                    return Ok(ForegroundAction::Wait);
+                }
+                return Err(error);
+            }
+        };
+        match started {
+            Some((owner, task_id, error)) => {
+                transaction.pending_agent_reply = reply;
+                let action =
+                    self.prepare_foreground_agent_completion(owner, task_id, Err(error), None)?;
+                transaction.agent_command_active = matches!(
+                    &action,
+                    ForegroundAction::Effect(ForegroundJob::AgentCancelApprovals { .. })
+                );
+                Ok(action)
+            }
+            None => {
+                if let Some((response, value)) = reply {
+                    let _ = response.send(Ok(value));
+                }
+                Ok(ForegroundAction::Wait)
+            }
+        }
+    }
+
+    /// Capture a plan scan as owned work that can run without the broker lock.
+    pub(crate) fn prepare_foreground_agent_result(
+        &self,
+        transaction: &mut ForegroundTransaction,
+    ) -> Result<ForegroundAction> {
+        if !self.provider.descriptor().capability.native_steer {
+            return Ok(ForegroundAction::Wait);
+        }
+        for task in self.agent_coordinator.unreported_result() {
+            if transaction
+                .attached_results
+                .iter()
+                .any(|attached| attached.id == task.id)
+                || !transaction.attempted_results.insert(task.id.clone())
+            {
+                continue;
+            }
+            anyhow::ensure!(
+                task.session_id == self.session.id && task.completed_at_ms.is_some(),
+                "child result does not belong to this settled session"
+            );
+            let message = self.agent_result_message(&task)?;
+            return Ok(ForegroundAction::Effect(ForegroundJob::AgentResult {
+                engine: transaction.engine.clone(),
+                scope: transaction.state.scope.clone(),
+                task: Box::new(task),
+                message,
+            }));
+        }
+        Ok(ForegroundAction::Wait)
+    }
+
+    /// Capture child interruptions and run approval/provider cleanup outside the broker.
+    pub(crate) fn prepare_foreground_agent_interrupt(
+        &mut self,
+        mut targets: Vec<String>,
+        request: OwnedAgentRequest,
+        result: Value,
+    ) -> Result<ForegroundAction> {
+        if targets.is_empty() {
+            let _ = request.response.send(Ok(result));
+            return Ok(ForegroundAction::Wait);
+        }
+        let target = targets.remove(0);
+        let captured = (|| -> Result<Vec<AgentInterruptItem>> {
+            let mut items = Vec::new();
+            let agent = self.agent_coordinator.resolve(&target)?;
+            let owner = crate::provider::ExecutionOwner {
+                session_id: self.session.id.clone().into(),
+                agent_id: agent.id.clone().into(),
+            };
+            let cancelled = self.agent_coordinator.interrupt(&target)?;
+            let cleanup = self.agent_coordinator.cleanup_task(&agent.id);
+            let provider = if cleanup.is_some() {
+                Some(
+                    self.child_provider_by_agent
+                        .get(&agent.id)
+                        .cloned()
+                        .context("child cleanup obligation has no retained provider adapter")?,
+                )
+            } else {
+                None
+            };
+            let approvals = self
+                .permission_coordinator
+                .pending_list()?
+                .into_iter()
+                .filter(|approval| approval.execution_owner.as_ref() == Some(&owner))
+                .collect();
+            items.push(AgentInterruptItem {
+                agent,
+                owner,
+                cancelled,
+                cleanup,
+                provider,
+                approvals,
+            });
+            Ok(items)
+        })();
+        let items = match captured {
+            Ok(items) => items,
+            Err(error) => {
+                let _ = request.response.send(Err(error));
+                return Ok(ForegroundAction::Wait);
+            }
+        };
+        Ok(ForegroundAction::Effect(ForegroundJob::AgentInterrupt {
+            coordinator: self.permission_coordinator.clone(),
+            operation: AgentInterrupt {
+                items,
+                remaining: targets,
+                request,
+                result,
+            },
+        }))
+    }
+
+    fn validate_foreground_agent_request(
+        &self,
+        transaction: &ForegroundTransaction,
+        owned: &OwnedAgentRequest,
+    ) -> Result<()> {
+        self.validate_foreground_agent_identity(transaction, owned)?;
+        if let Some(task) = owned
+            .authority
+            .as_ref()
+            .and_then(|authority| authority.task.as_ref())
+        {
+            task.validate_scope()?;
+        }
+        Ok(())
+    }
+
+    fn validate_foreground_agent_identity(
+        &self,
+        transaction: &ForegroundTransaction,
+        owned: &OwnedAgentRequest,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            owned.parent_id == transaction.state.interaction.id,
+            "child request belongs to another parent exchange"
+        );
+        if owned.request.source == crate::agent::AgentSource::Model {
+            let authority = owned
+                .authority
+                .as_ref()
+                .context("agent request has no active authenticated root authority")?;
+            anyhow::ensure!(
+                !*authority.expired.borrow()
+                    && authority.owner == crate::provider::ExecutionOwner::root(&self.session.id)
+                    && authority.parent_exchange_id == owned.parent_id
+                    && self.agent_coordinator.enabled(),
+                "agent request has no active authenticated root authority"
+            );
+        } else {
+            anyhow::ensure!(
+                owned.authority.is_none(),
+                "manual agent request has unexpected authority"
+            );
+        }
+        Ok(())
+    }
+
+    /// Admit one child command without awaiting provider work while holding the broker.
+    pub(crate) fn poll_foreground_agents(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+    ) -> Result<ForegroundAction> {
+        let Some(command) = self.agent_coordinator.try_receive() else {
+            return self.prepare_foreground_agent_result(transaction);
+        };
+        // Schedule another drain after this owned command has been staged.
+        self.agent_coordinator.notify_activity();
+        let action = match command {
+            crate::agent::AgentCommand::Event {
+                owner,
+                task_id,
+                event,
+            } => self.apply_foreground_agent_observation(owner, &task_id, *event),
+            crate::agent::AgentCommand::Completed {
+                owner,
+                task_id,
+                output,
+                cleanup_error,
+            } => self.prepare_foreground_agent_completion(owner, task_id, *output, cleanup_error),
+            crate::agent::AgentCommand::Request {
+                request,
+                authority,
+                response,
+            } => {
+                if response.is_closed() {
+                    return Ok(ForegroundAction::Wait);
+                }
+                let owned = OwnedAgentRequest {
+                    request: *request,
+                    authority,
+                    response,
+                    parent_id: transaction.state.interaction.id.clone(),
+                };
+                if let Err(error) = self.validate_foreground_agent_request(transaction, &owned) {
+                    let _ = owned.response.send(Err(error));
+                    return Ok(ForegroundAction::Wait);
+                }
+                self.prepare_foreground_agent_request(transaction, owned)
+            }
+        }?;
+        transaction.agent_command_active = matches!(
+            &action,
+            ForegroundAction::Effect(
+                ForegroundJob::AgentCancelApprovals { .. }
+                    | ForegroundJob::AgentInterrupt { .. }
+                    | ForegroundJob::AgentSpawnSelect { .. }
+                    | ForegroundJob::AgentMessageSteer { .. }
+            )
+        );
+        Ok(action)
+    }
+
+    fn prepare_foreground_agent_request(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        owned: OwnedAgentRequest,
+    ) -> Result<ForegroundAction> {
+        use crate::agent::AgentOperation;
+        let tasks = match self.store.list_agent_task(&self.session.id) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                let _ = owned.response.send(Err(error));
+                return Ok(ForegroundAction::Wait);
+            }
+        };
+        if let Some(task) = tasks
+            .into_iter()
+            .find(|task| task.operation_id == owned.request.operation_id)
+        {
+            let replay = (|| {
+                let agent = self.agent_coordinator.resolve(&task.agent_id)?;
+                let same = match &owned.request.operation {
+                    AgentOperation::Spawn(spawn) => {
+                        task.ordinal == 1
+                            && task.message == spawn.text
+                            && spawn
+                                .profile
+                                .as_deref()
+                                .is_none_or(|profile| profile == agent.definition)
+                    }
+                    AgentOperation::Followup { target, message } => {
+                        task.ordinal > 1
+                            && task.message == *message
+                            && self.agent_coordinator.resolve(target)?.id == agent.id
+                    }
+                    _ => false,
+                };
+                anyhow::ensure!(
+                    same && task.source == owned.request.source
+                        && task.parent_exchange_id == owned.parent_id,
+                    "operation identity was reused for different child work"
+                );
+                Ok(json!({"agent":agent,"task":task,"status":"admitted","replayed":true}))
+            })();
+            let _ = owned.response.send(replay);
+            return Ok(ForegroundAction::Wait);
+        }
+        match owned.request.operation.clone() {
+            AgentOperation::Interrupt { target } => self.prepare_foreground_agent_interrupt(
+                vec![target.clone()],
+                owned,
+                json!({"status":"interrupting","target":target}),
+            ),
+            AgentOperation::InterruptAll => {
+                let targets = self
+                    .agent_coordinator
+                    .snapshot(None)
+                    .into_iter()
+                    .map(|(agent, _)| agent.id)
+                    .collect();
+                self.prepare_foreground_agent_interrupt(
+                    targets,
+                    owned,
+                    json!({"status":"interrupting"}),
+                )
+            }
+            AgentOperation::Spawn(spawn) => {
+                let mut root = match self
+                    .provider_request(ProviderInput::from_text(String::new()), PromptMode::Chat)
+                {
+                    Ok(root) => root,
+                    Err(error) => {
+                        let _ = owned.response.send(Err(error));
+                        return Ok(ForegroundAction::Wait);
+                    }
+                };
+                if root.model == "default"
+                    && let Some(model) = &self.session.resolved_model
+                {
+                    root.model = model.clone();
+                }
+                let root_provider =
+                    match crate::provider::ProviderKind::parse(&self.session.provider) {
+                        Ok(provider) => provider,
+                        Err(error) => {
+                            let _ = owned.response.send(Err(error));
+                            return Ok(ForegroundAction::Wait);
+                        }
+                    };
+                Ok(ForegroundAction::Effect(ForegroundJob::AgentSpawnSelect {
+                    factory: self.agent_provider_factory.clone(),
+                    root: Box::new(root),
+                    root_provider,
+                    spawn,
+                    request: owned,
+                }))
+            }
+            AgentOperation::Followup { .. } => {
+                self.commit_foreground_agent_admission(transaction, owned, None)
+            }
+            AgentOperation::Message { target, message } => {
+                if message.trim().is_empty() {
+                    let _ = owned.response.send(Err(anyhow::anyhow!(
+                        "informational message must contain nonempty text"
+                    )));
+                    return Ok(ForegroundAction::Wait);
+                }
+                let agent = match self.agent_coordinator.resolve(&target) {
+                    Ok(agent) => agent,
+                    Err(error) => {
+                        let _ = owned.response.send(Err(error));
+                        return Ok(ForegroundAction::Wait);
+                    }
+                };
+                if let Some(existing) = agent
+                    .inbox
+                    .iter()
+                    .find(|item| item.id == owned.request.operation_id)
+                {
+                    let result = if existing.message == message {
+                        serde_json::to_value(existing).map_err(anyhow::Error::from)
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "operation identity was reused for a different informational message"
+                        ))
+                    };
+                    let _ = owned.response.send(result);
+                    return Ok(ForegroundAction::Wait);
+                }
+                if let Some(registry) = self.child_execution_by_agent.get(&agent.id) {
+                    let owner = crate::provider::ExecutionOwner {
+                        session_id: self.session.id.clone().into(),
+                        agent_id: agent.id.clone().into(),
+                    };
+                    Ok(ForegroundAction::Effect(ForegroundJob::AgentMessageSteer {
+                        registry: registry.clone(),
+                        owner,
+                        message,
+                        request: owned,
+                    }))
+                } else {
+                    self.commit_foreground_agent_message(
+                        transaction,
+                        owned,
+                        None,
+                        Err(anyhow::anyhow!("child execution is not active")),
+                    )
+                }
+            }
+            operation => {
+                let result = self.inspect_foreground_agent(operation);
+                let _ = owned.response.send(result);
+                Ok(ForegroundAction::Wait)
+            }
+        }
+    }
+
+    fn inspect_foreground_agent(&self, operation: crate::agent::AgentOperation) -> Result<Value> {
+        use crate::agent::AgentOperation;
+        match operation {
+            AgentOperation::List { prefix } => {
+                let mut entries = Vec::new();
+                if prefix
+                    .as_deref()
+                    .is_none_or(|prefix| "/root".starts_with(prefix))
+                {
+                    entries.push(json!({"agent":Agent::primary(&self.session.id, self.session.created_at_ms),"latest_task":null}));
+                }
+                entries.extend(
+                    self.agent_coordinator
+                        .snapshot(prefix.as_deref())
+                        .into_iter()
+                        .map(|(agent, task)| json!({"agent":agent,"latest_task":task})),
+                );
+                Ok(json!({"agents":entries}))
+            }
+            AgentOperation::Activity { target, limit } => {
+                let (agent, task) = self.agent_coordinator.inspection(&target)?;
+                let saved;
+                let exchange = if let Some(runtime) = self
+                    .child_exchange_runtime_by_agent
+                    .get(&agent.id)
+                    .filter(|runtime| runtime.exchange.id == task.id)
+                {
+                    &runtime.exchange
+                } else {
+                    saved = self
+                        .store
+                        .load_exchange_metadata(&task.id)?
+                        .context("child activity exchange missing")?;
+                    &saved
+                };
+                let awaiting = self
+                    .permission_coordinator
+                    .pending_list()?
+                    .iter()
+                    .any(|approval| {
+                        approval.execution_owner.as_ref().is_some_and(|owner| {
+                            owner.agent_id == agent.id && owner.session_id == self.session.id
+                        })
+                    });
+                Ok(serde_json::to_value(crate::agent::AgentActivity::capture(
+                    &agent,
+                    &task,
+                    exchange,
+                    limit.unwrap_or(5),
+                    self.clock.now_ms(),
+                    awaiting,
+                )?)?)
+            }
+            AgentOperation::ToolOutput {
+                call_ref,
+                offset,
+                limit,
+            } => {
+                let reference = crate::agent::AgentToolReference::decode(&call_ref)?;
+                anyhow::ensure!(
+                    reference.session_id == self.session.id,
+                    "tool reference belongs to another root session"
+                );
+                let agent = self.agent_coordinator.resolve(&reference.agent_id)?;
+                let task = self
+                    .agent_coordinator
+                    .task(&reference.exchange_id)
+                    .context("tool reference has no admitted child run")?;
+                anyhow::ensure!(
+                    task.agent_id == agent.id && task.session_id == self.session.id,
+                    "tool reference crosses child ownership"
+                );
+                let exchange = self
+                    .store
+                    .load_exchange_metadata(&reference.exchange_id)?
+                    .context("tool reference exchange missing")?;
+                anyhow::ensure!(
+                    exchange.agent_id == agent.id && exchange.session_id == self.session.id,
+                    "tool reference crosses exchange ownership"
+                );
+                let tool = exchange
+                    .turn
+                    .iter()
+                    .find(|turn| turn.id() == reference.turn_id)
+                    .and_then(|turn| {
+                        exchange
+                            .tools_for_turn(turn.id())
+                            .find(|tool| tool.id == reference.tool_id)
+                    })
+                    .context("tool reference does not identify a recorded call")?;
+                let page = self.store.tool_output_page(
+                    &exchange.id,
+                    &reference.turn_id,
+                    &reference.tool_id,
+                    offset,
+                    limit,
+                )?;
+                Ok(
+                    json!({"call_ref":call_ref,"status":crate::agent::tool_activity_status(tool),"failed":tool.failed,"output":page.output,"offset":offset,"next_offset":page.next_offset,"total_chars":page.total_chars}),
+                )
+            }
+            _ => anyhow::bail!("agent operation is not an inspection"),
+        }
+    }
+
+    /// Commit a message only while the original parent authority remains live.
+    pub(crate) fn commit_foreground_agent_message(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        owned: OwnedAgentRequest,
+        captured: Option<(
+            crate::provider::ExecutionOwner,
+            Arc<crate::provider::session_execution::SessionExecutionRegistry>,
+        )>,
+        result: Result<()>,
+    ) -> Result<ForegroundAction> {
+        transaction.agent_command_active = false;
+        let authority = owned
+            .authority
+            .as_ref()
+            .and_then(|authority| authority.task.clone());
+        let apply = || {
+            self.validate_foreground_agent_identity(transaction, &owned)?;
+            let crate::agent::AgentOperation::Message { target, message } =
+                &owned.request.operation
+            else {
+                anyhow::bail!("child message result has another operation");
+            };
+            let mut agent = self.agent_coordinator.resolve(target)?;
+            if let Some((owner, registry)) = &captured {
+                anyhow::ensure!(
+                    owner.session_id == self.session.id
+                        && owner.agent_id == agent.id
+                        && self
+                            .child_execution_by_agent
+                            .get(&agent.id)
+                            .is_some_and(|current| Arc::ptr_eq(current, registry)),
+                    "child execution was replaced during message delivery"
+                );
+            }
+            if let Some(existing) = agent
+                .inbox
+                .iter()
+                .find(|item| item.id == owned.request.operation_id)
+            {
+                anyhow::ensure!(
+                    existing.message == *message,
+                    "operation identity was reused for a different informational message"
+                );
+                return Ok(serde_json::to_value(existing)?);
+            }
+            let delivery = match result {
+                Ok(()) => crate::agent::MessageDelivery::Steered,
+                Err(error)
+                    if error.downcast_ref::<ProviderError>().is_some_and(|error| {
+                        matches!(error, ProviderError::DeliveryUncertain { .. })
+                    }) =>
+                {
+                    return Err(error.context(
+                        "child message delivery is uncertain and was not queued for replay",
+                    ));
+                }
+                Err(error) => {
+                    self.trace.record(&self.session.id, "agent.message_queued", json!({"agent_id":agent.id,"reason":"steering_not_accepted","error":error.to_string()}));
+                    crate::agent::MessageDelivery::Queued
+                }
+            };
+            let item = crate::agent::AgentMessage {
+                id: owned.request.operation_id.clone(),
+                ordinal: agent.inbox.last().map_or(1, |item| item.ordinal + 1),
+                message: message.clone(),
+                delivery,
+                task_id: None,
+                created_at_ms: self.clock.now_ms(),
+            };
+            agent.inbox.push(item.clone());
+            self.store.save_agent_run(&agent)?;
+            if let Some(task) = self
+                .agent_coordinator
+                .snapshot(None)
+                .into_iter()
+                .find(|(candidate, _)| candidate.id == agent.id)
+                .and_then(|(_, task)| task)
+            {
+                self.agent_coordinator.retain(agent.clone(), task)?;
+            }
+            self.agent_registry.insert(agent);
+            Ok(serde_json::to_value(item)?)
+        };
+        let applied = match authority {
+            Some(authority) => authority.commit(apply),
+            None => apply(),
+        };
+        let _ = owned.response.send(applied);
+        Ok(ForegroundAction::Wait)
+    }
+
+    /// Commit a selected child under the captured root authority.
+    pub(crate) fn commit_foreground_agent_admission(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        owned: OwnedAgentRequest,
+        selection: Option<crate::agent::AgentSelection>,
+    ) -> Result<ForegroundAction> {
+        use crate::agent::AgentOperation;
+        let authority = owned
+            .authority
+            .as_ref()
+            .and_then(|authority| authority.task.clone());
+        let admit = || {
+            self.validate_foreground_agent_identity(transaction, &owned)?;
+            let mut parent = transaction.state.interaction.clone();
+            let admission = match &owned.request.operation {
+                AgentOperation::Spawn(spawn) => {
+                    let selection = selection.context("child provider selection is missing")?;
+                    self.agent_provider_factory
+                        .profiles
+                        .resolve(Some(&selection.profile))?;
+                    self.agent_coordinator.reserve_spawn(
+                        &owned.request,
+                        spawn,
+                        selection,
+                        &parent.id,
+                        self.clock.now_ms(),
+                    )?
+                }
+                AgentOperation::Followup { target, message } => {
+                    let agent = self.agent_coordinator.resolve(target)?;
+                    self.agent_provider_factory
+                        .profiles
+                        .resolve(Some(&agent.definition))?;
+                    self.agent_coordinator.reserve_followup(
+                        &owned.request,
+                        target,
+                        message,
+                        &parent.id,
+                        self.clock.now_ms(),
+                    )?
+                }
+                _ => anyhow::bail!("child admission has another operation"),
+            };
+            if let Err(error) = parent.append_agent_task(&admission.task).and_then(|_| {
+                self.store
+                    .admit_agent_task(&admission.agent, &admission.task, &parent)
+            }) {
+                return Err(match admission.cancel() {
+                    Ok(()) => error,
+                    Err(cancel) => error.context(format!("release child reservation: {cancel:#}")),
+                });
+            }
+            let (work, launch) = match admission.commit()? {
+                crate::agent::AgentCommit::Admitted(work) => (work, true),
+                crate::agent::AgentCommit::Existing(work) => (work, false),
+            };
+            self.agent_registry.insert(work.agent.clone());
+            transaction.state.interaction = parent;
+            let warning = if matches!(&owned.request.operation, AgentOperation::Spawn(_)) {
+                self.agent_provider_factory.profiles.snapshot()?.error
+            } else {
+                None
+            };
+            let value =
+                json!({"agent":work.agent,"task":work.task,"status":"admitted","warning":warning});
+            Ok((
+                value,
+                if launch && work.launch {
+                    Some(work)
+                } else {
+                    None
+                },
+            ))
+        };
+        let admitted = match authority {
+            Some(authority) => authority.commit(admit),
+            None => admit(),
+        };
+        match admitted {
+            Ok((value, work)) => {
+                if let Some(work) = work {
+                    transaction
+                        .pending_agent_launch
+                        .push_back(PendingAgentLaunch {
+                            work,
+                            reply: Some((owned.response, value)),
+                        });
+                } else {
+                    let _ = owned.response.send(Ok(value));
+                }
+                let effects = self.prepare_agent_state()?;
+                Ok(ForegroundAction::Effect(ForegroundJob::Publication(
+                    self.prepare_provider_delivery(effects)?,
+                )))
+            }
+            Err(error) => {
+                let _ = owned.response.send(Err(error));
+                Ok(ForegroundAction::Wait)
+            }
+        }
+    }
+
+    pub(crate) fn apply_foreground_agent_selection(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        owned: OwnedAgentRequest,
+        selection: Result<crate::agent::AgentSelection>,
+    ) -> Result<ForegroundAction> {
+        transaction.agent_command_active = false;
+        match selection {
+            Ok(selection) => {
+                self.commit_foreground_agent_admission(transaction, owned, Some(selection))
+            }
+            Err(error) => {
+                let _ = owned.response.send(Err(error));
+                Ok(ForegroundAction::Wait)
+            }
+        }
+    }
+
+    /// Revalidate interrupted tasks before persisting cleanup and notifying the caller.
+    pub(crate) fn apply_foreground_agent_interrupt(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        operation: AgentInterrupt,
+        completed: usize,
+        result: Result<()>,
+    ) -> Result<ForegroundAction> {
+        transaction.agent_command_active = false;
+        let AgentInterrupt {
+            items,
+            remaining,
+            request,
+            result: reply,
+        } = operation;
+        let cleanup_succeeded = result.is_ok();
+        let applied = (|| {
+            let mut effects = Vec::new();
+            for item in items.into_iter().take(completed) {
+                let AgentInterruptItem {
+                    mut agent,
+                    owner,
+                    cancelled,
+                    cleanup,
+                    provider,
+                    approvals,
+                } = item;
+                anyhow::ensure!(
+                    owner.session_id == self.session.id
+                        && self.agent_coordinator.resolve(&agent.id)?.id == agent.id,
+                    "interrupted child authority changed during cleanup"
+                );
+                if let Some(expected) = &provider {
+                    anyhow::ensure!(
+                        self.child_provider_by_agent
+                            .get(&agent.id)
+                            .is_some_and(|current| Arc::ptr_eq(current, expected)),
+                        "interrupted child provider was replaced during cleanup"
+                    );
+                }
+                for approval in approvals {
+                    if let Some(runtime) = self
+                        .child_exchange_runtime_by_agent
+                        .get_mut(owner.agent_id.as_str())
+                    {
+                        runtime.exchange.observe_blocker(
+                            format!("approval:{}", approval.id),
+                            false,
+                            self.clock.now_ms(),
+                        );
+                        self.store.save_exchange(&runtime.exchange)?;
+                    }
+                    effects.push(AppliedProviderEvent::Update(SessionUpdate::Approval {
+                        update: Box::new(crate::provider::ApprovalUpdate::Cancelled(approval)),
+                    }));
+                }
+                for mut task in cancelled {
+                    let current = self
+                        .agent_coordinator
+                        .task(&task.id)
+                        .context("interrupted queued task disappeared")?;
+                    anyhow::ensure!(
+                        serde_json::to_value(&current)? == serde_json::to_value(&task)?,
+                        "interrupted queued task changed during cleanup"
+                    );
+                    task.state = ExchangeState::Cancelled;
+                    task.completed_at_ms = Some(self.clock.now_ms());
+                    if let Some(mut exchange) = self.store.load_exchange(&task.id)? {
+                        exchange.finish(
+                            crate::exchange::ExchangeOutcome::Cancelled,
+                            self.clock.now_ms(),
+                        )?;
+                        self.store.complete_agent_task(&agent, &task, &exchange)?;
+                    }
+                    self.agent_coordinator.retain(agent.clone(), task)?;
+                }
+                if let Some(mut task) = cleanup.filter(|_| cleanup_succeeded) {
+                    let current = self
+                        .agent_coordinator
+                        .cleanup_task(&agent.id)
+                        .context("child cleanup obligation disappeared")?;
+                    anyhow::ensure!(
+                        serde_json::to_value(&current)? == serde_json::to_value(&task)?,
+                        "child cleanup obligation changed during cleanup"
+                    );
+                    agent.state = AgentState::Ready;
+                    agent.updated_at_ms = self.clock.now_ms();
+                    task.error = None;
+                    let mut exchange = self
+                        .store
+                        .load_exchange(&task.id)?
+                        .context("child cleanup exchange missing")?;
+                    exchange.finalization_error = None;
+                    self.store.complete_agent_task(&agent, &task, &exchange)?;
+                    self.agent_registry.insert(agent.clone());
+                    self.agent_coordinator.retain(agent, task.clone())?;
+                    self.agent_coordinator
+                        .settled(&owner.agent_id, &task.id, false)?;
+                    self.child_provider_by_agent.remove(owner.agent_id.as_str());
+                    self.child_execution_by_agent
+                        .remove(owner.agent_id.as_str());
+                }
+                effects.push(self.prepare_agent_state()?);
+            }
+            Ok(AppliedProviderEvent::Effects(effects))
+        })();
+        match applied {
+            Ok(effects) => {
+                let delivery = self.prepare_provider_delivery(effects)?;
+                match result {
+                    Ok(()) if !remaining.is_empty() => {
+                        transaction.pending_agent_interrupt = Some((remaining, request, reply));
+                        transaction.agent_command_active = true;
+                    }
+                    result => {
+                        let _ = request.response.send(result.map(|()| reply));
+                    }
+                }
+                Ok(ForegroundAction::Effect(ForegroundJob::Publication(
+                    delivery,
+                )))
+            }
+            Err(error) => {
+                let _ = request.response.send(Err(error));
+                Ok(ForegroundAction::Wait)
+            }
+        }
+    }
+
+    /// Continue a multi-child interruption after the previous result is published.
+    pub(crate) fn continue_foreground_agent_interrupt(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+    ) -> Result<ForegroundAction> {
+        let Some((targets, request, reply)) = transaction.pending_agent_interrupt.take() else {
+            return Ok(ForegroundAction::Wait);
+        };
+        let action = self.prepare_foreground_agent_interrupt(targets, request, reply)?;
+        transaction.agent_command_active = matches!(
+            &action,
+            ForegroundAction::Effect(ForegroundJob::AgentInterrupt { .. })
+        );
+        Ok(action)
+    }
+
+    /// Acknowledge only the exact child result sent to this invocation.
+    pub(crate) fn apply_foreground_agent_result(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        task: crate::agent::AgentTask,
+        result: Result<()>,
+    ) -> Result<ForegroundAction> {
+        if let Err(error) = result {
+            self.trace.record(
+                &self.session.id,
+                "agent.result_queued",
+                json!({"task_id": task.id, "error": format!("{error:#}")}),
+            );
+            return self.prepare_foreground_agent_result(transaction);
+        }
+        let current = self
+            .agent_coordinator
+            .task(&task.id)
+            .context("delivered child task disappeared")?;
+        anyhow::ensure!(
+            current.session_id == self.session.id
+                && !current.parent_reported
+                && serde_json::to_value(&current)? == serde_json::to_value(&task)?,
+            "child result changed during delivery"
+        );
+        self.trace.record(
+            &self.session.id,
+            "agent.result_delivered",
+            json!({"task_id":task.id,"delivery":"steered"}),
+        );
+        self.acknowledge_agent_result(current)?;
+        self.prepare_foreground_agent_result(transaction)
+    }
+
+    /// Capture a plan scan as owned work that can run without the broker lock.
+    pub(crate) fn prepare_foreground_control(
+        &self,
+        transaction: &ForegroundTransaction,
+        control: crate::plan::execution::ExecutionControl,
+    ) -> ForegroundAction {
+        let crate::plan::execution::ExecutionControl {
+            task_permit,
+            execution_id,
+            generation,
+            operation,
+            response,
+        } = control;
+        let submission = matches!(
+            &operation,
+            crate::plan::execution::ExecutionOperation::Submit { .. }
+        );
+        match self.prepare_execution_control(
+            &execution_id,
+            generation,
+            &task_permit,
+            operation,
+            &transaction.state.interaction,
+        ) {
+            Ok(job) => ForegroundAction::Effect(ForegroundJob::ExecutionControl {
+                job: Box::new(job),
+                response,
+                submission,
+            }),
+            Err(error) => {
+                let _ = response.send(Err(error));
+                ForegroundAction::Wait
+            }
+        }
+    }
+
+    /// Apply evidence under the broker guard and stage a report capture if required.
+    pub(crate) fn apply_foreground_control_evidence(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        response: tokio::sync::oneshot::Sender<Result<Value>>,
+        submission: bool,
+        result: Result<execution::ExecutionControlEvidence>,
+    ) -> Result<ForegroundAction> {
+        let stage = result.and_then(|evidence| {
+            self.apply_execution_control(evidence, &mut transaction.state.interaction)
+        });
+        match stage {
+            Ok(execution::ExecutionControlStage::Report(job)) => Ok(ForegroundAction::Effect(
+                ForegroundJob::ExecutionControlReport {
+                    job,
+                    response,
+                    submission,
+                },
+            )),
+            Ok(execution::ExecutionControlStage::Complete(value)) => {
+                self.finish_foreground_control(transaction, response, submission, Ok(value))
+            }
+            Err(error) => {
+                self.finish_foreground_control(transaction, response, submission, Err(error))
+            }
+        }
+    }
+
+    /// Commit report evidence and deliver the control result or open revision review.
+    pub(crate) fn apply_foreground_control_report(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        response: tokio::sync::oneshot::Sender<Result<Value>>,
+        submission: bool,
+        result: Result<execution::ExecutionControlReport>,
+    ) -> Result<ForegroundAction> {
+        let result = result.and_then(|report| {
+            self.commit_execution_control_report(report, &mut transaction.state.interaction)
+        });
+        self.finish_foreground_control(transaction, response, submission, result)
+    }
+
+    fn finish_foreground_control(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        response: tokio::sync::oneshot::Sender<Result<Value>>,
+        submission: bool,
+        result: Result<Value>,
+    ) -> Result<ForegroundAction> {
+        let committed = result.is_ok();
+        if submission
+            && result
+                .as_ref()
+                .is_ok_and(|value| value["status"] == "paused")
+        {
+            anyhow::ensure!(
+                transaction.pending_revision.is_none(),
+                "another revision review is already pending"
+            );
+            let wait = self.revision_review.open()?;
+            transaction.state.interaction.pause(self.clock.now_ms());
+            transaction.state.interaction.set_awaiting_input(true);
+            self.store.save_exchange(&transaction.state.interaction)?;
+            transaction.pending_revision = Some((response, wait));
+        } else {
+            let _ = response.send(result);
+        }
+        if committed {
+            let patch = self.reconcile_timeline()?;
+            return Ok(ForegroundAction::Effect(ForegroundJob::Publication(
+                self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?,
+            )));
+        }
+        Ok(ForegroundAction::Wait)
+    }
+
+    /// Apply a revision-review request without retaining the broker during check capture.
+    pub(crate) fn apply_foreground_revision(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        request: crate::plan::revision_review::RevisionReviewRequest,
+    ) -> Result<ForegroundAction> {
+        use crate::plan::revision_review::RevisionReviewRequest;
+        match request {
+            RevisionReviewRequest::Capture {
+                plan_id,
+                digest,
+                revision,
+                response,
+            } => {
+                let result = (|| {
+                    if let Some(authority) = &transaction.task_authority {
+                        authority.validate()?;
+                    }
+                    anyhow::ensure!(
+                        transaction.pending_revision.is_some(),
+                        "revision review is no longer active"
+                    );
+                    anyhow::ensure!(
+                        self.current_plan_id()?.as_deref() == Some(plan_id.as_str()),
+                        "review belongs to another plan"
+                    );
+                    if let Some(revision) = revision {
+                        let source = self.observer.capture_plan_revision(&plan_id, revision)?;
+                        anyhow::ensure!(
+                            crate::plan::digest(&serde_json::to_vec(&source.document)?) == digest,
+                            "plan revision changed before opening"
+                        );
+                        Ok(source)
+                    } else {
+                        self.observer.capture_plan_review(&plan_id, &digest)
+                    }
+                })();
+                let _ = response.send(result);
+                Ok(ForegroundAction::Wait)
+            }
+            RevisionReviewRequest::Decide {
+                method,
+                params,
+                response,
+            } => {
+                let validate = (|| {
+                    if let Some(authority) = &transaction.task_authority {
+                        authority.validate()?;
+                    }
+                    anyhow::ensure!(
+                        transaction.pending_revision.is_some(),
+                        "revision review is no longer active"
+                    );
+                    if let Some(id) = params.get("plan_id").and_then(Value::as_str) {
+                        anyhow::ensure!(
+                            self.current_plan_id()?.as_deref() == Some(id),
+                            "review decision belongs to another plan"
+                        );
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = validate {
+                    let _ = response.send(Err(error));
+                    return Ok(ForegroundAction::Wait);
+                }
+                if matches!(method, RuntimeMethod::SessionPlanCheckUpdate) {
+                    return match self.prepare_plan_checks_update(params) {
+                        Ok(job) => {
+                            transaction.revision_job_active = true;
+                            Ok(ForegroundAction::Effect(
+                                ForegroundJob::RevisionChecksUpdate {
+                                    job: Box::new(job),
+                                    response,
+                                },
+                            ))
+                        }
+                        Err(error) => {
+                            let _ = response.send(Err(error));
+                            Ok(ForegroundAction::Wait)
+                        }
+                    };
+                }
+                let edits_only = matches!(
+                    method,
+                    RuntimeMethod::SessionPlanEntityRename | RuntimeMethod::SessionPlanTestDelete
+                );
+                let result = match method {
+                    RuntimeMethod::SessionPlanAcceptanceBegin => {
+                        self.dispatch_session_command("session.plan.acceptance.begin", params)
+                    }
+                    RuntimeMethod::SessionPlanChangesRequest => {
+                        self.dispatch_session_command("session.plan.changes.request", params)
+                    }
+                    RuntimeMethod::SessionPlanCancel => {
+                        self.dispatch_session_command("session.plan.cancel", params)
+                    }
+                    RuntimeMethod::SessionPlanEntityRename => self.rename_plan_entity(params),
+                    RuntimeMethod::SessionPlanTestDelete => self.delete_plan_tests(params),
+                    _ => Err(anyhow::anyhow!("unsupported revision review decision")),
+                };
+                if edits_only || result.is_err() {
+                    let _ = response.send(result);
+                    return Ok(ForegroundAction::Wait);
+                }
+                let (_, mut events) = result?;
+                transaction.state.interaction.set_awaiting_input(false);
+                transaction.state.interaction.resume(self.clock.now_ms())?;
+                self.store.save_exchange(&transaction.state.interaction)?;
+                let execution_id = self
+                    .current_execution()?
+                    .context("review has no execution")?
+                    .id;
+                let provider_response = self.revision_review_response(&execution_id)?;
+                events.retain(|event| event.event != "goal_continue_requested");
+                let patch = self.reconcile_timeline()?;
+                let snapshot = serde_json::to_value(self.snapshot()?)?;
+                let (provider, wait) = transaction
+                    .pending_revision
+                    .take()
+                    .context("revision review lost its provider wait")?;
+                drop(wait);
+                let _ = response.send(Ok((snapshot, events)));
+                let _ = provider.send(Ok(provider_response));
+                Ok(ForegroundAction::Effect(ForegroundJob::Publication(
+                    self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?,
+                )))
+            }
+        }
+    }
+
+    /// Revalidate and commit a completed revision check edit.
+    pub(crate) fn apply_foreground_revision_checks(
+        &mut self,
+        transaction: &mut ForegroundTransaction,
+        response: tokio::sync::oneshot::Sender<Result<(Value, Vec<SessionEvent>)>>,
+        result: Result<PlanChecksUpdateResult>,
+    ) -> ForegroundAction {
+        transaction.revision_job_active = false;
+        let result = result.and_then(|captured| {
+            if let Some(authority) = &transaction.task_authority {
+                authority.validate()?;
+            }
+            anyhow::ensure!(
+                transaction.pending_revision.is_some(),
+                "revision review is no longer active"
+            );
+            self.commit_plan_checks_update(captured)
+        });
+        let _ = response.send(result);
+        ForegroundAction::Wait
+    }
+
+    /// Capture a plan scan as owned work that can run without the broker lock.
+    pub(crate) fn prepare_foreground_scan(
+        &self,
+        transaction: &ForegroundTransaction,
+    ) -> Result<ForegroundJob> {
+        let execution_id = transaction
+            .execution_id
+            .as_deref()
+            .context("foreground execution is missing")?;
+        Ok(ForegroundJob::PlanScan(Box::new(
+            self.prepare_execution_scan(execution_id)?,
+        )))
+    }
+
+    /// Revalidate a completed scan and stage its ordered live updates.
+    pub(crate) fn apply_foreground_scan(
+        &mut self,
+        transaction: &ForegroundTransaction,
+        result: execution::ExecutionScanResult,
+    ) -> Result<AppliedProviderEvent> {
+        let progress = self.commit_execution_scan(result)?;
+        let patch = self.reconcile_live_interaction(Some(&transaction.state.interaction), None)?;
+        Ok(AppliedProviderEvent::Effects(vec![
+            AppliedProviderEvent::Timeline(patch),
+            AppliedProviderEvent::Update(SessionUpdate::PlanProgress {
+                progress: serde_json::from_value(progress)?,
+            }),
+        ]))
+    }
+
+    /// Revalidate and return foreground state to the broker after the owned worker ends.
+    #[cfg(test)]
+    pub(crate) fn finish_owned_foreground(
+        &mut self,
+        transaction: &mut OwnedForegroundTransaction,
+    ) -> Result<Exchange> {
+        anyhow::ensure!(
+            transaction.scope.owner == crate::provider::ExecutionOwner::root(&self.session.id),
+            "foreground transaction crosses execution ownership"
+        );
+        anyhow::ensure!(
+            self.exchange_runtime.is_none(),
+            "another foreground runtime is already installed"
+        );
+        let runtime = transaction
+            .runtime
+            .as_ref()
+            .context("foreground transaction already committed")?;
+        anyhow::ensure!(
+            runtime.exchange_id == transaction.interaction.id,
+            "foreground runtime belongs to another exchange"
+        );
+        if let Some(permit) = &runtime.task_permit {
+            permit.validate(self.task_controller.current()?.as_ref())?;
+        }
+        self.exchange_runtime = transaction.runtime.take();
+        Ok(transaction.interaction.clone())
+    }
+
+    /// Prepare ordered effects while holding broker state; delivery may run after releasing it.
+    pub(crate) fn prepare_provider_delivery(
+        &self,
+        applied: AppliedProviderEvent,
+    ) -> Result<PendingProviderDelivery> {
+        let mut updates = Vec::new();
+        let mut events = Vec::new();
+        let mut pending = vec![applied];
+        while let Some(effect) = pending.pop() {
+            let (update, timeline) = match effect {
+                AppliedProviderEvent::None => (None, None),
+                AppliedProviderEvent::Update(update) => (Some(update), None),
+                AppliedProviderEvent::Live(pending) => {
+                    (Some(pending.update), Some(pending.timeline))
+                }
+                AppliedProviderEvent::Timeline(patch) => (None, Some(patch)),
+                AppliedProviderEvent::Effects(effects) => {
+                    pending.extend(effects.into_iter().rev());
+                    continue;
+                }
+                AppliedProviderEvent::NativeGoalContinuation(_) => {
+                    anyhow::bail!("native goal transition must finish before publication")
+                }
+            };
+            if let Some(update) = update {
+                if update.wakes_input()
+                    && let Some(wakeup) = &self.input_wakeup
+                {
+                    wakeup.notify_one();
+                }
+                let payload = publication::encode_session_update(&update)?;
+                self.trace
+                    .record(&self.session.id, "lua.event.emitted", payload.clone());
+                if self.event_sink.is_some() {
+                    updates.push(update);
+                } else {
+                    events.push(self.event("provider_event", payload)?);
+                }
+            }
+            if let Some(patch) = timeline
+                && !patch.is_empty()
+            {
+                if self.event_sink.is_some() {
+                    updates.push(SessionUpdate::DocumentChanged { patch });
+                } else {
+                    events.push(self.event("document_changed", patch.notification())?);
+                }
+            }
+        }
+        Ok(PendingProviderDelivery {
+            sink: self.event_sink.clone(),
+            updates,
+            events,
+        })
+    }
+
+    /// Validate ownership and apply supported provider state without awaiting publication.
+    pub(crate) fn apply_provider_event(
+        &mut self,
+        runtime: &mut ExchangeRuntime,
+        interaction: &mut Exchange,
+        provider_event: ProviderEvent,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<AppliedProviderEvent> {
         let scope = provider_event.scope();
         if scope.owner() != &crate::provider::ExecutionOwner::root(&self.session.id) {
             self.trace.record(
@@ -6181,7 +7992,7 @@ impl HarnessBroker {
                 "provider.event.rejected",
                 json!({"code":"foreign_execution_owner","scope":scope}),
             );
-            return Box::pin(async { Ok(()) });
+            return Ok(AppliedProviderEvent::None);
         }
         if scope.invocation().is_some_and(|scope| {
             scope.exchange_id != interaction.id
@@ -6190,75 +8001,123 @@ impl HarnessBroker {
                     .iter()
                     .any(|turn| &turn.provider().scope == scope)
         }) {
-            return Box::pin(async { Ok(()) });
+            return Ok(AppliedProviderEvent::None);
         }
         match provider_event {
-            ProviderEvent::DirectoryAccess { grant, .. } => Box::pin(async move {
-                for grant in grant {
-                    let directories = match grant.operation {
-                        crate::permissions::directory::DirectoryOperation::Read => {
-                            &mut self.session.access.readable_directory
-                        }
-                        crate::permissions::directory::DirectoryOperation::Write => {
-                            &mut self.session.access.writable_directory
-                        }
-                    };
-                    if !directories.contains(&grant.path) {
-                        directories.push(grant.path);
-                    }
-                }
-                self.save_session()?;
-                self.session.active_task = self.task_controller.current()?;
-                self.emit_session_update(
-                    SessionUpdate::ExecutionState {
-                        session: Box::new(self.session.clone()),
-                    },
-                    event,
-                )
-                .await
-            }),
+            ProviderEvent::DirectoryAccess { grant, .. } => Ok(AppliedProviderEvent::Update(
+                self.apply_directory_access(grant)?,
+            )),
             ProviderEvent::Runtime {
                 update: crate::provider::RuntimeUpdate::Resolved { runtime: resolved },
                 ..
-            } => Box::pin(async move {
-                if !resolved.provider.is_empty() {
-                    self.session.provider_label = resolved.provider;
-                }
-                if let Some(model) = resolved.model.filter(|model| !model.is_empty()) {
-                    self.session.resolved_model = Some(model);
-                }
-                self.save_session()?;
-                self.emit_session_update(
-                    SessionUpdate::Runtime {
-                        session_id: self.session.id.clone(),
-                        runtime: crate::provider::ProviderRuntime {
-                            provider: self.session.provider_label.clone(),
-                            model: self.session.resolved_model.clone(),
-                        },
-                    },
-                    event,
-                )
-                .await
-            }),
-            ProviderEvent::Compaction { scope, update } => Box::pin(async move {
+            } => Ok(AppliedProviderEvent::Update(
+                self.apply_resolved_runtime(resolved)?,
+            )),
+            ProviderEvent::Compaction { scope, update } => {
                 let observation = ProviderEvent::Compaction {
                     scope,
                     update: update.clone(),
                 };
-                self.process_compaction_event(runtime, interaction, observation, *update, event)
-                    .await
-            }),
-            ProviderEvent::Approval {
-                scope,
-                update: crate::provider::ApprovalUpdate::Requested(request),
-            } => Box::pin(async move {
+                Ok(
+                    match self.apply_compaction_observation(
+                        runtime,
+                        interaction,
+                        observation,
+                        *update,
+                    )? {
+                        Some(patch) => AppliedProviderEvent::Timeline(patch),
+                        None => AppliedProviderEvent::None,
+                    },
+                )
+            }
+            ProviderEvent::Approval { update, .. } => Ok(
+                match self.apply_approval_observation(interaction, update)? {
+                    Some(pending) => AppliedProviderEvent::Live(pending),
+                    None => AppliedProviderEvent::None,
+                },
+            ),
+            ProviderEvent::ParentBoundary { update, .. } => Ok(AppliedProviderEvent::Live(
+                self.apply_parent_boundary(runtime, interaction, update)?,
+            )),
+            ProviderEvent::Agent {
+                update: crate::provider::AgentUpdate::Lifecycle { event: lifecycle },
+                ..
+            } => {
+                self.apply_agent_lifecycle(&lifecycle, Some(&interaction.id), event)?;
+                Ok(AppliedProviderEvent::None)
+            }
+            ProviderEvent::Agent { .. } => Ok(AppliedProviderEvent::None),
+            ProviderEvent::Diagnostic { diagnostic, .. } => {
+                Ok(AppliedProviderEvent::Update(SessionUpdate::Diagnostic {
+                    diagnostic,
+                }))
+            }
+            content => self.apply_exchange_content(runtime, interaction, content, true),
+        }
+    }
+
+    /// Persist directory grants and prepare the resulting session update.
+    fn apply_directory_access(
+        &mut self,
+        grants: Vec<forge_provider_api::access::DirectoryGrant>,
+    ) -> Result<SessionUpdate> {
+        for grant in grants {
+            let directories = match grant.operation {
+                crate::permissions::directory::DirectoryOperation::Read => {
+                    &mut self.session.access.readable_directory
+                }
+                crate::permissions::directory::DirectoryOperation::Write => {
+                    &mut self.session.access.writable_directory
+                }
+            };
+            if !directories.contains(&grant.path) {
+                directories.push(grant.path);
+            }
+        }
+        self.save_session()?;
+        self.session.active_task = self.task_controller.current()?;
+        Ok(SessionUpdate::ExecutionState {
+            session: Box::new(self.session.clone()),
+        })
+    }
+
+    /// Persist resolved native identity and prepare its session update.
+    fn apply_resolved_runtime(
+        &mut self,
+        resolved: crate::provider::ProviderRuntime,
+    ) -> Result<SessionUpdate> {
+        if !resolved.provider.is_empty() {
+            self.session.provider_label = resolved.provider;
+        }
+        if let Some(model) = resolved.model.filter(|model| !model.is_empty()) {
+            self.session.resolved_model = Some(model);
+        }
+        self.save_session()?;
+        Ok(SessionUpdate::Runtime {
+            session_id: self.session.id.clone(),
+            runtime: crate::provider::ProviderRuntime {
+                provider: self.session.provider_label.clone(),
+                model: self.session.resolved_model.clone(),
+            },
+        })
+    }
+
+    /// Apply approval ownership and return ordered publication work without awaiting delivery.
+    fn apply_approval_observation(
+        &mut self,
+        interaction: &mut Exchange,
+        update: crate::provider::ApprovalUpdate,
+    ) -> Result<Option<PendingLivePublication>> {
+        use crate::provider::ApprovalUpdate;
+        let update = match update {
+            ApprovalUpdate::Requested(request) => {
                 if !self
                     .permission_coordinator
                     .pending_list()?
                     .iter()
                     .any(|approval| approval.id == request.id)
                 {
-                    return Ok(());
+                    return Ok(None);
                 }
                 let turn = interaction
                     .turn
@@ -6271,29 +8130,21 @@ impl HarnessBroker {
                     turn.map(|turn| turn.id()),
                 )?
                 else {
-                    return Ok(());
+                    return Ok(None);
                 };
                 interaction.observe_blocker(
                     format!("approval:{}", approval.id),
                     true,
                     self.clock.now_ms(),
                 );
-                self.store.save_exchange(interaction)?;
-                self.emit_live(
-                    SessionUpdate::Approval {
-                        update: Box::new(crate::provider::ApprovalUpdate::Requested(approval)),
-                    },
-                    event,
-                )
-                .await?;
-                let _ = scope;
-                Ok(())
-            }),
-            ProviderEvent::Approval { update, .. } => Box::pin(async move {
+                ApprovalUpdate::Requested(approval)
+            }
+            update @ (ApprovalUpdate::Resolved(_) | ApprovalUpdate::Cancelled(_)) => {
                 let approval = match &update {
-                    crate::provider::ApprovalUpdate::Resolved(approval)
-                    | crate::provider::ApprovalUpdate::Cancelled(approval) => approval,
-                    crate::provider::ApprovalUpdate::Requested(_) => unreachable!(),
+                    ApprovalUpdate::Resolved(approval) | ApprovalUpdate::Cancelled(approval) => {
+                        approval
+                    }
+                    ApprovalUpdate::Requested(_) => unreachable!(),
                 };
                 interaction.observe_blocker(
                     format!("approval:{}", approval.id),
@@ -6301,211 +8152,234 @@ impl HarnessBroker {
                     self.clock.now_ms(),
                 );
                 interaction.approval_resolution.push(approval.clone());
-                self.store.save_exchange(interaction)?;
-                self.emit_live(
-                    SessionUpdate::Approval {
-                        update: Box::new(update),
-                    },
-                    event,
-                )
-                .await
-            }),
-            ProviderEvent::ParentBoundary { update, .. } => Box::pin(async move {
-                let now_ms = self.clock.now_ms();
-                match update {
-                    crate::provider::ParentBoundaryUpdate::WaitStarted { agent_count } => {
-                        interaction.observe_blocker("agent_wait".into(), true, now_ms);
-                        interaction.close_running_messages();
-                        runtime.active_wait = Some(ActiveWait {
-                            exchange_id: interaction.id.clone(),
-                            started_at_ms: now_ms,
-                            agent_count,
-                        });
-                    }
-                    crate::provider::ParentBoundaryUpdate::WaitUpdated { agent_count } => {
-                        if let Some(wait) = runtime.active_wait.as_mut() {
-                            wait.agent_count = agent_count;
-                        }
-                    }
-                    crate::provider::ParentBoundaryUpdate::WaitFinished => {
-                        interaction.observe_blocker("agent_wait".into(), false, now_ms);
-                        runtime.active_wait = None;
-                    }
-                }
-                self.store.save_exchange(interaction)?;
-                self.emit_active_wait(interaction, runtime, event).await
-            }),
-            ProviderEvent::Agent {
-                update: crate::provider::AgentUpdate::Lifecycle { event: lifecycle },
-                ..
-            } => Box::pin(async move {
-                self.apply_agent_lifecycle(&lifecycle, Some(&interaction.id), event)
-                    .await?;
-                Ok(())
-            }),
-            ProviderEvent::Agent { .. } => Box::pin(async { Ok(()) }),
-            ProviderEvent::Diagnostic { diagnostic, .. } => Box::pin(async move {
-                self.emit_session_update(SessionUpdate::Diagnostic { diagnostic }, event)
-                    .await
-            }),
-            content => self.process_exchange_content(runtime, interaction, content, event),
-        }
+                update
+            }
+        };
+        self.store.save_exchange(interaction)?;
+        let timeline = self.reconcile_timeline()?;
+        Ok(Some(PendingLivePublication {
+            update: SessionUpdate::Approval {
+                update: Box::new(update),
+            },
+            timeline,
+        }))
     }
 
-    fn process_exchange_content<'event>(
-        &'event mut self,
-        runtime: &'event mut ExchangeRuntime,
-        interaction: &'event mut Exchange,
-        provider_event: ProviderEvent,
-        event: &'event mut Vec<SessionEvent>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'event>> {
-        Box::pin(async move {
-            self.prepare_provider_observation(interaction, &provider_event);
-            if provider_event.turn_address().is_some_and(|address| {
-                self.diagnostic_native_thread.contains(&address.thread_id)
-                    || self
-                        .agent_registry
-                        .get_by_thread(&address.thread_id)
-                        .is_some_and(|agent| !agent.is_primary())
-            }) {
-                return Ok(());
+    /// Apply a parent wait transition and prepare its ordered publication.
+    fn apply_parent_boundary(
+        &mut self,
+        runtime: &mut ExchangeRuntime,
+        interaction: &mut Exchange,
+        update: crate::provider::ParentBoundaryUpdate,
+    ) -> Result<PendingLivePublication> {
+        let now_ms = self.clock.now_ms();
+        match update {
+            crate::provider::ParentBoundaryUpdate::WaitStarted { agent_count } => {
+                interaction.observe_blocker("agent_wait".into(), true, now_ms);
+                interaction.close_running_messages();
+                runtime.active_wait = Some(ActiveWait {
+                    exchange_id: interaction.id.clone(),
+                    started_at_ms: now_ms,
+                    agent_count,
+                });
             }
-            if self
-                .route_settled_parent_event(interaction, &provider_event, event)
-                .await?
-            {
-                return Ok(());
-            }
-            self.admit_native_goal_continuation(runtime, interaction, &provider_event, event)
-                .await?;
-            if !interaction.observe_turn(&provider_event, self.clock.now_ms())? {
-                self.trace.record(&self.session.id, "provider.event.rejected",
-                    json!({"exchange_id":interaction.id,"code":"execution_unknown_or_settled","event":provider_event}));
-                return Ok(());
-            }
-            match &provider_event {
-                ProviderEvent::Turn { address, update } => {
-                    if matches!(update, crate::provider::TurnUpdate::Started { .. })
-                        && self.session.provider_session_id.as_deref()
-                            != Some(address.thread_id.as_str())
-                    {
-                        self.session.provider_session_id = Some(address.thread_id.clone());
-                        self.save_session()?;
-                    }
-                    self.store.save_exchange(interaction)?;
-                    self.emit_observation(&provider_event, event).await?;
-                    return Ok(());
+            crate::provider::ParentBoundaryUpdate::WaitUpdated { agent_count } => {
+                if let Some(wait) = runtime.active_wait.as_mut() {
+                    wait.agent_count = agent_count;
                 }
-                ProviderEvent::InputAccepted {
-                    acknowledgement, ..
-                } => {
-                    runtime.retraction_eligible = false;
-                    let now_ms = self.clock.now_ms();
-                    match acknowledgement {
-                        crate::provider::InputAcknowledgement::TaskStarted {
-                            input_id,
-                            start,
-                            prompt,
-                        } => {
-                            let input_id = input_id
-                                .as_ref()
-                                .context("task entry is missing its input identity")?;
-                            if self.task_controller.current()?.is_some_and(|task| {
-                                task.entry.as_ref().is_some_and(|entry| {
-                                    entry.id.as_str() == input_id
-                                        && entry.review_exchange.as_deref() == Some(&interaction.id)
-                                })
-                            }) {
-                                interaction.observe_blocker("agent_wait".into(), false, now_ms);
-                                runtime.active_wait = None;
-                                self.store.save_exchange(interaction)?;
-                                return Ok(());
-                            }
-                            let id = format!("{}:task-start:{input_id}", self.session.id);
-                            if let Some(existing) =
-                                self.store.load_session_event(&self.session.id, &id)?
-                            {
-                                anyhow::ensure!(
-                                    matches!(existing.detail,
+            }
+            crate::provider::ParentBoundaryUpdate::WaitFinished => {
+                interaction.observe_blocker("agent_wait".into(), false, now_ms);
+                runtime.active_wait = None;
+            }
+        }
+        self.store.save_exchange(interaction)?;
+        self.active_wait_projection = runtime.active_wait.clone();
+        let update = SessionUpdate::Timeline {
+            update: TimelineUpdate::Wait {
+                exchange_id: interaction.id.clone(),
+                wait: runtime.active_wait.clone(),
+            },
+        };
+        let timeline = self.reconcile_live_interaction(Some(interaction), None)?;
+        Ok(PendingLivePublication { update, timeline })
+    }
+
+    /// Persist a native turn transition and prepare its publication.
+    fn apply_turn_observation(
+        &mut self,
+        interaction: &Exchange,
+        address: &crate::provider::TurnAddress,
+        update: &crate::provider::TurnUpdate,
+    ) -> Result<Option<SessionUpdate>> {
+        if matches!(update, crate::provider::TurnUpdate::Started { .. })
+            && self.session.provider_session_id.as_deref() != Some(address.thread_id.as_str())
+        {
+            self.session.provider_session_id = Some(address.thread_id.clone());
+            self.save_session()?;
+        }
+        self.store.save_exchange(interaction)?;
+        Ok(SessionUpdate::from_observation(&ProviderEvent::Turn {
+            address: address.clone(),
+            update: update.clone(),
+        }))
+    }
+
+    /// Apply ordinary content and retain ordered publication effects.
+    fn apply_exchange_content(
+        &mut self,
+        runtime: &mut ExchangeRuntime,
+        interaction: &mut Exchange,
+        provider_event: ProviderEvent,
+        allow_goal_transition: bool,
+    ) -> Result<AppliedProviderEvent> {
+        let mut effects = Vec::new();
+        self.prepare_provider_observation(interaction, &provider_event);
+        if provider_event.turn_address().is_some_and(|address| {
+            self.diagnostic_native_thread.contains(&address.thread_id)
+                || self
+                    .agent_registry
+                    .get_by_thread(&address.thread_id)
+                    .is_some_and(|agent| !agent.is_primary())
+        }) {
+            return Ok(AppliedProviderEvent::Effects(effects));
+        }
+        if let Some(routed) = self.apply_settled_parent_event(interaction, &provider_event)? {
+            return Ok(routed);
+        }
+        if allow_goal_transition
+            && self.native_goal_continuation_needed(runtime, interaction, &provider_event)?
+        {
+            return Ok(AppliedProviderEvent::NativeGoalContinuation(provider_event));
+        }
+        if !interaction.observe_turn(&provider_event, self.clock.now_ms())? {
+            self.trace.record(&self.session.id, "provider.event.rejected",
+                    json!({"exchange_id":interaction.id,"code":"execution_unknown_or_settled","event":provider_event}));
+            return Ok(AppliedProviderEvent::Effects(effects));
+        }
+        match &provider_event {
+            ProviderEvent::Turn { address, update } => {
+                let pending = self.apply_turn_observation(interaction, address, update)?;
+                if let Some(update) = pending {
+                    effects.push(AppliedProviderEvent::Update(update));
+                }
+                return Ok(AppliedProviderEvent::Effects(effects));
+            }
+            ProviderEvent::InputAccepted {
+                acknowledgement, ..
+            } => {
+                runtime.retraction_eligible = false;
+                let now_ms = self.clock.now_ms();
+                match acknowledgement {
+                    crate::provider::InputAcknowledgement::TaskStarted {
+                        input_id,
+                        start,
+                        prompt,
+                    } => {
+                        let input_id = input_id
+                            .as_ref()
+                            .context("task entry is missing its input identity")?;
+                        if self.task_controller.current()?.is_some_and(|task| {
+                            task.entry.as_ref().is_some_and(|entry| {
+                                entry.id.as_str() == input_id
+                                    && entry.review_exchange.as_deref() == Some(&interaction.id)
+                            })
+                        }) {
+                            interaction.observe_blocker("agent_wait".into(), false, now_ms);
+                            runtime.active_wait = None;
+                            self.store.save_exchange(interaction)?;
+                            return Ok(AppliedProviderEvent::Effects(effects));
+                        }
+                        let id = format!("{}:task-start:{input_id}", self.session.id);
+                        if let Some(existing) =
+                            self.store.load_session_event(&self.session.id, &id)?
+                        {
+                            anyhow::ensure!(
+                                matches!(existing.detail,
                                     SessionEventKind::TaskStarted { start: previous, prompt: previous_prompt }
                                     if previous == *start && previous_prompt == *prompt),
-                                    "task entry identity was reused for different content"
-                                );
-                                return Ok(());
-                            }
-                            interaction.observe_blocker("agent_wait".into(), false, now_ms);
-                            runtime.active_wait = None;
-                            self.store.save_exchange(interaction)?;
-                            let task_event = crate::timeline::SessionEventRecord {
-                                id,
-                                session_id: self.session.id.clone(),
-                                owner: self
-                                    .store
-                                    .capture_timeline_owner(&self.session.id, &interaction.id)?,
-                                created_at_ms: now_ms,
-                                detail: SessionEventKind::TaskStarted {
-                                    start: start.clone(),
-                                    prompt: prompt.clone(),
-                                },
-                            };
-                            self.store.save_session_event(&task_event)?;
-                            let mut displayed = interaction.clone();
-                            crate::timeline::ownership::insert_event(
-                                &mut displayed,
-                                crate::timeline::TimelineEvent::Session {
-                                    event: Box::new(task_event),
-                                },
-                            )?;
-                            self.emit_live_interaction(
-                                SessionUpdate::Timeline {
-                                    update: TimelineUpdate::Node { prompt: None },
-                                },
-                                &displayed,
-                                event,
-                            )
-                            .await?;
+                                "task entry identity was reused for different content"
+                            );
+                            return Ok(AppliedProviderEvent::Effects(effects));
                         }
-                        crate::provider::InputAcknowledgement::Steering { input_id, text } => {
-                            if input_id.as_ref().is_some_and(|id| interaction.node_list.iter().any(|node|
-                                matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == *id))) {
-                                return Ok(());
-                            }
-                            interaction.observe_blocker("agent_wait".into(), false, now_ms);
-                            runtime.active_wait = None;
-                            interaction.append_identified_input(
-                                input_id.clone(),
-                                crate::exchange::InputIntent::Steering,
-                                text.clone(),
-                                now_ms,
-                            )?;
-                            self.store.save_exchange(interaction)?;
-                            let prompt = interaction.node_list.last().and_then(|node| match node {
-                                ExchangeNode::ExchangeInput { prompt } => Some(prompt.clone()),
-                                _ => None,
-                            });
-                            self.emit_live_interaction(
-                                SessionUpdate::Timeline {
-                                    update: TimelineUpdate::Node { prompt },
-                                },
-                                interaction,
-                                event,
-                            )
-                            .await?;
-                        }
+                        interaction.observe_blocker("agent_wait".into(), false, now_ms);
+                        runtime.active_wait = None;
+                        self.store.save_exchange(interaction)?;
+                        let task_event = crate::timeline::SessionEventRecord {
+                            id,
+                            session_id: self.session.id.clone(),
+                            owner: self
+                                .store
+                                .capture_timeline_owner(&self.session.id, &interaction.id)?,
+                            created_at_ms: now_ms,
+                            detail: SessionEventKind::TaskStarted {
+                                start: start.clone(),
+                                prompt: prompt.clone(),
+                            },
+                        };
+                        self.store.save_session_event(&task_event)?;
+                        let mut displayed = interaction.clone();
+                        crate::timeline::ownership::insert_event(
+                            &mut displayed,
+                            crate::timeline::TimelineEvent::Session {
+                                event: Box::new(task_event),
+                            },
+                        )?;
+                        effects.push(self.prepare_live_interaction(
+                            SessionUpdate::Timeline {
+                                update: TimelineUpdate::Node { prompt: None },
+                            },
+                            &displayed,
+                        )?);
                     }
-                    self.emit_active_wait(interaction, runtime, event).await?;
-                    return Ok(());
+                    crate::provider::InputAcknowledgement::Steering { input_id, text } => {
+                        if input_id.as_ref().is_some_and(|id| interaction.node_list.iter().any(|node|
+                                matches!(node, ExchangeNode::ExchangeInput { prompt } if prompt.id == *id))) {
+                                return Ok(AppliedProviderEvent::Effects(effects));
+                            }
+                        interaction.observe_blocker("agent_wait".into(), false, now_ms);
+                        runtime.active_wait = None;
+                        interaction.append_identified_input(
+                            input_id.clone(),
+                            crate::exchange::InputIntent::Steering,
+                            text.clone(),
+                            now_ms,
+                        )?;
+                        self.store.save_exchange(interaction)?;
+                        let prompt = interaction.node_list.last().and_then(|node| match node {
+                            ExchangeNode::ExchangeInput { prompt } => Some(prompt.clone()),
+                            _ => None,
+                        });
+                        effects.push(self.prepare_live_interaction(
+                            SessionUpdate::Timeline {
+                                update: TimelineUpdate::Node { prompt },
+                            },
+                            interaction,
+                        )?);
+                    }
                 }
-                ProviderEvent::Runtime {
-                    update: crate::provider::RuntimeUpdate::ContextUsage { usage },
-                    ..
-                } => {
-                    let thread_id = self.session.provider_session_id.as_deref();
-                    if let Some(thread_id) = thread_id
+                self.active_wait_projection = runtime.active_wait.clone();
+                effects.push(self.prepare_live_interaction(
+                    SessionUpdate::Timeline {
+                        update: TimelineUpdate::Wait {
+                            exchange_id: interaction.id.clone(),
+                            wait: runtime.active_wait.clone(),
+                        },
+                    },
+                    interaction,
+                )?);
+                return Ok(AppliedProviderEvent::Effects(effects));
+            }
+            ProviderEvent::Runtime {
+                update: crate::provider::RuntimeUpdate::ContextUsage { usage },
+                ..
+            } => {
+                let thread_id = self.session.provider_session_id.as_deref();
+                if let Some(thread_id) = thread_id
                         && interaction.observe_compaction_usage(thread_id, usage.used) {
                         self.store.save_exchange(interaction)?;
                         let patch = self.reconcile_timeline()?;
-                        self.emit_timeline_patch(patch, event).await?;
+                        effects.push(AppliedProviderEvent::Timeline(patch));
                     } else if let Some(thread_id) = thread_id
                         && !interaction.node_list.iter().any(|node| matches!(node,
                             ExchangeNode::Compaction { compaction, .. } if compaction.thread_id == thread_id))
@@ -6524,48 +8398,48 @@ impl HarnessBroker {
                         && compaction.observe_context_usage(usage.used) {
                         self.store.save_session_event(&record)?;
                         let patch = self.reconcile_timeline()?;
-                        self.emit_timeline_patch(patch, event).await?;
+                        effects.push(AppliedProviderEvent::Timeline(patch));
                     }
-                    self.session.context_usage = Some(usage.clone());
-                    self.context_usage_fresh = true;
-                    self.emit_observation(&provider_event, event).await?;
-                    return Ok(());
+                self.session.context_usage = Some(usage.clone());
+                self.context_usage_fresh = true;
+                if let Some(update) = SessionUpdate::from_observation(&provider_event) {
+                    effects.push(AppliedProviderEvent::Update(update));
                 }
-                ProviderEvent::Checklist { update, .. } => {
-                    runtime.retraction_eligible = false;
-                    runtime.checklist.replace(update);
-                    interaction.checklist = Some(runtime.checklist.snapshot().clone());
-                    self.store.save_exchange(interaction)?;
-                    self.emit_live_interaction(
-                        publication::LiveUpdate::StateChanged,
-                        interaction,
-                        event,
-                    )
-                    .await?;
-                }
-                ProviderEvent::Tool { .. } => runtime.retraction_eligible = false,
-                ProviderEvent::Message { update, .. }
-                    if update.text().is_some_and(|text| !text.is_empty()) =>
-                {
-                    runtime.retraction_eligible = false
-                }
-                _ => {}
+                return Ok(AppliedProviderEvent::Effects(effects));
             }
-            if provider_event.turn_address().is_some() {
-                attribute_provider_tool(interaction, &mut runtime.checklist, &provider_event)?;
-                if provider_event.tool_output_delta().is_some() {
-                    self.store
-                        .save_tool_output_delta(interaction, &provider_event)?;
-                } else {
-                    self.store.save_exchange(interaction)?;
-                }
-                self.emit_live_interaction(provider_event, interaction, event)
-                    .await?;
+            ProviderEvent::Checklist { update, .. } => {
+                runtime.retraction_eligible = false;
+                runtime.checklist.replace(update);
+                interaction.checklist = Some(runtime.checklist.snapshot().clone());
+                self.store.save_exchange(interaction)?;
+                effects.push(self.prepare_live_interaction(
+                    publication::LiveUpdate::StateChanged,
+                    interaction,
+                )?);
+            }
+            ProviderEvent::Tool { .. } => runtime.retraction_eligible = false,
+            ProviderEvent::Message { update, .. }
+                if update.text().is_some_and(|text| !text.is_empty()) =>
+            {
+                runtime.retraction_eligible = false
+            }
+            _ => {}
+        }
+        if provider_event.turn_address().is_some() {
+            attribute_provider_tool(interaction, &mut runtime.checklist, &provider_event)?;
+            if provider_event.tool_output_delta().is_some() {
+                self.store
+                    .save_tool_output_delta(interaction, &provider_event)?;
             } else {
-                self.emit_observation(&provider_event, event).await?;
+                self.store.save_exchange(interaction)?;
             }
-            Ok(())
-        })
+            effects.push(self.prepare_live_interaction(provider_event, interaction)?);
+        } else {
+            if let Some(update) = SessionUpdate::from_observation(&provider_event) {
+                effects.push(AppliedProviderEvent::Update(update));
+            }
+        }
+        Ok(AppliedProviderEvent::Effects(effects))
     }
 
     fn prepare_provider_observation(
@@ -6589,14 +8463,14 @@ impl HarnessBroker {
         }
     }
 
-    async fn process_compaction_event(
+    /// Apply compaction state and return the timeline publication effect.
+    fn apply_compaction_observation(
         &mut self,
         runtime: &mut ExchangeRuntime,
         interaction: &mut Exchange,
         provider_event: ProviderEvent,
         mut compaction: crate::provider::Compaction,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
+    ) -> Result<Option<TimelinePatch>> {
         if compaction.state == crate::provider::CompactionState::Running
             && self.session.provider_session_id.as_deref() == Some(compaction.thread_id.as_str())
         {
@@ -6625,8 +8499,7 @@ impl HarnessBroker {
         if owns_other_exchange || owns_session_event {
             self.retain_external_compaction(compaction, now_ms)?;
             let patch = self.reconcile_timeline()?;
-            self.emit_timeline_patch(patch, event).await?;
-            return Ok(());
+            return Ok(Some(patch));
         }
         let child_id = self
             .agent_registry
@@ -6651,14 +8524,12 @@ impl HarnessBroker {
                 .remove(&child_id)
                 .context("compaction owner disappeared")?;
             child.exchange.observe_compaction(compaction, now_ms);
-            let result = async {
-                self.store.save_exchange(&child.exchange)?;
-                self.emit_live_interaction(provider_event, &child.exchange, event)
-                    .await
-            }
-            .await;
+            let result = self
+                .store
+                .save_exchange(&child.exchange)
+                .and_then(|()| self.reconcile_live_interaction(Some(&child.exchange), None));
             self.child_exchange_runtime_by_agent.insert(child_id, child);
-            result?;
+            return Ok(Some(result?));
         } else if self.session.provider_session_id.as_deref() == Some(compaction.thread_id.as_str())
             || interaction
                 .turn
@@ -6668,20 +8539,21 @@ impl HarnessBroker {
             runtime.retraction_eligible = false;
             interaction.observe_compaction(compaction, now_ms);
             self.store.save_exchange(interaction)?;
-            self.emit_live_interaction(provider_event, interaction, event)
-                .await?;
+            return Ok(Some(
+                self.reconcile_live_interaction(Some(interaction), None)?,
+            ));
         }
-        Ok(())
+        Ok(None)
     }
 
-    async fn route_settled_parent_event(
+    /// Apply a late observation to its settled owner and retain its ordered effects.
+    fn apply_settled_parent_event(
         &mut self,
         current: &Exchange,
         provider_event: &ProviderEvent,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<bool> {
+    ) -> Result<Option<AppliedProviderEvent>> {
         let Some(address) = provider_event.turn_address() else {
-            return Ok(false);
+            return Ok(None);
         };
         if current.turn.iter().any(|turn| turn.provider() == address)
             || !matches!(
@@ -6691,17 +8563,17 @@ impl HarnessBroker {
                     | ProviderEvent::Tool { .. }
             )
         {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(mut owner) = self
             .store
             .load_provider_exchange(&self.session.id, address)?
         else {
-            return Ok(false);
+            return Ok(None);
         };
+        let mut effects = Vec::new();
         if matches!(provider_event, ProviderEvent::Usage { .. })
-            || matches!(provider_event, ProviderEvent::Tool { address, update }
-                if owner.accepts_settled_tool_update(address, update))
+            || matches!(provider_event, ProviderEvent::Tool { address, update } if owner.accepts_settled_tool_update(address, update))
         {
             owner.observe_turn(provider_event, self.clock.now_ms())?;
             if provider_event.tool_output_delta().is_some() {
@@ -6720,120 +8592,68 @@ impl HarnessBroker {
                     status,
                     self.observer.status_thoughts.load(Ordering::Relaxed),
                 )?;
-            self.emit_observation(provider_event, event).await?;
-            self.emit_timeline_patch(patch, event).await?;
+            if let Some(update) = SessionUpdate::from_observation(provider_event) {
+                effects.push(AppliedProviderEvent::Update(update));
+            }
+            effects.push(AppliedProviderEvent::Timeline(patch));
         }
+        Ok(Some(AppliedProviderEvent::Effects(effects)))
+    }
+
+    /// Apply and deliver a settled-owner event in staged-interface tests.
+    #[cfg(test)]
+    async fn test_apply_settled_parent_event(
+        &mut self,
+        current: &Exchange,
+        provider_event: &ProviderEvent,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<bool> {
+        let Some(applied) = self.apply_settled_parent_event(current, provider_event)? else {
+            return Ok(false);
+        };
+        let delivery = self.prepare_provider_delivery(applied)?;
+        event.extend(delivery.deliver().await?);
         Ok(true)
     }
 
-    async fn admit_native_goal_continuation(
-        &mut self,
-        runtime: &mut ExchangeRuntime,
-        interaction: &mut Exchange,
+    /// Decide whether an observed start requires a native-goal checkpoint transition.
+    fn native_goal_continuation_needed(
+        &self,
+        runtime: &ExchangeRuntime,
+        interaction: &Exchange,
         observation: &ProviderEvent,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let ProviderEvent::Turn {
             address,
             update: crate::provider::TurnUpdate::Started { .. },
         } = observation
         else {
-            return Ok(());
+            return Ok(false);
         };
         let Some(previous) = interaction.turn.last() else {
-            return Ok(());
+            return Ok(false);
         };
-        if previous.provider().thread_id != address.thread_id
-            || interaction.turn.iter().any(|turn| {
+        Ok(previous.provider().thread_id == address.thread_id
+            && !interaction.turn.iter().any(|turn| {
                 turn.provider() == address || turn.state() == crate::turn::TurnState::Running
             })
-            || runtime.task_permit.as_ref().is_none_or(|permit| {
+            && runtime.task_permit.as_ref().is_some_and(|permit| {
                 permit
                     .validate(self.task_controller.current().ok().flatten().as_ref())
-                    .is_err()
+                    .is_ok()
             })
-            || !self
+            && self
                 .current_goal()?
                 .is_some_and(|goal| goal.native && goal.state == GoalState::Active)
-        {
-            return Ok(());
-        }
-        let crate::turn::TurnState::Finished { outcome } = previous.state() else {
-            return Ok(());
-        };
-        let outcome = match outcome {
-            crate::turn::TurnOutcome::Completed => crate::exchange::ExchangeOutcome::Complete,
-            crate::turn::TurnOutcome::Cancelled => crate::exchange::ExchangeOutcome::Cancelled,
-            crate::turn::TurnOutcome::Interrupted => crate::exchange::ExchangeOutcome::Interrupted,
-            crate::turn::TurnOutcome::Failed => crate::exchange::ExchangeOutcome::Failed,
-        };
-        self.collect_initial_checkpoint(runtime, interaction)
-            .await?;
-        self.capture_final_checkpoint(interaction, outcome).await?;
-        let (mut continuation, _, boundary) = self
-            .interaction_for_turn("", true, self.clock.now_ms())
-            .await?;
-        event.extend(boundary);
-        continuation.origin = crate::exchange::ExchangeOrigin::task_continuation(
-            "The native goal requires another turn",
-        );
-        continuation.checklist.clone_from(&interaction.checklist);
-        self.start_exchange_runtime(&mut continuation, self.clock.now_ms())
-            .await?;
-        let mut continuation_runtime = self
-            .exchange_runtime
-            .take()
-            .context("continuation runtime is missing")?;
-        self.collect_initial_checkpoint(&mut continuation_runtime, &mut continuation)
-            .await?;
-        continuation.inherit_native_turn(
-            address.clone(),
-            observation.observed_at_ms(self.clock.now_ms()),
-        )?;
-        *runtime = continuation_runtime;
-        runtime.retraction_eligible = false;
-        self.store.save_exchange(&continuation)?;
-        *interaction = continuation;
-        self.emit_live_interaction(publication::LiveUpdate::StateChanged, interaction, event)
-            .await
+            && matches!(previous.state(), crate::turn::TurnState::Finished { .. }))
     }
 
-    async fn emit_active_wait(
-        &mut self,
-        interaction: &Exchange,
-        runtime: &ExchangeRuntime,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
-        self.active_wait_projection = runtime.active_wait.clone();
-        self.emit_live_interaction(
-            SessionUpdate::Timeline {
-                update: TimelineUpdate::Wait {
-                    exchange_id: interaction.id.clone(),
-                    wait: runtime.active_wait.clone(),
-                },
-            },
-            interaction,
-            event,
-        )
-        .await
-    }
-
-    async fn emit_live(
-        &mut self,
-        update: impl Into<publication::LiveUpdate>,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
-        self.emit_publication(update.into(), event).await?;
-        let timeline_patch = self.reconcile_timeline()?;
-        self.emit_timeline_patch(timeline_patch, event).await
-    }
-
-    async fn emit_live_interaction(
+    /// Capture an ordered update and timeline patch without awaiting a presentation sink.
+    fn prepare_live_interaction(
         &mut self,
         update: impl Into<publication::LiveUpdate>,
         interaction: &Exchange,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
+    ) -> Result<AppliedProviderEvent> {
         let update = update.into();
         let incremental = if let publication::LiveUpdate::Observation(observation) = &update {
             if observation.tool_output_delta().is_some() {
@@ -6852,39 +8672,23 @@ impl HarnessBroker {
         } else {
             None
         };
-        self.emit_publication(update, event).await?;
-        let timeline_patch = match incremental {
+        let update = match update {
+            publication::LiveUpdate::StateChanged => None,
+            publication::LiveUpdate::Observation(observation) => {
+                SessionUpdate::from_observation(&observation)
+            }
+            publication::LiveUpdate::Notification(update) => Some(*update),
+        };
+        let patch = match incremental {
             Some(patch) => patch,
             None => self.reconcile_live_interaction(Some(interaction), None)?,
         };
-        self.emit_timeline_patch(timeline_patch, event).await
-    }
-
-    async fn emit_publication(
-        &mut self,
-        update: publication::LiveUpdate,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
-        match update {
-            publication::LiveUpdate::StateChanged => Ok(()),
-            publication::LiveUpdate::Observation(observation) => {
-                self.emit_observation(&observation, event).await
-            }
-            publication::LiveUpdate::Notification(update) => {
-                self.emit_session_update(*update, event).await
-            }
+        let mut effects = Vec::new();
+        if let Some(update) = update {
+            effects.push(AppliedProviderEvent::Update(update));
         }
-    }
-
-    async fn emit_observation(
-        &mut self,
-        observation: &ProviderEvent,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
-        if let Some(update) = SessionUpdate::from_observation(observation) {
-            self.emit_session_update(update, event).await?;
-        }
-        Ok(())
+        effects.push(AppliedProviderEvent::Timeline(patch));
+        Ok(AppliedProviderEvent::Effects(effects))
     }
 
     async fn emit_session_update(
@@ -6908,6 +8712,7 @@ impl HarnessBroker {
                     json!({"error":error.to_string()}),
                 );
                 self.event_sink = None;
+                return Err(error.into());
             }
         } else {
             event.push(self.event("provider_event", payload)?);
@@ -6936,6 +8741,7 @@ impl HarnessBroker {
                     json!({"error":error.to_string()}),
                 );
                 self.event_sink = None;
+                return Err(error.into());
             }
         } else {
             event.push(self.event("document_changed", timeline_patch.notification())?);
@@ -7026,12 +8832,29 @@ impl HarnessBroker {
         Ok(status)
     }
 
-    async fn interaction_for_turn(
+    #[cfg(test)]
+    async fn test_stage_interaction_for_turn(
         &mut self,
         text: &str,
         admit_exchange: bool,
         now_ms: i64,
     ) -> Result<(Exchange, bool, Vec<SessionEvent>)> {
+        let (interaction, admitted, mut events, effects) =
+            self.stage_interaction_for_turn(text, admit_exchange, now_ms)?;
+        for effect in effects {
+            let delivery = self.prepare_provider_delivery(effect)?;
+            events.extend(delivery.deliver().await?);
+        }
+        Ok((interaction, admitted, events))
+    }
+
+    /// Admit a turn and stage any previous-exchange presentation work without delivery.
+    fn stage_interaction_for_turn(
+        &mut self,
+        text: &str,
+        admit_exchange: bool,
+        now_ms: i64,
+    ) -> Result<(Exchange, bool, Vec<SessionEvent>, Vec<AppliedProviderEvent>)> {
         let current = self.store.current_exchange_state(&self.session.id)?;
         if !admit_exchange {
             let mut interaction = self
@@ -7039,7 +8862,7 @@ impl HarnessBroker {
                 .latest_exchange(&self.session.id)?
                 .context("continuation has no originating exchange")?;
             interaction.resume(now_ms)?;
-            return Ok((interaction, false, Vec::new()));
+            return Ok((interaction, false, Vec::new(), Vec::new()));
         }
         if current.latest.is_none() && self.session.name.trim().is_empty() {
             let words = text.split_whitespace().collect::<Vec<_>>();
@@ -7060,7 +8883,8 @@ impl HarnessBroker {
                 self.save_session()?;
             }
         }
-        let mut event = Vec::new();
+        let event = Vec::new();
+        let mut effects = Vec::new();
         if let Some(previous) = current.latest.as_ref()
             && previous.state == ExchangeState::Running
         {
@@ -7083,12 +8907,9 @@ impl HarnessBroker {
                 previous.finish(outcome, now_ms)?;
             }
             self.store.save_exchange(&previous)?;
-            self.emit_live_interaction(
-                publication::LiveUpdate::StateChanged,
-                &previous,
-                &mut event,
-            )
-            .await?;
+            effects.push(
+                self.prepare_live_interaction(publication::LiveUpdate::StateChanged, &previous)?,
+            );
         }
         Ok((
             Exchange {
@@ -7130,6 +8951,7 @@ impl HarnessBroker {
             },
             true,
             event,
+            effects,
         ))
     }
 
@@ -7204,78 +9026,8 @@ impl HarnessBroker {
     }
 
     async fn update_plan_checks(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let trace = crate::plan::edit_trace::PlanEditTrace::new(
-            Arc::clone(&self.trace),
-            &self.session.id,
-            "session.plan.check.update",
-            &params,
-        );
-        let plan_id = required_text(&params, "plan_id")?;
-        let expected_digest = required_text(&params, "digest")?;
-        let expected_version = params
-            .get("expected_version")
-            .and_then(Value::as_u64)
-            .context("check selection requires the reviewed plan version")?;
-        let changes: std::collections::BTreeMap<String, bool> = serde_json::from_value(
-            params
-                .get("enabled")
-                .cloned()
-                .context("check selection is missing")?,
-        )?;
-        let tests: Vec<crate::plan::DesignTestSelection> =
-            serde_json::from_value(params.get("tests").cloned().unwrap_or_else(|| json!([])))?;
-        let mut plan = self
-            .store
-            .load_plan(&plan_id)?
-            .context("plan record is missing")?;
-        anyhow::ensure!(
-            plan.session_id == self.session.id,
-            "plan belongs to another session"
-        );
-        anyhow::ensure!(
-            plan.state == PlanState::AwaitingReview,
-            "only plans awaiting review can change checks"
-        );
-        anyhow::ensure!(
-            plan.review_digest.as_deref() == Some(&expected_digest),
-            "plan changed before check selection"
-        );
-        let (document, rendered, checksum) = self
-            .plan_file
-            .update_checks(
-                &self.session.id,
-                &plan.id,
-                expected_version,
-                &expected_digest,
-                crate::plan::PlanCheckSelection {
-                    enabled: &changes,
-                    removed_tests: &tests,
-                },
-                Some(&trace),
-            )
-            .await?;
-        plan.document_version = document.version;
-        plan.review_digest = Some(checksum);
-        plan.acceptance = None;
-        plan.manual_changes.push(format!(
-            "Updated plan checks: {}",
-            changes
-                .iter()
-                .map(|(id, enabled)| format!(
-                    "{id} {}",
-                    if *enabled { "enabled" } else { "disabled" }
-                ))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-        plan.updated_at_ms = self.clock.now_ms();
-        self.publish_plan(&plan)?;
-        self.save_session()?;
-        let payload = json!({ "plan": plan, "content": rendered.markdown, "document": document });
-        Ok((
-            payload.clone(),
-            vec![self.event("plan_checks_updated", payload)?],
-        ))
+        let result = self.prepare_plan_checks_update(params)?.run().await?;
+        self.commit_plan_checks_update(result)
     }
 
     fn rename_plan_entity(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -7351,8 +9103,10 @@ impl HarnessBroker {
                 new_name.clone(),
             )?;
             let rendered = self.plan_file.render_review(&result.document)?;
-            let (document, rendered, digest) = self.plan_file.persist_review_draft(
+            let expected = result.document.clone();
+            let (document, rendered, digest) = self.plan_file.persist_review_draft_if_unchanged(
                 &self.session.id,
+                &expected,
                 crate::plan::PlanReviewRevision::new(&plan.id, result.document, rendered)?,
                 Some(&trace),
             )?;
@@ -7425,7 +9179,7 @@ impl HarnessBroker {
         self.active_goal()
     }
 
-    async fn apply_goal_evidence(
+    fn apply_goal_evidence_strict(
         &mut self,
         evidence: crate::goal::TurnEvidence,
         permit: Option<crate::task::TaskPermit>,
@@ -7435,11 +9189,12 @@ impl HarnessBroker {
         let Some(permit) = permit else {
             return Ok(false);
         };
-        let Some(task) = self.task_controller.current()? else {
-            return Ok(false);
-        };
+        let task = self
+            .task_controller
+            .current()?
+            .ok_or(crate::task::StaleTask)?;
         if task.kind() == crate::task::TaskKind::Plan {
-            return Ok(false);
+            return Err(crate::task::StaleTask.into());
         }
         let observed = self.task_controller.observe_goal(
             &mut self.store,
@@ -7448,15 +9203,7 @@ impl HarnessBroker {
             evidence,
             self.clock.now_ms(),
         );
-        let (observed, decision) = match observed {
-            Ok(observed) => observed,
-            Err(error) if error.is::<crate::task::StaleTask>() => {
-                self.trace
-                    .record(&self.session.id, "task.stale_goal_evidence", json!({}));
-                return Ok(false);
-            }
-            Err(error) => return Err(error),
-        };
+        let (observed, decision) = observed?;
         let goal = GoalRecord {
             id: task.id.as_str().into(),
             session_id: self.session.id.clone(),
@@ -7538,31 +9285,97 @@ impl HarnessBroker {
         Ok(None)
     }
 
-    async fn pause_goal_after_turn_failure(&mut self) -> Result<()> {
-        if let Some(task) = self.task_controller.current()?
-            && task.entry_accepted()
-            && task.status() == crate::task::TaskStatus::Running
-        {
-            self.task_controller.change(
-                &mut self.store,
-                Some(&task.revision),
-                crate::task::TaskChange::Pause,
-                self.clock.now_ms(),
-            )?;
-        }
-        Ok(())
-    }
-
     async fn sync_native_goal(&mut self, goal: &GoalRecord, state: GoalState) -> Result<()> {
         if !goal.native || self.session.provider_session_id.is_none() {
             return Ok(());
         }
-        self.provider
-            .goal_status(
-                self.provider_request(ProviderInput::from_text(""), PromptMode::GoalContinuation),
-                crate::provider::native_goal_update(goal.objective.clone(), state),
-            )
+        let registry = self.execution_registry();
+        let owner = crate::provider::ExecutionOwner::root(&self.session.id);
+        let expected = self.task_controller.current()?;
+        let lane = self.task_controller.native_goal_lane();
+        let _lane = match tokio::time::timeout(std::time::Duration::from_secs(30), lane.lock())
             .await
+        {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.task_controller.mark_native_goal_uncertain();
+                let error = anyhow::Error::new(ProviderError::DeliveryUncertain {
+                    message: "native goal transport lane timed out; provider outcome is uncertain"
+                        .into(),
+                });
+                return Err(match registry.fence(&owner).await {
+                    Ok(()) => error,
+                    Err(cleanup) => error.context(cleanup),
+                });
+            }
+        };
+        self.task_controller.ensure_native_goal_certain()?;
+        anyhow::ensure!(
+            foreground_failure::same_retraction_task(
+                self.task_controller.current()?.as_ref(),
+                expected.as_ref()
+            ),
+            "task changed before native goal update"
+        );
+        let result = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.provider.goal_status(
+                self.provider_request(ProviderInput::from_text(""), PromptMode::GoalContinuation)?,
+                crate::provider::native_goal_update(goal.objective.clone(), state),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.task_controller.mark_native_goal_uncertain();
+                Err(error.context(ProviderError::DeliveryUncertain {
+                    message:
+                        "native goal update failed after dispatch; provider outcome is uncertain"
+                            .into(),
+                }))
+            }
+            Err(_) => {
+                self.task_controller.mark_native_goal_uncertain();
+                Err(ProviderError::DeliveryUncertain {
+                    message: "native goal update timed out; provider outcome is uncertain".into(),
+                }
+                .into())
+            }
+        };
+        let epoch = match self.task_controller.native_goal_written() {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                drop(_lane);
+                return Err(match registry.fence(&owner).await {
+                    Ok(()) => error,
+                    Err(cleanup) => error.context(cleanup),
+                });
+            }
+        };
+        let changed = !foreground_failure::same_retraction_task(
+            self.task_controller.current()?.as_ref(),
+            expected.as_ref(),
+        );
+        drop(_lane);
+        if let Err(uncertain) = self.task_controller.ensure_native_goal_certain() {
+            let error = result.err().unwrap_or(uncertain);
+            return Err(match registry.fence(&owner).await {
+                Ok(()) => error,
+                Err(cleanup) => error.context(cleanup),
+            });
+        }
+        let _ = epoch;
+        result?;
+        if changed {
+            return Err(ProviderError::DeliveryUncertain {
+                message:
+                    "task changed during native goal update; canonical reconciliation is pending"
+                        .into(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     async fn prepare_rollback(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -7793,7 +9606,10 @@ impl HarnessBroker {
             self.trace.clone(),
             self.data_root.clone(),
         )?;
-        self.provider.shutdown().await?;
+        let execution_cleanup = self.execution_registry.close().await;
+        let native_cleanup = self.provider.shutdown().await;
+        execution_cleanup?;
+        native_cleanup?;
         self.provider = Arc::from(replacement);
         session.provider_session_id = None;
         session.provider_checkpoint_id = None;
@@ -7937,6 +9753,10 @@ impl HarnessBroker {
         }
     }
     async fn new_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        self.new_session_now(params)
+    }
+
+    fn new_session_now(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let now_ms = self.clock.now_ms();
         let child = prepare_new_session(
             &self.data_root,
@@ -8039,430 +9859,25 @@ impl HarnessBroker {
         .await
     }
 
-    async fn configure_session(&mut self, mut params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut resource_selection = None;
-        if params.get("settings_revision").is_some() {
-            let settings = crate::settings::SettingsStore::open(&self.data_root)?.get(
-                &self.session.workspace,
-                &self.session.id,
-                &self.session.provider,
-            )?;
-            anyhow::ensure!(
-                params["settings_revision"].as_u64() == Some(settings.revision),
-                "settings revision was superseded"
-            );
-            params["access"] =
-                serde_json::to_value(settings.desired.access.clone().unwrap_or_default())?;
-            params["shell"] = serde_json::to_value(settings.desired.shell.unwrap_or_default())?;
-            params["plan_compact"] = json!(
-                settings.desired.plan_compact.unwrap_or(false) && self.capability.native_compact
-            );
-            params["approval_timeout"] =
-                serde_json::to_value(settings.desired.approval_timeout.unwrap_or_default())?;
-            params["tool_timeout"] =
-                serde_json::to_value(settings.desired.tool_timeout.unwrap_or_default())?;
-
-            let desired = serde_json::to_value(&settings.desired)?;
-            for (key, value) in desired.as_object().context("settings must be an object")? {
-                if !value.is_null() && key != "skill" && key != "mcp" && key != "plan_compact" {
-                    params[key] = value.clone();
-                }
-            }
-            resource_selection = Some(settings.desired);
+    async fn configure_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let preparation = self.prepare_configuration(params)?;
+        let models = if preparation.needs_catalog(self) {
+            let result = self.prepare_configuration_catalog()?.run().await?;
+            self.commit_configuration_catalog(result)?
+        } else {
+            Vec::new()
+        };
+        let mut candidate = self.build_configuration_candidate(preparation, &models)?;
+        if let Some(job) = self.prepare_candidate_reconcile(&candidate)? {
+            let result = job.run().await?;
+            self.certify_candidate_reconcile(&mut candidate, result)?;
         }
-        let mut configured = self.session.clone();
-        let check_timing = params
-            .get("check_timing")
-            .map(|value| serde_json::from_value::<crate::checks::CheckTiming>(value.clone()))
-            .transpose()?;
-        let automatic_checks = params
-            .get("automatic_checks")
-            .map(|value| serde_json::from_value::<bool>(value.clone()))
-            .transpose()?;
-        if let Some(value) = params.get("auto_compaction") {
-            let policy: crate::session::AutoCompaction = serde_json::from_value(value.clone())?;
-            policy.validate(configured.context_usage.as_ref())?;
-            anyhow::ensure!(
-                !policy.enabled || self.capability.native_compact,
-                "This provider does not support automatic compaction"
-            );
-            configured.auto_compaction = policy;
+        let committed = self.commit_configuration_candidate(candidate)?;
+        if let Some(job) = committed.cleanup {
+            let result = job.run().await?;
+            self.commit_configuration_reconcile(result)?;
         }
-        configured.approval_timeout = self
-            .permission_coordinator
-            .approval_timeout(&self.session.id)?;
-        let access = params
-            .get("access")
-            .map(|value| serde_json::from_value::<crate::session::AccessPolicy>(value.clone()))
-            .transpose()?
-            .map(crate::session::AccessPolicy::validate)
-            .transpose()?;
-        if let Some(value) = params.get("shell") {
-            configured.shell = serde_json::from_value(value.clone())?;
-            configured.shell.executable()?;
-        }
-        if let Some(value) = params.get("approval_mode") {
-            configured.approval_mode = serde_json::from_value(value.clone())?;
-        }
-        if let Some(value) = params.get("approval_timeout") {
-            configured.approval_timeout =
-                serde_json::from_value::<crate::session::InputTimeout>(value.clone())?
-                    .validate()?;
-        }
-        if let Some(value) = params.get("tool_timeout") {
-            configured.tool_timeout =
-                serde_json::from_value::<crate::session::InputTimeout>(value.clone())?
-                    .require_expiry()?;
-        }
-        let requested_service_tier = params
-            .get("service_tier")
-            .map(|value| serde_json::from_value::<crate::provider::ServiceTier>(value.clone()))
-            .transpose()?;
-        if let Some(tier) = requested_service_tier {
-            tier.validate(&self.capability)?;
-        }
-        let requested_model = params.get("model").and_then(Value::as_str);
-        let requested_effort = params.get("effort").and_then(Value::as_str);
-        let requested_context_window = params.get("context_window").and_then(Value::as_str);
-        let validate_selection = params.get("validate").and_then(Value::as_bool) == Some(true);
-        let mut plan_executor = self.session.plan_executor.clone();
-        let mut plan_compact = self.session.plan_compact;
-        if let Some(enabled) = params.get("plan_compact").and_then(Value::as_bool) {
-            if enabled {
-                anyhow::ensure!(
-                    self.capability.native_compact,
-                    "current provider does not support context compaction"
-                );
-            }
-            plan_compact = enabled;
-        }
-        if let Some(enabled) = params.get("plan_executor_enabled").and_then(Value::as_bool) {
-            if enabled {
-                anyhow::ensure!(
-                    self.capability.model_selection,
-                    "current provider does not support model selection"
-                );
-                if plan_executor.model.is_none() {
-                    let active_model = self
-                        .session
-                        .resolved_model
-                        .clone()
-                        .unwrap_or_else(|| self.session.model.clone());
-                    let selected_model =
-                        if active_model == "default" {
-                            self.provider
-                                .model_list(self.provider_request(
-                                    ProviderInput::from_text(""),
-                                    PromptMode::Chat,
-                                ))
-                                .await?
-                                .into_iter()
-                                .find(|candidate| candidate.is_default)
-                                .context("the provider has no default model")?
-                                .id
-                        } else {
-                            active_model
-                        };
-                    plan_executor.model = Some(selected_model);
-                    plan_executor.effort = Some(self.session.effort.clone());
-                }
-            }
-            plan_executor.enabled = enabled;
-        }
-        if let Some(model) = params.get("plan_executor_model").and_then(Value::as_str) {
-            anyhow::ensure!(
-                !model.trim().is_empty(),
-                "plan executor model cannot be empty"
-            );
-            plan_executor.model = Some(model.to_owned());
-        }
-        if let Some(effort) = params.get("plan_executor_effort").and_then(Value::as_str) {
-            anyhow::ensure!(
-                !effort.trim().is_empty(),
-                "plan executor thinking cannot be empty"
-            );
-            plan_executor.effort = Some(effort.to_owned());
-        }
-        if params.get("plan_executor_model").is_some()
-            || params.get("plan_executor_effort").is_some()
-            || params.get("plan_executor_enabled").and_then(Value::as_bool) == Some(true)
-        {
-            self.validate_plan_executor(&plan_executor).await?;
-        }
-        let selected_tier = requested_service_tier.unwrap_or(self.session.service_tier);
-        let validate_tier = selected_tier != crate::provider::ServiceTier::Standard
-            && (requested_service_tier.is_some() || requested_model.is_some());
-        if validate_tier
-            || (validate_selection
-                && (requested_model.is_some()
-                    || requested_effort.is_some()
-                    || requested_context_window.is_some()))
-        {
-            let model_list = self
-                .provider
-                .model_list(self.provider_request(ProviderInput::from_text(""), PromptMode::Chat))
-                .await?;
-            let selected_model = requested_model.unwrap_or_else(|| {
-                self.session
-                    .resolved_model
-                    .as_deref()
-                    .unwrap_or(&self.session.model)
-            });
-            let target_model = model_list.iter().find(|candidate| {
-                if selected_model == "default" {
-                    candidate.is_default
-                } else {
-                    candidate.id == selected_model
-                }
-            });
-            if let Some(model) = requested_model {
-                anyhow::ensure!(
-                    target_model
-                        .is_some_and(|candidate| model == "default" || candidate.id == model),
-                    "model {model} is unavailable for this provider"
-                );
-            }
-            if validate_tier {
-                selected_tier.validate_model(
-                    target_model.context("the selected model is unavailable for this provider")?,
-                )?;
-            }
-            if let Some(effort) = requested_effort {
-                let model =
-                    target_model.context("the active model is unavailable for this provider")?;
-                if !model.reasoning.is_empty() {
-                    anyhow::ensure!(
-                        model.reasoning.iter().any(|candidate| candidate == effort),
-                        "reasoning effort {effort} is unavailable for model {}",
-                        model.id
-                    );
-                }
-            }
-            if let Some(context_window) = requested_context_window {
-                let model =
-                    target_model.context("the active model is unavailable for this provider")?;
-                if !model.context_window.is_empty() {
-                    anyhow::ensure!(
-                        model
-                            .context_window
-                            .iter()
-                            .any(|candidate| candidate.id == context_window),
-                        "context window {context_window} is unavailable for model {}",
-                        model.id
-                    );
-                }
-            }
-        }
-        if let Some(model) = params.get("model").and_then(Value::as_str) {
-            anyhow::ensure!(!model.trim().is_empty(), "model cannot be empty");
-            configured.model = model.to_owned();
-            configured.resolved_model = (model != "default").then(|| model.to_owned());
-        }
-        if let Some(effort) = params.get("effort").and_then(Value::as_str) {
-            anyhow::ensure!(!effort.trim().is_empty(), "effort cannot be empty");
-            configured.effort = effort.to_owned();
-        }
-        if params.get("context_window").is_some() {
-            configured.context_window = params
-                .get("context_window")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-        }
-        if let Some(service_tier) = requested_service_tier {
-            configured.service_tier = service_tier;
-        }
-        configured.plan_executor = plan_executor;
-        configured.plan_compact = plan_compact;
-        let subagent_tools = params.get("subagent_tools").and_then(Value::as_bool);
-        let lsp_tools = params.get("lsp_tools").and_then(Value::as_bool);
-        let session_tools = params
-            .get("session_tools")
-            .map(|value| serde_json::from_value::<bool>(value.clone()))
-            .transpose()?;
-        let status_thoughts = params
-            .get("status_thoughts")
-            .map(|value| serde_json::from_value::<bool>(value.clone()))
-            .transpose()?;
-        let delegation_registry_changed = subagent_tools
-            .is_some_and(|enabled| enabled != self.agent_coordinator.enabled())
-            || lsp_tools.is_some_and(|enabled| enabled != self.lsp.enabled(&self.session.id))
-            || session_tools.is_some();
-        if let Some(access) = &access {
-            configured.access = access.clone();
-        }
-        configured.access = crate::provider::registered_capability(
-            crate::provider::ProviderKind::parse(&configured.provider)?,
-        )
-        .resolve_access(configured.access);
-        if let Some(selection) = resource_selection {
-            self.provider
-                .reconcile_settings(
-                    ProviderCatalogRequest {
-                        execution_owner: None,
-                        harness_session_id: configured.id.clone(),
-                        workspace: configured.workspace.clone(),
-                        access: configured.access.clone(),
-                        approval_mode: configured.approval_mode,
-                        provider_session_id: configured.provider_session_id.clone(),
-                    },
-                    &selection,
-                )
-                .await?;
-        }
-        let previous = std::mem::replace(&mut self.session, configured);
-        self.permission_coordinator
-            .configure_timeout(&self.session.id, self.session.approval_timeout)?;
-        if let Err(error) = self.save_session() {
-            self.permission_coordinator
-                .configure_timeout(&previous.id, previous.approval_timeout)?;
-            self.session = previous;
-            return Err(error);
-        }
-        let update_model_preference = requested_model.is_some()
-            || requested_effort.is_some()
-            || params.get("context_window").is_some();
-        self.save_preference(update_model_preference)?;
-        if params.get("settings_revision").is_none() {
-            let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
-            let snapshot = settings.get(
-                &self.session.workspace,
-                &self.session.id,
-                &self.session.provider,
-            )?;
-            let scope =
-                if params.get("auto_compaction").is_some() || params["session_policy"] == true {
-                    crate::settings::SettingScope::Session
-                } else {
-                    crate::settings::SettingScope::Global
-                };
-            let mut portable = crate::settings::PortableSettings::default();
-            let mut changed = false;
-            if let Some(access) = access {
-                portable.access = Some(access);
-                changed = true;
-            }
-            if params.get("shell").is_some() {
-                portable.shell = Some(self.session.shell);
-                changed = true;
-            }
-            if let Some(value) = check_timing {
-                portable.check_timing = Some(value);
-                changed = true;
-            }
-            if let Some(value) = automatic_checks {
-                portable.automatic_checks = Some(value);
-                changed = true;
-            }
-            if params.get("auto_compaction").is_some() {
-                portable.auto_compaction = Some(self.session.auto_compaction.clone());
-                changed = true;
-            }
-            if params.get("plan_compact").is_some() {
-                portable.plan_compact = Some(self.session.plan_compact);
-                changed = true;
-            }
-            if params.get("approval_timeout").is_some() {
-                portable.approval_timeout = Some(self.session.approval_timeout);
-                changed = true;
-            }
-            if params.get("tool_timeout").is_some() {
-                portable.tool_timeout = Some(self.session.tool_timeout);
-                changed = true;
-            }
-            if let Some(enabled) = subagent_tools {
-                portable.subagent_tools = Some(enabled);
-                changed = true;
-            }
-            if let Some(enabled) = lsp_tools {
-                portable.lsp_tools = Some(enabled);
-                changed = true;
-            }
-            if let Some(enabled) = session_tools {
-                portable.session_tools = Some(enabled);
-                changed = true;
-            }
-            if let Some(enabled) = status_thoughts {
-                portable.status_thoughts = Some(enabled);
-                changed = true;
-            }
-            let revision = if changed {
-                settings.patch(
-                    crate::settings::SettingTarget {
-                        scope,
-                        workspace: &self.session.workspace,
-                        session: &self.session.id,
-                    },
-                    &portable,
-                )?
-            } else {
-                snapshot.revision
-            };
-            if update_model_preference
-                || params.get("service_tier").is_some()
-                || params.get("plan_executor_enabled").is_some()
-            {
-                settings.save_provider(revision,&self.session.provider,&json!({"model":self.session.model,"effort":self.session.effort,
-                    "context_window":self.session.context_window,"service_tier":self.session.service_tier,"plan_executor":self.session.plan_executor}))?;
-            }
-        }
-        if let Some(enabled) = subagent_tools {
-            self.agent_coordinator.set_enabled(enabled);
-        }
-        if let Some(enabled) = lsp_tools {
-            self.lsp.set_enabled(&self.session.id, enabled);
-        }
-        if let Some(enabled) = status_thoughts {
-            self.observer
-                .status_thoughts
-                .store(enabled, Ordering::Relaxed);
-        }
-        if delegation_registry_changed && params.get("settings_revision").is_none() {
-            self.provider.cleanup_execution(&self.session.id).await?;
-        }
-        Ok((
-            serde_json::to_value(self.session_view()?)?,
-            vec![self.event(
-                "session_configured",
-                json!({
-                    "session": self.session_view()?,
-                    "access_abbreviation": self.session.access.abbreviation(),
-                }),
-            )?],
-        ))
-    }
-
-    async fn validate_plan_executor(&mut self, executor: &PlanExecutor) -> Result<()> {
-        anyhow::ensure!(
-            self.capability.model_selection,
-            "current provider does not support model selection"
-        );
-        let model = executor
-            .model
-            .as_deref()
-            .context("plan executor model is not configured")?;
-        let effort = executor
-            .effort
-            .as_deref()
-            .context("plan executor thinking is not configured")?;
-        let model_list = self
-            .provider
-            .model_list(self.provider_request(ProviderInput::from_text(""), PromptMode::Chat))
-            .await?;
-        let selected = model_list
-            .iter()
-            .find(|candidate| candidate.id == model)
-            .with_context(|| {
-                format!("plan executor model {model} is unavailable for this provider")
-            })?;
-        anyhow::ensure!(
-            selected.reasoning.is_empty()
-                || selected
-                    .reasoning
-                    .iter()
-                    .any(|candidate| candidate == effort),
-            "plan executor thinking {effort} is unavailable for model {model}"
-        );
-        Ok(())
+        Ok((committed.value, committed.events))
     }
 
     /// Resolve persisted ownership across primary and child-agent exchanges.
@@ -8530,8 +9945,8 @@ impl HarnessBroker {
 
     /// Deliver queued session observations in provider order under broker ownership.
     pub(crate) fn drain_session_events(&mut self) -> Result<Vec<SessionEvent>> {
-        let mut updates = Vec::new();
-        for observation in self.observer.session_events.drain()? {
+        let mut updates = std::mem::take(&mut self.settlement_events);
+        for observation in self.observer.session_events().drain()? {
             updates.extend(self.observe_session_event(observation)?);
         }
         Ok(updates)
@@ -8542,7 +9957,34 @@ impl HarnessBroker {
         &mut self,
         event: ProviderEvent,
     ) -> Result<Vec<SessionEvent>> {
+        if let ProviderEvent::Execution { observation } = event {
+            return self.observe_execution_lifecycle(observation);
+        }
         let now_ms = event.observed_at_ms(self.clock.now_ms());
+        if let Some(scope) = event.scope().invocation()
+            && (self.reopened_execution.active(scope)
+                || matches!(
+                    event,
+                    ProviderEvent::Usage { .. } | ProviderEvent::Message { .. }
+                ))
+        {
+            anyhow::ensure!(
+                scope.owner == crate::provider::ExecutionOwner::root(&self.session.id),
+                "late output crosses root ownership"
+            );
+            if let Some(mut owner) = self.store.load_exchange(scope.exchange_id.as_str())?
+                && owner.observe_turn(&event, now_ms)?
+            {
+                self.store.save_exchange(&owner)?;
+                let patch = self.reconcile_timeline()?;
+                return Ok(if patch.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![self.event("document_changed", patch.notification())?]
+                });
+            }
+            return Ok(Vec::new());
+        }
         if let ProviderEvent::Tool { address, update } = &event {
             anyhow::ensure!(
                 address.turn.scope.owner == crate::provider::ExecutionOwner::root(&self.session.id),
@@ -8641,7 +10083,7 @@ impl HarnessBroker {
             .provider
             .compact(crate::provider::ProviderCompactionRequest {
                 id: compaction.id.clone(),
-                request: self.provider_request(ProviderInput::from_text(""), PromptMode::Chat),
+                request: self.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
             })
             .await;
         compaction.completed_at_ms = Some(self.clock.now_ms());
@@ -8693,7 +10135,7 @@ impl HarnessBroker {
         self.session.native_fork = output.native.capability.native_fork;
         self.session.native_compact = output.native.capability.native_compact;
         if let Some(provider_session_id) = output.native.provider_session_id {
-            self.session.provider_session_id = Some(provider_session_id);
+            self.session.provider_session_id = Some(provider_session_id.into());
         }
         if let Some(context_usage) = output.native.metrics.context_usage {
             let size = self
@@ -8733,7 +10175,7 @@ impl HarnessBroker {
         snapshot
     }
 
-    fn provider_request(&self, input: ProviderInput, mode: PromptMode) -> ProviderRequest {
+    fn provider_request(&self, input: ProviderInput, mode: PromptMode) -> Result<ProviderRequest> {
         let mut request = ProviderRequest {
             execution_owner: None,
             harness_session_id: self.session.id.clone(),
@@ -8762,7 +10204,12 @@ impl HarnessBroker {
                 access
             },
             approval_mode: self.session.approval_mode,
-            provider_session_id: self.session.provider_session_id.clone(),
+            provider_session_id: self
+                .session
+                .provider_session_id
+                .clone()
+                .map(TryInto::try_into)
+                .transpose()?,
             submission: None,
             recovered_input: Vec::new(),
             control_context: self.control_turn_context(if self.session.background.is_some() {
@@ -8780,7 +10227,7 @@ impl HarnessBroker {
             request.service_tier = selection.service_tier.unwrap_or_default();
             request.context_window = None;
         }
-        request
+        Ok(request)
     }
 
     fn event(&self, name: &str, payload: Value) -> Result<SessionEvent> {
@@ -8994,8 +10441,22 @@ fn default_goal_max_turns() -> u32 {
     20
 }
 
+pub(crate) use forge_provider_api::error::TurnCancelled;
+
 #[cfg(test)]
 mod test {
+    /// A canceled native owner cannot hold admission forever without a terminal.
+    #[tokio::test(start_paused = true)]
+    async fn native_cancellation_deadline_expires_without_terminal() {
+        let cancellation = super::TurnCancellation::new();
+        cancellation.request_native_cancel(false);
+        let expired = cancellation.native_cancel_expired();
+        tokio::pin!(expired);
+        assert!(futures_util::poll!(&mut expired).is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        expired.await;
+    }
+
     include!("workflow_test.rs");
     fn completed_message(
         turn: &crate::provider::TurnAddress,
@@ -9060,6 +10521,7 @@ mod test {
     }
 
     struct AutomaticCheckProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         turns: Arc<std::sync::atomic::AtomicUsize>,
         repair: bool,
         explicit: bool,
@@ -9090,13 +10552,46 @@ mod test {
         async fn cancel_session(&self, _: &str) -> Result<()> {
             Ok(())
         }
-        async fn active_session_id_for(&self, _: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
         async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> {
             Ok(false)
         }
-        async fn prompt_stream(
+
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+    }
+
+    impl AutomaticCheckProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             sink: ProviderEventSink,
@@ -9181,7 +10676,7 @@ mod test {
                     Ok(crate::provider::ProviderCompletion::default())
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
@@ -9197,6 +10692,7 @@ mod test {
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.shell = crate::session::CheckShell::Nushell;
         broker.provider = Arc::new(AutomaticCheckProvider {
+            fixture_events: Default::default(),
             turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair: true,
             explicit: false,
@@ -9249,6 +10745,7 @@ mod test {
         broker.session.shell = crate::session::CheckShell::Nushell;
         let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         broker.provider = Arc::new(AutomaticCheckProvider {
+            fixture_events: Default::default(),
             turns: turns.clone(),
             repair: false,
             explicit: false,
@@ -9296,17 +10793,16 @@ mod test {
             .await?;
         broker.session.shell = crate::session::CheckShell::Nushell;
         broker.provider = Arc::new(AutomaticCheckProvider {
+            fixture_events: Default::default(),
             turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             repair: true,
             explicit: false,
         });
         std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true,"paths":["seed.txt"]},"action":{"command":"if ((open --raw seed.txt) | str contains fixed) { print ok } else { exit 7 }","label":"Verify","category":"test"}}}}).to_string())?;
         let (mut exchange, _, _) = broker
-            .interaction_for_turn("Resumed edit", true, broker.clock.now_ms())
+            .test_stage_interaction_for_turn("Resumed edit", true, broker.clock.now_ms())
             .await?;
-        broker
-            .start_exchange_runtime(&mut exchange, broker.clock.now_ms())
-            .await?;
+        broker.begin_exchange_runtime(&mut exchange, broker.clock.now_ms())?;
         let mut runtime = broker.exchange_runtime.take().unwrap();
         broker
             .collect_initial_checkpoint(&mut runtime, &mut exchange)
@@ -9370,6 +10866,7 @@ mod test {
     }
 
     struct CheckpointProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         preparation: Option<Arc<PreparationProbe>>,
         started: Arc<tokio::sync::Notify>,
         tool_ran: Arc<std::sync::atomic::AtomicBool>,
@@ -9387,6 +10884,14 @@ mod test {
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for CheckpointProvider {
         type Host = crate::provider::HarnessProviderHost;
+        async fn fence_session(&self, _: &crate::provider::ExecutionOwner) -> Result<()> {
+            // This fixture has no external callback registration to revoke.
+            Ok(())
+        }
+        async fn reset_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
+            self.fixture_events.reset_owner(owner).await?;
+            Ok(())
+        }
         async fn prepare_turn(&self, _: &str) -> Result<()> {
             if let Some(preparation) = &self.preparation {
                 preparation.started.notify_one();
@@ -9411,23 +10916,62 @@ mod test {
         async fn has_active_turn(&self, _: &str) -> bool {
             false
         }
-        async fn cleanup_execution(&self, _: &str) -> Result<()> {
+        async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
+            self.fixture_events.cancel_runtime(session_id).await?;
             Ok(())
         }
-        async fn cancel_session(&self, _: &str) -> Result<()> {
+        async fn cancel_session(&self, session_id: &str) -> Result<()> {
+            self.fixture_events.cancel_runtime(session_id).await?;
             Ok(())
         }
-        async fn active_session_id_for(&self, _: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
         async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> {
             Ok(true)
         }
-        async fn prompt_stream(
+
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+    }
+
+    impl CheckpointProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             _sink: ProviderEventSink,
         ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
+            if let Some(submission) = &request.submission {
+                submission.sending(crate::provider::submission::SubmissionTarget::Untracked)?;
+                submission.accepted("checkpoint fixture accepted input".into())?;
+            }
             let _fixture_scope = _sink.invocation_scope()?.clone();
             let fixture = crate::provider::test_support::FixtureStream::new(_sink);
             let _sink = fixture.clone();
@@ -9452,7 +10996,7 @@ mod test {
                     Ok(crate::provider::ProviderCompletion::default())
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
@@ -9471,6 +11015,7 @@ mod test {
         let tool_ran = Arc::new(AtomicBool::new(false));
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         broker.provider = Arc::new(CheckpointProvider {
+            fixture_events: Default::default(),
             preparation: None,
             started: Arc::clone(&started),
             tool_ran: Arc::clone(&tool_ran),
@@ -9497,7 +11042,7 @@ mod test {
             .start(operation)?
             .context("fixture mutation admission")?;
         let cancellation = broker.turn_cancellation();
-        for _ in 0..16 {
+        for attempt in 0..16 {
             cancellation.arm(true);
             let cancel = async {
                 started.notified().await;
@@ -9513,7 +11058,14 @@ mod test {
             })
             .await;
             let error = result
-                .context("cancellation waited for the blocked checkpoint scan")?
+                .with_context(|| format!(
+                    "cancellation waited for the blocked checkpoint scan; attempt={attempt}, native_active={}, cancel_requested={}, stored={}",
+                    active.load(Ordering::Acquire),
+                    cancellation.requested.load(Ordering::Acquire),
+                    broker.store.list_exchange(&broker.session.id)
+                        .and_then(|exchanges| Ok(serde_json::to_string(&exchanges)?))
+                        .unwrap_or_else(|error| format!("read failed: {error:#}")),
+                ))?
                 .unwrap_err();
             assert!(error.is::<TurnRetracted>(), "{error:#}");
             assert!(!tool_ran.load(Ordering::SeqCst));
@@ -9554,14 +11106,18 @@ mod test {
             let data = tempfile::tempdir()?;
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
             let provider = Arc::new(CleanupRetryProvider {
+                fixture_events: Default::default(),
                 started: Notify::new(),
                 complete: Notify::new(),
                 settled: Notify::new(),
+                native_settled: AtomicBool::new(false),
                 attempt: std::sync::atomic::AtomicUsize::new(1),
                 visible_output,
             });
             broker.provider = provider.clone();
             broker.capability.native_turn_rollback = true;
+            broker.trace.configure(true)?;
+            let execution_registry = broker.execution_registry();
             let repositories = Arc::clone(&broker.repositories);
             let handle = repositories
                 .open(repository.path().to_owned())
@@ -9611,8 +11167,16 @@ mod test {
             .await;
             held.finish(forge_git::mutation::OperationCompletion::Completed)?;
             repositories.writes.take_receipt(operation);
-            let (result, cancelled) =
-                result.context("native abort completion waited for checkpoint finalization")?;
+            let (result, cancelled) = result.with_context(|| format!(
+                "native abort completion waited for checkpoint finalization; cleanup_before_completion={cleanup_before_completion}, visible_output={visible_output}, restore_prompt={restore_prompt}, native_settled={}, cleanup_attempts={}, cancel_requested={}, stored={}",
+                provider.native_settled.load(Ordering::Acquire),
+                provider.attempt.load(Ordering::Acquire),
+                cancellation.requested.load(Ordering::Acquire),
+                broker.store.list_exchange(&broker.session.id)
+                    .and_then(|exchanges| Ok(serde_json::to_string(&exchanges)?))
+                    .unwrap_or_else(|error| format!("read failed: {error:#}")),
+            ) + &format!("; trace={}", std::fs::read_to_string(broker.trace.session_status(&broker.session.id).path)
+                .unwrap_or_else(|error| format!("read failed: {error}"))))?;
             cancelled?;
             let error = result.unwrap_err();
             let exchange = broker.store.list_exchange(&broker.session.id)?;
@@ -9635,6 +11199,14 @@ mod test {
                 }
             }
             assert!(broker.exchange_runtime.is_none());
+            assert!(
+                !execution_registry
+                    .owner(crate::provider::ExecutionOwner::root(&session_id))
+                    .await?
+                    .is_healthy()
+                    .await,
+                "cancelled baseline owner must remain fenced until replacement collection"
+            );
         }
         Ok(())
     }
@@ -9660,6 +11232,7 @@ mod test {
         let (sink, mut stream) = publication::channel();
         broker.event_sink = Some(sink);
         broker.provider = Arc::new(CheckpointProvider {
+            fixture_events: Default::default(),
             preparation: None,
             started: started.clone(),
             tool_ran: tool_ran.clone(),
@@ -9968,6 +11541,7 @@ mod test {
     }
 
     struct DelegatingRootProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         turn: AtomicU64,
     }
 
@@ -9993,10 +11567,43 @@ mod test {
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             Ok(())
         }
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            Some("parent-history".into())
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(Some("parent-history".to_owned().try_into()?))
         }
-        async fn prompt_stream(
+
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+    }
+
+    impl DelegatingRootProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             sink: ProviderEventSink,
@@ -10025,7 +11632,7 @@ let sink = Some(sink);
             } else {
                 anyhow::ensure!(turn == 1, "parent continuation duplicated");
                 anyhow::ensure!(
-                    request.provider_session_id.as_deref() == Some("parent-history"),
+                    request.provider_session_id.as_ref().map(|id| id.as_str()) == Some("parent-history"),
                     "parent lost its conversation"
                 );
                 anyhow::ensure!(
@@ -10044,10 +11651,10 @@ let sink = Some(sink);
                 ))
                 .await?;
             }
-            Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {  provider_session_id: Some("parent-history".into()), capability: self.descriptor().capability, ..Default::default() }, ..Default::default() })
+            Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {  provider_session_id: Some("parent-history".to_owned().try_into().unwrap()), capability: self.descriptor().capability, ..Default::default() }, ..Default::default() })
 
         }.await;
-            Ok(output?)
+            output
 
         }.await;
             let result = result.map_err(crate::provider::ProviderError::from);
@@ -10063,6 +11670,7 @@ let sink = Some(sink);
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let provider = Arc::new(DelegatingRootProvider {
+            fixture_events: Default::default(),
             turn: AtomicU64::new(0),
         });
         broker.provider = provider.clone();
@@ -10659,7 +12267,7 @@ let sink = Some(sink);
             updated_at_ms: 1,
         };
         broker.save_session().unwrap();
-        let baseline = broker.capture_workspace_checkpoint().await.unwrap();
+        let baseline = broker.prepare_workspace_capture().run().await.unwrap();
         broker.store.save_checkpoint(&baseline).unwrap();
         std::fs::write(
             repository.join(".gate-input"),
@@ -11279,6 +12887,7 @@ let sink = Some(sink);
                 .is_err()
         );
         broker.provider = Arc::new(SemanticExecutionProvider {
+            fixture_events: Default::default(),
             turn: Default::default(),
             revision: plan.model_revision + 1,
         });
@@ -11316,9 +12925,13 @@ let sink = Some(sink);
         );
     }
 
-    struct NoProgressExecutionProvider;
+    #[derive(Default)]
+    struct NoProgressExecutionProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    }
 
     struct StoppedExecutionProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         cancelled: bool,
     }
 
@@ -11349,11 +12962,50 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            anyhow::bail!("test provider cannot fork")
+        }
+    }
+
+    impl StoppedExecutionProvider {
+        async fn run_native(
             &self,
             _: ProviderRequest,
             fixture_sink: ProviderEventSink,
@@ -11368,18 +13020,12 @@ let sink = Some(sink);
                     anyhow::bail!("provider connection lost")
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
-        }
-        async fn fork(
-            &self,
-            _: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("test provider cannot fork")
         }
     }
 
@@ -11407,7 +13053,10 @@ let sink = Some(sink);
                     .snapshot()?
                     .active_plan
                     .context("test plan missing")?;
-                broker.provider = Arc::new(StoppedExecutionProvider { cancelled: true });
+                broker.provider = Arc::new(StoppedExecutionProvider {
+                    fixture_events: Default::default(),
+                    cancelled: true,
+                });
                 broker.dispatch_session_command(
                     "session.plan.accept",
                     json!({"plan_id":plan.id,"approval_mode":"ask"}),
@@ -11474,7 +13123,10 @@ let sink = Some(sink);
                 .unwrap();
             run_plan_to_input_boundary(&mut broker).await.unwrap();
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
-            broker.provider = Arc::new(StoppedExecutionProvider { cancelled });
+            broker.provider = Arc::new(StoppedExecutionProvider {
+                fixture_events: Default::default(),
+                cancelled,
+            });
             broker
                 .dispatch_session_command(
                     "session.plan.accept",
@@ -11504,7 +13156,7 @@ let sink = Some(sink);
             assert_eq!(text.contains("Plan failed:"), !cancelled, "{text}");
             assert_eq!(text.matches("Plan accepted:").count(), 1);
             let stopped_id = stopped.id.clone();
-            broker.provider = Arc::new(NoProgressExecutionProvider);
+            broker.provider = Arc::new(NoProgressExecutionProvider::default());
             broker
                 .dispatch_session_command("session.goal.resume", json!({}))
                 .unwrap();
@@ -11552,11 +13204,50 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            anyhow::bail!("test provider cannot fork")
+        }
+    }
+
+    impl NoProgressExecutionProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             fixture_sink: ProviderEventSink,
@@ -11598,18 +13289,12 @@ let sink = Some(sink);
                     })
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
-        }
-        async fn fork(
-            &self,
-            _: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("test provider cannot fork")
         }
     }
 
@@ -11659,7 +13344,7 @@ let sink = Some(sink);
             .unwrap()
             .len();
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
-        broker.provider = Arc::new(NoProgressExecutionProvider);
+        broker.provider = Arc::new(NoProgressExecutionProvider::default());
         broker
             .dispatch_session_command(
                 "session.plan.accept",
@@ -11717,6 +13402,7 @@ let sink = Some(sink);
     }
 
     struct SemanticExecutionProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         turn: std::sync::atomic::AtomicUsize,
         revision: u32,
     }
@@ -11748,11 +13434,50 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            anyhow::bail!("test provider cannot fork")
+        }
+    }
+
+    impl SemanticExecutionProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             sink: ProviderEventSink,
@@ -11913,26 +13638,20 @@ let sink = Some(sink);
                 .await?;
             sink.as_ref()
                 .unwrap()
-                .send_wait(ProviderEvent::Turn { address: address, update: crate::provider::TurnUpdate::Finished { outcome: crate::turn::TurnOutcome::Completed, completed_at_ms: 100 } })
+                .send_wait(ProviderEvent::Turn { address, update: crate::provider::TurnUpdate::Finished { outcome: crate::turn::TurnOutcome::Completed, completed_at_ms: 100 } })
                 .await?;
-            Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {  provider_session_id: Some("semantic-execution".into()), capability: crate::provider::ProviderCapability {
+            Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {  provider_session_id: Some("semantic-execution".to_owned().try_into().unwrap()), capability: crate::provider::ProviderCapability {
                     approval_mode_list: vec![ApprovalMode::Ask],
                     ..Default::default()
                 }, ..Default::default() }, ..Default::default() })
 
         }.await;
-            Ok(output?)
+            output
 
         }.await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
-        }
-        async fn fork(
-            &self,
-            _: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("test provider cannot fork")
         }
     }
 
@@ -12027,6 +13746,7 @@ let sink = Some(sink);
     }
 
     struct SaturatingProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         completed: bool,
         wait_for_capacity: bool,
         cancelled: Arc<AtomicBool>,
@@ -12055,11 +13775,55 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            self.cancelled.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        async fn fork(
+            &self,
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            anyhow::bail!("fork unavailable")
+        }
+    }
+
+    impl SaturatingProvider {
+        async fn run_native(
             &self,
             _request: ProviderRequest,
             event_sink: ProviderEventSink,
@@ -12069,8 +13833,6 @@ let sink = Some(sink);
             let event_sink = fixture.clone();
             let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
                 let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let event_sink = Some(event_sink);
-                    let event_sink = event_sink.unwrap();
                     let address = crate::provider::MessageAddress {
                         turn: crate::provider::test_support::address(
                             &fixture_scope,
@@ -12118,24 +13880,12 @@ let sink = Some(sink);
                     }
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
-        }
-
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            self.cancelled.store(true, Ordering::Release);
-            Ok(())
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("fork unavailable")
         }
     }
 
@@ -12169,6 +13919,7 @@ let sink = Some(sink);
             .unwrap();
             let cancelled = Arc::new(AtomicBool::new(false));
             broker.provider = Arc::new(SaturatingProvider {
+                fixture_events: Default::default(),
                 completed,
                 wait_for_capacity: false,
                 cancelled: Arc::clone(&cancelled),
@@ -12235,6 +13986,7 @@ let sink = Some(sink);
         .unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
         broker.provider = Arc::new(SaturatingProvider {
+            fixture_events: Default::default(),
             completed: true,
             wait_for_capacity: true,
             cancelled: Arc::clone(&cancelled),
@@ -12307,6 +14059,7 @@ let sink = Some(sink);
     }
 
     struct RestartProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         cancellation: Arc<TurnCancellation>,
         invocation: std::sync::atomic::AtomicUsize,
         clarification: bool,
@@ -12339,11 +14092,50 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            anyhow::bail!("restart test does not fork")
+        }
+    }
+
+    impl RestartProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             event_sink: ProviderEventSink,
@@ -12370,7 +14162,7 @@ let sink = Some(sink);
                         return std::future::pending().await;
                     }
                     assert_eq!(
-                        request.provider_session_id.as_deref(),
+                        request.provider_session_id.as_ref().map(|id| id.as_str()),
                         Some("restart-thread")
                     );
                     assert_eq!(request.approval_mode, ApprovalMode::Allow);
@@ -12403,26 +14195,21 @@ let sink = Some(sink);
                     sink.send(event)?;
                     Ok(crate::provider::ProviderCompletion {
                         native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some("restart-thread".into()),
+                            provider_session_id: Some(
+                                "restart-thread".to_owned().try_into().unwrap(),
+                            ),
                             ..Default::default()
                         },
                         ..Default::default()
                     })
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("restart test does not fork")
         }
     }
 
@@ -12433,6 +14220,7 @@ let sink = Some(sink);
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.approval_mode = ApprovalMode::Ask;
         broker.provider = Arc::new(RestartProvider {
+            fixture_events: Default::default(),
             cancellation: Arc::clone(&broker.turn_cancellation),
             invocation: std::sync::atomic::AtomicUsize::new(0),
             clarification: false,
@@ -12537,6 +14325,7 @@ let sink = Some(sink);
             assert_eq!(configured["active_task"], before);
             assert_eq!(events[0].payload["session"]["active_task"], before);
             let provider = Arc::new(RestartProvider {
+                fixture_events: Default::default(),
                 cancellation: broker.turn_cancellation(),
                 invocation: std::sync::atomic::AtomicUsize::new(0),
                 clarification: false,
@@ -12655,13 +14444,14 @@ let sink = Some(sink);
                     },
                 };
                 broker
-                    .submit_prompt_inner(json!({"text":entry.instruction}))
+                    .submit_prompt(json!({"text":entry.instruction}))
                     .await
                     .unwrap();
                 broker.input_purpose = crate::input::InputPurpose::User;
             }
             let before = broker.snapshot().unwrap();
             let restart = Arc::new(RestartProvider {
+                fixture_events: Default::default(),
                 cancellation: broker.turn_cancellation(),
                 invocation: std::sync::atomic::AtomicUsize::new(0),
                 clarification: true,
@@ -12713,9 +14503,11 @@ let sink = Some(sink);
     }
 
     struct CleanupRetryProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         started: Notify,
         complete: Notify,
         settled: Notify,
+        native_settled: AtomicBool,
         attempt: std::sync::atomic::AtomicUsize,
         visible_output: bool,
     }
@@ -12723,6 +14515,14 @@ let sink = Some(sink);
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for CleanupRetryProvider {
         type Host = crate::provider::HarnessProviderHost;
+        async fn fence_session(&self, _: &crate::provider::ExecutionOwner) -> Result<()> {
+            // This fixture has no external callback registration to revoke.
+            Ok(())
+        }
+        async fn reset_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
+            self.fixture_events.reset_owner(owner).await?;
+            Ok(())
+        }
         fn checkpoint_tool_gate(&self) -> bool {
             true
         }
@@ -12746,19 +14546,73 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
         async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> {
             Ok(true)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
             &self,
-            _request: ProviderRequest,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
+            if self.attempt.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("cleanup deadline expired");
+            }
+            self.complete.notify_one();
+            loop {
+                let settled = self.settled.notified();
+                tokio::pin!(settled);
+                settled.as_mut().enable();
+                if self.native_settled.load(Ordering::Acquire) {
+                    break;
+                }
+                settled.await;
+            }
+            self.fixture_events.cancel_runtime(session_id).await?;
+            Ok(())
+        }
+    }
+
+    impl CleanupRetryProvider {
+        async fn run_native(
+            &self,
+            request: ProviderRequest,
             sink: ProviderEventSink,
         ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
+            if let Some(submission) = &request.submission {
+                submission.sending(crate::provider::submission::SubmissionTarget::Untracked)?;
+                submission.accepted("cleanup fixture accepted input".into())?;
+            }
             let fixture_scope = sink.invocation_scope()?.clone();
             let fixture = crate::provider::test_support::FixtureStream::new(sink);
             let sink = fixture.clone();
@@ -12792,25 +14646,17 @@ let sink = Some(sink);
                             completed_at_ms: 100,
                         },
                     })?;
-                    self.settled.notify_one();
+                    self.native_settled.store(true, Ordering::Release);
+                    self.settled.notify_waiters();
                     Ok(crate::provider::ProviderCompletion::default())
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
-        }
-
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            if self.attempt.fetch_add(1, Ordering::SeqCst) == 0 {
-                anyhow::bail!("cleanup deadline expired");
-            }
-            self.complete.notify_one();
-            self.settled.notified().await;
-            Ok(())
         }
     }
 
@@ -12937,9 +14783,11 @@ let sink = Some(sink);
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let provider = Arc::new(CleanupRetryProvider {
+            fixture_events: Default::default(),
             started: Notify::new(),
             complete: Notify::new(),
             settled: Notify::new(),
+            native_settled: AtomicBool::new(false),
             attempt: std::sync::atomic::AtomicUsize::new(0),
             visible_output: false,
         });
@@ -13003,7 +14851,7 @@ let sink = Some(sink);
             .rename_owned_session(&broker.session.id, &broker.client_id, "", None, 100)
             .unwrap();
         broker
-            .interaction_for_turn("  Explain\n this repository  ", true, 100)
+            .test_stage_interaction_for_turn("  Explain\n this repository  ", true, 100)
             .await
             .unwrap();
         assert_eq!(broker.session.name, "Explain this repository");
@@ -13017,13 +14865,13 @@ let sink = Some(sink);
             "Explain this repository"
         );
         broker
-            .interaction_for_turn("Another prompt", true, 101)
+            .test_stage_interaction_for_turn("Another prompt", true, 101)
             .await
             .unwrap();
         assert_eq!(broker.session.name, "Explain this repository");
         broker.session.name = "My explicit name".into();
         broker
-            .interaction_for_turn("Do not replace this name", true, 102)
+            .test_stage_interaction_for_turn("Do not replace this name", true, 102)
             .await
             .unwrap();
         assert_eq!(broker.session.name, "My explicit name");
@@ -13039,7 +14887,7 @@ let sink = Some(sink);
             .rename_owned_session(&broker.session.id, &broker.client_id, "", None, 100)
             .unwrap();
         broker
-            .interaction_for_turn("/plan convert to rust", true, 100)
+            .test_stage_interaction_for_turn("/plan convert to rust", true, 100)
             .await
             .unwrap();
         assert_eq!(broker.session.name, "convert to rust");
@@ -13061,7 +14909,7 @@ let sink = Some(sink);
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.name.clear();
         broker
-            .interaction_for_turn(
+            .test_stage_interaction_for_turn(
                 "/plan convert a rather long repository from TypeScript to Rust",
                 true,
                 100,
@@ -13077,166 +14925,6 @@ let sink = Some(sink);
                 .unwrap()
                 .name,
             "convert a rather long reposito"
-        );
-    }
-
-    #[tokio::test]
-    async fn restart_collects_pending_initial_checkpoint_and_preserves_the_baseline_on_resume() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let (mut exchange, _, _) = broker
-            .interaction_for_turn("retain this request", true, 100)
-            .await
-            .unwrap();
-        let baseline = broker
-            .checkpoint
-            .as_ref()
-            .unwrap()
-            .capture(
-                &broker.store.objects,
-                &broker.repositories,
-                &broker.session.id,
-                100,
-            )
-            .await
-            .unwrap();
-        let baseline_id = baseline.id.clone();
-        let gate = crate::checkpoint::ToolGate::new().unwrap();
-        gate.complete(Err(
-            "provider turn ended before checkpoint admission completed".into(),
-        ))
-        .unwrap();
-        let (complete, completed) = tokio::sync::oneshot::channel();
-        broker.exchange_runtime = Some(ExchangeRuntime {
-            task_permit: None,
-            checkpoint: Some(crate::checkpoint::CheckpointTask(tokio::spawn(
-                async move {
-                    completed
-                        .await
-                        .context("initial checkpoint fixture owner disappeared")?
-                },
-            ))),
-            tool_gate: Some(gate.clone()),
-            exchange_id: exchange.id.clone(),
-
-            checklist: ChecklistTracker::default(),
-            retraction_eligible: true,
-            active_wait: None,
-        });
-        {
-            let collecting = broker.park_exchange_for_restart(&mut exchange);
-            tokio::pin!(collecting);
-            assert!(futures_util::poll!(&mut collecting).is_pending());
-            assert!(!gate.ready());
-            complete.send(Ok(baseline)).unwrap();
-            collecting.await.unwrap();
-        }
-        assert!(!gate.ready());
-        assert!(
-            gate.wait()
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("provider turn ended")
-        );
-        assert_eq!(
-            exchange.checkpoint_before.as_deref(),
-            Some(baseline_id.as_str())
-        );
-        assert_eq!(
-            broker.store.list_exchange(&broker.session.id).unwrap()[0].checkpoint_before,
-            Some(baseline_id.clone())
-        );
-        assert!(broker.exchange_runtime.is_none());
-        assert!(exchange.execution_started_at_ms().is_none());
-        std::fs::write(
-            repository.path().join("seed.txt"),
-            "changed after baseline\n",
-        )
-        .unwrap();
-        broker.resume_exchange_runtime(&exchange).unwrap();
-        broker
-            .collect_active_initial_checkpoint(&mut exchange)
-            .await
-            .unwrap();
-        exchange.resume(102).unwrap();
-        broker
-            .capture_final_checkpoint(&mut exchange, crate::exchange::ExchangeOutcome::Complete)
-            .await
-            .unwrap();
-        assert_eq!(
-            exchange.checkpoint_before.as_deref(),
-            Some(baseline_id.as_str())
-        );
-        assert_ne!(exchange.checkpoint_after, exchange.checkpoint_before);
-        let persisted = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].state(), ExchangeState::Complete);
-        assert_eq!(
-            persisted[0].checkpoint_before.as_deref(),
-            Some(baseline_id.as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn restart_checkpoint_failure_propagates_without_releasing_tools() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let (mut exchange, _, _) = broker
-            .interaction_for_turn("retain the failed barrier", true, 100)
-            .await
-            .unwrap();
-        let gate = crate::checkpoint::ToolGate::new().unwrap();
-        broker.exchange_runtime = Some(ExchangeRuntime {
-            task_permit: None,
-            checkpoint: Some(crate::checkpoint::CheckpointTask(tokio::spawn(async {
-                anyhow::bail!("initial checkpoint fixture failed")
-            }))),
-            tool_gate: Some(gate.clone()),
-            exchange_id: exchange.id.clone(),
-
-            checklist: ChecklistTracker::default(),
-            retraction_eligible: true,
-            active_wait: None,
-        });
-        let failure = broker
-            .park_exchange_for_restart(&mut exchange)
-            .await
-            .unwrap_err();
-        assert!(
-            failure
-                .to_string()
-                .contains("initial checkpoint fixture failed")
-        );
-        assert!(
-            gate.wait()
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("initial checkpoint fixture failed")
-        );
-        assert!(!gate.ready());
-        assert!(exchange.checkpoint_before.is_none());
-        assert_eq!(exchange.state(), ExchangeState::Finalizing);
-        assert!(
-            exchange
-                .finalization_error
-                .as_deref()
-                .unwrap()
-                .contains("initial checkpoint fixture failed")
-        );
-        let persisted = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(persisted[0].state(), ExchangeState::Finalizing);
-        assert_eq!(persisted[0].finalization_error, exchange.finalization_error);
-        assert!(
-            broker
-                .exchange_runtime
-                .as_ref()
-                .unwrap()
-                .checkpoint
-                .is_none()
         );
     }
 
@@ -13322,13 +15010,10 @@ let sink = Some(sink);
         let mut exchange_id = Vec::new();
         for content in ["first\n", "second\n"] {
             let (mut exchange, _, _) = broker
-                .interaction_for_turn(content, true, 100)
+                .test_stage_interaction_for_turn(content, true, 100)
                 .await
                 .unwrap();
-            broker
-                .start_exchange_runtime(&mut exchange, 100)
-                .await
-                .unwrap();
+            broker.begin_exchange_runtime(&mut exchange, 100).unwrap();
             let mut runtime = broker.exchange_runtime.take().unwrap();
             broker
                 .collect_initial_checkpoint(&mut runtime, &mut exchange)
@@ -13444,7 +15129,10 @@ let sink = Some(sink);
             .unwrap();
     }
 
-    struct FailingProvider;
+    #[derive(Default)]
+    struct FailingProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    }
 
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for FailingProvider {
@@ -13473,11 +15161,50 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            anyhow::bail!("synthetic provider failure")
+        }
+    }
+
+    impl FailingProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             _event_sink: ProviderEventSink,
@@ -13494,23 +15221,19 @@ let sink = Some(sink);
                     anyhow::bail!("synthetic provider failure")
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("synthetic provider failure")
-        }
     }
 
-    struct InvalidControlOutputProvider;
+    #[derive(Default)]
+    struct InvalidControlOutputProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    }
 
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for InvalidControlOutputProvider {
@@ -13539,11 +15262,50 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            anyhow::bail!("fork unavailable")
+        }
+    }
+
+    impl InvalidControlOutputProvider {
+        async fn run_native(
             &self,
             _request: ProviderRequest,
             event_sink: ProviderEventSink,
@@ -13572,19 +15334,12 @@ let sink = Some(sink);
                     })
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("fork unavailable")
         }
     }
 
@@ -13596,7 +15351,10 @@ let sink = Some(sink);
         }
     }
 
-    struct ParentBoundaryProvider;
+    #[derive(Default)]
+    struct ParentBoundaryProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    }
 
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for ParentBoundaryProvider {
@@ -13625,11 +15383,50 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            anyhow::bail!("parent boundary provider does not fork")
+        }
+    }
+
+    impl ParentBoundaryProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             event_sink: ProviderEventSink,
@@ -13679,7 +15476,9 @@ let sink = Some(sink);
                     }
                     Ok(crate::provider::ProviderCompletion {
                         native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some("parent-boundary".into()),
+                            provider_session_id: Some(
+                                "parent-boundary".to_owned().try_into().unwrap(),
+                            ),
                             runtime: crate::provider::ProviderRuntime {
                                 provider: "Parent boundary test".into(),
                                 model: Some(request.model),
@@ -13690,32 +15489,30 @@ let sink = Some(sink);
                     })
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("parent boundary provider does not fork")
-        }
     }
 
     struct PlanningQuestionProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         turn: std::sync::atomic::AtomicUsize,
         structured: bool,
     }
 
     struct RetryPlanProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         turn: std::sync::atomic::AtomicUsize,
     }
 
-    struct RepeatedPlanEditProvider;
+    #[derive(Default)]
+    struct RepeatedPlanEditProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    }
 
     #[tokio::test]
     async fn plan_queries_preserve_the_selected_task_and_pending_review() {
@@ -13723,7 +15520,7 @@ let sink = Some(sink);
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker
-            .submit_prompt_inner(json!({"text":"/plan preserve review ownership"}))
+            .submit_prompt(json!({"text":"/plan preserve review ownership"}))
             .await
             .unwrap();
         run_plan_to_input_boundary(&mut broker).await.unwrap();
@@ -13844,7 +15641,7 @@ let sink = Some(sink);
         .unwrap()
         .into();
         broker
-            .submit_prompt_inner(json!({"text":"/plan revise the API"}))
+            .submit_prompt(json!({"text":"/plan revise the API"}))
             .await
             .unwrap();
         run_plan_to_input_boundary(&mut broker).await.unwrap();
@@ -14134,11 +15931,52 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            Ok(crate::provider::ProviderForkResult::unprofiled(
+                "retry-plan-fork".to_owned().try_into()?,
+            ))
+        }
+    }
+
+    impl RetryPlanProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             _event_sink: ProviderEventSink,
@@ -14152,7 +15990,7 @@ let sink = Some(sink);
                     let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let mut output = crate::provider::ProviderCompletion {
                         native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some("retry-plan".into()),
+                            provider_session_id: Some("retry-plan".to_owned().try_into().unwrap()),
                             capability: crate::provider::mock_capability(),
                             runtime: crate::provider::ProviderRuntime {
                                 provider: "Retry plan test".into(),
@@ -14172,21 +16010,12 @@ let sink = Some(sink);
                     Ok(output)
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            Ok(crate::provider::ProviderForkResult::unprofiled(
-                "retry-plan-fork",
-            ))
         }
     }
 
@@ -14217,11 +16046,52 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            Ok(crate::provider::ProviderForkResult::unprofiled(
+                "repeated-plan-document-fork".to_owned().try_into()?,
+            ))
+        }
+    }
+
+    impl RepeatedPlanEditProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             _event_sink: ProviderEventSink,
@@ -14234,7 +16104,9 @@ let sink = Some(sink);
                     let _event_sink = Some(_event_sink);
                     let mut output = crate::provider::ProviderCompletion {
                         native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some("repeated-plan-document".into()),
+                            provider_session_id: Some(
+                                "repeated-plan-document".to_owned().try_into().unwrap(),
+                            ),
                             capability: ProviderCapability::default(),
                             runtime: crate::provider::ProviderRuntime {
                                 provider: "Repeated plan document test".into(),
@@ -14249,27 +16121,19 @@ let sink = Some(sink);
                     Ok(output)
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            Ok(crate::provider::ProviderForkResult::unprofiled(
-                "repeated-plan-document-fork",
-            ))
-        }
     }
 
     impl PlanningQuestionProvider {
         fn new(structured: bool) -> Self {
             Self {
+                fixture_events: Default::default(),
                 turn: std::sync::atomic::AtomicUsize::new(0),
                 structured,
             }
@@ -14303,11 +16167,52 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            Ok(crate::provider::ProviderForkResult::unprofiled(
+                "planning-question-fork".to_owned().try_into()?,
+            ))
+        }
+    }
+
+    impl PlanningQuestionProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             event_sink: ProviderEventSink,
@@ -14356,7 +16261,9 @@ let sink = Some(sink);
                     });
                     let mut output = crate::provider::ProviderCompletion {
                         native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some("planning-question".into()),
+                            provider_session_id: Some(
+                                "planning-question".to_owned().try_into().unwrap(),
+                            ),
                             capability: ProviderCapability::default(),
                             runtime: crate::provider::ProviderRuntime {
                                 provider: "Planning question test".into(),
@@ -14377,25 +16284,19 @@ let sink = Some(sink);
                     Ok(output)
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            Ok(crate::provider::ProviderForkResult::unprofiled(
-                "planning-question-fork",
-            ))
-        }
     }
 
-    struct NestedWriteProvider;
+    #[derive(Default)]
+    struct NestedWriteProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    }
 
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for NestedWriteProvider {
@@ -14424,11 +16325,52 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            Ok(crate::provider::ProviderForkResult::unprofiled(
+                "nested-write-fork".to_owned().try_into()?,
+            ))
+        }
+    }
+
+    impl NestedWriteProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             event_sink: ProviderEventSink,
@@ -14547,7 +16489,9 @@ let sink = Some(sink);
                     }
                     Ok(crate::provider::ProviderCompletion {
                         native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some("nested-write".into()),
+                            provider_session_id: Some(
+                                "nested-write".to_owned().try_into().unwrap(),
+                            ),
                             capability: ProviderCapability::default(),
                             runtime: crate::provider::ProviderRuntime {
                                 provider: "Nested test".into(),
@@ -14559,25 +16503,19 @@ let sink = Some(sink);
                     })
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            Ok(crate::provider::ProviderForkResult::unprofiled(
-                "nested-write-fork",
-            ))
-        }
     }
 
-    struct TaskUpdateProvider;
+    #[derive(Default)]
+    struct TaskUpdateProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    }
 
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for TaskUpdateProvider {
@@ -14606,11 +16544,52 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            Ok(crate::provider::ProviderForkResult::unprofiled(
+                "task-update-fork".to_owned().try_into()?,
+            ))
+        }
+    }
+
+    impl TaskUpdateProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             event_sink: ProviderEventSink,
@@ -14653,7 +16632,7 @@ let sink = Some(sink);
                     }
                     Ok(crate::provider::ProviderCompletion {
                         native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some("task-update".into()),
+                            provider_session_id: Some("task-update".to_owned().try_into().unwrap()),
                             capability: ProviderCapability::default(),
                             runtime: crate::provider::ProviderRuntime {
                                 provider: "Task test".into(),
@@ -14665,21 +16644,12 @@ let sink = Some(sink);
                     })
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            Ok(crate::provider::ProviderForkResult::unprofiled(
-                "task-update-fork",
-            ))
         }
     }
 
@@ -14943,9 +16913,7 @@ let sink = Some(sink);
         };
         broker.task_controller.admit(task.kind())?;
         broker.input_purpose = purpose;
-        let result = broker
-            .submit_prompt_inner(json!({"text": instruction}))
-            .await;
+        let result = broker.submit_prompt(json!({"text": instruction})).await;
         broker.input_purpose = crate::input::InputPurpose::User;
         result
     }
@@ -14978,7 +16946,7 @@ let sink = Some(sink);
             },
         };
         let result = broker
-            .submit_prompt_inner(json!({"text":entry.instruction}))
+            .submit_prompt(json!({"text":entry.instruction}))
             .await;
         broker.input_purpose = crate::input::InputPurpose::User;
         result?;
@@ -15040,7 +17008,7 @@ let sink = Some(sink);
                 reason: continuation.reason,
             };
             let result = broker
-                .submit_prompt_inner(json!({"text":continuation.work.instruction().unwrap()}))
+                .submit_prompt(json!({"text":continuation.work.instruction().unwrap()}))
                 .await;
             broker.input_purpose = crate::input::InputPurpose::User;
             result?;
@@ -15048,6 +17016,7 @@ let sink = Some(sink);
     }
 
     struct MutableQuestionProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         fail_withdrawal_continuation: bool,
     }
 
@@ -15078,11 +17047,52 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
+        async fn fork(
+            &self,
+            _request: ProviderForkRequest,
+        ) -> Result<crate::provider::ProviderForkResult> {
+            Ok(crate::provider::ProviderForkResult::unprofiled(
+                "mutable-question-fork".to_owned().try_into()?,
+            ))
+        }
+    }
+
+    impl MutableQuestionProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
             _event_sink: ProviderEventSink,
@@ -15117,7 +17127,9 @@ let sink = Some(sink);
                     let request_text = request.input.text();
                     let mut output = crate::provider::ProviderCompletion {
                         native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some("mutable-question".into()),
+                            provider_session_id: Some(
+                                "mutable-question".to_owned().try_into().unwrap(),
+                            ),
                             capability: ProviderCapability::default(),
                             runtime: crate::provider::ProviderRuntime {
                                 provider: "Mutable question test".into(),
@@ -15175,27 +17187,19 @@ let sink = Some(sink);
                     Ok(output)
                 }
                 .await;
-                Ok(output?)
+                output
             }
             .await;
             let result = result.map_err(crate::provider::ProviderError::from);
             fixture.finish(&result).await?;
             result
         }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            Ok(crate::provider::ProviderForkResult::unprofiled(
-                "mutable-question-fork",
-            ))
-        }
     }
 
     fn mutable_question_broker(repository: &Path, data_root: &Path) -> HarnessBroker {
         let mut broker = planning_question_broker(repository, data_root, true);
         broker.provider = Arc::new(MutableQuestionProvider {
+            fixture_events: Default::default(),
             fail_withdrawal_continuation: false,
         });
         broker
@@ -15242,10 +17246,12 @@ let sink = Some(sink);
         broker.session.access.sandbox = false;
         broker.session.access.write_access = crate::session::WriteScope::Full;
         broker.question_discussion = true;
-        let request = broker.provider_request(
-            ProviderInput::from_text("Explain this choice"),
-            PromptMode::Chat,
-        );
+        let request = broker
+            .provider_request(
+                ProviderInput::from_text("Explain this choice"),
+                PromptMode::Chat,
+            )
+            .unwrap();
         assert!(request.access.sandbox);
         assert_eq!(request.access.write_access, crate::session::WriteScope::Off);
         assert!(request.access.writable_directory.is_empty());
@@ -15395,7 +17401,6 @@ let sink = Some(sink);
 
         broker
             .apply_agent_lifecycle(&lifecycle, None, &mut event)
-            .await
             .unwrap();
 
         assert!(broker.agent_registry.list().is_empty());
@@ -15421,7 +17426,6 @@ let sink = Some(sink);
         let mut events = Vec::new();
         let spawned = broker
             .apply_agent_lifecycle(&lifecycle, Some("parent-exchange"), &mut events)
-            .await
             .unwrap();
         let saved = broker.store.list_agent_run(&broker.session.id).unwrap();
         let child = saved
@@ -15460,7 +17464,6 @@ let sink = Some(sink);
 
         broker
             .apply_agent_lifecycle(&lifecycle, Some("parent-interaction"), &mut event)
-            .await
             .unwrap();
 
         let run_list = broker.agent_registry.list();
@@ -15537,7 +17540,7 @@ let sink = Some(sink);
         ] {
             assert!(
                 broker
-                    .route_settled_parent_event(
+                    .test_apply_settled_parent_event(
                         &current,
                         &ProviderEvent::Tool {
                             address: address.clone(),
@@ -15638,7 +17641,7 @@ let sink = Some(sink);
         let mut event = Vec::new();
         assert!(
             broker
-                .route_settled_parent_event(
+                .test_apply_settled_parent_event(
                     &current,
                     &ProviderEvent::Tool {
                         address: crate::provider::ToolAddress {
@@ -15700,7 +17703,7 @@ let sink = Some(sink);
         );
         let mut events = Vec::new();
         broker
-            .process_provider_event(
+            .test_apply_provider_event(
                 &mut runtime,
                 &mut exchange,
                 crate::provider::ProviderRuntime {
@@ -15769,7 +17772,7 @@ let sink = Some(sink);
         };
         let mut events = Vec::new();
         broker
-            .process_provider_event(
+            .test_apply_provider_event(
                 &mut runtime,
                 &mut exchange,
                 ProviderEvent::Turn {
@@ -15787,7 +17790,7 @@ let sink = Some(sink);
             "Inspecting",
         ) {
             broker
-                .process_provider_event(&mut runtime, &mut exchange, update, &mut events)
+                .test_apply_provider_event(&mut runtime, &mut exchange, update, &mut events)
                 .await
                 .unwrap();
         }
@@ -15811,7 +17814,7 @@ let sink = Some(sink);
             ],
         ) {
             broker
-                .process_provider_event(&mut runtime, &mut exchange, update, &mut events)
+                .test_apply_provider_event(&mut runtime, &mut exchange, update, &mut events)
                 .await
                 .unwrap();
         }
@@ -15841,7 +17844,7 @@ let sink = Some(sink);
             update: Box::new(compaction.clone()),
         };
         broker
-            .process_provider_event(&mut runtime, &mut exchange, notification, &mut events)
+            .test_apply_provider_event(&mut runtime, &mut exchange, notification, &mut events)
             .await
             .unwrap();
         let position = exchange.node_list.len() - 1;
@@ -15849,7 +17852,7 @@ let sink = Some(sink);
         let mut unrelated = compaction.clone();
         unrelated.thread_id = "unrelated".into();
         broker
-            .process_provider_event(
+            .test_apply_provider_event(
                 &mut runtime,
                 &mut exchange,
                 ProviderEvent::Compaction {
@@ -15862,7 +17865,7 @@ let sink = Some(sink);
             .unwrap();
         assert_eq!(exchange.node_list.len(), 3);
         broker
-            .process_provider_event(
+            .test_apply_provider_event(
                 &mut runtime,
                 &mut exchange,
                 ProviderEvent::Turn {
@@ -15893,7 +17896,7 @@ let sink = Some(sink);
             update: Box::new(completed),
         };
         broker
-            .process_provider_event(&mut runtime, &mut exchange, notification, &mut events)
+            .test_apply_provider_event(&mut runtime, &mut exchange, notification, &mut events)
             .await
             .unwrap();
         let ExchangeNode::Compaction {
@@ -15910,6 +17913,72 @@ let sink = Some(sink);
         assert_eq!(exchange.turn.len(), 1);
         assert_eq!(exchange.turn[0].messages().len(), 1);
         assert_eq!(exchange.tools_for_turn(exchange.turn[0].id()).count(), 1);
+    }
+
+    /// A continuation queued during finalization settles the original exchange before checkpoint commit.
+    #[tokio::test]
+    async fn native_continuation_invalidates_pending_settlement() -> Result<()> {
+        use forge_provider_api::lifecycle::{
+            ExecutionObservation, ExecutionResult, ExecutionUpdate,
+        };
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.checkpoint = None;
+        let mut exchange = completed_interaction("continued", &broker.session.id, Vec::new());
+        exchange.phase = crate::exchange::ExchangePhase::Running;
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ExecutionOwner::root(&broker.session.id),
+            exchange.id.clone(),
+        );
+        let first = crate::provider::TurnAddress {
+            scope: scope.clone(),
+            thread_id: "native".into(),
+            turn_id: "first".into(),
+        };
+        exchange.start_turn(first.clone(), 10)?;
+        exchange
+            .turn_mut(&first)
+            .unwrap()
+            .finish(crate::turn::TurnOutcome::Completed, 20)?;
+        broker.store.save_exchange(&exchange)?;
+        let next = crate::provider::TurnAddress {
+            scope: scope.clone(),
+            thread_id: "native".into(),
+            turn_id: "second".into(),
+        };
+        for update in [
+            ExecutionUpdate::Started {
+                address: next.clone(),
+            },
+            ExecutionUpdate::Finished {
+                address: next,
+                covered_submissions: Vec::new(),
+                completed_at_ms: 40,
+                result: ExecutionResult::Completed {
+                    completion: forge_provider_api::completion::ProviderCompletion::default()
+                        .into(),
+                },
+            },
+        ] {
+            broker
+                .observer
+                .session_events()
+                .push(ProviderEvent::Execution {
+                    observation: ExecutionObservation::new(scope.clone(), update)?,
+                })?;
+        }
+        broker
+            .capture_final_checkpoint(&mut exchange, crate::exchange::ExchangeOutcome::Complete)
+            .await?;
+        assert_eq!(exchange.state(), ExchangeState::Complete);
+        assert_eq!(exchange.turn.len(), 2);
+        assert_eq!(broker.reopened_execution.revision(&scope), 1);
+        assert!(!broker.reopened_execution.active(&scope));
+        let saved = broker.store.load_exchange(&exchange.id)?.unwrap();
+        assert_eq!(saved.turn.len(), 2);
+        assert_eq!(saved.state(), ExchangeState::Complete);
+        Ok(())
     }
 
     #[tokio::test]
@@ -16062,7 +18131,7 @@ let sink = Some(sink);
             let data = tempfile::tempdir().unwrap();
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
             let (mut setup, _, _) = broker
-                .interaction_for_turn("Configure project checks", true, 100)
+                .test_stage_interaction_for_turn("Configure project checks", true, 100)
                 .await
                 .unwrap();
             setup.check_setup = Some(state);
@@ -16113,6 +18182,7 @@ let sink = Some(sink);
         let (scope, _lease) = crate::checks::CheckToolScope::open(
             Arc::clone(&broker.check_runner),
             crate::checks::CheckAuthority {
+                task_authority: None,
                 data_root: broker.data_root.clone(),
                 provider: broker.session.provider.clone(),
                 task_id: None,
@@ -16205,6 +18275,7 @@ let sink = Some(sink);
             let (scope, lease) = crate::checks::CheckToolScope::open(
                 Arc::clone(&broker.check_runner),
                 crate::checks::CheckAuthority {
+                    task_authority: None,
                     data_root: broker.data_root.clone(),
                     provider: broker.session.provider.clone(),
                     task_id: None,
@@ -16306,7 +18377,7 @@ let sink = Some(sink);
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let (mut setup, _, _) = broker
-            .interaction_for_turn("Configure project checks", true, 100)
+            .test_stage_interaction_for_turn("Configure project checks", true, 100)
             .await
             .unwrap();
         setup.check_setup = Some(crate::checks::CheckSetupState::Reviewed);
@@ -16355,7 +18426,7 @@ let sink = Some(sink);
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let (mut setup, _, _) = broker
-            .interaction_for_turn("Configure project checks", true, 100)
+            .test_stage_interaction_for_turn("Configure project checks", true, 100)
             .await
             .unwrap();
         let admission = ExchangeAdmission::chat("Ordinary chat".into());
@@ -16765,7 +18836,7 @@ let sink = Some(sink);
         broker.event_sink = Some(sink);
         let mut events = Vec::new();
         broker
-            .process_provider_event(&mut runtime, &mut current, update.clone(), &mut events)
+            .test_apply_provider_event(&mut runtime, &mut current, update.clone(), &mut events)
             .await
             .unwrap();
         assert!(
@@ -16839,7 +18910,7 @@ let sink = Some(sink);
                 },
             };
             broker
-                .process_provider_event(&mut runtime, &mut current, usage_event, &mut events)
+                .test_apply_provider_event(&mut runtime, &mut current, usage_event, &mut events)
                 .await
                 .unwrap();
         }
@@ -16866,7 +18937,7 @@ let sink = Some(sink);
             result: Default::default(),
         };
         broker
-            .process_provider_event(
+            .test_apply_provider_event(
                 &mut runtime,
                 &mut current,
                 compaction_event(&broker.session.id, automatic.clone()),
@@ -16877,7 +18948,7 @@ let sink = Some(sink);
         let mut completed = automatic;
         completed.state = crate::provider::CompactionState::Completed;
         broker
-            .process_provider_event(
+            .test_apply_provider_event(
                 &mut runtime,
                 &mut current,
                 compaction_event(&broker.session.id, completed),
@@ -16892,7 +18963,7 @@ let sink = Some(sink);
             },
         };
         broker
-            .process_provider_event(&mut runtime, &mut current, usage_event, &mut events)
+            .test_apply_provider_event(&mut runtime, &mut current, usage_event, &mut events)
             .await
             .unwrap();
         let ExchangeNode::Compaction { compaction, .. } = current.node_list.last().unwrap() else {
@@ -17323,7 +19394,10 @@ let sink = Some(sink);
         );
     }
 
-    struct PreferenceProvider;
+    #[derive(Default)]
+    struct PreferenceProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    }
 
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for PreferenceProvider {
@@ -17345,29 +19419,38 @@ let sink = Some(sink);
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             Ok(())
         }
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
-        }
-        async fn prompt_stream(
+        async fn active_session_id_for(
             &self,
-            _request: ProviderRequest,
-            _sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let _fixture_scope = _sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(_sink);
-            let _sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let _sink = Some(_sink);
-                    anyhow::bail!("preference persistence must not start a model turn")
-                }
-                .await;
-                Ok(output?)
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
+        }
+
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
         }
 
         async fn model_list(
@@ -17382,6 +19465,30 @@ let sink = Some(sink);
                     "context_window": [{"id":"default"}, {"id":"long_context"}]
                 }))?)
             }).collect()
+        }
+    }
+
+    impl PreferenceProvider {
+        async fn run_native(
+            &self,
+            _request: ProviderRequest,
+            _sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
+            let _fixture_scope = _sink.invocation_scope()?.clone();
+            let fixture = crate::provider::test_support::FixtureStream::new(_sink);
+            let _sink = fixture.clone();
+            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
+                    let _sink = Some(_sink);
+                    anyhow::bail!("preference persistence must not start a model turn")
+                }
+                .await;
+                output
+            }
+            .await;
+            let result = result.map_err(crate::provider::ProviderError::from);
+            fixture.finish(&result).await?;
+            result
         }
     }
 
@@ -17412,7 +19519,7 @@ let sink = Some(sink);
             Box::new(FixedClock(100)),
         )
         .unwrap();
-        broker.provider = Arc::new(PreferenceProvider);
+        broker.provider = Arc::new(PreferenceProvider::default());
         let selected = broker
             .dispatch(Request {
                 id: 0,
@@ -17538,7 +19645,7 @@ let sink = Some(sink);
             Box::new(FixedClock(100)),
         )
         .unwrap();
-        broker.provider = Arc::new(PreferenceProvider);
+        broker.provider = Arc::new(PreferenceProvider::default());
         let selected = broker
             .dispatch(Request {
                 id: 21,
@@ -17891,7 +19998,7 @@ let sink = Some(sink);
             )
             .unwrap();
         let (mut exchange, _, _) = broker
-            .interaction_for_turn("interrupted request", true, 100)
+            .test_stage_interaction_for_turn("interrupted request", true, 100)
             .await
             .unwrap();
         exchange.resume(100).unwrap();
@@ -17974,6 +20081,7 @@ let sink = Some(sink);
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.goal_max_turns = 2;
         broker.provider = Arc::new(RetryPlanProvider {
+            fixture_events: Default::default(),
             turn: std::sync::atomic::AtomicUsize::new(0),
         });
 
@@ -18110,6 +20218,7 @@ let sink = Some(sink);
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.goal_max_turns = 2;
         broker.provider = Arc::new(RetryPlanProvider {
+            fixture_events: Default::default(),
             turn: std::sync::atomic::AtomicUsize::new(0),
         });
         broker
@@ -18145,7 +20254,7 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.provider = Arc::new(RepeatedPlanEditProvider);
+        broker.provider = Arc::new(RepeatedPlanEditProvider::default());
 
         let result = broker
             .dispatch(Request {
@@ -18206,7 +20315,7 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.provider = Arc::new(InvalidControlOutputProvider);
+        broker.provider = Arc::new(InvalidControlOutputProvider::default());
         broker.clock = Box::new(AdvancingClock(std::sync::atomic::AtomicI64::new(100)));
 
         let result = broker
@@ -18314,7 +20423,8 @@ let sink = Some(sink);
         Ok(())
     }
     struct NativeSettlementProvider {
-        inner: Arc<Provider>,
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+        inner: crate::provider::test_support::ProviderTestSession<Provider>,
         state: GoalState,
     }
 
@@ -18324,7 +20434,11 @@ let sink = Some(sink);
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.provider = Arc::new(NativeSettlementProvider {
-            inner: broker.provider.clone(),
+            fixture_events: Default::default(),
+            inner: crate::provider::test_support::ProviderTestSession::from_dyn(
+                broker.provider.clone(),
+            )
+            .unwrap(),
             state: GoalState::Active,
         });
         broker
@@ -18339,7 +20453,11 @@ let sink = Some(sink);
             .unwrap();
         dispatch_pending_task_input(&mut broker).await.unwrap();
         broker.provider = Arc::new(NativeSettlementProvider {
-            inner: broker.provider.clone(),
+            fixture_events: Default::default(),
+            inner: crate::provider::test_support::ProviderTestSession::from_dyn(
+                broker.provider.clone(),
+            )
+            .unwrap(),
             state: GoalState::Complete,
         });
         broker
@@ -18451,19 +20569,38 @@ let sink = Some(sink);
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
-        async fn prompt_stream(
+        async fn session_events(
             &self,
-            request: ProviderRequest,
-            event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let mut output = self.inner.prompt_stream(request, event_sink).await?;
-            output.evidence.native_state = Some(self.state);
-            output.evidence.tool_called = true;
-            Ok(output)
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::test_support::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
         }
 
         async fn fork(
@@ -18471,6 +20608,25 @@ let sink = Some(sink);
             request: ProviderForkRequest,
         ) -> Result<crate::provider::ProviderForkResult> {
             self.inner.fork(request).await
+        }
+    }
+
+    impl NativeSettlementProvider {
+        async fn run_native(
+            &self,
+            request: ProviderRequest,
+            event_sink: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
+            let mut output =
+                crate::provider::test_support::ProviderTestExt::session_prompt_and_wait(
+                    &self.inner,
+                    request,
+                    event_sink,
+                )
+                .await?;
+            output.evidence.native_state = Some(self.state);
+            output.evidence.tool_called = true;
+            Ok(output)
         }
     }
 
@@ -18501,7 +20657,7 @@ let sink = Some(sink);
             Box::new(FixedClock(200)),
         )
         .unwrap();
-        broker.provider = Arc::new(FailingProvider);
+        broker.provider = Arc::new(FailingProvider::default());
         let result = broker
             .dispatch(Request {
                 id: 1,
@@ -18551,7 +20707,7 @@ let sink = Some(sink);
             Box::new(FixedClock(250)),
         )
         .unwrap();
-        broker.provider = Arc::new(TaskUpdateProvider);
+        broker.provider = Arc::new(TaskUpdateProvider::default());
         let result = broker
             .dispatch(Request {
                 id: 1,
@@ -18599,7 +20755,7 @@ let sink = Some(sink);
             Box::new(FixedClock(500)),
         )
         .unwrap();
-        broker.provider = Arc::new(ParentBoundaryProvider);
+        broker.provider = Arc::new(ParentBoundaryProvider::default());
 
         let result = broker
             .dispatch(Request {
@@ -18673,7 +20829,7 @@ let sink = Some(sink);
             Box::new(FixedClock(300)),
         )
         .unwrap();
-        broker.provider = Arc::new(NestedWriteProvider);
+        broker.provider = Arc::new(NestedWriteProvider::default());
         let result = broker
             .dispatch(Request {
                 id: 1,
@@ -18734,7 +20890,7 @@ let sink = Some(sink);
             Box::new(FixedClock(300)),
         )
         .unwrap();
-        broker.provider = Arc::new(NestedWriteProvider);
+        broker.provider = Arc::new(NestedWriteProvider::default());
         let result = broker
             .dispatch(Request {
                 id: 1,
@@ -18817,19 +20973,16 @@ let sink = Some(sink);
             Box::new(FixedClock(300)),
         )
         .unwrap();
-        broker.provider = Arc::new(NestedWriteProvider);
+        broker.provider = Arc::new(NestedWriteProvider::default());
 
         let occupied: Vec<_> = (0..4)
             .map(|_| broker.repositories.reads.submit(0, |_| Ok(())).unwrap())
             .collect();
         let (mut rejected, _, _) = broker
-            .interaction_for_turn("not started", true, 300)
+            .test_stage_interaction_for_turn("not started", true, 300)
             .await
             .unwrap();
-        broker
-            .start_exchange_runtime(&mut rejected, 300)
-            .await
-            .unwrap();
+        broker.begin_exchange_runtime(&mut rejected, 300).unwrap();
         let mut runtime = broker.exchange_runtime.take().unwrap();
         let captured = (&mut runtime.checkpoint.as_mut().unwrap().0).await.unwrap();
         let error = broker
@@ -19047,5 +21200,3 @@ let sink = Some(sink);
         assert_eq!(broker.session.id, active_id);
     }
 }
-
-pub(crate) use forge_provider_api::error::TurnCancelled;

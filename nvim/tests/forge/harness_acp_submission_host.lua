@@ -21,6 +21,7 @@ if not vim.g.forge_acp_fixture_grid then
 end
 local kind = vim.g.forge_acp_fixture_kind or "claude"
 local lost = vim.g.forge_acp_fixture_lost_ack == true
+local runtime_version = kind == "antigravity" and "1.4.5" or "0.99.1"
 local root, workspace, data = vim.fn.getcwd(), vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
@@ -34,13 +35,16 @@ vim.fn.writefile(vim.split([[
 const fs = require('node:fs');
 const readline = require('node:readline');
 const write = value => process.stdout.write(JSON.stringify({jsonrpc:'2.0', ...value}) + '\n');
+let promptCount = 0;
 readline.createInterface({input:process.stdin}).on('line', line => {
   const request = JSON.parse(line);
   if (request.id === undefined) return;
   let result = {};
-  if (request.method === 'initialize') result = {protocolVersion:1,agentCapabilities:{loadSession:true}};
+  if (request.method === 'initialize') result = {protocolVersion:1,agentCapabilities:{loadSession:true},
+    agentInfo:{name:'fixture',version:process.argv[5]}};
   if (request.method === 'session/new' || request.method === 'session/load') result = {sessionId:'native'};
   if (request.method === 'session/prompt') {
+    const prompt = ++promptCount;
     fs.appendFileSync(process.argv[2], JSON.stringify(request.params) + '\n');
     if (process.argv[3] === 'lost') {
       process.exit(0);
@@ -48,9 +52,9 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     }
     // Exercise native ACP read and failed-edit updates before the final response.
     write({method:'session/update',params:{sessionId:'native',update:{sessionUpdate:'tool_call',
-      toolCallId:'skill-read',kind:'read',title:'Read fixture',status:'completed',rawInput:{path:process.argv[4]}}}});
+      toolCallId:`skill-read-${prompt}`,kind:'read',title:'Read fixture',status:'completed',rawInput:{path:process.argv[4]}}}});
     write({method:'session/update',params:{sessionId:'native',update:{sessionUpdate:'tool_call',
-      toolCallId:'edit',kind:'edit',title:'File changes',status:'interrupted'}}});
+      toolCallId:`edit-${prompt}`,kind:'edit',title:'File changes',status:'interrupted'}}});
     write({method:'session/update',params:{sessionId:'native',update:{sessionUpdate:'agent_message_chunk',
       content:{type:'text',text:'ACP_SUBMISSION_ACCEPTED'}}}});
     result = {stopReason:'end_turn'};
@@ -101,7 +105,7 @@ end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
   require("forge").setup({ harness = { provider = kind, config_dir = data,
-    providers = { [kind] = { command = { "node", peer, sent, lost and "lost" or "ok", skill }, selectable = true } } } })
+    providers = { [kind] = { command = { "node", peer, sent, lost and "lost" or "ok", skill, runtime_version }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.ready and state.session end, 10), table.concat(errors, " | "))
   request("session.configure", { access = { sandbox = false, write_access = "workspace", writable_directory = {}, isolation_mode = "elevated" } })
@@ -197,6 +201,6 @@ client.host_stop()
 local collected = vim.wait(6000, function() return client._client.process == nil end, 10)
 vim.fn.chdir(root)
 vim.fn.stdpath = original_stdpath
-assert(success and collected, failure or "host was not collected")
+assert(success and collected, (failure or "host was not collected") .. "\n" .. table.concat(errors, "\n"))
 print("harness_acp_submission_host: passed " .. kind .. (lost and " lost acknowledgment" or " acceptance"))
 if not vim.g.forge_acp_fixture_grid then vim.cmd("qa!") end

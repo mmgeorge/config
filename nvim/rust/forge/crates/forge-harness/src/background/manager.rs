@@ -7,6 +7,7 @@ use forge_protocol::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Semaphore, oneshot};
 use tokio::task::JoinSet;
@@ -44,6 +45,35 @@ pub struct BackgroundResult {
     pub text: String,
 }
 
+/// Retain the native owner and its observer between tool-free generation requests.
+struct RetainedBackground {
+    runtime: Arc<BrokerRuntime>,
+    cache_key: String,
+    session_id: String,
+    observer: Arc<crate::provider::session_execution::SessionObservationInbox>,
+    leased: AtomicBool,
+}
+
+struct BackgroundLease {
+    retained: Arc<RetainedBackground>,
+}
+
+impl BackgroundLease {
+    fn acquire(retained: Arc<RetainedBackground>) -> Result<Self> {
+        ensure!(
+            !retained.leased.swap(true, Ordering::AcqRel),
+            "Background runtime is already leased"
+        );
+        Ok(Self { retained })
+    }
+}
+
+impl Drop for BackgroundLease {
+    fn drop(&mut self) {
+        self.retained.leased.store(false, Ordering::Release);
+    }
+}
+
 /// Owns Background operation lifetimes independently of interactive Harness startup.
 pub struct BackgroundManager {
     pub(super) repositories: Arc<RepositoryStore>,
@@ -52,6 +82,8 @@ pub struct BackgroundManager {
     admission: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     tasks: Mutex<JoinSet<()>>,
     runtime_admission: Semaphore,
+    retained: Mutex<HashMap<String, Arc<RetainedBackground>>>,
+    cleanup_pending: std::sync::Mutex<Vec<Arc<RetainedBackground>>>,
     presentation:
         Mutex<HashMap<String, Arc<std::sync::Mutex<crate::buffer::session::SessionPresentation>>>>,
 }
@@ -70,6 +102,8 @@ impl BackgroundManager {
             admission: Mutex::new(HashMap::new()),
             tasks: Mutex::new(JoinSet::new()),
             runtime_admission: Semaphore::new(4),
+            retained: Mutex::new(HashMap::new()),
+            cleanup_pending: std::sync::Mutex::new(Vec::new()),
             presentation: Mutex::new(HashMap::new()),
         })
     }
@@ -139,49 +173,10 @@ impl BackgroundManager {
             .expect("prepared Background snapshot")
             .session
             .id;
-        let (sink, mut events) = crate::broker::publication::channel();
+        let (sink, events) = crate::broker::publication::channel();
         let delivery = request.delivery.clone();
         let progress_session = session_id.clone();
-        let forward = tokio::spawn(async move {
-            while let Ok(Some(event)) = events.recv().await {
-                let progress = match &event {
-                    crate::broker::publication::SessionUpdate::Runtime { .. } => {
-                        crate::broker::publication::encode_session_update(&event).ok()
-                    }
-                    crate::broker::publication::SessionUpdate::DocumentChanged { patch } => patch
-                        .notification()
-                        .get("status")
-                        .map(|status| json!({"kind":"status","data":status})),
-                    _ => None,
-                };
-                if let (Some((delivery, request_id)), Some(progress)) = (&delivery, progress) {
-                    let _ = delivery.send(Message::RequestEvent(RequestEvent {
-                        request_id: *request_id,
-                        event:
-                            forge_protocol::contract::RequestEventName::RepositoryGenerationProgress
-                                .as_str()
-                                .into(),
-                        payload: json!({"session_id":progress_session,"event":progress}),
-                    }));
-                }
-            }
-        });
-        let mut session_event_stream = match runtime
-            .provider_handle()
-            .session_event_stream(crate::provider::ExecutionOwner::root(&session_id))
-            .await
-        {
-            Ok(stream) => stream,
-            Err(error) => {
-                report(
-                    &request.delivery,
-                    &session_id,
-                    format!("Background session observation failed: {error:#}"),
-                )
-                .await;
-                None
-            }
-        };
+        let forward = tokio::spawn(forward_progress(events, delivery, progress_session));
         let policy = crate::settings::SettingsStore::open(&request.config.data_root)
             .and_then(|store| {
                 store.get(
@@ -199,8 +194,15 @@ impl BackgroundManager {
         let policy = match policy {
             Ok(policy) => policy,
             Err(error) => {
-                let _ = sender.send(Err(error));
                 forward.abort();
+                let _ = forward.await;
+                let error = match broker.release_lease() {
+                    Ok(()) => error,
+                    Err(release) => {
+                        error.context(format!("Background lease release also failed: {release:#}"))
+                    }
+                };
+                let _ = sender.send(Err(error));
                 return;
             }
         };
@@ -237,7 +239,19 @@ impl BackgroundManager {
             }
         };
         timeout.abort();
-        let _ = forward.await;
+        let _ = timeout.await;
+        let forwarded = forward
+            .await
+            .context("Background publication worker failed")
+            .and_then(|result| result);
+        let result = match (result, forwarded) {
+            (Ok(text), Ok(())) => Ok(text),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(publication)) => Err(error.context(format!(
+                "Background publication also failed: {publication:#}"
+            ))),
+        };
         if let Err(error) = &result
             && let Err(storage) =
                 broker.background_failure("background_generation", format!("{error:#}"))
@@ -255,7 +269,9 @@ impl BackgroundManager {
             session_id: session_id.clone(),
         }));
         let mut native_compaction_observed = false;
-        if let Some(stream) = &mut session_event_stream {
+        let mut observation_reliable = true;
+        {
+            let inbox = &runtime.retained.observer;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
             let mut pending: Option<crate::provider::Compaction> = None;
             loop {
@@ -264,28 +280,59 @@ impl BackgroundManager {
                 } else {
                     tokio::time::Instant::now() + Duration::from_millis(10)
                 };
-                match tokio::time::timeout_at(until, stream.recv()).await {
-                    Ok(Ok(Some(event))) => {
-                        if let crate::provider::ProviderEvent::Compaction {
-                            update: compaction,
-                            ..
-                        } = &event
-                        {
-                            native_compaction_observed = true;
-                            pending =
-                                if compaction.state == crate::provider::CompactionState::Running {
+                let observations = async {
+                    inbox.notified().await?;
+                    if inbox.is_closed() && !inbox.has_pending()? {
+                        return Ok(None);
+                    }
+                    inbox.drain().map(Some)
+                };
+                let observed = tokio::time::timeout_at(until, observations).await;
+                if let Ok(Err(error)) = &observed {
+                    observation_reliable = false;
+                    let failure = format!("Background session observation failed: {error:#}");
+                    if let Err(storage) =
+                        broker.background_failure("observation_loss", failure.clone())
+                    {
+                        report(
+                            &request.delivery,
+                            &session_id,
+                            format!("Could not retain Background observation loss: {storage:#}"),
+                        )
+                        .await;
+                    }
+                    report(&request.delivery, &session_id, failure).await;
+                }
+                match observed {
+                    Ok(Ok(Some(events))) => {
+                        for event in events {
+                            if let crate::provider::ProviderEvent::Compaction {
+                                update: compaction,
+                                ..
+                            } = &event
+                            {
+                                native_compaction_observed = true;
+                                pending = if compaction.state
+                                    == crate::provider::CompactionState::Running
+                                {
                                     Some(*compaction.clone())
                                 } else {
                                     None
                                 };
-                        }
-                        if let Err(error) = broker.observe_session_event(event) {
-                            report(
-                                &request.delivery,
-                                &session_id,
-                                format!("Background session observation failed: {error:#}"),
-                            )
-                            .await;
+                            }
+                            if let Err(error) = broker.observe_session_event(event) {
+                                observation_reliable = false;
+                                let _ = broker.background_failure(
+                                    "observation_application",
+                                    format!("{error:#}"),
+                                );
+                                report(
+                                    &request.delivery,
+                                    &session_id,
+                                    format!("Background session observation failed: {error:#}"),
+                                )
+                                .await;
+                            }
                         }
                     }
                     _ => {
@@ -314,7 +361,17 @@ impl BackgroundManager {
                 }
             }
         }
+        if observation_reliable && let Err(error) = broker.finalize_observed_execution().await {
+            let _ = broker.background_failure("continuation_settlement", format!("{error:#}"));
+            report(
+                &request.delivery,
+                &session_id,
+                format!("Background continuation settlement failed: {error:#}"),
+            )
+            .await;
+        }
         if succeeded
+            && observation_reliable
             && !native_compaction_observed
             && let Err(error) = broker.auto_compact().await
         {
@@ -326,14 +383,19 @@ impl BackgroundManager {
             )
             .await;
         }
-        if let Err(error) = runtime.provider_handle().shutdown().await {
-            let _ = broker.background_failure("provider_cleanup", format!("{error:#}"));
-            report(
-                &request.delivery,
-                &session_id,
-                format!("Background provider cleanup failed: {error:#}"),
-            )
-            .await;
+        if !succeeded {
+            let removed = self.retained.lock().await.remove(&key);
+            if let Some(removed) = removed
+                && let Err(error) = self.retire(removed).await
+            {
+                let _ = broker.background_failure("provider_cleanup", format!("{error:#}"));
+                report(
+                    &request.delivery,
+                    &session_id,
+                    format!("Background provider cleanup failed: {error:#}"),
+                )
+                .await;
+            }
         }
         if let Err(error) = broker.release_lease() {
             report(
@@ -349,7 +411,16 @@ impl BackgroundManager {
         &self,
         request: &BackgroundRequest,
         key: &str,
-    ) -> Result<(HarnessBroker, Arc<BrokerRuntime>, fs::File)> {
+    ) -> Result<(HarnessBroker, BackgroundLease, fs::File)> {
+        ensure!(
+            !self
+                .cleanup_pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|runtime| runtime.cache_key == key),
+            "Background runtime collection is incomplete; finish cleanup before replacing this owner"
+        );
         ensure!(
             !request.config.model.trim().is_empty(),
             "Background model cannot be empty"
@@ -429,21 +500,193 @@ impl BackgroundManager {
             "session_id":session_id, "background":identity,
             "new_session_name":if reason.is_empty() { None } else { Some("Background") }
         }))?;
+        let cached = {
+            let cache = self.retained.lock().await;
+            if let Some(retained) = cache.get(key) {
+                if initialize.session_id.as_deref() == Some(retained.session_id.as_str()) {
+                    Some(BackgroundLease::acquire(retained.clone())?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(retained) = cached {
+            let mut broker = HarnessBroker::initialize_with_runtime(
+                initialize,
+                retained.retained.runtime.clone(),
+            )?;
+            let recovery = async {
+                let registry = broker.execution_registry();
+                let owner = crate::provider::ExecutionOwner::root(&retained.retained.session_id);
+                let engine = registry.owner(owner.clone()).await?;
+                let mut retained = retained;
+                if !engine.is_healthy().await {
+                    engine.close().await?;
+                    loop {
+                        match retained.retained.observer.drain() {
+                            Ok(events) if events.is_empty() => break,
+                            Ok(events) => {
+                                for event in events {
+                                    broker.observe_session_event(event)?;
+                                }
+                            }
+                            Err(error) => {
+                                broker
+                                    .background_failure("observation_loss", format!("{error:#}"))?;
+                                break;
+                            }
+                        }
+                    }
+                    let observer = registry.replace(owner).await?;
+                    broker.observer().replace_session_events(observer.clone());
+                    let replacement = Arc::new(RetainedBackground {
+                        runtime: retained.retained.runtime.clone(),
+                        cache_key: key.to_owned(),
+                        session_id: retained.retained.session_id.clone(),
+                        observer,
+                        leased: AtomicBool::new(false),
+                    });
+                    let replacement_lease = BackgroundLease::acquire(replacement.clone())?;
+                    self.retained
+                        .lock()
+                        .await
+                        .insert(key.to_owned(), replacement);
+                    retained = replacement_lease;
+                }
+                request.context.verify(&self.repositories).await?;
+                Ok::<_, anyhow::Error>(retained)
+            }
+            .await;
+            let retained = match recovery {
+                Ok(retained) => retained,
+                Err(error) => {
+                    return match broker.release_lease() {
+                        Ok(()) => Err(error),
+                        Err(release) => Err(error.context(format!(
+                            "Background recovery lease release also failed: {release:#}"
+                        ))),
+                    };
+                }
+            };
+            return Ok((broker, retained, ownership));
+        }
+        let evicted = {
+            let mut cache = self.retained.lock().await;
+            let mut evicted = Vec::new();
+            if let Some(previous) = cache.remove(key) {
+                evicted.push(previous);
+            }
+            if cache.len() >= 4 {
+                let idle = cache
+                    .iter()
+                    .find(|(_, runtime)| !runtime.leased.load(Ordering::Acquire))
+                    .map(|(key, _)| key.clone())
+                    .context("all retained Background runtimes are busy")?;
+                if let Some(previous) = cache.remove(&idle) {
+                    evicted.push(previous);
+                }
+            }
+            evicted
+        };
+        self.cleanup_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(evicted.iter().cloned());
+        let mut cleanup_failure = None;
+        for previous in evicted {
+            match previous.runtime.shutdown().await {
+                Ok(()) => {
+                    self.cleanup_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .retain(|pending| !Arc::ptr_eq(pending, &previous));
+                }
+                Err(error) => {
+                    cleanup_failure.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = cleanup_failure {
+            return Err(error);
+        }
         let runtime = BrokerRuntime::initialize(
             &initialize,
             crate::workspace::WorkspaceKind::Git(PathBuf::from(&request.context.workspace)),
             Arc::clone(&self.repositories),
             Arc::clone(&self.diff),
         )?;
-        let broker = HarnessBroker::initialize_with_runtime(initialize, Arc::clone(&runtime))?;
+        let mut broker = HarnessBroker::initialize_with_runtime(initialize, Arc::clone(&runtime))?;
+        let session_id = broker.snapshot()?.session.id;
+        let registry = broker.execution_registry();
+        let owner = crate::provider::ExecutionOwner::root(&session_id);
+        registry.owner(owner.clone()).await?;
+        let observer = registry.observer(owner)?;
+        let retained = Arc::new(RetainedBackground {
+            runtime,
+            cache_key: key.to_owned(),
+            session_id,
+            observer,
+            leased: AtomicBool::new(false),
+        });
+        let lease = BackgroundLease::acquire(retained.clone())?;
+        self.retained.lock().await.insert(key.to_owned(), retained);
         request.context.verify(&self.repositories).await?;
-        Ok((broker, runtime, ownership))
+        Ok((broker, lease, ownership))
     }
 
-    /// Drain admitted generation and maintenance before shutting down the host.
-    pub async fn shutdown(&self) {
+    /// Retain native cleanup ownership until collection succeeds, including cancelled shutdown waits.
+    async fn retire(&self, runtime: Arc<RetainedBackground>) -> Result<()> {
+        self.cleanup_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(runtime.clone());
+        runtime.runtime.shutdown().await?;
+        self.cleanup_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|pending| !Arc::ptr_eq(pending, &runtime));
+        Ok(())
+    }
+
+    /// Drain admitted work and report every incomplete provider collection obligation.
+    pub async fn shutdown(&self) -> Result<()> {
+        let mut failure = None;
         let mut tasks = self.tasks.lock().await;
-        while tasks.join_next().await.is_some() {}
+        while let Some(result) = tasks.join_next().await {
+            if let Err(error) = result {
+                failure.get_or_insert_with(|| anyhow::Error::from(error));
+            }
+        }
+        drop(tasks);
+        let retained = std::mem::take(&mut *self.retained.lock().await);
+        self.cleanup_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(retained.into_values());
+        let pending = self
+            .cleanup_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        for runtime in pending {
+            match runtime.runtime.shutdown().await {
+                Ok(()) => {
+                    self.cleanup_pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .retain(|pending| !Arc::ptr_eq(pending, &runtime));
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Read or project Background history without acquiring provider ownership.
@@ -579,6 +822,36 @@ impl BackgroundManager {
     }
 }
 
+/// Forward ordered Background progress and surface errors before a flush can acknowledge it.
+async fn forward_progress(
+    mut events: crate::broker::publication::SessionUpdateStream,
+    delivery: Option<(MessageSender, u64)>,
+    progress_session: String,
+) -> Result<()> {
+    while let Some(event) = events.recv().await? {
+        let progress = match &event {
+            crate::broker::publication::SessionUpdate::Runtime { .. } => {
+                Some(crate::broker::publication::encode_session_update(&event)?)
+            }
+            crate::broker::publication::SessionUpdate::DocumentChanged { patch } => patch
+                .notification()
+                .get("status")
+                .map(|status| json!({"kind":"status","data":status})),
+            _ => None,
+        };
+        if let (Some((delivery, request_id)), Some(progress)) = (&delivery, progress) {
+            delivery.send(Message::RequestEvent(RequestEvent {
+                request_id: *request_id,
+                event: forge_protocol::contract::RequestEventName::RepositoryGenerationProgress
+                    .as_str()
+                    .into(),
+                payload: json!({"session_id":progress_session,"event":progress}),
+            }))?;
+        }
+    }
+    Ok::<_, anyhow::Error>(())
+}
+
 async fn report(delivery: &Option<(MessageSender, u64)>, session: &str, error: String) {
     if let Some((delivery, _)) = delivery {
         let _ = delivery
@@ -594,6 +867,138 @@ async fn report(delivery: &Option<(MessageSender, u64)>, session: &str, error: S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Refuse to acknowledge progress when the external receiver has closed.
+    #[tokio::test]
+    async fn failed_progress_delivery_cannot_acknowledge_flush() -> Result<()> {
+        let (outbound, receiver) = forge_protocol::outbound::channel();
+        drop(receiver);
+        let (sink, events) = crate::broker::publication::channel();
+        let forward = tokio::spawn(forward_progress(
+            events,
+            Some((outbound, 7)),
+            "background".into(),
+        ));
+        sink.send_wait(crate::broker::publication::SessionUpdate::Runtime {
+            session_id: "background".into(),
+            runtime: crate::provider::ProviderRuntime::default(),
+        })
+        .await?;
+        let error = tokio::time::timeout(Duration::from_secs(1), forward)
+            .await??
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::BrokenPipe)
+        );
+        assert_eq!(
+            sink.flush().await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        Ok(())
+    }
+
+    /// Recover a lost retained listener only when a new Background request arrives.
+    #[tokio::test]
+    async fn explicit_background_request_replaces_failed_observer() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().join("workspace");
+        fs::create_dir(&workspace)?;
+        let git = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["init", "-q"])
+            .output()?;
+        ensure!(git.status.success(), "fixture Git initialization failed");
+        let diff = DiffEngine::new(Default::default(), 1);
+        let manager = BackgroundManager::new(
+            Arc::new(RepositoryStore::default()),
+            Arc::clone(&diff),
+            forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool()),
+        );
+        let request = BackgroundRequest {
+            cancellation: super::super::CancellationToken::new(),
+            purpose: crate::provider::TextGeneration::CommitMessage,
+            config: TextGenerationConfig {
+                provider: crate::provider::ProviderLaunch {
+                    kind: "mock".into(),
+                    command: Vec::new(),
+                },
+                model: "mock-model".into(),
+                reasoning_effort: None,
+                service_tier: Default::default(),
+                data_root: fixture.path().join("state"),
+                auto_compaction: Default::default(),
+            },
+            context: BackgroundContext::read(
+                &manager.repositories,
+                workspace.to_str().context("fixture path is not UTF-8")?,
+            )
+            .await?,
+            input: "fixture".into(),
+            delivery: None,
+        };
+        let key = format!(
+            "{}:{}",
+            request.config.data_root.display(),
+            request.context.workspace
+        );
+        let (mut broker, retained, ownership) = manager.prepare(&request, &key).await?;
+        let session_id = retained.retained.session_id.clone();
+        let old_observer = retained.retained.observer.clone();
+        let owner = crate::provider::ExecutionOwner::root(&session_id);
+        let registry = broker.execution_registry();
+        let old_engine = registry.owner(owner.clone()).await?;
+        retained
+            .retained
+            .runtime
+            .provider_handle()
+            .reset_session(&owner)
+            .await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while old_engine.is_healthy().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        drop(retained);
+        broker.release_lease()?;
+        drop(broker);
+        drop(ownership);
+        let (mut broker, replacement, ownership) = manager.prepare(&request, &key).await?;
+        assert_eq!(replacement.retained.session_id, session_id);
+        assert!(!Arc::ptr_eq(&old_observer, &replacement.retained.observer));
+        assert!(registry.owner(owner).await?.is_healthy().await);
+        assert!(old_observer.is_closed());
+        let records =
+            SqliteStore::read_only(&request.config.data_root)?.list_session_event(&session_id)?;
+        assert!(records.iter().any(|record| matches!(&record.detail,
+            crate::timeline::SessionEventKind::Configuration { state, field, reason, .. }
+            if state == "failed" && field.iter().any(|field| field == "observation_loss") && reason.is_some()
+        )));
+        drop(replacement);
+        broker.release_lease()?;
+        drop(ownership);
+        manager.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_reports_background_worker_failure() {
+        let diff = DiffEngine::new(Default::default(), 1);
+        let manager = BackgroundManager::new(
+            Arc::new(RepositoryStore::default()),
+            Arc::clone(&diff),
+            forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool()),
+        );
+        manager.tasks.lock().await.spawn(async {
+            panic!("background worker failed before completing its request");
+        });
+        let error = manager.shutdown().await.unwrap_err();
+        assert!(error.to_string().contains("background worker failed"));
+    }
 
     #[tokio::test]
     async fn cancelled_admission_never_starts_provider() {
@@ -641,7 +1046,7 @@ mod tests {
             .expect("cancelled request succeeded");
         assert_eq!(error.to_string(), "Background generation cancelled");
         drop(permits);
-        manager.shutdown().await;
+        manager.shutdown().await.unwrap();
     }
 
     #[tokio::test]

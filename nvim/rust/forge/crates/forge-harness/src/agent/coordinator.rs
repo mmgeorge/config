@@ -90,6 +90,7 @@ pub struct AgentRequestAuthority {
     pub owner: ExecutionOwner,
     pub parent_exchange_id: String,
     pub expired: watch::Receiver<bool>,
+    pub(crate) task: Option<crate::tools::TaskAuthority>,
 }
 
 #[derive(Clone)]

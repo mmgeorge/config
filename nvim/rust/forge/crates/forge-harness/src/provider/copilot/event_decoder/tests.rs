@@ -28,7 +28,7 @@ async fn replay(native: Vec<SessionEvent>, synthesize: bool) -> anyhow::Result<V
         let mut decoder = CopilotEventDecoder::new(scope, String::new());
         let mut output = ProviderCompletion {
             native: forge_provider_api::completion::ProviderCompletion {
-                provider_session_id: Some("native-session".into()),
+                provider_session_id: Some("native-session".to_owned().try_into().unwrap()),
                 ..Default::default()
             },
             ..Default::default()
@@ -614,7 +614,7 @@ async fn cancelled_stream_does_not_synthesize_response() -> anyhow::Result<()> {
     let mut decoder = CopilotEventDecoder::new(scope, String::new());
     let mut output = ProviderCompletion {
         native: forge_provider_api::completion::ProviderCompletion {
-            provider_session_id: Some("native".into()),
+            provider_session_id: Some("native".to_owned().try_into().unwrap()),
             ..Default::default()
         },
         ..Default::default()

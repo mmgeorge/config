@@ -28,7 +28,7 @@ pub(super) fn apply(
         .questions
         .as_ref()
         .context("question operation requires a session question controller")?;
-    let snapshot = controller.apply(crate::question::QuestionCommand {
+    let command = crate::question::QuestionCommand {
         operation_id: uuid::Uuid::new_v4().to_string(),
         question_id: invocation.arguments["question_id"]
             .as_str()
@@ -39,7 +39,12 @@ pub(super) fn apply(
             .as_u64()
             .context("question revision required")?,
         action,
-    })?;
+    };
+    let authority = crate::tools::TaskAuthority::capture(&runtime.context);
+    let snapshot = match authority {
+        Some(authority) => authority.commit(|| controller.apply(command))?,
+        None => controller.apply(command)?,
+    };
     Ok(ControlToolResult {
         invocation: None,
         message: serde_json::to_string(&snapshot)?,

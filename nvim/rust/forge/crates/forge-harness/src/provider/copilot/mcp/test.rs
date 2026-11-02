@@ -2,6 +2,8 @@ use super::*;
 #[cfg(test)]
 use crate::provider::ProviderAdapter as _;
 use crate::provider::copilot::CopilotProvider;
+#[cfg(test)]
+use crate::provider::test_support::ProviderTestExt as _;
 use crate::provider::{
     McpStatus, PromptMode, ProviderCatalogRequest, ProviderInput, ProviderRequest,
 };
@@ -45,7 +47,7 @@ async fn write_message(writer: &mut DuplexStream, message: Value) {
 
 struct Fixture {
     directory: tempfile::TempDir,
-    provider: CopilotProvider,
+    provider: crate::provider::test_support::ProviderTestSession<CopilotProvider>,
     recovered: Arc<AtomicBool>,
     request: Arc<Mutex<Vec<String>>>,
     server: tokio::task::JoinHandle<()>,
@@ -85,6 +87,7 @@ impl Fixture {
             Some(data),
         )
         .unwrap();
+        let provider = crate::provider::test_support::ProviderTestSession::new(provider).unwrap();
         let (client_write, mut server_read) = tokio::io::duplex(65536);
         let (mut server_write, client_read) = tokio::io::duplex(65536);
         provider
@@ -102,15 +105,26 @@ impl Fixture {
             .collect::<Vec<_>>();
         let server = tokio::spawn(async move {
             let mut provider_session = String::new();
+            let mut disabled = std::collections::HashSet::<String>::new();
+            let mut stalled_start = false;
             while let Some(message) = read_request(&mut server_read).await {
                 let method = message["method"].as_str().unwrap();
                 requests.lock().unwrap().push(method.into());
                 if method == "session.mcp.startServer"
                     && message["params"]["serverName"] == "stalled"
                 {
+                    stalled_start = true;
+                    continue;
+                }
+                if method == "session.mcp.disable" && stalled_start {
+                    write_message(&mut server_write, json!({"jsonrpc":"2.0","id":message["id"], "error":{"code":-32000,"message":"disable blocked by pending startup"}})).await;
                     continue;
                 }
                 let result = match method {
+                    "status.get" => json!({"version":"1.0.103","protocolVersion":1}),
+                    "mcp.discover" => json!({"servers": names.iter().map(|name|
+                        json!({"name":name,"enabled":true,"source":"user"})).collect::<Vec<_>>()}),
+                    "session.detach" => json!({"success":true}),
                     "session.create" => {
                         provider_session =
                             message["params"]["sessionId"].as_str().unwrap().to_owned();
@@ -136,7 +150,19 @@ impl Fixture {
                         continue;
                     }
                     "session.mcp.startServer" | "session.mcp.disable" | "session.destroy" => {
+                        if method == "session.mcp.disable" {
+                            disabled.insert(
+                                message["params"]["serverName"].as_str().unwrap().to_owned(),
+                            );
+                        }
                         json!({})
+                    }
+                    "session.mcp.listConfigured" => {
+                        json!({"servers":names.iter().filter(|name| name.as_str() != "broken").map(|name|
+                        json!({"name":name,"enabled":!disabled.contains(name) && name != "disabled",
+                            "live":{"status":if recovery.load(Ordering::SeqCst) { "connected" }
+                                else { match name.as_str() { "disabled" => "disabled", "stalled" => "pending", _ => "connected" } }} }))
+                        .collect::<Vec<_>>()})
                     }
                     "session.mcp.list" => {
                         json!({"servers":names.iter().filter(|name| name.as_str() != "broken").map(|name|
@@ -159,13 +185,8 @@ impl Fixture {
                 )
                 .await;
                 if method == "session.send" {
-                    for index in 0..4096 {
-                        write_message(&mut server_write, json!({"jsonrpc":"2.0","method":"session.event",
-                            "params":{"sessionId":provider_session,"event":{"id":format!("stream-{index}"),
-                                "timestamp":"2026-10-14T00:00:00Z","type":"assistant.streaming_delta","ephemeral":true,
-                                "data":{"totalResponseSizeBytes":index}}}})).await;
-                    }
-                    for (event_type, data) in [
+                    for (index, (event_type, data)) in [
+                        ("user.message", json!({"messageId":"reply","turnId":"turn","content":"what is this repo?"})),
                         ("assistant.turn_start", json!({"turnId":"turn"})),
                         (
                             "assistant.message",
@@ -173,10 +194,11 @@ impl Fixture {
                         ),
                         ("assistant.turn_end", json!({"turnId":"turn"})),
                         ("session.idle", json!({})),
-                    ] {
+                    ].into_iter().enumerate() {
+                        let mut event = json!({"id":format!("event-{index}"), "timestamp":"2026-10-14T00:00:00Z", "type":event_type, "data":data});
+                        if index > 0 { event["parentId"] = json!(format!("event-{}", index - 1)); }
                         write_message(&mut server_write, json!({"jsonrpc":"2.0","method":"session.event",
-                            "params":{"sessionId":provider_session,"event":{"id":event_type,
-                                "timestamp":"2026-10-14T00:00:00Z","type":event_type,"data":data}}})).await;
+                            "params":{"sessionId":provider_session,"event":event}})).await;
                     }
                 }
             }
@@ -231,6 +253,64 @@ impl Fixture {
     }
 }
 
+#[tokio::test]
+async fn mcp_selection_is_verified_before_stalled_server_start() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let fixture = Fixture::new(&["healthy", "unselected"]).await;
+        let session = fixture
+            .provider
+            .session(
+                &fixture.prompt(),
+                crate::provider::copilot::CopilotSessionReuse::Compatible,
+            )
+            .await
+            .unwrap();
+        fixture.request.lock().unwrap().clear();
+        let launch = ["healthy", "stalled"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.to_owned(),
+                    serde_json::Map::from_iter([
+                        ("command".into(), json!("unused")),
+                        ("args".into(), json!([])),
+                    ]),
+                )
+            })
+            .collect::<Vec<_>>();
+        let failures = start(
+            &session,
+            &launch,
+            fixture.provider.trace.as_ref(),
+            "mcp-order",
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        assert!(failures["stalled"].contains("timed out"));
+        assert!(!failures.contains_key("healthy"));
+        let requests = fixture.request.lock().unwrap().clone();
+        let disable = requests
+            .iter()
+            .position(|method| method == "session.mcp.disable")
+            .unwrap();
+        let first_start = requests
+            .iter()
+            .position(|method| method == "session.mcp.startServer")
+            .unwrap();
+        assert!(disable < first_start);
+        assert!(
+            requests[disable + 1..first_start]
+                .iter()
+                .any(|method| method == "session.mcp.listConfigured"),
+            "selection was not verified before startup"
+        );
+        fixture.provider.shutdown().await.unwrap();
+    })
+    .await
+    .expect("MCP selection ordering regression timed out");
+}
+
 impl Drop for Fixture {
     fn drop(&mut self) {
         self.server.abort();
@@ -241,7 +321,11 @@ impl Drop for Fixture {
 async fn mcp_failures_keep_prompt_and_catalog_available() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let fixture = Fixture::new(&["broken", "disabled", "healthy"]).await;
-        let output = fixture.provider.prompt(fixture.prompt()).await.unwrap();
+        let output = fixture
+            .provider
+            .session_prompt_and_collect(fixture.prompt())
+            .await
+            .unwrap();
         assert!(output.event.iter().any(
             |event| matches!(event, crate::provider::ProviderEvent::Message {
                     update: crate::provider::MessageUpdate::Completed { text }, ..
@@ -370,6 +454,23 @@ async fn mcp_timeout_preserves_healthy_servers_and_session() {
         .unwrap();
         assert!(failed["stalled"].contains("timed out"));
         assert!(!failed.contains_key("healthy"));
+        assert!(
+            fixture
+                .request
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|method| method == "session.mcp.listConfigured")
+        );
+        assert!(
+            !fixture
+                .request
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|method| method == "session.mcp.list"),
+            "selection must not materialize or wait for servers"
+        );
         assert_eq!(
             fixture
                 .request
@@ -388,7 +489,11 @@ async fn mcp_timeout_preserves_healthy_servers_and_session() {
                 .iter()
                 .any(|method| method == "session.destroy")
         );
-        let output = fixture.provider.prompt(fixture.prompt()).await.unwrap();
+        let output = fixture
+            .provider
+            .session_prompt_and_collect(fixture.prompt())
+            .await
+            .unwrap();
         assert!(output.event.iter().any(
             |event| matches!(event, crate::provider::ProviderEvent::Message {
                     update: crate::provider::MessageUpdate::Completed { text }, ..

@@ -114,6 +114,7 @@ mod test {
     use tokio::sync::Notify;
 
     struct DiscoveryProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         release: Notify,
         calls: AtomicUsize,
         unavailable_reason: Option<&'static str>,
@@ -138,8 +139,11 @@ mod test {
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
         fn descriptor(&self) -> ProviderDescriptor {
@@ -150,12 +154,31 @@ mod test {
             }
         }
 
-        async fn prompt_stream(
+        async fn session_events(
             &self,
-            _: ProviderRequest,
-            _: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            Err(anyhow::anyhow!("catalog discovery must not prompt").into())
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
         }
 
         async fn mcp_configuration(&self, _: ProviderCatalogRequest) -> Result<Vec<McpDefinition>> {
@@ -170,6 +193,16 @@ mod test {
             let mut failed = server("unwired", McpStatus::Failed);
             failed.status_detail = Some("initialize connection closed".into());
             Ok(vec![server("working", McpStatus::Connected), failed])
+        }
+    }
+
+    impl DiscoveryProvider {
+        async fn run_native(
+            &self,
+            _: ProviderRequest,
+            _: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
+            Err(anyhow::anyhow!("catalog discovery must not prompt").into())
         }
     }
 
@@ -204,6 +237,7 @@ mod test {
     #[tokio::test]
     async fn closing_discovery_cancels_the_retained_provider_request() {
         let provider = Arc::new(DiscoveryProvider {
+            fixture_events: Default::default(),
             release: Notify::new(),
             calls: AtomicUsize::new(0),
             unavailable_reason: None,
@@ -220,6 +254,7 @@ mod test {
     #[tokio::test]
     async fn known_credential_failure_stays_unavailable_while_other_servers_load() {
         let provider = Arc::new(DiscoveryProvider {
+            fixture_events: Default::default(),
             release: Notify::new(),
             calls: AtomicUsize::new(0),
             unavailable_reason: Some("credential reference is unset"),
@@ -237,6 +272,7 @@ mod test {
     #[tokio::test]
     async fn cold_requests_share_discovery_and_preserve_individual_server_failures() {
         let provider = Arc::new(DiscoveryProvider {
+            fixture_events: Default::default(),
             release: Notify::new(),
             calls: AtomicUsize::new(0),
             unavailable_reason: None,

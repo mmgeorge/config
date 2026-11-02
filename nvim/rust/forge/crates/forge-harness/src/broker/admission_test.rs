@@ -4,13 +4,50 @@ struct PreparationProbe {
     fail: bool,
 }
 
+/// Reject host completion when its presentation receiver has disappeared.
+#[tokio::test]
+async fn closed_publication_cannot_complete_an_exchange() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let (sink, stream) = publication::channel();
+    broker.event_sink = Some(sink);
+    drop(stream);
+    let error = broker
+        .run_interaction(
+            "Publication must finish before this result".into(),
+            PromptMode::Chat,
+            Some(ExchangeAdmission::chat(
+                "Publication must finish before this result".into(),
+            )),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind),
+        Some(std::io::ErrorKind::BrokenPipe)
+    );
+    assert!(
+        broker
+            .store
+            .list_exchange(&broker.session.id)?
+            .iter()
+            .all(|exchange| exchange.state() != ExchangeState::Complete)
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn admission_skips_completed_transcript_but_settles_running_exchange() -> Result<()> {
     for completed in [true, false] {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let (mut previous, _, _) = broker.interaction_for_turn("previous", true, 10).await?;
+        let (mut previous, _, _) = broker
+            .test_stage_interaction_for_turn("previous", true, 10)
+            .await?;
         if completed {
             previous.finish(crate::exchange::ExchangeOutcome::Complete, 20)?;
         }
@@ -19,7 +56,9 @@ async fn admission_skips_completed_transcript_but_settles_running_exchange() -> 
             let connection = rusqlite::Connection::open(data.path().join("harness.sqlite3"))?;
             connection.execute("UPDATE exchange_record SET payload=json_set(payload,'$.node_list','invalid transcript') WHERE id=?1", [&previous.id])?;
         }
-        let (next, new_runtime, events) = broker.interaction_for_turn("next", true, 30).await?;
+        let (next, new_runtime, events) = broker
+            .test_stage_interaction_for_turn("next", true, 30)
+            .await?;
         assert!(new_runtime);
         assert_ne!(next.id, previous.id);
         assert_eq!(next.ordinal, previous.ordinal + 1);
@@ -50,6 +89,7 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
         });
         let tool_ran = Arc::new(AtomicBool::new(false));
         broker.provider = Arc::new(CheckpointProvider {
+            fixture_events: Default::default(),
             preparation: Some(preparation.clone()),
             started: Arc::new(Notify::new()),
             tool_ran: tool_ran.clone(),

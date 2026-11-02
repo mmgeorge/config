@@ -1,4 +1,5 @@
 mod future;
+pub(crate) use future::future_bytes;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

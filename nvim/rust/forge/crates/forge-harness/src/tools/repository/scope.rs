@@ -33,9 +33,24 @@ pub struct RepositoryToolScope {
     diff: Arc<DiffEngine>,
     active: AtomicBool,
     cancelled: Arc<AtomicBool>,
+    authority: std::sync::RwLock<Option<crate::tools::TaskAuthority>>,
 }
 
 pub(crate) struct RepositoryToolLease(Arc<RepositoryToolScope>);
+
+impl RepositoryToolLease {
+    pub(crate) fn bind_authority(
+        &self,
+        authority: Option<crate::tools::TaskAuthority>,
+    ) -> Result<()> {
+        *self
+            .0
+            .authority
+            .write()
+            .map_err(|_| anyhow::anyhow!("repository authority lock poisoned"))? = authority;
+        Ok(())
+    }
+}
 
 impl Drop for RepositoryToolLease {
     fn drop(&mut self) {
@@ -88,6 +103,7 @@ impl RepositoryToolScope {
             diff,
             active: AtomicBool::new(true),
             cancelled,
+            authority: std::sync::RwLock::new(None),
         });
         Ok((Arc::clone(&scope), RepositoryToolLease(scope)))
     }
@@ -97,6 +113,14 @@ impl RepositoryToolScope {
             self.active.load(Ordering::Acquire) && !self.cancelled.load(Ordering::Acquire),
             "repository inspection belongs to an inactive interaction"
         );
+        if let Some(authority) = self
+            .authority
+            .read()
+            .map_err(|_| anyhow::anyhow!("repository authority lock poisoned"))?
+            .clone()
+        {
+            authority.validate_scope()?;
+        }
         Ok(())
     }
 

@@ -40,6 +40,35 @@ pub(crate) struct SessionTaskController {
 }
 
 impl SessionTaskController {
+    /// Serialize provider goal writes independently from synchronous task mutations.
+    pub(crate) fn native_goal_lane(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.admission.native_goal_lane()
+    }
+
+    pub(crate) fn native_goal_written(&self) -> Result<u64> {
+        self.admission.native_goal_written()
+    }
+    pub(crate) fn native_goal_epoch(&self) -> u64 {
+        self.admission.native_goal_epoch()
+    }
+    pub(crate) fn mark_native_goal_uncertain(&self) {
+        self.admission.mark_native_goal_uncertain();
+    }
+    pub(crate) fn ensure_native_goal_certain(&self) -> Result<()> {
+        self.admission.ensure_native_goal_certain()
+    }
+    pub(crate) fn native_goal_is_uncertain(&self) -> bool {
+        self.admission.native_goal_is_uncertain()
+    }
+    pub(crate) fn reset_native_goal_generation(&self) -> Result<()> {
+        self.admission.reset_native_goal_generation()
+    }
+    pub(crate) fn acknowledge_native_goal(&self, epoch: u64) {
+        self.admission.acknowledge_native_goal(epoch);
+    }
+    pub(crate) async fn wait_native_goal_acknowledged(&self, epoch: u64) {
+        self.admission.wait_native_goal_acknowledged(epoch).await;
+    }
     /// Commit a typed observation under the task revision that admitted its operation.
     pub(crate) fn apply(
         &self,
@@ -64,6 +93,37 @@ impl SessionTaskController {
             Self::apply_event(task, event, now_ms)?;
             Ok(((), effects))
         })
+    }
+
+    /// Commit a task observation and dependent artifacts while its working document stays fixed.
+    pub(crate) fn apply_with_plan_document(
+        &self,
+        store: &mut SqliteStore,
+        permit: &TaskPermit,
+        document: crate::plan::WorkingDocumentGuard<'_>,
+        event: super::TaskEvent,
+        effects: crate::storage::TaskEffects,
+        now_ms: i64,
+    ) -> Result<()> {
+        store.commit_task_effects_with_document(
+            &self.session_id,
+            permit,
+            now_ms,
+            document,
+            |active| {
+                let task = active.as_mut().context("session has no active task")?;
+                task.edit(|draft| {
+                    let previous = draft.clone();
+                    Self::apply_event(draft, event, now_ms)?;
+                    if !draft.same_contract(&previous) && draft.revision == previous.revision {
+                        draft.renew(now_ms);
+                    } else {
+                        draft.updated_at_ms = now_ms;
+                    }
+                    Ok(((), effects))
+                })
+            },
+        )
     }
 
     /// Interpret an event inside the controller-owned candidate update.
@@ -217,6 +277,47 @@ impl SessionTaskController {
 
     pub(crate) fn current(&self) -> Result<Option<Task>> {
         Ok(self.admission.runtime()?.active_task.clone())
+    }
+
+    pub(crate) fn callback_snapshot(&self) -> Result<(u64, Option<Task>)> {
+        self.admission.callback_snapshot()
+    }
+
+    pub(crate) fn with_callback_authority<T>(
+        &self,
+        generation: u64,
+        permit: Option<&TaskPermit>,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.admission
+            .with_callback_authority(generation, permit, commit)
+    }
+
+    /// Commit a prepared plan file write only while its exact task authority remains current.
+    ///
+    /// Perform rendering before this call. The closure may perform the short file CAS, but
+    /// must not await or mutate task storage because task commits acquire the same gate.
+    pub(crate) fn commit_plan_write<Output>(
+        &self,
+        permit: &TaskPermit,
+        write: impl FnOnce() -> Result<Output>,
+    ) -> Result<Output> {
+        self.admission.with_task_mutation(|| {
+            permit.validate(self.current()?.as_ref())?;
+            write()
+        })
+    }
+
+    /// Apply a synchronous dependent restore against one current task snapshot.
+    ///
+    /// The closure must not mutate task state or await. Task replacement, recovery, and
+    /// revocation remain excluded until the dependent restore and its publication finish.
+    pub(crate) fn with_task_snapshot<Output>(
+        &self,
+        restore: impl FnOnce(Option<Task>) -> Result<Output>,
+    ) -> Result<Output> {
+        self.admission
+            .with_task_mutation(|| restore(self.current()?))
     }
 
     /// Applies a task-specific mutation atomically against its admitted contract.
@@ -1194,6 +1295,124 @@ fn goal_view(task: &super::active::TaskSnapshot) -> Result<super::GoalSnapshot> 
 mod tests {
     use super::*;
     use crate::session::{HarnessSession, SessionStore, continuation::ContinuationBudget};
+
+    /// Reject task and artifact publication when an equal-version working document changed.
+    #[test]
+    fn changed_document_cannot_commit_task_effects() -> Result<()> {
+        let (root, mut store, controller) = SessionTaskController::test_goal();
+        let previous = controller.current()?.unwrap();
+        let artifact: crate::plan::PlanRecord = serde_json::from_value(serde_json::json!({
+            "id":"document-plan", "session_id":"session", "request":"Design the change",
+            "state":"generating", "working_path":"working.json", "model_revision":0,
+            "user_revision":0, "created_at_ms":1, "updated_at_ms":1
+        }))?;
+        let task = controller
+            .change(
+                &mut store,
+                Some(&previous.revision),
+                TaskChange::Install(Box::new(Task::plan(artifact.clone(), 2)?)),
+                2,
+            )?
+            .unwrap();
+        let files = crate::plan::PlanFileStore::new(root.path(), root.path());
+        let original = crate::plan::test_fixture("document-plan", "original");
+        files.create_working_document("session", "document-plan", &original)?;
+        let mut intervening = original.clone();
+        intervening.overview = "new content at the same version".into();
+        files.write_working_document_if_unchanged(
+            "session",
+            "document-plan",
+            &original,
+            &intervening,
+        )?;
+        let mut observed = artifact.clone();
+        observed.model_revision = 1;
+        let error = controller
+            .apply_with_plan_document(
+                &mut store,
+                &task.permit(),
+                files.guard_working_document(&original),
+                super::super::TaskEvent::PlanArtifactUpdated(observed.clone()),
+                Default::default(),
+                3,
+            )
+            .unwrap_err();
+        assert!(error.is::<crate::plan::WorkingDocumentChanged>());
+        assert_eq!(store.load_plan("document-plan")?.unwrap().model_revision, 0);
+        assert_eq!(controller.current()?.unwrap().revision, task.revision);
+
+        controller.apply_with_plan_document(
+            &mut store,
+            &task.permit(),
+            files.guard_working_document(&intervening),
+            super::super::TaskEvent::PlanArtifactUpdated(observed),
+            Default::default(),
+            4,
+        )?;
+        assert_eq!(store.load_plan("document-plan")?.unwrap().model_revision, 1);
+        Ok(())
+    }
+
+    /// Exclude task revocation through the final file write and reject the old permit afterward.
+    #[test]
+    fn plan_write_and_task_revocation_share_one_commit_boundary() -> Result<()> {
+        let (root, _store, controller) = SessionTaskController::test_goal();
+        let task = controller.current()?.unwrap();
+        let permit = task.permit();
+        let path = root.path().join("prepared-plan.txt");
+        let (entered, entry) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (attempted, attempt) = std::sync::mpsc::channel();
+        let (finished, finish) = std::sync::mpsc::channel();
+
+        let premature = std::thread::scope(|threads| -> Result<_> {
+            let writer_controller = controller.clone();
+            let writer_permit = permit.clone();
+            let writer_path = path.clone();
+            let writer = threads.spawn(move || {
+                writer_controller.commit_plan_write(&writer_permit, || {
+                    entered.send(())?;
+                    released.recv_timeout(std::time::Duration::from_secs(5))?;
+                    std::fs::write(&writer_path, "accepted before revocation")?;
+                    Ok(())
+                })
+            });
+            entry.recv_timeout(std::time::Duration::from_secs(5))?;
+            let revoker = controller.clone();
+            let data_root = root.path().to_owned();
+            let revision = task.revision.clone();
+            let revocation = threads.spawn(move || -> Result<()> {
+                let mut store = SqliteStore::open(&data_root)?;
+                attempted.send(())?;
+                revoker.change(&mut store, Some(&revision), TaskChange::Pause, 2)?;
+                finished.send(())?;
+                Ok(())
+            });
+            attempt.recv_timeout(std::time::Duration::from_secs(5))?;
+            let premature = finish.recv_timeout(std::time::Duration::from_millis(30));
+            release.send(())?;
+            writer.join().expect("plan writer fixture must not panic")?;
+            revocation
+                .join()
+                .expect("task revocation fixture must not panic")?;
+            Ok(premature)
+        })?;
+
+        assert!(matches!(
+            premature,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(controller.current()?.unwrap().status(), TaskStatus::Paused);
+        let error = controller
+            .commit_plan_write(&permit, || {
+                std::fs::write(&path, "stale write")?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.is::<super::super::StaleTask>());
+        assert_eq!(std::fs::read_to_string(path)?, "accepted before revocation");
+        Ok(())
+    }
 
     #[test]
     fn repeated_task_input_acknowledgements_preserve_first_acceptance() -> Result<()> {

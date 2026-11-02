@@ -8,6 +8,7 @@ pub mod file_change;
 pub mod handle;
 pub mod history_repair;
 pub mod input;
+mod intake;
 pub mod mcp;
 pub mod message_state;
 pub mod mock_stream;

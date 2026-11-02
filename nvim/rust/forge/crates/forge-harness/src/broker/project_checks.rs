@@ -32,44 +32,15 @@ impl HarnessBroker {
         Ok((!published).then_some(setup))
     }
 
-    /// Runs check discovery while retaining the original plan request and its task identity.
-    pub(super) async fn configure_plan_checks(
-        &mut self,
-        prompt: String,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        let completed = Box::pin(
-            self.advance_configured_plan((serde_json::to_value(self.snapshot()?)?, Vec::new())),
-        )
-        .await?;
-        let plan_id = self
-            .current_plan_id()?
-            .context("check setup has no pending plan")?;
-        let plan = self
-            .store
-            .load_plan(&plan_id)?
-            .context("pending plan is missing")?;
-        if plan.state != PlanState::ConfiguringChecks {
-            return Ok(completed);
-        }
-        if self.find_active_interaction_elicitation()?.is_some() {
-            return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
-        }
-        let admission = ExchangeAdmission::chat(prompt);
-        self.observer.set_check_editing(true)?;
-        self.check_setup = true;
-        let result = self
-            .run_interaction(
-                PlanPrompt::checks_setup(&plan.request),
-                PromptMode::Chat,
-                Some(admission),
-            )
-            .await;
-        self.check_setup = false;
-        result
-    }
-
     /// Starts the retained plan only after this session records a matching configuration publication.
     pub(super) async fn advance_configured_plan(
+        &mut self,
+        result: (Value, Vec<SessionEvent>),
+    ) -> Result<(Value, Vec<SessionEvent>)> {
+        self.advance_configured_plan_now(result)
+    }
+
+    pub(super) fn advance_configured_plan_now(
         &mut self,
         result: (Value, Vec<SessionEvent>),
     ) -> Result<(Value, Vec<SessionEvent>)> {
@@ -112,11 +83,16 @@ impl HarnessBroker {
             .plan_file
             .read_working_document(&self.session.id, &plan_id)?;
         if document.design.is_none() {
+            let original = document.clone();
             document.design = Some(crate::plan::DeclarationDesign::open(Path::new(
                 &self.session.workspace,
             ))?);
-            self.plan_file
-                .write_working_document(&self.session.id, &plan_id, &document)?;
+            self.plan_file.write_working_document_if_unchanged(
+                &self.session.id,
+                &plan_id,
+                &original,
+                &document,
+            )?;
         }
         PlanStateMachine::apply(&mut plan, PlanEvent::ChecksConfigured, self.clock.now_ms())?;
         let task = self
@@ -174,6 +150,7 @@ impl HarnessBroker {
         let mut document = self
             .plan_file
             .read_working_document(&self.session.id, plan_id)?;
+        let original = document.clone();
         let Some(design) = &mut document.design else {
             return Ok(false);
         };
@@ -198,8 +175,9 @@ impl HarnessBroker {
         }
         design.check_configuration = Some(snapshot);
         let rendered = self.plan_file.render_review(&document)?;
-        let (_, _, digest) = self.plan_file.persist_review_draft(
+        let (_, _, digest) = self.plan_file.persist_review_draft_if_unchanged(
             &self.session.id,
+            &original,
             crate::plan::PlanReviewRevision::new(plan_id, document, rendered)?,
             None,
         )?;
@@ -293,26 +271,5 @@ impl HarnessBroker {
             _ => anyhow::bail!("unknown checks operation"),
         };
         Ok((result, Vec::new()))
-    }
-
-    pub(super) async fn check_task_files(
-        &mut self,
-        execution: &PlanExecutionRecord,
-    ) -> Result<Option<Vec<String>>> {
-        let Some(id) = &execution.baseline_checkpoint else {
-            return Ok(None);
-        };
-        let baseline = self
-            .store
-            .load_checkpoint(id)?
-            .context("execution baseline checkpoint is missing")?;
-        let current = self.capture_workspace_checkpoint().await?;
-        Ok(Some(
-            baseline
-                .changed_paths(&current)?
-                .into_iter()
-                .map(|path| path.as_str().to_owned())
-                .collect(),
-        ))
     }
 }

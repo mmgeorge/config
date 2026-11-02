@@ -36,6 +36,7 @@ impl IdleReader {
 
 impl BackgroundDelivery {
     /// Register the durable observer without borrowing an invocation's short-lived stream.
+    #[cfg(test)]
     pub(super) async fn subscribe(
         &self,
         owner: ExecutionOwner,
@@ -48,6 +49,11 @@ impl BackgroundDelivery {
             });
         self.sink.lock().await.insert(key, sink);
         stream
+    }
+
+    /// Attach the shared session publisher before a native reader can emit events.
+    pub(super) async fn attach(&self, owner: &ExecutionOwner, sink: ProviderEventSink) {
+        self.sink.lock().await.insert(owner.runtime_key(), sink);
     }
 
     /// Get the registered same-owner session delivery channel.
@@ -69,7 +75,7 @@ impl BackgroundDelivery {
         Ok(())
     }
 
-    /// Drain background evidence while idle, yielding only between complete publications.
+    /// Drain retained session evidence throughout idle periods, yielding between publications.
     pub(super) async fn start(
         &self,
         key: String,
@@ -84,38 +90,37 @@ impl BackgroundDelivery {
         if let Some(previous) = previous {
             previous.stop().await?;
         }
-        if self.sink(&key).await.is_none() {
+        let Some(failure_sink) = self.sink(&key).await else {
             return Ok(());
-        }
+        };
         let (stop, mut stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
-            let mut connection = tokio::select! {
-                biased;
-                _ = &mut stopped => return Ok(()),
-                connection = connection.lock() => connection,
-            };
-            if !connection
-                .process
-                .normalization
-                .has_pending_background_tools()
-            {
-                return Ok(());
-            }
-            loop {
-                let received = tokio::select! {
+            let result: Result<()> = async {
+                let mut connection = tokio::select! {
                     biased;
                     _ = &mut stopped => return Ok(()),
-                    received = connection.process.receive_message() => received?,
+                    connection = connection.lock() => connection,
                 };
-                connection.process.publish_idle_received(received).await?;
-                if !connection
-                    .process
-                    .normalization
-                    .has_pending_background_tools()
-                {
-                    return Ok(());
+                loop {
+                    let received = tokio::select! {
+                        biased;
+                        _ = &mut stopped => return Ok(()),
+                        received = connection.process.receive_message() => received?,
+                    };
+                    connection.process.publish_idle_received(received).await?;
                 }
             }
+            .await;
+            if let Err(error) = &result {
+                let failure = match error.downcast_ref::<crate::provider::ProviderError>() {
+                    Some(crate::provider::ProviderError::Observation(failure)) => {
+                        crate::provider::events::EventDeliveryError::Observation(failure.clone())
+                    }
+                    _ => crate::provider::events::EventDeliveryError::transport(error),
+                };
+                failure_sink.fail(failure);
+            }
+            result
         });
         let reader = IdleReader { stop, task };
         let displaced = {
@@ -528,12 +533,12 @@ mod test {
                         workspace: workspace.clone(),
                         access: Default::default(),
                         approval_mode: ApprovalMode::Allow,
-                        provider_session_id: Some("thread".into()),
+                        provider_session_id: Some("thread".to_owned().try_into().unwrap()),
                     },
                 );
                 assert_eq!(
                     provider.initialize_session(request).await?,
-                    Some("thread".into())
+                    Some("thread".to_owned().try_into()?)
                 );
                 finish
                     .send(())

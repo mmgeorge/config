@@ -28,6 +28,22 @@ struct PendingApproval {
     response: oneshot::Sender<ApprovalResolution>,
     resolution_sink: Option<ProviderEventSink>,
     directory_policy: Option<Arc<DirectoryPolicy>>,
+    authority: Option<Arc<ApprovalAuthority>>,
+}
+
+/// Serialize retirement with approval admission and persistent decisions for one native generation.
+#[derive(Default)]
+pub(crate) struct ApprovalAuthority(Mutex<bool>);
+
+impl ApprovalAuthority {
+    /// Revoke this generation after any already-committing decision completes.
+    pub(crate) fn retire(&self) -> Result<()> {
+        *self
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval authority poisoned"))? = true;
+        Ok(())
+    }
 }
 
 struct PendingRegistration<'registry> {
@@ -287,9 +303,22 @@ impl PermissionCoordinator {
     pub async fn authorize(
         &self,
         approval_mode: ApprovalMode,
+        request: PermissionRequest,
+        address: Option<crate::provider::TurnAddress>,
+        event_sink: Option<&ProviderEventSink>,
+    ) -> Result<ApprovalResolution> {
+        self.authorize_scoped(approval_mode, request, address, event_sink, None)
+            .await
+    }
+
+    /// Evaluate approval under a revocable native callback generation.
+    pub(crate) async fn authorize_scoped(
+        &self,
+        approval_mode: ApprovalMode,
         mut request: PermissionRequest,
         address: Option<crate::provider::TurnAddress>,
         event_sink: Option<&ProviderEventSink>,
+        authority: Option<Arc<ApprovalAuthority>>,
     ) -> Result<ApprovalResolution> {
         let directory_policy = address
             .as_ref()
@@ -504,7 +533,7 @@ impl PermissionCoordinator {
             }
         }
         view.execution_owner = execution_owner;
-        self.wait_for_approval(view, address, event_sink, directory_policy)
+        self.wait_for_approval(view, address, event_sink, directory_policy, authority)
             .await
     }
 
@@ -555,7 +584,7 @@ impl PermissionCoordinator {
                 ],
             }],
         };
-        self.wait_for_approval(view, None, Some(event_sink), None)
+        self.wait_for_approval(view, None, Some(event_sink), None, None)
             .await
     }
 
@@ -565,6 +594,7 @@ impl PermissionCoordinator {
         _address: Option<crate::provider::TurnAddress>,
         event_sink: Option<&ProviderEventSink>,
         directory_policy: Option<Arc<DirectoryPolicy>>,
+        authority: Option<Arc<ApprovalAuthority>>,
     ) -> Result<ApprovalResolution> {
         let id = view.id.clone();
         let timeout = self
@@ -589,6 +619,19 @@ impl PermissionCoordinator {
         let (sender, mut receiver) = oneshot::channel();
         let token = Uuid::new_v4();
         {
+            let generation = authority
+                .as_ref()
+                .map(|authority| {
+                    authority
+                        .0
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("approval authority poisoned"))
+                })
+                .transpose()?;
+            anyhow::ensure!(
+                !generation.as_ref().is_some_and(|retired| **retired),
+                "provider approval generation is retired"
+            );
             let mut pending = self
                 .pending_map
                 .lock()
@@ -605,6 +648,7 @@ impl PermissionCoordinator {
                     response: sender,
                     resolution_sink: event_sink.cloned(),
                     directory_policy,
+                    authority: authority.clone(),
                 },
             );
         }
@@ -630,14 +674,23 @@ impl PermissionCoordinator {
         tokio::select! {
             result = &mut receiver => result.with_context(|| format!("approval request {id} was cancelled")),
             () = expiry => {
-                let pending = self.pending_map.lock().map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?.remove(&id);
-                if let Some(mut pending) = pending {
-                    pending.view.resolution_source = ResolutionSource::Timeout;
-                    if let Some(owner) = &pending.view.execution_owner {
-                        self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?
-                            .insert(owner.clone(), format!("Approval {} was automatically rejected because its timeout expired. This was not an explicit user rejection. The existing user instruction and permissions remain in effect. Continue authorized work, avoid repeating the expired request, and do not ask whether to continue work the user already requested.", pending.view.id));
-                        self.publish_timeout_feedback(owner)?;
+                let pending = {
+                    let generation = authority.as_ref().map(|authority| authority.0.lock().map_err(|_| anyhow::anyhow!("approval authority poisoned"))).transpose()?;
+                    if generation.as_ref().is_some_and(|retired| **retired) {
+                        return Ok(ApprovalResolution::Cancel);
                     }
+                    let mut pending = self.pending_map.lock().map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?.remove(&id);
+                    if let Some(pending) = &mut pending {
+                        pending.view.resolution_source = ResolutionSource::Timeout;
+                        if let Some(owner) = &pending.view.execution_owner {
+                            self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?
+                                .insert(owner.clone(), format!("Approval {} was automatically rejected because its timeout expired. This was not an explicit user rejection. The existing user instruction and permissions remain in effect. Continue authorized work, avoid repeating the expired request, and do not ask whether to continue work the user already requested.", pending.view.id));
+                            self.publish_timeout_feedback(owner)?;
+                        }
+                    }
+                    pending
+                };
+                if let Some(pending) = pending {
                     Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view).await?;
                     Ok(ApprovalResolution::TimedOut)
                 } else {
@@ -691,125 +744,161 @@ impl PermissionCoordinator {
         answer_list: &[ApprovalAnswer],
         event_sink: Option<&ProviderEventSink>,
     ) -> Result<ApprovalRequestView> {
-        let (pending, resolution, rule_list, directory_list) = {
-            let mut pending_map = self
+        let (pending, resolution, directory_list, persisted) = {
+            let (token, authority) = self
                 .pending_map
                 .lock()
-                .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
-            let std::collections::btree_map::Entry::Occupied(entry) =
-                pending_map.entry(approval_id.to_owned())
-            else {
-                anyhow::bail!("approval request is no longer pending: {approval_id}");
-            };
-            let pending = entry.get();
+                .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?
+                .get(approval_id)
+                .map(|pending| (pending.token, pending.authority.clone()))
+                .with_context(|| format!("approval request is no longer pending: {approval_id}"))?;
+            let generation = authority
+                .as_ref()
+                .map(|authority| {
+                    authority
+                        .0
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("approval authority poisoned"))
+                })
+                .transpose()?;
             anyhow::ensure!(
-                !pending
-                    .view
-                    .deadline
-                    .as_ref()
-                    .is_some_and(|deadline| deadline.expired(0)),
-                "approval request timed out: {approval_id}"
+                !generation.as_ref().is_some_and(|retired| **retired),
+                "provider approval generation is retired"
             );
-            anyhow::ensure!(
-                answer_list.len() == pending.view.item_list.len(),
-                "every approval item requires one answer"
-            );
-            let mut answer_map = BTreeMap::new();
-            for answer in answer_list {
-                anyhow::ensure!(
-                    answer_map
-                        .insert(&answer.item_id, &answer.choice_id)
-                        .is_none(),
-                    "duplicate approval item: {}",
-                    answer.item_id
-                );
-            }
-            let mut resolution = ApprovalResolution::AllowOnce;
-            let mut rule_map = BTreeMap::new();
-            let mut directory_list = Vec::new();
-            for item in &pending.view.item_list {
-                let choice_id = answer_map
-                    .get(&item.id)
-                    .with_context(|| format!("missing approval item: {}", item.id))?;
-                let choice = item
-                    .choice_list
-                    .iter()
-                    .find(|choice| &choice.id == *choice_id)
-                    .with_context(|| format!("unknown approval choice: {choice_id}"))?;
-                if let Some(directory) = &choice.directory
-                    && !directory_list.contains(directory)
-                {
-                    directory_list.push(directory.clone());
-                }
-                match choice.resolution {
-                    ApprovalResolution::Cancel => resolution = ApprovalResolution::Cancel,
-                    ApprovalResolution::TimedOut
-                    | ApprovalResolution::DenyOnce
-                    | ApprovalResolution::DenyExact
-                    | ApprovalResolution::DenyBroad
-                        if resolution != ApprovalResolution::Cancel =>
-                    {
-                        resolution = ApprovalResolution::DenyOnce
-                    }
-                    _ => {}
-                }
-                let decision = match choice.resolution {
-                    ApprovalResolution::AllowExact | ApprovalResolution::AllowBroad => {
-                        Some(PermissionDecision::Allow)
-                    }
-                    ApprovalResolution::DenyExact | ApprovalResolution::DenyBroad => {
-                        Some(PermissionDecision::Deny)
-                    }
-                    _ => None,
+            let (pending, resolution, rule_list, directory_list) = {
+                let mut pending_map = self
+                    .pending_map
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
+                let std::collections::btree_map::Entry::Occupied(entry) =
+                    pending_map.entry(approval_id.to_owned())
+                else {
+                    anyhow::bail!("approval request is no longer pending: {approval_id}");
                 };
-                if let Some(decision) = decision {
-                    for rule in &choice.rule_list {
-                        if let Some(previous) = rule_map.insert(rule.clone(), decision) {
-                            anyhow::ensure!(
-                                previous == decision,
-                                "conflicting approval decisions for {} {}",
-                                rule.0,
-                                rule.1
-                            );
+                let pending = entry.get();
+                anyhow::ensure!(
+                    pending.token == token,
+                    "approval request was replaced: {approval_id}"
+                );
+                anyhow::ensure!(
+                    !pending
+                        .view
+                        .deadline
+                        .as_ref()
+                        .is_some_and(|deadline| deadline.expired(0)),
+                    "approval request timed out: {approval_id}"
+                );
+                anyhow::ensure!(
+                    answer_list.len() == pending.view.item_list.len(),
+                    "every approval item requires one answer"
+                );
+                let mut answer_map = BTreeMap::new();
+                for answer in answer_list {
+                    anyhow::ensure!(
+                        answer_map
+                            .insert(&answer.item_id, &answer.choice_id)
+                            .is_none(),
+                        "duplicate approval item: {}",
+                        answer.item_id
+                    );
+                }
+                let mut resolution = ApprovalResolution::AllowOnce;
+                let mut rule_map = BTreeMap::new();
+                let mut directory_list = Vec::new();
+                for item in &pending.view.item_list {
+                    let choice_id = answer_map
+                        .get(&item.id)
+                        .with_context(|| format!("missing approval item: {}", item.id))?;
+                    let choice = item
+                        .choice_list
+                        .iter()
+                        .find(|choice| &choice.id == *choice_id)
+                        .with_context(|| format!("unknown approval choice: {choice_id}"))?;
+                    if let Some(directory) = &choice.directory
+                        && !directory_list.contains(directory)
+                    {
+                        directory_list.push(directory.clone());
+                    }
+                    match choice.resolution {
+                        ApprovalResolution::Cancel => resolution = ApprovalResolution::Cancel,
+                        ApprovalResolution::TimedOut
+                        | ApprovalResolution::DenyOnce
+                        | ApprovalResolution::DenyExact
+                        | ApprovalResolution::DenyBroad
+                            if resolution != ApprovalResolution::Cancel =>
+                        {
+                            resolution = ApprovalResolution::DenyOnce
+                        }
+                        _ => {}
+                    }
+                    let decision = match choice.resolution {
+                        ApprovalResolution::AllowExact | ApprovalResolution::AllowBroad => {
+                            Some(PermissionDecision::Allow)
+                        }
+                        ApprovalResolution::DenyExact | ApprovalResolution::DenyBroad => {
+                            Some(PermissionDecision::Deny)
+                        }
+                        _ => None,
+                    };
+                    if let Some(decision) = decision {
+                        for rule in &choice.rule_list {
+                            if let Some(previous) = rule_map.insert(rule.clone(), decision) {
+                                anyhow::ensure!(
+                                    previous == decision,
+                                    "conflicting approval decisions for {} {}",
+                                    rule.0,
+                                    rule.1
+                                );
+                            }
                         }
                     }
                 }
-            }
-            let rule_list = if resolution == ApprovalResolution::Cancel {
-                Vec::new()
-            } else {
-                rule_map
-                    .into_iter()
-                    .map(|((category, pattern), decision)| (category, pattern, decision))
-                    .collect()
+                let rule_list = if resolution == ApprovalResolution::Cancel {
+                    Vec::new()
+                } else {
+                    rule_map
+                        .into_iter()
+                        .map(|((category, pattern), decision)| (category, pattern, decision))
+                        .collect()
+                };
+                anyhow::ensure!(
+                    !pending.response.is_closed(),
+                    "provider no longer waits for approval {approval_id}"
+                );
+                let pending = entry.remove();
+                if resolution != ApprovalResolution::AllowOnce {
+                    directory_list.clear();
+                }
+                (pending, resolution, rule_list, directory_list)
             };
-            anyhow::ensure!(
-                !pending.response.is_closed(),
-                "provider no longer waits for approval {approval_id}"
-            );
-            let pending = entry.remove();
-            if resolution != ApprovalResolution::AllowOnce {
-                directory_list.clear();
-            }
-            (pending, resolution, rule_list, directory_list)
+            let persisted = (|| -> Result<()> {
+                if !directory_list.is_empty() {
+                    pending
+                        .directory_policy
+                        .as_ref()
+                        .context("directory policy is no longer available")?
+                        .save(&directory_list)?;
+                }
+                if !rule_list.is_empty() {
+                    let mut store = self
+                        .store
+                        .write()
+                        .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?;
+                    if resolution == ApprovalResolution::AllowOnce
+                        && rule_list
+                            .iter()
+                            .all(|(_, _, decision)| *decision == PermissionDecision::Allow)
+                    {
+                        store.grant_approved(&rule_list)?;
+                    } else {
+                        store.set_rule_list(&rule_list)?;
+                    }
+                }
+                Ok(())
+            })();
+            (pending, resolution, directory_list, persisted)
         };
         let event_sink = pending.resolution_sink.as_ref().or(event_sink);
-        let persisted = (|| -> Result<()> {
-            if !directory_list.is_empty() {
-                pending
-                    .directory_policy
-                    .as_ref()
-                    .context("directory policy is no longer available")?
-                    .save(&directory_list)?;
-            }
-            if !rule_list.is_empty() {
-                self.store
-                    .write()
-                    .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
-                    .set_rule_list(&rule_list)?;
-            }
-            Ok(())
-        })();
         if let Err(error) = persisted {
             Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
             return Err(error);
@@ -884,6 +973,29 @@ impl PermissionCoordinator {
         owner: &crate::provider::ExecutionOwner,
         event_sink: Option<&ProviderEventSink>,
     ) -> Result<()> {
+        let pending_list = self.take_owner_approvals(owner)?;
+        for pending in pending_list {
+            let _ = pending.response.send(ApprovalResolution::Cancel);
+            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
+        }
+        Ok(())
+    }
+
+    /// Begin cancellation synchronously after callback authority is checked.
+    pub(crate) fn cancel_owner_immediate(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> Result<()> {
+        for pending in self.take_owner_approvals(owner)? {
+            let _ = pending.response.send(ApprovalResolution::Cancel);
+        }
+        Ok(())
+    }
+
+    fn take_owner_approvals(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> Result<Vec<PendingApproval>> {
         self.take_timeout_feedback(owner)?;
         let pending_list = {
             let mut pending_map = self
@@ -900,11 +1012,7 @@ impl PermissionCoordinator {
                 .filter_map(|id| pending_map.remove(&id))
                 .collect::<Vec<_>>()
         };
-        for pending in pending_list {
-            let _ = pending.response.send(ApprovalResolution::Cancel);
-            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
-        }
-        Ok(())
+        Ok(pending_list)
     }
 
     async fn emit_lifecycle(
@@ -1181,6 +1289,11 @@ pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) ->
         _ => false,
     })
 }
+
+pub use forge_provider_api::approval::{
+    ApprovalAnswer, ApprovalChoice, ApprovalCommand, ApprovalItem, ApprovalRequestView,
+    ApprovalResolution,
+};
 
 #[cfg(test)]
 mod test {
@@ -3014,8 +3127,3 @@ mod test {
         }
     }
 }
-
-pub use forge_provider_api::approval::{
-    ApprovalAnswer, ApprovalChoice, ApprovalCommand, ApprovalItem, ApprovalRequestView,
-    ApprovalResolution,
-};

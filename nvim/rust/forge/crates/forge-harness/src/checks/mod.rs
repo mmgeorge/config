@@ -30,6 +30,7 @@ pub use config::{
     ConfigSnapshot,
 };
 pub use inputs::{CheckInput, CheckInputMap, CheckInputSource, CheckInputType, CheckInputValues};
+pub(crate) use model::PreparedCheckRun;
 pub use model::{CheckEvent, CheckEventKind, CheckRun, CheckSetupState, CheckState, CommandCheck};
 pub use preview::CheckPreview;
 pub(crate) use preview::plan as preview_plan;
@@ -43,5 +44,5 @@ pub use selection::{
 pub(crate) use supervisor::CheckAdmission;
 pub use supervisor::{CheckSupervisor, CheckSupervisorContext};
 pub(crate) use tools::CheckAuthority;
-pub(crate) use tools::CheckToolScope;
 pub(crate) use tools::ConfigureChecks;
+pub(crate) use tools::{CheckToolLease, CheckToolScope};

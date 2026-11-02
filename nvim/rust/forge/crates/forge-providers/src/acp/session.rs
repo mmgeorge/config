@@ -13,10 +13,12 @@ pub struct AcpSessionState {
     kind: ProviderKind,
     permission: Arc<dyn ScopedPermissions>,
     active: RwLock<Option<ActiveTurn>>,
+    retained: RwLock<Option<ActiveTurn>>,
     operation: RwLock<Option<ActiveOperation>>,
     output: Mutex<forge_provider_api::completion::ProviderCompletion>,
     catalog: RwLock<Value>,
     tool: Mutex<HashMap<(String, String), Value>>,
+    tool_owner: Mutex<HashMap<(String, String), TurnAddress>>,
     finished_tool: Mutex<HashSet<(String, String)>>,
     compaction: Mutex<HashMap<String, Compaction>>,
     children: Mutex<super::children::AcpChildren>,
@@ -26,6 +28,7 @@ pub struct AcpSessionState {
 #[derive(Clone)]
 /// Captures immutable callback routing for the admitted provider turn.
 struct ActiveTurn {
+    generation: Arc<()>,
     sink: ProviderEventSink,
 }
 
@@ -47,10 +50,12 @@ impl AcpSessionState {
             kind,
             permission,
             active: RwLock::new(None),
+            retained: RwLock::new(None),
             operation: RwLock::new(None),
             output: Mutex::new(forge_provider_api::completion::ProviderCompletion::default()),
             catalog: RwLock::new(json!({})),
             tool: Mutex::new(HashMap::new()),
+            tool_owner: Mutex::new(HashMap::new()),
             finished_tool: Mutex::new(HashSet::new()),
             compaction: Mutex::new(HashMap::new()),
             children: Mutex::new(super::children::AcpChildren::default()),
@@ -70,30 +75,48 @@ impl AcpSessionState {
             });
         }
         let scope = sink.invocation_scope()?.clone();
+        *self.retained.write().await = None;
         *self.output.lock().await = forge_provider_api::completion::ProviderCompletion::default();
         self.compaction.lock().await.clear();
         self.tool.lock().await.clear();
         self.finished_tool.lock().await.clear();
         self.message.lock().await.clear();
         *self.children.lock().await = super::children::AcpChildren::new(session_id.into(), scope);
-        *self.active.write().await = Some(ActiveTurn { sink });
+        *self.active.write().await = Some(ActiveTurn {
+            generation: Arc::new(()),
+            sink,
+        });
         Ok(())
     }
 
+    /// Publish live observations through active or retained original invocation ownership.
     pub async fn emit(&self, event: ProviderEvent) -> Result<(), ProviderError> {
-        let sink = if let Some(active) = self.active.read().await.as_ref() {
-            Some(active.sink.clone())
-        } else {
-            self.operation
-                .read()
-                .await
-                .as_ref()
-                .map(|operation| operation.sink.clone())
-        };
-        if let Some(sink) = sink {
-            sink.send_wait(event).await?;
-        }
+        let sink = self
+            .publication_sink()
+            .await
+            .context("ACP observation has no retained owner")?;
+        sink.send_wait(event).await?;
         Ok(())
+    }
+
+    /// Get the active operation's publisher before falling back to a settled invocation.
+    async fn publication_sink(&self) -> Option<ProviderEventSink> {
+        if let Some(active) = self.active.read().await.as_ref() {
+            return Some(active.sink.clone());
+        }
+        if let Some(operation) = self.operation.read().await.as_ref() {
+            return Some(operation.sink.clone());
+        }
+        self.retained
+            .read()
+            .await
+            .as_ref()
+            .map(|retained| retained.sink.clone())
+    }
+
+    /// Recognize observation context without granting permission to start new work.
+    async fn has_observation_context(&self) -> bool {
+        self.active.read().await.is_some() || self.retained.read().await.is_some()
     }
 
     pub async fn begin_compaction(
@@ -129,16 +152,10 @@ impl AcpSessionState {
     }
 
     async fn event_scope(&self) -> Result<EventScope> {
-        if let Some(active) = self.active.read().await.as_ref() {
-            return Ok(active.sink.scope().clone());
-        }
         Ok(self
-            .operation
-            .read()
+            .publication_sink()
             .await
-            .as_ref()
-            .context("ACP update has no active operation")?
-            .sink
+            .context("ACP update has no observation owner")?
             .scope()
             .clone())
     }
@@ -156,12 +173,9 @@ impl AcpSessionState {
 
     pub async fn scope(&self) -> Result<InvocationScope, ProviderError> {
         Ok(self
-            .active
-            .read()
+            .publication_sink()
             .await
-            .as_ref()
-            .context("ACP update has no active invocation")?
-            .sink
+            .context("ACP update has no invocation owner")?
             .invocation_scope()?
             .clone())
     }
@@ -291,9 +305,7 @@ impl AcpSessionState {
             Ok(())
         }
         .await;
-        *self.active.write().await = None;
-        self.tool.lock().await.clear();
-        self.finished_tool.lock().await.clear();
+        *self.retained.write().await = self.active.write().await.take();
         result
     }
 
@@ -332,14 +344,35 @@ impl AcpSessionState {
     }
 
     async fn authorize(&self, parameter: Value) -> Result<Value> {
-        ensure!(
-            self.active.read().await.is_some(),
-            "ACP permission request has no active turn"
-        );
-        let address = self
-            .address(parameter["sessionId"].as_str().unwrap_or_default())
+        let active = self
+            .active
+            .read()
             .await
-            .context("ACP permission request has no active session owner")?;
+            .clone()
+            .context("ACP permission request has no active turn")?;
+        let session_id = parameter["sessionId"].as_str().unwrap_or_default();
+        let address = if let Some(id) = parameter["toolCall"]["toolCallId"].as_str() {
+            self.tool_owner
+                .lock()
+                .await
+                .get(&(session_id.to_owned(), id.to_owned()))
+                .cloned()
+        } else {
+            None
+        };
+        let address = match address {
+            Some(address) => address,
+            None => self
+                .address(session_id)
+                .await
+                .context("ACP permission request has no active session owner")?,
+        };
+        if active.sink.invocation_scope()? != &address.scope {
+            return Err(ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+            )
+            .into());
+        }
         let supplied = &parameter["toolCall"];
         let item_id = supplied["toolCallId"].as_str();
         let session_id = parameter["sessionId"].as_str().unwrap_or_default();
@@ -362,6 +395,15 @@ impl AcpSessionState {
         }
         let request = super::permission::permission_request(self.kind, &tool)?;
         let resolution = self.permission.authorize(address, request).await?;
+        if !self
+            .active
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &active.generation))
+        {
+            return Ok(json!({"outcome":{"outcome":"cancelled"}}));
+        }
         if matches!(resolution, PermissionResponse::Allow)
             && let (Some(item_id), Some(observed)) = (item_id, &observed_tool)
         {
@@ -389,7 +431,7 @@ impl AcpSessionState {
 impl AcpSessionState {
     async fn handle_notification(&self, method: &str, parameter: Value) -> Result<()> {
         if method == "_claude/sdkMessage" && self.kind == ProviderKind::Claude {
-            if self.active.read().await.is_none()
+            if !self.has_observation_context().await
                 || !self
                     .is_root(parameter["sessionId"].as_str().unwrap_or_default())
                     .await
@@ -451,7 +493,7 @@ impl AcpSessionState {
         }
         let update = &parameter["update"];
         let session_id = parameter["sessionId"].as_str().unwrap_or_default();
-        if self.active.read().await.is_none()
+        if !self.has_observation_context().await
             && !matches!(
                 update["sessionUpdate"].as_str(),
                 Some("available_commands_update" | "config_option_update" | "current_mode_update")
@@ -463,6 +505,32 @@ impl AcpSessionState {
                 ))
         {
             return Ok(());
+        }
+        let idle_root = self.active.read().await.is_none() && self.is_root(session_id).await;
+        let starts_unowned_work = idle_root
+            && match update["sessionUpdate"].as_str() {
+                Some("subagent_spawned") => true,
+                Some("tool_call") => match update["toolCallId"].as_str() {
+                    Some(id) => !self
+                        .tool
+                        .lock()
+                        .await
+                        .contains_key(&(session_id.to_owned(), id.to_owned())),
+                    None => true,
+                },
+                _ => false,
+            };
+        if starts_unowned_work {
+            let failure = forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable;
+            let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
+                self.scope().await?,
+                forge_provider_api::lifecycle::ExecutionUpdate::ObservationLost {
+                    failure: failure.clone(),
+                    completion: None,
+                },
+            )?;
+            self.emit(ProviderEvent::Execution { observation }).await?;
+            return Err(ProviderError::Observation(failure).into());
         }
         let lifecycle = self.children.lock().await.lifecycle(session_id, update)?;
         if let Some(events) = lifecycle {
@@ -505,6 +573,18 @@ impl AcpSessionState {
                 let Some(id) = update["toolCallId"].as_str().filter(|id| !id.is_empty()) else {
                     return Ok(());
                 };
+                if let Some(address) = self.address(session_id).await {
+                    let mut owners = self.tool_owner.lock().await;
+                    let owner = owners
+                        .entry((session_id.to_owned(), id.to_owned()))
+                        .or_insert_with(|| address.clone());
+                    if owner != &address {
+                        return Err(ProviderError::Observation(
+                            forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                        )
+                        .into());
+                    }
+                }
                 let mut tool_map = self.tool.lock().await;
                 let first = !tool_map.contains_key(&(session_id.to_owned(), id.to_owned()));
                 let snapshot = tool_map
@@ -678,7 +758,7 @@ impl AcpSessionState {
                     })
                 {
                     self.output.lock().await.metrics.context_usage = Some(context.clone());
-                    if self.active.read().await.is_some() {
+                    if self.has_observation_context().await {
                         self.emit(ProviderEvent::Runtime {
                             scope: self.scope().await?,
                             update: RuntimeUpdate::ContextUsage { usage: context },
@@ -857,7 +937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_snapshots_are_scoped_to_the_native_session_and_cleared_on_finish() -> Result<()> {
+    async fn tool_snapshots_keep_original_scope_until_the_next_invocation() -> Result<()> {
         let state = AcpSessionState::new(ProviderKind::Claude, Arc::new(Deny));
         let (sink, _stream) = events::channel(InvocationScope::new(
             ExecutionOwner::root("host"),
@@ -875,7 +955,27 @@ mod tests {
         state
             .finish(forge_provider_api::turn::TurnOutcome::Completed)
             .await?;
+        assert!(
+            state
+                .tool
+                .lock()
+                .await
+                .contains_key(&("native".into(), "edit".into()))
+        );
+        let (next_sink, _next_stream) =
+            events::channel(InvocationScope::new(ExecutionOwner::root("host"), "next"));
+        state.begin("native", next_sink).await?;
         assert!(state.tool.lock().await.is_empty());
+        let error = state
+            .authorize(json!({"sessionId":"native","toolCall":{"toolCallId":"edit"},"options":[]}))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ProviderError>(),
+            Some(ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict
+            ))
+        ));
         Ok(())
     }
 }

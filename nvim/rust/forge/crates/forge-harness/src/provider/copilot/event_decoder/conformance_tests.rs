@@ -13,7 +13,7 @@ async fn collect(
         let mut decoder = CopilotEventDecoder::new(binding, String::new());
         let mut completion = ProviderCompletion {
             native: forge_provider_api::completion::ProviderCompletion {
-                provider_session_id: Some("native-session".into()),
+                provider_session_id: Some("native-session".to_owned().try_into().unwrap()),
                 runtime: crate::provider::ProviderRuntime {
                     provider: "Copilot CLI".into(),
                     model: None,

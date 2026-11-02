@@ -3,7 +3,7 @@ local root = vim.fn.getcwd()
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
 local executable = vim.g.forge_acp_test_binary or require("forge.builder").binary_path()
-assert(vim.fn.executable(executable) == 1, "build the release Forge host first")
+assert(vim.fn.executable(executable) == 1, "build the development Forge host first")
 local peer = data .. "/acp-peer.cjs"
 vim.fn.writefile(vim.split([[
 const readline = require('node:readline');
@@ -15,7 +15,7 @@ readline.createInterface({ input: process.stdin }).on('line', line => {
   let result = {};
   if (request.method === 'initialize') result = { protocolVersion: 1,
     agentCapabilities: { loadSession: true, sessionCapabilities: { subagents: {} } },
-    agentInfo: { name: 'fixture', version: '1.0.0' }, authMethods: [] };
+    agentInfo: { name: 'fixture', version: '0.99.1' }, authMethods: [] };
   if (request.method === 'session/new' || request.method === 'session/load') result = {
     sessionId: 'root', models: { currentModelId: 'haiku', availableModels: [{ modelId: 'haiku', name: 'Fixture' }] } };
   if (request.method === 'session/load') {
@@ -108,7 +108,7 @@ local collected = vim.wait(6000, function() return client._client.process == nil
 vim.fn.chdir(root)
 vim.fn.stdpath = original_stdpath
 if not success or not collected then
-  io.stderr:write(tostring(failure or "host was not collected"), "\n")
+  io.stderr:write(tostring(failure or "host was not collected"), "\n", table.concat(errors, "\n"), "\n")
   vim.cmd("cquit 1")
 end
 print("harness_acp_children_host: passed (simulated ACP peer, real host, native child isolation, root completion, tool ownership)")

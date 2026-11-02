@@ -13,6 +13,8 @@ pub(super) struct NativeGoalSelection {
     pub(super) provider_session_id: String,
     /// Canonical task authority observed when selecting the update.
     pub(super) revision: Option<crate::task::TaskRevision>,
+    /// Reject acknowledgments invalidated by another writer of this provider goal.
+    pub(super) transport_epoch: u64,
     /// Complete native goal state selected by the canonical task.
     pub(super) update: crate::provider::NativeGoalUpdate,
 }
@@ -238,7 +240,7 @@ impl SessionController {
                                     .as_deref()
                                     .context("delivery evidence is missing")?,
                             )?;
-                            let record = submission.reconcile(self.provider.as_ref()).await?;
+                            let record = self.reconcile_submission_current(&submission).await?;
                             if matches!(record.delivery, SubmissionState::Accepted { .. }) {
                                 let update = self
                                     .coordinator
@@ -451,6 +453,30 @@ impl SessionController {
         if !self.observer.native_goal_supported()? || !self.provider_ready().await {
             return Ok(());
         }
+        // Capture the current registry before taking the transport lane; no broker guard spans I/O.
+        let provider = self.provider_handle();
+        let registry = self.broker.lock().await.execution_registry();
+        let owner = crate::provider::ExecutionOwner::root(self.observer.session_id());
+        let lane = self.task_controller.native_goal_lane();
+        let _lane = match tokio::time::timeout(Duration::from_secs(30), lane.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.task_controller.mark_native_goal_uncertain();
+                let error = anyhow::Error::new(crate::provider::ProviderError::DeliveryUncertain {
+                    message: "native goal transport lane timed out; provider outcome is uncertain"
+                        .into(),
+                });
+                return Err(match registry.fence(&owner).await {
+                    Ok(()) => error,
+                    Err(cleanup) => error.context(cleanup),
+                });
+            }
+        };
+        anyhow::ensure!(
+            Arc::ptr_eq(&provider, &self.provider_handle()),
+            "provider changed before native goal transport acquired its lane"
+        );
+        self.task_controller.ensure_native_goal_certain()?;
         loop {
             // Capture the canonical task and provider identity before transport.
             let session = SqliteStore::read_only(&self.data_root)?
@@ -461,7 +487,10 @@ impl SessionController {
             };
             let desired = self.native_goal_selection(provider_session_id.clone())?;
             if applied.as_ref() == Some(&desired) {
-                return Ok(());
+                if self.acknowledge_native_goal_if_current(&desired)? {
+                    return Ok(());
+                }
+                continue;
             }
             let request = crate::provider::ProviderRequest {
                 execution_owner: None,
@@ -475,7 +504,7 @@ impl SessionController {
                 service_tier: session.service_tier,
                 access: session.access,
                 approval_mode: session.approval_mode,
-                provider_session_id: Some(provider_session_id),
+                provider_session_id: Some(provider_session_id.try_into()?),
                 submission: None,
                 recovered_input: Vec::new(),
                 control_context: None,
@@ -484,21 +513,82 @@ impl SessionController {
             if self.native_goal_selection(desired.provider_session_id.clone())? != desired {
                 continue;
             }
-            self.provider
-                .goal_status(request, desired.update.clone())
-                .await?;
-            // A stale acknowledgment cannot authorize input or mark its old state applied.
-            let current_session = SqliteStore::read_only(&self.data_root)?
-                .load_session(self.observer.session_id())?
-                .context("native goal session is missing")?;
-            if current_session.provider_session_id.as_deref() != Some(&desired.provider_session_id)
-                || self.native_goal_selection(desired.provider_session_id.clone())? != desired
+            let result = match tokio::time::timeout(
+                Duration::from_secs(30),
+                provider.goal_status(request, desired.update.clone()),
+            )
+            .await
             {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => {
+                    self.task_controller.mark_native_goal_uncertain();
+                    Err(error.context(crate::provider::ProviderError::DeliveryUncertain { message: "native goal synchronization failed after dispatch; provider outcome is uncertain".into() }))
+                }
+                Err(_) => {
+                    self.task_controller.mark_native_goal_uncertain();
+                    Err(crate::provider::ProviderError::DeliveryUncertain {
+                        message:
+                            "native goal synchronization timed out; provider outcome is uncertain"
+                                .into(),
+                    }
+                    .into())
+                }
+            };
+            let epoch = match self.task_controller.native_goal_written() {
+                Ok(epoch) => epoch,
+                Err(error) => {
+                    drop(_lane);
+                    return Err(match registry.fence(&owner).await {
+                        Ok(()) => error,
+                        Err(cleanup) => error.context(cleanup),
+                    });
+                }
+            };
+            if let Err(error) = result {
+                drop(_lane);
+                return Err(match registry.fence(&owner).await {
+                    Ok(()) => error,
+                    Err(cleanup) => error.context(cleanup),
+                });
+            }
+            if !Arc::ptr_eq(&provider, &self.provider_handle()) {
+                self.task_controller.mark_native_goal_uncertain();
+                drop(_lane);
+                let error = anyhow::Error::new(crate::provider::ProviderError::DeliveryUncertain {
+                    message: "provider changed during native goal transport".into(),
+                });
+                return Err(match registry.fence(&owner).await {
+                    Ok(()) => error,
+                    Err(cleanup) => error.context(cleanup),
+                });
+            }
+            // A stale acknowledgment cannot authorize input or mark its old state applied.
+            let mut expected = desired.clone();
+            expected.transport_epoch = epoch;
+            if !self.acknowledge_native_goal_if_current(&expected)? {
                 continue;
             }
-            *applied = Some(desired);
+            *applied = Some(expected);
             return Ok(());
         }
+    }
+
+    /// Acknowledge only while the captured task and provider session are still canonical.
+    fn acknowledge_native_goal_if_current(&self, expected: &NativeGoalSelection) -> Result<bool> {
+        self.task_controller.with_task_snapshot(|_| {
+            self.task_controller.ensure_native_goal_certain()?;
+            let session = SqliteStore::read_only(&self.data_root)?
+                .load_session(self.observer.session_id())?
+                .context("native goal session is missing")?;
+            if session.provider_session_id.as_deref() != Some(&expected.provider_session_id)
+                || self.native_goal_selection(expected.provider_session_id.clone())? != *expected
+            {
+                return Ok(false);
+            }
+            self.task_controller
+                .acknowledge_native_goal(expected.transport_epoch);
+            Ok(true)
+        })
     }
 
     /// Preserve suspended native tasks instead of treating them as deleted goals.
@@ -543,6 +633,7 @@ impl SessionController {
         Ok(NativeGoalSelection {
             provider_session_id,
             revision: task.map(|task| task.revision.clone()),
+            transport_epoch: self.task_controller.native_goal_epoch(),
             update,
         })
     }
@@ -645,7 +736,10 @@ impl SessionController {
             && jobs.len() < crate::provider::SteeringLane::CAPACITY
             && (self.parent_input.is_active()
                 || snapshot.native_steer
-                    && self.provider.has_active_turn(&snapshot.session.id).await);
+                    && self
+                        .provider_handle()
+                        .has_active_turn(&snapshot.session.id)
+                        .await);
         if command.is_none()
             && steering_available
             && message.intent == InputIntent::Queue
@@ -740,7 +834,7 @@ impl SessionController {
             && message.config.is_none()
             && match &message.purpose {
                 crate::input::InputPurpose::TaskEntry { start, .. } => {
-                    self.provider.supports_task_steering(start.kind)
+                    self.provider_handle().supports_task_steering(start.kind)
                 }
                 crate::input::InputPurpose::TaskContinuation { .. }
                 | crate::input::InputPurpose::QuestionContinuation { .. } => false,
@@ -823,7 +917,14 @@ impl SessionController {
             let Ok(_execution) = self.coordinator.execution.clone().try_acquire_owned() else {
                 return Ok(Some(InputProgress::WaitExecution));
             };
-            self.broker.lock().await.refresh_verification_gate().await?;
+            let scan = self.broker.lock().await.prepare_verification_gate()?;
+            if let Some(scan) = scan {
+                let (scan, current) = scan.run().await?;
+                self.broker
+                    .lock()
+                    .await
+                    .commit_verification_gate(scan, current)?;
+            }
         }
         let Some(task) = self.task_controller.current()? else {
             return Ok(None);
@@ -870,26 +971,192 @@ impl SessionController {
         let owner = self.clone();
         let sink = sink.clone();
         jobs.spawn(async move {
-            let mut broker = owner.broker.lock().await;
             let session_id = owner.observer.session_id().to_owned();
-            let result = async {
-                let events = broker.run_task_checks().await?;
+            let (publication, mut stream) = crate::broker::publication::channel();
+            let output = sink.clone();
+            let stream_session = session_id.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Some(update) = stream.recv().await? {
+                    let payload = crate::broker::publication::encode_session_update(&update)?;
+                    let event = if matches!(&update, crate::broker::publication::SessionUpdate::DocumentChanged { .. }) {
+                        "document_changed"
+                    } else { "provider_event" };
+                    output.send_event(SessionEvent { session_id: stream_session.clone(), event: event.into(), payload }).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+            let result: Result<()> = async {
+                let (start, start_task) = { let broker = owner.broker.lock().await;
+                    let task = owner.task_controller.current()?;
+                    (broker.begin_owned_task_checks(), task) };
+                let (mut state, scan) = match start {
+                    Ok(start) => start,
+                    Err(error) => {
+                        let task = match start_task { Some(task) => task, None => return Err(error) };
+                        return owner.report_initial_task_check_failure(&task, error, &publication, &sink).await;
+                    }
+                };
+                let prepared = async {
+                    let scanned = scan.run().await?;
+                    let mut broker = owner.broker.lock().await;
+                    broker.with_publication_sink(&publication, |broker| broker.prepare_owned_task_check_run(&mut state, scanned))
+                }.await;
+                let run = match prepared {
+                    Ok(run) => run,
+                    Err(error) => return owner.report_owned_task_check_failure(&state, error, &publication, &sink).await,
+                };
+                let checked = match run.run().await {
+                    Ok(checked) => checked,
+                    Err(error) => return owner.report_owned_task_check_failure(&state, error, &publication, &sink).await,
+                };
+                let post = { let broker = owner.broker.lock().await; broker.prepare_task_check_postscan(&state) };
+                let post = match post {
+                    Ok(post) => post,
+                    Err(error) => return owner.report_owned_task_check_failure(&state, error, &publication, &sink).await,
+                };
+                let scanned = match post.run().await {
+                    Ok(scanned) => scanned,
+                    Err(error) => return owner.report_owned_task_check_failure(&state, error, &publication, &sink).await,
+                };
+                let mut finalization = owner.broker.lock().await.prepare_task_check_finalization(state, checked, scanned)?;
+                let report = match finalization.capture_report().await {
+                    Ok(report) => report,
+                    Err(error) => {
+                        let prepared = {
+                            let mut broker = owner.broker.lock().await;
+                            broker.with_publication_sink(&publication, |broker| broker.prepare_task_check_report_failure(&finalization, &error))
+                        };
+                        let prepared = match prepared {
+                            Ok(prepared) => prepared,
+                            Err(failure) => return Err(error.context(format!("check failure persistence failed: {failure:#}"))),
+                        };
+                        match prepared.run().await {
+                            Ok((_, events, _)) => { for event in events { sink.send_event(event).await?; } return Err(error); }
+                            Err(failure) => return Err(error.context(format!("check failure publication failed: {failure:#}"))),
+                        }
+                    }
+                };
+                let delivery = {
+                    let mut broker = owner.broker.lock().await;
+                    broker.with_publication_sink(&publication, |broker| broker.commit_task_check_finalization(finalization, report))?
+                };
+                let (events, acknowledgment) = delivery.run().await?;
                 for event in events { sink.send_event(event).await?; }
-                let snapshot = broker.snapshot()?;
+                owner.broker.lock().await.acknowledge_owned_task_check(acknowledgment)?;
+                let snapshot = owner.broker.lock().await.snapshot()?;
                 sink.send_event(SessionEvent { session_id: session_id.clone(), event: "session_changed".into(),
                     payload: serde_json::to_value(snapshot.session)? }).await?;
-                Ok::<(), anyhow::Error>(())
+                Ok(())
             }.await;
-            if let Err(error) = result {
+            drop(publication);
+            let forwarded = forwarder.await.context("check publication task panicked").and_then(|result| result);
+            if let Err(error) = result.and(forwarded) {
                 let _ = sink.send_event(SessionEvent { session_id:session_id.clone(), event:"provider_event".into(),
                     payload:json!({"kind":"error","text":format!("Execution checks failed: {error:#}")}) }).await;
             }
-            drop(broker);
             drop(admission);
             owner.coordinator.submissions.changed.notify_one();
             false
         });
         Ok(Some(InputProgress::Started))
+    }
+
+    async fn report_initial_task_check_failure(
+        &self,
+        task: &crate::task::Task,
+        error: anyhow::Error,
+        publication: &crate::broker::publication::SessionUpdateSink,
+        sink: &MessageSender,
+    ) -> Result<()> {
+        let prepared = {
+            let mut broker = self.broker.lock().await;
+            broker.with_publication_sink(publication, |broker| {
+                broker.prepare_task_check_start_failure(task, &error)
+            })
+        };
+        let prepared = match prepared {
+            Ok(Some(prepared)) => prepared,
+            Ok(None) => return Err(error),
+            Err(failure) => {
+                return Err(error.context(format!("check failure persistence failed: {failure:#}")));
+            }
+        };
+        let (handled, events, acknowledgment) = match prepared.run().await {
+            Ok(result) => result,
+            Err(failure) => {
+                return Err(error.context(format!("check failure publication failed: {failure:#}")));
+            }
+        };
+        for event in events {
+            sink.send_event(event).await?;
+        }
+        if let Some(acknowledgment) = acknowledgment {
+            self.broker
+                .lock()
+                .await
+                .acknowledge_owned_task_check(acknowledgment)?;
+        }
+        if handled {
+            let snapshot = self.broker.lock().await.snapshot()?;
+            sink.send_event(SessionEvent {
+                session_id: self.observer.session_id().to_owned(),
+                event: "session_changed".into(),
+                payload: serde_json::to_value(snapshot.session)?,
+            })
+            .await?;
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
+    /// Persist and deliver a verification failure without retaining broker ownership.
+    async fn report_owned_task_check_failure(
+        &self,
+        state: &crate::broker::OwnedTaskChecks,
+        error: anyhow::Error,
+        publication: &crate::broker::publication::SessionUpdateSink,
+        sink: &MessageSender,
+    ) -> Result<()> {
+        let prepared = {
+            let mut broker = self.broker.lock().await;
+            broker.with_publication_sink(publication, |broker| {
+                broker.prepare_owned_task_check_failure(state, &error)
+            })
+        };
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                return Err(error.context(format!("check failure persistence failed: {failure:#}")));
+            }
+        };
+        let (handled, events, acknowledgment) = match prepared.run().await {
+            Ok(result) => result,
+            Err(failure) => {
+                return Err(error.context(format!("check failure publication failed: {failure:#}")));
+            }
+        };
+        for event in events {
+            sink.send_event(event).await?;
+        }
+        if let Some(acknowledgment) = acknowledgment {
+            self.broker
+                .lock()
+                .await
+                .acknowledge_owned_task_check(acknowledgment)?;
+        }
+        if handled {
+            let snapshot = self.broker.lock().await.snapshot()?;
+            sink.send_event(SessionEvent {
+                session_id: self.observer.session_id().to_owned(),
+                event: "session_changed".into(),
+                payload: serde_json::to_value(snapshot.session)?,
+            })
+            .await?;
+            Ok(())
+        } else {
+            Err(error)
+        }
     }
 
     async fn enqueue_task_input(&self, sink: &MessageSender) -> Result<()> {
@@ -1050,11 +1317,28 @@ impl SessionController {
         let sink = sink.clone();
         jobs.spawn(async move {
             let session_id = controller.catalog_request.read().await.harness_session_id.clone();
-            let mut broker = controller.broker.lock().await;
-            let result = dispatch_task_attempt(&mut broker, &session_id,
-                Request { id: 0, method: "session.check.complete".into(), params: json!({}) },
-                &sink, controller.catalog_request.clone()).await;
-            drop(broker);
+            let (publication, mut stream) = crate::broker::publication::channel();
+            let output = sink.clone();
+            let stream_session = session_id.clone();
+            let forwarder = tokio::spawn(async move {
+                while let Some(update) = stream.recv().await? {
+                    let payload = crate::broker::publication::encode_session_update(&update)?;
+                    let event = if matches!(&update, crate::broker::publication::SessionUpdate::DocumentChanged { .. }) {
+                        "document_changed"
+                    } else { "provider_event" };
+                    output.send_event(SessionEvent { session_id: stream_session.clone(), event: event.into(), payload }).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+            let broker = controller.broker.lock().await;
+            let response = super::check_completion::drive(&controller, broker,
+                Request { id: 0, method: "session.check.complete".into(), params: json!({}) }, publication, &sink).await;
+            let result: Result<()> = async {
+                forwarder.await.context("completion check publication task failed")??;
+                for event in response.event { sink.send_event(event).await?; }
+                if let Some(failure) = response.response.error() { anyhow::bail!("{}", failure.message); }
+                Ok(())
+            }.await;
             drop(admission);
             if let Err(error) = result {
                 let _ = sink.send_event(SessionEvent {
@@ -1083,7 +1367,7 @@ impl SessionController {
             if matches!(
                 message.purpose,
                 crate::input::InputPurpose::TaskEntry { .. }
-            ) && let Err(activation) = submission.reconcile(self.provider.as_ref()).await
+            ) && let Err(activation) = self.reconcile_submission_current(&submission).await
             {
                 return self
                     .publish_input(
@@ -1140,13 +1424,7 @@ impl SessionController {
                     }));
             }
             crate::input::InputPurpose::Question { question_id, .. } => {
-                return Ok(self.questions.snapshot()?.questions.iter().any(|question| {
-                    &question.id == question_id
-                        && !matches!(
-                            question.resolution,
-                            crate::question::QuestionResolution::Retired { .. }
-                        )
-                }));
+                return self.questions.delivery_is_current(question_id);
             }
             crate::input::InputPurpose::TaskEntry { revision, .. } => (revision, true),
             crate::input::InputPurpose::TaskContinuation { revision, .. } => (revision, false),
@@ -1209,7 +1487,7 @@ impl SessionController {
         }
         let input = crate::provider::ProviderInput::from_text(message.text.clone())
             .with_attachments(attachments.clone());
-        let provider = self.provider.descriptor().kind;
+        let provider = self.provider_handle().descriptor().kind;
         let message_id = message.id.clone();
         let task_input_id = match &message.purpose {
             crate::input::InputPurpose::TaskEntry { id, .. }
@@ -1326,9 +1604,11 @@ impl SessionController {
                 if self.parent_input.is_active() {
                     self.parent_input.steer(input).await
                 } else {
-                    self.provider
-                        .steer_session(&catalog.harness_session_id, input)
-                        .await
+                    self.steer_retained(
+                        crate::provider::ExecutionOwner::root(&catalog.harness_session_id),
+                        input,
+                    )
+                    .await
                 }
             };
             tokio::pin!(dispatch);
@@ -1347,18 +1627,55 @@ impl SessionController {
             if let Some(config) = &message.config {
                 let mut config = config.clone();
                 config["validate"] = json!(true);
-                dispatch_task_attempt(
-                    &mut broker,
-                    &catalog.harness_session_id,
+                let (publication, mut stream) = crate::broker::publication::channel();
+                let output = sink.clone();
+                let session = catalog.harness_session_id.clone();
+                let forwarder = tokio::spawn(async move {
+                    while let Some(update) = stream.recv().await? {
+                        let payload = crate::broker::publication::encode_session_update(&update)?;
+                        let event = if matches!(
+                            &update,
+                            crate::broker::publication::SessionUpdate::DocumentChanged { .. }
+                        ) {
+                            "document_changed"
+                        } else {
+                            "provider_event"
+                        };
+                        output
+                            .send_event(SessionEvent {
+                                session_id: session.clone(),
+                                event: event.into(),
+                                payload,
+                            })
+                            .await?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                });
+                let result = super::drive_direct_configuration(
+                    self,
+                    broker,
                     Request {
                         id: 0,
                         method: "session.configure".into(),
                         params: config,
                     },
-                    sink,
-                    self.catalog_request.clone(),
+                    publication,
                 )
-                .await?;
+                .await;
+                forwarder
+                    .await
+                    .context("queued configuration publication task failed")??;
+                for event in result.event {
+                    sink.send_event(event).await?;
+                }
+                if let Some(failure) = result.response.error() {
+                    anyhow::bail!("{}", failure.message);
+                }
+                broker = self.broker.lock().await;
+                let updated_catalog = broker.provider_catalog_request()?;
+                drop(broker);
+                *self.catalog_request.write().await = updated_catalog;
+                broker = self.broker.lock().await;
             }
             broker.input_submission = Some(submission.clone());
             broker.input_purpose = message.purpose.clone();
@@ -1416,29 +1733,46 @@ impl SessionController {
                 "input.dispatch_started",
                 json!({"message_id":message.id,"submission_id":submission.id()}),
             );
+            let prompt = message.text != "/compact";
+            let request = Request {
+                id: 0,
+                method: if prompt {
+                    "session.prompt.submit"
+                } else {
+                    "session.compact"
+                }
+                .into(),
+                params,
+            };
+            let mut acceptance_failure = None;
             let mut response = {
-                let mut dispatch = Box::pin(
-                    broker.dispatch_stream(
-                        Request {
-                            id: 0,
-                            method: if message.text == "/compact" {
-                                "session.compact"
-                            } else {
-                                "session.prompt.submit"
-                            }
-                            .into(),
-                            params,
-                        },
-                        event_sink,
-                    ),
-                );
+                let mut dispatch = Box::pin(async {
+                    if prompt {
+                        super::drive_foreground_dispatch(self, broker, request, event_sink, sink)
+                            .await
+                    } else {
+                        let (result, failure) =
+                            super::drive_manual_compaction(self, broker, request, event_sink, sink)
+                                .await;
+                        if let Some(failure) = failure {
+                            self.record_compaction_failure(failure)?;
+                        }
+                        Ok(result)
+                    }
+                });
                 tokio::select! {
                     biased;
                     accepted = acceptance.changed() => {
-                        accepted.context("submission acceptance channel closed")?;
-                        self.publish_input(self.coordinator.submissions.delivery(
-                            &message.id, Some(InputDelivery::Accepted), None, None,
-                        )?, sink).await?;
+                        let published: Result<()> = async {
+                            accepted.context("submission acceptance channel closed")?;
+                            self.publish_input(self.coordinator.submissions.delivery(
+                                &message.id, Some(InputDelivery::Accepted), None, None,
+                            )?, sink).await
+                        }.await;
+                        if let Err(error) = published {
+                            acceptance_failure = Some(error);
+                            self.cancellation.request(false);
+                        }
                         dispatch.await
                     }
                     response = &mut dispatch => response,
@@ -1449,28 +1783,89 @@ impl SessionController {
                 "input.dispatch_finished",
                 json!({"message_id":message.id}),
             );
-            for event in response.event.drain(..) {
-                sink.send_event(event).await?;
+            // Retire host admission state even when execution failed before returning a response.
+            let postlude: Result<()> = async {
+                let refreshed = {
+                    let mut broker = self.broker.lock().await;
+                    broker.input_submission = None;
+                    self.trace.record(
+                        &catalog.harness_session_id,
+                        "input.catalog_pending",
+                        json!({"message_id":message.id}),
+                    );
+                    broker.provider_catalog_request()
+                };
+                let catalog = match refreshed {
+                    Ok(refreshed) => {
+                        *self.catalog_request.write().await = refreshed;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                };
+                let events: Result<()> = async {
+                    if let Ok(response) = &mut response {
+                        for event in response.event.drain(..) {
+                            sink.send_event(event).await?;
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+                match (catalog, events) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                    (Err(error), Err(events)) => Err(error.context(format!(
+                        "input response publication also failed: {events:#}"
+                    ))),
+                }
             }
-            broker.input_submission = None;
-            self.trace.record(
-                &catalog.harness_session_id,
-                "input.catalog_pending",
-                json!({"message_id":message.id}),
-            );
-            *self.catalog_request.write().await = broker.provider_catalog_request();
-            drop(broker);
+            .await;
             self.trace.record(
                 &catalog.harness_session_id,
                 "input.forwarder_pending",
                 json!({"message_id":message.id}),
             );
-            forwarder.await??;
+            // Collect failure publications before exposing the delivery result.
+            let forwarded = forwarder
+                .await
+                .context("input publication task failed")
+                .and_then(|result| result);
             self.trace.record(
                 &catalog.harness_session_id,
                 "input.forwarder_finished",
                 json!({"message_id":message.id}),
             );
+            let postlude = match (postlude, forwarded) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                (Err(error), Err(forwarding)) => {
+                    Err(error.context(format!("input publication also failed: {forwarding:#}")))
+                }
+            };
+            let postlude = match (acceptance_failure, postlude) {
+                (None, result) => result,
+                (Some(error), Ok(())) => Err(error),
+                (Some(error), Err(postlude)) => {
+                    Err(error.context(format!("input finalization also failed: {postlude:#}")))
+                }
+            };
+            let response = match (response, postlude) {
+                (Ok(response), Ok(())) => Ok(response),
+                (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+                (Err(error), Err(postlude)) => {
+                    Err(error.context(format!("input finalization also failed: {postlude:#}")))
+                }
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    let result = self
+                        .settle_input(message, submission, Err(error), false, sink)
+                        .await;
+                    drop(admission);
+                    return result;
+                }
+            };
             for event in response.event {
                 sink.send_event(event).await?;
             }
@@ -1508,9 +1903,11 @@ impl SessionController {
                 None => Ok(()),
             }
         };
+        let result = self
+            .settle_input(message, submission, result, steer, sink)
+            .await;
         drop(admission);
-        self.settle_input(message, submission, result, steer, sink)
-            .await
+        result
     }
 
     async fn settle_input(
@@ -1521,7 +1918,7 @@ impl SessionController {
         steer: bool,
         sink: &MessageSender,
     ) -> Result<()> {
-        let record = submission.reconcile(self.provider.as_ref()).await?;
+        let record = self.reconcile_submission_current(&submission).await?;
         if matches!(
             message.purpose,
             crate::input::InputPurpose::TaskEntry { .. }
@@ -1563,7 +1960,7 @@ impl SessionController {
                 if steer
                     && !self.parent_input.is_active()
                     && !self
-                        .provider
+                        .provider_handle()
                         .has_active_turn(&record.request.harness_session_id)
                         .await =>
             {

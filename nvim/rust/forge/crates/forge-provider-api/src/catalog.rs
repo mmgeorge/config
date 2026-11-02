@@ -12,7 +12,7 @@ pub enum ResourceScope {
 }
 
 /// Describes provider-owned catalogs and their active-turn mutation behavior.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct CatalogCapability {
     pub skill: bool,
     pub mcp: bool,
@@ -99,7 +99,7 @@ pub struct ProviderCatalogRequest {
     pub access: crate::access::AccessPolicy,
     pub approval_mode: ApprovalMode,
     #[serde(alias = "backend_session_id")]
-    pub provider_session_id: Option<String>,
+    pub provider_session_id: Option<crate::ProviderSessionId>,
 }
 
 impl ProviderCatalogRequest {

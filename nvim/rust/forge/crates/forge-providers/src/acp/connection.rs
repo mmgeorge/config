@@ -217,6 +217,22 @@ impl AcpConnection {
         })
     }
 
+    /// Send the session's native interruption without closing its response reader.
+    pub fn cancel(&self, session_id: &str) -> Result<(), AcpConnectionError> {
+        let method = "session/cancel";
+        let notification = UntypedMessage::new(method, serde_json::json!({"sessionId":session_id}))
+            .map_err(|source| AcpConnectionError::Protocol {
+                method: method.into(),
+                source: Box::new(source),
+            })?;
+        self.connection
+            .send_notification(notification)
+            .map_err(|source| AcpConnectionError::Remote {
+                method: method.into(),
+                source: Box::new(source),
+            })
+    }
+
     /// Collect the process tree and stop the native driver.
     pub async fn shutdown(&self) -> Result<(), AcpConnectionError> {
         let mut process = self.process.lock().await;

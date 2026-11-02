@@ -8,6 +8,7 @@ pub(crate) async fn replay(
         request
             .provider_session_id
             .clone()
+            .map(String::from)
             .unwrap_or_else(|| "mock-copilot-session".into()),
         request.workspace.clone(),
         request.model.clone(),

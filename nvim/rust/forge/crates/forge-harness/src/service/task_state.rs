@@ -36,8 +36,6 @@ pub(super) async fn apply_command(
     goal_max_turns: u32,
     sink: &MessageSender,
 ) -> Result<()> {
-    let current = controller.task_controller.current()?;
-    let expected_revision = current.as_ref().map(|task| task.revision.clone());
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     let normalized = command.action.to_params()?;
     let mut receipt = TaskOperation {
@@ -61,6 +59,42 @@ pub(super) async fn apply_command(
         let _ = publish_response(controller, command, request_id, previous.view(), sink).await?;
         return Ok(());
     }
+    // Keep task authority stable until the active foreground has observed its
+    // native cancellation and committed its terminal state.
+    let (_pause_control, _pause_execution) = if matches!(command.action, SessionAction::Pause) {
+        let update = controller
+            .coordinator
+            .submissions
+            .suspend(true, Some(&command.operation_id))?;
+        controller.publish_input(update, sink).await?;
+        let control = tokio::time::timeout(
+            Duration::from_secs(60),
+            Arc::clone(&controller.coordinator.control).acquire_owned(),
+        )
+        .await
+        .context("timed out waiting for pause control")??;
+        controller.broker.lock().await.cancel_question_delivery()?;
+        let execution = match Arc::clone(&controller.coordinator.execution).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                request_foreground_native_cancel(controller, session_id, false).await?;
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    Arc::clone(&controller.coordinator.execution).acquire_owned(),
+                )
+                .await
+                .context("timed out collecting the cancelled foreground before pause")??
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                anyhow::bail!("session execution admission is closed")
+            }
+        };
+        (Some(control), Some(execution))
+    } else {
+        (None, None)
+    };
+    let current = controller.task_controller.current()?;
+    let expected_revision = current.as_ref().map(|task| task.revision.clone());
     let observer = controller.observer.clone();
     let action = command.action.clone();
     let prepared = tokio::task::spawn_blocking(move || {
@@ -81,11 +115,11 @@ pub(super) async fn apply_command(
     receipt = store
         .load_task_operation(session_id, &command.operation_id)?
         .context("session command receipt is missing")?;
-    if command.action.admits_entry() || matches!(command.action, SessionAction::Pause) {
-        let update = controller.coordinator.submissions.suspend(
-            matches!(command.action, SessionAction::Pause),
-            Some(&receipt.id),
-        )?;
+    if command.action.admits_entry() {
+        let update = controller
+            .coordinator
+            .submissions
+            .suspend(false, Some(&receipt.id))?;
         controller.publish_input(update, sink).await?;
     }
     let active_elicitation =

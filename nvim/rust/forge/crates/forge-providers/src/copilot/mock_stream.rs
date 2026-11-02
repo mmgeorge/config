@@ -9,7 +9,11 @@ pub async fn replay(
     sink: &ProviderEventSink,
 ) -> Result<ProviderCompletion, ProviderError> {
     let mut completion = ProviderCompletion {
-        provider_session_id: Some(session_id),
+        provider_session_id: Some(session_id.try_into().map_err(
+            |error: forge_provider_api::ProviderSessionIdError| ProviderError::Protocol {
+                message: error.to_string(),
+            },
+        )?),
         runtime: forge_provider_api::ProviderRuntime {
             provider: "Mock Copilot stream".into(),
             model: Some(model),

@@ -1,0 +1,243 @@
+//! Own conversation rollback teardown outside broker ownership.
+use super::*;
+
+/// Retain the old native generation and replacement until teardown has completed.
+pub(crate) struct UndoTeardown {
+    session_id: String,
+    expected_latest: String,
+    exchanges: Vec<String>,
+    expected_task: Option<crate::task::Task>,
+    provider: Arc<Provider>,
+    replacement: Arc<Provider>,
+    registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
+    inbox: Arc<crate::provider::session_execution::SessionObservationInbox>,
+    goal: Option<foreground_failure::RetractionGoalJob>,
+    goal_controller: Arc<crate::task::SessionTaskController>,
+    goal_lane: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl UndoTeardown {
+    /// Fence native goal authority, then collect both old-generation resources.
+    pub(crate) async fn run(&mut self) -> Result<()> {
+        if let Some(goal) = self.goal.take() {
+            goal.run().await?;
+        }
+        let lane = self.goal_controller.native_goal_lane();
+        self.goal_lane = Some(
+            tokio::time::timeout(std::time::Duration::from_secs(30), lane.lock_owned())
+                .await
+                .map_err(|_| {
+                    self.goal_controller.mark_native_goal_uncertain();
+                    ProviderError::DeliveryUncertain {
+                        message: "native goal generation remained active during undo".into(),
+                    }
+                })?,
+        );
+        self.goal_controller.ensure_native_goal_certain()?;
+        anyhow::ensure!(
+            foreground_failure::same_retraction_task(
+                self.goal_controller.current()?.as_ref(),
+                self.expected_task.as_ref()
+            ),
+            "task changed before undo provider teardown"
+        );
+        let execution = self.registry.close().await;
+        let native = self.provider.shutdown().await;
+        if let Err(error) = execution {
+            return match native {
+                Ok(()) => Err(error.into()),
+                Err(native) => Err(anyhow::Error::new(error)
+                    .context(format!("provider shutdown also failed: {native:#}"))),
+            };
+        }
+        native?;
+        self.inbox.close();
+        self.inbox.retire_background().await?;
+        Ok(())
+    }
+}
+
+impl HarnessBroker {
+    /// Pause task authority and stage any idle running exchange for cancellation.
+    pub(crate) fn prepare_undo_cancel(&mut self) -> Result<Vec<SessionEvent>> {
+        if let Some(task) = self.task_controller.current()? {
+            self.task_controller.change(
+                &mut self.store,
+                Some(&task.revision),
+                crate::task::TaskChange::Pause,
+                self.clock.now_ms(),
+            )?;
+        }
+        let mut events = Vec::new();
+        if self.task_controller.current()?.is_none() {
+            self.questions.cancel_chat(None)?;
+        }
+        if self
+            .current_goal()?
+            .is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused))
+        {
+            let (_, next) = self.dispatch_session_command("session.goal.pause", json!({}))?;
+            events.extend(next);
+        }
+        if let Some(mut exchange) = self
+            .store
+            .exchange_in_state(&self.session.id, ExchangeState::Running)?
+        {
+            anyhow::ensure!(
+                exchange.execution_started_at_ms().is_none()
+                    && exchange
+                        .turn
+                        .iter()
+                        .all(|turn| turn.state() != crate::turn::TurnState::Running),
+                "execution must settle before idle cancellation"
+            );
+            exchange.begin_finalization(
+                crate::exchange::ExchangeOutcome::Cancelled,
+                self.clock.now_ms(),
+            )?;
+            self.store.save_exchange(&exchange)?;
+        }
+        Ok(events)
+    }
+
+    /// Validate history and capture the exact provider generation to be retired.
+    pub(crate) fn prepare_undo_teardown(&mut self, action: &Value) -> Result<UndoTeardown> {
+        anyhow::ensure!(
+            self.agent_coordinator.active_count() == 0,
+            "child execution must settle before conversation rollback"
+        );
+        self.require_restore_recovered()?;
+        let rollback = action
+            .get("rollback")
+            .context("undo requires rollback selection")?;
+        anyhow::ensure!(
+            rollback["scope"] == "conversation",
+            "undo requires conversation rollback scope"
+        );
+        let requested = required_text(rollback, "exchange_id")?;
+        let target = self.store.checkpoint_owner(&self.session.id, &requested)?;
+        let expected_latest = required_text(rollback, "latest_exchange_id")?;
+        let exchanges = self.store.list_exchange(&self.session.id)?;
+        anyhow::ensure!(
+            exchanges
+                .last()
+                .is_some_and(|exchange| exchange.id == expected_latest),
+            "conversation changed; select the rollback interaction again"
+        );
+        let position = exchanges
+            .iter()
+            .position(|exchange| exchange.id == target)
+            .context("rollback interaction disappeared")?;
+        anyhow::ensure!(
+            exchanges[position].disposition() == crate::exchange::HistoryDisposition::Current,
+            "selected interaction has already been rolled back"
+        );
+        anyhow::ensure!(
+            exchanges.iter().all(|exchange| exchange.is_finished()),
+            "cancel or finish active work before conversation rollback"
+        );
+        let ids = exchanges[position..]
+            .iter()
+            .map(|exchange| exchange.id.clone())
+            .collect::<Vec<_>>();
+        self.store
+            .require_settled_exchange_tree(&self.session.id, &ids)?;
+        let expected_task = self.task_controller.current()?;
+        let goal = if let Some(goal) = self
+            .current_goal()?
+            .filter(|goal| goal.native && self.session.provider_session_id.is_some())
+        {
+            Some(foreground_failure::RetractionGoalJob::new(
+                self,
+                self.provider_request(ProviderInput::from_text(""), PromptMode::GoalContinuation)?,
+                crate::provider::native_goal_update(goal.objective, GoalState::Cleared),
+                expected_task.clone(),
+                self.execution_registry.clone(),
+            ))
+        } else {
+            None
+        };
+        let replacement = Arc::from(crate::provider::build(
+            self.provider_launch.clone(),
+            self.permission_coordinator.clone(),
+            self.trace.clone(),
+            self.data_root.clone(),
+        )?);
+        Ok(UndoTeardown {
+            session_id: self.session.id.clone(),
+            expected_latest,
+            exchanges: ids,
+            expected_task,
+            provider: self.provider.clone(),
+            replacement,
+            registry: self.execution_registry(),
+            inbox: self.observer.session_events(),
+            goal,
+            goal_controller: self.task_controller.clone(),
+            goal_lane: None,
+        })
+    }
+
+    /// Publish a fresh observer and commit rollback only if the retired generation still owns it.
+    pub(crate) fn commit_undo_teardown(
+        &mut self,
+        mut teardown: UndoTeardown,
+    ) -> Result<(Vec<SessionEvent>, tokio::sync::OwnedMutexGuard<()>)> {
+        anyhow::ensure!(
+            self.session.id == teardown.session_id
+                && Arc::ptr_eq(&self.provider, &teardown.provider)
+                && Arc::ptr_eq(&self.observer.session_events(), &teardown.inbox)
+                && foreground_failure::same_retraction_task(
+                    self.task_controller.current()?.as_ref(),
+                    teardown.expected_task.as_ref()
+                ),
+            "rollback owner changed during provider teardown"
+        );
+        let exchanges = self.store.list_exchange(&self.session.id)?;
+        anyhow::ensure!(
+            exchanges
+                .last()
+                .is_some_and(|exchange| exchange.id == teardown.expected_latest)
+                && exchanges.iter().all(|exchange| exchange.is_finished()),
+            "conversation changed during provider teardown"
+        );
+        self.store
+            .require_settled_exchange_tree(&self.session.id, &teardown.exchanges)?;
+        let mut session = self.session.clone();
+        if let Some(task) = &teardown.expected_task {
+            self.task_controller.change(
+                &mut self.store,
+                Some(&task.revision),
+                crate::task::TaskChange::Clear,
+                self.clock.now_ms(),
+            )?;
+            session.active_task = None;
+        }
+        session.provider_session_id = None;
+        session.provider_checkpoint_id = None;
+        session.provider_fork_state = ProviderForkState::Ready;
+        session.context_usage = None;
+        session.last_compaction_turn = None;
+        session.acquire_lease(&self.client_id)?;
+        session.updated_at_ms = self.clock.now_ms();
+        self.store.record_rollback(&session, &teardown.exchanges)?;
+        self.session = session;
+        self.provider = teardown.replacement;
+        self.context_usage_fresh = false;
+        self.observer
+            .replace_session_events(Arc::new(Default::default()));
+        let exchange = self
+            .store
+            .load_exchange(&teardown.exchanges[0])?
+            .filter(|exchange| exchange.session_id == self.session.id)
+            .context("rolled-back interaction disappeared")?;
+        let lane = teardown
+            .goal_lane
+            .take()
+            .context("undo goal generation lane was not collected")?;
+        Ok((
+            vec![self.event("interaction_rolled_back", serde_json::to_value(exchange)?)?],
+            lane,
+        ))
+    }
+}

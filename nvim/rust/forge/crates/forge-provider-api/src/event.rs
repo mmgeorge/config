@@ -10,6 +10,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderEvent {
+    /// Carry validated execution lifecycle evidence independently of RPC completion.
+    Execution {
+        observation: crate::lifecycle::ExecutionObservation,
+    },
     Message {
         address: MessageAddress,
         update: MessageUpdate,
@@ -128,6 +132,7 @@ pub enum ParentBoundaryUpdate {
 impl ProviderEvent {
     pub fn scope(&self) -> EventScope {
         match self {
+            Self::Execution { observation } => observation.scope().clone().into(),
             Self::Message { address, .. } => address.turn.scope.clone().into(),
             Self::Tool { address, .. } => address.turn.scope.clone().into(),
             Self::Turn { address, .. }
@@ -198,7 +203,7 @@ impl ProviderEvent {
 }
 
 /// Represents the provider identity and resolved model shown by Harness.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ProviderRuntime {
     pub provider: String,
     pub model: Option<String>,

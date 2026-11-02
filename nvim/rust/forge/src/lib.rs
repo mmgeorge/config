@@ -1,3 +1,6 @@
+// Match Harness's trait recursion budget when proving its session futures are Send.
+#![recursion_limit = "256"]
+
 mod host;
 mod router;
 mod runtime;

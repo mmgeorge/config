@@ -3,7 +3,7 @@ use crate::{ProviderRuntime, context::ContextUsage};
 /// Receive native turn observations without exposing host workflow state to a provider.
 pub trait TurnProgress: Send + Sync {
     /// Get the conversation receiving the current provider events.
-    fn session_id(&self) -> Option<&str>;
+    fn session_id(&self) -> Option<&crate::ProviderSessionId>;
 
     /// Get the provider identity and resolved model.
     fn runtime(&self) -> &ProviderRuntime;

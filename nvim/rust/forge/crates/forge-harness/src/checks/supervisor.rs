@@ -1510,6 +1510,30 @@ impl CheckSupervisor {
         self.update(run, sink)
     }
 
+    /// Persist a short check-record commit while the captured task authority remains current.
+    pub(crate) fn publish_with_authority(
+        &self,
+        run: &CheckRun,
+        sink: Option<&SessionUpdateSink>,
+        authority: &crate::tools::TaskAuthority,
+    ) -> Result<()> {
+        authority.commit(|| {
+            self.validate_owner(run)?;
+            if let Some(previous) = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("check state lock poisoned"))?
+                .records
+                .get(&run.id)
+            {
+                ensure!(previous.owner == run.owner, "check ownership cannot change");
+            }
+            let path = self.root.join(&run.id).join("record.json");
+            write_record(&path, run)?;
+            self.update(run, sink)
+        })
+    }
+
     fn update(&self, run: &CheckRun, sink: Option<&SessionUpdateSink>) -> Result<()> {
         let mut state = self
             .state
@@ -1586,6 +1610,23 @@ impl CheckSupervisor {
         Ok(id)
     }
 
+    /// Start a provider-requested run only while its captured callback authority is current.
+    pub(crate) async fn start_authorized(
+        self: &Arc<Self>,
+        run: PreparedCheckRun,
+        sink: Option<SessionUpdateSink>,
+        external_cancelled: Option<Arc<AtomicBool>>,
+        authority: Option<&crate::tools::TaskAuthority>,
+    ) -> Result<String> {
+        let run = self.resolve(run).await?;
+        let launch = || self.admit_and_launch(run, sink, external_cancelled, None);
+        let (id, _) = match authority {
+            Some(authority) => authority.commit(launch)?,
+            None => launch()?,
+        };
+        Ok(id)
+    }
+
     async fn launch(
         self: &Arc<Self>,
         run: PreparedCheckRun,
@@ -1597,6 +1638,19 @@ impl CheckSupervisor {
         tokio::sync::oneshot::Receiver<std::result::Result<CheckRun, String>>,
     )> {
         let run = self.resolve(run).await?;
+        self.admit_and_launch(run, sink, external_cancelled, admission)
+    }
+
+    fn admit_and_launch(
+        self: &Arc<Self>,
+        run: PreparedCheckRun,
+        sink: Option<SessionUpdateSink>,
+        external_cancelled: Option<Arc<AtomicBool>>,
+        admission: Option<crate::command::ExecutionPermit>,
+    ) -> Result<(
+        String,
+        tokio::sync::oneshot::Receiver<std::result::Result<CheckRun, String>>,
+    )> {
         std::fs::create_dir_all(self.root.join(&run.id))?;
         let admitted = self.admit(run, admission)?;
         let id = admitted.run.id.clone();

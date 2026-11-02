@@ -15,6 +15,7 @@ pub(crate) struct TaskEffects {
     pub lifecycle: Vec<crate::plan::PlanLifecycleRecord>,
     pub event: Vec<crate::timeline::SessionEventRecord>,
     pub exchange: Vec<crate::exchange::Exchange>,
+    pub checkpoint: Vec<crate::checkpoint::CheckpointRecord>,
 }
 
 pub(crate) struct PlanArtifactGuard {
@@ -163,7 +164,50 @@ impl SqliteStore {
         )
     }
 
+    /// Commit a task and its effects against an unchanged working document in the same fence.
+    pub(crate) fn commit_task_effects_with_document<Output>(
+        &mut self,
+        session_id: &str,
+        permit: &crate::task::TaskPermit,
+        now_ms: i64,
+        document: crate::plan::WorkingDocumentGuard<'_>,
+        change: impl FnOnce(&mut Option<Task>) -> Result<(Output, TaskEffects)>,
+    ) -> Result<Output> {
+        let admission = self.session_admission(session_id)?;
+        admission.with_task_mutation(|| {
+            permit.validate(admission.runtime()?.active_task.as_ref())?;
+            document.commit(session_id, || {
+                self.commit_task_effects_locked(
+                    session_id,
+                    TaskFence::Revision(Some(permit.revision())),
+                    now_ms,
+                    None,
+                    |active| {
+                        permit.validate(active.as_ref())?;
+                        change(active)
+                    },
+                )?
+                .context("document task commit unexpectedly reused a command")
+            })
+        })
+    }
+
     fn commit_task_effects_fenced<Output>(
+        &mut self,
+        session_id: &str,
+        fence: TaskFence<'_>,
+        now_ms: i64,
+        command: Option<&crate::task::TaskOperation>,
+        change: impl FnOnce(&mut Option<Task>) -> Result<(Output, TaskEffects)>,
+    ) -> Result<Option<Output>> {
+        let admission = self.session_admission(session_id)?;
+        admission.with_task_mutation(|| {
+            self.commit_task_effects_locked(session_id, fence, now_ms, command, change)
+        })
+    }
+
+    /// Commit and publish while the session's task mutation gate excludes dependent writes.
+    fn commit_task_effects_locked<Output>(
         &mut self,
         session_id: &str,
         fence: TaskFence<'_>,
@@ -174,6 +218,7 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::ensure_no_configuration_intent(&transaction, session_id)?;
         if let Some(command) = command {
             let existing: Option<String> = transaction
                 .query_row(
@@ -274,6 +319,17 @@ impl SqliteStore {
                 }
                 Ok(())
             })?;
+        }
+        for checkpoint in &effects.checkpoint {
+            ensure!(
+                checkpoint.session_id == session_id,
+                "checkpoint belongs to another session"
+            );
+            let written = transaction.execute(
+                "INSERT INTO checkpoint_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE checkpoint_record.session_id=excluded.session_id",
+                params![checkpoint.id, session_id, super::encode(checkpoint)?],
+            )?;
+            ensure!(written == 1, "checkpoint cannot change its owning session");
         }
         for artifact in &effects.plan {
             ensure!(

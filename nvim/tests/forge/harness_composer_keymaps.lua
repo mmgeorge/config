@@ -53,4 +53,29 @@ assert(vim.fn.maparg("<M-CR>", "n", false, true).buffer == 1, "custom submit bin
 assert(vim.fn.maparg("<F6>", "n", false, true).buffer == 1, "custom artifact binding was ignored")
 assert(vim.fn.maparg("op", "n", false, true).buffer ~= 1, "default artifact binding survived override")
 assert(vim.fn.maparg("og", "n", false, true).buffer ~= 1, "disabled agent binding was installed")
+local interrupt = require("forge.views.harness.composer_interrupt")
+local real_on_key = vim.on_key
+local listener
+vim.on_key = function(callback, _) listener = callback end
+local raw = vim.api.nvim_replace_termcodes("<C-c>", true, false, true)
+local cancellations = 0
+interrupt.attach(custom, function() return true end, function() cancellations = cancellations + 1 end)
+listener(raw, raw)
+listener(raw, raw)
+assert(vim.wait(1000, function() return cancellations == 1 end), "raw interrupt did not cancel once")
+listener("mapped", raw)
+vim.wait(20)
+assert(cancellations == 1, "mapped interrupt triggered fallback")
+vim.api.nvim_set_current_buf(buffer)
+listener(raw, raw)
+vim.wait(20)
+assert(cancellations == 1, "another buffer triggered fallback")
+vim.api.nvim_set_current_buf(custom)
+config.options.keymaps.harness.cancel = "<F7>"
+listener(raw, raw)
+vim.wait(20)
+assert(cancellations == 1, "disabled Ctrl-C binding triggered fallback")
+vim.api.nvim_buf_delete(custom, { force = true })
+assert(listener == nil, "composer teardown retained interrupt listener")
+vim.on_key = real_on_key
 print("harness_composer_keymaps: passed")

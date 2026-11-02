@@ -21,6 +21,7 @@ pub struct CopilotClient {
 
 pub struct CopilotSession {
     pub(crate) inner: Arc<github_copilot_sdk::session::Session>,
+    pub(crate) events: super::intake::SessionIntake,
 }
 
 pub struct SkillSelection {
@@ -100,6 +101,7 @@ impl CopilotClient {
                 .rpc()
                 .mcp()
                 .discover(McpDiscoverRequest {
+                    include_effective_source: Some(true),
                     working_directory: Some(workspace.to_owned()),
                 })
                 .await
@@ -192,12 +194,17 @@ impl CopilotClient {
 
 impl CopilotSession {
     pub async fn send(&self, input: MessageInput) -> Result<String, ProviderError> {
-        self.inner
-            .send(super::input::message(input))
-            .await
-            .map_err(|error| ProviderError::Transport {
-                message: error.to_string(),
-            })
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.inner.send(super::input::message(input)),
+        )
+        .await
+        .map_err(|_| ProviderError::DeliveryUncertain {
+            message: "Copilot initial input acknowledgment exceeded 30 seconds".into(),
+        })?
+        .map_err(|error| ProviderError::Transport {
+            message: error.to_string(),
+        })
     }
 
     pub fn id(&self) -> String {
@@ -210,12 +217,22 @@ impl CopilotSession {
         self.inner.cwd()
     }
     pub async fn disconnect(&self) -> Result<(), ProviderError> {
-        self.inner
+        let intake = self.events.close().await;
+        let native = self
+            .inner
             .disconnect()
             .await
             .map_err(|error| ProviderError::Transport {
                 message: error.to_string(),
-            })
+            });
+        match (intake, native) {
+            (Err(cause), Err(cleanup)) => Err(ProviderError::PreparationCleanup {
+                cause: Arc::new(cause),
+                cleanup: Arc::new(cleanup),
+            }),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
     pub async fn abort(&self) -> Result<(), ProviderError> {
         self.inner
@@ -510,6 +527,9 @@ impl CopilotSession {
                     .rpc()
                     .event_log()
                     .read(EventLogReadRequest {
+                        agent_ids: None,
+                        direction: None,
+                        include_ephemeral: Some(false),
                         cursor: Some(cursor.clone()),
                         agent_scope: Some(EventsAgentScope::Primary),
                         types: Some(json!(["user.message"])),
@@ -571,6 +591,9 @@ impl CopilotSession {
                         .rpc()
                         .event_log()
                         .read(EventLogReadRequest {
+                            agent_ids: None,
+                            direction: None,
+                            include_ephemeral: Some(false),
                             cursor: Some(cursor.clone()),
                             agent_scope: Some(EventsAgentScope::Primary),
                             types: Some(json!(["user.message"])),

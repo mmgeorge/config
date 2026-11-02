@@ -176,7 +176,9 @@ impl MockResponseLease<'_> {
             let observed = state.borrow_and_update().clone();
             match observed {
                 ResponseState::Released => return Ok(()),
-                ResponseState::Cancelled => bail!("mock response hold was cancelled"),
+                ResponseState::Cancelled => {
+                    return Err(forge_provider_api::error::TurnCancelled.into());
+                }
                 ResponseState::Armed | ResponseState::Pending(_) => {}
             }
             state.changed().await.context("mock response hold closed")?;

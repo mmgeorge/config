@@ -13,6 +13,7 @@ use std::collections::HashSet;
 #[derive(Default)]
 pub struct CodexNormalization {
     scope: Option<EventScope>,
+    turn_owners: HashMap<(String, ProviderTurnId), InvocationScope>,
     control_tools: HashSet<String>,
     control_calls: Vec<ToolCall>,
     message: HashMap<MessageAddress, NativeMessage>,
@@ -120,20 +121,68 @@ impl CodexNormalization {
         std::mem::take(&mut self.control_calls)
     }
 
+    /// Bind new admission while preserving known native identities from the same owner.
     pub fn bind(&mut self, scope: Option<impl Into<EventScope>>) {
-        self.scope = scope.map(Into::into);
+        let scope = scope.map(Into::into);
+        if let Some(scope) = &scope {
+            self.turn_owners
+                .retain(|_, owner| &owner.owner == scope.owner());
+            self.message
+                .retain(|address, _| &address.turn.scope.owner == scope.owner());
+            self.checklist
+                .retain(|(address, _), _| &address.scope.owner == scope.owner());
+            self.tool
+                .retain(|address, _| &address.turn.scope.owner == scope.owner());
+        }
+        self.scope = scope;
         self.control_calls.clear();
-        self.message.clear();
-        self.checklist.clear();
-        self.tool.retain(|address, tool| {
-            tool.lifetime == NativeToolLifetime::Background
-                && !tool.terminal
-                && self
-                    .scope
-                    .as_ref()
-                    .is_none_or(|scope| scope.owner() == &address.turn.scope.owner)
-        });
         self.replay_sensitive = false;
+    }
+
+    /// Get the original invocation for a previously observed native turn.
+    pub fn retained_scope(&self, message: &Value) -> Option<&InvocationScope> {
+        let identity = Self::native_identity(message.get("params")?)?;
+        self.turn_owners.get(&identity)
+    }
+
+    /// Normalize only native turns already bound to an original invocation.
+    pub async fn normalize_retained(
+        &mut self,
+        message: &Value,
+        workspace: &str,
+    ) -> Result<Option<Vec<ProviderEvent>>> {
+        let params = message.get("params").unwrap_or(&Value::Null);
+        let Some((thread_id, turn_id)) = Self::native_identity(params) else {
+            return Ok(None);
+        };
+        let Some(owner) = self.turn_owners.get(&(thread_id, turn_id)).cloned() else {
+            return Ok(None);
+        };
+        let previous = self.scope.replace(owner.into());
+        let replay_sensitive = self.replay_sensitive;
+        let mut output = ProviderOutput::default();
+        let result = self
+            .normalize(message, &mut output, None, workspace, false)
+            .await;
+        self.scope = previous;
+        self.replay_sensitive = replay_sensitive;
+        result?;
+        Ok(Some(output.event))
+    }
+
+    fn native_identity(params: &Value) -> Option<(String, ProviderTurnId)> {
+        Some((
+            pointer_string(
+                params,
+                &[
+                    "/threadId",
+                    "/thread_id",
+                    "/turn/threadId",
+                    "/turn/thread_id",
+                ],
+            )?,
+            pointer_string(params, &["/turnId", "/turn_id", "/turn/id"])?.into(),
+        ))
     }
 
     /// Identify retained commands whose native updates can outlive foreground completion.
@@ -208,18 +257,16 @@ impl CodexNormalization {
     }
 
     fn address(&self, params: &Value) -> Option<TurnAddress> {
+        let (thread_id, turn_id) = Self::native_identity(params)?;
+        let scope = self
+            .turn_owners
+            .get(&(thread_id.clone(), turn_id.clone()))
+            .cloned()
+            .or_else(|| self.scope.as_ref()?.invocation().cloned())?;
         Some(TurnAddress {
-            scope: self.scope.as_ref()?.invocation()?.clone(),
-            thread_id: pointer_string(
-                params,
-                &[
-                    "/threadId",
-                    "/thread_id",
-                    "/turn/threadId",
-                    "/turn/thread_id",
-                ],
-            )?,
-            turn_id: pointer_string(params, &["/turnId", "/turn_id", "/turn/id"])?.into(),
+            scope,
+            thread_id,
+            turn_id,
         })
     }
 
@@ -336,7 +383,18 @@ impl CodexNormalization {
         if let Some(value) = available_compact_update(&params) {
             output.completion.metrics.native_compact_update = Some(value);
         }
+        if let (Some(scope), Some(identity)) =
+            (event_scope.invocation(), Self::native_identity(&params))
+        {
+            self.turn_owners
+                .entry(identity)
+                .or_insert_with(|| scope.clone());
+        }
         let address = self.address(&params);
+        let event_scope = address
+            .as_ref()
+            .map(|address| EventScope::from(address.scope.clone()))
+            .unwrap_or(event_scope);
         let mut events = Vec::new();
         let item_type = params
             .pointer("/item/type")
@@ -758,7 +816,8 @@ impl CodexNormalization {
         if let Some(state) = output
             .completion
             .provider_session_id
-            .as_deref()
+            .as_ref()
+            .map(|id| id.as_str())
             .and_then(|thread| native_goal_state(message, thread))
         {
             output.completion.evidence.native_state = Some(state);
@@ -779,6 +838,93 @@ fn timestamp() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+pub fn native_goal_state(message: &Value, thread_id: &str) -> Option<GoalState> {
+    if message.pointer("/params/threadId").and_then(Value::as_str) != Some(thread_id) {
+        return None;
+    }
+    match message.get("method").and_then(Value::as_str)? {
+        "thread/goal/cleared" => Some(GoalState::Cleared),
+        "thread/goal/updated" => match message
+            .pointer("/params/goal/status")
+            .or_else(|| message.pointer("/params/status"))?
+            .as_str()?
+        {
+            "active" => Some(GoalState::Active),
+            "complete" => Some(GoalState::Complete),
+            "paused" => Some(GoalState::Paused),
+            "blocked" => Some(GoalState::Blocked),
+            "usageLimited" => Some(GoalState::UsageLimited),
+            "budgetLimited" => Some(GoalState::BudgetLimited),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn control_tool_name<'value>(
+    method: &str,
+    value: &'value Value,
+    allowed: &HashSet<String>,
+) -> Option<&'value str> {
+    let method_lower = method.to_ascii_lowercase();
+    let envelope = value.get("update").unwrap_or(value);
+    let item = envelope.get("item").unwrap_or(envelope);
+    let dynamic_tool_call = method_lower == "item/tool/call"
+        || item
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|item_type| item_type.eq_ignore_ascii_case("dynamicToolCall"));
+    if !dynamic_tool_call {
+        return None;
+    }
+    ["tool", "name", "toolName", "tool_name"]
+        .into_iter()
+        .find_map(|key| item.get(key).and_then(Value::as_str))
+        .filter(|name| allowed.contains(*name))
+}
+
+fn find_control_arguments(value: &Value, control_name: &str) -> Option<Value> {
+    if value
+        .get("tool")
+        .or_else(|| value.get("name"))
+        .or_else(|| value.get("toolName"))
+        .or_else(|| value.get("tool_name"))
+        .and_then(Value::as_str)
+        == Some(control_name)
+        && let Some(arguments) = value.get("arguments")
+    {
+        if let Some(arguments) = arguments.as_str() {
+            return serde_json::from_str(arguments).ok();
+        }
+        return Some(arguments.clone());
+    }
+    match value {
+        Value::Array(item) => item
+            .iter()
+            .find_map(|item| find_control_arguments(item, control_name)),
+        Value::Object(map) => map
+            .values()
+            .find_map(|item| find_control_arguments(item, control_name)),
+        _ => None,
+    }
+}
+
+pub(super) fn control_invocation(
+    method: &str,
+    value: &Value,
+    allowed: &HashSet<String>,
+) -> Result<Option<ToolCall>> {
+    let Some(control_name) = control_tool_name(method, value, allowed) else {
+        return Ok(None);
+    };
+    let arguments = find_control_arguments(value, control_name)
+        .with_context(|| format!("{control_name} omitted its arguments object"))?;
+    Ok(Some(ToolCall {
+        name: control_name.to_owned(),
+        arguments,
+    }))
 }
 
 #[cfg(test)]
@@ -1146,91 +1292,4 @@ mod test {
         }
         Ok(())
     }
-}
-
-pub fn native_goal_state(message: &Value, thread_id: &str) -> Option<GoalState> {
-    if message.pointer("/params/threadId").and_then(Value::as_str) != Some(thread_id) {
-        return None;
-    }
-    match message.get("method").and_then(Value::as_str)? {
-        "thread/goal/cleared" => Some(GoalState::Cleared),
-        "thread/goal/updated" => match message
-            .pointer("/params/goal/status")
-            .or_else(|| message.pointer("/params/status"))?
-            .as_str()?
-        {
-            "active" => Some(GoalState::Active),
-            "complete" => Some(GoalState::Complete),
-            "paused" => Some(GoalState::Paused),
-            "blocked" => Some(GoalState::Blocked),
-            "usageLimited" => Some(GoalState::UsageLimited),
-            "budgetLimited" => Some(GoalState::BudgetLimited),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-fn control_tool_name<'value>(
-    method: &str,
-    value: &'value Value,
-    allowed: &HashSet<String>,
-) -> Option<&'value str> {
-    let method_lower = method.to_ascii_lowercase();
-    let envelope = value.get("update").unwrap_or(value);
-    let item = envelope.get("item").unwrap_or(envelope);
-    let dynamic_tool_call = method_lower == "item/tool/call"
-        || item
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|item_type| item_type.eq_ignore_ascii_case("dynamicToolCall"));
-    if !dynamic_tool_call {
-        return None;
-    }
-    ["tool", "name", "toolName", "tool_name"]
-        .into_iter()
-        .find_map(|key| item.get(key).and_then(Value::as_str))
-        .filter(|name| allowed.contains(*name))
-}
-
-fn find_control_arguments(value: &Value, control_name: &str) -> Option<Value> {
-    if value
-        .get("tool")
-        .or_else(|| value.get("name"))
-        .or_else(|| value.get("toolName"))
-        .or_else(|| value.get("tool_name"))
-        .and_then(Value::as_str)
-        == Some(control_name)
-        && let Some(arguments) = value.get("arguments")
-    {
-        if let Some(arguments) = arguments.as_str() {
-            return serde_json::from_str(arguments).ok();
-        }
-        return Some(arguments.clone());
-    }
-    match value {
-        Value::Array(item) => item
-            .iter()
-            .find_map(|item| find_control_arguments(item, control_name)),
-        Value::Object(map) => map
-            .values()
-            .find_map(|item| find_control_arguments(item, control_name)),
-        _ => None,
-    }
-}
-
-pub(super) fn control_invocation(
-    method: &str,
-    value: &Value,
-    allowed: &HashSet<String>,
-) -> Result<Option<ToolCall>> {
-    let Some(control_name) = control_tool_name(method, value, allowed) else {
-        return Ok(None);
-    };
-    let arguments = find_control_arguments(value, control_name)
-        .with_context(|| format!("{control_name} omitted its arguments object"))?;
-    Ok(Some(ToolCall {
-        name: control_name.to_owned(),
-        arguments,
-    }))
 }

@@ -18,7 +18,8 @@ pub(crate) struct BrokerObserver {
     pub(crate) status_thoughts: AtomicBool,
     pub(crate) check_editing: Arc<AtomicBool>,
     pub(crate) completion_queue: crate::checks::CompletionQueue,
-    pub(crate) session_events: Arc<super::session_events::SessionEventInbox>,
+    pub(crate) session_events:
+        RwLock<Arc<crate::provider::session_execution::SessionObservationInbox>>,
     pub(super) data_root: PathBuf,
     pub(super) session_id: String,
     pub(super) session_metadata: crate::storage::lifecycle::SessionMetadataWriter,
@@ -42,6 +43,26 @@ pub(super) struct ObservationMetadata {
 }
 
 impl BrokerObserver {
+    /// Get the current owner observation generation.
+    pub(crate) fn session_events(
+        &self,
+    ) -> Arc<crate::provider::session_execution::SessionObservationInbox> {
+        self.session_events
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Install a replacement only after the previous observer has drained.
+    pub(crate) fn replace_session_events(
+        &self,
+        inbox: Arc<crate::provider::session_execution::SessionObservationInbox>,
+    ) {
+        *self
+            .session_events
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = inbox;
+    }
     #[cfg(test)]
     pub(crate) fn set_native_goal_for_test(&self, supported: bool) -> Result<()> {
         self.metadata

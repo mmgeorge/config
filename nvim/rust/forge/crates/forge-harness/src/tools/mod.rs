@@ -23,7 +23,7 @@ pub mod repository;
 pub(crate) mod session;
 
 pub(crate) use agents::is_tool as is_agent_tool;
-pub(crate) use authority::TaskAuthority;
+pub(crate) use authority::{PermissionAuthoritySnapshot, TaskAuthority};
 pub use error::{ToolError, ToolResult};
 pub(crate) use executor::ControlToolExecutor;
 pub(crate) use failure::{
@@ -37,6 +37,7 @@ pub use questions::{
 pub use registry::{ControlToolDefinition, ControlToolRegistry};
 #[cfg(test)]
 pub(crate) use runtime::ControlToolRuntime;
+pub(crate) use runtime::ProviderExecutionPreview;
 pub use runtime::{ControlToolResult, ControlTurnContext};
 pub use stdio::run_stdio;
 

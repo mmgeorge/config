@@ -1,4 +1,6 @@
-use crate::{ProviderCapability, ProviderEvent, ProviderRuntime, context::ContextUsage};
+use crate::{
+    ProviderCapability, ProviderEvent, ProviderRuntime, ProviderSessionId, context::ContextUsage,
+};
 use serde::{Deserialize, Serialize};
 
 /// Represents the lifecycle state of one persistent harness goal.
@@ -16,7 +18,7 @@ pub enum GoalState {
 }
 
 /// Represents observable evidence produced by one provider turn.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct TurnEvidence {
     pub workspace_changed: bool,
     pub tool_called: bool,
@@ -27,17 +29,17 @@ pub struct TurnEvidence {
 }
 
 /// Tracks provider-reported metrics while one provider turn streams.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct TurnMetrics {
     pub context_usage: Option<ContextUsage>,
     pub native_compact_update: Option<bool>,
 }
 
 /// Collect native observations without host plan documents, permits, or tool implementation state.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ProviderCompletion {
     #[serde(alias = "backend_session_id")]
-    pub provider_session_id: Option<String>,
+    pub provider_session_id: Option<ProviderSessionId>,
     pub provider_checkpoint_id: Option<String>,
     pub evidence: TurnEvidence,
     pub capability: ProviderCapability,
@@ -55,8 +57,8 @@ pub struct ProviderOutput {
 }
 
 impl crate::progress::TurnProgress for ProviderCompletion {
-    fn session_id(&self) -> Option<&str> {
-        self.provider_session_id.as_deref()
+    fn session_id(&self) -> Option<&ProviderSessionId> {
+        self.provider_session_id.as_ref()
     }
     fn runtime(&self) -> &ProviderRuntime {
         &self.runtime

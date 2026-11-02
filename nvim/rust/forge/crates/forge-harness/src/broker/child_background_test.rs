@@ -5,6 +5,7 @@ enum ChildBackgroundCompletion {
 }
 
 struct ChildBackgroundProvider {
+    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
     completion: ChildBackgroundCompletion,
     observer: std::sync::Mutex<Option<ProviderEventSink>>,
     final_event: std::sync::Mutex<Vec<ProviderEvent>>,
@@ -48,16 +49,25 @@ impl crate::provider::ProviderAdapter for ChildBackgroundProvider {
     async fn shutdown(&self) -> Result<()> {
         self.publish_final().await?;
         self.observer.lock().unwrap().take();
+        self.fixture_events.shutdown().await?;
         Ok(())
     }
 
     /// Keep provider cancellation independent of the test's natural prompt completion.
-    async fn cancel_session(&self, _: &str) -> Result<()> {
+    async fn cancel_session(&self, runtime_key: &str) -> Result<()> {
+        self.fixture_events.cancel_runtime(runtime_key).await?;
         Ok(())
     }
 
     /// Leave cleanup to the observer-producing shutdown implementation.
-    async fn cleanup_execution(&self, _: &str) -> Result<()> {
+    async fn cleanup_execution(&self, runtime_key: &str) -> Result<()> {
+        self.fixture_events.cancel_runtime(runtime_key).await?;
+        Ok(())
+    }
+
+    /// Collect this owner's invocation tasks while preserving final session observations.
+    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
+        self.fixture_events.cancel(owner).await?;
         Ok(())
     }
 
@@ -67,26 +77,46 @@ impl crate::provider::ProviderAdapter for ChildBackgroundProvider {
     }
 
     /// Preserve the native conversation used by the original tool address.
-    async fn active_session_id_for(&self, _: &str) -> Option<String> {
-        Some("child-background-thread".into())
+    async fn active_session_id_for(
+        &self,
+        _: &str,
+    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+        Ok(Some("child-background-thread".to_owned().try_into()?))
     }
 
     /// Bind session observations to the actual admitted managed child owner.
-    async fn session_event_stream(
+    /// Admit a real background tool with partial output, then finish only its foreground turn.
+    async fn session_events(
         &self,
         owner: crate::provider::ExecutionOwner,
-    ) -> Result<Option<crate::provider::events::ProviderEventStream>> {
-        let (sink, stream) =
-            crate::provider::events::channel(crate::provider::EventScope::SessionOperation {
-                owner,
-                operation_id: "child-background-observer".into(),
-            });
-        *self.observer.lock().unwrap() = Some(sink);
-        Ok(Some(stream))
+    ) -> std::result::Result<
+        crate::provider::events::ProviderEventStream,
+        crate::provider::ProviderError,
+    > {
+        let stream = self.fixture_events.subscribe(owner.clone())?;
+        *self.observer.lock().unwrap() = Some(self.fixture_events.session_sink(&owner)?);
+        Ok(stream)
     }
 
-    /// Admit a real background tool with partial output, then finish only its foreground turn.
-    async fn prompt_stream(
+    async fn session_prompt(
+        self: std::sync::Arc<Self>,
+        request: crate::provider::ProviderRequest,
+        scope: crate::provider::InvocationScope,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let events = self.fixture_events.clone();
+        events
+            .submit(
+                request,
+                scope,
+                crate::provider::test_support::TerminalBoundary::LocalFixture,
+                move |request, sink| async move { self.run_native(request, sink).await },
+            )
+            .await
+    }
+}
+
+impl ChildBackgroundProvider {
+    async fn run_native(
         &self,
         _: ProviderRequest,
         sink: ProviderEventSink,
@@ -120,6 +150,12 @@ impl crate::provider::ProviderAdapter for ChildBackgroundProvider {
                 },
             ];
             // Admit foreground ownership before handing the tool to background observation.
+            sink.send_wait(ProviderEvent::Execution {
+                observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                    scope.clone(),
+                    forge_provider_api::lifecycle::ExecutionUpdate::Started { address: turn.clone() },
+                )?,
+            }).await?;
             sink.send_wait(ProviderEvent::Turn {
                 address: turn.clone(),
                 update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
@@ -158,9 +194,14 @@ impl crate::provider::ProviderAdapter for ChildBackgroundProvider {
             if matches!(self.completion, ChildBackgroundCompletion::Natural) {
                 self.publish_final().await?;
             }
-            Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {
-                provider_session_id: Some("child-background-thread".into()),
-                capability: self.descriptor().capability, ..Default::default() },
+            Ok(crate::provider::ProviderCompletion {
+                native: forge_provider_api::completion::ProviderCompletion {
+                    provider_session_id: Some(
+                        "child-background-thread".to_owned().try_into().unwrap(),
+                    ),
+                    capability: self.descriptor().capability,
+                    ..Default::default()
+                },
                 ..Default::default()
             })
         }
@@ -193,6 +234,7 @@ async fn assert_managed_child_background_completion(
     broker
         .agent_provider_factory
         .register(Arc::new(ChildBackgroundProvider {
+            fixture_events: Default::default(),
             completion,
             observer: Default::default(),
             final_event: Default::default(),
@@ -234,7 +276,7 @@ async fn assert_managed_child_background_completion(
                         let (turn, tool) = exchange
                             .tools()
                             .next()
-                            .context("background tool was not persisted")?;
+                            .with_context(|| format!("background tool was not persisted; child_failed={}, cleanup_error={cleanup_error:?}, exchange={}", output.is_err(), serde_json::to_string(&exchange).unwrap_or_default()))?;
                         let expected = match completion {
                             ChildBackgroundCompletion::Shutdown => {
                                 crate::turn::ToolState::Interrupted

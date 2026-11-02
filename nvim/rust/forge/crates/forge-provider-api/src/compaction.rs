@@ -23,7 +23,7 @@ pub enum CompactionState {
     Unconfirmed,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 /// Describes the compaction evidence available through the provider protocol.
 pub struct CompactionCapability {
     /// Publishes compaction start and completion notifications.

@@ -85,7 +85,8 @@ pub(super) async fn execute(
                 .context("execution revision requires a reason")?;
             let mut response = execution
                 .send(crate::plan::execution::ExecutionOperation::Submit {
-                    document: submitted,
+                    baseline: Box::new(document.clone()),
+                    document: Box::new(submitted),
                     reason: reason.into(),
                 })
                 .await?;

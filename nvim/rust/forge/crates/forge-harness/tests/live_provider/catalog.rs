@@ -1,3 +1,4 @@
+use super::collect::ProviderTestExt as _;
 use anyhow::{Context, Result};
 use forge_harness::provider::ProviderAdapter as _;
 use forge_harness::provider::approval::PermissionCoordinator;
@@ -14,6 +15,7 @@ use std::time::Duration;
 async fn live_mcp_catalog() {
     let workspace = tempfile::tempdir().unwrap();
     let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    let provider = super::collect::ProviderTestSession::new(provider).unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(30),
         provider.mcp_list(super::catalog_request(workspace.path(), "mcp-catalog-test")),
@@ -28,6 +30,7 @@ async fn live_mcp_catalog() {
 async fn default_cli_resolution_starts_and_collects_without_a_session() {
     let workspace = tempfile::tempdir().unwrap();
     let provider = CopilotProvider::new(Vec::new()).unwrap();
+    let provider = super::collect::ProviderTestSession::new(provider).unwrap();
     let request = super::catalog_request(workspace.path(), "copilot-startup");
     let result = tokio::time::timeout(
         Duration::from_secs(30),
@@ -46,6 +49,7 @@ async fn default_cli_resolution_starts_and_collects_without_a_session() {
         provider
             .active_session_id_for(&request.harness_session_id)
             .await
+            .unwrap()
             .is_none(),
         "model discovery created a conversation"
     );
@@ -95,6 +99,7 @@ end
         Arc::new(TraceStore::open(fixture.path())?),
         Some(fixture.path().into()),
     )?;
+    let provider = super::collect::ProviderTestSession::new(provider)?;
     let mut request = super::catalog_request(fixture.path(), "mcp-terminal-smoke");
     let mut settings = forge_harness::settings::SettingsStore::open(fixture.path())?;
     let configuration = provider.mcp_configuration(request.clone()).await?;
@@ -129,7 +134,7 @@ end
             "model catalog missing"
         );
         request.provider_session_id = provider
-            .prompt(prompt)
+            .session_prompt_and_collect(prompt)
             .await?
             .completion
             .native

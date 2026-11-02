@@ -26,15 +26,53 @@ pub trait ProviderHost: Send + Sync + 'static {
 
 /// Requires session lifecycle ownership and provides explicit failures for optional operations.
 #[async_trait]
-pub trait Provider: Send + Sync {
+pub trait Provider: Send + Sync + 'static {
     type Host: ProviderHost;
+    /// Submit input to a retained session; success means acceptance, not execution completion.
+    async fn session_prompt(
+        self: std::sync::Arc<Self>,
+        request: <Self::Host as ProviderHost>::Request,
+        scope: InvocationScope,
+    ) -> Result<(), ProviderError>;
+
+    /// Observe normalized events through the lifetime of one execution owner's session.
+    async fn session_events(
+        &self,
+        owner: ExecutionOwner,
+    ) -> Result<events::ProviderEventStream, ProviderError>;
+
+    /// Retire one failed owner's native binding and observation generation before replacement.
+    async fn reset_session(&self, _owner: &ExecutionOwner) -> Result<()> {
+        Err(UnsupportedCapability("session_replacement").into())
+    }
+
+    /// Revoke callback authority before collecting an owner with unreliable observation.
+    async fn fence_session(&self, _owner: &ExecutionOwner) -> Result<()> {
+        Err(UnsupportedCapability("session_fencing").into())
+    }
+
+    /// Submit steering to its original owner without exposing native turn placement.
+    async fn session_steer(
+        self: std::sync::Arc<Self>,
+        owner: &ExecutionOwner,
+        scope: InvocationScope,
+        input: <Self::Host as ProviderHost>::SteeringInput,
+    ) -> Result<(), ProviderError> {
+        if scope.owner != *owner {
+            return Err(ProviderError::Rejected {
+                message: "steering scope belongs to a different execution owner".into(),
+            });
+        }
+        let _ = input;
+        Err(UnsupportedCapability("native_steer").into())
+    }
     /// Create or resume provider history and connections without admitting a model turn.
     /// The returned identity belongs to the requested Harness session in this runtime.
     /// The broker decides whether to resume or replace it when reopening local history.
     async fn initialize_session(
         &self,
         _request: <Self::Host as ProviderHost>::Request,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<ProviderSessionId>> {
         Ok(None)
     }
 
@@ -96,53 +134,6 @@ pub trait Provider: Send + Sync {
     ) -> Result<Option<String>> {
         Ok(None)
     }
-
-    /// Collects the ordered stream while the provider executes, including its final drain.
-    async fn prompt(
-        &self,
-        request: <Self::Host as ProviderHost>::Request,
-    ) -> Result<<Self::Host as ProviderHost>::Output, ProviderError> {
-        let scope = InvocationScope::new(
-            <Self::Host as ProviderHost>::owner(&request)?,
-            uuid::Uuid::new_v4().to_string(),
-        );
-        let (sink, mut stream) = events::channel(scope);
-        let execution = self.prompt_stream(request, sink.clone());
-        tokio::pin!(execution);
-        let mut events = Vec::new();
-        let mut open = true;
-        let mut delivery_failure = None;
-        let result = loop {
-            tokio::select! {
-                event = stream.recv(), if open => match event {
-                    Ok(Some(event)) => events.push(event),
-                    Ok(None) => open = false,
-                    Err(error) => {
-                        delivery_failure = Some(error);
-                        open = false;
-                    }
-                },
-                output = &mut execution => break output,
-            }
-        };
-        if let Some(error) = delivery_failure {
-            return Err(error.into());
-        }
-        while let Some(event) = stream.try_next()? {
-            events.push(event);
-        }
-        let completion = result?;
-        drop(sink);
-        Ok(<Self::Host as ProviderHost>::output(events, completion))
-    }
-
-    /// Publishes normalized updates in order and returns completion metadata after delivery settles.
-    /// Implementations must collect provider work before returning and propagate delivery failures.
-    async fn prompt_stream(
-        &self,
-        request: <Self::Host as ProviderHost>::Request,
-        event_sink: ProviderEventSink,
-    ) -> Result<<Self::Host as ProviderHost>::Completion, ProviderError>;
 
     /// Fork a provider session only when the provider advertises native support.
     async fn fork(
@@ -254,26 +245,6 @@ pub trait Provider: Send + Sync {
         Err(UnsupportedCapability("native_compact").into())
     }
 
-    /// Subscribe once to owned session observations that can outlive an active provider turn.
-    /// Shutdown publishes final known-background outcomes, then closes the stream so
-    /// callers can await durable delivery of all preceding observations.
-    async fn session_event_stream(
-        &self,
-        _owner: ExecutionOwner,
-    ) -> Result<Option<events::ProviderEventStream>> {
-        Ok(None)
-    }
-
-    /// Appends input to an active turn without starting an idle provider session.
-    /// Implementations render user additions only and keep agent results out of user-prompt rows.
-    async fn steer_session(
-        &self,
-        _session_id: &str,
-        _input: <Self::Host as ProviderHost>::SteeringInput,
-    ) -> Result<()> {
-        Err(UnsupportedCapability("native_steer").into())
-    }
-
     /// Interrupt the parent and descendants for one session and await terminal evidence.
     async fn cleanup_execution(&self, session_id: &str) -> Result<()>;
 
@@ -283,7 +254,7 @@ pub trait Provider: Send + Sync {
     }
 
     /// Return one Harness session's provider conversation after interruption.
-    async fn active_session_id_for(&self, session_id: &str) -> Option<String>;
+    async fn active_session_id_for(&self, session_id: &str) -> Result<Option<ProviderSessionId>>;
 
     /// Roll back a cancelled turn after the broker proves it produced no visible output or changes.
     async fn rollback_cancelled_turn(&self) -> Result<bool> {

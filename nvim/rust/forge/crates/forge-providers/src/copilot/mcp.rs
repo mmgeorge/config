@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Starts selected servers independently and retains failures for catalog inspection.
+/// Start selected servers independently and retain failures for catalog inspection.
 /// Failure to enforce the selected server set still rejects the session.
 pub async fn start(
     session: &Arc<super::handle::CopilotSession>,
@@ -18,6 +18,82 @@ pub async fn start(
     timeout: Duration,
 ) -> Result<HashMap<String, String>> {
     let session = &session.inner;
+    // Timed-out starts may remain active natively; exclude unselected servers before launching them.
+    trace.record(harness_session_id, "copilot.mcp.selection_begin", json!({}));
+    let selected = tokio::time::timeout(timeout, async {
+        trace.record(
+            harness_session_id,
+            "copilot.mcp.selection_step",
+            json!({"phase":"list.begin"}),
+        );
+        let loaded = session
+            .rpc()
+            .mcp()
+            .list_configured()
+            .await
+            .context("inspect Copilot MCP selection")?;
+        trace.record(
+            harness_session_id,
+            "copilot.mcp.selection_step",
+            json!({"phase":"list.complete"}),
+        );
+        for server in loaded
+            .servers
+            .iter()
+            .filter(|server| server.enabled && !launch.iter().any(|(name, _)| name == &server.name))
+        {
+            trace.record(
+                harness_session_id,
+                "copilot.mcp.selection_step",
+                json!({"phase":"disable.begin", "server":server.name}),
+            );
+            session
+                .rpc()
+                .mcp()
+                .disable(McpDisableRequest {
+                    server_name: server.name.clone(),
+                })
+                .await
+                .with_context(|| {
+                    format!("exclude unselected Copilot MCP server {}", server.name)
+                })?;
+            trace.record(
+                harness_session_id,
+                "copilot.mcp.selection_step",
+                json!({"phase":"disable.complete", "server":server.name}),
+            );
+        }
+        let verified = session
+            .rpc()
+            .mcp()
+            .list_configured()
+            .await
+            .context("verify excluded Copilot MCP servers")?;
+        anyhow::ensure!(
+            verified.servers.iter().all(
+                |server| !server.enabled || launch.iter().any(|(name, _)| name == &server.name)
+            ),
+            "Copilot retained an unselected enabled MCP server"
+        );
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("Copilot MCP selection verification timed out")
+    .and_then(|result| result);
+    match &selected {
+        Ok(()) => trace.record(
+            harness_session_id,
+            "copilot.mcp.selection_complete",
+            json!({"status":"ok"}),
+        ),
+        Err(error) => trace.record(
+            harness_session_id,
+            "copilot.mcp.selection_complete",
+            json!({"status":"failed", "error":format!("{error:#}")}),
+        ),
+    }
+    selected?;
+    // Start selected servers independently without extending another server's deadline.
     let request = launch
         .iter()
         .map(|(name, payload)| launch_request(name, &Value::Object(payload.clone())))
@@ -45,62 +121,50 @@ pub async fn start(
         }
     }
     let logged_failure: HashSet<_> = failure.keys().cloned().collect();
-    let selected = tokio::time::timeout(timeout, async {
-        let loaded = session
-            .rpc()
-            .mcp()
-            .list()
-            .await
-            .context("inspect Copilot MCP selection")?;
-        for server in loaded
+    // Recheck exclusion before exposing native status for the selected servers.
+    let verified = tokio::time::timeout(timeout, session.rpc().mcp().list_configured())
+        .await
+        .context("Copilot MCP status inspection timed out")?
+        .context("inspect Copilot MCP status")?;
+    anyhow::ensure!(
+        verified
             .servers
             .iter()
-            .filter(|server| !launch.iter().any(|(name, _)| name == &server.name))
-        {
-            session
-                .rpc()
-                .mcp()
-                .disable(McpDisableRequest {
-                    server_name: server.name.clone(),
-                })
-                .await
-                .with_context(|| {
-                    format!("exclude unselected Copilot MCP server {}", server.name)
-                })?;
-        }
-        for (name, _) in launch {
-            match loaded.servers.iter().find(|server| &server.name == name) {
-                Some(server) if server.status == McpServerStatus::Connected => {
-                    failure.remove(name);
-                }
-                Some(server)
-                    if matches!(
-                        server.status,
-                        McpServerStatus::Failed
-                            | McpServerStatus::Disabled
-                            | McpServerStatus::NotConfigured
-                    ) =>
-                {
-                    failure.entry(name.clone()).or_insert_with(|| {
-                        server
-                            .error
-                            .clone()
-                            .unwrap_or_else(|| format!("Copilot MCP server is {:?}", server.status))
-                    });
-                }
-                None => {
-                    failure
-                        .entry(name.clone())
-                        .or_insert_with(|| "Copilot MCP server was not registered".into());
-                }
-                _ => {}
+            .all(|server| !server.enabled || launch.iter().any(|(name, _)| name == &server.name)),
+        "Copilot retained an unselected enabled MCP server after startup"
+    );
+    for (name, _) in launch {
+        match verified.servers.iter().find(|server| &server.name == name) {
+            Some(server) if server.enabled && server.live.status == McpServerStatus::Connected => {
+                failure.remove(name);
             }
+            Some(server) if !server.enabled => {
+                failure
+                    .entry(name.clone())
+                    .or_insert_with(|| "Copilot MCP server is disabled".into());
+            }
+            Some(server)
+                if matches!(
+                    server.live.status,
+                    McpServerStatus::Failed
+                        | McpServerStatus::Disabled
+                        | McpServerStatus::NotConfigured
+                ) =>
+            {
+                failure.entry(name.clone()).or_insert_with(|| {
+                    server.live.error.clone().unwrap_or_else(|| {
+                        format!("Copilot MCP server is {:?}", server.live.status)
+                    })
+                });
+            }
+            None => {
+                failure
+                    .entry(name.clone())
+                    .or_insert_with(|| "Copilot MCP server was not registered".into());
+            }
+            _ => {}
         }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await
-    .context("Copilot MCP selection verification timed out")
-    .and_then(|result| result);
+    }
     for (name, error) in &failure {
         if logged_failure.contains(name) {
             continue;
@@ -111,10 +175,10 @@ pub async fn start(
             json!({"server": name, "error": error}),
         );
     }
-    selected?;
     Ok(failure)
 }
 
+/// Create one selected server's startup request with an explicit default tool set.
 pub fn launch_request(name: &str, payload: &Value) -> McpStartServerRequest {
     let mut config = payload.clone();
     if config.get("tools").is_none() {
@@ -122,6 +186,6 @@ pub fn launch_request(name: &str, payload: &Value) -> McpStartServerRequest {
     }
     McpStartServerRequest {
         server_name: name.to_owned(),
-        config,
+        config: Some(config),
     }
 }

@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::provider::test_support::ProviderTestExt as _;
 pub(crate) mod approval;
 pub(crate) mod attachments;
 use crate::provider::ProviderAdapter as _;
@@ -67,6 +69,7 @@ struct TerminalConnection {
 
 /// Owns Codex app-server thread lifecycle, prompting, permission policy, and native fork.
 pub struct CodexProvider {
+    session_events: Arc<crate::provider::session_events::SessionEvents>,
     runtime: CodexRuntime,
     background: background::BackgroundDelivery,
     command: Vec<String>,
@@ -172,6 +175,7 @@ impl CodexProvider {
             "Codex provider requires harness.providers.codex.command"
         );
         Ok(Self {
+            session_events: Default::default(),
             runtime: CodexRuntime::new(command.clone()),
             background: background::BackgroundDelivery::default(),
             command,
@@ -233,10 +237,30 @@ impl CodexProvider {
         process.set_execution_owner(request.owner()?).await;
         let process_duration_ms = process_started.elapsed().as_secs_f64() * 1000.0;
         let initialize_started = Instant::now();
-        process.request("initialize", json!({
+        let initialized = process.request("initialize", json!({
             "clientInfo": { "name": "forge-harness", "title": "Forge Harness", "version": env!("CARGO_PKG_VERSION") },
             "capabilities": { "experimentalApi": true }
         }), output).await?;
+        let reported = initialized
+            .get("userAgent")
+            .and_then(Value::as_str)
+            .and_then(|agent| {
+                agent
+                    .split(|character: char| {
+                        character.is_whitespace() || matches!(character, '/' | '(' | ')')
+                    })
+                    .find(|part| semver::Version::parse(part).is_ok())
+            });
+        forge_provider_api::version::RuntimeRequirement::new(
+            ProviderKind::Codex,
+            self.command
+                .first()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| "Codex app-server".into()),
+            semver::Version::new(0, 164, 0),
+        )
+        .validate(reported)
+        .map_err(super::ProviderError::from)?;
         process.notify("initialized", Value::Null).await?;
         Ok(CodexConnection {
             process,
@@ -404,7 +428,7 @@ impl CodexProvider {
             .or_else(|| response.get("thread_id"))
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .or(request.provider_session_id.clone())
+            .or(request.provider_session_id.clone().map(Into::into))
             .context("Codex thread response omitted thread id")?;
         if request.mode != PromptMode::Background
             && let Some(resources) = self.resources(&Self::catalog_from_request(request)).await?
@@ -558,9 +582,9 @@ impl CodexProvider {
     ) -> Result<Option<(CodexJsonRpc, ProviderOutput, String)>> {
         request.provider_session_id = self
             .active_session_id_for(&request.runtime_key()?)
-            .await
+            .await?
             .or(request.provider_session_id);
-        let Some(thread_id) = request.provider_session_id.clone() else {
+        let Some(thread_id) = request.provider_session_id.clone().map(String::from) else {
             return Ok(None);
         };
         let (mut process, mut output) = self.catalog_process(&request).await?;
@@ -585,7 +609,8 @@ impl CodexProvider {
     ) -> Result<()> {
         let thread_id = request
             .provider_session_id
-            .as_deref()
+            .as_ref()
+            .map(|id| id.as_str())
             .context("terminal thread id missing")?;
         if let Some(resources) = resources
             && resources.thread().await.as_deref() == Some(thread_id)
@@ -882,7 +907,16 @@ impl CodexProvider {
                 serde_json::json!({}),
             ))?;
         }
-        let request_id = process.send_request("turn/start", params).await?;
+        let acknowledgment_deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let request_id = tokio::time::timeout_at(
+            acknowledgment_deadline,
+            process.send_request("turn/start", params),
+        )
+        .await
+        .map_err(|_| super::ProviderError::DeliveryUncertain {
+            message: "Codex initial input dispatch exceeded 30 seconds".into(),
+        })??;
         self.active_turn_by_session.lock().await.insert(
             request.runtime_key()?,
             CodexTurnState::Submitted {
@@ -892,7 +926,12 @@ impl CodexProvider {
         );
         let mut observed_message_list = Vec::new();
         loop {
-            let received = process.receive_message().await?;
+            let received =
+                tokio::time::timeout_at(acknowledgment_deadline, process.receive_message())
+                    .await
+                    .map_err(|_| super::ProviderError::DeliveryUncertain {
+                        message: "Codex initial input acknowledgment exceeded 30 seconds".into(),
+                    })??;
             let message = match received {
                 json_rpc::ReceivedMessage::Provider(message) => message,
                 completed => {
@@ -975,7 +1014,10 @@ impl CodexProvider {
 impl crate::provider::ProviderAdapter for CodexProvider {
     type Host = crate::provider::HarnessProviderHost;
     /// Initialize or reuse a native thread without suspending its retained background delivery.
-    async fn initialize_session(&self, mut request: ProviderRequest) -> Result<Option<String>> {
+    async fn initialize_session(
+        &self,
+        mut request: ProviderRequest,
+    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
         capability().validate_access(&request.access)?;
         let runtime_key = request.runtime_key()?;
         let _startup = self.startup_guard(runtime_key.clone()).await;
@@ -986,7 +1028,7 @@ impl crate::provider::ProviderAdapter for CodexProvider {
         let result = async {
             let mut connection = connection.lock().await;
             if let Some(thread) = &connection.thread {
-                return Ok(Some(thread.id().to_owned()));
+                return Ok(Some(thread.id().to_owned().try_into()?));
             }
             request.model = self
                 .resolve_model(&request, &mut connection.process, &mut output)
@@ -1009,7 +1051,7 @@ impl crate::provider::ProviderAdapter for CodexProvider {
             } else {
                 CodexThread::Prepared(thread.clone())
             });
-            Ok(Some(thread))
+            Ok(Some(thread.try_into()?))
         }.await;
         self.background.start(runtime_key, connection).await?;
         result
@@ -1031,7 +1073,7 @@ impl crate::provider::ProviderAdapter for CodexProvider {
             return Ok(None);
         };
         let mut request = Self::catalog_from_request(&submission.request);
-        request.provider_session_id = Some(thread_id.to_owned());
+        request.provider_session_id = Some(thread_id.to_owned().try_into()?);
         let (mut process, mut output) = self.catalog_process(&request).await?;
         let mut cursor: Option<String> = None;
         let mut seen = HashSet::new();
@@ -1181,9 +1223,9 @@ impl crate::provider::ProviderAdapter for CodexProvider {
         let runtime_key = request.runtime_key()?;
         request.provider_session_id = self
             .active_session_id_for(&runtime_key)
-            .await
+            .await?
             .or(request.provider_session_id);
-        let Some(thread_id) = request.provider_session_id.clone() else {
+        let Some(thread_id) = request.provider_session_id.clone().map(String::from) else {
             return Ok(super::terminal::TerminalSnapshot {
                 supported: true,
                 starting: false,
@@ -1259,7 +1301,15 @@ impl crate::provider::ProviderAdapter for CodexProvider {
     }
 
     async fn shutdown(&self) -> Result<()> {
-        let mut failure = self.background.stop_readers().await.err();
+        let mut failure = self
+            .session_events
+            .shutdown()
+            .await
+            .err()
+            .map(anyhow::Error::from);
+        if let Err(error) = self.background.stop_readers().await {
+            failure.get_or_insert(error);
+        }
         let connections: Vec<_> = self
             .connection_by_session
             .lock()
@@ -1268,7 +1318,11 @@ impl crate::provider::ProviderAdapter for CodexProvider {
             .cloned()
             .collect();
         for connection in connections {
-            if let Err(error) = connection.lock().await.process.shutdown_background().await {
+            let mut connection = connection.lock().await;
+            if let Err(error) = connection.process.shutdown_background().await {
+                failure.get_or_insert(error);
+            }
+            if let Err(error) = connection.process.close().await {
                 failure.get_or_insert(error);
             }
         }
@@ -1302,374 +1356,68 @@ impl crate::provider::ProviderAdapter for CodexProvider {
     }
 
     /// Subscribe to original-owner background updates independently of foreground requests.
-    async fn session_event_stream(
+    async fn session_events(
         &self,
-        owner: super::ExecutionOwner,
-    ) -> Result<Option<super::events::ProviderEventStream>> {
-        Ok(Some(self.background.subscribe(owner).await))
+        owner: crate::provider::ExecutionOwner,
+    ) -> Result<crate::provider::events::ProviderEventStream, crate::provider::ProviderError> {
+        let stream = self.session_events.subscribe(owner.clone())?;
+        self.background
+            .attach(&owner, self.session_events.session_sink(&owner)?)
+            .await;
+        Ok(stream)
     }
 
-    async fn prompt_stream(
-        &self,
-        mut request: ProviderRequest,
-        event_sink: ProviderEventSink,
-    ) -> std::result::Result<crate::provider::ProviderCompletion, super::ProviderError> {
-        capability().validate_access(&request.access)?;
-        if request.owner().map_err(super::ProviderError::from)?
-            != event_sink.invocation_scope()?.owner
-        {
-            return Err(super::ProviderError::Rejected {
-                message: "Codex invocation scope does not match the requested owner".into(),
+    async fn session_steer(
+        self: std::sync::Arc<Self>,
+        owner: &crate::provider::ExecutionOwner,
+        scope: crate::provider::InvocationScope,
+        input: crate::provider::SteeringInput,
+    ) -> Result<(), crate::provider::ProviderError> {
+        if scope.owner != *owner {
+            return Err(crate::provider::ProviderError::Rejected {
+                message: "steering scope belongs to another owner".into(),
             });
         }
-        let runtime_key = request.runtime_key().map_err(super::ProviderError::from)?;
-        let output: anyhow::Result<crate::provider::ProviderOutput> = async {
-            let event_sink = Some(event_sink);
-            let skills = self.permission_coordinator.skills(
-                self.settings_root.as_deref(),
-                &request,
-                super::ProviderKind::Codex,
-            )?;
-            let _directories = self
-                .permission_coordinator
-                .directories(self.settings_root.as_deref(), &request)?;
-            let event_sink = skills.sink(event_sink);
-            let mut active_steering = self
-                .activate_turn_control(&request.runtime_key()?, event_sink.clone())
-                .await?;
-            let mut output = ProviderOutput {
-                event: Vec::new(),
-                completion: crate::provider::ProviderCompletion {
-                    native: forge_provider_api::completion::ProviderCompletion {
-                    capability: capability(), ..Default::default() },
-                    ..Default::default()
-                },
-            };
-            let coordinator_event_sink = event_sink.clone();
-            let startup = self.startup_guard(request.runtime_key()?).await;
-            let connection = self
-                .persistent_connection(&request, &mut output, event_sink)
-                .await?;
-            let mut connection = connection.lock().await;
-            let prepared = connection.thread.as_ref().is_some_and(|thread| {
-                matches!(thread, CodexThread::Prepared(_))
-                    && request.provider_session_id.as_deref().is_none_or(|id| id == thread.id())
-            });
-            if request.provider_session_id.is_none() {
-                request.provider_session_id = connection.thread.as_ref().map(|thread| thread.id().to_owned());
-            }
-            let CodexConnection {
-                process,
-                thread: retained_thread,
-                ..
-            } = &mut *connection;
-            process.set_activity_publication(false);
-            let request_text = request.input.text();
-            let mut control_context = request.control_context.clone().unwrap_or_else(|| {
-                crate::tools::ControlTurnContext::inactive(request.mode)
-            });
-            control_context.planning_feedback =
-                request.mode == PromptMode::Plan && request_text.contains("Planning feedback:");
-            if control_context.plan_document.is_none() {
-                control_context.plan_document = (request.mode == PromptMode::Plan)
-                    .then(|| super::mock_plan_document_from_prompt(&request_text))
-                    .flatten();
-            }
-            let dynamic_tool_definition = ControlToolRegistry
-                .definition_list_for_context(Some(&control_context), request.owner()?.is_root());
-            process.set_control_context(control_context).await;
-            request.model = self.resolve_model(&request, process, &mut output).await?;
-            output.completion.runtime.provider = "Codex CLI".into();
-            output.completion.runtime.model = Some(request.model.clone());
-            if let Some(sink) = coordinator_event_sink.as_ref() {
-                let runtime_event = crate::provider::ProviderEvent::Runtime {
-                    scope: sink.invocation_scope()?.clone(),
-                    update: crate::provider::RuntimeUpdate::Resolved {
-                        runtime: output.completion.runtime.clone(),
-                    },
-                };
-                sink.send_wait(runtime_event).await?;
-            }
-            let dynamic_tool_list = dynamic_tool_definition
-                .into_iter()
-                .map(|definition| {
-                    json!({
-                        "type": "function",
-                        "name": definition.name,
-                        "description": definition.description,
-                        "inputSchema": definition.input_schema,
-                    })
-                })
-                .collect::<Vec<_>>();
-            let thread_id = if prepared {
-                request.provider_session_id.clone().context("prepared Codex thread is missing")?
-            } else {
-                self.load_thread(process, &mut output, &request, false, dynamic_tool_list).await?
-            };
-            drop(startup);
-            if prepared {
-                // The initial thread has no per-turn checkpoint hook. Admit its first turn
-                // only after the checkpoint completes, before native tools can execute.
-                if let Some(gate) = request.control_context.as_ref().and_then(|context| context.checkpoint.as_ref()) {
-                    gate.wait().await?;
-                }
-            } else if request.provider_session_id.is_some()
-                && let Some(gate) = request
-                    .control_context
-                    .as_ref()
-                    .and_then(|context| context.checkpoint.as_ref())
-                && !gate.ready()
-            {
-                // Existing exec sessions accept stdin without running Codex's PreToolUse hook.
-                let terminals = process
-                    .request(
-                        "thread/backgroundTerminals/list",
-                        json!({"threadId":thread_id,"limit":1}),
-                        &mut output,
-                    )
-                    .await
-                    .and_then(|value| forge_providers::terminal::parse_snapshot(&value, false));
-                if !terminals
-                    .as_ref()
-                    .is_ok_and(|snapshot| snapshot.terminal.is_empty())
-                {
-                    gate.wait().await?;
-                }
-            }
-            output.completion.provider_session_id = Some(thread_id.clone());
-            let mut prompt = request_text.clone();
-            let native_goal = request
-                .control_context
-                .as_ref()
-                .and_then(|context| context.native_goal.as_deref());
-            if let Some(objective) = native_goal {
-                if request_text.lines().next() != Some("/goal resume") {
-                    process
-                        .request(
-                            "thread/goal/set",
-                            json!({
-                                "threadId": thread_id,
-                                "objective": objective,
-                                "status": "active"
-                            }),
-                            &mut output,
-                        )
-                        .await?;
-                    if request_text.starts_with("/goal ") {
-                        prompt = format!("Work toward the active goal: {objective}");
-                    }
-                } else {
-                    prompt = "Continue working toward the active goal.".into();
-                }
-            }
-            let recovered = request
-                .recovered_input
-                .iter()
-                .map(ProviderInput::text)
-                .collect::<Vec<_>>();
-            prompt = request.recovered_text(&prompt, &recovered);
-            let mut input =
-                crate::provider::codex::attachments::input(prompt, &request.input_attachments()).await?;
-            for name in request
-                .recovered_input
-                .iter()
-                .chain(std::iter::once(&request.input))
-                .filter_map(|input| {
-                    if let ProviderInput::Skill { name, .. } = input {
-                        Some(name)
-                    } else {
-                        None
-                    }
-                })
-            {
-                let catalog = if let Some(resources) = self
-                    .resources(&Self::catalog_from_request(&request))
-                    .await?
-                {
-                    resources.catalog.skill.clone()
-                } else {
-                    Self::skill_catalog(process, &mut output, &request.workspace, true).await?
-                };
-                let skill = catalog
-                    .into_iter()
-                    .find(|skill| skill.name == *name && skill.enabled && skill.user_invocable)
-                    .with_context(|| format!("skill ${name} is unavailable or disabled"))?;
-                let path = skill
-                    .path
-                    .with_context(|| format!("skill ${name} omitted its provider path"))?;
-                input.push(json!({ "type": "skill", "name": name, "path": path }));
-            }
-            let native_resume = native_goal.is_some()
-                && request_text.lines().next() == Some("/goal resume")
-                && request.recovered_input.is_empty();
-            let resume_message = native_resume
-                .then(|| {
-                    request_text
-                        .split_once("\n\nAdditional user instructions:\n")
-                        .or_else(|| request_text.split_once("\n\nHarness transition:\n"))
-                        .map(|(_, text)| text.to_owned())
-                })
-                .flatten();
-            *retained_thread = Some(CodexThread::Submitted(thread_id.clone()));
-            let admission = if native_resume {
-                if let Some(submission) = &request.submission {
-                    submission.sending(super::submission::SubmissionTarget::Untracked)?;
-                }
-                let admission = self
-                    .resume_native_goal_turn(process, &mut output, &request, &thread_id)
-                    .await?;
-                if let Some(submission) = &request.submission {
-                    submission.accepted(format!("goal/resume:{thread_id}"))?;
-                }
-                admission
-            } else {
-                Some(
-                    self.start_turn(
-                        process,
-                        &mut output,
-                        &request,
-                        &thread_id,
-                        false,
-                        Self::with_model(
-                            Self::secure(
-                                json!({
-                                    "threadId": thread_id,
-                                    "input": input,
-                                    "cwd": request.workspace,
-                                    "effort": request.effort,
-                                    "serviceTier": request.service_tier,
-                                    "collaborationMode": prepared.then(|| json!({
-                                        "mode":"default", "settings":{
-                                            "model":request.model, "reasoning_effort":request.effort,
-                                            "developer_instructions":request.system_message()
-                                        }
-                                    }))
-                                }),
-                                &request,
-                            ),
-                            &request.model,
-                        ),
-                    )
-                    .await?,
-                )
-            };
-            let turn_id = if let Some((turn, provider_turn_started, observed_message_list)) =
-                admission
-            {
-                let current_turn_id = turn
-                    .pointer("/turn/id")
-                    .or_else(|| turn.get("turnId"))
-                    .or_else(|| turn.get("turn_id"))
-                    .and_then(Value::as_str)
-                    .context("Codex turn/start response omitted turn id")?
-                    .to_owned();
-                let coordinator = turn_coordinator::CodexTurnCoordinator::new(
-                    self,
-                    process,
-                    &mut output,
-                    &mut active_steering,
-                    coordinator_event_sink.clone(),
-                    &request,
-                    &thread_id,
-                );
-                let completion = coordinator.run(
-                    current_turn_id.clone(),
-                    provider_turn_started,
-                    observed_message_list,
-                );
-                let completed = if let Some(text) = resume_message {
-                    let lane = self.steering_lane(&request.runtime_key()?).await;
-                    let (completed, delivered) = tokio::join!(completion, lane.steer(text.into()));
-                    delivered.context("deliver instructions to resumed native goal")?;
-                    completed?
-                } else {
-                    completion.await?
-                };
-                let status = completed
-                    .pointer("/turn/status")
-                    .or_else(|| completed.get("status"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if status.eq_ignore_ascii_case("failed") {
-                    self.active_turn_by_session
-                        .lock()
-                        .await
-                        .insert(request.runtime_key()?, CodexTurnState::Completed);
-                    let error = completed
-                        .pointer("/turn/error")
-                        .or_else(|| completed.get("error"));
-                    if let Some((error, code)) = error
-                        .and_then(|error| retry::transient_code(error).map(|code| (error, code)))
-                        && !process.normalization.replay_sensitive
-                        && super::retry::replay_safe(&output.completion)
-                    {
-                        return Err(super::retry::RetryableFailure {
-                            address: super::TurnAddress {
-                                scope: coordinator_event_sink
-                                    .as_ref()
-                                    .context("Codex retry has no invocation")?
-                                    .invocation_scope()?
-                                    .clone(),
-                                thread_id: thread_id.clone(),
-                                turn_id: completed
-                                    .pointer("/turn/id")
-                                    .or_else(|| completed.get("turnId"))
-                                    .and_then(Value::as_str)
-                                    .unwrap_or(&current_turn_id)
-                                    .into(),
-                            },
-                            code,
-                            detail: error.clone(),
-                            message: format!("Codex turn failed: {completed}"),
-                        }
-                        .into());
-                    }
-                    anyhow::bail!("Codex turn failed: {completed}");
-                }
-                Some(
-                    completed
-                        .pointer("/turn/id")
-                        .or_else(|| completed.get("turnId"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or(current_turn_id),
-                )
-            } else {
-                anyhow::ensure!(
-                    resume_message.is_none(),
-                    "native goal settled before receiving the resume message"
-                );
-                None
-            };
-            self.active_turn_by_session
-                .lock()
-                .await
-                .insert(request.runtime_key()?, CodexTurnState::Completed);
-            if let Some(turn_id) = turn_id {
-                self.completed_turn_by_session
-                    .lock()
-                    .await
-                    .insert(request.runtime_key()?, turn_id.clone());
-                output.completion.provider_checkpoint_id = Some(turn_id);
-            }
-            Ok(output)
+        if !self.session_events.running(&scope).await? {
+            let request = self.session_events.continuation(&scope, input)?;
+            return self.session_prompt(request, scope).await;
         }
-        .await;
-        let connection = self
-            .connection_by_session
-            .lock()
+        let events = self.session_events.clone();
+        let provider = self.clone();
+        let continuation = input.clone();
+        let result = events
+            .steer(&scope, input, |input| async move {
+                provider
+                    .steer_native(&owner.runtime_key(), input)
+                    .await
+                    .map_err(crate::provider::ProviderError::from)
+            })
+            .await;
+        if matches!(
+            &result,
+            Err(crate::provider::ProviderError::NotConsumed { .. })
+        ) {
+            events.wait_closed(&scope).await?;
+            let request = events.continuation(&scope, continuation)?;
+            return self.session_prompt(request, scope).await;
+        }
+        result
+    }
+
+    async fn session_prompt(
+        self: Arc<Self>,
+        request: ProviderRequest,
+        scope: crate::provider::InvocationScope,
+    ) -> Result<(), crate::provider::ProviderError> {
+        let events = self.session_events.clone();
+        events
+            .submit(
+                request,
+                scope,
+                crate::provider::TerminalBoundary::AdapterCertificate,
+                move |request, sink| async move { self.run_native(request, sink).await },
+            )
             .await
-            .get(&runtime_key)
-            .cloned();
-        if let Some(connection) = connection {
-            self.background
-                .start(runtime_key, connection)
-                .await
-                .map_err(super::ProviderError::from)?;
-        }
-        output
-            .map(ProviderOutput::into_completion)
-            .map_err(super::ProviderError::from)
     }
 
     async fn fork(&self, request: ProviderForkRequest) -> Result<ProviderForkResult> {
@@ -1684,7 +1432,7 @@ impl crate::provider::ProviderAdapter for CodexProvider {
         ) {
             (Some(source), Some(last_turn_id)) => (
                 "thread/fork",
-                Self::fork_parameters(source, last_turn_id, &source_request),
+                Self::fork_parameters(source.into(), last_turn_id, &source_request),
             ),
             _ => (
                 "thread/start",
@@ -1737,13 +1485,9 @@ impl crate::provider::ProviderAdapter for CodexProvider {
             Arc::new(Mutex::new(connection)),
         );
         Ok(ProviderForkResult {
-            provider_session_id,
+            provider_session_id: provider_session_id.try_into()?,
             timing,
         })
-    }
-
-    async fn steer_session(&self, session_id: &str, input: super::SteeringInput) -> Result<()> {
-        self.steering_lane(session_id).await.steer(input).await
     }
 
     async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
@@ -1755,21 +1499,76 @@ impl crate::provider::ProviderAdapter for CodexProvider {
     }
 
     async fn cancel_session(&self, session_id: &str) -> Result<()> {
-        self.background.stop(session_id).await?;
-        self.steering_lane(session_id)
-            .await
-            .cleanup_execution()
-            .await?;
-        self.connection_by_session.lock().await.remove(session_id);
+        self.cleanup_execution(session_id).await
+    }
+
+    async fn reset_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
+        let key = owner.runtime_key();
+        self.background.stop(&key).await?;
+        let connection = self.connection_by_session.lock().await.get(&key).cloned();
+        if let Some(connection) = connection {
+            connection.lock().await.process.close().await?;
+            self.connection_by_session.lock().await.remove(&key);
+        }
+        self.active_turn_by_session.lock().await.remove(&key);
+        self.session_events.reset_owner(owner).await?;
         Ok(())
     }
 
-    async fn active_session_id_for(&self, session_id: &str) -> Option<String> {
-        match self.active_turn_by_session.lock().await.get(session_id) {
-            Some(CodexTurnState::Submitted { thread_id, .. }) => Some(thread_id.clone()),
-            Some(CodexTurnState::Idle | CodexTurnState::Pending | CodexTurnState::Completed)
-            | None => None,
+    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
+        let key = owner.runtime_key();
+        let interrupt = self.cleanup_execution(&key).await;
+        let collection = self.session_events.cancel(owner).await;
+        let connection = self.connection_by_session.lock().await.get(&key).cloned();
+        let close = if let Some(connection) = connection {
+            let result = connection.lock().await.process.close().await;
+            if result.is_ok() {
+                self.connection_by_session.lock().await.remove(&key);
+            }
+            result
+        } else {
+            Ok(())
+        };
+        match (interrupt, collection, close) {
+            (Err(error), collection, close) => {
+                let error = if let Err(next) = collection {
+                    error.context(format!("collect Codex execution: {next:#}"))
+                } else {
+                    error
+                };
+                Err(if let Err(next) = close {
+                    error.context(format!("close Codex connection: {next:#}"))
+                } else {
+                    error
+                })
+            }
+            (Ok(()), Err(error), close) => {
+                let error = anyhow::Error::new(error);
+                Err(if let Err(next) = close {
+                    error.context(format!("close Codex connection: {next:#}"))
+                } else {
+                    error
+                })
+            }
+            (Ok(()), Ok(()), close) => close,
         }
+    }
+
+    async fn active_session_id_for(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+        Ok(
+            match self.active_turn_by_session.lock().await.get(session_id) {
+                Some(CodexTurnState::Submitted { thread_id, .. }) => {
+                    Some(thread_id.clone().try_into()?)
+                }
+                Some(
+                    CodexTurnState::Idle | CodexTurnState::Pending | CodexTurnState::Completed,
+                )
+                | None => None,
+            },
+        )
     }
 
     async fn compact(&self, request: super::ProviderCompactionRequest) -> Result<ProviderOutput> {
@@ -1781,12 +1580,13 @@ impl crate::provider::ProviderAdapter for CodexProvider {
         let thread_id = request
             .provider_session_id
             .clone()
+            .map(String::from)
             .context("Codex thread has not started")?;
         let mut output = ProviderOutput {
             event: Vec::new(),
             completion: crate::provider::ProviderCompletion {
                 native: forge_provider_api::completion::ProviderCompletion {
-                    provider_session_id: Some(thread_id.clone()),
+                    provider_session_id: Some(thread_id.clone().try_into()?),
                     capability: capability(),
                     ..Default::default()
                 },
@@ -1904,9 +1704,10 @@ impl crate::provider::ProviderAdapter for CodexProvider {
             request
                 .provider_session_id
                 .clone()
+                .map(String::from)
                 .or(resources.thread().await)
         } else {
-            request.provider_session_id.clone()
+            request.provider_session_id.clone().map(String::from)
         };
         if resources.is_some() && thread.is_none() {
             return self.mcp_configuration(request).await;
@@ -1916,7 +1717,8 @@ impl crate::provider::ProviderAdapter for CodexProvider {
             && resources.thread().await != thread
         {
             let mut provider_request = Self::catalog_provider_request(&request);
-            provider_request.provider_session_id = thread.clone();
+            provider_request.provider_session_id =
+                thread.clone().map(TryInto::try_into).transpose()?;
             self.load_thread(
                 &mut process,
                 &mut output,
@@ -2124,9 +1926,602 @@ impl crate::provider::ProviderAdapter for CodexProvider {
     }
 }
 
+impl CodexProvider {
+    async fn steer_native(&self, session_id: &str, input: super::SteeringInput) -> Result<()> {
+        self.steering_lane(session_id).await.steer(input).await
+    }
+}
+
+impl CodexProvider {
+    /// Drive admitted native work inside the session-owned task.
+    async fn run_native(
+        &self,
+        mut request: ProviderRequest,
+        event_sink: ProviderEventSink,
+    ) -> std::result::Result<crate::provider::ProviderCompletion, super::ProviderError> {
+        capability().validate_access(&request.access)?;
+        if request.owner().map_err(super::ProviderError::from)?
+            != event_sink.invocation_scope()?.owner
+        {
+            return Err(super::ProviderError::Rejected {
+                message: "Codex invocation scope does not match the requested owner".into(),
+            });
+        }
+        let runtime_key = request.runtime_key().map_err(super::ProviderError::from)?;
+        let output: anyhow::Result<crate::provider::ProviderOutput> = async {
+            let event_sink = Some(event_sink);
+            let skills = self.permission_coordinator.skills(
+                self.settings_root.as_deref(),
+                &request,
+                super::ProviderKind::Codex,
+            )?;
+            let _directories = self
+                .permission_coordinator
+                .directories(self.settings_root.as_deref(), &request)?;
+            let event_sink = skills.sink(event_sink);
+            let mut active_steering = self
+                .activate_turn_control(&request.runtime_key()?, event_sink.clone())
+                .await?;
+            let mut output = ProviderOutput {
+                event: Vec::new(),
+                completion: crate::provider::ProviderCompletion {
+                    native: forge_provider_api::completion::ProviderCompletion {
+                    capability: capability(), ..Default::default() },
+                    ..Default::default()
+                },
+            };
+            let coordinator_event_sink = event_sink.clone();
+            let startup = self.startup_guard(request.runtime_key()?).await;
+            let connection = self
+                .persistent_connection(&request, &mut output, event_sink)
+                .await?;
+            let mut connection = connection.lock().await;
+            let prepared = connection.thread.as_ref().is_some_and(|thread| {
+                matches!(thread, CodexThread::Prepared(_))
+                    && request.provider_session_id.as_ref().is_none_or(|id| id.as_str() == thread.id())
+            });
+            if request.provider_session_id.is_none() {
+                request.provider_session_id = connection.thread.as_ref().map(|thread| thread.id().to_owned().try_into()).transpose()?;
+            }
+            let CodexConnection {
+                process,
+                thread: retained_thread,
+                ..
+            } = &mut *connection;
+            process.set_activity_publication(false);
+            let request_text = request.input.text();
+            let mut control_context = request.control_context.clone().unwrap_or_else(|| {
+                crate::tools::ControlTurnContext::inactive(request.mode)
+            });
+            control_context.planning_feedback =
+                request.mode == PromptMode::Plan && request_text.contains("Planning feedback:");
+            if control_context.plan_document.is_none() {
+                control_context.plan_document = (request.mode == PromptMode::Plan)
+                    .then(|| super::mock_plan_document_from_prompt(&request_text))
+                    .flatten();
+            }
+            let dynamic_tool_definition = ControlToolRegistry
+                .definition_list_for_context(Some(&control_context), request.owner()?.is_root());
+            process.set_control_context(control_context).await;
+            request.model = self.resolve_model(&request, process, &mut output).await?;
+            output.completion.runtime.provider = "Codex CLI".into();
+            output.completion.runtime.model = Some(request.model.clone());
+            if let Some(sink) = coordinator_event_sink.as_ref() {
+                let runtime_event = crate::provider::ProviderEvent::Runtime {
+                    scope: sink.invocation_scope()?.clone(),
+                    update: crate::provider::RuntimeUpdate::Resolved {
+                        runtime: output.completion.runtime.clone(),
+                    },
+                };
+                sink.send_wait(runtime_event).await?;
+            }
+            let dynamic_tool_list = dynamic_tool_definition
+                .into_iter()
+                .map(|definition| {
+                    json!({
+                        "type": "function",
+                        "name": definition.name,
+                        "description": definition.description,
+                        "inputSchema": definition.input_schema,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let thread_id = if prepared {
+                request.provider_session_id.clone().map(String::from).context("prepared Codex thread is missing")?
+            } else {
+                self.load_thread(process, &mut output, &request, false, dynamic_tool_list).await?
+            };
+            drop(startup);
+            if prepared {
+                // The initial thread has no per-turn checkpoint hook. Admit its first turn
+                // only after the checkpoint completes, before native tools can execute.
+                if let Some(gate) = request.control_context.as_ref().and_then(|context| context.checkpoint.as_ref()) {
+                    gate.wait().await?;
+                }
+            } else if request.provider_session_id.is_some()
+                && let Some(gate) = request
+                    .control_context
+                    .as_ref()
+                    .and_then(|context| context.checkpoint.as_ref())
+                && !gate.ready()
+            {
+                // Existing exec sessions accept stdin without running Codex's PreToolUse hook.
+                let terminals = process
+                    .request(
+                        "thread/backgroundTerminals/list",
+                        json!({"threadId":thread_id,"limit":1}),
+                        &mut output,
+                    )
+                    .await
+                    .and_then(|value| forge_providers::terminal::parse_snapshot(&value, false));
+                if !terminals
+                    .as_ref()
+                    .is_ok_and(|snapshot| snapshot.terminal.is_empty())
+                {
+                    gate.wait().await?;
+                }
+            }
+            output.completion.provider_session_id = Some(thread_id.clone().try_into()?);
+            let mut prompt = request_text.clone();
+            let native_goal = request
+                .control_context
+                .as_ref()
+                .and_then(|context| context.native_goal.as_deref());
+            if let Some(objective) = native_goal {
+                if request_text.lines().next() != Some("/goal resume") {
+                    process
+                        .request(
+                            "thread/goal/set",
+                            json!({
+                                "threadId": thread_id,
+                                "objective": objective,
+                                "status": "active"
+                            }),
+                            &mut output,
+                        )
+                        .await?;
+                    if request_text.starts_with("/goal ") {
+                        prompt = format!("Work toward the active goal: {objective}");
+                    }
+                } else {
+                    prompt = "Continue working toward the active goal.".into();
+                }
+            }
+            let recovered = request
+                .recovered_input
+                .iter()
+                .map(ProviderInput::text)
+                .collect::<Vec<_>>();
+            prompt = request.recovered_text(&prompt, &recovered);
+            let mut input =
+                crate::provider::codex::attachments::input(prompt, &request.input_attachments()).await?;
+            for name in request
+                .recovered_input
+                .iter()
+                .chain(std::iter::once(&request.input))
+                .filter_map(|input| {
+                    if let ProviderInput::Skill { name, .. } = input {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
+            {
+                let catalog = if let Some(resources) = self
+                    .resources(&Self::catalog_from_request(&request))
+                    .await?
+                {
+                    resources.catalog.skill.clone()
+                } else {
+                    Self::skill_catalog(process, &mut output, &request.workspace, true).await?
+                };
+                let skill = catalog
+                    .into_iter()
+                    .find(|skill| skill.name == *name && skill.enabled && skill.user_invocable)
+                    .with_context(|| format!("skill ${name} is unavailable or disabled"))?;
+                let path = skill
+                    .path
+                    .with_context(|| format!("skill ${name} omitted its provider path"))?;
+                input.push(json!({ "type": "skill", "name": name, "path": path }));
+            }
+            let native_resume = native_goal.is_some()
+                && request_text.lines().next() == Some("/goal resume")
+                && request.recovered_input.is_empty();
+            let resume_message = native_resume
+                .then(|| {
+                    request_text
+                        .split_once("\n\nAdditional user instructions:\n")
+                        .or_else(|| request_text.split_once("\n\nHarness transition:\n"))
+                        .map(|(_, text)| text.to_owned())
+                })
+                .flatten();
+            *retained_thread = Some(CodexThread::Submitted(thread_id.clone()));
+            let admission = if native_resume {
+                if let Some(submission) = &request.submission {
+                    submission.sending(super::submission::SubmissionTarget::Untracked)?;
+                }
+                let admission = self
+                    .resume_native_goal_turn(process, &mut output, &request, &thread_id)
+                    .await?;
+                if let Some(submission) = &request.submission {
+                    submission.accepted(format!("goal/resume:{thread_id}"))?;
+                }
+                admission
+            } else {
+                Some(
+                    self.start_turn(
+                        process,
+                        &mut output,
+                        &request,
+                        &thread_id,
+                        false,
+                        Self::with_model(
+                            Self::secure(
+                                json!({
+                                    "threadId": thread_id,
+                                    "input": input,
+                                    "cwd": request.workspace,
+                                    "effort": request.effort,
+                                    "serviceTier": request.service_tier,
+                                    "collaborationMode": prepared.then(|| json!({
+                                        "mode":"default", "settings":{
+                                            "model":request.model, "reasoning_effort":request.effort,
+                                            "developer_instructions":request.system_message()
+                                        }
+                                    }))
+                                }),
+                                &request,
+                            ),
+                            &request.model,
+                        ),
+                    )
+                    .await?,
+                )
+            };
+            let turn_id = if let Some((turn, _provider_turn_started, observed_message_list)) =
+                admission
+            {
+                let current_turn_id = turn
+                    .pointer("/turn/id")
+                    .or_else(|| turn.get("turnId"))
+                    .or_else(|| turn.get("turn_id"))
+                    .and_then(Value::as_str)
+                    .context("Codex turn/start response omitted turn id")?
+                    .to_owned();
+                let coordinator = turn_coordinator::CodexTurnCoordinator::new(
+                    self,
+                    process,
+                    &mut output,
+                    &mut active_steering,
+                    coordinator_event_sink.clone(),
+                    &request,
+                    &thread_id,
+                );
+                let completion = coordinator.run(
+                    current_turn_id.clone(),
+                    observed_message_list,
+                );
+                let completed = if let Some(text) = resume_message {
+                    let lane = self.steering_lane(&request.runtime_key()?).await;
+                    let (completed, delivered) = tokio::join!(completion, lane.steer(text.into()));
+                    delivered.context("deliver instructions to resumed native goal")?;
+                    completed?
+                } else {
+                    completion.await?
+                };
+                let status = completed
+                    .pointer("/turn/status")
+                    .or_else(|| completed.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if status.eq_ignore_ascii_case("failed") {
+                    self.active_turn_by_session
+                        .lock()
+                        .await
+                        .insert(request.runtime_key()?, CodexTurnState::Completed);
+                    let error = completed
+                        .pointer("/turn/error")
+                        .or_else(|| completed.get("error"));
+                    if let Some((error, code)) = error
+                        .and_then(|error| retry::transient_code(error).map(|code| (error, code)))
+                        && !process.normalization.replay_sensitive
+                        && super::retry::replay_safe(&output.completion)
+                    {
+                        return Err(super::retry::RetryableFailure {
+                            address: super::TurnAddress {
+                                scope: coordinator_event_sink
+                                    .as_ref()
+                                    .context("Codex retry has no invocation")?
+                                    .invocation_scope()?
+                                    .clone(),
+                                thread_id: thread_id.clone(),
+                                turn_id: completed
+                                    .pointer("/turn/id")
+                                    .or_else(|| completed.get("turnId"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or(&current_turn_id)
+                                    .into(),
+                            },
+                            code,
+                            detail: error.clone(),
+                            message: format!("Codex turn failed: {completed}"),
+                        }
+                        .into());
+                    }
+                    anyhow::bail!("Codex turn failed: {completed}");
+                }
+                Some(
+                    completed
+                        .pointer("/turn/id")
+                        .or_else(|| completed.get("turnId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .unwrap_or(current_turn_id),
+                )
+            } else {
+                anyhow::ensure!(
+                    resume_message.is_none(),
+                    "native goal settled before receiving the resume message"
+                );
+                if let Some(context) = &request.control_context {
+                    let covered = request.submission.as_ref().map(|submission| {
+                        forge_provider_api::lifecycle::SubmissionId::try_from(submission.id().to_owned())
+                    }).transpose()?.into_iter().collect();
+                    context.provider_completion.certify(
+                        crate::provider::ExecutionCertificate::WithoutExecution { covered },
+                    )?;
+                }
+                None
+            };
+            self.active_turn_by_session
+                .lock()
+                .await
+                .insert(request.runtime_key()?, CodexTurnState::Completed);
+            if let Some(turn_id) = turn_id {
+                self.completed_turn_by_session
+                    .lock()
+                    .await
+                    .insert(request.runtime_key()?, turn_id.clone());
+                output.completion.provider_checkpoint_id = Some(turn_id);
+            }
+            Ok(output)
+        }
+        .await;
+        let connection = self
+            .connection_by_session
+            .lock()
+            .await
+            .get(&runtime_key)
+            .cloned();
+        if let Some(connection) = connection {
+            self.background
+                .start(runtime_key, connection)
+                .await
+                .map_err(super::ProviderError::from)?;
+        }
+        output
+            .map(ProviderOutput::into_completion)
+            .map_err(super::ProviderError::from)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// A certified native interruption must not retire the session's socket owner.
+    #[tokio::test]
+    async fn normal_cancellation_keeps_reader_for_next_native_turn() -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let permission = PermissionCoordinator::transient(&workspace)?;
+        let trace = Arc::new(TraceStore::open(fixture.path())?);
+        let provider = CodexProvider::new_with_permission_coordinator(
+            vec!["unused".into()],
+            permission.clone(),
+            trace.clone(),
+            None,
+        )?;
+        let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = tokio_tungstenite::accept_async(stream).await?;
+            for method in ["thread/start", "turn/start"] {
+                let request: Value = serde_json::from_str(
+                    socket
+                        .next()
+                        .await
+                        .context("native request missing")??
+                        .to_text()?,
+                )?;
+                anyhow::ensure!(
+                    request["method"] == method,
+                    "unexpected native request: {request}"
+                );
+                let result = if method == "thread/start" {
+                    json!({"thread":{"id":"retained-thread"}})
+                } else {
+                    json!({"turn":{"id":"interrupted-turn"}})
+                };
+                socket
+                    .send(Message::Text(
+                        json!({"id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await?;
+            }
+            started
+                .send(())
+                .map_err(|_| anyhow::anyhow!("cancellation waiter dropped"))?;
+            let interrupt: Value = serde_json::from_str(
+                socket
+                    .next()
+                    .await
+                    .context("interrupt missing")??
+                    .to_text()?,
+            )?;
+            anyhow::ensure!(
+                interrupt["method"] == "turn/interrupt",
+                "unexpected interrupt request: {interrupt}"
+            );
+            for message in [
+                json!({"id":interrupt["id"],"result":{}}),
+                json!({"method":"turn/completed","params":{"threadId":"retained-thread","turn":{"id":"interrupted-turn","status":"interrupted"}}}),
+            ] {
+                socket
+                    .send(Message::Text(message.to_string().into()))
+                    .await?;
+            }
+            let resume: Value = serde_json::from_str(
+                socket
+                    .next()
+                    .await
+                    .context("retained thread resume missing")??
+                    .to_text()?,
+            )?;
+            anyhow::ensure!(
+                resume["method"] == "thread/resume"
+                    && resume["params"]["threadId"] == "retained-thread",
+                "unexpected retained thread resume: {resume}"
+            );
+            socket
+                .send(Message::Text(
+                    json!({"id":resume["id"],"result":{"thread":{"id":"retained-thread"}}})
+                        .to_string()
+                        .into(),
+                ))
+                .await?;
+            let next: Value = serde_json::from_str(
+                socket
+                    .next()
+                    .await
+                    .context("next turn missing")??
+                    .to_text()?,
+            )?;
+            anyhow::ensure!(
+                next["method"] == "turn/start" && next["params"]["threadId"] == "retained-thread",
+                "session reader was not reused: {next}"
+            );
+            for message in [
+                json!({"id":next["id"],"result":{"turn":{"id":"next-turn"}}}),
+                json!({"method":"item/completed","params":{"threadId":"retained-thread","turnId":"next-turn","item":{"id":"answer","type":"agentMessage","phase":"final_answer","text":"next turn completed"}}}),
+                json!({"method":"turn/completed","params":{"threadId":"retained-thread","turn":{"id":"next-turn","status":"completed"}}}),
+            ] {
+                socket
+                    .send(Message::Text(message.to_string().into()))
+                    .await?;
+            }
+            match socket.next().await {
+                None | Some(Ok(Message::Close(_))) => {}
+                other => {
+                    anyhow::bail!("explicit owner fence did not close native socket: {other:?}")
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            ApprovalMode::Ask,
+            permission,
+            None,
+            trace,
+            "cancel-reader".into(),
+        )
+        .await?;
+        provider.connection_by_session.lock().await.insert(
+            "cancel-reader".into(),
+            Arc::new(Mutex::new(CodexConnection {
+                process,
+                timing: Vec::new(),
+                thread: None,
+            })),
+        );
+        let mut request = CodexProvider::catalog_provider_request(&ProviderCatalogRequest {
+            execution_owner: None,
+            harness_session_id: "cancel-reader".into(),
+            workspace,
+            access: Default::default(),
+            approval_mode: ApprovalMode::Ask,
+            provider_session_id: None,
+        });
+        request.model = "fixture-model".into();
+        request.input = ProviderInput::from_text("first request");
+        let first = provider.session_prompt_and_collect(request.clone());
+        let cancel = async {
+            ready
+                .await
+                .context("fake peer stopped before first turn/start acknowledgement")?;
+            provider
+                .cancel_session("cancel-reader")
+                .await
+                .context("interrupt and collect first native turn")
+        };
+        let (first, cancelled) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                biased;
+                peer = &mut server => {
+                    peer.context("fake peer task failed")??;
+                    anyhow::bail!("fake peer exited before first cancellation completed")
+                }
+                pair = async { tokio::join!(first, cancel) } => Ok(pair),
+            }
+        })
+        .await
+        .context("first native cancellation timed out")??;
+        if let Err(error) = cancelled {
+            if server.is_finished() {
+                (&mut server).await.context("fake peer task failed")??;
+            }
+            return Err(error);
+        }
+        match first {
+            Err(crate::provider::ProviderError::Cancelled) => {}
+            Err(error) => {
+                return Err(anyhow::Error::from(error))
+                    .context("first native turn failed before certified cancellation");
+            }
+            Ok(_) => anyhow::bail!("interrupted turn did not retain its cancelled terminal result"),
+        }
+        assert!(
+            provider
+                .connection_by_session
+                .lock()
+                .await
+                .contains_key("cancel-reader")
+        );
+        request.provider_session_id = Some("retained-thread".to_owned().try_into()?);
+        request.input = ProviderInput::from_text("next request");
+        let output = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                biased;
+                peer = &mut server => {
+                    peer.context("fake peer task failed")??;
+                    anyhow::bail!("fake peer exited before the second native turn completed")
+                }
+                result = provider.session_prompt_and_collect(request) => result.context("second native turn failed on retained socket"),
+            }
+        }).await.context("second native turn timed out")??;
+        assert!(serde_json::to_string(&output.event)?.contains("next turn completed"));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            provider.fence_session(&crate::provider::ExecutionOwner::root("cancel-reader")),
+        )
+        .await
+        .context("explicit owner fence timed out")??;
+        tokio::time::timeout(Duration::from_secs(5), provider.close()).await??;
+        tokio::time::timeout(Duration::from_secs(5), provider.shutdown()).await??;
+        tokio::time::timeout(Duration::from_secs(5), server).await???;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn eager_initialization_reuses_live_thread_without_persisting_or_resuming() -> Result<()>
@@ -2142,6 +2537,7 @@ mod test {
             trace.clone(),
             None,
         )?;
+        let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
         let server = tokio::spawn(async move {
@@ -2238,12 +2634,12 @@ mod test {
         request.model = "fixture-model".into();
         assert_eq!(
             provider.initialize_session(request.clone()).await?,
-            Some("prepared-thread".into())
+            Some("prepared-thread".to_owned().try_into()?)
         );
         assert!(provider.active_turn_by_session.lock().await.is_empty());
         assert_eq!(
             provider.initialize_session(request.clone()).await?,
-            Some("prepared-thread".into())
+            Some("prepared-thread".to_owned().try_into()?)
         );
         request.input = ProviderInput::from_text("first prompt");
         let gate = crate::checkpoint::ToolGate::new()?;
@@ -2252,8 +2648,13 @@ mod test {
         let mut blocked_context = crate::tools::ControlTurnContext::inactive(PromptMode::Chat);
         blocked_context.checkpoint = Some(gate);
         blocked_request.control_context = Some(blocked_context);
-        let failure = provider.prompt(blocked_request).await.unwrap_err();
+        let failure = provider
+            .session_prompt_and_collect(blocked_request)
+            .await
+            .unwrap_err();
         assert!(failure.to_string().contains("fixture checkpoint failed"));
+        // The retained idle reader owns the connection until explicitly stopped.
+        provider.background.stop("eager").await?;
         assert!(matches!(
             provider.connection_by_session.lock().await["eager"]
                 .lock()
@@ -2264,15 +2665,19 @@ mod test {
         request.mode = PromptMode::Plan;
         request.control_context =
             Some(crate::tools::ControlTurnContext::inactive(PromptMode::Plan));
-        let output = provider.prompt(request.clone()).await?;
+        let output = provider.session_prompt_and_collect(request.clone()).await?;
         assert_eq!(
-            output.completion.provider_session_id.as_deref(),
+            output
+                .completion
+                .provider_session_id
+                .as_ref()
+                .map(|id| id.as_str()),
             Some("prepared-thread")
         );
         assert!(serde_json::to_string(&output.event)?.contains("ready"));
         assert_eq!(
             provider.initialize_session(request).await?,
-            Some("prepared-thread".into())
+            Some("prepared-thread".to_owned().try_into()?)
         );
         server.await?;
         provider.shutdown().await?;
@@ -2333,6 +2738,7 @@ mod test {
             }
         });
         let provider = CodexProvider::new(vec!["unused".into()])?;
+        let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
         let mut request = CodexProvider::catalog_provider_request(&ProviderCatalogRequest {
             execution_owner: None,
             harness_session_id: "checkpoint".into(),
@@ -2477,7 +2883,7 @@ mod test {
             workspace,
             access: Default::default(),
             approval_mode: ApprovalMode::Ask,
-            provider_session_id: Some("provider-thread".into()),
+            provider_session_id: Some("provider-thread".to_owned().try_into().unwrap()),
         };
         let result = CodexProvider::load_terminal_thread(
             &mut process,
@@ -2504,7 +2910,7 @@ mod test {
             workspace: workspace.clone(),
             access: Default::default(),
             approval_mode: ApprovalMode::Ask,
-            provider_session_id: Some("provider-thread".into()),
+            provider_session_id: Some("provider-thread".to_owned().try_into().unwrap()),
         };
         let resources = CodexResources::new(fixture.path(), &request, vec!["unused".into()])?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -2605,13 +3011,14 @@ mod test {
             trace.clone(),
             None,
         )?;
+        let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
         let request = ProviderCatalogRequest {
             execution_owner: None,
             harness_session_id: "session".into(),
             workspace: workspace.clone(),
             access: Default::default(),
             approval_mode: ApprovalMode::Ask,
-            provider_session_id: Some("provider-thread".into()),
+            provider_session_id: Some("provider-thread".to_owned().try_into().unwrap()),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -2720,7 +3127,7 @@ mod test {
             service_tier: crate::provider::ServiceTier::Standard,
             access: Default::default(),
             approval_mode: ApprovalMode::Ask,
-            provider_session_id: Some("source-thread".into()),
+            provider_session_id: Some("source-thread".to_owned().try_into().unwrap()),
             submission: None,
             recovered_input: Vec::new(),
             control_context: None,
@@ -2749,6 +3156,7 @@ mod test {
             trace.clone(),
             None,
         )?;
+        let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
         let server = tokio::spawn(async move {
@@ -2819,7 +3227,10 @@ mod test {
         let store = super::super::submission::SubmissionStore::open(fixture.path(), trace)?;
         let submission = store.prepare(&request, ProviderKind::Codex)?;
         request.submission = Some(submission.clone());
-        let error = provider.prompt(request).await.unwrap_err();
+        let error = provider
+            .session_prompt_and_collect(request)
+            .await
+            .unwrap_err();
         assert!(
             error
                 .to_string()
@@ -2831,6 +3242,172 @@ mod test {
             super::super::submission::SubmissionState::Prepared
         );
         server.await?;
+        Ok(())
+    }
+
+    /// An unanswered native start remains uncertain and cannot trigger a replay.
+    #[tokio::test]
+    async fn initial_start_acknowledgment_timeout_preserves_delivery_evidence_without_replay()
+    -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let permission = PermissionCoordinator::transient(&workspace)?;
+        let trace = Arc::new(TraceStore::open(fixture.path())?);
+        let provider = CodexProvider::new_with_permission_coordinator(
+            vec!["unused".into()],
+            permission.clone(),
+            trace.clone(),
+            None,
+        )?;
+        let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = tokio_tungstenite::accept_async(stream).await?;
+            let resume: Value = serde_json::from_str(
+                socket
+                    .next()
+                    .await
+                    .context("missing thread resume")??
+                    .to_text()?,
+            )?;
+            anyhow::ensure!(
+                resume["method"] == "thread/resume",
+                "expected thread resume"
+            );
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"id":resume["id"],"result":{"thread":{"id":"parent"}}})
+                        .to_string()
+                        .into(),
+                ))
+                .await?;
+            let start: Value = serde_json::from_str(
+                socket
+                    .next()
+                    .await
+                    .context("missing turn start")??
+                    .to_text()?,
+            )?;
+            anyhow::ensure!(start["method"] == "turn/start", "expected turn start");
+            let _ = started_tx.send(
+                start["params"]["clientUserMessageId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
+            let mut starts = 1usize;
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    message = socket.next() => match message {
+                        Some(Ok(message)) if message.is_text() => {
+                            let value: Value = serde_json::from_str(message.to_text()?)?;
+                            if value["method"] == "turn/start" { starts += 1; }
+                        }
+                        Some(Ok(_)) => {},
+                        Some(Err(_)) | None => break,
+                    }
+                }
+            }
+            Ok::<usize, anyhow::Error>(starts)
+        });
+        let process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            ApprovalMode::Ask,
+            permission,
+            None,
+            trace.clone(),
+            "ack-timeout".into(),
+        )
+        .await?;
+        provider.connection_by_session.lock().await.insert(
+            "ack-timeout".into(),
+            Arc::new(Mutex::new(CodexConnection {
+                process,
+                thread: None,
+                timing: Vec::new(),
+            })),
+        );
+        let mut request = ProviderRequest {
+            execution_owner: None,
+            harness_session_id: "ack-timeout".into(),
+            workspace,
+            input: ProviderInput::from_text("retain this input"),
+            mode: PromptMode::Chat,
+            model: "gpt-5.6-terra".into(),
+            effort: "medium".into(),
+            context_window: None,
+            service_tier: crate::provider::ServiceTier::Standard,
+            access: Default::default(),
+            approval_mode: ApprovalMode::Ask,
+            provider_session_id: Some("parent".to_owned().try_into()?),
+            submission: None,
+            recovered_input: Vec::new(),
+            control_context: None,
+        };
+        let journal =
+            super::super::submission::SubmissionStore::open(fixture.path(), trace.clone())?;
+        let submission = journal.prepare(&request, ProviderKind::Codex)?;
+        let submission_id = submission.id().to_owned();
+        request.submission = Some(submission.clone());
+        let owner = provider.clone();
+        let retained_trace = trace.clone();
+        let retained_journal = journal.clone();
+        let prompt = tokio::spawn(async move {
+            crate::provider::test_support::retry_prompt(
+                &owner,
+                request,
+                None,
+                &retained_trace,
+                &retained_journal,
+            )
+            .await
+        });
+        anyhow::ensure!(
+            started_rx.await? == submission_id,
+            "native start lost submission identity"
+        );
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        anyhow::ensure!(
+            !prompt.is_finished(),
+            "initial acknowledgment deadline fired early"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        let error = prompt
+            .await?
+            .expect_err("unacknowledged native input must remain uncertain");
+        anyhow::ensure!(
+            matches!(
+                error.downcast_ref::<super::super::ProviderError>(),
+                Some(super::super::ProviderError::DeliveryUncertain { .. })
+            ),
+            "unexpected failure: {error:#}"
+        );
+        let record = submission.record()?;
+        anyhow::ensure!(
+            matches!(
+                record.delivery,
+                super::super::submission::SubmissionState::Sending { .. }
+            ),
+            "uncertain input lost its dispatch evidence"
+        );
+        anyhow::ensure!(
+            record.id == submission_id && record.request.input.text() == "retain this input",
+            "submission journal lost the original input"
+        );
+        let _ = stop_tx.send(());
+        anyhow::ensure!(
+            server.await?? == 1,
+            "uncertain input was automatically replayed"
+        );
         Ok(())
     }
 
@@ -2902,6 +3479,7 @@ mod test {
                 trace.clone(),
                 None,
             )?;
+            let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
             *provider.default_model.lock().await = Some("gpt-catalog-default".into());
             let expected_model = if default_model {
                 "gpt-catalog-default"
@@ -3032,7 +3610,7 @@ mod test {
                 service_tier,
                 access: Default::default(),
                 approval_mode: ApprovalMode::Ask,
-                provider_session_id: resumed.then(|| "parent".into()),
+                provider_session_id: resumed.then(|| "parent".to_owned().try_into().unwrap()),
                 submission: None,
                 recovered_input: Vec::new(),
                 control_context: None,
@@ -3043,9 +3621,11 @@ mod test {
             )?;
             let submission = journal.prepare(&request, ProviderKind::Codex)?;
             request.submission = Some(submission.clone());
-            let output =
-                tokio::time::timeout(std::time::Duration::from_secs(2), provider.prompt(request))
-                    .await??;
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                provider.session_prompt_and_collect(request),
+            )
+            .await??;
             assert!(matches!(
                 submission.record()?.delivery,
                 super::super::submission::SubmissionState::Accepted { .. }
@@ -3181,6 +3761,7 @@ mod test {
                 trace.clone(),
                 None,
             )?;
+            let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let endpoint = format!("ws://{}", listener.local_addr()?);
             let server = tokio::spawn(async move {
@@ -3306,7 +3887,7 @@ mod test {
             );
             let output = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                provider.prompt(
+                provider.session_prompt_and_collect(
                     ProviderRequest {
                         execution_owner: None,
                         harness_session_id: "session".into(),
@@ -3320,7 +3901,7 @@ mod test {
                         service_tier: crate::provider::ServiceTier::Standard,
                         access: Default::default(),
                         approval_mode: ApprovalMode::Ask,
-                        provider_session_id: Some("parent".into()),
+                        provider_session_id: Some("parent".to_owned().try_into().unwrap()),
                         submission: None,
                         recovered_input: Vec::new(),
                         control_context: Some({
@@ -3356,6 +3937,7 @@ mod test {
             Arc::new(TraceStore::open(fixture.path())?),
             None,
         )?;
+        let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
         for clear in [false, true] {
             let mut control = Box::pin(provider.stop_goal_session("session", clear));
             assert!(
@@ -3387,6 +3969,7 @@ mod test {
     #[tokio::test]
     async fn distinguishes_an_unsubmitted_cancel_from_a_completed_turn() {
         let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
+        let provider = crate::provider::test_support::ProviderTestSession::new(provider).unwrap();
         provider
             .active_turn_by_session
             .lock()

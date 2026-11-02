@@ -1,3 +1,4 @@
+use super::collect::ProviderTestExt as _;
 use anyhow::{Context, Result};
 use forge_harness::provider::approval::PermissionCoordinator;
 use forge_harness::provider::codex::CodexProvider;
@@ -14,10 +15,10 @@ fn create_provider(
     provider: &str,
     root: &Path,
     request: &ProviderRequest,
-) -> Result<Box<Provider>> {
+) -> Result<super::collect::ProviderTestSession<Provider>> {
     let permission = PermissionCoordinator::transient(&request.workspace)?;
     let trace = Arc::new(TraceStore::open(root)?);
-    Ok(match provider {
+    let native: Box<Provider> = match provider {
         "codex" => Box::new(CodexProvider::new_with_permission_coordinator(
             vec!["codex".into(), "app-server".into()],
             permission,
@@ -31,7 +32,8 @@ fn create_provider(
             Some(root.into()),
         )?) as Box<Provider>,
         _ => unreachable!("fixture provider is explicit"),
-    })
+    };
+    super::collect::ProviderTestSession::from_dyn(Arc::from(native))
 }
 
 /// Exercise preparation, restart, first submission, warm reuse, and durable resumption.
@@ -52,7 +54,7 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
     request.access.sandbox = provider == "codex";
     let first = create_provider(provider, &data, &request)?;
     let mut missing = request.clone();
-    missing.provider_session_id = Some(uuid::Uuid::new_v4().to_string());
+    missing.provider_session_id = Some(uuid::Uuid::new_v4().to_string().try_into()?);
     let unavailable = first.initialize_session(missing).await;
     eprintln!("{provider}: missing history result {unavailable:?}");
     assert!(
@@ -74,11 +76,11 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
     }
     first.shutdown().await?;
     let thread = prepared?.context("provider initialization omitted its thread")?;
-    eprintln!("{provider}: prepared {thread}");
+    eprintln!("{provider}: prepared {}", thread.as_str());
     // Reopening a local session with no exchanges discards its provisional provider ID.
     request.provider_session_id = None;
     let second = create_provider(provider, &data, &request)?;
-    let result: Result<String> = async {
+    let result: Result<forge_provider_api::ProviderSessionId> = async {
         let prepared = second.initialize_session(request.clone()).await?.context("missing prepared thread")?;
         assert_ne!(prepared, thread);
         let mut inventory = catalog.clone();
@@ -94,15 +96,15 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
         // Exercise the live binding independently of a caller-supplied identity.
         request.provider_session_id = None;
         request.input = ProviderInput::from_text("Remember the exact token FORGE-RESUME-72931. Reply only with that token. Do not use any tools.");
-        let output = second.prompt(request.clone()).await?;
+        let output = second.session_prompt_and_collect(request.clone()).await?;
         let conversation = output.completion.provider_session_id.clone().context("missing conversation thread")?;
         assert_eq!(conversation, prepared);
         inventory.provider_session_id = Some(conversation.clone());
         assert_token(&output.event);
         request.provider_session_id = Some(conversation.clone());
         request.input = ProviderInput::from_text("What exact token did I ask you to remember? Reply only with the token. Do not use tools.");
-        let warm = second.prompt(request.clone()).await?;
-        assert_eq!(warm.completion.provider_session_id.as_deref(), Some(conversation.as_str()));
+        let warm = second.session_prompt_and_collect(request.clone()).await?;
+        assert_eq!(warm.completion.provider_session_id.as_ref().map(|id| id.as_str()), Some(conversation.as_str()));
         assert_token(&warm.event);
         second.background_terminals(inventory).await?;
         if provider == "codex" {
@@ -129,7 +131,7 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
                 )
                 .await?;
         }
-        assert_token(&third.prompt(request).await?.event);
+        assert_token(&third.session_prompt_and_collect(request).await?.event);
         Ok(())
     }
     .await;

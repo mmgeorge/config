@@ -37,7 +37,8 @@ impl PlanFileStore {
             document.title = request.lines().next().unwrap_or_default().into();
             document.overview = request.clone();
         }
-        let working_path = self.write_working_document(session_id, &document.plan_id, &document)?;
+        let working_path =
+            self.create_working_document(session_id, &document.plan_id, &document)?;
         let instruction = if checks_ready {
             PlanPrompt::with_active_document(PlanPrompt::draft(&request), &document.model_json()?)
         } else {

@@ -82,6 +82,7 @@ fn native_agent_exclusions() -> Vec<String> {
 type SharedCopilotSession = Arc<forge_providers::copilot::handle::CopilotSession>;
 /// Owns the native Copilot SDK client, session, event decoder, and Harness callbacks.
 pub struct CopilotProvider {
+    session_events: Arc<crate::provider::session_events::SessionEvents>,
     runtime: CopilotRuntime,
     settings_root: Option<PathBuf>,
     trace: Arc<crate::trace::TraceStore>,
@@ -111,6 +112,7 @@ impl CopilotProvider {
         settings_root: Option<PathBuf>,
     ) -> Result<Self> {
         Ok(Self {
+            session_events: Default::default(),
             settings_root,
             sessions: Arc::new(CopilotSessions::new(trace.clone())),
             trace,
@@ -149,7 +151,7 @@ impl CopilotProvider {
         let selection = SessionSelection {
             runtime_key: key.clone(),
             correlation_id: request.harness_session_id.clone(),
-            session_id: request.provider_session_id.clone(),
+            session_id: request.provider_session_id.clone().map(Into::into),
             model: (request.model != "default").then(|| request.model.clone()),
             context_tier: request.context_window.clone(),
             tools: selected_tools,
@@ -214,7 +216,7 @@ impl CopilotProvider {
                     let mcp = resources.as_ref().map(|resources| resources.launch.clone());
                     Ok(PreparedSession {
                         options: forge_providers::copilot::session::SessionOptions {
-                            session_id: request.provider_session_id.clone(),
+                            session_id: request.provider_session_id.clone().map(Into::into),
                             model: (request.model != "default").then(|| request.model.clone()),
                             reasoning_effort: None,
                             context_tier: request.context_window.clone(),
@@ -228,6 +230,16 @@ impl CopilotProvider {
                             resources: if resources.is_some() {
                                 forge_providers::copilot::session::ResourceDiscovery::Managed {
                                     skill_directories: skill_directories.unwrap_or_default(),
+                                    selected_mcp: resources
+                                        .as_ref()
+                                        .map(|resources| {
+                                            resources
+                                                .launch
+                                                .iter()
+                                                .map(|(name, _)| name.clone())
+                                                .collect()
+                                        })
+                                        .unwrap_or_default(),
                                 }
                             } else {
                                 forge_providers::copilot::session::ResourceDiscovery::Native
@@ -380,7 +392,7 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
             .as_str()
             .context("Copilot recovery checkpoint omitted prompt")?;
         let mut request = submission.request.clone();
-        request.provider_session_id = Some(session_id.to_owned());
+        request.provider_session_id = Some(session_id.to_owned().try_into()?);
         let session = self
             .session(&request, CopilotSessionReuse::Compatible)
             .await?;
@@ -472,13 +484,30 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        let mut failure = self
+            .session_events
+            .shutdown()
+            .await
+            .err()
+            .map(anyhow::Error::from);
         self.runtime.close_admission();
         self.sessions.close_observers().await;
-        self.runtime.shutdown().await?;
-        self.sessions.clear().await;
+        let client_stopped = match self.runtime.shutdown().await {
+            Ok(()) => forge_providers::copilot::sessions::ClientShutdown::Collected,
+            Err(error) => {
+                failure.get_or_insert(error.into());
+                forge_providers::copilot::sessions::ClientShutdown::Uncertain
+            }
+        };
+        if let Err(error) = self.sessions.clear(client_stopped).await {
+            failure.get_or_insert(error.into());
+        }
         self.control_router_by_harness.lock().await.clear();
         self.permission_context_by_harness.lock().await.clear();
-        Ok(())
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -489,102 +518,71 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
         }
     }
 
-    async fn prompt_stream(
+    async fn session_events(
         &self,
-        request: ProviderRequest,
-        event_sink: ProviderEventSink,
-    ) -> std::result::Result<ProviderCompletion, ProviderError> {
-        let output: std::result::Result<ProviderCompletion, ProviderError> = async {
-            let event_sink = Some(event_sink);
-            let turn_event = self.turn_event(&request.runtime_key()?).await;
-            let skills = self.permission_coordinator.skills(
-                self.settings_root.as_deref(),
-                &request,
-                super::ProviderKind::Copilot,
-            )?;
-            let _directories = self
-                .permission_coordinator
-                .directories(self.settings_root.as_deref(), &request)?;
-            let event_sink = skills.sink(event_sink);
-            let turn_event_guard = turn_event.activate(
-                event_sink.clone(),
-                request
-                    .control_context
-                    .as_ref()
-                    .and_then(|context| context.submission_cancelled.clone()),
-            )?;
-            self.permission_context(&request.runtime_key()?)
-                .await
-                .configure(
-                    request.owner()?,
-                    request.approval_mode,
-                    request.workspace.clone(),
-                    event_sink.clone(),
-                )?;
-            self.permission_context(&request.runtime_key()?)
-                .await
-                .bind_context(request.control_context.as_ref())?;
-            let session = self
-                .session(&request, CopilotSessionReuse::Compatible)
-                .await?;
-            let control_router = self.control_router(&request.runtime_key()?).await;
-            let control_context = request
-                .control_context
-                .clone()
-                .unwrap_or_else(|| ControlTurnContext::inactive(request.mode));
-            let control_stream = control_router.activate(control_context)?;
-            let host = host_turn::HostTurn::new(
-                control_router,
-                control_stream,
-                self.permission_context(&request.runtime_key()?).await,
-                self.sessions.clone(),
-                request.runtime_key()?,
-                session.clone(),
-                request.mode == PromptMode::ExecutePlan,
-            );
-            let repair = self.sessions.repair(&request.runtime_key()?).await;
-            let completed = forge_providers::copilot::prompt::run(
-                &session,
-                &turn_event,
-                &turn_event_guard,
-                forge_providers::copilot::prompt::TurnOptions {
-                    correlation_id: request.harness_session_id.clone(),
-                    workspace: request.workspace.clone(),
-                    model: (request.model != "default").then(|| request.model.clone()),
-                    capability: capability(),
-                    input: (&request.input).into(),
-                    recovered: request.recovered_input.iter().map(Into::into).collect(),
-                    instructions: request.interaction_contract(),
-                    repair_caution: repair.map(|repair| repair.caution().to_owned()),
-                    attachments: crate::provider::copilot::attachments::input(
-                        "",
-                        &request.input_attachments(),
-                    )?,
-                    receipt: request.submission.as_ref().map(|receipt| {
-                        receipt.clone() as Arc<dyn forge_provider_api::submission::InputReceipt>
-                    }),
-                    background_compaction_observed: self
-                        .sessions
-                        .observes_compaction(&request.runtime_key()?)
-                        .await,
-                },
-                event_sink
-                    .as_ref()
-                    .expect("active Copilot invocation has an event sink"),
-                &host,
-                self.trace.clone(),
+        owner: crate::provider::ExecutionOwner,
+    ) -> Result<crate::provider::events::ProviderEventStream, crate::provider::ProviderError> {
+        let stream = self.session_events.subscribe(owner.clone())?;
+        self.sessions
+            .subscribe(
+                owner.runtime_key(),
+                self.session_events.session_sink(&owner)?,
             )
-            .await?;
-            if completed.answered_rejection {
-                self.permission_coordinator
-                    .take_timeout_feedback(&request.owner()?)?;
-            }
-            let mut output = host.take_output()?;
-            output.merge_native(completed.completion);
-            Ok(output)
+            .await;
+        Ok(stream)
+    }
+
+    async fn session_steer(
+        self: std::sync::Arc<Self>,
+        owner: &crate::provider::ExecutionOwner,
+        scope: crate::provider::InvocationScope,
+        input: crate::provider::SteeringInput,
+    ) -> Result<(), crate::provider::ProviderError> {
+        if scope.owner != *owner {
+            return Err(crate::provider::ProviderError::Rejected {
+                message: "steering scope belongs to another owner".into(),
+            });
         }
-        .await;
-        output
+        if !self.session_events.running(&scope).await? {
+            let request = self.session_events.continuation(&scope, input)?;
+            return self.session_prompt(request, scope).await;
+        }
+        let events = self.session_events.clone();
+        let provider = self.clone();
+        let continuation = input.clone();
+        let result = events
+            .steer(&scope, input, |input| async move {
+                provider
+                    .steer_native(&owner.runtime_key(), input)
+                    .await
+                    .map_err(crate::provider::ProviderError::from)
+            })
+            .await;
+        if matches!(
+            &result,
+            Err(crate::provider::ProviderError::NotConsumed { .. })
+        ) {
+            events.wait_closed(&scope).await?;
+            let request = events.continuation(&scope, continuation)?;
+            return self.session_prompt(request, scope).await;
+        }
+        result
+    }
+
+    async fn session_prompt(
+        self: Arc<Self>,
+        request: ProviderRequest,
+        scope: crate::provider::InvocationScope,
+    ) -> Result<(), crate::provider::ProviderError> {
+        let events = self.session_events.clone();
+        events
+            .submit(
+                request,
+                scope,
+                crate::provider::TerminalBoundary::AdapterCertificate,
+                move |request, sink| async move { self.run_native(request, sink).await },
+            )
+            .await
     }
 
     async fn compact(&self, request: super::ProviderCompactionRequest) -> Result<ProviderOutput> {
@@ -615,7 +613,7 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
             }],
             completion: crate::provider::ProviderCompletion {
                 native: forge_provider_api::completion::ProviderCompletion {
-                    provider_session_id: Some(session.id().to_string()),
+                    provider_session_id: Some(session.id().to_string().try_into()?),
                     capability: capability(),
                     runtime: crate::provider::ProviderRuntime {
                         provider: "Copilot CLI".into(),
@@ -632,21 +630,6 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
         })
     }
 
-    /// Subscribe to owner-scoped session observations independently of foreground turns.
-    async fn session_event_stream(
-        &self,
-        owner: super::ExecutionOwner,
-    ) -> Result<Option<super::events::ProviderEventStream>> {
-        let runtime_key = owner.runtime_key();
-        let scope = super::EventScope::SessionOperation {
-            owner,
-            operation_id: uuid::Uuid::new_v4().to_string(),
-        };
-        let (sink, stream) = super::events::channel(scope);
-        self.sessions.subscribe(runtime_key, sink).await;
-        Ok(Some(stream))
-    }
-
     async fn fork(
         &self,
         request: ProviderForkRequest,
@@ -659,7 +642,7 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
             request.checkpoint_id,
         ) {
             (Some(source_session_id), to_event_id) => {
-                client.fork(source_session_id, to_event_id).await?
+                client.fork(source_session_id.into(), to_event_id).await?
             }
             _ => {
                 target_request
@@ -672,11 +655,11 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
             }
         };
         target_request.harness_session_id = request.target_harness_session_id;
-        target_request.provider_session_id = Some(provider_session_id.clone());
+        target_request.provider_session_id = Some(provider_session_id.clone().try_into()?);
         self.session(&target_request, CopilotSessionReuse::Compatible)
             .await?;
         Ok(crate::provider::ProviderForkResult {
-            provider_session_id,
+            provider_session_id: provider_session_id.try_into()?,
             timing: vec![crate::provider::ProviderTimingRecord {
                 phase: "copilot.session_fork".into(),
                 duration_ms: started.elapsed().as_secs_f64() * 1000.0,
@@ -685,7 +668,30 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
     }
 
     async fn model_list(&self, request: ProviderRequest) -> Result<Vec<ProviderModel>> {
-        Ok(self.client(&request.workspace).await?.models().await?)
+        let client = || self.client(&request.workspace);
+        self.trace.record(
+            &request.harness_session_id,
+            "future.stack_probe",
+            json!({
+                "phase":"copilot.model.client", "bytes":crate::trace::future_bytes(&client),
+            }),
+        );
+        self.trace.record(&request.harness_session_id, "future.stack_probe", json!({
+            "phase":"copilot.sdk.start", "bytes":forge_providers::copilot::runtime::CopilotRuntime::sdk_start_future_bytes(),
+        }));
+        let client = client().await?;
+        self.trace.record(
+            &request.harness_session_id,
+            "future.stack_probe",
+            json!({"phase":"copilot.model.client.ready","bytes":0}),
+        );
+        let models = || client.models();
+        self.trace.record(
+            &request.harness_session_id,
+            "future.stack_probe",
+            json!({"phase":"copilot.model.list","bytes":crate::trace::future_bytes(&models)}),
+        );
+        Ok(models().await?)
     }
 
     async fn skill_list(&self, request: ProviderCatalogRequest) -> Result<Vec<SkillDefinition>> {
@@ -722,11 +728,20 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
         Ok(session.set_skill_enabled(name, enabled).await?)
     }
 
-    async fn initialize_session(&self, request: ProviderRequest) -> Result<Option<String>> {
-        let session = self
-            .session(&request, CopilotSessionReuse::Compatible)
-            .await?;
-        Ok(Some(session.id().to_string()))
+    async fn initialize_session(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+        let start = || self.session(&request, CopilotSessionReuse::Compatible);
+        self.trace.record(&request.harness_session_id, "future.stack_probe", json!({"phase":"copilot.initialize.session","bytes":crate::trace::future_bytes(&start)}));
+        self.trace.record(&request.harness_session_id, "future.stack_probe", json!({"phase":"copilot.sdk.start","bytes":forge_providers::copilot::runtime::CopilotRuntime::sdk_start_future_bytes()}));
+        let session = start().await?;
+        self.trace.record(
+            &request.harness_session_id,
+            "future.stack_probe",
+            json!({"phase":"copilot.initialize.ready","bytes":0}),
+        );
+        Ok(Some(session.id().to_string().try_into()?))
     }
 
     async fn mcp_configuration(
@@ -786,42 +801,13 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
         self.turn_event(session_id).await.reset()
     }
 
-    async fn steer_session(&self, session_id: &str, input: super::SteeringInput) -> Result<()> {
-        let text = input.text().to_owned();
-        let message = crate::provider::copilot::attachments::input(&text, input.attachments())?;
-        self.trace
-            .record(session_id, "copilot.session.steer", json!({"text":text}));
-        let session = self
-            .active_session(session_id)
-            .await
-            .context("Copilot session has not started")?;
-        self.turn_event(session_id)
-            .await
-            .steer(async {
-                let receipt = input.submission().map(|receipt| {
-                    receipt as Arc<dyn forge_provider_api::submission::InputReceipt>
-                });
-                Ok(session.steer(message, receipt).await?)
-            })
-            .await?;
-        if !matches!(input, super::SteeringInput::AgentResult(_)) {
-            let input_message_id = input
-                .submission()
-                .map(|submission| submission.record())
-                .transpose()?
-                .and_then(|record| record.input_message_id);
-            self.turn_event(session_id)
-                .await
-                .publish_steering(text, input_message_id, input.task_start().cloned())
-                .await?;
-        }
-        Ok(())
-    }
-
     async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
         let controls = self.control_router(session_id).await.cancel()?;
         let turn_event = self.turn_event(session_id).await;
         let stop = turn_event.request_stop()?;
+        if !stop.submitted && !stop.sending {
+            self.session_events.cancel_runtime(session_id).await?;
+        }
         let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
             if stop.submitted {
                 let session = self
@@ -854,6 +840,30 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
         result
     }
 
+    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
+        let key = owner.runtime_key();
+        if let Some(permission) = self.permission_context_by_harness.lock().await.get(&key) {
+            permission.retire()?;
+        }
+        self.permission_coordinator
+            .cancel_owner(owner, None)
+            .await?;
+        if let Some(router) = self.control_router_by_harness.lock().await.get(&key) {
+            router.cancel()?;
+        }
+        Ok(())
+    }
+
+    async fn reset_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
+        let key = owner.runtime_key();
+        self.fence_session(owner).await?;
+        self.sessions.retire(&key).await?;
+        self.control_router_by_harness.lock().await.remove(&key);
+        self.permission_context_by_harness.lock().await.remove(&key);
+        self.session_events.reset_owner(owner).await?;
+        Ok(())
+    }
+
     async fn rollback_cancelled_turn_for(&self, session_id: &str) -> Result<bool> {
         let turn_event = self.turn_event(session_id).await;
         let target = turn_event.retraction_target()?;
@@ -869,10 +879,217 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
         Ok(true)
     }
 
-    async fn active_session_id_for(&self, session_id: &str) -> Option<String> {
+    async fn active_session_id_for(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
         self.active_session(session_id)
             .await
-            .map(|session| session.id().to_string())
+            .map(|session| session.id().to_string().try_into().map_err(Into::into))
+            .transpose()
+    }
+}
+
+impl CopilotProvider {
+    async fn steer_native(&self, session_id: &str, input: super::SteeringInput) -> Result<()> {
+        let text = input.text().to_owned();
+        let message = crate::provider::copilot::attachments::input(&text, input.attachments())?;
+        self.trace
+            .record(session_id, "copilot.session.steer", json!({"text":text}));
+        let session = self
+            .active_session(session_id)
+            .await
+            .context("Copilot session has not started")?;
+        self.turn_event(session_id)
+            .await
+            .steer(
+                input
+                    .submission()
+                    .map(|receipt| {
+                        forge_provider_api::lifecycle::SubmissionId::try_from(
+                            receipt.id().to_owned(),
+                        )
+                    })
+                    .transpose()?,
+                async {
+                    let receipt = input.submission().map(|receipt| {
+                        receipt as Arc<dyn forge_provider_api::submission::InputReceipt>
+                    });
+                    Ok(session.steer(message, receipt).await?)
+                },
+            )
+            .await?;
+        if !matches!(input, super::SteeringInput::AgentResult(_)) {
+            let input_message_id = input
+                .submission()
+                .map(|submission| submission.record())
+                .transpose()?
+                .and_then(|record| record.input_message_id);
+            self.turn_event(session_id)
+                .await
+                .publish_steering(text, input_message_id, input.task_start().cloned())
+                .await?;
+        }
+        Ok(())
+    }
+}
+
+impl CopilotProvider {
+    /// Drive admitted native work inside the session-owned task.
+    async fn run_native(
+        &self,
+        request: ProviderRequest,
+        event_sink: ProviderEventSink,
+    ) -> std::result::Result<ProviderCompletion, ProviderError> {
+        let output: std::result::Result<ProviderCompletion, ProviderError> = async {
+            let event_sink = Some(event_sink);
+            let turn_event = self.turn_event(&request.runtime_key()?).await;
+            let skills = self.permission_coordinator.skills(
+                self.settings_root.as_deref(),
+                &request,
+                super::ProviderKind::Copilot,
+            )?;
+            let _directories = self
+                .permission_coordinator
+                .directories(self.settings_root.as_deref(), &request)?;
+            let event_sink = skills.sink(event_sink);
+            let turn_event_guard = turn_event.activate(
+                event_sink.clone(),
+                request
+                    .control_context
+                    .as_ref()
+                    .and_then(|context| context.submission_cancelled.clone()),
+            )?;
+            self.permission_context(&request.runtime_key()?)
+                .await
+                .configure(
+                    request.owner()?,
+                    request.approval_mode,
+                    request.workspace.clone(),
+                    event_sink.clone(),
+                )?;
+            self.permission_context(&request.runtime_key()?)
+                .await
+                .bind_context(request.control_context.as_ref())?;
+            let session = self
+                .session(&request, CopilotSessionReuse::Compatible)
+                .await
+                .map_err(|error| {
+                    let cause = ProviderError::from(error);
+                    self.trace.record(
+                        &request.harness_session_id,
+                        "copilot.preparation.failed",
+                        json!({"phase":"session", "error":cause.to_string()}),
+                    );
+                    match cause {
+                        error @ ProviderError::PreparationCleanup { .. } => error,
+                        error => ProviderError::PreparationFailed(Arc::new(error)),
+                    }
+                })?;
+            let control_router = self.control_router(&request.runtime_key()?).await;
+            let control_context = request
+                .control_context
+                .clone()
+                .unwrap_or_else(|| ControlTurnContext::inactive(request.mode));
+            let control_stream = control_router.activate(control_context)?;
+            let host = host_turn::HostTurn::new(
+                control_router,
+                control_stream,
+                self.permission_context(&request.runtime_key()?).await,
+                self.sessions.clone(),
+                request.runtime_key()?,
+                session.clone(),
+                request.mode == PromptMode::ExecutePlan,
+            );
+            let repair = self.sessions.repair(&request.runtime_key()?).await;
+            let completed = forge_providers::copilot::prompt::run(
+                &session,
+                &turn_event,
+                &turn_event_guard,
+                forge_providers::copilot::prompt::TurnOptions {
+                    correlation_id: request.harness_session_id.clone(),
+                    workspace: request.workspace.clone(),
+                    model: (request.model != "default").then(|| request.model.clone()),
+                    capability: capability(),
+                    input: (&request.input).into(),
+                    recovered: request.recovered_input.iter().map(Into::into).collect(),
+                    instructions: request.interaction_contract(),
+                    repair_caution: repair.map(|repair| repair.caution().to_owned()),
+                    attachments: crate::provider::copilot::attachments::input(
+                        "",
+                        &request.input_attachments(),
+                    )?,
+                    receipt: request.submission.as_ref().map(|receipt| {
+                        receipt.clone() as Arc<dyn forge_provider_api::submission::InputReceipt>
+                    }),
+                    background_compaction_observed: self
+                        .sessions
+                        .observes_compaction(&request.runtime_key()?)
+                        .await,
+                },
+                event_sink
+                    .as_ref()
+                    .expect("active Copilot invocation has an event sink"),
+                &host,
+                self.trace.clone(),
+            )
+            .await;
+            if let (Some(context), Some(sink), Ok(Some((_, event_id))), Ok(executions)) = (
+                request.control_context.as_ref(),
+                event_sink.as_ref(),
+                turn_event.foreground_anchor(),
+                turn_event.certified_executions(),
+            ) {
+                let scope = sink.invocation_scope()?.clone();
+                let thread_id = session.id().to_string();
+                let initial_is_first = executions
+                    .first()
+                    .is_some_and(|(anchor, _, _)| anchor == &event_id);
+                let mut initial = None;
+                let mut continuations = Vec::new();
+                for (native_event, covered, result) in executions {
+                    if native_event == event_id {
+                        initial = Some((covered, result));
+                    } else {
+                        continuations.push(crate::provider::NativeExecutionCertificate {
+                            anchor: crate::provider::TurnAddress {
+                                scope: scope.clone(),
+                                thread_id: thread_id.clone(),
+                                turn_id: native_event.into(),
+                            },
+                            covered,
+                            result,
+                            completed_at_ms: crate::provider::retry::now_ms(),
+                        });
+                    }
+                }
+                if let Some((covered, initial_result)) = initial.filter(|_| initial_is_first) {
+                    let anchor = crate::provider::TurnAddress {
+                        scope,
+                        thread_id,
+                        turn_id: event_id.into(),
+                    };
+                    context.provider_completion.certify(
+                        crate::provider::ExecutionCertificate::Foreground {
+                            anchor,
+                            covered,
+                            initial_result: Some(Box::new(initial_result)),
+                            continuations,
+                        },
+                    )?;
+                }
+            }
+            let completed = completed?;
+            if completed.answered_rejection {
+                self.permission_coordinator
+                    .take_timeout_feedback(&request.owner()?)?;
+            }
+            let mut output = host.take_output()?;
+            output.merge_native(completed.completion);
+            Ok(output)
+        }
+        .await;
+        output
     }
 }
 
@@ -895,10 +1112,9 @@ fn selected_reasoning_effort(
         .map(|_| request.effort.clone())
 }
 
-/// Finish the main agent independently from attached background work.
-
 #[cfg(test)]
 mod test {
+    /// Finish the main agent independently from attached background work.
     #[test]
     fn only_root_session_idle_finishes_the_provider_invocation() {
         let mut event: github_copilot_sdk::SessionEvent =
@@ -1110,7 +1326,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn publishes_steering_only_while_a_copilot_turn_is_active() {
+    async fn publishes_steering_through_retained_copilot_context() {
         let turn_event = CopilotTurnEvent::default();
         let (event_sink, mut event_stream) =
             crate::provider::events::channel(crate::provider::InvocationScope::new(
@@ -1133,6 +1349,9 @@ mod test {
             .publish_steering("late".into(), None, None)
             .await
             .unwrap();
-        assert!(event_stream.try_recv().is_err());
+        assert!(matches!(
+            event_stream.try_recv().unwrap(),
+            ProviderEvent::InputAccepted { .. }
+        ));
     }
 }

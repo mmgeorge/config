@@ -4,7 +4,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 const MAX_STEERING_REQUESTS: usize = 32;
 
-use super::{ProviderEvent, ProviderEventSink};
+use super::{ProviderError, ProviderEvent, ProviderEventSink};
 
 #[derive(Clone, Debug)]
 /// Distinguishes user steering from child results delivered without user-prompt rendering.
@@ -111,7 +111,7 @@ pub struct SteerCommand {
     pub submission: Option<Arc<super::submission::Submission>>,
     pub target: Option<SteerTarget>,
     pub operation: ActiveTurnOperation,
-    completion: Option<oneshot::Sender<std::result::Result<(), String>>>,
+    completion: Option<oneshot::Sender<std::result::Result<(), ProviderError>>>,
     event_sink: Option<ProviderEventSink>,
     publish_input: bool,
     task_start: Option<crate::exchange::TaskStart>,
@@ -208,11 +208,13 @@ impl SteeringLane {
             .sender
             .clone();
         let Some(sender) = sender else {
-            anyhow::ensure!(
-                operation == ActiveTurnOperation::CleanupExecution,
-                "provider has no active turn to steer"
-            );
-            return Ok(());
+            if operation == ActiveTurnOperation::CleanupExecution {
+                return Ok(());
+            }
+            return Err(ProviderError::NotConsumed {
+                message: "provider has no active turn to steer".into(),
+            }
+            .into());
         };
         let admission = match operation {
             ActiveTurnOperation::Steer
@@ -252,18 +254,27 @@ impl SteeringLane {
                 publish_input,
                 task_start,
             })
-            .map_err(|_| anyhow::anyhow!("active turn completed before steering input was sent"))?;
+            .map_err(|_| ProviderError::NotConsumed {
+                message: "active turn completed before steering input was sent".into(),
+            })?;
         if let Some(submission) = submission {
             submission.mark_steering_queued();
         }
         response
             .await
             .context("active turn completed before steering input was acknowledged")?
-            .map_err(anyhow::Error::msg)
+            .map_err(anyhow::Error::from)
     }
 }
 
 impl ActiveSteering {
+    /// Release this completed lane while retaining its receiver until its owner is dropped.
+    pub(crate) fn retire(&mut self) {
+        let mut state = self.lane.state.lock().expect("steering lane lock poisoned");
+        if state.generation == self.generation {
+            state.sender = None;
+        }
+    }
     /// Drains input already admitted before a provider-turn boundary.
     pub(crate) fn try_receive(&mut self) -> Option<SteerCommand> {
         let mut command = self.receiver.try_recv().ok()?;
@@ -307,11 +318,11 @@ impl SteerCommand {
         }
     }
     /// Retain continuation ownership until provider acceptance or a terminal failure.
-    pub(crate) async fn complete_with<Output>(
+    pub(crate) async fn complete_with(
         mut self,
-        operation: impl std::future::Future<Output = Result<Output>>,
+        operation: impl std::future::Future<Output = Result<super::retry::RetryAttempt>>,
         event_sink: ProviderEventSink,
-    ) -> Result<Output> {
+    ) -> Result<(super::retry::RetryAttempt, Option<Self>)> {
         self.event_sink = Some(event_sink);
         let mut operation = Box::pin(operation);
         let result = if let Some(submission) = &self.submission {
@@ -321,13 +332,17 @@ impl SteerCommand {
                 accepted = async { acceptance.wait_for(|accepted| *accepted).await.map(drop) } => {
                     accepted.context("continuation acceptance channel closed")?;
                     self.complete(Ok(())).await;
-                    return operation.await;
+                    let result = operation.await?;
+                    return Ok((result, None));
                 }
                 result = &mut operation => result,
             }
         } else {
             operation.await
         };
+        if matches!(&result, Ok(super::retry::RetryAttempt::Stale(..))) {
+            return Ok((result?, Some(self)));
+        }
         let accepted = self
             .submission
             .as_ref()
@@ -348,7 +363,7 @@ impl SteerCommand {
                 .map_err(|error| anyhow::anyhow!("{error:#}"))
         })
         .await;
-        result
+        Ok((result?, None))
     }
 
     /// Defers only an input that never crossed native dispatch, and settles all other outcomes.
@@ -359,23 +374,25 @@ impl SteerCommand {
                 Ok(None)
             }
             Err(error) => {
-                let dispatched = self
+                let not_consumed = error
+                    .downcast_ref::<ProviderError>()
+                    .is_some_and(|error| matches!(error, ProviderError::NotConsumed { .. }));
+                let prepared = self
                     .submission
                     .as_ref()
                     .map(|submission| submission.record())
                     .transpose()?
                     .is_some_and(|record| {
-                        !matches!(
+                        matches!(
                             record.delivery,
                             super::submission::SubmissionState::Prepared
                         )
                     });
-                if dispatched {
-                    self.complete(Err(anyhow::anyhow!("{error:#}"))).await;
-                    Err(error)
-                } else {
-                    Ok(Some(self))
+                if not_consumed && prepared {
+                    return Ok(Some(self));
                 }
+                self.complete(Err(anyhow::anyhow!("{error:#}"))).await;
+                Err(error)
             }
         }
     }
@@ -431,7 +448,7 @@ impl SteerCommand {
             }
         }
         if let Some(completion) = self.completion.take() {
-            let _ = completion.send(result.map_err(|error| format!("{error:#}")));
+            let _ = completion.send(result.map_err(ProviderError::from));
         }
     }
 }
@@ -439,9 +456,25 @@ impl SteerCommand {
 impl Drop for SteerCommand {
     fn drop(&mut self) {
         if let Some(completion) = self.completion.take() {
-            let _ = completion.send(Err(
-                "active turn completed before steering input was acknowledged".into(),
-            ));
+            let error = if self
+                .submission
+                .as_ref()
+                .and_then(|submission| submission.record().ok())
+                .is_some_and(|record| {
+                    matches!(
+                        record.delivery,
+                        super::submission::SubmissionState::Prepared
+                    )
+                }) {
+                ProviderError::NotConsumed {
+                    message: "active turn ended before steering input was sent".into(),
+                }
+            } else {
+                ProviderError::DeliveryUncertain {
+                    message: "active turn ended before steering input was acknowledged".into(),
+                }
+            };
+            let _ = completion.send(Err(error));
         }
     }
 }
@@ -457,6 +490,63 @@ mod test {
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn stale_continuation_retains_unconsumed_command() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = std::sync::Arc::new(crate::trace::TraceStore::open(directory.path())?);
+        let store = crate::provider::submission::SubmissionStore::open(directory.path(), trace)?;
+        let catalog = crate::provider::ProviderCatalogRequest {
+            execution_owner: None,
+            harness_session_id: "steering".into(),
+            workspace: "workspace".into(),
+            access: Default::default(),
+            approval_mode: crate::session::ApprovalMode::Ask,
+            provider_session_id: None,
+        };
+        let submission = store.prepare_steering(
+            &catalog,
+            crate::provider::ProviderInput::from_text("once"),
+            crate::provider::ProviderKind::Codex,
+        )?;
+        let lane = SteeringLane::default();
+        let mut active = lane.activate(None)?;
+        let mut sending = Box::pin(lane.steer(super::SteeringInput::User {
+            text: "once".into(),
+            attachments: Vec::new(),
+            submission: Some(submission.clone()),
+        }));
+        assert!(futures_util::poll!(sending.as_mut()).is_pending());
+        let command = active.receive().await.unwrap();
+        let request = submission.record()?.request;
+        let (sink, _events) = crate::provider::events::channel(scope());
+        let (attempt, command) = command
+            .complete_with(
+                async move {
+                    Ok(crate::provider::retry::RetryAttempt::Stale(
+                        Box::new(request),
+                        Default::default(),
+                    ))
+                },
+                sink,
+            )
+            .await?;
+        assert!(matches!(
+            attempt,
+            crate::provider::retry::RetryAttempt::Stale(..)
+        ));
+        assert!(futures_util::poll!(sending.as_mut()).is_pending());
+        assert!(matches!(
+            submission.record()?.delivery,
+            crate::provider::submission::SubmissionState::Prepared
+        ));
+        command
+            .expect("stale command retained")
+            .complete(Ok(()))
+            .await;
+        sending.await?;
+        Ok(())
     }
 
     #[tokio::test]

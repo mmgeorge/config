@@ -1,3 +1,4 @@
+use super::collect::ProviderTestExt as _;
 use anyhow::{Context, Result, ensure};
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
 use forge_harness::provider::approval::PermissionCoordinator;
@@ -677,11 +678,11 @@ fn create_provider(
     provider: &str,
     initialize: &InitializeRequest,
     request: &ProviderRequest,
-) -> Result<Box<Provider>> {
+) -> Result<super::collect::ProviderTestSession<Provider>> {
     let permission = PermissionCoordinator::transient(&request.workspace)?;
     let root = Path::new(&initialize.data_root);
     let trace = Arc::new(TraceStore::open(root)?);
-    Ok(match provider {
+    let native: Box<Provider> = match provider {
         "codex" => Box::new(CodexProvider::new_with_permission_coordinator(
             vec!["codex".into(), "app-server".into()],
             permission,
@@ -695,7 +696,8 @@ fn create_provider(
             Some(root.into()),
         )?) as Box<Provider>,
         _ => unreachable!("test provider is explicit"),
-    })
+    };
+    super::collect::ProviderTestSession::from_dyn(Arc::from(native))
 }
 
 /// Interrupt an actual command, drain its execution, and submit a successful replacement turn.
@@ -750,7 +752,7 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
     let result: Result<()> = async {
         request.provider_session_id = provider.initialize_session(request.clone()).await?;
         let (sink, mut stream) = forge_harness::provider::events::channel(InvocationScope::new(request.owner()?, "cancel-tool"));
-        let execution = provider.prompt_stream(request.clone(), sink);
+        let execution = provider.session_prompt_and_wait(request.clone(), sink);
         tokio::pin!(execution);
         let mut observed = Vec::new();
         loop {
@@ -807,9 +809,9 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
         // Observe past the command's scheduled write; a closed turn alone does not prove process cancellation.
         tokio::time::sleep_until(command_started_at + std::time::Duration::from_secs(5)).await;
         ensure!(!finished.exists(), "cancelled native command continued executing after turn settlement");
-        request.provider_session_id = provider.active_session_id_for(&request.harness_session_id).await;
+        request.provider_session_id = provider.active_session_id_for(&request.harness_session_id).await?;
         request.input = ProviderInput::from_text("The previous command was intentionally cancelled. Use a tool to read input.txt, then reply with its exact token. Do not run another sleep.");
-        let retried = provider.prompt(request).await?;
+        let retried = provider.session_prompt_and_collect(request).await?;
         ensure!(retried.event.iter().any(|event| matches!(event, ProviderEvent::Tool { update: ToolUpdate::Finished { .. }, .. })), "retry did not execute a tool");
         ensure!(serde_json::to_string(&retried.event)?.contains("WORKFLOW-72931"), "retry lost workspace access");
         eprintln!("{provider_name}: active command cancellation, drained execution, and successful tool retry passed");

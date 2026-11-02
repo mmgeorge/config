@@ -1,3 +1,4 @@
+use super::collect::ProviderTestExt as _;
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
 use forge_harness::plan::PlanPrompt;
 use forge_harness::provider::ProviderAdapter as _;
@@ -77,6 +78,7 @@ fn observe_assistant_text(
 async fn lists_provider_owned_codex_model_metadata() {
     let repository = tempfile::tempdir().unwrap();
     let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    let provider = super::collect::ProviderTestSession::new(provider).unwrap();
 
     let model_list = tokio::time::timeout(
         Duration::from_secs(30),
@@ -102,6 +104,7 @@ async fn lists_provider_owned_codex_model_metadata() {
 async fn lists_provider_skills_and_complete_mcp_rows() {
     let repository = tempfile::tempdir().unwrap();
     let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    let provider = super::collect::ProviderTestSession::new(provider).unwrap();
     let catalog_request = ProviderCatalogRequest {
         execution_owner: None,
         harness_session_id: "catalog-session".into(),
@@ -152,7 +155,7 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
         })
         .await
         .unwrap();
-    assert!(!fork.provider_session_id.is_empty());
+    assert!(!fork.provider_session_id.as_str().is_empty());
     assert_eq!(provider.app_server_process_id().await, Some(process_id));
     assert_eq!(provider.app_server_start_count(), 1);
 }
@@ -179,6 +182,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     git(repository.path(), &["commit", "-qm", "seed"]);
 
     let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    let provider = super::collect::ProviderTestSession::new(provider).unwrap();
     provider
         .model_list(request(repository.path(), PromptMode::Chat, ""))
         .await
@@ -199,7 +203,8 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     let (answer_event_sink, mut answer_event_stream) = forge_harness::provider::events::channel(
         InvocationScope::new(answer_request.owner().unwrap(), "answer"),
     );
-    let mut answer_future = Box::pin(provider.prompt_stream(answer_request, answer_event_sink));
+    let mut answer_future =
+        Box::pin(provider.session_prompt_and_wait(answer_request, answer_event_sink));
     let mut answer_events = Vec::new();
     let mut answer_classification = HashMap::new();
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -281,7 +286,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         ),
         r#"{"version":1,"plan_id":"plan","title":"Add harness integration marker","overview":"Planning in progress.","usage":null,"entity_changes":[],"flows":[],"tasks":[],"tests":[],"assumptions":[]}"#,
     );
-    let planning = provider.prompt(request(
+    let planning = provider.session_prompt_and_collect(request(
         repository.path(),
         PromptMode::Plan,
         &planning_prompt,
@@ -289,8 +294,8 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     let steering = async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         provider
-            .steer_session(
-                "harness-session",
+            .steer_current(
+                forge_harness::provider::ExecutionOwner::root("harness-session"),
                 "Include the literal marker `STEERING_CONSTRAINT_7B3D` in the plan Overview."
                     .into(),
             )
@@ -321,7 +326,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         InvocationScope::new(execute.owner().unwrap(), "execution"),
     );
     let (executed, streamed_event_list) = tokio::time::timeout(Duration::from_secs(90), async {
-        let execution = provider.prompt_stream(execute.clone(), event_sink);
+        let execution = provider.session_prompt_and_wait(execute.clone(), event_sink);
         tokio::pin!(execution);
         let mut streamed_event_list = Vec::new();
         let mut stream_open = true;
@@ -437,7 +442,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     .await
     .expect("Codex fork timed out")
     .unwrap();
-    assert!(!forked.provider_session_id.trim().is_empty());
+    assert!(!forked.provider_session_id.as_str().trim().is_empty());
     assert_eq!(provider.app_server_process_id().await, Some(process_id));
     assert_eq!(provider.app_server_start_count(), 1);
 }
@@ -449,16 +454,20 @@ async fn streams_structured_child_agent_lifecycle() {
     git(repository.path(), &["init", "-q"]);
     fs::write(repository.path().join("README.md"), "# Child lifecycle\n").unwrap();
     let provider = CodexProvider::new(vec!["codex".into(), "app-server".into()]).unwrap();
+    let provider = super::collect::ProviderTestSession::new(provider).unwrap();
     let mut provider_request = request(
         repository.path(),
         PromptMode::Chat,
         "Spawn an explorer subagent to read README.md and report its heading. Wait for it to finish.",
     );
     provider_request.approval_mode = ApprovalMode::Ask;
-    let output = tokio::time::timeout(Duration::from_secs(90), provider.prompt(provider_request))
-        .await
-        .expect("Codex subagent turn exceeded 90 seconds")
-        .unwrap();
+    let output = tokio::time::timeout(
+        Duration::from_secs(90),
+        provider.session_prompt_and_collect(provider_request),
+    )
+    .await
+    .expect("Codex subagent turn exceeded 90 seconds")
+    .unwrap();
     assert!(
         output.event.iter().any(|event| matches!(
             event,
@@ -503,7 +512,8 @@ async fn streams_structured_child_agent_lifecycle() {
     let parent_thread_id = output
         .completion
         .provider_session_id
-        .as_deref()
+        .as_ref()
+        .map(|id| id.as_str())
         .expect("the parent turn must preserve its provider thread identity");
     let mut message_classification = HashMap::new();
     for event in &output.event {

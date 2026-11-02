@@ -362,6 +362,20 @@ impl CodexJsonRpc {
                 if self.publish_background(&message, &mut output).await? {
                     return Ok(());
                 }
+                if let Some(events) = self
+                    .normalization
+                    .normalize_retained(&message, &self.workspace)
+                    .await?
+                {
+                    self.publish_background_events(events, &mut output).await?;
+                    return Ok(());
+                }
+                if message["method"].as_str() == Some("turn/started") {
+                    return Err(crate::provider::ProviderError::Observation(
+                        forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                    )
+                    .into());
+                }
                 if message.get("id").is_some() && message.get("method").is_some() {
                     self.write_message(&json!({"jsonrpc":"2.0", "id":message["id"],
                         "error":{"code":-32001,"message":"No active provider invocation"}}))
@@ -459,6 +473,15 @@ impl CodexJsonRpc {
                 .collect();
             self.publish_background_events(events, &mut output).await?;
         }
+        Ok(())
+    }
+
+    /// Collect the native socket task after session shutdown has drained its observations.
+    pub(super) async fn close(&mut self) -> Result<()> {
+        self.socket
+            .close()
+            .await
+            .map_err(crate::provider::ProviderError::from)?;
         Ok(())
     }
 
@@ -700,6 +723,31 @@ impl CodexJsonRpc {
         output: &mut ProviderOutput,
     ) -> Result<Value> {
         self.mcp.normalize(&mut message);
+        let retained_foreign = self
+            .normalization
+            .retained_scope(&message)
+            .is_some_and(|owner| {
+                self.event_sink
+                    .as_ref()
+                    .and_then(|sink| sink.scope().invocation())
+                    != Some(owner)
+            });
+        if retained_foreign {
+            if message.get("id").is_some() && message.get("method").is_some() {
+                // Old callbacks cannot acquire the current invocation's tool or approval authority.
+                self.write_message(&json!({"jsonrpc":"2.0", "id":message["id"],
+                    "error":{"code":-32001,"message":"The original invocation no longer accepts callbacks"}}))
+                    .await?;
+            } else if let Some(events) = self
+                .normalization
+                .normalize_retained(&message, &self.workspace)
+                .await?
+            {
+                self.publish_background_events(events, output).await?;
+            }
+            // The active coordinator must not interpret another invocation's terminal frame.
+            return Ok(Value::Null);
+        }
         if self.publish_background(&message, output).await? {
             return Ok(message);
         }
@@ -747,6 +795,9 @@ impl CodexJsonRpc {
             }
             let request = message.clone();
             let approval = method != "item/tool/call";
+            let waiting_question = !approval
+                && message["params"]["tool"] == "question_ask"
+                && message["params"]["arguments"]["wait"] == true;
             let ordered = if approval {
                 None
             } else {
@@ -773,6 +824,10 @@ impl CodexJsonRpc {
                         && previous.await.is_err()
                     {
                         return ExecutedRequest::cancelled(request);
+                    }
+                    if waiting_question {
+                        let mut question = executor.lock().await.fork_waiting_question(completed);
+                        return question.execute(request, received_at).await;
                     }
                     let mut result = executor.lock().await.execute(request, received_at).await;
                     result.control_completion = Some(completed);
@@ -1162,13 +1217,134 @@ pub(super) fn control_invocation(
 
 #[cfg(test)]
 mod test {
-    /// Keep both directions' numeric IDs separate while rejecting malformed client responses.
-
-    /// Distinguish missing history from permission, transient, and unrelated RPC failures.
     use crate::provider::{
         MessageAddress, MessageClassification, MessageRole, MessageUpdate, TextUpdate, ToolAddress,
         ToolOutcome, ToolStatus, ToolUpdate,
     };
+
+    /// A waiting ask must release the actual ordered JSON-RPC dispatch gate after publication.
+    #[tokio::test]
+    async fn waiting_question_dispatches_clarification_before_answer() -> anyhow::Result<()> {
+        use super::*;
+        use crate::question::{
+            QuestionAction, QuestionAnswer, QuestionCommand, QuestionController,
+        };
+
+        let (fixture, _store, controller) = crate::task::SessionTaskController::test_goal();
+        let questions = Arc::new(QuestionController::open(fixture.path(), "session")?);
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            tokio_tungstenite::accept_async(stream).await
+        });
+        let (sink, _events) = crate::provider::events::channel(fixture_scope());
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            ApprovalMode::Ask,
+            PermissionCoordinator::transient(&workspace)?,
+            Some(sink),
+            Arc::new(TraceStore::open(fixture.path())?),
+            "session".into(),
+        )
+        .await?;
+        process.normalization.bind(Some(fixture_scope()));
+        let mut context = ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        context.questions = Some(questions.clone());
+        context.question_exchange_id = Some("exchange".into());
+        context.bind_test_task_controller(controller);
+        process.set_control_context(context).await;
+        let mut peer = peer.await??;
+        let mut output = ProviderOutput::default();
+        peer.send(Message::Text(
+            json!({"jsonrpc":"2.0","id":1,"method":"item/tool/call","params":{
+                "threadId":"thread","turnId":"turn","callId":"ask","tool":"question_ask",
+                "arguments":{"wait":true,"questions":[{"header":"Format","question":"Which format?",
+                    "options":[{"label":"JSON","description":"Structured"}]}]}
+            }})
+            .to_string()
+            .into(),
+        ))
+        .await?;
+        tokio::time::timeout(Duration::from_secs(2), process.read_message(&mut output))
+            .await
+            .context("socket did not dispatch ask")??;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while questions.snapshot()?.questions.is_empty() {
+                tokio::task::yield_now().await;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("ask was not committed before deadline")??;
+        assert_eq!(
+            process.pending_requests.len(),
+            1,
+            "the required ask must remain pending"
+        );
+        assert!(
+            process.request_executor.try_lock().is_ok(),
+            "waiting question retained the request executor lock"
+        );
+        let question = questions.snapshot()?.questions.remove(0);
+        questions.apply(QuestionCommand {
+            operation_id: "clarify".into(),
+            question_id: question.id.clone(),
+            revision: 1,
+            action: QuestionAction::Clarify {
+                text: "Show an example".into(),
+            },
+        })?;
+        peer.send(Message::Text(json!({"jsonrpc":"2.0","id":2,"method":"item/tool/call","params":{
+            "threadId":"thread","turnId":"turn","callId":"reply","tool":"question_reply",
+            "arguments":{"question_id":question.id,"revision":1,"message_id":"clarify","text":"An example"}
+        }}).to_string().into())).await?;
+        tokio::time::timeout(Duration::from_secs(2), process.read_message(&mut output))
+            .await
+            .context("socket did not dispatch clarification")??;
+        let reply = tokio::time::timeout(Duration::from_secs(2), process.receive_message())
+            .await
+            .context("clarification worker did not finish")??;
+        process.publish_received(reply, &mut output).await?;
+        let response = tokio::time::timeout(Duration::from_secs(2), peer.next())
+            .await
+            .context("clarification response was not sent")?
+            .context("reply socket closed")??;
+        let response: Value = serde_json::from_str(response.to_text()?)?;
+        assert_eq!(response["id"], 2, "{response}");
+        assert_eq!(response["result"]["success"], true, "{response}");
+        assert_eq!(
+            process.pending_requests.len(),
+            1,
+            "reply must leave ask pending"
+        );
+        questions.apply(QuestionCommand {
+            operation_id: "answer".into(),
+            question_id: question.id,
+            revision: 1,
+            action: QuestionAction::Answer {
+                answer: QuestionAnswer::Selected {
+                    option_id: "1:0".into(),
+                    feedback: None,
+                },
+            },
+        })?;
+        let answer = tokio::time::timeout(Duration::from_secs(2), process.receive_message())
+            .await
+            .context("answered ask worker did not finish")??;
+        process.publish_received(answer, &mut output).await?;
+        let response = tokio::time::timeout(Duration::from_secs(2), peer.next())
+            .await
+            .context("ask response was not sent")?
+            .context("ask socket closed")??;
+        let response: Value = serde_json::from_str(response.to_text()?)?;
+        assert_eq!(response["id"], 1, "{response}");
+        assert_eq!(response["result"]["success"], true, "{response}");
+        assert!(process.pending_requests.is_empty());
+        Ok(())
+    }
 
     struct MessageRecord {
         address: MessageAddress,
@@ -1420,8 +1596,9 @@ mod test {
             process.publish_message(json!({"id":id,"method":"item/tool/call","params":{
                 "threadId":"thread","turnId":"turn","callId":format!("call-{id}"),"tool":tool,"arguments":arguments
             }}), &mut output).await?;
+            // Each edit depends on the preceding edit's committed document version.
+            process.finish_requests(&mut output).await?;
         }
-        process.finish_requests(&mut output).await?;
         assert_eq!(output.completion.design_patch.len(), 2);
         for patch in output.completion.design_patch {
             document = document.patch_design(fixture.path(), patch)?;
@@ -1706,7 +1883,7 @@ mod test {
             event: Vec::new(),
             completion: crate::provider::ProviderCompletion {
                 native: forge_provider_api::completion::ProviderCompletion {
-                    provider_session_id: Some("parent".into()),
+                    provider_session_id: Some("parent".to_owned().try_into().unwrap()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -2604,7 +2781,7 @@ mod test {
         normalize_event(
             &mut normalization,
             &json!({"method":"item/agentMessage/delta", "params":{
-                "threadId":"parent","turnId":"turn","itemId":"one","delta":"Next invocation"
+                "threadId":"parent","turnId":"next-turn","itemId":"one","delta":"Next invocation"
             }}),
             &mut output,
             None,

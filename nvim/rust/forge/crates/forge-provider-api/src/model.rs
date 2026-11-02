@@ -41,7 +41,7 @@ pub struct ProviderDescriptor {
 }
 
 /// Represents provider features that control visible Harness actions.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ProviderCapability {
     /// Integration-owned support declarations consumed without provider identity switches.
     #[serde(default)]
@@ -92,15 +92,15 @@ pub struct ProviderTimingRecord {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderForkResult {
     #[serde(alias = "backend_session_id")]
-    pub provider_session_id: String,
+    pub provider_session_id: crate::ProviderSessionId,
     pub timing: Vec<ProviderTimingRecord>,
 }
 
 impl ProviderForkResult {
     /// Build an unprofiled native fork result from its provider session identity.
-    pub fn unprofiled(provider_session_id: impl Into<String>) -> Self {
+    pub fn unprofiled(provider_session_id: crate::ProviderSessionId) -> Self {
         Self {
-            provider_session_id: provider_session_id.into(),
+            provider_session_id,
             timing: Vec::new(),
         }
     }
@@ -134,7 +134,7 @@ pub struct ProviderModel {
 }
 
 /// Declares optional operations and implementation-specific explanations.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ProviderIntegration {
     pub background_generation: bool,
     pub isolated_generation: bool,
@@ -185,7 +185,7 @@ impl ProviderCapability {
 }
 
 /// Describes an implementation-owned isolation choice and its actual guarantees.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct IsolationMode {
     pub id: String,
     pub label: String,

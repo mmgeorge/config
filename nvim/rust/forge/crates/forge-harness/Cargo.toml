@@ -42,7 +42,7 @@ stacker = { workspace = true }
 strip-ansi-escapes = { workspace = true }
 syn = { workspace = true, features = ["full", "visit-mut"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = { workspace = true, features = ["compat"] }
 toml = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }

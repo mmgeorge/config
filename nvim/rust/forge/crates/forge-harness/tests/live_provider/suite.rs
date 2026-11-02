@@ -7,33 +7,35 @@
 //!
 //! `#[ignore]` keeps all cases compiled and discoverable without executing them
 //! during normal runs or requiring a Cargo feature. Provider-specific modules
-//! below belong to this single integration-test target, not the library suite.
+//! below belong to this internal test module, using the production execution engine.
 //!
 //! List cases from the Rust workspace without starting providers:
-//! `cargo test --profile dev --locked -p forge-harness --test live_provider -- --list`
+//! `cargo test --profile dev --locked -p forge-harness --lib live_provider:: -- --list`
 //!
 //! After verifying a case's prerequisites and authorizing its external requests,
 //! select it explicitly, for example:
-//! `cargo test --profile dev --locked -p forge-harness --test live_provider codex_cli::lists_provider_owned_codex_model_metadata -- --ignored --exact --nocapture`
+//! `cargo test --profile dev --locked -p forge-harness --lib live_provider::codex_cli::lists_provider_owned_codex_model_metadata -- --ignored --exact --nocapture`
 //! Do not add `--ignored` or `--include-ignored` to routine checks.
+
+use crate::provider::test_support as collect;
 
 use forge_harness::provider::{PromptMode, ProviderCatalogRequest, ProviderInput, ProviderRequest};
 use forge_harness::session::ApprovalMode;
 use std::path::Path;
 
-#[path = "live_provider/catalog.rs"]
+#[path = "catalog.rs"]
 mod catalog;
-#[path = "live_provider/codex_cli.rs"]
+#[path = "codex_cli.rs"]
 mod codex_cli;
-#[path = "live_provider/codex_real.rs"]
+#[path = "codex_real.rs"]
 mod codex_real;
-#[path = "live_provider/copilot_real.rs"]
+#[path = "copilot_real.rs"]
 mod copilot_real;
-#[path = "live_provider/session_resume.rs"]
+#[path = "session_resume.rs"]
 mod session_resume;
-#[path = "live_provider/text_generation.rs"]
+#[path = "text_generation.rs"]
 mod text_generation;
-#[path = "live_provider/workflows.rs"]
+#[path = "workflows.rs"]
 mod workflows;
 
 fn catalog_request(workspace: &Path, session_id: &str) -> ProviderCatalogRequest {

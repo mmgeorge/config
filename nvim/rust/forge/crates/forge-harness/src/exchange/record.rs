@@ -539,7 +539,12 @@ impl Exchange {
                 else {
                     return Ok(false);
                 };
-                if turn.state() != TurnState::Running && !late_update {
+                let retained_output = matches!(event, ProviderEvent::Message { .. })
+                    && turn.state()
+                        == (TurnState::Finished {
+                            outcome: crate::turn::TurnOutcome::Completed,
+                        });
+                if turn.state() != TurnState::Running && !late_update && !retained_output {
                     return Ok(false);
                 }
                 let item_count = turn.items().len();
@@ -687,6 +692,85 @@ impl Exchange {
             .ok_or_else(|| anyhow::anyhow!("provider event has no admitted turn"))
     }
 
+    /// Reopen only a positively correlated new native execution under its retained invocation.
+    pub(crate) fn reopen_provider_execution(
+        &mut self,
+        address: crate::provider::TurnAddress,
+        now_ms: i64,
+    ) -> anyhow::Result<bool> {
+        if self.turn.iter().any(|turn| turn.provider() == &address) {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            self.state() == ExchangeState::Complete
+                || self.state() == ExchangeState::Finalizing
+                    && self.finalization_outcome() == Some(ExchangeOutcome::Complete),
+            "only successfully settled work can reopen from native activity"
+        );
+        anyhow::ensure!(
+            self.disposition() == HistoryDisposition::Current,
+            "superseded work cannot reopen"
+        );
+        anyhow::ensure!(
+            self.turn
+                .iter()
+                .any(|turn| turn.provider().scope == address.scope),
+            "native continuation has no retained invocation"
+        );
+        anyhow::ensure!(
+            address.scope.owner.session_id == self.session_id
+                && address.scope.owner.agent_id == self.agent_id,
+            "native continuation belongs to another owner"
+        );
+        anyhow::ensure!(
+            !address.thread_id.is_empty() && !address.turn_id.is_empty(),
+            "native continuation has no turn identity"
+        );
+        let ordinal = self
+            .turn
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("provider turn count overflowed"))?;
+        let turn = crate::turn::Turn::new(format!("{}:turn:{ordinal}", self.id), address, now_ms);
+        self.phase = super::ExchangePhase::Running;
+        self.finalization_error = None;
+        self.checkpoint_after = None;
+        self.checkpoint_diff_text = None;
+        self.attributed_matches_checkpoint = false;
+        self.clock.resume(now_ms);
+        self.turn.push(turn);
+        Ok(true)
+    }
+
+    /// Revalidate host prerequisites for the same retained invocation after a stale ticket.
+    pub(crate) fn revalidate_host_settlement(
+        &mut self,
+        scope: &crate::provider::InvocationScope,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.state() == ExchangeState::Complete
+                && self.finalization_outcome() == Some(ExchangeOutcome::Complete)
+                && self.disposition() == HistoryDisposition::Current,
+            "only a current completed exchange can revalidate host settlement"
+        );
+        anyhow::ensure!(
+            scope.exchange_id == self.id
+                && scope.owner.session_id == self.session_id
+                && scope.owner.agent_id == self.agent_id
+                && self
+                    .turn
+                    .last()
+                    .is_none_or(|turn| &turn.provider().scope == scope),
+            "host settlement revalidation crosses invocation ownership"
+        );
+        self.phase = super::ExchangePhase::Finalizing(ExchangeOutcome::Complete);
+        self.finalization_error = None;
+        self.checkpoint_after = None;
+        self.checkpoint_diff_text = None;
+        self.attributed_matches_checkpoint = false;
+        Ok(())
+    }
+
     /// Reject continuation after the request has reached a terminal outcome.
     pub fn resume(&mut self, now_ms: i64) -> anyhow::Result<()> {
         anyhow::ensure!(
@@ -735,7 +819,8 @@ impl Exchange {
         self.resume(now_ms)
     }
 
-    /// Settle interrupted provider turns while retaining the request and its original checkpoint.
+    /// Seed interrupted restart history for state-machine and presentation fixtures.
+    #[cfg(test)]
     pub(crate) fn pause_for_restart(&mut self, now_ms: i64) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.state() == ExchangeState::Running,
@@ -1874,5 +1959,65 @@ mod test {
             ExchangeNode::ArtifactChange { .. }
         ));
         assert_eq!(interaction.turn[0].duration_ms(), 200);
+    }
+    /// Replayed native identity never reopens a completed exchange, but a new correlated turn does.
+    #[test]
+    fn native_reopening_preserves_original_history_and_rejects_replayed_start() {
+        let mut exchange = interaction();
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ExecutionOwner::root(&exchange.session_id),
+            exchange.id.clone(),
+        );
+        let first = crate::provider::TurnAddress {
+            scope: scope.clone(),
+            thread_id: "native".into(),
+            turn_id: "first".into(),
+        };
+        exchange.start_turn(first.clone(), 10).unwrap();
+        exchange
+            .turn_mut(&first)
+            .unwrap()
+            .finish(crate::turn::TurnOutcome::Completed, 20)
+            .unwrap();
+        exchange.finish(ExchangeOutcome::Complete, 20).unwrap();
+        let checkpoint = exchange.checkpoint_before.clone();
+        let prompt = exchange.prompt.clone();
+        assert!(!exchange.reopen_provider_execution(first, 30).unwrap());
+        assert_eq!(exchange.state(), ExchangeState::Complete);
+        let next = crate::provider::TurnAddress {
+            scope,
+            thread_id: "native".into(),
+            turn_id: "second".into(),
+        };
+        assert!(exchange.reopen_provider_execution(next, 30).unwrap());
+        assert_eq!(exchange.state(), ExchangeState::Running);
+        assert_eq!(exchange.turn.len(), 2);
+        assert_eq!(exchange.prompt, prompt);
+        assert_eq!(exchange.checkpoint_before, checkpoint);
+    }
+
+    /// Explicit cancellation revokes permission for unsolicited native resumption.
+    #[test]
+    fn native_reopening_rejects_cancelled_exchange() {
+        let mut exchange = interaction();
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ExecutionOwner::root(&exchange.session_id),
+            exchange.id.clone(),
+        );
+        let first = crate::provider::TurnAddress {
+            scope: scope.clone(),
+            thread_id: "native".into(),
+            turn_id: "first".into(),
+        };
+        exchange.start_turn(first, 10).unwrap();
+        exchange.finish(ExchangeOutcome::Cancelled, 20).unwrap();
+        let next = crate::provider::TurnAddress {
+            scope,
+            thread_id: "native".into(),
+            turn_id: "second".into(),
+        };
+        assert!(exchange.reopen_provider_execution(next, 30).is_err());
+        assert_eq!(exchange.state(), ExchangeState::Cancelled);
+        assert_eq!(exchange.turn.len(), 1);
     }
 }

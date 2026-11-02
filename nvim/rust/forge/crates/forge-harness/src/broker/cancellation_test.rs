@@ -14,6 +14,7 @@ enum ProviderFailure {
 }
 
 struct CancelledNativeProvider {
+    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
     failure: ProviderFailure,
     calls: AtomicUsize,
     cancellations: AtomicUsize,
@@ -58,12 +59,44 @@ impl crate::provider::ProviderAdapter for CancelledNativeProvider {
     }
 
     /// Avoid inventing provider history for the fixture.
-    async fn active_session_id_for(&self, _: &str) -> Option<String> {
-        None
+    async fn active_session_id_for(
+        &self,
+        _: &str,
+    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+        Ok(None)
     }
 
     /// Emit native cancellation evidence on the first call and a successful subsequent response.
-    async fn prompt_stream(
+    async fn session_events(
+        &self,
+        owner: crate::provider::ExecutionOwner,
+    ) -> std::result::Result<
+        crate::provider::events::ProviderEventStream,
+        crate::provider::ProviderError,
+    > {
+        let stream = self.fixture_events.subscribe(owner.clone())?;
+        Ok(stream)
+    }
+
+    async fn session_prompt(
+        self: std::sync::Arc<Self>,
+        request: crate::provider::ProviderRequest,
+        scope: crate::provider::InvocationScope,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let events = self.fixture_events.clone();
+        events
+            .submit(
+                request,
+                scope,
+                crate::provider::test_support::TerminalBoundary::LocalFixture,
+                move |request, sink| async move { self.run_native(request, sink).await },
+            )
+            .await
+    }
+}
+
+impl CancelledNativeProvider {
+    async fn run_native(
         &self,
         request: ProviderRequest,
         sink: ProviderEventSink,
@@ -81,6 +114,16 @@ impl crate::provider::ProviderAdapter for CancelledNativeProvider {
             "native-thread",
             format!("native-turn-{call}"),
         );
+        sink.send_wait(ProviderEvent::Execution {
+            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                turn.scope.clone(),
+                forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                    address: turn.clone(),
+                },
+            )
+            .expect("execution scope is derived from its native address"),
+        })
+        .await?;
         sink.send_wait(ProviderEvent::Turn {
             address: turn.clone(),
             update: TurnUpdate::Started { started_at_ms: 1 },
@@ -206,6 +249,7 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
         };
     }
     let provider = Arc::new(CancelledNativeProvider {
+        fixture_events: Default::default(),
         failure,
         calls: AtomicUsize::new(0),
         cancellations: AtomicUsize::new(0),

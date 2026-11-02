@@ -331,6 +331,36 @@ fn script_path(invocation: &CommandInvocation) -> Option<&str> {
     (valid && !path.starts_with('-')).then_some(path)
 }
 
+pub use forge_provider_api::skill::SkillRead;
+
+struct SkillEventObserver(Arc<Mutex<SkillObserver>>);
+
+impl forge_provider_api::events::EventObserver for SkillEventObserver {
+    fn additional_events(
+        &self,
+        event: &ProviderEvent,
+    ) -> Result<Vec<ProviderEvent>, forge_provider_api::events::EventDeliveryError> {
+        let read = self
+            .0
+            .lock()
+            .map_err(|_| {
+                forge_provider_api::events::EventDeliveryError::transport(
+                    "skill observer lock poisoned",
+                )
+            })?
+            .observe(event);
+        match event {
+            ProviderEvent::Tool { address, .. } if !read.is_empty() => {
+                Ok(vec![ProviderEvent::Tool {
+                    address: address.clone(),
+                    update: crate::provider::ToolUpdate::SkillRead { read },
+                }])
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,35 +690,5 @@ mod tests {
         ));
         assert_eq!(rendered.tool.len(), 4);
         Ok(())
-    }
-}
-
-pub use forge_provider_api::skill::SkillRead;
-
-struct SkillEventObserver(Arc<Mutex<SkillObserver>>);
-
-impl forge_provider_api::events::EventObserver for SkillEventObserver {
-    fn additional_events(
-        &self,
-        event: &ProviderEvent,
-    ) -> Result<Vec<ProviderEvent>, forge_provider_api::events::EventDeliveryError> {
-        let read = self
-            .0
-            .lock()
-            .map_err(|_| {
-                forge_provider_api::events::EventDeliveryError::transport(
-                    "skill observer lock poisoned",
-                )
-            })?
-            .observe(event);
-        match event {
-            ProviderEvent::Tool { address, .. } if !read.is_empty() => {
-                Ok(vec![ProviderEvent::Tool {
-                    address: address.clone(),
-                    update: crate::provider::ToolUpdate::SkillRead { read },
-                }])
-            }
-            _ => Ok(Vec::new()),
-        }
     }
 }

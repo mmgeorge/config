@@ -196,7 +196,7 @@ mod tests {
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         let (_task_root, _task_store, task_controller) =
             crate::task::SessionTaskController::test_goal();
-        context.task_controller = Some(task_controller);
+        context.bind_test_task_controller(task_controller);
         let mut stream = router.activate(context).unwrap();
         router
             .call(ToolCall {
@@ -216,7 +216,7 @@ mod tests {
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         let (_task_root, _task_store, task_controller) =
             crate::task::SessionTaskController::test_goal();
-        context.task_controller = Some(task_controller);
+        context.bind_test_task_controller(task_controller);
         context.checkpoint = Some(crate::checkpoint::ToolGate::new()?);
         let mut stream = router.activate(context)?;
         let mut pending = Box::pin(router.route(ControlToolInvocation {
@@ -236,7 +236,7 @@ mod tests {
         let mut replacement = ControlTurnContext::inactive(PromptMode::Chat);
         let (_task_root, _task_store, task_controller) =
             crate::task::SessionTaskController::test_goal();
-        replacement.task_controller = Some(task_controller);
+        replacement.bind_test_task_controller(task_controller);
         let mut stream = router.activate(replacement)?;
         router
             .route(ControlToolInvocation {
@@ -255,7 +255,7 @@ mod tests {
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         let (_task_root, _task_store, task_controller) =
             crate::task::SessionTaskController::test_goal();
-        context.task_controller = Some(task_controller);
+        context.bind_test_task_controller(task_controller);
         let mut stream = router.activate(context).unwrap();
 
         let response = router
@@ -282,7 +282,7 @@ mod tests {
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         let (_task_root, _task_store, task_controller) =
             crate::task::SessionTaskController::test_goal();
-        context.task_controller = Some(task_controller);
+        context.bind_test_task_controller(task_controller);
         let mut stream = router.activate(context).unwrap();
         for _ in 0..32 {
             router
@@ -325,7 +325,7 @@ mod tests {
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         let (_task_root, _task_store, task_controller) =
             crate::task::SessionTaskController::test_goal();
-        context.task_controller = Some(task_controller);
+        context.bind_test_task_controller(task_controller);
         let mut stream = router.activate(context).unwrap();
         let summary = "λ".repeat(256 * 1024 + 1);
         assert_eq!(

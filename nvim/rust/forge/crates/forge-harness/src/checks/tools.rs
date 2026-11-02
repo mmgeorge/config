@@ -64,6 +64,7 @@ pub(crate) struct CheckToolScope {
     agent: Arc<crate::agent::AgentCoordinator>,
     cancelled: Arc<AtomicBool>,
     delivery: Mutex<Option<CheckDelivery>>,
+    task_authority: Option<crate::tools::TaskAuthority>,
 }
 
 #[derive(Clone)]
@@ -74,6 +75,7 @@ struct CheckDelivery {
 
 /// Binds check operations to the live root turn and its setup/write authority.
 pub(crate) struct CheckAuthority {
+    pub task_authority: Option<crate::tools::TaskAuthority>,
     pub data_root: PathBuf,
     pub provider: String,
     pub task_id: Option<String>,
@@ -92,6 +94,25 @@ pub(crate) struct CheckAuthority {
 }
 
 pub(crate) struct CheckToolLease(Arc<CheckToolScope>);
+
+impl CheckToolLease {
+    /// Rebind presentation without replacing the invocation's tool authority.
+    pub(crate) fn bind_lifecycle(
+        &self,
+        sink: Option<crate::broker::publication::SessionUpdateSink>,
+    ) -> Result<()> {
+        let mut delivery = self
+            .0
+            .delivery
+            .lock()
+            .map_err(|_| anyhow::anyhow!("check delivery lock poisoned"))?;
+        let delivery = delivery
+            .as_mut()
+            .context("check tools belong to an inactive interaction")?;
+        delivery.lifecycle = sink;
+        Ok(())
+    }
+}
 
 impl Drop for CheckToolLease {
     fn drop(&mut self) {
@@ -118,6 +139,7 @@ impl CheckToolScope {
         authority: CheckAuthority,
     ) -> (Arc<Self>, CheckToolLease) {
         let CheckAuthority {
+            task_authority,
             data_root,
             provider,
             task_id,
@@ -153,11 +175,15 @@ impl CheckToolScope {
                 authorization: authorization_sink,
                 lifecycle: sink,
             })),
+            task_authority,
         });
         (Arc::clone(&scope), CheckToolLease(scope))
     }
 
     pub(crate) async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {
+        if let Some(authority) = &self.task_authority {
+            authority.validate_scope()?;
+        }
         let delivery = self
             .delivery
             .lock()
@@ -289,12 +315,13 @@ impl CheckToolScope {
                 );
                 let published = self
                     .runner
-                    .configure(
+                    .configure_with_authority(
                         self.runner
                             .exchange_owner(self.scope.exchange_id.as_str())?,
                         request,
                         delivery.lifecycle.as_ref(),
                         Some(&self.editing),
+                        self.task_authority.as_ref(),
                     )
                     .await?;
                 json!({
@@ -331,7 +358,7 @@ impl CheckToolScope {
                     self.agent.active_count() == 0,
                     "an agent started during check resolution"
                 );
-                json!({"run_id":self.runner.start(run, delivery.lifecycle,Some(Arc::clone(&self.cancelled)),None).await?})
+                json!({"run_id":self.runner.start_authorized(run, delivery.lifecycle,Some(Arc::clone(&self.cancelled)),self.task_authority.as_ref()).await?})
             }
             "check_status" => {
                 let id = arguments["run_id"].as_str().context("run_id is required")?;
@@ -353,6 +380,9 @@ impl CheckToolScope {
             }
             _ => anyhow::bail!("unknown checks tool"),
         };
+        if let Some(authority) = &self.task_authority {
+            authority.validate_scope()?;
+        }
         Ok(serde_json::to_string(&result)?)
     }
 
@@ -667,6 +697,7 @@ impl CheckSupervisor {
     }
 
     /// Validates captured identities before saving settings and opaque helper sources.
+    #[cfg(test)]
     pub(crate) async fn configure(
         &self,
         owner: crate::timeline::TimelineOwner,
@@ -674,6 +705,21 @@ impl CheckSupervisor {
         sink: Option<&crate::broker::publication::SessionUpdateSink>,
         editing: Option<&AtomicBool>,
     ) -> Result<Value> {
+        self.configure_with_authority(owner, request, sink, editing, None)
+            .await
+    }
+
+    pub(super) async fn configure_with_authority(
+        &self,
+        owner: crate::timeline::TimelineOwner,
+        request: ConfigureChecks,
+        sink: Option<&crate::broker::publication::SessionUpdateSink>,
+        editing: Option<&AtomicBool>,
+        authority: Option<&crate::tools::TaskAuthority>,
+    ) -> Result<Value> {
+        if let Some(authority) = authority {
+            authority.validate_scope()?;
+        }
         ensure!(
             owner.session_id() == self.session_id,
             "check configuration crosses sessions"
@@ -758,7 +804,21 @@ impl CheckSupervisor {
             editing.is_none_or(|permission| permission.load(Ordering::Acquire)),
             "Check editing was disabled before configuration publication"
         );
-        let publication = (|| {
+        let commit = || {
+            ensure!(
+                editing.is_none_or(|permission| permission.load(Ordering::Acquire)),
+                "Check editing was disabled before configuration publication"
+            );
+            ensure!(
+                super::config::read_document(&self.workspace)? == original,
+                ".forge.json changed before setup publication"
+            );
+            for (path, previous, _) in &helpers {
+                ensure!(
+                    std::fs::read(path).ok().as_ref() == previous.as_ref(),
+                    "helper changed before setup publication"
+                );
+            }
             for (path, _, source) in &helpers {
                 super::config::reject_links(&self.workspace, path)?;
                 std::fs::create_dir_all(path.parent().unwrap())?;
@@ -771,22 +831,29 @@ impl CheckSupervisor {
             );
             std::fs::rename(&temporary, &destination)?;
             Ok::<_, anyhow::Error>(())
-        })();
-        if publication.is_err() {
-            for (path, previous, source) in &helpers {
-                if std::fs::read(path).ok().as_ref() == Some(source) {
-                    if let Some(previous) = previous {
-                        std::fs::write(path, previous)?;
-                    } else {
-                        std::fs::remove_file(path)?;
+        };
+        let publication = || {
+            let result = commit();
+            if result.is_err() {
+                for (path, previous, source) in &helpers {
+                    if std::fs::read(path).ok().as_ref() == Some(source) {
+                        if let Some(previous) = previous {
+                            std::fs::write(path, previous)?;
+                        } else {
+                            std::fs::remove_file(path)?;
+                        }
                     }
                 }
+                if temporary.exists() {
+                    std::fs::remove_file(&temporary)?;
+                }
             }
-            if temporary.exists() {
-                std::fs::remove_file(&temporary)?;
-            }
+            result
+        };
+        match authority {
+            Some(authority) => authority.commit(publication)?,
+            None => publication()?,
         }
-        publication?;
         let snapshot = ConfigSnapshot::load(&self.workspace)?;
         let mut run = self.prepare(
             snapshot,
@@ -816,7 +883,12 @@ impl CheckSupervisor {
                 request.config.definitions.len()
             ),
         );
-        self.publish(&run.into_record(), sink).await?;
+        let run = run.into_record();
+        if let Some(authority) = authority {
+            self.publish_with_authority(&run, sink, authority)?;
+        } else {
+            self.publish(&run, sink).await?;
+        }
         self.catalog(None)
     }
 }

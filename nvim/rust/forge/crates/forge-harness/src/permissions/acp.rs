@@ -11,6 +11,7 @@ use tokio::sync::RwLock;
 
 #[derive(Clone)]
 struct ActivePermission {
+    generation: Arc<()>,
     mode: ApprovalMode,
     authority: Option<TaskAuthority>,
     sink: ProviderEventSink,
@@ -37,6 +38,7 @@ impl AcpPermissionContext {
         sink: ProviderEventSink,
     ) {
         *self.active.write().await = Some(ActivePermission {
+            generation: Arc::new(()),
             mode,
             authority,
             sink,
@@ -63,6 +65,11 @@ impl ScopedPermissions for AcpPermissionContext {
             .ok_or_else(|| ProviderError::Rejected {
                 message: "ACP permission request has no active turn".into(),
             })?;
+        if active.sink.invocation_scope()? != &address.scope {
+            return Err(ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+            ));
+        }
         let protected = {
             let store = self.coordinator.store();
             let store = store.read().map_err(|_| ProviderError::Rejected {
@@ -99,6 +106,15 @@ impl ScopedPermissions for AcpPermissionContext {
             | ApprovalResolution::AllowBroad => {
                 if let Some(authority) = authority {
                     authority.validate()?;
+                }
+                if !self
+                    .active
+                    .read()
+                    .await
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(&current.generation, &active.generation))
+                {
+                    return Ok(PermissionResponse::Cancelled);
                 }
                 Ok(PermissionResponse::Allow)
             }

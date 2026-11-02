@@ -1,6 +1,6 @@
 //! Durable user decisions independent of provider exchanges and workflow phases.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 /// Identify one question without confusing it with an exchange or task.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -230,6 +230,7 @@ struct QuestionState {
     outbox: Vec<QuestionOutbox>,
     operations: BTreeMap<String, String>,
     chat_continuation: BTreeMap<String, ChatContinuation>,
+    cancelled_exchanges: BTreeSet<String>,
 }
 
 /// Retain one automatic continuation for an interrupted chat request.
@@ -298,6 +299,20 @@ impl QuestionController {
             .lock()
             .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
         Ok(self.load(&connection)?.outbox)
+    }
+
+    /// Reject queued answer delivery after its originating execution was cancelled.
+    pub(crate) fn delivery_is_current(&self, id: &QuestionId) -> Result<bool> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let state = self.load(&connection)?;
+        Ok(state.snapshot.questions.iter().any(|question| {
+            question.id == *id
+                && !state.cancelled_exchanges.contains(&question.exchange_id)
+                && !matches!(question.resolution, QuestionResolution::Retired { .. })
+        }))
     }
 
     /// Acknowledge durable input admission; provider delivery remains independently tracked.
@@ -378,14 +393,12 @@ impl QuestionController {
             if let Some(exchange_id) = active_exchange {
                 cancelled.insert(exchange_id.to_owned());
             }
+            state.cancelled_exchanges.extend(cancelled.iter().cloned());
             let mut retired = std::collections::BTreeSet::new();
             for question in &mut state.snapshot.questions {
-                if question.task_id.is_none()
-                    && cancelled.contains(&question.exchange_id)
-                    && question.requirement == QuestionRequirement::Required
-                {
+                if cancelled.contains(&question.exchange_id) {
                     retired.insert(question.id.as_str().to_owned());
-                    if question.pending() {
+                    if question.requirement == QuestionRequirement::Required && question.pending() {
                         question.resolution = QuestionResolution::Retired {
                             reason: "The owning chat request was cancelled".into(),
                         };
@@ -421,6 +434,10 @@ impl QuestionController {
         let task = origin.task();
         let request = serde_json::to_string(&(exchange_id, continues_chat, &drafts))?;
         self.update_guarded(task, |state| {
+            ensure!(
+                !state.cancelled_exchanges.contains(exchange_id),
+                "question execution was cancelled"
+            );
             if let Some(previous) = state.operations.get(operation_id) {
                 ensure!(
                     previous == &request,
@@ -471,6 +488,7 @@ impl QuestionController {
 
     /// Keep the calling tool pending until every question is answered or withdrawn.
     /// Dropping the future releases its answer destinations so later answers use normal delivery.
+    #[cfg(test)]
     pub(crate) async fn ask_wait(
         &self,
         operation_id: &str,
@@ -478,17 +496,35 @@ impl QuestionController {
         task: Option<&crate::task::Task>,
         drafts: Vec<QuestionDraft>,
     ) -> Result<Vec<QuestionRecord>> {
+        self.ask_wait_authorized(operation_id, exchange_id, task, drafts, None)
+            .await
+    }
+
+    pub(crate) async fn ask_wait_authorized(
+        &self,
+        operation_id: &str,
+        exchange_id: &str,
+        task: Option<&crate::task::Task>,
+        drafts: Vec<QuestionDraft>,
+        authority: Option<&crate::tools::TaskAuthority>,
+    ) -> Result<Vec<QuestionRecord>> {
         let ids = (0..drafts.len())
             .map(|index| QuestionId::for_operation(operation_id, index))
             .collect();
         let mut changed = self.changed.subscribe();
         let waiting = QuestionWait::new(self, ids)?;
-        self.ask(
-            operation_id,
-            exchange_id,
-            QuestionOrigin::Tool(task),
-            drafts,
-        )?;
+        let publish = || {
+            self.ask(
+                operation_id,
+                exchange_id,
+                QuestionOrigin::Tool(task),
+                drafts,
+            )
+        };
+        match authority {
+            Some(authority) => authority.commit(publish)?,
+            None => publish()?,
+        };
         loop {
             let questions = self
                 .snapshot()?
@@ -506,6 +542,43 @@ impl QuestionController {
         }
     }
 
+    /// Register and publish the question before releasing the tool mutation lock.
+    pub(crate) fn begin_owned_wait(
+        self: &std::sync::Arc<Self>,
+        operation_id: &str,
+        exchange_id: &str,
+        task: Option<&crate::task::Task>,
+        drafts: Vec<QuestionDraft>,
+        authority: Option<&crate::tools::TaskAuthority>,
+    ) -> Result<OwnedQuestionWait> {
+        let ids = (0..drafts.len())
+            .map(|index| QuestionId::for_operation(operation_id, index))
+            .collect::<Vec<_>>();
+        let changed = self.changed.subscribe();
+        self.waiting
+            .lock()
+            .map_err(|_| anyhow::anyhow!("question wait registry poisoned"))?
+            .extend(ids.iter().cloned());
+        let wait = OwnedQuestionWait {
+            controller: self.clone(),
+            ids,
+            changed,
+        };
+        let publish = || {
+            self.ask(
+                operation_id,
+                exchange_id,
+                QuestionOrigin::Tool(task),
+                drafts,
+            )
+        };
+        match authority {
+            Some(authority) => authority.commit(publish)?,
+            None => publish()?,
+        };
+        Ok(wait)
+    }
+
     /// Commit an explicit decision or discussion item together with its delivery intent.
     pub(crate) fn apply(&self, command: QuestionCommand) -> Result<QuestionSnapshot> {
         ensure!(
@@ -519,8 +592,9 @@ impl QuestionController {
                 return Ok(state.snapshot.clone());
             }
             let question = state.snapshot.questions.iter_mut().find(|question| question.id == command.question_id).context("question does not belong to this session")?;
+            let cancelled = state.cancelled_exchanges.contains(&question.exchange_id);
             ensure!(question.content.revision == command.revision, "question changed; review its current choices before submitting");
-            ensure!(!matches!(question.resolution, QuestionResolution::Retired { .. }), "question belongs to a retired task");
+            ensure!(!matches!(question.resolution, QuestionResolution::Retired { .. }), "question owner is no longer active");
             let message_id = command.operation_id.clone();
             let mut outbound = None;
             match command.action {
@@ -531,6 +605,7 @@ impl QuestionController {
                     outbound = Some((QuestionMessageKind::Answer, text));
                 }
                 QuestionAction::Clarify { text } => {
+                    ensure!(!cancelled, "question execution was cancelled");
                     ensure!(question.pending(), "question is no longer pending");
                     ensure!(!text.trim().is_empty(), "clarification is empty");
                     outbound = Some((QuestionMessageKind::Clarification, text));
@@ -564,6 +639,11 @@ impl QuestionController {
             }
             if let Some((kind, text)) = outbound {
                 question.discussion.push(QuestionMessage { id: message_id.clone(), kind, text: text.clone(), reply_to: None });
+                // Optional answers remain durable history without authorizing another native turn.
+                if cancelled {
+                    state.operations.insert(command.operation_id, encoded);
+                    return Ok(state.snapshot.clone());
+                }
                 let waiting = question.delivery == QuestionDelivery::ToolResult
                     && self.waiting.lock().map_err(|_| anyhow::anyhow!("question wait registry poisoned"))?.contains(&question.id);
                 if waiting && matches!(kind, QuestionMessageKind::Answer | QuestionMessageKind::Correction) {
@@ -571,7 +651,12 @@ impl QuestionController {
                     return Ok(state.snapshot.clone());
                 }
                 let rendered = if kind == QuestionMessageKind::Clarification {
-                    format!("Harness question {} revision {}\n{}\nChoices: {}\nUser {:?} (message {}): {}\nThis is a read-only question discussion. Explain this question with question_reply, targeting the clarification message ID. Leave the question unanswered. Honor any explicit constraint in the user's text. Do not perform the original work; Harness owns its continuation.", question.id.as_str(), question.content.revision, question.content.question, serde_json::to_string(&question.content.options)?, kind, message_id, text)
+                    let target = serde_json::json!({
+                        "question_id": question.id.as_str(),
+                        "revision": question.content.revision,
+                        "message_id": message_id,
+                    });
+                    format!("Harness question clarification\n{}\nChoices: {}\nUser clarification: {}\nReply target: {}\nThis is a read-only question discussion. Call question_reply with these exact target fields and your explanation in text. Copy the complete opaque question_id, including its colon and index suffix. Leave the question unanswered. Honor any explicit constraint in the user's text. Do not perform the original work; Harness owns its continuation.", question.content.question, serde_json::to_string(&question.content.options)?, text, target)
                 } else {
                     let end = question.content.question.floor_char_boundary(question.content.question.len().min(512));
                     let replies = serde_json::json!([{
@@ -676,6 +761,42 @@ impl QuestionController {
 struct QuestionWait<'controller> {
     controller: &'controller QuestionController,
     ids: Vec<QuestionId>,
+}
+
+/// Owns a published question wait independently of the tool runtime lock.
+pub(crate) struct OwnedQuestionWait {
+    controller: std::sync::Arc<QuestionController>,
+    ids: Vec<QuestionId>,
+    changed: tokio::sync::watch::Receiver<u64>,
+}
+
+impl OwnedQuestionWait {
+    pub(crate) async fn answers(mut self) -> Result<Vec<QuestionRecord>> {
+        loop {
+            let questions = self
+                .controller
+                .snapshot()?
+                .questions
+                .into_iter()
+                .filter(|question| self.ids.contains(&question.id))
+                .collect::<Vec<_>>();
+            if questions.iter().all(|question| !question.pending()) {
+                return Ok(questions);
+            }
+            self.changed
+                .changed()
+                .await
+                .context("question controller closed while waiting for answers")?;
+        }
+    }
+}
+
+impl Drop for OwnedQuestionWait {
+    fn drop(&mut self) {
+        if let Ok(mut waiting) = self.controller.waiting.lock() {
+            waiting.retain(|id| !self.ids.contains(id));
+        }
+    }
 }
 
 impl<'controller> QuestionWait<'controller> {
@@ -1044,7 +1165,8 @@ mod tests {
                     },
                 },
             ))?;
-            assert_eq!(restored.outbox()?.len(), 1);
+            assert!(restored.outbox()?.is_empty());
+            assert!(!restored.delivery_is_current(&ids[1])?);
             restored.admitted("answer-after-cancellation")?;
             assert!(restored.ready_chat_continuations()?.is_empty());
             assert!(!restored.chat_continuation_is_current("request")?);
@@ -1068,6 +1190,74 @@ mod tests {
                 QuestionResolution::Withdrawn { .. }
             ));
         }
+        Ok(())
+    }
+
+    /// Cancel tool-result questions durably even when they never requested a chat continuation.
+    #[test]
+    fn cancelled_tool_questions_retire_required_and_retain_optional_answers_locally() -> Result<()>
+    {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let ids = controller.ask(
+            "tool-questions",
+            "active",
+            QuestionOrigin::Tool(None),
+            vec![
+                draft(QuestionRequirement::Required),
+                draft(QuestionRequirement::Optional),
+            ],
+        )?;
+        controller.apply(command(
+            &ids[1],
+            "before-cancel",
+            QuestionAction::Clarify {
+                text: "Explain the options".into(),
+            },
+        ))?;
+        assert_eq!(controller.outbox()?.len(), 1);
+        controller.cancel_chat(Some("active"))?;
+        let restored = QuestionController::open(root.path(), "session")?;
+        assert!(restored.outbox()?.is_empty());
+        assert!(!restored.delivery_is_current(&ids[0])?);
+        assert!(!restored.delivery_is_current(&ids[1])?);
+        assert!(
+            restored
+                .apply(command(
+                    &ids[0],
+                    "required-after-cancel",
+                    QuestionAction::Answer {
+                        answer: QuestionAnswer::Other {
+                            text: "Tabs".into()
+                        },
+                    }
+                ))
+                .is_err()
+        );
+        restored.apply(command(
+            &ids[1],
+            "optional-after-cancel",
+            QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "Tabs".into(),
+                },
+            },
+        ))?;
+        assert!(matches!(
+            restored.snapshot()?.questions[1].resolution,
+            QuestionResolution::Answered { .. }
+        ));
+        assert!(restored.outbox()?.is_empty());
+        assert!(
+            restored
+                .ask(
+                    "late-callback",
+                    "active",
+                    QuestionOrigin::Tool(None),
+                    vec![draft(QuestionRequirement::Required)]
+                )
+                .is_err()
+        );
         Ok(())
     }
 

@@ -3,6 +3,34 @@ use serde_json::{Value, json};
 
 use crate::provider::{ApprovalUpdate, ProviderDiagnostic, ProviderEvent, RuntimeUpdate};
 
+impl super::HarnessBroker {
+    /// Consume the prompt token once and retain its ordered admission publication.
+    pub(crate) fn prepare_prompt_admission(
+        &mut self,
+        admitted: bool,
+    ) -> anyhow::Result<super::AppliedProviderEvent> {
+        let Some((document, token)) = self.prompt_admission.take() else {
+            return Ok(super::AppliedProviderEvent::None);
+        };
+        let transition = if let Some(document) = document {
+            self.presentation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                .complete_submission(&document, token, admitted)?
+        } else {
+            Some(
+                json!({"document":null,"token":token,"state":if admitted { "accepted" } else { "rejected" }}),
+            )
+        };
+        Ok(match transition {
+            Some(transition) => super::AppliedProviderEvent::Update(SessionUpdate::Submission {
+                transition: serde_json::from_value(transition)?,
+            }),
+            None => super::AppliedProviderEvent::None,
+        })
+    }
+}
+
 pub enum LiveUpdate {
     StateChanged,
     Observation(Box<ProviderEvent>),
@@ -153,7 +181,8 @@ impl SessionUpdate {
             } => Some(Self::TurnStarted {
                 address: address.clone(),
             }),
-            ProviderEvent::Message { .. }
+            ProviderEvent::Execution { .. }
+            | ProviderEvent::Message { .. }
             | ProviderEvent::Tool { .. }
             | ProviderEvent::Turn { .. }
             | ProviderEvent::Usage { .. }
@@ -260,9 +289,14 @@ pub fn encode_session_update(update: &SessionUpdate) -> anyhow::Result<Value> {
 }
 
 #[derive(Clone)]
-pub struct SessionUpdateSink(tokio::sync::mpsc::Sender<SessionUpdate>);
+pub struct SessionUpdateSink(tokio::sync::mpsc::Sender<SessionPublication>);
 
-pub struct SessionUpdateStream(tokio::sync::mpsc::Receiver<SessionUpdate>);
+pub struct SessionUpdateStream(tokio::sync::mpsc::Receiver<SessionPublication>);
+
+enum SessionPublication {
+    Update(SessionUpdate),
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
 
 pub fn channel() -> (SessionUpdateSink, SessionUpdateStream) {
     let (sender, receiver) = tokio::sync::mpsc::channel(32);
@@ -271,10 +305,33 @@ pub fn channel() -> (SessionUpdateSink, SessionUpdateStream) {
 
 impl SessionUpdateSink {
     pub async fn send_wait(&self, update: SessionUpdate) -> Result<(), std::io::Error> {
-        self.0.send(update).await.map_err(|_| {
+        self.0
+            .send(SessionPublication::Update(update))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "session notification receiver closed",
+                )
+            })
+    }
+
+    /// Wait until the consumer has processed all preceding updates.
+    pub async fn flush(&self) -> Result<(), std::io::Error> {
+        let (reply, received) = tokio::sync::oneshot::channel();
+        self.0
+            .send(SessionPublication::Flush(reply))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "session notification receiver closed",
+                )
+            })?;
+        received.await.map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
-                "session notification receiver closed",
+                "session notification flush was not consumed",
             )
         })
     }
@@ -290,21 +347,41 @@ impl SessionUpdateSink {
 
 impl SessionUpdateStream {
     pub async fn recv(&mut self) -> Result<Option<SessionUpdate>, std::io::Error> {
-        Ok(self.0.recv().await)
+        loop {
+            match self.0.recv().await {
+                Some(SessionPublication::Update(update)) => return Ok(Some(update)),
+                Some(SessionPublication::Flush(reply)) => {
+                    let _ = reply.send(());
+                }
+                None => return Ok(None),
+            }
+        }
     }
 
     pub fn try_recv(&mut self) -> Result<SessionUpdate, std::io::Error> {
-        self.0.try_recv().map_err(|error| {
-            std::io::Error::new(
-                match error {
-                    tokio::sync::mpsc::error::TryRecvError::Empty => std::io::ErrorKind::WouldBlock,
-                    tokio::sync::mpsc::error::TryRecvError::Disconnected => {
-                        std::io::ErrorKind::UnexpectedEof
-                    }
-                },
-                "session notification queue has no available update",
-            )
-        })
+        loop {
+            match self.0.try_recv() {
+                Ok(SessionPublication::Update(update)) => return Ok(update),
+                Ok(SessionPublication::Flush(reply)) => {
+                    let _ = reply.send(());
+                }
+                Err(error) => {
+                    return Err({
+                        std::io::Error::new(
+                            match error {
+                                tokio::sync::mpsc::error::TryRecvError::Empty => {
+                                    std::io::ErrorKind::WouldBlock
+                                }
+                                tokio::sync::mpsc::error::TryRecvError::Disconnected => {
+                                    std::io::ErrorKind::UnexpectedEof
+                                }
+                            },
+                            "session notification queue has no available update",
+                        )
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -312,5 +389,45 @@ pub async fn failed(sink: Option<&SessionUpdateSink>) -> std::io::Error {
     match sink {
         Some(sink) => sink.failed().await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn flush_waits_for_prior_delivery_and_fails_when_consumer_closes() {
+        let (sink, mut stream) = channel();
+        sink.send_wait(SessionUpdate::Diagnostic {
+            diagnostic: ProviderDiagnostic {
+                code: None,
+                message: "first".into(),
+                fatal: false,
+            },
+        })
+        .await
+        .unwrap();
+        let flush_sink = sink.clone();
+        let mut flush = tokio::spawn(async move { flush_sink.flush().await });
+        assert!(matches!(
+            stream.recv().await.unwrap(),
+            Some(SessionUpdate::Diagnostic { .. })
+        ));
+        assert!(!flush.is_finished());
+        let next = tokio::spawn(async move { stream.recv().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut flush)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        next.abort();
+
+        let (sink, stream) = channel();
+        drop(stream);
+        assert_eq!(
+            sink.flush().await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
     }
 }

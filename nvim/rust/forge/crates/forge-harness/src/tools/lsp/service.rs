@@ -145,6 +145,7 @@ impl LspService {
             policy,
             cancelled,
             active: AtomicBool::new(true),
+            authority: std::sync::RwLock::new(None),
             selection,
             generation,
         });
@@ -344,6 +345,7 @@ pub(crate) struct LspScope {
     policy: Arc<CompiledPermissionDocument>,
     cancelled: Arc<AtomicBool>,
     active: AtomicBool,
+    authority: std::sync::RwLock<Option<crate::tools::TaskAuthority>>,
     selection: Arc<Selection>,
     generation: u64,
 }
@@ -359,6 +361,14 @@ impl LspScope {
             self.active.load(Ordering::Acquire) && !self.cancelled.load(Ordering::Acquire),
             "cancelled: LSP request cancelled."
         );
+        if let Some(authority) = self
+            .authority
+            .read()
+            .map_err(|_| anyhow::anyhow!("LSP authority lock poisoned"))?
+            .clone()
+        {
+            authority.validate_scope()?;
+        }
         ensure!(
             self.selection.enabled.load(Ordering::Acquire)
                 && self.selection.generation.load(Ordering::Acquire) == self.generation,
@@ -503,6 +513,19 @@ impl LspScope {
 
 /// Revokes a scope when its owner stops awaiting the provider turn.
 pub(crate) struct LspLease(Arc<LspScope>);
+impl LspLease {
+    pub(crate) fn bind_authority(
+        &self,
+        authority: Option<crate::tools::TaskAuthority>,
+    ) -> Result<()> {
+        *self
+            .0
+            .authority
+            .write()
+            .map_err(|_| anyhow::anyhow!("LSP authority lock poisoned"))? = authority;
+        Ok(())
+    }
+}
 impl Drop for LspLease {
     fn drop(&mut self) {
         self.0.active.store(false, Ordering::Release);

@@ -1,10 +1,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock, Weak},
 };
 
 use anyhow::{Result, ensure};
@@ -99,7 +96,7 @@ impl SubmissionStore {
             record: Mutex::new(record),
             acceptance: tokio::sync::watch::channel(accepted).0,
             steering_queued: tokio::sync::watch::channel(false).0,
-            steering_active: AtomicBool::new(false),
+            dispatch: Mutex::new(None),
             accepted_action: Mutex::new(None),
         });
         live.retain(|_, entry| entry.strong_count() > 0);
@@ -283,7 +280,7 @@ impl SubmissionStore {
             record: Mutex::new(record),
             acceptance: tokio::sync::watch::channel(false).0,
             steering_queued: tokio::sync::watch::channel(false).0,
-            steering_active: AtomicBool::new(false),
+            dispatch: Mutex::new(None),
             accepted_action: Mutex::new(None),
         });
         let mut live = self
@@ -432,16 +429,55 @@ pub struct Submission {
     record: Mutex<SubmissionRecord>,
     acceptance: tokio::sync::watch::Sender<bool>,
     steering_queued: tokio::sync::watch::Sender<bool>,
-    steering_active: AtomicBool,
+    dispatch: Mutex<Option<SubmissionDispatch>>,
     accepted_action: Mutex<Option<AcceptedAction>>,
 }
 
-/// Keeps live steering distinct from a lost acknowledgment until its worker settles.
-pub(crate) struct SteeringFlight(Arc<Submission>);
+/// Distinguish the worker retaining input from its independently owned native prompt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubmissionDispatch {
+    Prompt,
+    Steering,
+    SteeringPrompt,
+}
 
-impl Drop for SteeringFlight {
+/// Identify the lifetime released by one dispatch guard.
+#[derive(Clone, Copy)]
+enum DispatchOperation {
+    Prompt,
+    Steering,
+}
+
+/// Retain a live dispatch without changing its durable delivery evidence.
+pub(crate) struct SubmissionFlight {
+    submission: Arc<Submission>,
+    operation: DispatchOperation,
+}
+
+impl Drop for SubmissionFlight {
     fn drop(&mut self) {
-        self.0.steering_active.store(false, Ordering::Release);
+        let mut dispatch = self
+            .submission
+            .dispatch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *dispatch = match (*dispatch, self.operation) {
+            (Some(SubmissionDispatch::SteeringPrompt), DispatchOperation::Prompt) => {
+                Some(SubmissionDispatch::Steering)
+            }
+            (Some(SubmissionDispatch::SteeringPrompt), DispatchOperation::Steering) => {
+                Some(SubmissionDispatch::Prompt)
+            }
+            (Some(SubmissionDispatch::Prompt), DispatchOperation::Prompt)
+            | (Some(SubmissionDispatch::Steering), DispatchOperation::Steering) => None,
+            (None, DispatchOperation::Prompt | DispatchOperation::Steering) => None,
+            (Some(SubmissionDispatch::Prompt), DispatchOperation::Steering) => {
+                Some(SubmissionDispatch::Prompt)
+            }
+            (Some(SubmissionDispatch::Steering), DispatchOperation::Prompt) => {
+                Some(SubmissionDispatch::Steering)
+            }
+        };
     }
 }
 
@@ -455,19 +491,55 @@ impl std::fmt::Debug for AcceptedAction {
 
 impl Submission {
     /// Own this live steering attempt without authorizing replay of uncertain input.
-    pub(crate) fn begin_steering(self: &Arc<Self>) -> Result<SteeringFlight> {
+    pub(crate) fn begin_steering(self: &Arc<Self>) -> Result<SubmissionFlight> {
+        let flight = self.begin_dispatch(DispatchOperation::Steering)?;
+        self.steering_queued.send_replace(false);
+        Ok(flight)
+    }
+
+    /// Retain a pending ACP prompt response as live work without inventing acceptance.
+    pub(crate) fn begin_prompt(self: &Arc<Self>) -> Result<SubmissionFlight> {
+        self.begin_dispatch(DispatchOperation::Prompt)
+    }
+
+    /// Admit one operation under the journal's write gate before its first native write.
+    fn begin_dispatch(self: &Arc<Self>, operation: DispatchOperation) -> Result<SubmissionFlight> {
+        let _journal = self
+            .store
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
         ensure!(
             self.record()?.delivery == SubmissionState::Prepared,
-            "steering input was already dispatched"
+            "input was already dispatched"
         );
-        ensure!(
-            self.steering_active
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "steering input already has a worker"
-        );
-        self.steering_queued.send_replace(false);
-        Ok(SteeringFlight(self.clone()))
+        let mut dispatch = self
+            .dispatch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission dispatch lock poisoned"))?;
+        *dispatch = Some(match (*dispatch, operation) {
+            (None, DispatchOperation::Prompt) => SubmissionDispatch::Prompt,
+            (None, DispatchOperation::Steering) => SubmissionDispatch::Steering,
+            (Some(SubmissionDispatch::Steering), DispatchOperation::Prompt) => {
+                SubmissionDispatch::SteeringPrompt
+            }
+            (
+                Some(SubmissionDispatch::Prompt | SubmissionDispatch::SteeringPrompt),
+                DispatchOperation::Prompt,
+            )
+            | (
+                Some(
+                    SubmissionDispatch::Prompt
+                    | SubmissionDispatch::Steering
+                    | SubmissionDispatch::SteeringPrompt,
+                ),
+                DispatchOperation::Steering,
+            ) => anyhow::bail!("input already has a dispatch worker"),
+        });
+        Ok(SubmissionFlight {
+            submission: self.clone(),
+            operation,
+        })
     }
 
     /// Observe FIFO handoff independently from the provider's acknowledgment.
@@ -702,13 +774,26 @@ impl Submission {
                 .live
                 .lock()
                 .map_err(|_| anyhow::anyhow!("submission registry lock poisoned"))?;
-            let unresolved = sending.iter().any(|id| {
-                !self.steering_active.load(Ordering::Acquire)
-                    || !live
-                        .get(id)
-                        .and_then(Weak::upgrade)
-                        .is_some_and(|other| other.steering_active.load(Ordering::Acquire))
-            });
+            let steering = match *self
+                .dispatch
+                .lock()
+                .map_err(|_| anyhow::anyhow!("submission dispatch lock poisoned"))?
+            {
+                Some(SubmissionDispatch::Steering | SubmissionDispatch::SteeringPrompt) => true,
+                None | Some(SubmissionDispatch::Prompt) => false,
+            };
+            let mut unresolved = false;
+            for id in sending {
+                let active = match live.get(&id).and_then(Weak::upgrade) {
+                    Some(other) => other
+                        .dispatch
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("submission dispatch lock poisoned"))?
+                        .is_some(),
+                    None => false,
+                };
+                unresolved |= !steering || !active;
+            }
             ensure!(
                 !unresolved,
                 "an earlier submission has uncertain delivery; input remains saved"
@@ -742,9 +827,10 @@ impl Submission {
                     handle.accepted(receipt)?;
                     if request.provider_session_id.is_none() {
                         request.provider_session_id = match &pending.delivery {
-                            SubmissionState::Sending { target } => {
-                                target.conversation_id().map(str::to_owned)
-                            }
+                            SubmissionState::Sending { target } => target
+                                .conversation_id()
+                                .map(|id| id.to_owned().try_into())
+                                .transpose()?,
                             _ => None,
                         };
                     }
@@ -776,6 +862,49 @@ impl Submission {
     }
 }
 
+#[async_trait::async_trait]
+impl forge_provider_api::submission::InputReceipt for Submission {
+    fn id(&self) -> &str {
+        self.id()
+    }
+
+    async fn record_sending(
+        self: Arc<Self>,
+        target: SubmissionTarget,
+    ) -> Result<(), forge_provider_api::ProviderError> {
+        self.persist(move |submission| submission.sending(target))
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record_accepted(
+        self: Arc<Self>,
+        receipt: String,
+    ) -> Result<(), forge_provider_api::ProviderError> {
+        self.persist(move |submission| submission.accepted(receipt))
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record_rejected(
+        self: Arc<Self>,
+        message: String,
+    ) -> Result<(), forge_provider_api::ProviderError> {
+        self.persist(move |submission| submission.rejected(message))
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn record_failure(
+        self: Arc<Self>,
+        message: String,
+    ) -> Result<(), forge_provider_api::ProviderError> {
+        self.persist(move |submission| submission.failed(message))
+            .await
+            .map_err(Into::into)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,6 +913,40 @@ mod tests {
         ProviderInput, ProviderKind,
     };
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Keep a live ACP prompt distinct from lost delivery and preserve a continuation after its caller drops.
+    #[test]
+    fn live_prompt_allows_steering_until_its_dispatch_lifetime_ends() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let original = store.prepare(&request("original"), ProviderKind::Claude)?;
+        let caller = original.begin_steering()?;
+        let prompt = original.begin_prompt()?;
+        assert!(original.begin_prompt().is_err());
+        let target = SubmissionTarget::native("acp", "session", serde_json::json!({}));
+        original.sending(target.clone())?;
+        drop(caller);
+        let steering = store.prepare(&request("steering"), ProviderKind::Claude)?;
+        let _steering = steering.begin_steering()?;
+        steering.sending(target.clone())?;
+        steering.accepted("injected".into())?;
+        let next = store.prepare(&request("next normal prompt"), ProviderKind::Claude)?;
+        let _next = next.begin_prompt()?;
+        assert!(
+            next.sending(target.clone()).is_err(),
+            "a normal prompt overlapped live work"
+        );
+        drop(prompt);
+        let later = store.prepare(&request("later steering"), ProviderKind::Claude)?;
+        let _later = later.begin_steering()?;
+        assert!(
+            later.sending(target.clone()).is_err(),
+            "lost acknowledgment was treated as live"
+        );
+        original.accepted("terminal prompt response".into())?;
+        later.sending(target)?;
+        Ok(())
+    }
 
     #[test]
     fn live_steering_can_overlap_but_lost_acknowledgments_block_new_dispatch() -> Result<()> {
@@ -924,6 +1087,7 @@ mod tests {
     }
 
     struct ReceiptProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         fail_before_send: AtomicBool,
         lose_ack: AtomicBool,
         history_accepts: AtomicBool,
@@ -934,6 +1098,7 @@ mod tests {
     impl ReceiptProvider {
         fn new() -> Self {
             Self {
+                fixture_events: Default::default(),
                 fail_before_send: AtomicBool::new(false),
                 lose_ack: AtomicBool::new(false),
                 history_accepts: AtomicBool::new(false),
@@ -968,8 +1133,11 @@ mod tests {
         async fn cleanup_execution(&self, _: &str) -> Result<()> {
             Ok(())
         }
-        async fn active_session_id_for(&self, _: &str) -> Option<String> {
-            Some("native-thread".into())
+        async fn active_session_id_for(
+            &self,
+            _: &str,
+        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(Some("native-thread".to_owned().try_into()?))
         }
         async fn reconcile_submission(
             &self,
@@ -981,10 +1149,40 @@ mod tests {
                 .load(Ordering::SeqCst)
                 .then(|| "history-receipt".into()))
         }
-        async fn prompt_stream(
+
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+    }
+
+    impl ReceiptProvider {
+        async fn run_native(
             &self,
             request: ProviderRequest,
-            _: ProviderEventSink,
+            sink: ProviderEventSink,
         ) -> Result<ProviderCompletion, ProviderError> {
             let output: anyhow::Result<ProviderCompletion> = async {
                 if self.fail_before_send.swap(false, Ordering::SeqCst) {
@@ -996,7 +1194,27 @@ mod tests {
                     "native-thread",
                     serde_json::json!({}),
                 ))?;
-                self.send_count.fetch_add(1, Ordering::SeqCst);
+                let count = self.send_count.fetch_add(1, Ordering::SeqCst);
+                let address = crate::provider::TurnAddress {
+                    scope: sink.invocation_scope()?.clone(),
+                    thread_id: "native-thread".into(),
+                    turn_id: format!("turn-{count}").into(),
+                };
+                sink.send_wait(crate::provider::ProviderEvent::Execution {
+                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                        address.scope.clone(),
+                        forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                            address: address.clone(),
+                        },
+                    )
+                    .expect("execution scope is derived from its native address"),
+                })
+                .await?;
+                sink.send_wait(crate::provider::ProviderEvent::Turn {
+                    address,
+                    update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
+                })
+                .await?;
                 self.input.lock().unwrap().push(request.clone());
                 if self.lose_ack.swap(false, Ordering::SeqCst) {
                     anyhow::bail!("connection lost after write");
@@ -1034,17 +1252,24 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace.clone())?;
-        let provider = ReceiptProvider::new();
+        let provider =
+            crate::provider::test_support::ProviderTestSession::new(ReceiptProvider::new())?;
         provider.fail_before_send.store(true, Ordering::SeqCst);
         let earlier = request("earlier instruction\nwith exact whitespace\n");
         assert!(
-            super::super::retry::prompt(&provider, earlier.clone(), None, &trace, &store)
-                .await
-                .is_err()
+            crate::provider::test_support::retry_prompt(
+                &provider,
+                earlier.clone(),
+                None,
+                &trace,
+                &store
+            )
+            .await
+            .is_err()
         );
         drop(store);
         let store = SubmissionStore::open(directory.path(), trace.clone())?;
-        super::super::retry::prompt(
+        crate::provider::test_support::retry_prompt(
             &provider,
             request("new instruction replaces earlier scope"),
             None,
@@ -1072,7 +1297,8 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace)?;
-        let provider = ReceiptProvider::new();
+        let provider =
+            crate::provider::test_support::ProviderTestSession::new(ReceiptProvider::new())?;
         let owned = store.prepare_identified(
             &request("owned input"),
             super::super::ProviderKind::Codex,
@@ -1080,7 +1306,9 @@ mod tests {
         )?;
         let mut next = request("next input");
         let submission = store.prepare(&next, super::super::ProviderKind::Codex)?;
-        submission.recover(&provider, &mut next).await?;
+        submission
+            .recover(provider.as_provider(), &mut next)
+            .await?;
         assert!(next.recovered_input.is_empty());
         assert_eq!(owned.record()?.delivery, SubmissionState::Prepared);
         assert_eq!(
@@ -1217,17 +1445,30 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace.clone())?;
-        let provider = ReceiptProvider::new();
+        let provider =
+            crate::provider::test_support::ProviderTestSession::new(ReceiptProvider::new())?;
         provider.lose_ack.store(true, Ordering::SeqCst);
         assert!(
-            super::super::retry::prompt(&provider, request("first"), None, &trace, &store)
-                .await
-                .is_err()
+            crate::provider::test_support::retry_prompt(
+                &provider,
+                request("first"),
+                None,
+                &trace,
+                &store
+            )
+            .await
+            .is_err()
         );
         for text in ["second", "third"] {
-            let error = super::super::retry::prompt(&provider, request(text), None, &trace, &store)
-                .await
-                .unwrap_err();
+            let error = crate::provider::test_support::retry_prompt(
+                &provider,
+                request(text),
+                None,
+                &trace,
+                &store,
+            )
+            .await
+            .unwrap_err();
             assert!(error.to_string().contains("uncertain delivery"));
             assert!(error.to_string().contains("connection lost after write"));
         }
@@ -1239,11 +1480,18 @@ mod tests {
             3
         );
         provider.history_accepts.store(true, Ordering::SeqCst);
-        super::super::retry::prompt(&provider, request("fourth"), None, &trace, &store).await?;
+        crate::provider::test_support::retry_prompt(
+            &provider,
+            request("fourth"),
+            None,
+            &trace,
+            &store,
+        )
+        .await?;
         let sent = provider.input.lock().unwrap();
         assert_eq!(sent.len(), 2);
         assert_eq!(
-            sent[1].provider_session_id.as_deref(),
+            sent[1].provider_session_id.as_ref().map(|id| id.as_str()),
             Some("native-thread")
         );
         assert_eq!(
@@ -1409,48 +1657,5 @@ mod tests {
                 .is_err()
         );
         Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl forge_provider_api::submission::InputReceipt for Submission {
-    fn id(&self) -> &str {
-        self.id()
-    }
-
-    async fn record_sending(
-        self: Arc<Self>,
-        target: SubmissionTarget,
-    ) -> Result<(), forge_provider_api::ProviderError> {
-        self.persist(move |submission| submission.sending(target))
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn record_accepted(
-        self: Arc<Self>,
-        receipt: String,
-    ) -> Result<(), forge_provider_api::ProviderError> {
-        self.persist(move |submission| submission.accepted(receipt))
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn record_rejected(
-        self: Arc<Self>,
-        message: String,
-    ) -> Result<(), forge_provider_api::ProviderError> {
-        self.persist(move |submission| submission.rejected(message))
-            .await
-            .map_err(Into::into)
-    }
-
-    async fn record_failure(
-        self: Arc<Self>,
-        message: String,
-    ) -> Result<(), forge_provider_api::ProviderError> {
-        self.persist(move |submission| submission.failed(message))
-            .await
-            .map_err(Into::into)
     }
 }

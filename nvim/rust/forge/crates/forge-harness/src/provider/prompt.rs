@@ -136,7 +136,7 @@ mod test {
             service_tier: ServiceTier::Standard,
             access: Default::default(),
             approval_mode: ApprovalMode::Ask,
-            provider_session_id: Some("existing".into()),
+            provider_session_id: Some("existing".to_owned().try_into().unwrap()),
             submission: None,
             recovered_input: Vec::new(),
             control_context: Some(ControlTurnContext::inactive(PromptMode::Chat)),

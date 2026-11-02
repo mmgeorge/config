@@ -8,6 +8,12 @@ use rusqlite::{OptionalExtension, TransactionBehavior, params};
 impl SqliteStore {
     /// Settle execution that has no runtime owner before publishing a restored session.
     pub(crate) fn interrupt_detached_execution(&mut self, session_id: &str) -> Result<()> {
+        let admission = self.session_admission(session_id)?;
+        admission.with_task_mutation(|| self.interrupt_detached_execution_locked(session_id))
+    }
+
+    /// Recover task state without allowing an admitted plan write to cross the recovery boundary.
+    fn interrupt_detached_execution_locked(&mut self, session_id: &str) -> Result<()> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;

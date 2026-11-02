@@ -10,6 +10,7 @@ use tokio::sync::{Notify, watch};
 pub(crate) struct ControlToolExecutor {
     task_controller: Option<std::sync::Arc<crate::task::SessionTaskController>>,
     task_permit: Option<crate::task::TaskPermit>,
+    authority: Option<super::TaskAuthority>,
     mode: crate::provider::PromptMode,
     runtime: tokio::sync::Mutex<ControlToolRuntime>,
     admission: Mutex<Admission>,
@@ -23,6 +24,7 @@ impl ControlToolExecutor {
         Self {
             task_controller: context.task_controller.clone(),
             task_permit: context.task_permit.clone(),
+            authority: super::TaskAuthority::capture(&context),
             mode: context.mode,
             runtime: tokio::sync::Mutex::new(ControlToolRuntime::new(context)),
             admission: Mutex::new(Admission::default()),
@@ -34,8 +36,21 @@ impl ControlToolExecutor {
     /// Serializes canonical mutations while allowing cancellation to release any tool wait.
     pub(crate) async fn execute(
         &self,
-        mut invocation: ControlToolInvocation,
+        invocation: ControlToolInvocation,
     ) -> anyhow::Result<ControlToolOutcome<'_>> {
+        self.execute_with_barrier(invocation, None).await
+    }
+
+    /// Signal after a waiting question is committed, allowing later ordered mutations.
+    pub(crate) async fn execute_with_barrier(
+        &self,
+        mut invocation: ControlToolInvocation,
+        barrier: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> anyhow::Result<ControlToolOutcome<'_>> {
+        let mut barrier = QuestionBarrier(barrier);
+        if let Some(authority) = &self.authority {
+            authority.validate_scope()?;
+        }
         let execution = {
             let mut admission = self
                 .admission
@@ -60,6 +75,48 @@ impl ControlToolExecutor {
         };
         if *cancelled.borrow() {
             return Err(crate::broker::TurnCancelled.into());
+        }
+        if let Some(authority) = &self.authority {
+            authority.validate_scope()?;
+        }
+        if invocation.name == "question_ask"
+            && invocation.arguments["wait"].as_bool() == Some(true)
+            && runtime.context.questions.is_some()
+        {
+            let prepared = super::questions::begin_wait(&runtime, &invocation);
+            let plan_document = runtime.plan_document().cloned();
+            let execution_finished = runtime.execution_finished();
+            drop(runtime);
+            barrier.release();
+            let result = match prepared {
+                Ok(wait) => {
+                    let answers = tokio::select! {
+                        biased;
+                        _ = cancelled.wait_for(|closed| *closed) => return Err(crate::broker::TurnCancelled.into()),
+                        answers = wait.answers() => answers,
+                    };
+                    match answers {
+                        Ok(answers) => {
+                            if let Some(authority) = &self.authority {
+                                authority.validate_scope()?;
+                            }
+                            Ok(ControlToolResult {
+                                invocation: None,
+                                message: serde_json::json!({"answers":answers}).to_string(),
+                            })
+                        }
+                        Err(error) => Err(error.into()),
+                    }
+                }
+                Err(error) => Err(error),
+            };
+            return Ok(ControlToolOutcome {
+                _execution: execution,
+                result,
+                plan_document,
+                source_digests: None,
+                execution_finished,
+            });
         }
         let result = tokio::select! {
             biased;
@@ -107,6 +164,22 @@ impl ControlToolExecutor {
             }
             settled.await;
         }
+    }
+}
+
+struct QuestionBarrier(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl QuestionBarrier {
+    fn release(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+impl Drop for QuestionBarrier {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -200,7 +273,7 @@ mod test {
     async fn task_replacement_invalidates_running_and_queued_goal_controls() -> Result<()> {
         let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        context.task_controller = Some(controller.clone());
+        context.bind_test_task_controller(controller.clone());
         let checkpoint = crate::checkpoint::ToolGate::new()?;
         context.checkpoint = Some(checkpoint.clone());
         let executor = ControlToolExecutor::new(context);
@@ -229,14 +302,24 @@ mod test {
             .unwrap();
         checkpoint.complete(Ok(()))?;
         let running = running.await?.result.unwrap_err();
-        let queued = queued.await?.result.unwrap_err();
+        let queued = queued.await.unwrap_err();
         assert!(running.is::<crate::task::StaleTask>());
         assert!(queued.is::<crate::task::StaleTask>());
         assert_eq!(
             controller.current()?.unwrap().revision,
             replacement.revision
         );
-        let accepted = executor.execute(invocation()).await?.result?;
+        assert!(
+            executor
+                .execute(invocation())
+                .await
+                .unwrap_err()
+                .is::<crate::task::StaleTask>()
+        );
+        let mut fresh = ControlTurnContext::inactive(PromptMode::Chat);
+        fresh.bind_test_task_controller(controller.clone());
+        let fresh_executor = ControlToolExecutor::new(fresh);
+        let accepted = fresh_executor.execute(invocation()).await?.result?;
         accepted
             .invocation
             .unwrap()
@@ -255,7 +338,7 @@ mod test {
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         let (_task_root, _task_store, task_controller) =
             crate::task::SessionTaskController::test_goal();
-        context.task_controller = Some(task_controller);
+        context.bind_test_task_controller(task_controller);
         context.checkpoint = Some(crate::checkpoint::ToolGate::new()?);
         let executor = ControlToolExecutor::new(context);
         let invocation = || ControlToolInvocation {
@@ -284,7 +367,7 @@ mod test {
         let mut replacement = ControlTurnContext::inactive(PromptMode::Chat);
         let (_task_root, _task_store, task_controller) =
             crate::task::SessionTaskController::test_goal();
-        replacement.task_controller = Some(task_controller);
+        replacement.bind_test_task_controller(task_controller);
         assert!(
             ControlToolExecutor::new(replacement)
                 .execute(invocation())
@@ -300,7 +383,7 @@ mod test {
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         let (_task_root, _task_store, task_controller) =
             crate::task::SessionTaskController::test_goal();
-        context.task_controller = Some(task_controller);
+        context.bind_test_task_controller(task_controller);
         let executor = ControlToolExecutor::new(context);
         let outcome = executor
             .execute(ControlToolInvocation {

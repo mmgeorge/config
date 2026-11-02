@@ -603,7 +603,9 @@ impl HostRouter {
                     *subscription = StatusSubscription::Active { stop, task };
                 }
                 StatusSubscription::Active { .. } => {}
-                StatusSubscription::Closed => anyhow::bail!("Forge status subscription is closed"),
+                StatusSubscription::Closed => {
+                    anyhow::bail!("Forge status subscription is closed")
+                }
             }
         }
         let harness_admission = envelope.harness_admission;

@@ -8,6 +8,15 @@ use serde_json::json;
 
 use super::TraceStore;
 
+/// Measure a future's inline storage without constructing or polling it.
+pub(crate) fn future_bytes<F, Fut>(_: &F) -> usize
+where
+    F: FnOnce() -> Fut,
+    Fut: Future,
+{
+    std::mem::size_of::<Fut>()
+}
+
 struct FutureTrace<'trace> {
     trace: &'trace TraceStore,
     session_id: &'trace str,
@@ -87,6 +96,17 @@ impl Drop for FutureTrace<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn future_size_does_not_invoke_its_factory() {
+        let called = std::cell::Cell::new(false);
+        let factory = || {
+            called.set(true);
+            async {}
+        };
+        let _bytes = future_bytes(&factory);
+        assert!(!called.get());
+    }
 
     #[tokio::test]
     async fn future_trace_records_completion_failure_and_cancellation_only_when_enabled()

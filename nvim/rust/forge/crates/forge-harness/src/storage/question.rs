@@ -265,6 +265,148 @@ pub(super) fn retire_task_questions(
     Ok(())
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum QuestionOwner {
+    Interaction,
+    Plan,
+    PlanAcceptance,
+}
+
+#[derive(Deserialize)]
+struct QuestionTarget {
+    owner: QuestionOwner,
+    id: String,
+    set_id: String,
+    revision: u32,
+}
+
+impl SqliteStore {
+    /// Commits one identified answer and its retry receipt in the same transaction.
+    pub(crate) fn answer_question_command(
+        &mut self,
+        session_id: &str,
+        request: &Value,
+    ) -> Result<Value> {
+        let admission = self.session_admission(session_id)?;
+        admission.with_task_mutation(|| self.answer_question_command_locked(session_id, request))
+    }
+
+    /// Publish a plan answer's task update under the shared dependent-write fence.
+    fn answer_question_command_locked(
+        &mut self,
+        session_id: &str,
+        request: &Value,
+    ) -> Result<Value> {
+        let identity = request["operation_id"]
+            .as_str()
+            .context("question command identity is required")?;
+        let target: QuestionTarget = serde_json::from_value(request["target"].clone())?;
+        let question_id = request["question_id"]
+            .as_str()
+            .context("question identity is required")?;
+        let response: PlanQuestionResponse = serde_json::from_value(request["response"].clone())?;
+        let encoded = serde_json::to_string(request)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let previous: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT request,result FROM command_receipt WHERE session_id=?1 AND id=?2",
+                params![session_id, identity],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((previous, result)) = previous {
+            ensure!(
+                previous == encoded,
+                "question command identity was reused for a different answer"
+            );
+            return Ok(serde_json::from_str(&result)?);
+        }
+        let (table, pointer, condition, owner) = match target.owner {
+            QuestionOwner::Interaction => (
+                "exchange_record",
+                "$.elicitation",
+                "json_extract(payload,'$.awaiting_input')=1",
+                "interaction",
+            ),
+            QuestionOwner::Plan => (
+                "plan_record",
+                "$.elicitation",
+                "json_extract(payload,'$.state')='awaiting_input'",
+                "plan",
+            ),
+            QuestionOwner::PlanAcceptance => (
+                "plan_record",
+                ACCEPTANCE_ELICITATION_PATH,
+                "json_extract(payload,'$.state')='awaiting_review'",
+                "plan_acceptance",
+            ),
+        };
+        let text: Option<String> = transaction.query_row(
+            &format!("SELECT json_extract(payload,?3) FROM {table} WHERE session_id=?1 AND id=?2 AND {condition}"),
+            params![session_id, target.id, pointer], |row| row.get(0),
+        ).optional()?.flatten();
+        let mut elicitation: PlanElicitation = serde_json::from_str(
+            &text.context("question owner is no longer awaiting this answer")?,
+        )?;
+        ensure!(
+            elicitation.question_set.id == target.set_id && elicitation.revision == target.revision,
+            "question set changed before the answer was committed"
+        );
+        let order: Option<(String, u64)> = request
+            .get("answer_order")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?;
+        let superseded =
+            order.as_ref().is_some_and(|(writer, sequence)| {
+                elicitation.answer_order.get(question_id).is_some_and(
+                    |(previous_writer, previous)| previous_writer == writer && previous >= sequence,
+                )
+            });
+        if !superseded {
+            elicitation.answer(question_id, response)?;
+            if let Some(order) = order {
+                elicitation
+                    .answer_order
+                    .insert(question_id.to_owned(), order);
+            }
+        }
+        transaction.execute(
+            &format!("UPDATE {table} SET payload=json_set(payload,?3,json(?4)) WHERE session_id=?1 AND id=?2"),
+            params![session_id, target.id, pointer, serde_json::to_string(&elicitation)?],
+        )?;
+        if table == "plan_record" {
+            let plan: crate::plan::PlanRecord =
+                super::task::read_record(&transaction, table, &target.id)?
+                    .context("answered plan disappeared")?;
+            let active: String = transaction.query_row("SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1", [session_id], |row| row.get(0))?;
+            let mut active: crate::task::Task = super::decode(&active)?;
+            crate::task::SessionTaskController::apply_plan_answer(&mut active, plan)?;
+            transaction.execute("UPDATE session_record SET payload=json_set(payload,'$.session.active_task',json(?2)) WHERE id=?1", params![session_id,super::encode(&active)?])?;
+        }
+        let result = json!({"operation_id":identity,"active_elicitation":{
+            "owner":owner,
+            "exchange_id":if owner == "interaction" { Some(&target.id) } else { None },
+            "plan_id":if owner != "interaction" { Some(&target.id) } else { None },
+            "elicitation":elicitation,
+        }});
+        transaction.execute(
+            "INSERT INTO command_receipt(session_id,id,request,result) VALUES(?1,?2,?3,?4)",
+            params![
+                session_id,
+                identity,
+                encoded,
+                serde_json::to_string(&result)?
+            ],
+        )?;
+        transaction.commit()?;
+        self.publish_admission(session_id)?;
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,137 +664,5 @@ mod tests {
             1
         );
         Ok(())
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum QuestionOwner {
-    Interaction,
-    Plan,
-    PlanAcceptance,
-}
-
-#[derive(Deserialize)]
-struct QuestionTarget {
-    owner: QuestionOwner,
-    id: String,
-    set_id: String,
-    revision: u32,
-}
-
-impl SqliteStore {
-    /// Commits one identified answer and its retry receipt in the same transaction.
-    pub(crate) fn answer_question_command(
-        &mut self,
-        session_id: &str,
-        request: &Value,
-    ) -> Result<Value> {
-        let identity = request["operation_id"]
-            .as_str()
-            .context("question command identity is required")?;
-        let target: QuestionTarget = serde_json::from_value(request["target"].clone())?;
-        let question_id = request["question_id"]
-            .as_str()
-            .context("question identity is required")?;
-        let response: PlanQuestionResponse = serde_json::from_value(request["response"].clone())?;
-        let encoded = serde_json::to_string(request)?;
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous: Option<(String, String)> = transaction
-            .query_row(
-                "SELECT request,result FROM command_receipt WHERE session_id=?1 AND id=?2",
-                params![session_id, identity],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        if let Some((previous, result)) = previous {
-            ensure!(
-                previous == encoded,
-                "question command identity was reused for a different answer"
-            );
-            return Ok(serde_json::from_str(&result)?);
-        }
-        let (table, pointer, condition, owner) = match target.owner {
-            QuestionOwner::Interaction => (
-                "exchange_record",
-                "$.elicitation",
-                "json_extract(payload,'$.awaiting_input')=1",
-                "interaction",
-            ),
-            QuestionOwner::Plan => (
-                "plan_record",
-                "$.elicitation",
-                "json_extract(payload,'$.state')='awaiting_input'",
-                "plan",
-            ),
-            QuestionOwner::PlanAcceptance => (
-                "plan_record",
-                ACCEPTANCE_ELICITATION_PATH,
-                "json_extract(payload,'$.state')='awaiting_review'",
-                "plan_acceptance",
-            ),
-        };
-        let text: Option<String> = transaction.query_row(
-            &format!("SELECT json_extract(payload,?3) FROM {table} WHERE session_id=?1 AND id=?2 AND {condition}"),
-            params![session_id, target.id, pointer], |row| row.get(0),
-        ).optional()?.flatten();
-        let mut elicitation: PlanElicitation = serde_json::from_str(
-            &text.context("question owner is no longer awaiting this answer")?,
-        )?;
-        ensure!(
-            elicitation.question_set.id == target.set_id && elicitation.revision == target.revision,
-            "question set changed before the answer was committed"
-        );
-        let order: Option<(String, u64)> = request
-            .get("answer_order")
-            .map(|value| serde_json::from_value(value.clone()))
-            .transpose()?;
-        let superseded =
-            order.as_ref().is_some_and(|(writer, sequence)| {
-                elicitation.answer_order.get(question_id).is_some_and(
-                    |(previous_writer, previous)| previous_writer == writer && previous >= sequence,
-                )
-            });
-        if !superseded {
-            elicitation.answer(question_id, response)?;
-            if let Some(order) = order {
-                elicitation
-                    .answer_order
-                    .insert(question_id.to_owned(), order);
-            }
-        }
-        transaction.execute(
-            &format!("UPDATE {table} SET payload=json_set(payload,?3,json(?4)) WHERE session_id=?1 AND id=?2"),
-            params![session_id, target.id, pointer, serde_json::to_string(&elicitation)?],
-        )?;
-        if table == "plan_record" {
-            let plan: crate::plan::PlanRecord =
-                super::task::read_record(&transaction, table, &target.id)?
-                    .context("answered plan disappeared")?;
-            let active: String = transaction.query_row("SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1", [session_id], |row| row.get(0))?;
-            let mut active: crate::task::Task = super::decode(&active)?;
-            crate::task::SessionTaskController::apply_plan_answer(&mut active, plan)?;
-            transaction.execute("UPDATE session_record SET payload=json_set(payload,'$.session.active_task',json(?2)) WHERE id=?1", params![session_id,super::encode(&active)?])?;
-        }
-        let result = json!({"operation_id":identity,"active_elicitation":{
-            "owner":owner,
-            "exchange_id":if owner == "interaction" { Some(&target.id) } else { None },
-            "plan_id":if owner != "interaction" { Some(&target.id) } else { None },
-            "elicitation":elicitation,
-        }});
-        transaction.execute(
-            "INSERT INTO command_receipt(session_id,id,request,result) VALUES(?1,?2,?3,?4)",
-            params![
-                session_id,
-                identity,
-                encoded,
-                serde_json::to_string(&result)?
-            ],
-        )?;
-        transaction.commit()?;
-        self.publish_admission(session_id)?;
-        Ok(result)
     }
 }

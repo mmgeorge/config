@@ -2,7 +2,7 @@ use super::{ProviderEvent, ToolAddress, ToolUpdate};
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::{
-    Mutex,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
@@ -12,9 +12,19 @@ use tokio::time::Instant;
 /// Retains each invocation's original deadline, independently of output and replay.
 pub(crate) struct ToolWatchdog {
     duration: Duration,
-    tools: Mutex<HashMap<ToolAddress, ToolDeadline>>,
+    state: Mutex<WatchdogState>,
     changed: Notify,
-    foreground_finished: AtomicBool,
+    monitor_started: AtomicBool,
+    timeout_reported: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct WatchdogState {
+    tools: HashMap<ToolAddress, ToolDeadline>,
+    active_native: Option<super::TurnAddress>,
+    foreground_finished: bool,
+    idle_retired: bool,
+    expiration: Option<ToolTimeout>,
 }
 
 enum ToolDeadline {
@@ -28,12 +38,13 @@ enum ToolDeadline {
 }
 
 /// Identifies the invocation whose deadline stopped provider execution.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ToolTimeout {
     /// Retains the exact provider invocation that exceeded its deadline.
     pub(crate) address: ToolAddress,
     title: String,
     duration: Duration,
+    reported: Arc<AtomicBool>,
 }
 
 impl std::fmt::Display for ToolTimeout {
@@ -50,29 +61,62 @@ impl std::fmt::Display for ToolTimeout {
 
 impl std::error::Error for ToolTimeout {}
 
+impl ToolTimeout {
+    /// Reserve the single diagnostic and tool-state publication for this timeout.
+    pub(crate) fn claim_report(&self) -> bool {
+        !self.reported.swap(true, Ordering::AcqRel)
+    }
+}
+
 impl ToolWatchdog {
     /// Create an invocation tracker with a required, finite execution deadline.
     pub(crate) fn new(timeout: crate::session::InputTimeout) -> Result<Self> {
         Ok(Self {
             duration: timeout.require_expiry()?.duration(),
-            tools: Mutex::new(HashMap::new()),
+            state: Mutex::new(WatchdogState::default()),
             changed: Notify::new(),
-            foreground_finished: AtomicBool::new(false),
+            monitor_started: AtomicBool::new(false),
+            timeout_reported: Arc::new(AtomicBool::new(false)),
         })
     }
 
     /// Track execution deadlines while leaving explicit waits for user answers unbounded.
     pub(crate) fn observe(&self, event: &ProviderEvent) -> Result<()> {
+        if let ProviderEvent::Execution { observation } = event
+            && let forge_provider_api::lifecycle::ExecutionUpdate::Started { address } =
+                observation.update()
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| anyhow!("tool deadline lock poisoned"))?;
+            if !state.idle_retired {
+                state.foreground_finished = false;
+                state.active_native = Some(address.clone());
+                drop(state);
+                self.changed.notify_waiters();
+            }
+            return Ok(());
+        }
+        if let ProviderEvent::Execution { observation } = event
+            && let forge_provider_api::lifecycle::ExecutionUpdate::Finished { address, .. } =
+                observation.update()
+        {
+            return self.finish_native_execution(address);
+        }
         let ProviderEvent::Tool { address, update } = event else {
             return Ok(());
         };
-        let mut tools = self
-            .tools
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| anyhow!("tool deadline lock poisoned"))?;
+        if (state.foreground_finished || state.idle_retired) && !state.tools.contains_key(address) {
+            return Ok(());
+        }
         match update {
             ToolUpdate::Requested { invocation } => {
-                tools.entry(address.clone()).or_insert_with(|| {
+                state.tools.entry(address.clone()).or_insert_with(|| {
                     if invocation.name == "question_ask"
                         && invocation.arguments["wait"].as_bool() == Some(true)
                     {
@@ -87,7 +131,8 @@ impl ToolWatchdog {
                 });
             }
             ToolUpdate::Started => {
-                tools
+                state
+                    .tools
                     .entry(address.clone())
                     .or_insert_with(|| ToolDeadline::Running {
                         deadline: Instant::now() + self.duration,
@@ -96,15 +141,18 @@ impl ToolWatchdog {
                     });
             }
             ToolUpdate::Finished { .. } => {
-                tools.insert(address.clone(), ToolDeadline::Finished);
+                state.tools.insert(address.clone(), ToolDeadline::Finished);
             }
             ToolUpdate::TitleChanged { title } => {
-                if let Some(ToolDeadline::Running { title: current, .. }) = tools.get_mut(address) {
+                if let Some(ToolDeadline::Running { title: current, .. }) =
+                    state.tools.get_mut(address)
+                {
                     current.clone_from(title);
                 }
             }
             ToolUpdate::Backgrounded => {
-                if let Some(ToolDeadline::Running { background, .. }) = tools.get_mut(address) {
+                if let Some(ToolDeadline::Running { background, .. }) = state.tools.get_mut(address)
+                {
                     *background = true;
                 }
             }
@@ -113,7 +161,89 @@ impl ToolWatchdog {
             | ToolUpdate::Changes { .. }
             | ToolUpdate::SkillRead { .. } => {}
         }
-        drop(tools);
+        drop(state);
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    /// Retain existing background deadlines while stopping adoption of later native executions.
+    pub(crate) fn retire_idle(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("tool deadline lock poisoned"))?;
+        state.idle_retired = true;
+        state.foreground_finished = true;
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
+    }
+
+    /// Reserve session-owned deadline observation exactly once for this scope tracker.
+    pub(crate) fn start_monitor(&self) -> bool {
+        !self.monitor_started.swap(true, Ordering::AcqRel)
+    }
+
+    /// Report whether session ownership of deadline observation has already been installed.
+    pub(crate) fn is_monitored(&self) -> bool {
+        self.monitor_started.load(Ordering::Acquire)
+    }
+
+    /// Get the first deadline failure even after native cancellation reports terminal tools.
+    pub(crate) fn timeout(&self) -> Result<Option<ToolTimeout>> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("tool expiration lock poisoned"))?
+            .expiration
+            .clone())
+    }
+
+    /// Wait for positively certified native activity or retirement of this retained scope.
+    pub(crate) async fn resumed(&self) -> Result<bool> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("tool deadline lock poisoned"))?;
+                if state.idle_retired {
+                    return Ok(false);
+                }
+                if !state.foreground_finished {
+                    return Ok(true);
+                }
+            }
+            changed.await;
+        }
+    }
+
+    /// Retire one native execution's ordinary tools while preserving background deadlines.
+    fn finish_native_execution(&self, address: &crate::provider::TurnAddress) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("tool deadline lock poisoned"))?;
+        for (tool, deadline) in state.tools.iter_mut() {
+            if &tool.turn == address
+                && matches!(
+                    deadline,
+                    ToolDeadline::Running {
+                        background: false,
+                        ..
+                    }
+                )
+            {
+                *deadline = ToolDeadline::Finished;
+            }
+        }
+        if state.active_native.as_ref() == Some(address) {
+            state.active_native = None;
+        }
+        drop(state);
         self.changed.notify_one();
         Ok(())
     }
@@ -121,23 +251,31 @@ impl ToolWatchdog {
     /// Wait for the earliest unfinished invocation without extending it on activity.
     pub(crate) async fn expired(&self) -> Result<Option<ToolTimeout>> {
         loop {
+            if let Some(timeout) = self.timeout()? {
+                return Ok(Some(timeout));
+            }
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let next = self
-                .tools
-                .lock()
-                .map_err(|_| anyhow!("tool deadline lock poisoned"))?
-                .iter()
-                .filter_map(|(address, state)| match state {
-                    ToolDeadline::Running {
-                        deadline, title, ..
-                    } => Some((*deadline, address.clone(), title.clone())),
-                    ToolDeadline::UserInput | ToolDeadline::Finished => None,
-                })
-                .min_by_key(|(deadline, _, _)| *deadline);
+            let (next, foreground_finished) = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow!("tool deadline lock poisoned"))?;
+                let next = state
+                    .tools
+                    .iter()
+                    .filter_map(|(address, state)| match state {
+                        ToolDeadline::Running {
+                            deadline, title, ..
+                        } => Some((*deadline, address.clone(), title.clone())),
+                        ToolDeadline::UserInput | ToolDeadline::Finished => None,
+                    })
+                    .min_by_key(|(deadline, _, _)| *deadline);
+                (next, state.foreground_finished)
+            };
             let Some((deadline, address, title)) = next else {
-                if self.foreground_finished.load(Ordering::Acquire) {
+                if foreground_finished {
                     return Ok(None);
                 }
                 changed.await;
@@ -146,9 +284,12 @@ impl ToolWatchdog {
             tokio::select! {
                 biased;
                 _ = tokio::time::sleep_until(deadline) => {
-                    let tools = self.tools.lock().map_err(|_| anyhow!("tool deadline lock poisoned"))?;
-                    if matches!(tools.get(&address), Some(ToolDeadline::Running { deadline, .. }) if *deadline <= Instant::now()) {
-                        return Ok(Some(ToolTimeout { address, title, duration: self.duration }));
+                    let mut state = self.state.lock().map_err(|_| anyhow!("tool deadline lock poisoned"))?;
+                    if matches!(state.tools.get(&address), Some(ToolDeadline::Running { deadline, .. }) if *deadline <= Instant::now()) {
+                        let timeout = state.expiration.get_or_insert_with(|| ToolTimeout {
+                            address, title, duration: self.duration, reported: self.timeout_reported.clone(),
+                        });
+                        return Ok(Some(timeout.clone()));
                     }
                 }
                 _ = changed => {},
@@ -156,30 +297,44 @@ impl ToolWatchdog {
         }
     }
 
-    /// Retain deadlines only for provider-confirmed background commands after the turn ends.
+    /// Retire completed foreground tools without ending a newer certified native execution.
     pub(crate) fn finish_foreground(&self) -> Result<bool> {
-        let mut tools = self
-            .tools
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| anyhow!("tool deadline lock poisoned"))?;
-        for state in tools.values_mut() {
-            if matches!(
-                state,
-                ToolDeadline::Running {
-                    background: false,
-                    ..
+        // A certified continuation can start between host commit and result delivery.
+        if state.active_native.is_none() {
+            for deadline in state.tools.values_mut() {
+                if matches!(
+                    deadline,
+                    ToolDeadline::Running {
+                        background: false,
+                        ..
+                    }
+                ) {
+                    *deadline = ToolDeadline::Finished;
                 }
-            ) {
-                *state = ToolDeadline::Finished;
             }
+            state.foreground_finished = true;
         }
-        let pending = tools
+        let pending = state
+            .tools
             .values()
             .any(|state| matches!(state, ToolDeadline::Running { .. }));
-        self.foreground_finished.store(true, Ordering::Release);
-        drop(tools);
+        drop(state);
         self.changed.notify_one();
         Ok(pending)
+    }
+}
+
+impl forge_provider_api::events::EventObserver for ToolWatchdog {
+    fn before_delivery(
+        &self,
+        event: &ProviderEvent,
+    ) -> Result<(), forge_provider_api::events::EventDeliveryError> {
+        self.observe(event)
+            .map_err(forge_provider_api::events::EventDeliveryError::transport)
     }
 }
 
@@ -189,6 +344,7 @@ mod tests {
     use crate::provider::{
         ExecutionOwner, InvocationScope, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome,
     };
+    use anyhow::Context;
 
     /// Bind each fixture invocation to a real execution identity.
     fn address(id: &str) -> ToolAddress {
@@ -304,7 +460,7 @@ mod tests {
         Ok(())
     }
 
-    /// Keep background command deadlines after foreground completion and retire them on success.
+    /// Keep background deadlines and preserve an elapsed timeout through a late success frame.
     #[tokio::test(start_paused = true)]
     async fn background_deadlines_survive_foreground_completion() -> Result<()> {
         let watchdog = watchdog()?;
@@ -325,17 +481,74 @@ mod tests {
                 outcome: ToolOutcome::Succeeded,
             },
         })?;
-        assert!(watchdog.expired().await?.is_none());
+        watchdog.observe(&requested("later-attempt", ToolActivityKind::Command))?;
+        assert_eq!(
+            watchdog.expired().await?.unwrap().address,
+            address("background")
+        );
         Ok(())
     }
-}
 
-impl forge_provider_api::events::EventObserver for ToolWatchdog {
-    fn before_delivery(
-        &self,
-        event: &ProviderEvent,
-    ) -> Result<(), forge_provider_api::events::EventDeliveryError> {
-        self.observe(event)
-            .map_err(forge_provider_api::events::EventDeliveryError::transport)
+    /// Retire an earlier native turn without disabling deadlines for its same-scope continuation.
+    #[tokio::test(start_paused = true)]
+    async fn native_completion_preserves_continuation_deadlines() -> Result<()> {
+        let watchdog = watchdog()?;
+        let started = Instant::now();
+        watchdog.observe(&requested("ordinary", ToolActivityKind::Command))?;
+        tokio::time::advance(Duration::from_millis(750)).await;
+        let turn = address("ordinary").turn;
+        watchdog.observe(&ProviderEvent::Execution {
+            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                turn.scope.clone(),
+                forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                    address: turn,
+                    covered_submissions: Vec::new(),
+                    result: forge_provider_api::lifecycle::ExecutionResult::Completed {
+                        completion: forge_provider_api::completion::ProviderCompletion::default()
+                            .into(),
+                    },
+                    completed_at_ms: 0,
+                },
+            )?,
+        })?;
+        let mut next = requested("ordinary", ToolActivityKind::Command);
+        let ProviderEvent::Tool { address: later, .. } = &mut next else {
+            unreachable!("fixture tool event")
+        };
+        later.turn.turn_id = "later-turn".into();
+        let later = later.clone();
+        watchdog.observe(&next)?;
+
+        let timeout = watchdog
+            .expired()
+            .await?
+            .context("continuation deadline ended without expiry")?;
+        assert_eq!(timeout.address, later);
+        assert_eq!(started.elapsed(), Duration::from_millis(1750));
+        Ok(())
+    }
+
+    /// Preserve a positively reopened tool when delivery of the prior host result finishes late.
+    #[tokio::test(start_paused = true)]
+    async fn late_host_completion_cannot_retire_reopened_tool() -> Result<()> {
+        let watchdog = watchdog()?;
+        let mut tool = requested("continued", ToolActivityKind::Command);
+        let ProviderEvent::Tool { address, .. } = &mut tool else {
+            unreachable!("fixture tool event")
+        };
+        address.turn.turn_id = "reopened".into();
+        let expected = address.clone();
+        watchdog.observe(&ProviderEvent::Execution {
+            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                expected.turn.scope.clone(),
+                forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                    address: expected.turn.clone(),
+                },
+            )?,
+        })?;
+        watchdog.observe(&tool)?;
+        assert!(watchdog.finish_foreground()?);
+        assert_eq!(watchdog.expired().await?.unwrap().address, expected);
+        Ok(())
     }
 }

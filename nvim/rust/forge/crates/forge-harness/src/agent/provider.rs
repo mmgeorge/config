@@ -255,7 +255,11 @@ impl AgentProviderFactory {
             access: crate::provider::registered_capability(selection.provider)
                 .resolve_access(root.access.clone()),
             approval_mode: narrow_permission(root.approval_mode, selection.approval_mode),
-            provider_session_id: agent.provider_thread_id.clone(),
+            provider_session_id: agent
+                .provider_thread_id
+                .clone()
+                .map(TryInto::try_into)
+                .transpose()?,
             submission: None,
             recovered_input: Vec::new(),
             control_context: None,

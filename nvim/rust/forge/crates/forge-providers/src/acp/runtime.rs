@@ -4,8 +4,8 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const LEGACY_CLAUDE_VERSION: &str = "0.89.1";
-const LEGACY_ANTIGRAVITY_VERSION: &str = "1.3.0";
+const MANAGED_CLAUDE_VERSION: &str = "0.99.1";
+const MANAGED_ANTIGRAVITY_VERSION: &str = "1.4.5";
 
 #[derive(Serialize)]
 /// Reports installation independently of authentication and provider session state.
@@ -17,7 +17,7 @@ pub struct RuntimeStatus {
     pub environment: BTreeMap<String, String>,
 }
 
-/// Resolves installed ACP adapters and retains compatibility with existing managed copies.
+/// Resolve configured ACP adapters or the supported managed installation.
 pub struct AcpRuntime {
     kind: ProviderKind,
     command: Vec<String>,
@@ -39,11 +39,11 @@ impl AcpRuntime {
         }
     }
 
-    fn legacy_version(&self) -> &'static str {
+    fn managed_version(&self) -> &'static str {
         if self.kind == ProviderKind::Claude {
-            LEGACY_CLAUDE_VERSION
+            MANAGED_CLAUDE_VERSION
         } else {
-            LEGACY_ANTIGRAVITY_VERSION
+            MANAGED_ANTIGRAVITY_VERSION
         }
     }
 
@@ -108,12 +108,12 @@ impl AcpRuntime {
         }
         if program.is_none()
             && self.default_command()
-            && let Some(command) = self.managed_command(&self.root.join(self.legacy_version()))
+            && let Some(command) = self.managed_command(&self.root.join(self.managed_version()))
         {
             return RuntimeStatus {
                 available: true,
                 managed: true,
-                adapter_version: Some(self.legacy_version().into()),
+                adapter_version: Some(self.managed_version().into()),
                 command,
                 environment,
             };

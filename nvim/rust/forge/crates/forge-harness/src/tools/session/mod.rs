@@ -12,4 +12,4 @@ mod status;
 mod tool;
 
 pub(in crate::tools) use catalog::{definitions, execute, is_tool, record};
-pub(crate) use inspection::HarnessInspectionScope;
+pub(crate) use inspection::{HarnessInspectionScope, InspectionLease};

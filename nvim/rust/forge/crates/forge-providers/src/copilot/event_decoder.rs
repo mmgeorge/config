@@ -74,6 +74,30 @@ impl CopilotEventDecoder {
             && self.pending_input.is_empty()
     }
 
+    /// Match late events only against native identities already owned by this invocation.
+    pub(crate) fn owns_event(&self, event: &SessionEvent) -> bool {
+        if self.observed.contains(&event.id) {
+            return true;
+        }
+        let Some(thread) = event.agent_id.as_ref().or(self.root_thread.as_ref()) else {
+            return false;
+        };
+        if let Some(id) = event.data.get("messageId").and_then(Value::as_str) {
+            let key = (thread.clone(), id.to_owned());
+            if self.message_address.contains_key(&key) || self.reasoning_address.contains_key(&key)
+            {
+                return true;
+            }
+        }
+        if let Some(id) = event.data.get("toolCallId").and_then(Value::as_str)
+            && self.tool.contains_key(&(thread.clone(), id.to_owned()))
+        {
+            return true;
+        }
+        // Native background wakeups may reuse turnId; it cannot distinguish old output here.
+        false
+    }
+
     pub fn root_address(&self) -> Option<TurnAddress> {
         self.root_thread
             .as_ref()
@@ -95,7 +119,7 @@ impl CopilotEventDecoder {
         event
             .agent_id
             .clone()
-            .or_else(|| output.session_id().map(str::to_owned))
+            .or_else(|| output.session_id().map(|id| id.as_str().to_owned()))
             .ok_or_else(|| Self::protocol("Copilot event has no conversation identity"))
     }
 
@@ -395,7 +419,7 @@ impl CopilotEventDecoder {
                 self.diagnostic(
                     sink,
                     "copilot_session_error",
-                    super::decode::session_error(event, output.session_id()),
+                    super::decode::session_error(event, output.session_id().map(|id| id.as_str())),
                 )
                 .await?;
             }

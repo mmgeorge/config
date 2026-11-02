@@ -858,6 +858,23 @@ pub(crate) struct PlanCheckSelection<'selection> {
     pub removed_tests: &'selection [DesignTestSelection],
 }
 
+/// The working plan changed after it was captured for an update.
+pub(crate) struct WorkingDocumentChanged;
+
+impl std::fmt::Display for WorkingDocumentChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("plan document changed before write")
+    }
+}
+
+impl std::fmt::Debug for WorkingDocumentChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("WorkingDocumentChanged")
+    }
+}
+
+impl std::error::Error for WorkingDocumentChanged {}
+
 /// Owns physical plan files and immutable revision history.
 pub struct PlanFileStore {
     review_cache: review_cache::ReviewCache,
@@ -871,7 +888,88 @@ pub struct PlanFileStore {
     workspace: PathBuf,
 }
 
+/// Retain a validated and rendered plan until its captured baseline can be committed.
+pub(crate) struct PreparedPlanSubmission {
+    session_id: String,
+    plan_id: String,
+    revision: u32,
+    expected: PlanDocument,
+    document: PlanDocument,
+    rendered: RenderedPlan,
+}
+
+/// Bind a dependent commit to the captured contents of one canonical working document.
+pub(crate) struct WorkingDocumentGuard<'store> {
+    files: &'store PlanFileStore,
+    expected: &'store PlanDocument,
+}
+
+impl WorkingDocumentGuard<'_> {
+    /// Validate the complete document and exclude file writers until the dependent commit finishes.
+    ///
+    /// Task-dependent callers acquire their task mutation gate before entering this method.
+    /// The closure must not mutate the working document or reenter its file store gate.
+    pub(crate) fn commit<Output>(
+        self,
+        session_id: &str,
+        commit: impl FnOnce() -> Result<Output>,
+    ) -> Result<Output> {
+        let gate = self
+            .files
+            .working_document_gate(session_id, &self.expected.plan_id)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
+        if self
+            .files
+            .read_working_document(session_id, &self.expected.plan_id)?
+            != *self.expected
+        {
+            return Err(WorkingDocumentChanged.into());
+        }
+        commit()
+    }
+}
+
 impl PlanFileStore {
+    /// Bind a later dependent commit to this store and its captured document.
+    pub(crate) fn guard_working_document<'store>(
+        &'store self,
+        expected: &'store PlanDocument,
+    ) -> WorkingDocumentGuard<'store> {
+        WorkingDocumentGuard {
+            files: self,
+            expected,
+        }
+    }
+
+    /// Share one short mutation gate for every store instance targeting this plan directory.
+    fn working_document_gate(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+    ) -> Result<std::sync::Arc<std::sync::Mutex<()>>> {
+        static GATES: std::sync::OnceLock<
+            std::sync::Mutex<
+                std::collections::HashMap<PathBuf, std::sync::Weak<std::sync::Mutex<()>>>,
+            >,
+        > = std::sync::OnceLock::new();
+        let directory = self.plan_dir(session_id, plan_id);
+        fs::create_dir_all(&directory)?;
+        let key = fs::canonicalize(&directory)?;
+        let mut gates = GATES
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan mutation gate registry poisoned"))?;
+        if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+            return Ok(gate);
+        }
+        gates.retain(|_, gate| gate.strong_count() != 0);
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(()));
+        gates.insert(key, std::sync::Arc::downgrade(&gate));
+        Ok(gate)
+    }
+
     pub fn new(root: impl Into<PathBuf>, workspace: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -909,6 +1007,10 @@ impl PlanFileStore {
         revision: u32,
     ) -> Result<PlanDocument> {
         let document = self.read_submitted_document(session_id, plan_id, revision)?;
+        let gate = self.working_document_gate(session_id, plan_id)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
         let directory = self.plan_dir(session_id, plan_id);
         for extension in ["md", "index.json"] {
             let source = directory
@@ -919,11 +1021,12 @@ impl PlanFileStore {
                 &fs::read(source)?,
             )?;
         }
-        self.write_working_document(session_id, plan_id, &document)?;
+        self.write_working_document_locked(session_id, plan_id, &document)?;
         Ok(document)
     }
 
     /// Preserve incomplete construction until submission validates the whole plan.
+    #[cfg(test)]
     pub fn write_working_document(
         &self,
         session_id: &str,
@@ -935,6 +1038,69 @@ impl PlanFileStore {
             "working document plan id mismatch"
         );
         self.review_cache.validate(document, false)?;
+        let gate = self.working_document_gate(session_id, plan_id)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
+        self.write_working_document_locked(session_id, plan_id, document)
+    }
+
+    /// Create a new working document without replacing an existing plan.
+    pub fn create_working_document(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        document: &PlanDocument,
+    ) -> Result<PathBuf> {
+        anyhow::ensure!(
+            document.plan_id == plan_id,
+            "working document plan id mismatch"
+        );
+        self.review_cache.validate(document, false)?;
+        let gate = self.working_document_gate(session_id, plan_id)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
+        anyhow::ensure!(
+            !self
+                .plan_dir(session_id, plan_id)
+                .join("working.json")
+                .exists(),
+            "working plan already exists"
+        );
+        self.write_working_document_locked(session_id, plan_id, document)
+    }
+
+    /// Publish only if the canonical working document still equals the captured version.
+    pub(crate) fn write_working_document_if_unchanged(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        expected: &PlanDocument,
+        document: &PlanDocument,
+    ) -> Result<PathBuf> {
+        anyhow::ensure!(
+            expected.plan_id == plan_id && document.plan_id == plan_id,
+            "working document plan id mismatch"
+        );
+        self.review_cache.validate(document, false)?;
+        let gate = self.working_document_gate(session_id, plan_id)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
+        let current = self.read_working_document(session_id, plan_id)?;
+        if &current != expected {
+            return Err(WorkingDocumentChanged.into());
+        }
+        self.write_working_document_locked(session_id, plan_id, document)
+    }
+
+    fn write_working_document_locked(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        document: &PlanDocument,
+    ) -> Result<PathBuf> {
         let directory = self.plan_dir(session_id, plan_id);
         fs::create_dir_all(directory.join("revisions"))
             .with_context(|| format!("create plan directory {}", directory.display()))?;
@@ -961,7 +1127,12 @@ impl PlanFileStore {
     ) -> Result<PlanEditResult> {
         let document = self.read_working_document(session_id, &request.plan_id)?;
         let result = apply_plan_edit(&document, request)?;
-        self.write_working_document(session_id, &result.plan_id, &result.document)?;
+        self.write_working_document_if_unchanged(
+            session_id,
+            &result.plan_id,
+            &document,
+            &result.document,
+        )?;
         Ok(result)
     }
 
@@ -992,8 +1163,9 @@ impl PlanFileStore {
         let rendered = measure(trace, "rename.render_changed_plan", || {
             design_review::render(&renamed)
         })?;
-        let (document, rendered, digest) = self.persist_review_draft(
+        let (document, rendered, digest) = self.persist_review_draft_if_unchanged(
             session_id,
+            &document,
             PlanReviewRevision::new(plan_id, renamed, rendered)?,
             trace,
         )?;
@@ -1010,7 +1182,12 @@ impl PlanFileStore {
     ) -> Result<PlanEditResult> {
         let document = self.read_working_document(session_id, plan_id)?;
         let result = edit::rename_added_entity(&document, entity_name, new_name)?;
-        self.write_working_document(session_id, &result.plan_id, &result.document)?;
+        self.write_working_document_if_unchanged(
+            session_id,
+            &result.plan_id,
+            &document,
+            &result.document,
+        )?;
         Ok(result)
     }
 
@@ -1023,25 +1200,68 @@ impl PlanFileStore {
         expected_version: u64,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let document = self.read_working_document(session_id, plan_id)?;
-        self.submit_validated_document_revision(
+        self.submit_validated_document_revision_if_unchanged(
             session_id,
             plan_id,
             revision,
             expected_version,
-            document,
+            &document,
+            document.clone(),
         )
     }
 
     /// Freeze one externally validated document without re-reading stale derived state.
+    #[cfg(test)]
     pub fn submit_validated_document_revision(
         &self,
         session_id: &str,
         plan_id: &str,
         revision: u32,
         expected_version: u64,
-        mut document: PlanDocument,
+        document: PlanDocument,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let current = self.read_working_document(session_id, plan_id)?;
+        self.submit_validated_document_revision_if_unchanged(
+            session_id,
+            plan_id,
+            revision,
+            expected_version,
+            &current,
+            document,
+        )
+    }
+
+    /// Commit a separately validated plan against the document that was validated.
+    pub(crate) fn submit_validated_document_revision_if_unchanged(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        revision: u32,
+        expected_version: u64,
+        current: &PlanDocument,
+        document: PlanDocument,
+    ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        let prepared = self.prepare_validated_submission(
+            session_id,
+            plan_id,
+            revision,
+            expected_version,
+            current,
+            document,
+        )?;
+        self.commit_prepared_submission(prepared)
+    }
+
+    /// Validate and render without holding either the task or working-document mutation gate.
+    pub(crate) fn prepare_validated_submission(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        revision: u32,
+        expected_version: u64,
+        current: &PlanDocument,
+        mut document: PlanDocument,
+    ) -> Result<PreparedPlanSubmission> {
         anyhow::ensure!(
             current.version == expected_version,
             "plan version changed before validated submission"
@@ -1074,18 +1294,49 @@ impl PlanFileStore {
             report.ensure_valid()?;
             design.validation = Some(report);
         }
-        self.persist_revision(session_id, plan_id, revision, document, None)
+        let rendered = self.render_review(&document)?;
+        Ok(PreparedPlanSubmission {
+            session_id: session_id.into(),
+            plan_id: plan_id.into(),
+            revision,
+            expected: current.clone(),
+            document,
+            rendered,
+        })
     }
 
-    /// Freeze a validated execution revision without requiring unchanged original sources.
-    pub(crate) fn submit_execution_revision(
+    /// Commit a prepared submission against the exact canonical baseline it validated.
+    pub(crate) fn commit_prepared_submission(
+        &self,
+        prepared: PreparedPlanSubmission,
+    ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        let PreparedPlanSubmission {
+            session_id,
+            plan_id,
+            revision,
+            expected,
+            document,
+            rendered,
+        } = prepared;
+        self.persist_rendered_revision(
+            &session_id,
+            &plan_id,
+            revision,
+            PlanReviewRevision::new(&plan_id, document, rendered)?,
+            Some(&expected),
+            None,
+        )
+    }
+
+    /// Submit a validated execution derivative against its captured canonical baseline.
+    pub(crate) fn submit_execution_revision_if_unchanged(
         &self,
         session_id: &str,
         plan_id: &str,
         revision: u32,
+        current: &PlanDocument,
         mut document: PlanDocument,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
-        let current = self.read_working_document(session_id, plan_id)?;
         anyhow::ensure!(
             current.version == document.version && document.plan_id == plan_id,
             "execution revision changed before submission"
@@ -1104,7 +1355,7 @@ impl PlanFileStore {
             .ensure_valid()?;
         document.design = Some(design);
         document.validate_for_submission()?;
-        self.persist_revision(session_id, plan_id, revision, document, None)
+        self.persist_revision(session_id, plan_id, revision, document, Some(current), None)
     }
 
     fn persist_revision(
@@ -1113,12 +1364,20 @@ impl PlanFileStore {
         plan_id: &str,
         revision: u32,
         document: PlanDocument,
+        expected: Option<&PlanDocument>,
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let rendered = measure(trace, "persist.render_plan", || {
             self.render_review(&document)
         })?;
-        self.persist_rendered_revision(session_id, plan_id, revision, document, rendered, trace)
+        self.persist_rendered_revision(
+            session_id,
+            plan_id,
+            revision,
+            PlanReviewRevision::new(plan_id, document, rendered)?,
+            expected,
+            trace,
+        )
     }
 
     /// Render a validated review document while reusing unchanged analysis.
@@ -1145,15 +1404,21 @@ impl PlanFileStore {
         session_id: &str,
         plan_id: &str,
         revision: u32,
-        document: PlanDocument,
-        rendered: RenderedPlan,
+        review: PlanReviewRevision,
+        expected: Option<&PlanDocument>,
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
-        let (document, rendered, checksum) = self.persist_review_draft(
-            session_id,
-            PlanReviewRevision::new(plan_id, document, rendered)?,
-            trace,
-        )?;
+        let gate = self.working_document_gate(session_id, plan_id)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
+        if let Some(expected) = expected
+            && self.read_working_document(session_id, plan_id)? != *expected
+        {
+            return Err(WorkingDocumentChanged.into());
+        }
+        let (document, rendered, checksum) =
+            self.persist_review_draft_locked(session_id, review, trace)?;
         let revision_directory = self.plan_dir(session_id, plan_id).join("revisions");
         measure(trace, "persist.revision_directory", || {
             Ok(fs::create_dir_all(&revision_directory)?)
@@ -1177,8 +1442,29 @@ impl PlanFileStore {
         Ok((document, rendered, checksum))
     }
 
-    /// Save the current review draft without creating an immutable submitted revision.
-    pub(crate) fn persist_review_draft(
+    /// Commit a prepared review only if its original canonical document is still current.
+    pub(crate) fn persist_review_draft_if_unchanged(
+        &self,
+        session_id: &str,
+        expected: &PlanDocument,
+        revision: PlanReviewRevision,
+        trace: Option<&PlanEditTrace>,
+    ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        anyhow::ensure!(
+            expected.plan_id == revision.document.plan_id,
+            "review plan identity changed"
+        );
+        let gate = self.working_document_gate(session_id, &revision.document.plan_id)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
+        if self.read_working_document(session_id, &expected.plan_id)? != *expected {
+            return Err(WorkingDocumentChanged.into());
+        }
+        self.persist_review_draft_locked(session_id, revision, trace)
+    }
+
+    fn persist_review_draft_locked(
         &self,
         session_id: &str,
         revision: PlanReviewRevision,
@@ -1224,8 +1510,12 @@ impl PlanFileStore {
             session_id,
             plan_id,
             revision,
-            reviewed.document.clone(),
-            reviewed.rendered.clone(),
+            PlanReviewRevision::new(
+                plan_id,
+                reviewed.document.clone(),
+                reviewed.rendered.clone(),
+            )?,
+            Some(&reviewed.document),
             None,
         )?;
         Ok(())
@@ -1252,6 +1542,7 @@ impl PlanFileStore {
             digest(&crate::plan::codec::to_vec(&document)?) == expected_digest,
             "plan changed before test deletion"
         );
+        let original = document.clone();
         let before = measure(trace, "delete.render_previous", || {
             self.render_review(&document)
         })?;
@@ -1284,6 +1575,7 @@ impl PlanFileStore {
         })?;
         self.persist_annotated_edit(
             session_id,
+            &original,
             PlanReviewRevision::new(plan_id, document, rendered)?,
             &before,
             annotation,
@@ -1314,6 +1606,7 @@ impl PlanFileStore {
             digest(&crate::plan::codec::to_vec(&document)?) == expected_digest,
             "plan changed before check selection"
         );
+        let original = document.clone();
         let before = self.render_review(&document)?;
         let path = self.plan_dir(session_id, plan_id).join("working.json");
         let annotation =
@@ -1342,6 +1635,7 @@ impl PlanFileStore {
         let rendered = design_review::render(&document)?;
         self.persist_annotated_edit(
             session_id,
+            &original,
             PlanReviewRevision::new(plan_id, document, rendered)?,
             &before,
             annotation,
@@ -1352,16 +1646,24 @@ impl PlanFileStore {
     fn persist_annotated_edit(
         &self,
         session_id: &str,
+        expected: &PlanDocument,
         revision: PlanReviewRevision,
         before: &RenderedPlan,
         annotation: Vec<ReviewAnnotation>,
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        let gate = self.working_document_gate(session_id, &expected.plan_id)?;
+        let _guard = gate
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
+        if self.read_working_document(session_id, &expected.plan_id)? != *expected {
+            return Err(WorkingDocumentChanged.into());
+        }
         let path = self
             .plan_dir(session_id, &revision.document.plan_id)
             .join("working.json");
         let (document, rendered, checksum) =
-            self.persist_review_draft(session_id, revision, trace)?;
+            self.persist_review_draft_locked(session_id, revision, trace)?;
         let reanchor = trace.map(|trace| trace.stage("delete.reanchor_annotations"));
         let mut retained = Vec::new();
         for mut item in annotation {
@@ -1467,7 +1769,7 @@ impl PlanFileStore {
         fs::create_dir_all(target.join("revisions"))?;
         let mut working = self.read_working_document(source_session_id, source_plan_id)?;
         working.plan_id = target_plan_id.to_owned();
-        self.write_working_document(target_session_id, target_plan_id, &working)?;
+        self.create_working_document(target_session_id, target_plan_id, &working)?;
         let source_revision = source.join("revisions");
         if source_revision.exists() {
             for entry in fs::read_dir(&source_revision)? {
@@ -1601,6 +1903,79 @@ mod test {
     use super::*;
 
     #[test]
+    fn working_document_cas_rejects_same_version_changes_across_store_instances() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("data");
+        let first = PlanFileStore::new(&root, temporary.path());
+        let second = PlanFileStore::new(&root, temporary.path());
+        let original = document::test_fixture("cas-plan", "original");
+        first.write_working_document("session", "cas-plan", &original)?;
+        let mut replacement = original.clone();
+        replacement.overview = "intervening".into();
+        second.write_working_document_if_unchanged(
+            "session",
+            "cas-plan",
+            &original,
+            &replacement,
+        )?;
+        let mut stale = original.clone();
+        stale.overview = "stale".into();
+        let error = first
+            .write_working_document_if_unchanged("session", "cas-plan", &original, &stale)
+            .unwrap_err();
+        assert!(error.downcast_ref::<WorkingDocumentChanged>().is_some());
+        assert_eq!(
+            first.read_working_document("session", "cas-plan")?,
+            replacement
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_plan_writers_cannot_both_commit_the_same_baseline() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().join("data");
+        let workspace = temporary.path().to_path_buf();
+        let initial_store = PlanFileStore::new(&root, &workspace);
+        let original = document::test_fixture("race-plan", "original");
+        initial_store.write_working_document("session", "race-plan", &original)?;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = ["first", "second"]
+            .into_iter()
+            .map(|name| {
+                let root = root.clone();
+                let workspace = workspace.clone();
+                let original = original.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let store = PlanFileStore::new(root, workspace);
+                    let mut updated = original.clone();
+                    updated.overview = name.into();
+                    barrier.wait();
+                    store.write_working_document_if_unchanged(
+                        "session",
+                        "race-plan",
+                        &original,
+                        &updated,
+                    )
+                })
+            })
+            .collect();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .all(|error| error.downcast_ref::<WorkingDocumentChanged>().is_some())
+        );
+        Ok(())
+    }
+
+    #[test]
     fn warm_review_edits_preserve_a_multifile_plan() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
@@ -1624,7 +1999,7 @@ mod test {
         .unwrap();
         document.design = Some(design);
         store
-            .persist_revision("session", "fast-review", 1, document.clone(), None)
+            .persist_revision("session", "fast-review", 1, document.clone(), None, None)
             .unwrap();
         let index = references::PlanReferenceIndex::planned(&document, temporary.path()).unwrap();
         let identity = &index.definition[&("src/part_0.rs".into(), 1, 11)].0;
@@ -1753,7 +2128,7 @@ mod test {
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         crate::checks::configure_fixture(&store.workspace);
         store
-            .persist_revision("session", "rename", 1, document.clone(), None)
+            .persist_revision("session", "rename", 1, document.clone(), None, None)
             .unwrap();
         let previous = fs::read(
             store

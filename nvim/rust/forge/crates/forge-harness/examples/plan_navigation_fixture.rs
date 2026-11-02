@@ -159,7 +159,7 @@ fn main() -> Result<()> {
     }
     document.design = Some(design);
     document.version += 1;
-    files.write_working_document(session, plan, &document)?;
+    files.create_working_document(session, plan, &document)?;
     let mut store = SqliteStore::open(&data)?;
     let mut record = store
         .load_plan(plan)?

@@ -33,6 +33,7 @@ pub(super) struct RequestExecutor {
     session_id: String,
     execution_owner: Option<ExecutionOwner>,
     approval: Option<Result<PreparedApproval>>,
+    question_barrier: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl RequestExecutor {
@@ -61,6 +62,29 @@ impl RequestExecutor {
             session_id,
             execution_owner: None,
             approval: None,
+            question_barrier: None,
+        }
+    }
+
+    /// A waiting question shares the canonical runtime but owns its response state.
+    pub(super) fn fork_waiting_question(&self, barrier: tokio::sync::oneshot::Sender<()>) -> Self {
+        Self {
+            workspace: self.workspace.clone(),
+            approval_mode: self.approval_mode,
+            planning_feedback: self.planning_feedback,
+            plan_document: self.plan_document.clone(),
+            control_runtime: self.control_runtime.clone(),
+            task_authority: self.task_authority.clone(),
+            replay_invocation: None,
+            source_digests: None,
+            execution_finished: false,
+            permission_coordinator: self.permission_coordinator.clone(),
+            event_sink: self.event_sink.clone(),
+            trace: self.trace.clone(),
+            session_id: self.session_id.clone(),
+            execution_owner: self.execution_owner.clone(),
+            approval: None,
+            question_barrier: Some(barrier),
         }
     }
 
@@ -141,6 +165,9 @@ impl RequestExecutor {
                 json!({"jsonrpc":"2.0", "id":message["id"], "error":{"code":-32001,"message":format!("{error:#}")}})
             }
         };
+        if let Some(barrier) = self.question_barrier.take() {
+            let _ = barrier.send(());
+        }
         ExecutedRequest {
             control_completion: None,
             message,
@@ -314,7 +341,9 @@ impl RequestExecutor {
         invocation: &ControlToolInvocation,
     ) -> Result<Option<String>> {
         if let Some(runtime) = self.control_runtime.as_ref() {
-            let outcome = runtime.execute(invocation.clone()).await?;
+            let outcome = runtime
+                .execute_with_barrier(invocation.clone(), self.question_barrier.take())
+                .await?;
             self.plan_document = outcome.plan_document;
             self.source_digests = outcome.source_digests;
             self.execution_finished = outcome.execution_finished;
@@ -524,6 +553,79 @@ impl ExecutedRequest {
 mod tests {
     use super::*;
 
+    /// A clarification can complete while the same turn's required ask awaits an answer.
+    #[tokio::test]
+    async fn waiting_question_allows_same_turn_clarification_before_answer() -> Result<()> {
+        use crate::question::*;
+        let (root, _store, controller) = crate::task::SessionTaskController::test_goal();
+        let questions = Arc::new(QuestionController::open(root.path(), "session")?);
+        let mut executor = RequestExecutor::new(
+            root.path().to_string_lossy().into_owned(),
+            ApprovalMode::Ask,
+            PermissionCoordinator::transient(root.path())?,
+            None,
+            Arc::new(TraceStore::open(root.path())?),
+            "session".into(),
+        );
+        let mut context = ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        context.questions = Some(questions.clone());
+        context.question_exchange_id = Some("exchange".into());
+        context.bind_test_task_controller(controller);
+        executor.configure(context);
+        let (committed, ready) = tokio::sync::oneshot::channel();
+        let mut waiting = executor.fork_waiting_question(committed);
+        let ask = tokio::spawn(async move {
+            waiting.execute(json!({"id":1,"method":"item/tool/call","params":{
+                "tool":"question_ask","arguments":{"wait":true,"questions":[{
+                    "header":"Format","question":"Which format?","options":[{"label":"JSON","description":"Structured"}]
+                }]}
+            }}), Instant::now()).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), ready).await??;
+        assert!(!ask.is_finished());
+        let question = questions.snapshot()?.questions.remove(0);
+        questions.apply(QuestionCommand {
+            operation_id: "clarify".into(),
+            question_id: question.id.clone(),
+            revision: 1,
+            action: QuestionAction::Clarify {
+                text: "Show an example".into(),
+            },
+        })?;
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), executor.execute(json!({
+            "id":2,"method":"item/tool/call","params":{"tool":"question_reply","arguments":{
+                "question_id":question.id,"revision":1,"message_id":"clarify","text":"An example"
+            }}
+        }), Instant::now())).await?;
+        assert_eq!(
+            reply.response["result"]["success"], true,
+            "{}",
+            reply.response
+        );
+        assert!(
+            !ask.is_finished(),
+            "clarification must not answer the question"
+        );
+        questions.apply(QuestionCommand {
+            operation_id: "answer".into(),
+            question_id: question.id,
+            revision: 1,
+            action: QuestionAction::Answer {
+                answer: QuestionAnswer::Selected {
+                    option_id: "1:0".into(),
+                    feedback: None,
+                },
+            },
+        })?;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), ask).await??;
+        assert_eq!(
+            result.response["result"]["success"], true,
+            "{}",
+            result.response
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn persistent_question_tools_reach_the_canonical_runtime() -> Result<()> {
         use crate::question::*;
@@ -541,7 +643,7 @@ mod tests {
         context.questions = Some(questions.clone());
         context.question_exchange_id = Some("discussion".into());
         context.question_discussion = true;
-        context.task_controller = Some(task_controller);
+        context.bind_test_task_controller(task_controller);
         executor.configure(context);
         let execute = |tool: &str, arguments: Value| {
             json!({
@@ -620,7 +722,7 @@ mod tests {
             "session".into(),
         );
         let mut context = ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
-        context.task_controller = Some(controller.clone());
+        context.bind_test_task_controller(controller.clone());
         executor.configure(context);
         let result = executor
             .execute(

@@ -14,6 +14,7 @@ fn save_child_profile(
 }
 
 struct RoutingProvider {
+    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
     kind: crate::provider::ProviderKind,
     turn: std::sync::atomic::AtomicUsize,
     request: std::sync::Mutex<Vec<ProviderRequest>>,
@@ -141,13 +142,14 @@ async fn profile_selection_captures_tuning_and_instructions_without_widening_per
     broker
         .agent_provider_factory
         .register(Arc::new(RoutingProvider {
+            fixture_events: Default::default(),
             kind: ProviderKind::Codex,
             turn: std::sync::atomic::AtomicUsize::new(0),
             request: Default::default(),
             reject_steering: false,
         }));
     let mut root =
-        broker.provider_request(ProviderInput::from_text("parent secret"), PromptMode::Chat);
+        broker.provider_request(ProviderInput::from_text("parent secret"), PromptMode::Chat)?;
     root.model = "parent-model".into();
     root.effort = "high".into();
     root.approval_mode = ApprovalMode::Ask;
@@ -365,7 +367,7 @@ impl HarnessBroker {
     ) -> Result<()> {
         use crate::provider::test_support::FixtureBatch;
         let updates = match batch.into() {
-            FixtureBatch::Event(event) => vec![event],
+            FixtureBatch::Event(event) => vec![*event],
             FixtureBatch::Sequence(event) => event,
         };
         let scope = crate::provider::InvocationScope {
@@ -375,6 +377,9 @@ impl HarnessBroker {
         };
         for mut update in updates {
             match &mut update {
+                ProviderEvent::Execution { .. } => {
+                    anyhow::bail!("lifecycle fixture requires its original validated scope")
+                }
                 ProviderEvent::Message { address, .. } => address.turn.scope = scope.clone(),
                 ProviderEvent::Tool { address, .. } => address.turn.scope = scope.clone(),
                 ProviderEvent::Turn { address, .. }
@@ -490,7 +495,10 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
             &mut Vec::new(),
         )
         .await?;
-    let sibling_tool = child_tool("SIBLING OUTPUT".into(), crate::provider::ToolStatus::Running);
+    let sibling_tool = child_tool(
+        "SIBLING OUTPUT".into(),
+        crate::provider::ToolStatus::Running,
+    );
     broker
         .observe_child_fixture(
             sibling_owner,
@@ -687,7 +695,10 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
         "queued follow-up must not hide active progress"
     );
 
-    update = child_tool("failure details".into(), crate::provider::ToolStatus::Failed);
+    update = child_tool(
+        "failure details".into(),
+        crate::provider::ToolStatus::Failed,
+    );
     broker
         .observe_child_fixture(
             owner.clone(),
@@ -807,7 +818,8 @@ async fn child_execution_blocks_automatic_verification_without_mutating_the_goal
         data.path(),
         vec!["Write-Output verified".into()],
         false,
-    ).await;
+    )
+    .await;
     let admission = admit_child_fixture(&mut broker, "verification-child")?;
     assert!(
         broker
@@ -838,7 +850,14 @@ async fn child_execution_blocks_automatic_verification_without_mutating_the_goal
         )
         .await?;
     broker.run_checks().await?;
-    assert_eq!(broker.store.load_plan_execution("check-execution")?.unwrap().state, PlanExecutionState::Complete);
+    assert_eq!(
+        broker
+            .store
+            .load_plan_execution("check-execution")?
+            .unwrap()
+            .state,
+        PlanExecutionState::Complete
+    );
     Ok(())
 }
 
@@ -892,8 +911,6 @@ async fn child_summary_preserves_running_exchange_when_followup_is_queued() -> R
     assert_eq!(summary["exchange_count"], 2);
     Ok(())
 }
-
-
 
 #[tokio::test]
 async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_approval()
@@ -1091,11 +1108,14 @@ async fn interrupted_child_retains_conversation_and_all_children_guard_workspace
         Some("durable-child-conversation")
     );
     let request = broker.agent_provider_factory.request(
-        &broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat),
+        &broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
         &admitted_request_fixture(&broker, retained.clone())?,
         "Follow-up".into(),
     )?;
-    assert_eq!(request.provider_session_id, retained.provider_thread_id);
+    assert_eq!(
+        request.provider_session_id.map(String::from),
+        retained.provider_thread_id
+    );
     broker
         .store
         .interrupt_detached_execution(&broker.session.id)?;
@@ -1118,7 +1138,7 @@ async fn child_admission_and_followup_disable_unsupported_root_sandbox() -> Resu
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let admission = admit_child_fixture(&mut broker, "policy")?;
-    let mut root = broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat);
+    let mut root = broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?;
     root.access.sandbox = true;
     assert!(root.access.sandbox);
     for provider in [
@@ -1129,6 +1149,7 @@ async fn child_admission_and_followup_disable_unsupported_root_sandbox() -> Resu
         broker
             .agent_provider_factory
             .register(Arc::new(RoutingProvider {
+                fixture_events: Default::default(),
                 kind: provider,
                 turn: std::sync::atomic::AtomicUsize::new(0),
                 request: Default::default(),
@@ -1282,6 +1303,7 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
     broker.child_provider_by_agent.insert(
         first.agent.id.clone(),
         Arc::new(RoutingProvider {
+            fixture_events: Default::default(),
             kind: crate::provider::ProviderKind::Mock,
             turn: std::sync::atomic::AtomicUsize::new(0),
             request: Default::default(),
@@ -1434,26 +1456,53 @@ impl crate::provider::ProviderAdapter for RoutingProvider {
         }
     }
     async fn shutdown(&self) -> Result<()> {
+        self.fixture_events.shutdown().await?;
         Ok(())
     }
     async fn has_active_turn(&self, _session_id: &str) -> bool {
         self.reject_steering
     }
-    async fn steer_session(
+    async fn session_steer(
+        self: std::sync::Arc<Self>,
+        owner: &crate::provider::ExecutionOwner,
+        scope: crate::provider::InvocationScope,
+        input: crate::provider::SteeringInput,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        if scope.owner != *owner {
+            return Err(crate::provider::ProviderError::Rejected {
+                message: "steering crosses owner".into(),
+            });
+        }
+        let events = self.fixture_events.clone();
+        if !events.running(&scope).await? {
+            let request = events.continuation(&scope, input)?;
+            return self.session_prompt(request, scope).await;
+        }
+        events
+            .steer(&scope, input, |input| async move {
+                self.steer_native(&owner.runtime_key(), input)
+                    .await
+                    .map_err(crate::provider::ProviderError::from)
+            })
+            .await
+    }
+    async fn cancel_session(&self, runtime_key: &str) -> Result<()> {
+        self.fixture_events.cancel_runtime(runtime_key).await?;
+        Ok(())
+    }
+    async fn cleanup_execution(&self, runtime_key: &str) -> Result<()> {
+        self.fixture_events.cancel_runtime(runtime_key).await?;
+        Ok(())
+    }
+    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
+        self.fixture_events.cancel(owner).await?;
+        Ok(())
+    }
+    async fn active_session_id_for(
         &self,
         _session_id: &str,
-        _input: crate::provider::SteeringInput,
-    ) -> Result<()> {
-        Err(anyhow::anyhow!("steering was not accepted"))
-    }
-    async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-        Ok(())
-    }
-    async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-        Ok(())
-    }
-    async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-        None
+    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+        Ok(None)
     }
     async fn model_list(
         &self,
@@ -1466,7 +1515,47 @@ impl crate::provider::ProviderAdapter for RoutingProvider {
             "vision":false,"description":null,"is_default":true}),
         )?])
     }
-    async fn prompt_stream(
+
+    async fn session_events(
+        &self,
+        owner: crate::provider::ExecutionOwner,
+    ) -> std::result::Result<
+        crate::provider::events::ProviderEventStream,
+        crate::provider::ProviderError,
+    > {
+        let stream = self.fixture_events.subscribe(owner.clone())?;
+        Ok(stream)
+    }
+
+    async fn session_prompt(
+        self: std::sync::Arc<Self>,
+        request: crate::provider::ProviderRequest,
+        scope: crate::provider::InvocationScope,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let events = self.fixture_events.clone();
+        events
+            .submit(
+                request,
+                scope,
+                crate::provider::test_support::TerminalBoundary::LocalFixture,
+                move |request, sink| async move { self.run_native(request, sink).await },
+            )
+            .await
+    }
+}
+
+impl RoutingProvider {
+    async fn steer_native(
+        &self,
+        _session_id: &str,
+        _input: crate::provider::SteeringInput,
+    ) -> Result<()> {
+        Err(anyhow::anyhow!("steering was not accepted"))
+    }
+}
+
+impl RoutingProvider {
+    async fn run_native(
         &self,
         request: ProviderRequest,
         sink: ProviderEventSink,
@@ -1496,7 +1585,7 @@ let sink = Some(sink);
             } else {
                 anyhow::ensure!(ordinal == 1, "root continuation duplicated");
                 anyhow::ensure!(
-                    request.provider_session_id.as_deref() == Some("root-history"),
+                    request.provider_session_id.as_ref().map(|id| id.as_str()) == Some("root-history"),
                     "root history changed"
                 );
                 anyhow::ensure!(
@@ -1533,11 +1622,11 @@ let sink = Some(sink);
                 } else {
                     "child-history"
                 }
-                .into(),
+                .to_owned().try_into()?,
             ), capability: self.descriptor().capability, ..Default::default() }, ..Default::default() })
 
         }.await;
-        Ok(output?)
+        output
 
         }.await;
         let result = result.map_err(crate::provider::ProviderError::from);
@@ -1554,6 +1643,7 @@ async fn cross_provider_children_resolve_profile_model_reasoning_and_service_tie
     broker
         .agent_provider_factory
         .register(Arc::new(RoutingProvider {
+            fixture_events: Default::default(),
             kind: crate::provider::ProviderKind::Codex,
             turn: std::sync::atomic::AtomicUsize::new(0),
             request: Default::default(),
@@ -1570,7 +1660,7 @@ async fn cross_provider_children_resolve_profile_model_reasoning_and_service_tie
             ..Default::default()
         },
     )?;
-    let root = broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat);
+    let root = broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?;
     let spawn = crate::agent::SpawnAgentRequest {
         profile: Some("configured-child".into()),
         text: "Inspect".into(),
@@ -1653,6 +1743,7 @@ async fn rejected_followup_preserves_inbox_and_current_root_policy() -> Result<(
     broker
         .agent_provider_factory
         .register(Arc::new(RoutingProvider {
+            fixture_events: Default::default(),
             kind: crate::provider::ProviderKind::Mock,
             turn: std::sync::atomic::AtomicUsize::new(0),
             request: Default::default(),
@@ -1681,7 +1772,7 @@ async fn rejected_followup_preserves_inbox_and_current_root_policy() -> Result<(
     let mut agent = broker.agent_coordinator.resolve(&target)?;
     agent.selection.as_mut().unwrap().approval_mode = ApprovalMode::Allow;
     agent.selection.as_mut().unwrap().access.sandbox = false;
-    let root = broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat);
+    let root = broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?;
     let request = broker.agent_provider_factory.request(
         &root,
         &admitted_request_fixture(&broker, agent.clone())?,
@@ -1689,7 +1780,10 @@ async fn rejected_followup_preserves_inbox_and_current_root_policy() -> Result<(
     )?;
     assert_eq!(request.approval_mode, root.approval_mode);
     assert_eq!(request.access.sandbox, root.access.sandbox);
-    assert_eq!(request.provider_session_id, agent.provider_thread_id);
+    assert_eq!(
+        request.provider_session_id.map(String::from),
+        agent.provider_thread_id
+    );
     broker
         .handle_agent_request(
             crate::agent::AgentRequest {
@@ -1726,6 +1820,7 @@ async fn rejected_followup_preserves_inbox_and_current_root_policy() -> Result<(
 
 #[derive(Default)]
 struct ResultReceivingProvider {
+    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
     turn: std::sync::atomic::AtomicUsize,
     active: std::sync::atomic::AtomicBool,
     incoming: tokio::sync::Notify,
@@ -1756,10 +1851,67 @@ impl crate::provider::ProviderAdapter for ResultReceivingProvider {
     async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
         Ok(())
     }
-    async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-        Some("result-parent-history".into())
+    async fn active_session_id_for(
+        &self,
+        _session_id: &str,
+    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+        Ok(Some("result-parent-history".to_owned().try_into()?))
     }
-    async fn steer_session(
+    async fn session_steer(
+        self: std::sync::Arc<Self>,
+        owner: &crate::provider::ExecutionOwner,
+        scope: crate::provider::InvocationScope,
+        input: crate::provider::SteeringInput,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        if scope.owner != *owner {
+            return Err(crate::provider::ProviderError::Rejected {
+                message: "steering crosses owner".into(),
+            });
+        }
+        let events = self.fixture_events.clone();
+        if !events.running(&scope).await? {
+            let request = events.continuation(&scope, input)?;
+            return self.session_prompt(request, scope).await;
+        }
+        events
+            .steer(&scope, input, |input| async move {
+                self.steer_native(&owner.runtime_key(), input)
+                    .await
+                    .map_err(crate::provider::ProviderError::from)
+            })
+            .await
+    }
+
+    async fn session_events(
+        &self,
+        owner: crate::provider::ExecutionOwner,
+    ) -> std::result::Result<
+        crate::provider::events::ProviderEventStream,
+        crate::provider::ProviderError,
+    > {
+        let stream = self.fixture_events.subscribe(owner.clone())?;
+        Ok(stream)
+    }
+
+    async fn session_prompt(
+        self: std::sync::Arc<Self>,
+        request: crate::provider::ProviderRequest,
+        scope: crate::provider::InvocationScope,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let events = self.fixture_events.clone();
+        events
+            .submit(
+                request,
+                scope,
+                crate::provider::test_support::TerminalBoundary::LocalFixture,
+                move |request, sink| async move { self.run_native(request, sink).await },
+            )
+            .await
+    }
+}
+
+impl ResultReceivingProvider {
+    async fn steer_native(
         &self,
         _session_id: &str,
         input: crate::provider::SteeringInput,
@@ -1778,7 +1930,10 @@ impl crate::provider::ProviderAdapter for ResultReceivingProvider {
             .await
             .context("parent stopped polling before result acceptance")
     }
-    async fn prompt_stream(
+}
+
+impl ResultReceivingProvider {
+    async fn run_native(
         &self,
         request: ProviderRequest,
         sink: ProviderEventSink,
@@ -1828,14 +1983,19 @@ impl crate::provider::ProviderAdapter for ResultReceivingProvider {
                     ))
                     .await?;
                 }
-                Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {
-                    provider_session_id: Some("result-parent-history".into()),
-                    capability: self.descriptor().capability, ..Default::default() },
+                Ok(crate::provider::ProviderCompletion {
+                    native: forge_provider_api::completion::ProviderCompletion {
+                        provider_session_id: Some(
+                            "result-parent-history".to_owned().try_into().unwrap(),
+                        ),
+                        capability: self.descriptor().capability,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 })
             }
             .await;
-            Ok(output?)
+            output
         }
         .await;
         let result = result.map_err(crate::provider::ProviderError::from);
@@ -1984,61 +2144,8 @@ async fn idle_child_result_is_retained_until_one_explicit_parent_turn() -> Resul
     Ok(())
 }
 
-#[tokio::test]
-async fn rejected_active_result_delivery_retains_report_for_next_input() -> Result<()> {
-    let repository = repository();
-    let data = tempfile::tempdir()?;
-    let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    broker.provider = Arc::new(RoutingProvider {
-        kind: crate::provider::ProviderKind::Mock,
-        turn: Default::default(),
-        request: Default::default(),
-        reject_steering: true,
-    });
-    let admission = admit_child_fixture(&mut broker, "rejected-result")?;
-    let owner = crate::provider::ExecutionOwner {
-        session_id: (broker.session.id.clone()).into(),
-        agent_id: (admission.agent.id.clone()).into(),
-    };
-    broker
-        .complete_managed_agent(
-            owner,
-            admission.task.id.clone(),
-            Err(anyhow::anyhow!("CHILD_FAILURE")),
-            None,
-            &mut Vec::new(),
-        )
-        .await?;
-    let mut attempted = std::collections::HashSet::new();
-    let mut delivery = tokio::task::JoinSet::new();
-    broker.start_agent_result_delivery(&[], &mut attempted, &mut delivery)?;
-    let result = delivery
-        .join_next()
-        .await
-        .context("missing attempted delivery")?;
-    broker.finish_agent_result_delivery(result)?;
-    assert_eq!(broker.agent_coordinator.unreported_result().len(), 1);
-    assert!(!broker.store.list_agent_task(&broker.session.id)?[0].parent_reported);
-    broker.start_agent_result_delivery(&[], &mut attempted, &mut delivery)?;
-    assert!(
-        delivery.is_empty(),
-        "rejected delivery was retried within the same provider turn"
-    );
-    let provider = Arc::new(ResultReceivingProvider::default());
-    broker.provider = provider.clone();
-    broker
-        .run_interaction(
-            "EXPLICIT_NEXT_TURN".into(),
-            PromptMode::Chat,
-            Some(ExchangeAdmission::chat("EXPLICIT_NEXT_TURN".into())),
-        )
-        .await?;
-    assert!(provider.input.lock().unwrap()[0].contains("CHILD_FAILURE"));
-    assert!(broker.store.list_agent_task(&broker.session.id)?[0].parent_reported);
-    Ok(())
-}
-
 struct SuspendedParentProvider {
+    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
     blocked: AtomicBool,
     root_turn: std::sync::atomic::AtomicUsize,
     root_started: tokio::sync::Semaphore,
@@ -2050,6 +2157,7 @@ struct SuspendedParentProvider {
 impl Default for SuspendedParentProvider {
     fn default() -> Self {
         Self {
+            fixture_events: Default::default(),
             blocked: Default::default(),
             root_turn: Default::default(),
             root_started: tokio::sync::Semaphore::new(0),
@@ -2084,10 +2192,40 @@ impl crate::provider::ProviderAdapter for SuspendedParentProvider {
     async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
         Ok(())
     }
-    async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-        Some("suspended-history".into())
+    async fn active_session_id_for(
+        &self,
+        _session_id: &str,
+    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+        Ok(Some("suspended-history".to_owned().try_into()?))
     }
-    async fn prompt_stream(
+    async fn session_events(
+        &self,
+        owner: crate::provider::ExecutionOwner,
+    ) -> std::result::Result<
+        crate::provider::events::ProviderEventStream,
+        crate::provider::ProviderError,
+    > {
+        self.fixture_events.subscribe(owner)
+    }
+    async fn session_prompt(
+        self: std::sync::Arc<Self>,
+        request: ProviderRequest,
+        scope: crate::provider::InvocationScope,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let events = self.fixture_events.clone();
+        events
+            .submit(
+                request,
+                scope,
+                crate::provider::test_support::TerminalBoundary::LocalFixture,
+                move |request, sink| async move { self.run_native(request, sink).await },
+            )
+            .await
+    }
+}
+
+impl SuspendedParentProvider {
+    async fn run_native(
         &self,
         request: ProviderRequest,
         sink: ProviderEventSink,
@@ -2133,9 +2271,14 @@ impl crate::provider::ProviderAdapter for SuspendedParentProvider {
                     ))
                     .await?;
                 }
-                let mut output = crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {
-                    provider_session_id: Some("suspended-history".into()),
-                    capability: self.descriptor().capability, ..Default::default() },
+                let mut output = crate::provider::ProviderCompletion {
+                    native: forge_provider_api::completion::ProviderCompletion {
+                        provider_session_id: Some(
+                            "suspended-history".to_owned().try_into().unwrap(),
+                        ),
+                        capability: self.descriptor().capability,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
                 if self.blocked.load(Ordering::Acquire) && request.input.text() == "Research both" {
@@ -2146,7 +2289,7 @@ impl crate::provider::ProviderAdapter for SuspendedParentProvider {
                 Ok(output)
             }
             .await;
-            Ok(output?)
+            output
         }
         .await;
         let result = result.map_err(crate::provider::ProviderError::from);

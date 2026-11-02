@@ -17,7 +17,8 @@ pub(crate) use activity::status as tool_activity_status;
 pub(crate) use activity::{AgentActivity, AgentToolReference};
 pub use coordinator::{
     AgentAdmission, AgentCommand, AgentCommandSender, AgentCommit, AgentCoordinator,
-    AgentOperation, AgentQuiescence, AgentRequest, AgentWork, SpawnAgentRequest,
+    AgentOperation, AgentQuiescence, AgentRequest, AgentRequestAuthority, AgentWork,
+    SpawnAgentRequest,
 };
 pub use profile::{AgentProfile, AgentProfileDocument, AgentProfileStore};
 pub use selection::AgentSelection;

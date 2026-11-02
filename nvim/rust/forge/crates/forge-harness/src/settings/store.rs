@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const SETTINGS_FORMAT_VERSION: u32 = 4;
+const SETTINGS_FORMAT_VERSION: u32 = 5;
 
 enum SettingLayerChange<'setting> {
     Replace {
@@ -277,6 +277,11 @@ struct SettingsReceipt {
 }
 
 impl SettingsStore {
+    #[cfg(test)]
+    pub(crate) fn execute_test_sql(&self, sql: &str) -> Result<()> {
+        self.connection.execute_batch(sql)?;
+        Ok(())
+    }
     pub(crate) fn read_only(data_root: &Path) -> Result<Self> {
         let connection = Connection::open_with_flags(
             data_root.join("settings.db"),
@@ -296,6 +301,7 @@ impl SettingsStore {
         std::fs::create_dir_all(data_root)?;
         let mut connection = Connection::open(data_root.join("settings.db"))?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         anyhow::ensure!(
             version <= 1,
@@ -542,6 +548,127 @@ impl SettingsStore {
         Ok(self
             .write_layer(SettingLayerChange::Patch(setting), target, None, &[])?
             .revision)
+    }
+
+    /// Hold the settings revision stable while committing a captured host configuration.
+    pub(crate) fn commit_configuration<T>(
+        &mut self,
+        expected_revision: u64,
+        target: SettingTarget<'_>,
+        portable: Option<&PortableSettings>,
+        provider: Option<(&str, &Value)>,
+        intent: Option<&crate::storage::configuration::ConfigurationIntent>,
+        apply: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let revision = u64::try_from(transaction.query_row(
+            "SELECT revision FROM setting_revision WHERE id=1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?)?;
+        ensure!(
+            revision == expected_revision,
+            "settings revision conflict: expected {expected_revision}, current {revision}"
+        );
+        let mut next = revision;
+        if let Some(patch) = portable {
+            let (scope, identity) = match target.scope {
+                SettingScope::Global => ("global", ""),
+                SettingScope::Workspace => ("workspace", target.workspace),
+                SettingScope::Session => ("session", target.session),
+            };
+            let payload = transaction
+                .query_row(
+                    "SELECT payload FROM setting_layer WHERE scope=?1 AND identity=?2",
+                    params![scope, identity],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let mut setting = payload
+                .map(|payload| SettingsRecord::<PortableSettings>::decode(&payload))
+                .transpose()?
+                .flatten()
+                .unwrap_or_default();
+            setting.inherit(patch.clone());
+            if let Some(policy) = &setting.auto_compaction {
+                policy.validate(None)?;
+            }
+            if let Some(timeout) = setting.approval_timeout {
+                timeout.validate()?;
+            }
+            if let Some(timeout) = setting.tool_timeout {
+                timeout.require_expiry()?;
+            }
+            if let Some(access) = &setting.access {
+                access.clone().validate()?;
+            }
+            if let Some(shell) = setting.shell {
+                shell.executable()?;
+            }
+            transaction.execute("INSERT INTO setting_layer VALUES (?1,?2,?3) ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload", params![scope, identity, SettingsRecord::encode(&setting)?])?;
+            next = next.checked_add(1).context("settings revision exhausted")?;
+        }
+        if let Some((provider, value)) = provider {
+            let fields = value
+                .as_object()
+                .context("provider preferences must be an object")?;
+            let payload = transaction
+                .query_row(
+                    "SELECT payload FROM setting_layer WHERE scope='provider' AND identity=?1",
+                    [provider],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let mut preference: Value = payload
+                .map(|payload| serde_json::from_str(&payload))
+                .transpose()?
+                .unwrap_or_else(|| serde_json::json!({}));
+            let destination = preference
+                .as_object_mut()
+                .context("saved provider preferences must be an object")?;
+            for (field, value) in fields {
+                if value.is_null() {
+                    destination.remove(field);
+                } else {
+                    destination.insert(field.clone(), value.clone());
+                }
+            }
+            transaction.execute("INSERT INTO setting_layer VALUES ('provider',?1,?2) ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload", params![provider, serde_json::to_string(&preference)?])?;
+            next = next.checked_add(1).context("settings revision exhausted")?;
+        }
+        if next != revision {
+            transaction.execute(
+                "UPDATE setting_revision SET revision=?1 WHERE id=1",
+                [i64::try_from(next)?],
+            )?;
+        }
+        let value = apply()?;
+        if let Some(intent) = intent {
+            let receipt = SettingsReceipt {
+                request: serde_json::to_value(intent)?,
+                mutation: SettingsMutation {
+                    revision: next,
+                    field: Vec::new(),
+                },
+            };
+            transaction.execute(
+                "INSERT INTO setting_operation VALUES (?1,?2,?3)",
+                params![intent.id, intent.session, SettingsRecord::encode(&receipt)?],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(value)
+    }
+
+    pub(crate) fn configuration_applied(
+        &self,
+        intent: &crate::storage::configuration::ConfigurationIntent,
+    ) -> Result<bool> {
+        Ok(self
+            .operation(&intent.session, &intent.id, &serde_json::to_value(intent)?)?
+            .is_some())
     }
 
     /// Merge explicit directory grants into global settings without replacing concurrent preferences.
@@ -1063,10 +1190,72 @@ mod test {
     use super::*;
 
     #[test]
+    fn configuration_commit_rejects_stale_revision_before_host_mutation() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let mut store = SettingsStore::open(fixture.path())?;
+        let expected = store.get("workspace", "session", "mock")?.revision;
+        let target = || SettingTarget {
+            scope: SettingScope::Session,
+            workspace: "workspace",
+            session: "session",
+        };
+        store.patch(
+            target(),
+            &PortableSettings {
+                status_thoughts: Some(true),
+                ..Default::default()
+            },
+        )?;
+        let mut applied = false;
+        let result = store.commit_configuration(expected, target(), None, None, None, || {
+            applied = true;
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert!(!applied);
+        assert_eq!(
+            store
+                .get("workspace", "session", "mock")?
+                .desired
+                .status_thoughts,
+            Some(true)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configuration_commit_rolls_back_settings_when_host_fails() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let mut store = SettingsStore::open(fixture.path())?;
+        let expected = store.get("workspace", "session", "mock")?.revision;
+        let patch = PortableSettings {
+            status_thoughts: Some(true),
+            ..Default::default()
+        };
+        let result = store.commit_configuration(
+            expected,
+            SettingTarget {
+                scope: SettingScope::Session,
+                workspace: "workspace",
+                session: "session",
+            },
+            Some(&patch),
+            None,
+            None,
+            || -> Result<()> { anyhow::bail!("host failed") },
+        );
+        assert!(result.is_err());
+        let after = store.get("workspace", "session", "mock")?;
+        assert_eq!(after.revision, expected);
+        assert_ne!(after.desired.status_thoughts, Some(true));
+        Ok(())
+    }
+
+    #[test]
     fn incompatible_settings_stay_hidden_across_every_persistence_path() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let mut store = SettingsStore::open(fixture.path())?;
-        let obsolete = r#"{"format_version":2,"payload":{"default_approval":"allow","plan_approval":"deny","status_thoughts":false}}"#;
+        let obsolete = r#"{"format_version":4,"payload":{"access":{"sandbox":true,"write_access":"workspace","writable_directory":[],"windows_sandbox":true},"status_thoughts":false}}"#;
         for (scope, identity) in [
             ("global", ""),
             ("workspace", "workspace"),
@@ -1175,7 +1364,12 @@ mod test {
     fn current_settings_decode_failures_remain_visible() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let store = SettingsStore::open(fixture.path())?;
-        for payload in ["{", r#"{"format_version":4,"payload":{"shell":"invalid"}}"#] {
+        let invalid = serde_json::json!({
+            "format_version": SETTINGS_FORMAT_VERSION,
+            "payload": {"shell": "invalid"},
+        })
+        .to_string();
+        for payload in ["{", invalid.as_str()] {
             store.connection.execute(
                 "INSERT OR REPLACE INTO setting_layer VALUES ('global','',?1)",
                 [payload],
@@ -1184,7 +1378,11 @@ mod test {
         }
         store.connection.execute(
             "UPDATE setting_layer SET payload=?1",
-            [r#"{"format_version":5,"payload":{"future_setting":true}}"#],
+            [serde_json::json!({
+                "format_version": SETTINGS_FORMAT_VERSION + 1,
+                "payload": {"future_setting": true},
+            })
+            .to_string()],
         )?;
         assert!(
             store

@@ -1,6 +1,9 @@
 // Proving Send for the broker's nested async futures exceeds the default depth.
 #![recursion_limit = "256"]
 
+#[cfg(test)]
+extern crate self as forge_harness;
+
 pub mod agent;
 /// Typed file attachments captured independently of prompt text.
 pub mod attachment;
@@ -34,3 +37,7 @@ pub mod tools;
 pub mod trace;
 pub mod turn;
 pub mod workspace;
+
+#[cfg(test)]
+#[path = "../tests/live_provider/suite.rs"]
+mod live_provider;

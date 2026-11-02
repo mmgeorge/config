@@ -13,6 +13,9 @@ impl From<crate::copilot::decode::DecodeError> for ProviderError {
 impl From<CodexConnectionError> for ProviderError {
     fn from(error: CodexConnectionError) -> Self {
         match error {
+            CodexConnectionError::Overflow => {
+                Self::Observation(forge_provider_api::lifecycle::ObservationFailure::Overflow)
+            }
             error @ CodexConnectionError::Encoding(_) => Self::Protocol {
                 message: error.to_string(),
             },

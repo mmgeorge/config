@@ -71,17 +71,17 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
     assert!(empty["session"].is_null());
     assert!(SqliteStore::open(&data)?.list_session(None)?.is_empty());
     let first = generate(&first_manager, &root, &data).await?;
-    first_manager.shutdown().await;
+    first_manager.shutdown().await?;
     assert!(!first.text.is_empty());
     let second = generate(&first_manager, &root, &data).await?;
-    first_manager.shutdown().await;
+    first_manager.shutdown().await?;
     assert_eq!(first.session_id, second.session_id);
     git(
         &root,
         &["commit", "-q", "--allow-empty", "-m", "feat: initial"],
     );
     let third = generate(&first_manager, &root, &data).await?;
-    first_manager.shutdown().await;
+    first_manager.shutdown().await?;
     assert_eq!(
         first.session_id, third.session_id,
         "first commit should advance an unborn branch"
@@ -94,7 +94,7 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
         left?.session_id, right?.session_id,
         "concurrent requests created different conversations"
     );
-    first_manager.shutdown().await;
+    first_manager.shutdown().await?;
 
     drop(first_manager);
     {
@@ -120,7 +120,7 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
     }
     let resumed_manager = manager();
     let resumed = generate(&resumed_manager, &root, &data).await?;
-    resumed_manager.shutdown().await;
+    resumed_manager.shutdown().await?;
     assert_eq!(
         first.session_id, resumed.session_id,
         "fresh manager lost durable session"
@@ -130,7 +130,7 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
 
     git(&root, &["switch", "-q", "-c", "feature"]);
     let branch = generate(&resumed_manager, &root, &data).await?;
-    resumed_manager.shutdown().await;
+    resumed_manager.shutdown().await?;
     assert_ne!(first.session_id, branch.session_id);
     git(
         &root,
@@ -144,7 +144,7 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
         ],
     );
     let rewritten = generate(&resumed_manager, &root, &data).await?;
-    resumed_manager.shutdown().await;
+    resumed_manager.shutdown().await?;
     assert_ne!(branch.session_id, rewritten.session_id);
     let store = SqliteStore::open(&data)?;
     assert_eq!(store.list_exchange(&first.session_id)?.len(), 6);
@@ -204,7 +204,7 @@ async fn background_reuses_one_provider_thread_for_commits_and_pull_requests() -
                 },
             })
             .await?;
-        owner.shutdown().await;
+        owner.shutdown().await?;
         let store = SqliteStore::open(&data)?;
         let session = store
             .load_session(&result.session_id)?

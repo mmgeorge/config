@@ -2567,6 +2567,9 @@ function M.attach()
   state.command_set = M.command_set()
   M.attach_transcript(state.transcript_buf)
   keymaps.setup_view_keymaps(state.composer_buf, "harness", M.composer_command_set())
+  require("forge.views.harness.composer_interrupt").attach(composer_buffer,
+    function() return harness_state() == state and state.composer_buf == composer_buffer end,
+    function() M.cancel_turn() end)
   require("forge.views.harness.workspace").attach(state)
   prompt_history.attach(state.composer_buf)
   if state.unsubscribe then state.unsubscribe() end

@@ -358,6 +358,20 @@ impl MessageReceiver {
         }
     }
 
+    /// Drain accepted frames after a producer failure without admitting more writes.
+    pub fn try_drain(&mut self) -> io::Result<EncodedFrame> {
+        if let Ok(frame) = self.control_receiver.try_recv() {
+            return Ok(frame);
+        }
+        self.receiver.try_recv().map_err(|error| {
+            let kind = match error {
+                mpsc::error::TryRecvError::Empty => io::ErrorKind::WouldBlock,
+                mpsc::error::TryRecvError::Disconnected => io::ErrorKind::UnexpectedEof,
+            };
+            io::Error::new(kind, error)
+        })
+    }
+
     pub fn try_recv(&mut self) -> io::Result<EncodedFrame> {
         self.check()?;
         if let Ok(frame) = self.control_receiver.try_recv() {

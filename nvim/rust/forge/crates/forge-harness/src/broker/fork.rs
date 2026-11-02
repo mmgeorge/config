@@ -165,7 +165,10 @@ pub fn prepare_provider_fork(
             service_tier: source.service_tier,
             access: source.access,
             approval_mode: source.approval_mode,
-            provider_session_id: fork_point.provider_session_id,
+            provider_session_id: fork_point
+                .provider_session_id
+                .map(TryInto::try_into)
+                .transpose()?,
             submission: None,
             recovered_input: Vec::new(),
             control_context: None,
@@ -205,7 +208,7 @@ impl HarnessBroker {
         };
         let (event, timing) = match result {
             Ok(result) => {
-                self.session.provider_session_id = Some(result.provider_session_id);
+                self.session.provider_session_id = Some(result.provider_session_id.into());
                 self.session.provider_fork_state = ProviderForkState::Ready;
                 ("session_fork_ready", result.timing)
             }

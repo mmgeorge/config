@@ -3,34 +3,108 @@ use std::sync::Arc;
 
 use crate::task::{SessionTaskController, TaskPermit};
 
+/// Retain a callback's captured evaluator and its revocation authority.
+#[derive(Clone)]
+pub(crate) struct PermissionAuthoritySnapshot {
+    store: Arc<std::sync::RwLock<crate::permissions::store::PermissionStore>>,
+    compiled: Arc<crate::permissions::matcher::CompiledPermissionDocument>,
+    epoch: crate::permissions::store::PermissionRevocationEpoch,
+}
+
+impl PermissionAuthoritySnapshot {
+    pub(crate) fn capture(
+        store: Arc<std::sync::RwLock<crate::permissions::store::PermissionStore>>,
+        current: &crate::permissions::store::PermissionStore,
+    ) -> Self {
+        Self {
+            store,
+            compiled: current.compiled(),
+            epoch: current.revocation_epoch(),
+        }
+    }
+
+    /// Get the evaluator captured with the callback authority.
+    pub(crate) fn compiled(&self) -> Arc<crate::permissions::matcher::CompiledPermissionDocument> {
+        self.compiled.clone()
+    }
+}
+
 /// Preserves the task contract that admitted a provider callback across asynchronous waits.
 #[derive(Clone)]
 pub(crate) struct TaskAuthority {
     controller: Option<Arc<SessionTaskController>>,
-    permit: TaskPermit,
+    permit: Option<TaskPermit>,
+    generation: Option<u64>,
+    permission_snapshot: Option<PermissionAuthoritySnapshot>,
+    permission_required: bool,
 }
 
 impl TaskAuthority {
     pub(crate) fn capture(context: &super::ControlTurnContext) -> Option<Self> {
-        context.task_permit.as_ref().map(|permit| Self {
+        context.task_controller.as_ref().map(|_| Self {
             controller: context.task_controller.clone(),
-            permit: permit.clone(),
+            permit: context.task_permit.clone(),
+            generation: context.task_generation,
+            permission_snapshot: context.permission_snapshot.clone(),
+            permission_required: context.permission_required,
         })
     }
 
     /// Rejects callbacks whose task was replaced, suspended, cleared, or not acknowledged.
     pub(crate) fn validate(&self) -> Result<()> {
-        let current = self
+        self.commit(|| {
+            if self.permit.is_some() {
+                let current = self
+                    .controller
+                    .as_ref()
+                    .context("task callback has no session controller")?
+                    .current()?;
+                ensure!(
+                    current.as_ref().is_some_and(|task| task.entry_accepted()),
+                    "task entry has not been acknowledged by the provider"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    /// Fence task and taskless scopes without imposing an entry-acknowledgment policy.
+    pub(crate) fn validate_scope(&self) -> Result<()> {
+        self.commit(|| Ok(()))
+    }
+
+    /// Validate under the shared task gate and perform only a short synchronous commit.
+    pub(crate) fn commit<T>(&self, commit: impl FnOnce() -> Result<T>) -> Result<T> {
+        let controller = self
             .controller
             .as_ref()
-            .context("task callback has no session controller")?
-            .current()?;
-        self.permit.validate(current.as_ref())?;
-        ensure!(
-            current.as_ref().is_some_and(|task| task.entry_accepted()),
-            "task entry has not been acknowledged by the provider"
-        );
-        Ok(())
+            .context("task callback has no session controller")?;
+        let generation = self
+            .generation
+            .context("task callback generation was not captured")?;
+        controller.with_callback_authority(generation, self.permit.as_ref(), || {
+            if self.permission_required && self.permission_snapshot.is_none() {
+                anyhow::bail!("permission authority was not captured");
+            }
+            let permission = self
+                .permission_snapshot
+                .as_ref()
+                .map(|snapshot| -> Result<_> {
+                    let guard = snapshot
+                        .store
+                        .read()
+                        .map_err(|_| anyhow::anyhow!("permission authority lock poisoned"))?;
+                    anyhow::ensure!(
+                        guard.revocation_epoch() == snapshot.epoch,
+                        "permission authority changed before callback"
+                    );
+                    Ok(guard)
+                })
+                .transpose()?;
+            let result = commit();
+            drop(permission);
+            result
+        })
     }
 }
 
@@ -48,6 +122,7 @@ mod test {
         );
         context.task_controller = Some(controller.clone());
         context.task_permit = Some(task.permit());
+        context.task_generation = Some(controller.callback_snapshot()?.0);
         let authority = TaskAuthority::capture(&context).unwrap();
         authority.validate()?;
         let mut replacement = Task::goal("Replacement".into(), Default::default(), false, 2);
@@ -67,6 +142,7 @@ mod test {
                 .is::<crate::task::StaleTask>()
         );
         context.task_permit = Some(replacement.permit());
+        context.task_generation = Some(controller.callback_snapshot()?.0);
         let pending = TaskAuthority::capture(&context).unwrap();
         assert!(pending.validate().is_err());
         controller.acknowledge_entry(
@@ -76,6 +152,216 @@ mod test {
             3,
         )?;
         pending.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn taskless_callback_cannot_survive_task_install_and_clear() -> Result<()> {
+        let (_root, mut store, controller) = SessionTaskController::test_goal();
+        let original = controller.current()?.unwrap();
+        controller.change(&mut store, Some(&original.revision), TaskChange::Clear, 2)?;
+        let mut context =
+            super::super::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        context.task_controller = Some(controller.clone());
+        context.task_generation = Some(controller.callback_snapshot()?.0);
+        let authority = TaskAuthority::capture(&context).unwrap();
+        authority.validate()?;
+        let next = controller
+            .change(
+                &mut store,
+                None,
+                TaskChange::Install(Box::new(Task::goal(
+                    "new goal".into(),
+                    Default::default(),
+                    false,
+                    3,
+                ))),
+                3,
+            )?
+            .unwrap();
+        controller.change(&mut store, Some(&next.revision), TaskChange::Clear, 4)?;
+        let mut mutated = false;
+        assert!(
+            authority
+                .commit(|| {
+                    mutated = true;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(
+            !mutated,
+            "revoked taskless callback committed after task replacement"
+        );
+        Ok(())
+    }
+
+    /// A grant made by an approval does not revoke the same turn's control tools.
+    #[tokio::test]
+    async fn approved_allow_grant_preserves_followup_tool_but_deny_revokes_it() -> Result<()> {
+        use crate::permissions::document::PermissionDecision;
+        let (root, _store, controller) = SessionTaskController::test_goal();
+        let permissions = Arc::new(std::sync::RwLock::new(
+            crate::permissions::store::PermissionStore::load(
+                root.path().join("permissions.json"),
+                root.path(),
+            )?,
+        ));
+        let captured = {
+            let store = permissions.read().unwrap();
+            PermissionAuthoritySnapshot::capture(permissions.clone(), &store)
+        };
+        let old = captured.compiled();
+        let mut context =
+            super::super::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        context.bind_test_task_controller(controller);
+        let questions = Arc::new(crate::question::QuestionController::open(
+            root.path(),
+            "session",
+        )?);
+        context.questions = Some(questions.clone());
+        context.question_exchange_id = Some("exchange".into());
+        context.permission_snapshot = Some(captured);
+        context.permission_required = true;
+        let executor = super::super::ControlToolExecutor::new(context);
+        let coordinator = Arc::new(crate::provider::approval::PermissionCoordinator::new(
+            permissions.clone(),
+        ));
+        let (sink, mut stream) =
+            crate::provider::events::channel(crate::provider::InvocationScope::new(
+                crate::provider::ExecutionOwner::root("approval"),
+                "exchange",
+            ));
+        let waiting_coordinator = coordinator.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_coordinator
+                .authorize(
+                    crate::session::ApprovalMode::Ask,
+                    crate::permissions::matcher::PermissionRequest {
+                        id: "rg".into(),
+                        provider: "test".into(),
+                        reason: None,
+                        target_list: vec![crate::permissions::matcher::PermissionTarget::Command {
+                            command: "rg --files".into(),
+                            shell: None,
+                        }],
+                    },
+                    None,
+                    Some(&sink),
+                )
+                .await
+        });
+        let event = stream.recv().await?.context("approval event missing")?;
+        let crate::provider::ProviderEvent::Approval {
+            update: crate::provider::ApprovalUpdate::Requested(view),
+            ..
+        } = event
+        else {
+            anyhow::bail!("expected approval request")
+        };
+        coordinator
+            .resolve(
+                &view.id,
+                &[crate::provider::approval::ApprovalAnswer {
+                    item_id: view.item_list[0].id.clone(),
+                    choice_id: "allow_broad".into(),
+                }],
+                None,
+            )
+            .await?;
+        waiting.await??;
+        assert!(!Arc::ptr_eq(&old, &permissions.read().unwrap().compiled()));
+        let question = executor.execute(super::super::ControlToolInvocation {
+            task_permit: None,
+            name: "question_ask".into(),
+            arguments: serde_json::json!({"questions":[{"header":"Choice", "question":"What should happen?", "options":[]}]}),
+        }).await?;
+        assert!(question.result.is_ok());
+        drop(question);
+        assert_eq!(questions.snapshot()?.questions.len(), 1);
+        let invocation = || super::super::ControlToolInvocation {
+            task_permit: None,
+            name: "goal_status".into(),
+            arguments: serde_json::json!({"status":"working"}),
+        };
+        assert!(executor.execute(invocation()).await?.result.is_ok());
+        permissions.write().unwrap().set_rule_list(&[(
+            "read".into(),
+            "private/**".into(),
+            PermissionDecision::Deny,
+        )])?;
+        let error = executor.execute(invocation()).await.unwrap_err();
+        assert!(error.to_string().contains("permission authority changed"));
+        Ok(())
+    }
+
+    /// Replacing a store cannot recycle an old permission generation.
+    #[test]
+    fn replacing_permission_store_revokes_captured_callback() -> Result<()> {
+        let (root, _store, controller) = SessionTaskController::test_goal();
+        let path = root.path().join("permissions.json");
+        let permissions = Arc::new(std::sync::RwLock::new(
+            crate::permissions::store::PermissionStore::load(&path, root.path())?,
+        ));
+        let captured = {
+            let store = permissions.read().unwrap();
+            PermissionAuthoritySnapshot::capture(permissions.clone(), &store)
+        };
+        let mut context =
+            super::super::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        context.bind_test_task_controller(controller);
+        context.permission_snapshot = Some(captured);
+        context.permission_required = true;
+        let authority = TaskAuthority::capture(&context).unwrap();
+        authority.validate_scope()?;
+        *permissions.write().unwrap() =
+            crate::permissions::store::PermissionStore::load(&path, root.path())?;
+        assert!(authority.validate_scope().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn policy_replacement_revokes_captured_callback_before_mutation() -> Result<()> {
+        let (root, _store, controller) = SessionTaskController::test_goal();
+        let task = controller.current()?.unwrap();
+        let permissions = Arc::new(std::sync::RwLock::new(
+            crate::permissions::store::PermissionStore::load(
+                root.path().join("permissions.json"),
+                root.path(),
+            )?,
+        ));
+        let captured = {
+            let current = permissions.read().unwrap();
+            PermissionAuthoritySnapshot::capture(permissions.clone(), &current)
+        };
+        let mut context = super::super::ControlTurnContext::inactive(
+            crate::provider::PromptMode::GoalContinuation,
+        );
+        context.task_controller = Some(controller.clone());
+        context.task_permit = Some(task.permit());
+        context.task_generation = Some(controller.callback_snapshot()?.0);
+        context.permission_snapshot = Some(captured);
+        context.permission_required = true;
+        let authority = TaskAuthority::capture(&context).unwrap();
+        authority.validate_scope()?;
+        permissions.write().unwrap().set_rule_list(&[(
+            "read".into(),
+            "private/**".into(),
+            crate::permissions::document::PermissionDecision::Deny,
+        )])?;
+        let mut mutated = false;
+        assert!(
+            authority
+                .commit(|| {
+                    mutated = true;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert!(
+            !mutated,
+            "old policy authority committed after policy replacement"
+        );
         Ok(())
     }
 }

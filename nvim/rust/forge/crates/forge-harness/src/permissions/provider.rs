@@ -1,11 +1,14 @@
 use super::matcher::PermissionRequest;
 use super::session_directory::SessionDirectory;
-use crate::provider::approval::{ApprovalResolution, PermissionCoordinator, protected_target};
+use crate::provider::approval::{
+    ApprovalAuthority, ApprovalResolution, PermissionCoordinator, protected_target,
+};
 use crate::provider::{ProviderError, ProviderEventSink};
 use crate::session::ApprovalMode;
 use anyhow::Result;
 use async_trait::async_trait;
 use forge_provider_api::permissions::{PermissionResponse, ProviderPermissions};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StandardMutex};
 
 pub(crate) const REJECT_ALL_GUIDANCE: &str = "Tool approval is set to reject all, and no user is reviewing requests. Commands and tools that saved permission rules do not allow are rejected automatically. Continue with the allowed tools and commands. Do not wait for approval, retry rejected operations, or work around the restrictions.";
@@ -25,6 +28,8 @@ struct PermissionState {
 pub(crate) struct ProviderPermissionContext {
     coordinator: Arc<PermissionCoordinator>,
     state: StandardMutex<PermissionState>,
+    retired: AtomicBool,
+    approval_authority: Arc<ApprovalAuthority>,
 }
 
 impl ProviderPermissionContext {
@@ -32,6 +37,8 @@ impl ProviderPermissionContext {
     pub(crate) fn new(coordinator: Arc<PermissionCoordinator>) -> Self {
         Self {
             coordinator,
+            retired: AtomicBool::new(false),
+            approval_authority: Arc::new(ApprovalAuthority::default()),
             state: StandardMutex::new(PermissionState {
                 task_authority: None,
                 cancelled: false,
@@ -53,6 +60,10 @@ impl ProviderPermissionContext {
         workspace: String,
         event_sink: Option<ProviderEventSink>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !self.retired.load(Ordering::Acquire),
+            "provider permission context is retired"
+        );
         let mut state = self
             .state
             .lock()
@@ -73,6 +84,13 @@ impl ProviderPermissionContext {
 }
 
 impl ProviderPermissionContext {
+    /// Revoke this native generation before disconnecting its callback transport.
+    pub(crate) fn retire(&self) -> Result<()> {
+        self.retired.store(true, Ordering::Release);
+        self.approval_authority.retire()?;
+        Ok(())
+    }
+
     /// Install the directory reported by the native session for limited automatic access.
     pub(crate) fn set_session_directory(&self, directory: Option<SessionDirectory>) -> Result<()> {
         self.state
@@ -119,18 +137,27 @@ impl ProviderPermissionContext {
 #[async_trait]
 impl ProviderPermissions for ProviderPermissionContext {
     async fn before_tool(&self) -> std::result::Result<(), ProviderError> {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(ProviderError::Cancelled);
+        }
         let checkpoint = self
             .state
             .lock()
             .map(|state| state.checkpoint.clone())
             .map_err(|_| anyhow::anyhow!("provider checkpoint context lock poisoned"))?;
-        match checkpoint {
-            Some(gate) => gate.wait().await.map_err(ProviderError::from),
-            None => Ok(()),
+        if let Some(gate) = checkpoint {
+            gate.wait().await.map_err(ProviderError::from)?;
         }
+        if self.retired.load(Ordering::Acquire) {
+            return Err(ProviderError::Cancelled);
+        }
+        Ok(())
     }
 
     async fn authorize(&self, session_id: &str, request: PermissionRequest) -> PermissionResponse {
+        if self.retired.load(Ordering::Acquire) {
+            return denied("Provider session observation was retired.", None);
+        }
         let (approval_mode, workspace, event_sink, owner, session_directory, task_authority) =
             match self.state.lock() {
                 Ok(state) => (
@@ -209,7 +236,11 @@ impl ProviderPermissions for ProviderPermissionContext {
                             if evaluation.decision
                                 != crate::permissions::document::PermissionDecision::Deny =>
                         {
-                            PermissionResponse::Allow
+                            if self.retired.load(Ordering::Acquire) {
+                                deny("Provider session observation was retired.")
+                            } else {
+                                PermissionResponse::Allow
+                            }
                         }
                         Ok(_) => deny(
                             "Automatically rejected by Harness permission policy for this session file.",
@@ -229,7 +260,13 @@ impl ProviderPermissions for ProviderPermissionContext {
         }
         match self
             .coordinator
-            .authorize(approval_mode, request, None, event_sink.as_ref())
+            .authorize_scoped(
+                approval_mode,
+                request,
+                None,
+                event_sink.as_ref(),
+                Some(self.approval_authority.clone()),
+            )
             .await
         {
             Ok(
@@ -237,6 +274,11 @@ impl ProviderPermissions for ProviderPermissionContext {
                 | ApprovalResolution::AllowExact
                 | ApprovalResolution::AllowBroad,
             ) => {
+                if self.retired.load(Ordering::Acquire) {
+                    return deny(
+                        "Provider session observation was retired while approval was pending.",
+                    );
+                }
                 if let Some(authority) = &task_authority
                     && let Err(error) = authority.validate()
                 {

@@ -284,7 +284,6 @@ fn is_parent_activity_message(message: &Value, parent_thread_id: &str) -> bool {
 
 struct ParentTurn {
     id: String,
-    provider_started: bool,
     completion: Option<Value>,
 }
 
@@ -298,18 +297,12 @@ impl ParentTurn {
             CodexProvider::notification_thread_turn_id(message, "turn/started", thread_id)
         {
             self.id = started_turn_id.to_owned();
-            self.provider_started = true;
             return true;
         }
         if CodexProvider::notification_matches_turn(message, "turn/completed", thread_id, &self.id)
         {
             self.completion = Some(message.get("params").cloned().unwrap_or(Value::Null));
             return true;
-        }
-        if is_parent_activity_message(message, thread_id)
-            && message_turn_id(message) == Some(self.id.as_str())
-        {
-            self.provider_started = true;
         }
         false
     }
@@ -329,6 +322,9 @@ pub(super) struct CodexTurnCoordinator<'a> {
     finalization_attempt: usize,
     interrupted: Vec<(tokio::time::Instant, SteerCommand)>,
     completed_turn: HashSet<(String, String)>,
+    accepted_turns: HashMap<forge_provider_api::lifecycle::SubmissionId, (String, String)>,
+    terminal_results:
+        HashMap<(String, String), (forge_provider_api::lifecycle::ExecutionResult, i64, usize)>,
     cleanup: Option<DescendantCleanup>,
     stopping: bool,
     native_goal: NativeGoalLifetime,
@@ -365,6 +361,8 @@ impl<'a> CodexTurnCoordinator<'a> {
             finalization_attempt: 0,
             interrupted: Vec::new(),
             completed_turn: HashSet::new(),
+            accepted_turns: HashMap::new(),
+            terminal_results: HashMap::new(),
             cleanup: None,
             stopping: false,
             provider_goal_active,
@@ -379,13 +377,102 @@ impl<'a> CodexTurnCoordinator<'a> {
     pub(super) async fn run(
         mut self,
         turn_id: String,
-        provider_started: bool,
         observed_message_list: Vec<Value>,
     ) -> Result<Value> {
-        let result = self
-            .run_inner(turn_id, provider_started, observed_message_list)
-            .await;
+        let anchor = turn_id.clone();
+        if let Some(sink) = &self.event_sink {
+            let scope = sink.invocation_scope()?.clone();
+            let address = crate::provider::TurnAddress {
+                scope: scope.clone(),
+                thread_id: self.thread_id.to_owned(),
+                turn_id: anchor.clone().into(),
+            };
+            let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
+                scope,
+                forge_provider_api::lifecycle::ExecutionUpdate::Started { address },
+            )?;
+            sink.send_wait(crate::provider::ProviderEvent::Execution { observation })
+                .await?;
+        }
+        if let Some(submission) = &self.request.submission {
+            self.accepted_turns.insert(
+                forge_provider_api::lifecycle::SubmissionId::try_from(submission.id().to_owned())?,
+                (self.thread_id.to_owned(), turn_id.clone()),
+            );
+        }
+        let result = self.run_inner(turn_id, observed_message_list).await;
         let cleanup = self.process.cancel_requests(self.output).await;
+        if result.is_ok()
+            && cleanup.is_ok()
+            && self
+                .completed_turn
+                .contains(&(self.thread_id.to_owned(), anchor.clone()))
+            && self
+                .accepted_turns
+                .values()
+                .all(|turn| self.completed_turn.contains(turn))
+            && let (Some(sink), Some(context)) = (&self.event_sink, &self.request.control_context)
+        {
+            let address = crate::provider::TurnAddress {
+                scope: sink.invocation_scope()?.clone(),
+                thread_id: self.thread_id.to_owned(),
+                turn_id: anchor.clone().into(),
+            };
+            let mut covered = Vec::new();
+            let mut grouped: HashMap<
+                (String, String),
+                Vec<forge_provider_api::lifecycle::SubmissionId>,
+            > = HashMap::new();
+            for (submission, target) in &self.accepted_turns {
+                if target.0 == self.thread_id && target.1 == anchor {
+                    covered.push(submission.clone());
+                } else {
+                    grouped
+                        .entry(target.clone())
+                        .or_default()
+                        .push(submission.clone());
+                }
+            }
+            let mut continuations = Vec::new();
+            let mut complete = true;
+            for ((thread_id, turn_id), covered) in grouped {
+                let Some((terminal, completed_at_ms, sequence)) = self
+                    .terminal_results
+                    .get(&(thread_id.clone(), turn_id.clone()))
+                else {
+                    complete = false;
+                    break;
+                };
+                continuations.push((
+                    *sequence,
+                    crate::provider::NativeExecutionCertificate {
+                        anchor: crate::provider::TurnAddress {
+                            scope: address.scope.clone(),
+                            thread_id,
+                            turn_id: turn_id.into(),
+                        },
+                        covered,
+                        result: terminal.clone(),
+                        completed_at_ms: *completed_at_ms,
+                    },
+                ));
+            }
+            if complete {
+                continuations.sort_by_key(|(sequence, _)| *sequence);
+                let continuations = continuations.into_iter().map(|(_, entry)| entry).collect();
+                context.provider_completion.certify(
+                    crate::provider::ExecutionCertificate::Foreground {
+                        anchor: address,
+                        covered,
+                        initial_result: self
+                            .terminal_results
+                            .get(&(self.thread_id.to_owned(), anchor.clone()))
+                            .map(|(result, _, _)| Box::new(result.clone())),
+                        continuations,
+                    },
+                )?;
+            }
+        }
         match (result, cleanup) {
             (result, Ok(())) => result,
             (Ok(_), Err(error)) => Err(error),
@@ -398,7 +485,6 @@ impl<'a> CodexTurnCoordinator<'a> {
     async fn run_inner(
         &mut self,
         turn_id: String,
-        provider_started: bool,
         observed_message_list: Vec<Value>,
     ) -> Result<Value> {
         self.owned_turn
@@ -406,7 +492,6 @@ impl<'a> CodexTurnCoordinator<'a> {
         let mut last_completion = Value::Null;
         let mut parent_turn = Some(ParentTurn {
             id: turn_id,
-            provider_started,
             completion: None,
         });
         for message in observed_message_list {
@@ -417,7 +502,6 @@ impl<'a> CodexTurnCoordinator<'a> {
             {
                 parent_turn = Some(ParentTurn {
                     id: turn_id.to_owned(),
-                    provider_started: true,
                     completion: None,
                 });
             }
@@ -457,7 +541,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                         settle_interruptions(&mut self.interrupted, &self.completed_turn, tokio::time::Instant::now()).await;
                         self.settle_cleanup(tokio::time::Instant::now()).await;
                     }
-                    Some(command) = self.steering.receive(), if active.provider_started => {
+                    Some(command) = self.steering.receive() => {
                         if command.operation == ActiveTurnOperation::CleanupExecution {
                             self.start_cleanup(command, Some(&active.id)).await;
                         } else if self.stopping {
@@ -533,6 +617,12 @@ impl<'a> CodexTurnCoordinator<'a> {
                         let text = steering_prompt(&command);
                         match self.start_parent_turn(text, command.submission.clone()).await {
                             Ok(mut turn) => {
+                                if let Some(submission) = &command.submission {
+                                    self.accepted_turns.insert(
+                                        forge_provider_api::lifecycle::SubmissionId::try_from(submission.id().to_owned())?,
+                                        (self.thread_id.to_owned(), turn.id.clone()),
+                                    );
+                                }
                                 self.clear_wait().await?;
                                 command.complete(Ok(())).await;
                                 if let Some(completion) = turn.completion.take() {
@@ -558,7 +648,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                     self.complete_pending_command(&message, &mut pending_command).await?;
                     self.complete_cleanup_request(&message).await?;
                     if let Some(turn_id) = CodexProvider::notification_thread_turn_id(&message, "turn/started", self.thread_id) {
-                        parent_turn = Some(ParentTurn { id: turn_id.to_owned(), provider_started: true, completion: None });
+                        parent_turn = Some(ParentTurn { id: turn_id.to_owned(), completion: None });
                         self.clear_wait().await?;
                         continue;
                     }
@@ -608,7 +698,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         let input =
             crate::provider::codex::attachments::input(text, self.request.input.attachments())
                 .await?;
-        let (turn, provider_started, observed_message_list) = self
+        let (turn, _provider_started, observed_message_list) = self
             .provider
             .start_turn(
                 self.process,
@@ -643,7 +733,6 @@ impl<'a> CodexTurnCoordinator<'a> {
             .insert((self.thread_id.into(), id.clone().into()));
         let mut parent = ParentTurn {
             id,
-            provider_started,
             completion: None,
         };
         for message in observed_message_list {
@@ -748,7 +837,10 @@ impl<'a> CodexTurnCoordinator<'a> {
                 return;
             }
         };
-        if command.operation == ActiveTurnOperation::Interrupt {
+        if matches!(
+            command.operation,
+            ActiveTurnOperation::Interrupt | ActiveTurnOperation::Steer
+        ) {
             command.target = Some(crate::provider::SteerTarget {
                 thread_id: thread_id.into(),
                 turn_id: turn_id.into(),
@@ -812,6 +904,16 @@ impl<'a> CodexTurnCoordinator<'a> {
         if let Some(submission) = &command.submission {
             match &result {
                 Ok(()) => {
+                    if command.operation == ActiveTurnOperation::Steer
+                        && let Some(target) = &command.target
+                    {
+                        self.accepted_turns.insert(
+                            forge_provider_api::lifecycle::SubmissionId::try_from(
+                                submission.id().to_owned(),
+                            )?,
+                            (target.thread_id.clone(), target.turn_id.clone()),
+                        );
+                    }
                     let receipt = format!("turn/steer:{message}");
                     result = submission
                         .persist(move |submission| submission.accepted(receipt))
@@ -1010,6 +1112,45 @@ impl<'a> CodexTurnCoordinator<'a> {
 
     /// Retain owned native command and goal evidence before acknowledging terminal cleanup.
     fn observe_native_state(&mut self, message: &Value) -> Result<()> {
+        if message.get("method").and_then(Value::as_str) == Some("turn/completed")
+            && let (Some(thread), Some(turn)) =
+                (message_thread_id(message), message_turn_id(message))
+        {
+            let key = (thread.to_owned(), turn.to_owned());
+            self.completed_turn.insert(key.clone());
+            let completion = self.output.completion.native.clone().into();
+            let result = match message
+                .pointer("/params/turn/status")
+                .and_then(Value::as_str)
+            {
+                Some("completed") => {
+                    Some(forge_provider_api::lifecycle::ExecutionResult::Completed { completion })
+                }
+                Some("interrupted" | "cancelled") => {
+                    Some(forge_provider_api::lifecycle::ExecutionResult::Cancelled { completion })
+                }
+                Some("failed") => Some(forge_provider_api::lifecycle::ExecutionResult::Failed {
+                    completion,
+                    failure: forge_provider_api::lifecycle::ExecutionFailure::Terminal {
+                        code: None,
+                        message: message
+                            .pointer("/params/turn/error/message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Codex turn failed")
+                            .to_owned(),
+                    },
+                }),
+                _ => None,
+            };
+            if let Some(result) = result {
+                let sequence = self.terminal_results.len();
+                self.terminal_results.entry(key).or_insert((
+                    result,
+                    crate::provider::retry::now_ms(),
+                    sequence,
+                ));
+            }
+        }
         // Retain exact command ownership even after the provider ends its turn.
         if let (Some(thread_id), Some(turn_id)) =
             (message_thread_id(message), message_turn_id(message))
@@ -1581,12 +1722,17 @@ mod test {
             "session".into(),
         )
         .await?;
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ExecutionOwner::root("session"),
+            "exchange",
+        );
+        let (sink, mut events) = forge_provider_api::events::channel(scope);
+        tokio::spawn(
+            async move { while events.recv().await.is_ok_and(|event| event.is_some()) {} },
+        );
         process
-            .normalization
-            .bind(Some(crate::provider::InvocationScope::new(
-                crate::provider::ExecutionOwner::root("session"),
-                "exchange",
-            )));
+            .set_request_context(&workspace, ApprovalMode::Ask, Some(sink))
+            .await?;
         let request = ProviderRequest {
             execution_owner: None,
             harness_session_id: "session".into(),
@@ -1599,7 +1745,7 @@ mod test {
             access: Default::default(),
             service_tier: crate::provider::ServiceTier::Standard,
             approval_mode: ApprovalMode::Ask,
-            provider_session_id: Some("parent".into()),
+            provider_session_id: Some("parent".to_owned().try_into().unwrap()),
             submission: None,
             recovered_input: Vec::new(),
             control_context: None,
@@ -1610,7 +1756,7 @@ mod test {
         let observed_finished = finished.clone();
         let mut output = ProviderOutput::default();
         let run = async {
-            let result = CodexTurnCoordinator::new(&provider, &mut process, &mut output, &mut steering, None, &request, "parent").run("current".into(), true, vec![
+            let result = CodexTurnCoordinator::new(&provider, &mut process, &mut output, &mut steering, None, &request, "parent").run("current".into(), vec![
                 json!({"method":"item/completed","params":{"threadId":"parent","item":{"type":"collabAgentToolCall","tool":"spawnAgent","receiverThreadIds":["child"],"status":"completed"}}}),
                 json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"child-turn"}}}),
             ]).await?;
@@ -1827,12 +1973,17 @@ mod test {
             "session".into(),
         )
         .await?;
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ExecutionOwner::root("session"),
+            "exchange",
+        );
+        let (sink, mut events) = forge_provider_api::events::channel(scope);
+        tokio::spawn(
+            async move { while events.recv().await.is_ok_and(|event| event.is_some()) {} },
+        );
         process
-            .normalization
-            .bind(Some(crate::provider::InvocationScope::new(
-                crate::provider::ExecutionOwner::root("session"),
-                "exchange",
-            )));
+            .set_request_context(&workspace, ApprovalMode::Ask, Some(sink))
+            .await?;
         let request = ProviderRequest {
             execution_owner: None,
             harness_session_id: "session".into(),
@@ -1845,7 +1996,7 @@ mod test {
             access: Default::default(),
             service_tier: crate::provider::ServiceTier::Standard,
             approval_mode: ApprovalMode::Ask,
-            provider_session_id: Some("parent".into()),
+            provider_session_id: Some("parent".to_owned().try_into().unwrap()),
             submission: None,
             recovered_input: Vec::new(),
             control_context: None,
@@ -1891,15 +2042,13 @@ mod test {
             match timing {
                 CommandStartTiming::Initial
                 | CommandStartTiming::ChildBeforeSpawnAcknowledgment => {
-                    coordinator.run("current".into(), true, observed).await
+                    coordinator.run("current".into(), observed).await
                 }
                 CommandStartTiming::BeforeFollowupAcknowledgment => {
                     let parent = coordinator
                         .start_parent_turn("follow-up".into(), None)
                         .await?;
-                    coordinator
-                        .run(parent.id, parent.provider_started, observed)
-                        .await
+                    coordinator.run(parent.id, observed).await
                 }
             }
         })
@@ -2076,7 +2225,7 @@ mod test {
             access: Default::default(),
             service_tier: Default::default(),
             approval_mode: ApprovalMode::Ask,
-            provider_session_id: Some("thread".into()),
+            provider_session_id: Some("thread".to_owned().try_into().unwrap()),
             submission: None,
             recovered_input: Vec::new(),
             control_context: None,
@@ -2093,7 +2242,7 @@ mod test {
             &request,
             "thread",
         )
-        .run("turn".into(), true, Vec::new());
+        .run("turn".into(), Vec::new());
         let stop = async {
             let query = editor.recv().await?.context("LSP request was not sent")?;
             let query: Value = serde_json::from_slice(query.bytes())?;
@@ -2216,7 +2365,7 @@ mod test {
             access: Default::default(),
             service_tier: crate::provider::ServiceTier::Standard,
             approval_mode: ApprovalMode::Ask,
-            provider_session_id: Some("parent".into()),
+            provider_session_id: Some("parent".to_owned().try_into().unwrap()),
             submission: None,
             recovered_input: Vec::new(),
             control_context: None,
@@ -2227,7 +2376,7 @@ mod test {
         let mut output = ProviderOutput::default();
         let result = tokio::time::timeout(std::time::Duration::from_secs(3),
             CodexTurnCoordinator::new(&provider, &mut process, &mut output, &mut steering,
-                None, &request, "parent").run("current".into(), true, vec![
+                None, &request, "parent").run("current".into(), vec![
                     json!({"method":"thread/goal/updated","params":{"threadId":"parent","goal":{"status":"active"}}})
                 ])).await??;
         assert_eq!(result["turn"]["status"], "interrupted");
@@ -2310,7 +2459,7 @@ mod test {
             context_window: None,
             service_tier: crate::provider::ServiceTier::Ultrafast,
             approval_mode: ApprovalMode::Ask,
-            provider_session_id: Some("parent".into()),
+            provider_session_id: Some("parent".to_owned().try_into().unwrap()),
             submission: None,
             recovered_input: Vec::new(),
             control_context: None,
@@ -2321,7 +2470,7 @@ mod test {
             event: Vec::new(),
             completion: crate::provider::ProviderCompletion {
                 native: forge_provider_api::completion::ProviderCompletion {
-                    provider_session_id: Some("parent".into()),
+                    provider_session_id: Some("parent".to_owned().try_into().unwrap()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -2344,7 +2493,7 @@ mod test {
         let (completed, acknowledged) =
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 tokio::join!(
-                    coordinator.run("first".into(), true, observed),
+                    coordinator.run("first".into(), observed),
                     lane.steer("continue".into())
                 )
             })
@@ -2553,16 +2702,21 @@ mod test {
                     "session".into(),
                 )
                 .await?;
+                let scope = crate::provider::InvocationScope::new(
+                    crate::provider::ExecutionOwner::root("session"),
+                    "exchange",
+                );
+                let (sink, mut events) = forge_provider_api::events::channel(scope);
+                tokio::spawn(async move {
+                    while events.recv().await.is_ok_and(|event| event.is_some()) {}
+                });
                 process
-                    .normalization
-                    .bind(Some(crate::provider::InvocationScope::new(
-                        crate::provider::ExecutionOwner::root("session"),
-                        "exchange",
-                    )));
+                    .set_request_context(&workspace, ApprovalMode::Ask, Some(sink))
+                    .await?;
                 let mut context =
                     crate::tools::ControlTurnContext::inactive(PromptMode::GoalContinuation);
                 context.native_goal = Some("Fixture objective".into());
-                context.task_controller = Some(controller.clone());
+                context.bind_test_task_controller(controller.clone());
                 process.set_control_context(context.clone()).await;
                 let request = ProviderRequest {
                     execution_owner: None,
@@ -2576,7 +2730,7 @@ mod test {
                     service_tier: crate::provider::ServiceTier::Standard,
                     access: Default::default(),
                     approval_mode: ApprovalMode::Ask,
-                    provider_session_id: Some("parent".into()),
+                    provider_session_id: Some("parent".to_owned().try_into().unwrap()),
                     submission: None,
                     recovered_input: Vec::new(),
                     control_context: Some(context),
@@ -2595,7 +2749,7 @@ mod test {
                         &request,
                         "parent",
                     )
-                    .run("first".into(), true, vec![]),
+                    .run("first".into(), vec![]),
                 )
                 .await?;
                 if ownership_replaced {
@@ -2642,7 +2796,7 @@ mod test {
                 crate::task::SessionTaskController::test_goal();
             let previous = controller.current()?.unwrap();
             let mut output = ProviderOutput::default();
-            output.completion.provider_session_id = Some("parent".into());
+            output.completion.provider_session_id = Some("parent".to_owned().try_into().unwrap());
             if stale {
                 output.completion.goal_control = Some(crate::goal::GoalControl {
                     permit: previous.permit(),
@@ -2719,16 +2873,21 @@ mod test {
                 "session".into(),
             )
             .await?;
+            let scope = crate::provider::InvocationScope::new(
+                crate::provider::ExecutionOwner::root("session"),
+                "exchange",
+            );
+            let (sink, mut events) = forge_provider_api::events::channel(scope);
+            tokio::spawn(
+                async move { while events.recv().await.is_ok_and(|event| event.is_some()) {} },
+            );
             process
-                .normalization
-                .bind(Some(crate::provider::InvocationScope::new(
-                    crate::provider::ExecutionOwner::root("session"),
-                    "exchange",
-                )));
+                .set_request_context(&workspace, ApprovalMode::Ask, Some(sink))
+                .await?;
             let mut context =
                 crate::tools::ControlTurnContext::inactive(PromptMode::GoalContinuation);
             context.native_goal = Some("Fixture objective".into());
-            context.task_controller = Some(controller);
+            context.bind_test_task_controller(controller);
             process.set_control_context(context.clone()).await;
             let request = ProviderRequest {
                 execution_owner: None,
@@ -2742,7 +2901,7 @@ mod test {
                 service_tier: crate::provider::ServiceTier::Standard,
                 access: Default::default(),
                 approval_mode: ApprovalMode::Ask,
-                provider_session_id: Some("parent".into()),
+                provider_session_id: Some("parent".to_owned().try_into().unwrap()),
                 submission: None,
                 recovered_input: Vec::new(),
                 control_context: Some(context),
@@ -2760,7 +2919,7 @@ mod test {
                     &request,
                     "parent",
                 )
-                .run("first".into(), true, vec![]),
+                .run("first".into(), vec![]),
             )
             .await??;
             assert_eq!(result["turn"]["id"], "second");
@@ -2872,12 +3031,14 @@ mod test {
                 "session".into(),
             )
             .await?;
+            let scope = crate::provider::InvocationScope::new(
+                crate::provider::ExecutionOwner::root("session"),
+                "exchange",
+            );
+            let (sink, mut events) = forge_provider_api::events::channel(scope);
             process
-                .normalization
-                .bind(Some(crate::provider::InvocationScope::new(
-                    crate::provider::ExecutionOwner::root("session"),
-                    "exchange",
-                )));
+                .set_request_context(&workspace, ApprovalMode::Ask, Some(sink))
+                .await?;
             let request = ProviderRequest {
                 execution_owner: None,
                 harness_session_id: "session".into(),
@@ -2890,7 +3051,7 @@ mod test {
                 service_tier: crate::provider::ServiceTier::Standard,
                 access: Default::default(),
                 approval_mode: ApprovalMode::Ask,
-                provider_session_id: Some("parent".into()),
+                provider_session_id: Some("parent".to_owned().try_into().unwrap()),
                 submission: None,
                 recovered_input: Vec::new(),
                 control_context: Some({
@@ -2914,7 +3075,7 @@ mod test {
                 event: Vec::new(),
                 completion: crate::provider::ProviderCompletion {
                     native: forge_provider_api::completion::ProviderCompletion {
-                        provider_session_id: Some("parent".into()),
+                        provider_session_id: Some("parent".to_owned().try_into().unwrap()),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -2931,7 +3092,7 @@ mod test {
                     &request,
                     "parent",
                 )
-                .run("first".into(), true, vec![]),
+                .run("first".into(), vec![]),
             )
             .await??;
             server.abort();
@@ -2943,12 +3104,11 @@ mod test {
                 Some("second"),
                 "{status}"
             );
-            assert!(
-                output
-                    .event
-                    .iter()
-                    .any(|event| matches!(event, ProviderEvent::Message { update, .. } if update.text() == Some("second turn retained")))
-            );
+            let mut retained_answer = false;
+            while let Ok(event) = events.try_recv() {
+                retained_answer |= matches!(event, ProviderEvent::Message { update, .. } if update.text() == Some("second turn retained"));
+            }
+            assert!(retained_answer);
             assert_eq!(
                 output.completion.evidence.native_state,
                 Some(match status {
@@ -3190,7 +3350,6 @@ mod test {
     fn adopts_the_same_thread_started_id_without_adopting_child_turns() {
         let mut parent = ParentTurn {
             id: "initial-turn".into(),
-            provider_started: false,
             completion: None,
         };
         let authoritative_start = json!({
@@ -3210,34 +3369,8 @@ mod test {
 
         assert!(parent.observe(&authoritative_start, "parent-thread"));
         assert_eq!(parent.id, "authoritative-turn");
-        assert!(parent.provider_started);
         assert!(!parent.observe(&child, "parent-thread"));
         assert_eq!(parent.id, "authoritative-turn");
-    }
-
-    #[test]
-    fn acknowledged_turn_waits_for_matching_activity_before_accepting_steering() {
-        let mut parent = ParentTurn {
-            id: "current".into(),
-            provider_started: false,
-            completion: None,
-        };
-        for (thread_id, turn_id) in [("child", "current"), ("parent", "cancelled")] {
-            parent.observe(
-                &json!({"method":"item/started","params":{
-                    "threadId":thread_id,"turnId":turn_id
-                }}),
-                "parent",
-            );
-            assert!(!parent.provider_started);
-        }
-        parent.observe(
-            &json!({"method":"item/started","params":{
-                "threadId":"parent","turnId":"current"
-            }}),
-            "parent",
-        );
-        assert!(parent.provider_started);
     }
 }
 /// Ignore a previous child turn's completion after its trusted successor starts.

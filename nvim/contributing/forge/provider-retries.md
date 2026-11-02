@@ -6,7 +6,7 @@ This guide explains the retry contract and how to allow a new error. For the del
 
 ## Lifecycle
 
-`provider/retry.rs` owns the request runner shared by root, child, and Background sessions. Adapters classify native errors and return a `RetryableFailure` only after checking `replay_safe`. The runner keeps the provider thread, model, settings, and control context, and submits a continuation rather than appending the user's message again. Retries stay in the same exchange.
+`provider/retry.rs` owns retry policy shared by root, child, and Background sessions. Each attempt waits on the shared session execution engine, which separates submission acceptance from normalized terminal evidence. A successful submission RPC cannot trigger completion or a retry. Adapters classify native terminal errors as `RetryableFailure` only after checking `replay_safe`. The runner keeps the provider thread, model, settings, and control context, and submits a continuation rather than appending the user's message again. Retries stay in the same exchange.
 
 The first attempt has no delay. Five retries then wait 1, 5, 10, 30, and 60 seconds. The budget belongs to one runner invocation and does not reset after each error. After the fifth retry, or on any non-retryable error, the actual provider error goes through the normal failure path.
 
@@ -24,14 +24,14 @@ Provider metadata was checked against the sources below on 2026-10-20.
 
 All other errors fail without a Forge retry, including authentication, authorization, quota, policy, context limits, generic internal errors, HTTP 429, unknown codes, and tool errors. A generic internal error alone does not prove a temporary problem.
 
-Copilot SDK 1.0.7 classifies `errorType: "model_call"` as a native transient error and its agent loop continues, so Forge keeps reading and does not start an overlapping retry. Codex nonterminal error notifications likewise start no retry.
+Copilot SDK 1.0.26 classifies `errorType: "model_call"` as a native transient error and its agent loop continues, so Forge keeps reading and does not start an overlapping retry. Codex nonterminal error notifications likewise start no retry.
 
 Sources:
 
 - [Codex error variants](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/shared.rs), file blob `65c7db5aebe8bb5e3d5653a9109d412f099e1edb`.
 - [Codex turn input](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/turn.rs), file blob `38b00228a6d4c0693c13daa03734bb8f121007dc`.
 - [Copilot session error schema](https://github.com/github/copilot-sdk/blob/main/nodejs/src/generated/session-events.ts), file blob `dc403c7b0f8fbeb7ff6c755e72810ef447727ecd`.
-- The installed `github-copilot-sdk` 1.0.7 `SessionEvent::is_transient_error` implementation.
+- The installed `github-copilot-sdk` 1.0.26 `SessionEvent::is_transient_error` implementation.
 
 ## Allow a newly observed error
 

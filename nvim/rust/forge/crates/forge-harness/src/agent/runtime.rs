@@ -11,6 +11,8 @@ use crate::provider::{
 /// Runs one child turn without retaining a broker, storage, or presentation lock.
 pub struct AgentRuntime {
     pub provider: Arc<Provider>,
+    pub(crate) execution_registry:
+        Arc<crate::provider::session_execution::SessionExecutionRegistry>,
     /// Applies the root session's deadline to each child tool and shell invocation.
     pub(crate) tool_timeout: crate::session::InputTimeout,
     /// Shared diagnostics for provider retry attempts and cancellation.
@@ -36,26 +38,20 @@ impl AgentRuntime {
         );
         // Subscribe before dispatch so retained child observations keep their original owner.
         let scope = crate::provider::InvocationScope::new(owner.clone(), self.task_id.clone());
-        let (event_sink, event_stream) = crate::provider::events::channel(scope.clone());
+        let engine = self.execution_registry.owner(owner.clone()).await?;
+        let (session_sink, event_stream) = engine.session_observer().await?;
+        let event_sink = session_sink.invocation_sink(&scope)?;
         let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
             self.tool_timeout,
         )?);
         let event_sink = event_sink.with_observer(watchdog.clone());
-        let (session_events, subscription_error) =
-            match self.provider.session_event_stream(owner.clone()).await {
-                Ok(stream) => (stream, None),
-                Err(error) => (None, Some(error)),
-            };
-        let mut events = ChildEventDelivery {
-            invocation: Some(event_stream),
-            session: session_events,
+        let mut events = ChildObservation {
+            stream: Some(event_stream),
         };
         let mut request = self.request.clone();
         let mut cancelled = *self.cancellation.borrow();
-        // Run foreground work while consuming both observation lanes.
-        let mut output = if let Some(error) = subscription_error {
-            Err(error)
-        } else {
+        // Run foreground work while consuming the owner's single ordered stream.
+        let mut output = {
             loop {
                 if request.submission.is_none() {
                     request.submission = Some(
@@ -64,7 +60,7 @@ impl AgentRuntime {
                     );
                 }
                 let result = async {
-            let prompt = crate::provider::retry::prompt(self.provider.as_ref(), request.clone(), Some(event_sink.clone()), &self.trace, &self.submission_store);
+            let prompt = crate::provider::retry::execute(engine.as_ref(), request.clone(), event_sink.clone(), &self.trace, &self.submission_store);
             tokio::pin!(prompt);
             loop {
                 if cancelled {break Err(anyhow::anyhow!("child task interrupted before dispatch"));}
@@ -105,7 +101,9 @@ impl AgentRuntime {
                 cancelled |= result
                     .as_ref()
                     .is_err_and(|error| error.is::<crate::broker::TurnCancelled>());
-                if cancelled && let Some(submission) = &request.submission {
+                if (cancelled || result.is_err())
+                    && let Some(submission) = &request.submission
+                {
                     submission.cancel()?;
                 }
                 if cancelled || result.is_err() {
@@ -139,19 +137,24 @@ impl AgentRuntime {
             )
             .await;
         if let Some(error) = observation_error {
-            output = Err(error);
+            preserve_child_failure(&mut output, error);
         }
         let retained = match retained {
-            Ok(retained) => retained,
+            Ok(Ok(retained)) => retained,
+            Ok(Err(error)) => {
+                preserve_child_failure(&mut output, error);
+                None
+            }
             Err(_) => {
-                output = Err(anyhow::anyhow!(
-                    "child provider identity lookup exceeded 2 seconds"
-                ));
+                preserve_child_failure(
+                    &mut output,
+                    anyhow::anyhow!("child provider identity lookup exceeded 2 seconds"),
+                );
                 None
             }
         };
         if let Err(error) = events.drain(&self, &owner).await {
-            output = Err(error);
+            preserve_child_failure(&mut output, error);
         }
         if let Some(provider_thread_id) = &retained
             && let Err(error) = self
@@ -160,13 +163,13 @@ impl AgentRuntime {
                     ProviderEvent::Agent {
                         scope: scope.clone(),
                         update: crate::provider::AgentUpdate::ConversationResolved {
-                            thread_id: provider_thread_id.clone(),
+                            thread_id: provider_thread_id.clone().into(),
                         },
                     },
                 )
                 .await
         {
-            output = Err(error);
+            preserve_child_failure(&mut output, error);
         }
         // Settle native work and publish its final observations before child completion.
         let cleanup = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -181,8 +184,14 @@ impl AgentRuntime {
                             failure.push(format!("cleanup: {error:#}"));
                         }
                     }
+                    if let Err(error) = self.execution_registry.begin_orderly_shutdown().await {
+                        failure.push(format!("execution shutdown fence: {error:#}"));
+                    }
                     if let Err(error) = self.provider.shutdown().await {
                         failure.push(format!("shutdown: {error:#}"));
+                    }
+                    if let Err(error) = self.execution_registry.close().await {
+                        failure.push(format!("execution collection: {error:#}"));
                     }
                     failure
                 })
@@ -194,7 +203,7 @@ impl AgentRuntime {
         let cleanup = match cleanup {
             Ok((failure, observation_error)) => {
                 if let Some(error) = observation_error {
-                    output = Err(error);
+                    preserve_child_failure(&mut output, error);
                 }
                 Ok(failure)
             }
@@ -243,44 +252,47 @@ impl AgentRuntime {
     }
 }
 
-/// Preserve invocation ordering while draining observations owned by the same child session.
-struct ChildEventDelivery {
-    invocation: Option<crate::provider::events::ProviderEventStream>,
-    session: Option<crate::provider::events::ProviderEventStream>,
+/// Keep the original child failure while retaining later observation failures as context.
+fn preserve_child_failure(output: &mut Result<ProviderCompletion>, additional: anyhow::Error) {
+    let prior = std::mem::replace(
+        output,
+        Err(anyhow::anyhow!("child failure is being recorded")),
+    );
+    *output = Err(match prior {
+        Ok(_) => additional,
+        Err(original) => {
+            let message =
+                format!("{original:#}; additional child observation failure: {additional:#}");
+            original.context(message)
+        }
+    });
 }
 
-impl ChildEventDelivery {
-    /// Identify whether either owned observation stream can still produce an event.
+/// Preserve invocation ordering while draining observations owned by the same child session.
+struct ChildObservation {
+    stream: Option<crate::provider::events::ProviderEventStream>,
+}
+
+impl ChildObservation {
+    /// Identify whether the owner stream can still produce an observation.
     fn is_open(&self) -> bool {
-        self.invocation.is_some() || self.session.is_some()
+        self.stream.is_some()
     }
 
-    /// Poll admitted invocation events before later session observations of those items.
+    /// Receive foreground and retained events in the engine's delivery order.
     async fn next(&mut self) -> Result<Option<ProviderEvent>> {
-        loop {
-            tokio::select! {
-                biased;
-                event = async { self.invocation.as_mut().expect("invocation branch requires an open stream").recv().await }, if self.invocation.is_some() => {
-                    match event {
-                        Ok(Some(event)) => return Ok(Some(event)),
-                        Ok(None) => self.invocation = None,
-                        Err(error) => {
-                            self.invocation = None;
-                            return Err(error.into());
-                        }
-                    }
-                }
-                event = async { self.session.as_mut().expect("session branch requires an open stream").recv().await }, if self.session.is_some() => {
-                    match event {
-                        Ok(Some(event)) => return Ok(Some(event)),
-                        Ok(None) => self.session = None,
-                        Err(error) => {
-                            self.session = None;
-                            return Err(error.into());
-                        }
-                    }
-                }
-                else => return Ok(None),
+        let Some(stream) = self.stream.as_mut() else {
+            return Ok(None);
+        };
+        match stream.recv().await {
+            Ok(Some(event)) => Ok(Some(event)),
+            Ok(None) => {
+                self.stream = None;
+                Ok(None)
+            }
+            Err(error) => {
+                self.stream = None;
+                Err(child_delivery_error(error))
             }
         }
     }
@@ -316,29 +328,8 @@ impl ChildEventDelivery {
     /// Publish every queued final observation after its producer has finished shutdown.
     async fn drain(&mut self, runtime: &AgentRuntime, owner: &ExecutionOwner) -> Result<()> {
         let mut failure = None;
-        loop {
-            if let Some(invocation) = self.invocation.as_mut() {
-                match invocation.try_recv() {
-                    Ok(event) => {
-                        if let Err(error) = runtime.publish(owner, event).await {
-                            failure.get_or_insert(error);
-                        }
-                        continue;
-                    }
-                    Err(crate::provider::events::EventDeliveryError::Empty) => {}
-                    Err(crate::provider::events::EventDeliveryError::Closed { .. }) => {
-                        self.invocation = None
-                    }
-                    Err(error) => {
-                        self.invocation = None;
-                        failure.get_or_insert(error.into());
-                    }
-                }
-            }
-            let Some(session) = self.session.as_mut() else {
-                break;
-            };
-            match session.try_recv() {
+        while let Some(stream) = self.stream.as_mut() {
+            match stream.try_recv() {
                 Ok(event) => {
                     if let Err(error) = runtime.publish(owner, event).await {
                         failure.get_or_insert(error);
@@ -346,12 +337,12 @@ impl ChildEventDelivery {
                 }
                 Err(crate::provider::events::EventDeliveryError::Empty) => break,
                 Err(crate::provider::events::EventDeliveryError::Closed { .. }) => {
-                    self.session = None;
+                    self.stream = None;
                     break;
                 }
                 Err(error) => {
-                    self.session = None;
-                    failure.get_or_insert(error.into());
+                    self.stream = None;
+                    failure.get_or_insert(child_delivery_error(error));
                     break;
                 }
             }
@@ -360,6 +351,16 @@ impl ChildEventDelivery {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+}
+
+/// Preserve observation failures as provider errors across the child event boundary.
+fn child_delivery_error(error: crate::provider::events::EventDeliveryError) -> anyhow::Error {
+    match error {
+        crate::provider::events::EventDeliveryError::Observation(failure) => {
+            crate::provider::ProviderError::Observation(failure).into()
+        }
+        error => error.into(),
     }
 }
 

@@ -9,11 +9,15 @@ use std::sync::Arc;
 /// Carries the broker-owned control state visible to one provider turn.
 #[derive(Clone)]
 pub struct ControlTurnContext {
+    pub(crate) provider_completion: Arc<crate::provider::CompletionSlot>,
     pub(crate) questions: Option<Arc<crate::question::QuestionController>>,
     pub(crate) question_exchange_id: Option<String>,
     pub(crate) question_discussion: bool,
     pub(crate) task_controller: Option<Arc<crate::task::SessionTaskController>>,
     pub(crate) task_permit: Option<crate::task::TaskPermit>,
+    pub(crate) task_generation: Option<u64>,
+    pub(crate) permission_snapshot: Option<super::authority::PermissionAuthoritySnapshot>,
+    pub(crate) permission_required: bool,
     pub(crate) native_goal: Option<String>,
     pub(crate) submission_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub checkpoint: Option<crate::checkpoint::ToolGate>,
@@ -55,15 +59,111 @@ impl std::fmt::Debug for ControlTurnContext {
     }
 }
 
+pub(crate) struct ProviderExecutionPreview {
+    pub revision: u64,
+    pub outcome: std::result::Result<ProviderCompletion, crate::provider::ProviderError>,
+    pub batches: Vec<crate::provider::HostEffectBatch>,
+}
+
 impl ControlTurnContext {
+    #[cfg(test)]
+    pub(crate) fn bind_test_task_controller(
+        &mut self,
+        controller: Arc<crate::task::SessionTaskController>,
+    ) {
+        let (generation, task) = controller.callback_snapshot().expect("test task snapshot");
+        self.task_generation = Some(generation);
+        self.task_permit = task.map(|task| task.permit());
+        self.task_controller = Some(controller);
+    }
+    /// Start a new provider observation while retaining this invocation's host authority.
+    pub fn begin_provider_execution(&mut self) {
+        self.provider_completion = Arc::default();
+    }
+
+    /// Merge terminal native evidence with host effects retained by the invocation.
+    pub fn complete_provider_execution(
+        &self,
+        result: &forge_provider_api::lifecycle::ExecutionResult,
+    ) -> std::result::Result<ProviderCompletion, crate::provider::ProviderError> {
+        let (effects, host_outcome) = self.provider_completion.take_with_outcome()?;
+        Self::merge_provider_execution(host_outcome.as_ref().unwrap_or(result), effects)
+    }
+
+    /// Preview the exact retained host effects without consuming them.
+    pub(crate) fn preview_provider_execution(
+        &self,
+        result: &forge_provider_api::lifecycle::ExecutionResult,
+    ) -> std::result::Result<ProviderExecutionPreview, crate::provider::ProviderError> {
+        let preview = self.provider_completion.preview()?;
+        Ok(ProviderExecutionPreview {
+            revision: preview.revision,
+            outcome: Self::merge_provider_execution(
+                preview.host_outcome.as_ref().unwrap_or(result),
+                preview.completion,
+            ),
+            batches: preview.batches,
+        })
+    }
+
+    /// Consume effects only if the host's reviewed revision is still current.
+    pub(crate) fn commit_provider_execution(
+        &self,
+        revision: u64,
+    ) -> std::result::Result<bool, crate::provider::ProviderError> {
+        self.provider_completion.take_revision(revision)
+    }
+
+    /// Combine native terminal evidence with the supplied host effects.
+    fn merge_provider_execution(
+        result: &forge_provider_api::lifecycle::ExecutionResult,
+        effects: Option<ProviderCompletion>,
+    ) -> std::result::Result<ProviderCompletion, crate::provider::ProviderError> {
+        use crate::provider::ProviderError;
+        use forge_provider_api::lifecycle::{ExecutionFailure, ExecutionResult};
+        match result {
+            ExecutionResult::Completed { completion } => {
+                let mut output = effects.unwrap_or_default();
+                output.merge_native(completion.clone().into());
+                Ok(output)
+            }
+            ExecutionResult::Cancelled { .. } => Err(ProviderError::Cancelled),
+            ExecutionResult::Failed { failure, .. } => match failure {
+                ExecutionFailure::Rejected { message } => Err(ProviderError::Rejected {
+                    message: message.clone(),
+                }),
+                ExecutionFailure::Terminal { code, message } => Err(ProviderError::Provider {
+                    code: code.clone(),
+                    message: message.clone(),
+                }),
+                ExecutionFailure::Retryable {
+                    address,
+                    code,
+                    message,
+                } => Err(ProviderError::Retryable(Box::new(
+                    forge_provider_api::retry::RetryableFailure {
+                        address: address.clone(),
+                        code: code.clone(),
+                        message: message.clone(),
+                        detail: serde_json::Value::Null,
+                    },
+                ))),
+            },
+        }
+    }
+
     /// Build an inert context for provider calls without broker state.
     pub fn inactive(mode: PromptMode) -> Self {
         Self {
+            provider_completion: Default::default(),
             questions: None,
             question_exchange_id: None,
             question_discussion: false,
             task_controller: None,
             task_permit: None,
+            task_generation: None,
+            permission_snapshot: None,
+            permission_required: false,
             native_goal: None,
             submission_cancelled: None,
             checkpoint: None,
@@ -118,6 +218,9 @@ impl ControlToolRuntime {
 
     /// Validate a control invocation and await broker persistence for execution controls.
     pub async fn invoke(&mut self, invocation: ControlToolInvocation) -> Result<ControlToolResult> {
+        if let Some(authority) = super::TaskAuthority::capture(&self.context) {
+            authority.validate_scope()?;
+        }
         if invocation.name == "question_ask" && invocation.arguments["wait"].as_bool() == Some(true)
         {
             crate::tools::error::ensure!(
@@ -176,6 +279,9 @@ impl ControlToolRuntime {
         )?;
         if let Some(checkpoint) = &self.context.checkpoint {
             checkpoint.wait().await?;
+        }
+        if let Some(authority) = super::TaskAuthority::capture(&self.context) {
+            authority.validate_scope()?;
         }
         invocation.admit_turn_control(
             self.context.task_controller.as_deref(),
@@ -295,6 +401,47 @@ impl ControlToolRuntime {
 mod test {
     use super::*;
 
+    /// Preserve explicit rejection when native lifecycle evidence reaches the host.
+    #[test]
+    fn rejected_execution_preserves_provider_error_kind() {
+        let context = ControlTurnContext::inactive(PromptMode::Chat);
+        let result = forge_provider_api::lifecycle::ExecutionResult::Failed {
+            completion: forge_provider_api::completion::ProviderCompletion::default().into(),
+            failure: forge_provider_api::lifecycle::ExecutionFailure::Rejected {
+                message: "denied".into(),
+            },
+        };
+        assert!(matches!(context.complete_provider_execution(&result),
+            Err(crate::provider::ProviderError::Rejected { message }) if message == "denied"));
+    }
+
+    /// A host rejection remains distinct from the native turn's successful terminal evidence.
+    #[test]
+    fn host_rejection_does_not_rewrite_native_completion() {
+        use forge_provider_api::lifecycle::{ExecutionFailure, ExecutionResult};
+        let context = ControlTurnContext::inactive(PromptMode::Chat);
+        let native = ExecutionResult::Completed {
+            completion: forge_provider_api::completion::ProviderCompletion::default().into(),
+        };
+        context
+            .provider_completion
+            .publish_host_outcome(ExecutionResult::Failed {
+                completion: forge_provider_api::completion::ProviderCompletion::default().into(),
+                failure: ExecutionFailure::Rejected {
+                    message: "denied".into(),
+                },
+            })
+            .unwrap();
+        let ProviderExecutionPreview {
+            revision, outcome, ..
+        } = context.preview_provider_execution(&native).unwrap();
+        assert!(
+            matches!(outcome, Err(crate::provider::ProviderError::Rejected { message }) if message == "denied")
+        );
+        assert!(matches!(native, ExecutionResult::Completed { .. }));
+        assert!(context.commit_provider_execution(revision).unwrap());
+    }
+
     #[tokio::test]
     async fn persistent_questions_append_without_terminating_each_workflow() -> Result<()> {
         for mode in [
@@ -362,7 +509,7 @@ mod test {
             .change(&mut store, Some(&initial.revision), TaskChange::Clear, 2)
             .unwrap();
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        context.task_controller = Some(controller.clone());
+        context.bind_test_task_controller(controller.clone());
         let mut runtime = ControlToolRuntime::new(context);
         let invocation = |name: &str| ControlToolInvocation {
             name: name.into(),
@@ -684,6 +831,7 @@ mod test {
         let workspace = tempfile::tempdir().unwrap().keep();
         crate::checks::configure_fixture(&workspace);
         ControlTurnContext {
+            provider_completion: Default::default(),
             questions: None,
             question_exchange_id: None,
             question_discussion: false,
@@ -703,6 +851,9 @@ mod test {
             task_controller: None,
             workspace_root: Some(workspace),
             task_permit: None,
+            task_generation: None,
+            permission_snapshot: None,
+            permission_required: false,
             repository: None,
             harness: None,
             lsp: None,

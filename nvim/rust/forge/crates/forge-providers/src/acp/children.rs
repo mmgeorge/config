@@ -9,16 +9,21 @@ use std::collections::HashMap;
 /// Routes native child sessions into separate Harness execution lifecycles.
 pub struct AcpChildren {
     root: String,
-    scope: Option<InvocationScope>,
+    root_execution: Option<TurnAddress>,
     child: HashMap<String, ChildExecution>,
 }
 
 impl AcpChildren {
     /// Start one prompt's routing without retaining children from an earlier prompt.
     pub fn new(root: String, scope: InvocationScope) -> Self {
+        let root_execution = TurnAddress {
+            scope,
+            thread_id: root.clone(),
+            turn_id: format!("acp:{}", uuid::Uuid::new_v4()).into(),
+        };
         Self {
             root,
-            scope: Some(scope),
+            root_execution: Some(root_execution),
             child: HashMap::new(),
         }
     }
@@ -61,9 +66,11 @@ impl AcpChildren {
             }
             let address = TurnAddress {
                 scope: self
+                    .root_execution
+                    .as_ref()
+                    .context("ACP children have no invocation")?
                     .scope
-                    .clone()
-                    .context("ACP children have no invocation")?,
+                    .clone(),
                 thread_id: id.into(),
                 turn_id: format!("acp-child:{}", uuid::Uuid::new_v4()).into(),
             };
@@ -139,15 +146,11 @@ impl AcpChildren {
     /// Attribute child content and drop unknown or completed child streams.
     pub fn address(&self, session: &str, allow_closed: bool) -> Option<TurnAddress> {
         if self.is_root(session) {
-            return Some(TurnAddress {
-                scope: self.scope.clone()?,
-                thread_id: if self.root.is_empty() {
-                    session.into()
-                } else {
-                    self.root.clone()
-                },
-                turn_id: format!("acp:{}", self.scope.as_ref()?.invocation_id).into(),
-            });
+            let mut address = self.root_execution.clone()?;
+            if address.thread_id.is_empty() {
+                address.thread_id = session.into();
+            }
+            return Some(address);
         }
         let child = self.child.get(session)?;
         (!child.closed || allow_closed).then(|| child.address.clone())
@@ -224,6 +227,22 @@ pub fn timestamp() -> i64 {
 mod test {
     use super::*;
     use serde_json::json;
+
+    /// Normal prompts under one retained invocation have distinct terminal anchors.
+    #[test]
+    fn continued_prompt_gets_a_new_root_execution_identity() {
+        let scope =
+            InvocationScope::new(forge_provider_api::ExecutionOwner::root("host"), "exchange");
+        let first = AcpChildren::new("native".into(), scope.clone())
+            .root_address()
+            .unwrap();
+        let second = AcpChildren::new("native".into(), scope)
+            .root_address()
+            .unwrap();
+        assert_eq!(first.scope, second.scope);
+        assert_eq!(first.thread_id, second.thread_id);
+        assert_ne!(first.turn_id, second.turn_id);
+    }
 
     #[test]
     fn child_routing_preserves_all_sessions_beyond_former_limit() -> Result<()> {

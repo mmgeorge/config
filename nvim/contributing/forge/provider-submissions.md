@@ -8,7 +8,9 @@ This reference explains what counts as acceptance for each provider, and how to 
 
 `provider/submission.rs` owns the journal in `provider-submissions.sqlite3` under the Harness data root, using WAL and FULL synchronous commits. It stays enabled when tracing is disabled. Root admission saves the complete typed input before acknowledging the composer, and live steering saves its input before entering the active-turn queue. Child and Background requests use the same journal with their own owner identity.
 
-Live steering waits for the native lane to accept or reject the input. The broker does not impose a separate admission deadline: abandoning a command still queued in that lane can strand later inputs or schedule a duplicate continuation. Cancelling the owning turn still interrupts delivery.
+Owner-targeted steering is registered with the shared session execution engine before dispatch. The adapter reports delivery separately from execution completion. Its 30-second acknowledgment deadline produces an uncertain-delivery error; it never silently queues another copy. Cancelling the owning turn still interrupts delivery.
+
+An explicit `NotConsumed` result permits a normal submission in the same invocation. The adapter waits for the prior native execution to close admission before that continuation. An accepted result, disconnect, or unknown outcome does not permit resending. A terminal event must cover every accepted input before the host result waiter completes.
 
 | State | Meaning |
 | --- | --- |
@@ -46,13 +48,13 @@ The [Codex App Server reference](https://developers.openai.com/codex/app-server#
 
 Copilot captures a native event-log cursor and the exact rendered prompt before `session.send`, and its returned message ID acknowledges acceptance. Reconciliation requires one exact match after that cursor, with a native message ID Forge has not already acknowledged. Multiple matches stay uncertain, and unsupported history, expired cursors, and transport errors do not establish absence.
 
-SDK 1.0.7 documents that cancelling after its writer commits a frame can lose the response while the CLI still processes the message, and `MessageOptions` has no caller-supplied identity. See [Copilot's send implementation](https://github.com/github/copilot-sdk/blob/main/rust/src/session.rs).
+SDK 1.0.26 documents that cancelling after its writer commits a frame can lose the response while the CLI still processes the message, and `MessageOptions` has no caller-supplied identity. See [Copilot's send implementation](https://github.com/github/copilot-sdk/blob/main/rust/src/session.rs).
 
 ### ACP
 
 Claude and Antigravity use [ACP v1 prompt turns](https://agentclientprotocol.com/protocol/v1/prompt-turn). The `session/prompt` response ends the turn, so it is not an early acceptance receipt, and v1 has no mandatory client-assigned ID to prove delivery. Both providers commit the session ID and method as `Sending` immediately before the transport call. Startup and attachment failures leave input `Prepared`.
 
-Claude's pinned 0.89.1 adapter advertises the [`_session/steering` extension](https://github.com/agentclientprotocol/claude-agent-acp/blob/v0.89.1/src/acp-agent.ts). With `idleBehavior: "promptRequired"`, only the exact `promptRequired` / `noRunningTurn` response proves the input was not queued, so only that response returns it to `Prepared`. Antigravity does not advertise steering.
+Claude's minimum supported 0.99.1 adapter advertises the [`_session/steering` extension](https://github.com/agentclientprotocol/claude-agent-acp/blob/v0.99.1/src/acp-agent.ts). With `idleBehavior: "promptRequired"`, only the exact `promptRequired` / `noRunningTurn` response proves the input was not queued, so only that response returns it to `Prepared`. Antigravity does not advertise steering.
 
 The [ACP v2 draft](https://agentclientprotocol.com/protocol/v2/prompt-lifecycle) makes `session/prompt` return when the message enters the conversation. Forge negotiates v1, and must not apply v2 semantics to a v1 connection.
 

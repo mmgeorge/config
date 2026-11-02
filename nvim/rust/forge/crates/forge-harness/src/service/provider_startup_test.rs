@@ -5,6 +5,7 @@ use crate::provider::{
 use std::sync::atomic::AtomicUsize;
 
 struct StartupProvider {
+    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
     entered: Notify,
     release: tokio::sync::Semaphore,
     calls: AtomicUsize,
@@ -15,13 +16,18 @@ struct StartupProvider {
 #[async_trait::async_trait]
 impl crate::provider::ProviderAdapter for StartupProvider {
     type Host = crate::provider::HarnessProviderHost;
-    async fn initialize_session(&self, request: ProviderRequest) -> Result<Option<String>> {
+    async fn initialize_session(
+        &self,
+        request: ProviderRequest,
+    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
         assert!(request.input.text().is_empty());
         self.calls.fetch_add(1, Ordering::AcqRel);
         self.request.lock().unwrap().push(request.clone());
         self.entered.notify_one();
         self.release.acquire().await.unwrap().forget();
-        if request.provider_session_id.as_deref() == Some("missing-provider-thread") {
+        if request.provider_session_id.as_ref().map(|id| id.as_str())
+            == Some("missing-provider-thread")
+        {
             return Err(crate::provider::ProviderError::SessionMissing {
                 message: "fixture missing provider thread".into(),
             }
@@ -30,7 +36,7 @@ impl crate::provider::ProviderAdapter for StartupProvider {
         if self.fail {
             anyhow::bail!("fixture startup failure");
         }
-        Ok(Some("prepared-provider-thread".into()))
+        Ok(Some("prepared-provider-thread".to_owned().try_into()?))
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -45,8 +51,11 @@ impl crate::provider::ProviderAdapter for StartupProvider {
     async fn has_active_turn(&self, _: &str) -> bool {
         false
     }
-    async fn active_session_id_for(&self, _: &str) -> Option<String> {
-        None
+    async fn active_session_id_for(
+        &self,
+        _: &str,
+    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+        Ok(None)
     }
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor {
@@ -55,7 +64,37 @@ impl crate::provider::ProviderAdapter for StartupProvider {
             capability: ProviderCapability::default(),
         }
     }
-    async fn prompt_stream(
+
+    async fn session_events(
+        &self,
+        owner: crate::provider::ExecutionOwner,
+    ) -> std::result::Result<
+        crate::provider::events::ProviderEventStream,
+        crate::provider::ProviderError,
+    > {
+        let stream = self.fixture_events.subscribe(owner.clone())?;
+        Ok(stream)
+    }
+
+    async fn session_prompt(
+        self: std::sync::Arc<Self>,
+        request: crate::provider::ProviderRequest,
+        scope: crate::provider::InvocationScope,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let events = self.fixture_events.clone();
+        events
+            .submit(
+                request,
+                scope,
+                crate::provider::TerminalBoundary::LocalFixture,
+                move |request, sink| async move { self.run_native(request, sink).await },
+            )
+            .await
+    }
+}
+
+impl StartupProvider {
+    async fn run_native(
         &self,
         _: ProviderRequest,
         _: ProviderEventSink,
@@ -74,15 +113,16 @@ async fn provider_startup_is_nonblocking_persists_ready_identity_and_reports_fai
             "client_id":"startup-fixture", "provider":{"kind":"mock","command":[]},
         }))?;
         let broker = HarnessBroker::initialize(initialize)?;
-        let mut controller = SessionController::new(broker)?;
+        let controller = SessionController::new(broker)?;
         let provider = Arc::new(StartupProvider {
+            fixture_events: Default::default(),
             entered: Notify::new(),
             release: tokio::sync::Semaphore::new(0),
             calls: AtomicUsize::new(0),
             request: Default::default(),
             fail,
         });
-        Arc::get_mut(&mut controller).unwrap().provider = provider.clone();
+        *controller.provider.write().unwrap() = provider.clone();
         let (sink, mut output) = forge_protocol::outbound::channel();
         controller.start_provider(&sink).await;
         provider.entered.notified().await;
@@ -156,7 +196,8 @@ async fn provider_startup_is_nonblocking_persists_ready_identity_and_reports_fai
                     .read()
                     .await
                     .provider_session_id
-                    .as_deref(),
+                    .as_ref()
+                    .map(|id| id.as_str()),
                 Some("prepared-provider-thread")
             );
         }
@@ -200,15 +241,16 @@ async fn provider_startup_recovers_only_missing_empty_sessions() -> Result<()> {
         }
         drop(store);
         let broker = HarnessBroker::initialize(serde_json::from_value(parameters)?)?;
-        let mut controller = SessionController::new(broker)?;
+        let controller = SessionController::new(broker)?;
         let provider = Arc::new(StartupProvider {
+            fixture_events: Default::default(),
             entered: Notify::new(),
             release: tokio::sync::Semaphore::new(2),
             calls: AtomicUsize::new(0),
             request: Default::default(),
             fail: false,
         });
-        Arc::get_mut(&mut controller).unwrap().provider = provider.clone();
+        *controller.provider.write().unwrap() = provider.clone();
         let (sink, _output) = forge_protocol::outbound::channel();
         controller.start_provider(&sink).await;
         controller
@@ -239,14 +281,18 @@ async fn provider_startup_recovers_only_missing_empty_sessions() -> Result<()> {
                     .read()
                     .await
                     .provider_session_id
-                    .as_deref(),
+                    .as_ref()
+                    .map(|id| id.as_str()),
                 Some("prepared-provider-thread")
             );
         } else {
             assert_eq!(provider.calls.load(Ordering::Acquire), 1);
             assert!(!controller.provider_ready().await);
             assert_eq!(
-                provider.request.lock().unwrap()[0].provider_session_id,
+                provider.request.lock().unwrap()[0]
+                    .provider_session_id
+                    .clone()
+                    .map(String::from),
                 session.provider_session_id
             );
             assert_eq!(persisted.provider_session_id, session.provider_session_id);
@@ -274,15 +320,16 @@ async fn rename_without_exchanges_is_local_and_survives_provider_replacement() -
         "client_id":"rename-fixture", "provider":{"kind":"mock","command":[]},
     });
     let broker = HarnessBroker::initialize(serde_json::from_value(parameters.clone())?)?;
-    let mut controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker)?;
     let provider = Arc::new(StartupProvider {
+        fixture_events: Default::default(),
         entered: Notify::new(),
         release: tokio::sync::Semaphore::new(0),
         calls: AtomicUsize::new(0),
         request: Default::default(),
         fail: false,
     });
-    Arc::get_mut(&mut controller).unwrap().provider = provider.clone();
+    *controller.provider.write().unwrap() = provider.clone();
     let session_id = controller.observer.session_id().to_owned();
     controller.observer.query(
         RuntimeMethod::SessionRename,

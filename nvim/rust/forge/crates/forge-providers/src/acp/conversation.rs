@@ -37,11 +37,22 @@ impl AcpConversation {
         state: Arc<AcpSessionState>,
         options: ConversationOptions,
     ) -> Result<Self, ProviderError> {
+        let runtime = PathBuf::from(launch.command.first().map(String::as_str).unwrap_or("ACP"));
         let transport = AcpConnection::launch(launch, state.clone()).await?;
         let result: Result<Self> = async {
         let initialized = transport.request("initialize", json!({"protocolVersion":1,
             "clientInfo":{"name":"forge-harness","title":"Forge Harness","version":"0.1.0"},
             "clientCapabilities":{"session":{"compaction":{},"configOptions":{"boolean":{}}},"subagents":{}}})).await?;
+        let minimum = match options.kind {
+            ProviderKind::Claude => semver::Version::new(0, 99, 1),
+            ProviderKind::Antigravity => semver::Version::new(1, 4, 5),
+            ProviderKind::Codex | ProviderKind::Copilot | ProviderKind::Mock => {
+                return Err(ProviderError::Protocol { message: "non-ACP provider selected for ACP initialization".into() }.into());
+            }
+        };
+        forge_provider_api::version::RuntimeRequirement::new(options.kind, runtime, minimum)
+            .validate(initialized.pointer("/agentInfo/version").and_then(Value::as_str))
+            .map_err(ProviderError::from)?;
         ensure!(
             initialized["protocolVersion"] == 1,
             "ACP agent did not negotiate protocol v1"
@@ -151,6 +162,20 @@ impl AcpConversation {
         receipt: Option<Arc<dyn forge_provider_api::submission::InputReceipt>>,
     ) -> Result<Value, ProviderError> {
         self.transport.submit(method, parameter, receipt).await
+    }
+
+    /// Submit steering and retain the adapter's typed lifecycle limitation.
+    pub async fn steer(
+        &self,
+        parameter: Value,
+        receipt: Option<Arc<dyn forge_provider_api::submission::InputReceipt>>,
+    ) -> Result<super::submission::SteeringAcceptance, ProviderError> {
+        self.transport.submit_steering(parameter, receipt).await
+    }
+
+    /// Interrupt this conversation while retaining the outstanding prompt's terminal response.
+    pub fn cancel(&self) -> Result<(), ProviderError> {
+        Ok(self.transport.cancel(&self.id)?)
     }
 
     /// Stop and collect the owned native process.

@@ -844,7 +844,7 @@ mod test {
                         elapsed_ms: Some(elapsed),
                         failed: false,
                         title: "cargo test --locked --lib controls::tests · Running",
-                        expanded: expanded,
+                        expanded,
                         shell: None,
                     },
                 )?;
@@ -1186,10 +1186,10 @@ mod test {
                 let expanded = renderer.refresh_tool_heading(
                     &collapsed,
                     crate::buffer::transcript::ToolHeading {
-                        kind: kind,
+                        kind,
                         elapsed_ms: Some(400),
                         failed: false,
-                        title: title,
+                        title,
                         expanded: true,
                         shell: None,
                     },
@@ -1357,7 +1357,7 @@ mod test {
                     failed: false,
                     title: &invocation.title,
                     expanded: false,
-                    shell: shell,
+                    shell,
                 },
             )?;
             assert_eq!(completed.text, running.text);

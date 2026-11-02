@@ -1,5 +1,6 @@
 pub(crate) mod admission;
 mod archive;
+pub(crate) mod configuration;
 mod current;
 pub(crate) mod inspection;
 pub(crate) mod lifecycle;
@@ -35,8 +36,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 59;
-const PREFERENCE_FORMAT_VERSION: u32 = 43;
+const SESSION_FORMAT_VERSION: u32 = 60;
+const PREFERENCE_FORMAT_VERSION: u32 = 44;
 
 /// Keeps storage failures explicit at the host boundary, including the configured contention wait.
 pub fn error_message(error: &anyhow::Error) -> String {
@@ -382,6 +383,7 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("begin session ownership write")?;
+        Self::ensure_no_configuration_intent(&transaction, &session.id)?;
         let payload: Option<String> = transaction
             .query_row(
                 "SELECT payload FROM session_record WHERE id=?1",
@@ -1261,6 +1263,7 @@ impl SessionStore for SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Self::ensure_no_configuration_intent(&transaction, &session.id)?;
         transaction.execute(
             "INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES(?1, ?2, ?3, ?4)\
              ON CONFLICT(id) DO UPDATE SET workspace=excluded.workspace, updated_at_ms=excluded.updated_at_ms, payload=json_set(excluded.payload,'$.session.name',json_extract(session_record.payload,'$.session.name'),'$.session.active_task',json_extract(session_record.payload,'$.session.active_task'))",
@@ -2354,6 +2357,54 @@ mod test {
                 .model,
             "current-model"
         );
+    }
+
+    /// Skip obsolete access payloads before decoding without deleting their stored history.
+    #[test]
+    fn obsolete_windows_sandbox_payloads_do_not_block_current_sessions() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let mut store = SqliteStore::open(temporary.path())?;
+        let mut obsolete = serde_json::json!({
+            "format_version": 59,
+            "session": session("obsolete-access", "D:/work"),
+        });
+        obsolete["session"]["access"]["windows_sandbox"] = serde_json::json!(true);
+        let encoded = encode(&obsolete)?;
+        store.connection.execute(
+            "INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES('obsolete-access', 'D:/work', 1, ?1)",
+            [&encoded],
+        )?;
+        let obsolete_preference = encode(&serde_json::json!({
+            "format_version": 43,
+            "preference": {
+                "model": "obsolete-model",
+                "effort": "low",
+                "access": obsolete["session"]["access"],
+            },
+        }))?;
+        store.connection.execute(
+            "INSERT INTO preference_record(workspace, backend, payload) VALUES('D:/work', 'codex', ?1)",
+            [&obsolete_preference],
+        )?;
+        store.save_session(&session("current-access", "D:/work"))?;
+
+        assert!(store.load_session("obsolete-access")?.is_none());
+        assert!(store.load_preference("D:/work", "codex")?.is_none());
+        assert_eq!(store.list_session(Some("D:/work"))?.len(), 1);
+        assert!(store.load_session("current-access")?.is_some());
+        let retained: String = store.connection.query_row(
+            "SELECT payload FROM session_record WHERE id='obsolete-access'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained, encoded);
+        let retained_preference: String = store.connection.query_row(
+            "SELECT payload FROM preference_record WHERE workspace='D:/work' AND backend='codex'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained_preference, obsolete_preference);
+        Ok(())
     }
 
     #[test]

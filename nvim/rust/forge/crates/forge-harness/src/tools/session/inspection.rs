@@ -33,12 +33,26 @@ pub(crate) struct HarnessInspectionScope {
     policy: Arc<CompiledPermissionDocument>,
     cancelled: Arc<AtomicBool>,
     active: AtomicBool,
+    authority: std::sync::RwLock<Option<crate::tools::TaskAuthority>>,
     pages: Mutex<HashMap<String, InspectionPage>>,
     trace: Arc<crate::trace::TraceStore>,
     enabled: bool,
 }
 
 pub(crate) struct InspectionLease(Arc<HarnessInspectionScope>);
+impl InspectionLease {
+    pub(crate) fn bind_authority(
+        &self,
+        authority: Option<crate::tools::TaskAuthority>,
+    ) -> Result<()> {
+        *self
+            .0
+            .authority
+            .write()
+            .map_err(|_| anyhow::anyhow!("inspection authority lock poisoned"))? = authority;
+        Ok(())
+    }
+}
 impl Drop for InspectionLease {
     fn drop(&mut self) {
         self.0.active.store(false, Ordering::Release);
@@ -89,6 +103,7 @@ impl HarnessInspectionScope {
             trace,
             enabled,
             active: AtomicBool::new(true),
+            authority: std::sync::RwLock::new(None),
             pages: Mutex::default(),
         });
         Ok((scope.clone(), InspectionLease(scope)))
@@ -104,6 +119,14 @@ impl HarnessInspectionScope {
             self.active.load(Ordering::Acquire) && !self.cancelled.load(Ordering::Acquire),
             "Harness inspection belongs to an inactive interaction"
         );
+        if let Some(authority) = self
+            .authority
+            .read()
+            .map_err(|_| anyhow::anyhow!("inspection authority lock poisoned"))?
+            .clone()
+        {
+            authority.validate_scope()?;
+        }
         Ok(())
     }
 

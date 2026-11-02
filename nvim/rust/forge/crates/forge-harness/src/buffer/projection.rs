@@ -5051,7 +5051,6 @@ mod tests {
             for turn in &stored.turn {
                 let outputs = stored
                     .tools_for_turn(turn.id())
-                    .into_iter()
                     .map(|tool| (tool.id.clone(), tool.output.as_bytes().to_vec()))
                     .collect::<Vec<_>>();
                 for (tool_id, bytes) in outputs {

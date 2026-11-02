@@ -64,12 +64,12 @@ Test fixtures must use the current public check configuration. Task-specific ena
 
 ## Live provider tests
 
-Tests that need installed or authenticated provider CLIs live in the `tests/live_provider.rs` integration target, with modules under `tests/live_provider/`. Each case is marked `#[ignore]`, because it depends on local tools, credentials, remote services, or billable requests. Normal runs compile these cases without running them.
+Tests that need installed or authenticated provider CLIs live in the internal `live_provider` test module, with sources under `tests/live_provider/`. This lets complete-result fixtures use the same crate-private execution engine as production. Each case is marked `#[ignore]`, because it depends on local tools, credentials, remote services, or billable requests. Normal library test runs compile these cases without running them.
 
 After authorizing external requests and checking a case's prerequisites, run only that case:
 
 ```nu
-cargo test --profile dev --locked -p forge-harness --test live_provider <module::test_name> -- --ignored --exact
+cargo test --profile dev --locked -p forge-harness --lib live_provider::<module::test_name> -- --ignored --exact
 ```
 
 Never enable ignored cases in routine project checks.

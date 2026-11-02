@@ -1798,6 +1798,46 @@ async fn scoped_input_preserves_paths_and_valid_receipts() -> Result<()> {
 }
 
 #[tokio::test]
+async fn revoked_callback_cannot_write_check_configuration() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    save(workspace.path(), vec![definition("unit", "exit 0")]);
+    let before = std::fs::read(workspace.path().join(".forge.json"))?;
+    let runner = make_runner(workspace.path(), data.path());
+    let catalog = runner.catalog(None)?;
+    let (_root, mut task_store, controller) = crate::task::SessionTaskController::test_goal();
+    let task = controller.current()?.unwrap();
+    let mut context = crate::tools::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+    context.bind_test_task_controller(controller.clone());
+    let authority = crate::tools::TaskAuthority::capture(&context).unwrap();
+    controller.change(
+        &mut task_store,
+        Some(&task.revision),
+        crate::task::TaskChange::Clear,
+        2,
+    )?;
+    let result = runner
+        .configure_with_authority(
+            crate::timeline::TimelineOwner::session("checks-test"),
+            crate::checks::ConfigureChecks {
+                expected_revision: catalog["revision"].as_str().unwrap().into(),
+                config: CheckConfig {
+                    version: 2,
+                    definitions: Vec::new(),
+                },
+                helpers: Vec::new(),
+            },
+            None,
+            None,
+            Some(&authority),
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(workspace.path().join(".forge.json"))?, before);
+    Ok(())
+}
+
+#[tokio::test]
 async fn setup_preserves_fields_and_task_overrides_do_not_leak() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;

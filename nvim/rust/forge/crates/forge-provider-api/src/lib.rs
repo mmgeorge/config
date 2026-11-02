@@ -16,10 +16,12 @@ pub mod events;
 pub mod execution;
 pub mod generation;
 pub mod input;
+pub mod lifecycle;
 pub mod message;
 pub mod model;
 pub mod permissions;
 pub mod progress;
+pub mod provider_session_id;
 pub mod retry;
 pub mod service_tier;
 pub mod skill;
@@ -30,6 +32,7 @@ pub mod trace;
 pub mod turn;
 pub mod turn_control;
 pub mod usage;
+pub mod version;
 
 pub use change::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
 pub use checklist::{ChecklistStatus, ProviderChecklistEntry, ProviderChecklistUpdate};
@@ -40,6 +43,7 @@ pub use events::{ProviderEventSink, ProviderEventStream};
 pub use execution::*;
 pub use message::{MessageClassification, MessageId, MessageRole, MessageUpdate};
 pub use model::*;
+pub use provider_session_id::{ProviderSessionId, ProviderSessionIdError};
 pub use service_tier::ServiceTier;
 pub use tool::{
     TextUpdate, ToolActivityKind, ToolDiagnostic, ToolInvocation, ToolOutcome, ToolStatus,

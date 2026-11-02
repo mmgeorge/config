@@ -15,7 +15,10 @@ pub(super) fn definition() -> ControlToolDefinition {
                 comments, and Calls/Constructs/Accesses; never executable bodies. New callables require a \
                 nonempty Algorithm; use the academic-pseudocode skill. Modified callables use a \
                 one-to-two-sentence Change, even when the signature stays the same. Place behavior and reference \
-                sections directly below the signature. Comment declarations, without starting comments with \
+                sections directly below the signature. Use a standalone heading and indented content, for example:\n\
+                pub fn existing();\nChange\n  Preserve the existing result while recording the update.\n\
+                pub fn added();\nAlgorithm\n  return none\n\
+                Comment declarations, without starting comments with \
                 Returns. Keep unchanged references; omitted reference sections mean unknown, and empty sections \
                 mean none. New internal declarations need a recorded use. Configuration files retain complete \
                 contents. Read existing files with plan_file_read first and omit displayed line numbers from \

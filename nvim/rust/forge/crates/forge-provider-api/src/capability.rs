@@ -1,7 +1,7 @@
 use crate::{ProviderDescriptor, ProviderKind};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 /// Distinguishes supported behavior from provider limitations.
 pub enum Support {
@@ -460,6 +460,14 @@ impl std::fmt::Display for UnsupportedCapability {
 
 impl std::error::Error for UnsupportedCapability {}
 
+/// Records a restriction supplied by the integration that owns the operation.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct FeatureLimitation {
+    pub id: String,
+    pub support: Support,
+    pub reason: String,
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -503,12 +511,4 @@ mod test {
             assert_eq!(find("file_diff").reason, "fixture restriction");
         }
     }
-}
-
-/// Records a restriction supplied by the integration that owns the operation.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct FeatureLimitation {
-    pub id: String,
-    pub support: Support,
-    pub reason: String,
 }

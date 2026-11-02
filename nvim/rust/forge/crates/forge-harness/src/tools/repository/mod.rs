@@ -7,4 +7,5 @@ mod scope;
 mod status;
 
 pub(in crate::tools) use catalog::{definitions, execute, is_tool, record};
+pub(crate) use scope::RepositoryToolLease;
 pub use scope::RepositoryToolScope;

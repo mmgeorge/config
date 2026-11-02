@@ -13,6 +13,13 @@ pub enum AcpSubmission {
     Steering,
 }
 
+/// Distinguish confirmed injection from accepted work without an observable terminal signal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SteeringAcceptance {
+    Injected,
+    UnobservableExecution,
+}
+
 impl AcpSubmission {
     fn method(self) -> &'static str {
         match self {
@@ -45,6 +52,24 @@ impl std::str::FromStr for AcpSubmission {
 }
 
 impl AcpConnection {
+    /// Decode steering outcomes only after recording native acceptance evidence.
+    pub async fn submit_steering(
+        &self,
+        parameter: Value,
+        submission: Option<Arc<dyn InputReceipt>>,
+    ) -> Result<SteeringAcceptance, ProviderError> {
+        let response = self
+            .submit(AcpSubmission::Steering, parameter, submission)
+            .await?;
+        match response["outcome"].as_str() {
+            Some("injected") => Ok(SteeringAcceptance::Injected),
+            Some("startedNewTurn") => Ok(SteeringAcceptance::UnobservableExecution),
+            _ => Err(ProviderError::Protocol {
+                message: "ACP accepted an unsupported steering outcome".into(),
+            }),
+        }
+    }
+
     /// Commits delivery evidence around an ACP prompt or advertised steering request.
     /// Cancellation after dispatch leaves the input uncertain. Only a valid native
     /// response permits acceptance or the documented idle-steering fallback.
@@ -97,7 +122,7 @@ impl AcpConnection {
                         if let Some(submission) = submission.as_ref() {
                             submission.clone().record_rejected(error.into()).await?;
                         }
-                        return Err(ProviderError::Rejected {
+                        return Err(ProviderError::NotConsumed {
                             message: error.into(),
                         });
                     }

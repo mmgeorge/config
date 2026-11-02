@@ -12,7 +12,7 @@ use crate::provider::TurnAddress;
 pub enum TurnState {
     /// Provider events may still extend the execution.
     Running,
-    /// Provider events can no longer change this execution.
+    /// Execution timing and outcome are fixed; correlated late output may still arrive.
     Finished {
         /// The provider or cancellation boundary that settled execution.
         outcome: TurnOutcome,
@@ -221,6 +221,10 @@ impl Turn {
                 "provider message identity does not belong to this execution",
             ));
         }
+        let retained_output = self.state
+            == (TurnState::Finished {
+                outcome: TurnOutcome::Completed,
+            });
         let existing = self
             .message
             .iter()
@@ -243,8 +247,8 @@ impl Turn {
                     ))
                 };
             }
-            if self.state != TurnState::Running {
-                return Err(protocol("completed turn rejects new messages"));
+            if self.state != TurnState::Running && !retained_output {
+                return Err(protocol("cancelled or failed turn rejects new messages"));
             }
             let index = self.message.len();
             let id = format!("{}:message:{}", self.id, index + 1);
@@ -277,16 +281,22 @@ impl Turn {
                     return Err(protocol("provider message classification changed"));
                 }
             },
-            MessageUpdate::Delta { text } if message.state == MessageState::Streaming => {
-                if self.state != TurnState::Running {
-                    return Err(protocol("completed turn rejects message deltas"));
+            MessageUpdate::Delta { text }
+                if message.state == MessageState::Streaming
+                    || retained_output && message.state == MessageState::Interrupted =>
+            {
+                if self.state != TurnState::Running && !retained_output {
+                    return Err(protocol("cancelled or failed turn rejects message deltas"));
                 }
                 message.text.push_str(text);
                 if self.current_message.is_none_or(|current| index >= current) {
                     self.current_message = Some(index);
                 }
             }
-            MessageUpdate::Completed { text } if message.state == MessageState::Streaming => {
+            MessageUpdate::Completed { text }
+                if message.state == MessageState::Streaming
+                    || retained_output && message.state == MessageState::Interrupted =>
+            {
                 message.text.clone_from(text);
                 message.state = MessageState::Completed;
                 if self.current_message == Some(index) {
@@ -353,6 +363,8 @@ fn default_delivery(kind: MessageKind) -> MessageDelivery {
     }
 }
 
+pub use forge_provider_api::turn::TurnOutcome;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +377,53 @@ mod tests {
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
         }
+    }
+
+    /// Late output enriches its known execution without changing its outcome or active timing.
+    #[test]
+    fn late_message_after_completion_preserves_terminal_execution() -> Result<()> {
+        let address = TurnAddress {
+            scope: scope(),
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        let mut turn = super::Turn::new("local".into(), address.clone(), 10);
+        let message = crate::provider::MessageAddress {
+            turn: address,
+            message_id: crate::provider::MessageId::Native("answer".into()),
+        };
+        turn.record_message(
+            &message,
+            &crate::provider::MessageUpdate::Started {
+                classification: crate::provider::MessageClassification::Known(
+                    crate::provider::MessageRole::Response,
+                ),
+                text: "first".into(),
+            },
+        )?;
+        turn.finish(TurnOutcome::Completed, 20)?;
+        turn.record_message(
+            &message,
+            &crate::provider::MessageUpdate::Delta {
+                text: " last".into(),
+            },
+        )?;
+        turn.record_message(
+            &message,
+            &crate::provider::MessageUpdate::Completed {
+                text: "first last".into(),
+            },
+        )?;
+        assert_eq!(
+            turn.state(),
+            TurnState::Finished {
+                outcome: TurnOutcome::Completed
+            }
+        );
+        assert_eq!(turn.duration_ms(), 10);
+        assert_eq!(turn.messages()[0].text(), "first last");
+        assert_eq!(turn.messages()[0].state(), MessageState::Completed);
+        Ok(())
     }
 
     #[test]
@@ -926,5 +985,3 @@ mod tests {
         assert!(turn.finish(TurnOutcome::Failed, 90).is_err());
     }
 }
-
-pub use forge_provider_api::turn::TurnOutcome;

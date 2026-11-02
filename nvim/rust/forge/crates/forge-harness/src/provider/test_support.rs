@@ -1,3 +1,7 @@
+mod collect;
+pub(crate) use super::session_events::{SessionEvents, TerminalBoundary};
+pub(crate) use collect::{ProviderTestExt, ProviderTestSession};
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
@@ -79,13 +83,13 @@ pub(crate) fn tool(
 }
 
 pub(crate) enum FixtureBatch {
-    Event(ProviderEvent),
+    Event(Box<ProviderEvent>),
     Sequence(Vec<ProviderEvent>),
 }
 
 impl From<ProviderEvent> for FixtureBatch {
     fn from(event: ProviderEvent) -> Self {
-        Self::Event(event)
+        Self::Event(Box::new(event))
     }
 }
 
@@ -118,7 +122,7 @@ impl FixtureStream {
 
     fn prepare(&self, batch: FixtureBatch) -> Vec<ProviderEvent> {
         let source = match batch {
-            FixtureBatch::Event(event) => vec![event],
+            FixtureBatch::Event(event) => vec![*event],
             FixtureBatch::Sequence(event) => event,
         };
         let mut admission = self.admission.lock().expect("fixture admission lock");
@@ -126,18 +130,27 @@ impl FixtureStream {
         for update in source {
             if let Some(address) = update.turn_address()
                 && admission.turn.insert(address.clone())
-                && !matches!(
+            {
+                let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
+                    address.scope.clone(),
+                    forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                        address: address.clone(),
+                    },
+                )
+                .expect("fixture execution address carries its own invocation scope");
+                event.push(ProviderEvent::Execution { observation });
+                if !matches!(
                     &update,
                     ProviderEvent::Turn {
                         update: TurnUpdate::Started { .. },
                         ..
                     }
-                )
-            {
-                event.push(ProviderEvent::Turn {
-                    address: address.clone(),
-                    update: TurnUpdate::Started { started_at_ms: 0 },
-                });
+                ) {
+                    event.push(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: TurnUpdate::Started { started_at_ms: 0 },
+                    });
+                }
             }
             if let ProviderEvent::Tool {
                 address,
@@ -209,5 +222,45 @@ impl FixtureStream {
                 .await?;
         }
         Ok(())
+    }
+}
+
+/// Supply an explicit observation drain for retry-policy tests that inspect only completion.
+pub(crate) async fn retry_prompt<P>(
+    provider: &ProviderTestSession<P>,
+    mut request: super::ProviderRequest,
+    sink: Option<ProviderEventSink>,
+    trace: &crate::trace::TraceStore,
+    store: &Arc<super::submission::SubmissionStore>,
+) -> anyhow::Result<super::ProviderCompletion>
+where
+    P: super::ProviderAdapter<Host = super::HarnessProviderHost> + ?Sized,
+{
+    if request.submission.is_none() {
+        request.submission = Some(store.prepare(&request, provider.descriptor().kind)?);
+    }
+    let (sink, mut drain) = match sink {
+        Some(sink) => (sink, None),
+        None => {
+            let (sink, stream) = super::events::channel(InvocationScope::new(
+                request.owner()?,
+                uuid::Uuid::new_v4().to_string(),
+            ));
+            (sink, Some(stream))
+        }
+    };
+    let pending =
+        super::retry::run_policy(request, sink, trace, |mut request, sink, _| async move {
+            if request.submission.is_none() {
+                request.submission = Some(store.prepare(&request, provider.descriptor().kind)?);
+            }
+            provider.session_prompt_and_wait(request, sink).await
+        });
+    tokio::pin!(pending);
+    loop {
+        tokio::select! {
+            result = &mut pending => return result,
+            event = async { match &mut drain { Some(stream) => stream.recv().await, None => std::future::pending().await } } => { event?; },
+        }
     }
 }

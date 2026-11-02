@@ -508,9 +508,10 @@ impl PlanExecutionRecord {
 pub enum ExecutionOperation {
     Inspect,
     Phase(PlanPhaseDone),
-    Draft(PlanDocument),
+    Draft(Box<PlanDocument>),
     Submit {
-        document: PlanDocument,
+        baseline: Box<PlanDocument>,
+        document: Box<PlanDocument>,
         reason: String,
     },
 }

@@ -1,14 +1,33 @@
 use anyhow::{Context, Result};
 use forge_provider_api::trace::ProviderTrace;
+use github_copilot_sdk::SessionEvent;
 use github_copilot_sdk::subscription::RecvErrorKind;
-use github_copilot_sdk::{Client, SessionEvent};
 use std::sync::Arc;
+
+/// Distinguish pending initialization from its established native outcome.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum StartupState {
+    /// Native creation or resumption has not returned.
+    Pending,
+    /// Initialization has established whether subscription closure is expected.
+    Finished(StartupOutcome),
+}
+
+/// Establish whether the native session started or rejected initialization.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum StartupOutcome {
+    /// Native initialization succeeded and observation must remain available.
+    Started,
+    /// Native initialization failed and the SDK closes its subscription.
+    Failed,
+}
 
 /// Drains SDK notifications without owning the session or blocking on presentation.
 pub struct SessionEventStream {
     receiver: tokio::sync::mpsc::Receiver<SessionEvent>,
-    task: tokio::task::JoinHandle<Result<()>>,
+    task: Option<tokio::task::JoinHandle<Result<()>>>,
     session_id: String,
+    startup: Option<tokio::sync::watch::Sender<StartupState>>,
 }
 
 impl SessionEventStream {
@@ -19,67 +38,77 @@ impl SessionEventStream {
         trace: Arc<dyn ProviderTrace>,
         harness_session_id: String,
     ) -> Self {
-        let mut subscription = session.subscribe();
-        let client = session.client().clone();
-        let session_id = session.id().to_string();
+        Self::from_subscription(
+            session.subscribe(),
+            session.id().to_string(),
+            accepts,
+            trace,
+            harness_session_id,
+            StartupState::Finished(StartupOutcome::Started),
+        )
+    }
+
+    /// Drain a subscription installed before the native session starts.
+    pub(crate) fn from_subscription(
+        mut subscription: github_copilot_sdk::subscription::EventSubscription,
+        session_id: String,
+        accepts: fn(&SessionEvent) -> bool,
+        trace: Arc<dyn ProviderTrace>,
+        harness_session_id: String,
+        initial: StartupState,
+    ) -> Self {
         let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+        let (startup, mut startup_state) = tokio::sync::watch::channel(initial);
         let stream_session_id = session_id.clone();
         let task = tokio::spawn(async move {
             let result: Result<()> = async {
-            let mut cursor = None;
-            let mut lagged = false;
-            loop {
-                let event = match subscription.recv().await {
-                    Ok(event) => event,
-                    Err(error) if matches!(error.kind(), RecvErrorKind::Lagged(_)) => {
-                        if let RecvErrorKind::Lagged(skipped) = error.kind() {
-                            trace.record(&harness_session_id, "copilot.subscription.lagged",
-                                serde_json::json!({"session_id": session_id, "skipped": skipped.skipped()}));
+                loop {
+                    let event = match subscription.recv().await {
+                        Ok(event) => event,
+                        Err(error) => {
+                            if matches!(error.kind(), RecvErrorKind::Closed) {
+                                while *startup_state.borrow() == StartupState::Pending {
+                                    if startup_state.changed().await.is_err() {
+                                        break;
+                                    }
+                                }
+                                if *startup_state.borrow()
+                                    == StartupState::Finished(StartupOutcome::Failed)
+                                {
+                                    return Ok(());
+                                }
+                            }
+                            let failure = match error.kind() {
+                                RecvErrorKind::Lagged(_) => {
+                                    forge_provider_api::lifecycle::ObservationFailure::Overflow
+                                }
+                                RecvErrorKind::Closed => {
+                                    forge_provider_api::lifecycle::ObservationFailure::Disconnected
+                                }
+                                _ => forge_provider_api::lifecycle::ObservationFailure::Protocol {
+                                    message: error.to_string(),
+                                },
+                            };
+                            return Err(
+                                forge_provider_api::ProviderError::Observation(failure).into()
+                            );
                         }
-                        lagged = true;
-                        continue;
+                    };
+                    if accepts(&event) {
+                        match sender.try_send(event) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                return Err(forge_provider_api::ProviderError::Observation(
+                                    forge_provider_api::lifecycle::ObservationFailure::Overflow,
+                                )
+                                .into());
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                        }
                     }
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("receive Copilot SDK subscription for session {session_id}")
-                        });
-                    }
-                };
-                if lagged {
-                    if let Err(error) = Self::recover(
-                        &client,
-                        &session_id,
-                        &sender,
-                        accepts,
-                        cursor.as_deref(),
-                        event.parent_id.as_deref(),
-                    )
-                    .await
-                    {
-                        return Err(error).with_context(|| {
-                            format!("recover Copilot SDK subscription for session {session_id}")
-                        });
-                    }
-                    trace.record(
-                        &harness_session_id,
-                        "copilot.subscription.recovered",
-                        serde_json::json!({"session_id": session_id, "parent_id": event.parent_id}),
-                    );
-                    cursor = event.parent_id.clone();
-                    lagged = false;
-                }
-                if event.ephemeral != Some(true) {
-                    cursor = Some(event.id.clone());
-                } else if cursor.is_none() {
-                    cursor = event.parent_id.clone();
-                }
-                if accepts(&event) {
-                    sender.send(event).await.with_context(|| {
-                        format!("deliver Copilot SDK event to intake receiver for session {session_id}")
-                    })?;
                 }
             }
-            }.await;
+            .await;
             if let Err(error) = &result {
                 trace.record(
                     &harness_session_id,
@@ -91,67 +120,43 @@ impl SessionEventStream {
         });
         Self {
             receiver,
-            task,
+            task: Some(task),
             session_id: stream_session_id,
+            startup: (initial == StartupState::Pending).then_some(startup),
         }
     }
 
-    async fn recover(
-        client: &Client,
-        session_id: &str,
-        sender: &tokio::sync::mpsc::Sender<SessionEvent>,
-        accepts: fn(&SessionEvent) -> bool,
-        cursor: Option<&str>,
-        parent: Option<&str>,
-    ) -> Result<()> {
-        if cursor == parent {
+    #[cfg(test)]
+    pub(crate) fn fixture(
+        receiver: tokio::sync::mpsc::Receiver<SessionEvent>,
+        task: tokio::task::JoinHandle<Result<()>>,
+    ) -> Self {
+        Self {
+            receiver,
+            task: Some(task),
+            session_id: "fixture".into(),
+            startup: None,
+        }
+    }
+
+    /// Resolve whether closure during session initialization was expected.
+    pub(crate) fn finish_startup(&mut self, outcome: StartupOutcome) {
+        if let Some(startup) = self.startup.take() {
+            startup.send_replace(StartupState::Finished(outcome));
+        }
+    }
+
+    /// Stop and join the SDK subscription reader before releasing its session.
+    pub(crate) async fn close(&mut self) -> Result<()> {
+        let Some(task) = self.task.take() else {
             return Ok(());
+        };
+        task.abort();
+        match task.await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(error).context("Copilot event intake failed during collection"),
         }
-        let cursor = cursor.context("Copilot event recovery has no prior durable event")?;
-        let parent = parent.context("Copilot event recovery has no next durable parent")?;
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            client.call(
-                "session.getMessages",
-                Some(serde_json::json!({"sessionId": session_id})),
-            ),
-        )
-        .await
-        .context("Copilot event recovery timed out")?
-        .context("read Copilot events for subscription recovery")?;
-        let history =
-            serde_json::from_value::<github_copilot_sdk::types::GetMessagesResponse>(response)
-                .context("decode Copilot session.getMessages recovery response")?
-                .events;
-        let start = history
-            .iter()
-            .position(|event| event.id == cursor)
-            .with_context(|| {
-                format!(
-                    "Copilot recovery cursor {cursor} is absent from session {session_id} history"
-                )
-            })?;
-        let end = history
-            .iter()
-            .position(|event| event.id == parent)
-            .with_context(|| {
-                format!(
-                    "Copilot recovery parent {parent} is absent from session {session_id} history"
-                )
-            })?;
-        anyhow::ensure!(
-            start <= end,
-            "Copilot session {session_id} recovery history is out of order: cursor {cursor} at {start}, parent {parent} at {end}"
-        );
-        // Replay only the gap before the queued event. Newer history still arrives live.
-        for event in history.into_iter().take(end + 1).skip(start + 1) {
-            if accepts(&event) {
-                sender.send(event).await.with_context(|| {
-                    format!("deliver recovered Copilot SDK event for session {session_id}")
-                })?;
-            }
-        }
-        Ok(())
     }
 
     /// Receive retained notifications in SDK order without doing work on the intake task.
@@ -159,7 +164,9 @@ impl SessionEventStream {
         if let Some(event) = self.receiver.recv().await {
             return Ok(event);
         }
-        (&mut self.task)
+        self.task
+            .take()
+            .context("Copilot event intake was already collected")?
             .await
             .with_context(|| {
                 format!(
@@ -177,13 +184,33 @@ impl SessionEventStream {
 
 impl Drop for SessionEventStream {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Explicit close waits for the producer to drop its queue and can be repeated safely.
+    #[tokio::test]
+    async fn explicit_close_collects_the_subscription_task() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let probe = sender.clone();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _sender = sender;
+            let _ = ready.send(());
+            std::future::pending::<Result<()>>().await
+        });
+        let mut stream = SessionEventStream::fixture(receiver, task);
+        started.await.unwrap();
+        stream.close().await.unwrap();
+        assert_eq!(probe.strong_count(), 1);
+        stream.close().await.unwrap();
+    }
 
     #[tokio::test]
     async fn intake_preserves_large_events_before_reporting_the_producer_error() {
@@ -209,8 +236,9 @@ mod tests {
         });
         let mut stream = SessionEventStream {
             receiver,
-            task,
+            task: Some(task),
             session_id: "native-session".into(),
+            startup: None,
         };
         let event = stream.recv().await.unwrap();
         assert_eq!(event.data["patch"].as_str(), Some(expected.as_str()));
@@ -231,8 +259,9 @@ mod tests {
         });
         let mut stream = SessionEventStream {
             receiver,
-            task,
+            task: Some(task),
             session_id: "native-session".into(),
+            startup: None,
         };
         let error = format!("{:#}", stream.recv().await.unwrap_err());
         assert!(error.contains("native-session"), "{error}");
@@ -248,8 +277,9 @@ mod tests {
         });
         let mut stream = SessionEventStream {
             receiver,
-            task,
+            task: Some(task),
             session_id: "native-session".into(),
+            startup: None,
         };
         let error = stream.recv().await.unwrap_err().to_string();
         assert!(error.contains("native-session"), "{error}");
@@ -269,8 +299,9 @@ mod tests {
         task.abort();
         let mut stream = SessionEventStream {
             receiver,
-            task,
+            task: Some(task),
             session_id: "native-session".into(),
+            startup: None,
         };
         let error = format!("{:#}", stream.recv().await.unwrap_err());
         assert!(error.contains("native-session"), "{error}");

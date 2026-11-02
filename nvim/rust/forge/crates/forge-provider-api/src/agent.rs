@@ -35,7 +35,7 @@ pub struct AgentLifecycleEvent {
     pub status: AgentExecutionState,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 /// Reports Harness-owned execution independently of native provider delegation.
 pub struct AgentCapability {
     pub observe: bool,

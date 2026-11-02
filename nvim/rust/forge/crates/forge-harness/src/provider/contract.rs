@@ -43,7 +43,7 @@ pub struct ProviderRequest {
     pub access: crate::session::AccessPolicy,
     pub approval_mode: ApprovalMode,
     #[serde(alias = "backend_session_id")]
-    pub provider_session_id: Option<String>,
+    pub provider_session_id: Option<forge_provider_api::ProviderSessionId>,
     #[serde(skip, default)]
     /// Durable acknowledgment capability attached before dispatch.
     pub submission: Option<std::sync::Arc<super::submission::Submission>>,
@@ -109,10 +109,6 @@ pub struct ProviderCompletion {
     pub design_patch: Vec<crate::plan::DesignEditRequest>,
     pub plan_submit: Option<PlanSubmitRequest>,
     pub plan_read: Option<String>,
-    #[serde(default)]
-    pub plan_deviation: Vec<crate::plan::PlanDeviationRequest>,
-    #[serde(default)]
-    pub plan_task_report: Vec<crate::plan::PlanTaskReport>,
     pub plan_question: Option<PlanQuestionSet>,
     pub question_answer: Option<PlanQuestionAnswer>,
     pub question_withdrawal: Option<PlanQuestionWithdrawal>,
@@ -136,6 +132,41 @@ impl ProviderOutput {
 }
 
 impl ProviderCompletion {
+    /// Accumulate host effects from native continuations before the exchange settles.
+    pub(crate) fn merge_execution(&mut self, next: Self) {
+        let Self {
+            native,
+            mut plan_edit,
+            mut design_patch,
+            plan_submit,
+            plan_read,
+            plan_question,
+            question_answer,
+            question_withdrawal,
+            control_error,
+            goal_control,
+            dispatched_task_permit,
+            dispatched_execution_id,
+            dispatched_entry_id,
+            structured_plan,
+        } = next;
+        self.merge_native(native);
+        self.plan_edit.append(&mut plan_edit);
+        self.design_patch.append(&mut design_patch);
+        self.plan_submit = plan_submit.or(self.plan_submit.take());
+        self.plan_read = plan_read.or(self.plan_read.take());
+        self.plan_question = plan_question.or(self.plan_question.take());
+        self.question_answer = question_answer.or(self.question_answer.take());
+        self.question_withdrawal = question_withdrawal.or(self.question_withdrawal.take());
+        self.control_error = control_error.or(self.control_error.take());
+        self.goal_control = goal_control.or(self.goal_control.take());
+        self.dispatched_task_permit = dispatched_task_permit.or(self.dispatched_task_permit.take());
+        self.dispatched_execution_id =
+            dispatched_execution_id.or(self.dispatched_execution_id.take());
+        self.dispatched_entry_id = dispatched_entry_id.or(self.dispatched_entry_id.take());
+        self.structured_plan |= structured_plan;
+    }
+
     pub(crate) fn merge_native(
         &mut self,
         mut native: forge_provider_api::completion::ProviderCompletion,
@@ -237,6 +268,7 @@ pub fn build(
             acp::AcpProvider::new(kind, launch.command, permission_coordinator, settings_root)?,
         )),
         ProviderKind::Mock => Ok(Box::new(MockProvider {
+            session_events: Default::default(),
             provider_stream: launch
                 .command
                 .first()
@@ -282,7 +314,9 @@ pub fn build(
     }
 }
 
+#[derive(Default)]
 struct MockProvider {
+    session_events: std::sync::Arc<super::session_events::SessionEvents>,
     provider_stream: bool,
     response_control: super::mock_response::MockResponseControl,
     lsp_probe: bool,
@@ -352,12 +386,88 @@ impl MockProvider {
 #[async_trait]
 impl crate::provider::ProviderAdapter for MockProvider {
     type Host = crate::provider::HarnessProviderHost;
+    async fn session_events(
+        &self,
+        owner: ExecutionOwner,
+    ) -> Result<super::events::ProviderEventStream, ProviderError> {
+        self.session_events.subscribe(owner)
+    }
+
+    async fn session_steer(
+        self: std::sync::Arc<Self>,
+        owner: &crate::provider::ExecutionOwner,
+        scope: crate::provider::InvocationScope,
+        input: crate::provider::SteeringInput,
+    ) -> Result<(), crate::provider::ProviderError> {
+        if scope.owner != *owner {
+            return Err(crate::provider::ProviderError::Rejected {
+                message: "steering scope belongs to another owner".into(),
+            });
+        }
+        if !self.session_events.running(&scope).await? {
+            let request = self.session_events.continuation(&scope, input)?;
+            return self.session_prompt(request, scope).await;
+        }
+        let events = self.session_events.clone();
+        events
+            .steer(&scope, input, |input| async move {
+                self.steer_native(&owner.runtime_key(), input)
+                    .await
+                    .map_err(crate::provider::ProviderError::from)
+            })
+            .await
+    }
+
+    async fn session_prompt(
+        self: std::sync::Arc<Self>,
+        request: ProviderRequest,
+        scope: InvocationScope,
+    ) -> Result<(), ProviderError> {
+        if request.owner()? != scope.owner {
+            return Err(ProviderError::Rejected {
+                message: "mock request belongs to a different owner".into(),
+            });
+        }
+        self.session_events.retain_request(&scope, &request)?;
+        let covered = request
+            .submission
+            .as_ref()
+            .map(|receipt| {
+                forge_provider_api::lifecycle::SubmissionId::try_from(receipt.id().to_owned())
+                    .map_err(|error| ProviderError::Protocol {
+                        message: error.to_string(),
+                    })
+            })
+            .transpose()?
+            .into_iter()
+            .collect();
+        self.session_events.sink(&scope)?;
+        let acknowledgement =
+            super::session_events::Acknowledgement::Local(request.submission.clone());
+        let completion = request
+            .control_context
+            .as_ref()
+            .map(|context| context.provider_completion.clone());
+        let events = self.session_events.clone();
+        events
+            .start(
+                scope,
+                covered,
+                acknowledgement,
+                completion,
+                crate::provider::TerminalBoundary::LocalFixture,
+                move |sink| async move { self.run_native(request, sink).await },
+            )
+            .await
+    }
+
     fn mock_response_control(&self) -> Option<&super::mock_response::MockResponseControl> {
         Some(&self.response_control)
     }
 
     async fn shutdown(&self) -> Result<()> {
         self.response_control.cancel_session(None);
+        self.session_events.shutdown().await?;
         Ok(())
     }
 
@@ -375,8 +485,11 @@ impl crate::provider::ProviderAdapter for MockProvider {
             .is_some_and(|lane| lane.is_active())
     }
 
-    async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-        None
+    async fn active_session_id_for(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+        Ok(None)
     }
 
     async fn background_terminals(
@@ -389,6 +502,13 @@ impl crate::provider::ProviderAdapter for MockProvider {
     async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
         self.response_control.cancel_session(Some(session_id));
         Ok(())
+    }
+    async fn reset_session(&self, owner: &ExecutionOwner) -> Result<()> {
+        self.session_events.reset_owner(owner).await?;
+        Ok(())
+    }
+    async fn fence_session(&self, owner: &ExecutionOwner) -> Result<()> {
+        self.cleanup_execution(&owner.runtime_key()).await
     }
     async fn generate_text(
         &self,
@@ -420,7 +540,112 @@ impl crate::provider::ProviderAdapter for MockProvider {
         }
     }
 
-    async fn prompt_stream(
+    async fn fork(&self, request: ProviderForkRequest) -> Result<ProviderForkResult> {
+        if let Some(delay) = self.fork_delay {
+            tokio::time::sleep(delay).await;
+        }
+        Ok(ProviderForkResult::unprofiled(
+            format!(
+                "{}-fork",
+                request
+                    .source
+                    .provider_session_id
+                    .map(String::from)
+                    .unwrap_or_else(|| "mock-session".into())
+            )
+            .try_into()?,
+        ))
+    }
+
+    async fn rollback_cancelled_turn(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn compact(&self, request: ProviderCompactionRequest) -> Result<ProviderOutput> {
+        let scope = EventScope::SessionOperation {
+            owner: request.request.owner()?,
+            operation_id: request.id.clone(),
+        };
+        let compaction = Compaction {
+            id: request.id,
+            thread_id: request
+                .request
+                .provider_session_id
+                .clone()
+                .map(String::from)
+                .unwrap_or_default(),
+            state: CompactionState::Completed,
+            manual: true,
+            started_at_ms: None,
+            completed_at_ms: None,
+            result: CompactionResult {
+                summary_content: Some(
+                    "Mock compacted context preserves the conversation constraints.".into(),
+                ),
+                pre_compaction_tokens: Some(80_000),
+                post_compaction_tokens: Some(20_000),
+                tokens_removed: Some(60_000),
+                ..Default::default()
+            },
+        };
+        let request = request.request;
+        Ok(ProviderOutput {
+            event: vec![ProviderEvent::Compaction {
+                scope,
+                update: Box::new(compaction),
+            }],
+            completion: crate::provider::ProviderCompletion {
+                native: forge_provider_api::completion::ProviderCompletion {
+                    provider_session_id: request.provider_session_id,
+                    capability: mock_capability(),
+                    runtime: ProviderRuntime {
+                        provider: "Mock provider".into(),
+                        model: Some(request.model),
+                    },
+                    metrics: TurnMetrics {
+                        context_usage: ContextUsage::reported(20_000, 100_000),
+                        ..TurnMetrics::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        })
+    }
+
+    async fn model_list(&self, _request: ProviderRequest) -> Result<Vec<ProviderModel>> {
+        Ok(vec![ProviderModel {
+            service_tiers: vec![
+                ServiceTier::Standard,
+                ServiceTier::Fast,
+                ServiceTier::Ultrafast,
+            ],
+            id: "mock-model".into(),
+            reasoning: vec!["low".into(), "medium".into(), "high".into()],
+            default_reasoning: Some("medium".into()),
+            selected_reasoning: None,
+            context_window: vec![ProviderContextWindow {
+                id: "default".into(),
+                token_limit: Some(100_000),
+            }],
+            default_context_window: Some("default".into()),
+            selected_context_window: None,
+            vision: false,
+            description: Some("Deterministic Harness test model.".into()),
+            is_default: true,
+        }])
+    }
+}
+
+impl MockProvider {
+    async fn steer_native(&self, session_id: &str, input: SteeringInput) -> Result<()> {
+        self.steering_lane(session_id).steer(input).await
+    }
+}
+
+impl MockProvider {
+    /// Drive admitted native work inside the session-owned task.
+    async fn run_native(
         &self,
         request: ProviderRequest,
         event_sink: ProviderEventSink,
@@ -442,9 +667,23 @@ impl crate::provider::ProviderAdapter for MockProvider {
             thread_id: request
                 .provider_session_id
                 .clone()
+                .map(String::from)
                 .unwrap_or_else(|| "mock-session".into()),
             turn_id: uuid::Uuid::new_v4().to_string().into(),
         };
+        event_sink
+            .send_wait(ProviderEvent::Execution {
+                observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                    turn_address.scope.clone(),
+                    forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                        address: turn_address.clone(),
+                    },
+                )
+                .map_err(|error| ProviderError::Protocol {
+                    message: error.to_string(),
+                })?,
+            })
+            .await?;
         event_sink
             .send_wait(ProviderEvent::Turn {
                 address: turn_address.clone(),
@@ -877,7 +1116,7 @@ impl crate::provider::ProviderAdapter for MockProvider {
             };
             let proposed =
                 document.patch_design(std::path::Path::new(&request.workspace), change.clone())?;
-            return Ok(ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {  provider_session_id: request.provider_session_id.or(Some("mock-session".into())), capability: mock_capability(), ..Default::default() }, design_patch: vec![change.into()], plan_submit: Some(PlanSubmitRequest {
+            return Ok(ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {  provider_session_id: request.provider_session_id.or(Some("mock-session".to_owned().try_into().expect("static mock identity is nonempty"))), capability: mock_capability(), ..Default::default() }, design_patch: vec![change.into()], plan_submit: Some(PlanSubmitRequest {
                     plan_id: document.plan_id.clone(),
                     expected_version: proposed.version,
                 }), structured_plan: true, ..Default::default() });
@@ -1121,14 +1360,14 @@ branches: Vec::new()
             };
         Ok(ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {  provider_session_id: request
                 .provider_session_id
-                .or_else(|| Some("mock-session".into())), provider_checkpoint_id: Some("mock-checkpoint".into()), evidence: TurnEvidence {
+                .or_else(|| Some("mock-session".to_owned().try_into().expect("static mock identity is nonempty"))), provider_checkpoint_id: Some("mock-checkpoint".into()), evidence: TurnEvidence {
                 tool_called: request.access.write_access != crate::session::WriteScope::Off,
                 structured_complete: execution_complete,
                 ..TurnEvidence::default()
             }, capability: mock_capability(), runtime: ProviderRuntime {
                 provider: "Mock provider".into(),
                 model: Some(request.model),
-            }, metrics: TurnMetrics::default() }, plan_edit, design_patch: Vec::new(), plan_submit, plan_read: None, plan_deviation: Vec::new(), plan_task_report: plan_task_report.into_iter().collect(), plan_question, question_answer: None, question_withdrawal: None, control_error: None, goal_control: None, dispatched_task_permit: None, dispatched_execution_id: None, dispatched_entry_id: None, structured_plan: request.mode == PromptMode::Plan})
+            }, metrics: TurnMetrics::default() }, plan_edit, design_patch: Vec::new(), plan_submit, plan_read: None, plan_question, question_answer: None, question_withdrawal: None, control_error: None, goal_control: None, dispatched_task_permit: None, dispatched_execution_id: None, dispatched_entry_id: None, structured_plan: request.mode == PromptMode::Plan})
 
         }.await;
         let outcome = match &output {
@@ -1148,101 +1387,6 @@ branches: Vec::new()
             })
             .await?;
         output.map_err(ProviderError::from)
-    }
-
-    async fn fork(&self, request: ProviderForkRequest) -> Result<ProviderForkResult> {
-        if let Some(delay) = self.fork_delay {
-            tokio::time::sleep(delay).await;
-        }
-        Ok(ProviderForkResult::unprofiled(format!(
-            "{}-fork",
-            request
-                .source
-                .provider_session_id
-                .unwrap_or_else(|| "mock-session".into())
-        )))
-    }
-
-    async fn steer_session(&self, session_id: &str, input: SteeringInput) -> Result<()> {
-        self.steering_lane(session_id).steer(input).await
-    }
-
-    async fn rollback_cancelled_turn(&self) -> Result<bool> {
-        Ok(true)
-    }
-
-    async fn compact(&self, request: ProviderCompactionRequest) -> Result<ProviderOutput> {
-        let scope = EventScope::SessionOperation {
-            owner: request.request.owner()?,
-            operation_id: request.id.clone(),
-        };
-        let compaction = Compaction {
-            id: request.id,
-            thread_id: request
-                .request
-                .provider_session_id
-                .clone()
-                .unwrap_or_default(),
-            state: CompactionState::Completed,
-            manual: true,
-            started_at_ms: None,
-            completed_at_ms: None,
-            result: CompactionResult {
-                summary_content: Some(
-                    "Mock compacted context preserves the conversation constraints.".into(),
-                ),
-                pre_compaction_tokens: Some(80_000),
-                post_compaction_tokens: Some(20_000),
-                tokens_removed: Some(60_000),
-                ..Default::default()
-            },
-        };
-        let request = request.request;
-        Ok(ProviderOutput {
-            event: vec![ProviderEvent::Compaction {
-                scope,
-                update: Box::new(compaction),
-            }],
-            completion: crate::provider::ProviderCompletion {
-                native: forge_provider_api::completion::ProviderCompletion {
-                    provider_session_id: request.provider_session_id,
-                    capability: mock_capability(),
-                    runtime: ProviderRuntime {
-                        provider: "Mock provider".into(),
-                        model: Some(request.model),
-                    },
-                    metrics: TurnMetrics {
-                        context_usage: ContextUsage::reported(20_000, 100_000),
-                        ..TurnMetrics::default()
-                    },
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        })
-    }
-
-    async fn model_list(&self, _request: ProviderRequest) -> Result<Vec<ProviderModel>> {
-        Ok(vec![ProviderModel {
-            service_tiers: vec![
-                ServiceTier::Standard,
-                ServiceTier::Fast,
-                ServiceTier::Ultrafast,
-            ],
-            id: "mock-model".into(),
-            reasoning: vec!["low".into(), "medium".into(), "high".into()],
-            default_reasoning: Some("medium".into()),
-            selected_reasoning: None,
-            context_window: vec![ProviderContextWindow {
-                id: "default".into(),
-                token_limit: Some(100_000),
-            }],
-            default_context_window: Some("default".into()),
-            selected_context_window: None,
-            vision: false,
-            description: Some("Deterministic Harness test model.".into()),
-            is_default: true,
-        }])
     }
 }
 
@@ -1314,7 +1458,8 @@ mod test {
     #[test]
     fn native_completion_preserves_the_flat_host_wire_format() {
         let mut completion = super::ProviderCompletion::default();
-        completion.native.provider_session_id = Some("native-session".into());
+        completion.native.provider_session_id =
+            Some("native-session".to_owned().try_into().unwrap());
         completion.native.runtime.provider = "test-provider".into();
         completion.native.evidence.tool_called = true;
         completion.plan_read = Some("plan".into());
@@ -1326,7 +1471,11 @@ mod test {
         assert_eq!(encoded["plan_read"], "plan");
         let restored: super::ProviderCompletion = serde_json::from_value(encoded).unwrap();
         assert_eq!(
-            restored.native.provider_session_id.as_deref(),
+            restored
+                .native
+                .provider_session_id
+                .as_ref()
+                .map(|id| id.as_str()),
             Some("native-session")
         );
         assert_eq!(restored.plan_read.as_deref(), Some("plan"));
@@ -1381,6 +1530,7 @@ mod test {
     }
     use super::super::mock_response::MockResponseCommand;
     use super::{MockProvider, PromptMode, ProviderAdapter, ProviderRequest};
+    use crate::provider::test_support::ProviderTestExt as _;
     use crate::session::ApprovalMode;
     use std::sync::Arc;
 
@@ -1412,6 +1562,7 @@ mod test {
             submission: Some(submission.clone()),
         };
         let provider = Arc::new(MockProvider {
+            session_events: Default::default(),
             response_control: Default::default(),
             provider_stream: false,
             lsp_probe: false,
@@ -1435,10 +1586,12 @@ mod test {
             .await
             .unwrap();
         let hold_id = hold["id"].as_str().unwrap().to_owned();
-        let prompt_provider = Arc::clone(&provider);
+        let test_provider =
+            crate::provider::test_support::ProviderTestSession::from_arc(provider.clone()).unwrap();
+        let prompt_provider = test_provider.clone();
         let prompt = tokio::spawn(async move {
             prompt_provider
-                .prompt(
+                .session_prompt_and_collect(
                     ProviderRequest {
                         execution_owner: None,
                         harness_session_id: "harness-session".into(),
@@ -1473,8 +1626,11 @@ mod test {
             .unwrap();
         assert!(provider.has_active_turn("harness-session").await);
         assert!(!provider.has_active_turn("other-session").await);
-        provider
-            .steer_session("harness-session", input)
+        test_provider
+            .steer_current(
+                crate::provider::ExecutionOwner::root("harness-session"),
+                input,
+            )
             .await
             .unwrap();
         assert!(!prompt.is_finished(), "steering released the held response");
@@ -1505,9 +1661,207 @@ mod test {
     }
 }
 
+#[cfg(test)]
+mod session_stream_tests {
+    use super::*;
+    use crate::provider::mock_response::MockResponseCommand;
+    use std::sync::Arc;
+
+    fn request() -> ProviderRequest {
+        ProviderRequest {
+            execution_owner: None,
+            harness_session_id: "persistent-mock".into(),
+            workspace: ".".into(),
+            input: ProviderInput::from_text("hello"),
+            mode: PromptMode::Chat,
+            model: "mock-model".into(),
+            effort: "default".into(),
+            context_window: None,
+            service_tier: Default::default(),
+            access: Default::default(),
+            approval_mode: ApprovalMode::Ask,
+            provider_session_id: None,
+            submission: None,
+            recovered_input: Vec::new(),
+            control_context: None,
+        }
+    }
+
+    /// A held native turn reports its real start and a collected cancellation.
+    #[tokio::test]
+    async fn cancelling_held_response_preserves_native_terminal_and_session_stream()
+    -> anyhow::Result<()> {
+        use forge_provider_api::lifecycle::{ExecutionResult, ExecutionUpdate};
+
+        let provider = Arc::new(MockProvider::default());
+        let owner = request().owner()?;
+        let mut stream = provider.session_events(owner.clone()).await?;
+        let hold = provider
+            .response_control
+            .dispatch(
+                "persistent-mock",
+                MockResponseCommand::Hold {
+                    mode: Some(PromptMode::Chat),
+                    any_session: false,
+                },
+            )
+            .await?;
+        let scope = InvocationScope::new(owner.clone(), "cancelled");
+        provider
+            .clone()
+            .session_prompt(request(), scope.clone())
+            .await?;
+        provider
+            .response_control
+            .dispatch(
+                "persistent-mock",
+                MockResponseCommand::Wait {
+                    id: hold["id"].as_str().unwrap().to_owned(),
+                },
+            )
+            .await?;
+        let mut started = false;
+        while let Some(event) = stream.try_next()? {
+            if let ProviderEvent::Execution { observation } = event
+                && matches!(observation.update(), ExecutionUpdate::Started { .. })
+            {
+                assert_eq!(observation.scope(), &scope);
+                started = true;
+            }
+        }
+        assert!(
+            started,
+            "held response must follow an observed native start"
+        );
+        provider.cancel_session("persistent-mock").await?;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = stream.recv().await?.ok_or_else(|| {
+                    anyhow::anyhow!("session stream disconnected during cancellation")
+                })?;
+                if let ProviderEvent::Execution { observation } = event {
+                    assert_eq!(observation.scope(), &scope);
+                    match observation.update() {
+                        ExecutionUpdate::Finished {
+                            result: ExecutionResult::Cancelled { .. },
+                            ..
+                        } => return Ok::<_, anyhow::Error>(()),
+                        ExecutionUpdate::ObservationLost { failure, .. } => {
+                            anyhow::bail!("lost cancellation observation: {failure}")
+                        }
+                        ExecutionUpdate::Finished { result, .. } => {
+                            anyhow::bail!("incorrect terminal result: {result:?}")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        })
+        .await??;
+        assert!(!provider.has_active_turn("persistent-mock").await);
+        let next = InvocationScope::new(owner, "next");
+        provider
+            .clone()
+            .session_prompt(request(), next.clone())
+            .await?;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = stream
+                    .recv()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("session stream closed after cancellation"))?;
+                if let ProviderEvent::Execution { observation } = event
+                    && observation.scope() == &next
+                    && matches!(
+                        observation.update(),
+                        ExecutionUpdate::Finished {
+                            result: ExecutionResult::Completed { .. },
+                            ..
+                        }
+                    )
+                {
+                    return Ok::<_, anyhow::Error>(());
+                }
+            }
+        })
+        .await??;
+        provider.shutdown().await?;
+        Ok(())
+    }
+
+    /// Acceptance cannot release a response barrier or end the session's observation channel.
+    #[tokio::test]
+    async fn acceptance_precedes_completion_and_observation_survives_next_prompt()
+    -> anyhow::Result<()> {
+        let provider = Arc::new(MockProvider::default());
+        let owner = request().owner()?;
+        let mut stream = provider.session_events(owner.clone()).await?;
+        for exchange in ["first", "second"] {
+            let hold = provider
+                .response_control
+                .dispatch(
+                    "persistent-mock",
+                    MockResponseCommand::Hold {
+                        mode: Some(PromptMode::Chat),
+                        any_session: false,
+                    },
+                )
+                .await?;
+            let hold_id = hold["id"].as_str().unwrap().to_owned();
+            let scope = InvocationScope::new(owner.clone(), exchange);
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                provider.clone().session_prompt(request(), scope.clone()),
+            )
+            .await??;
+            provider
+                .response_control
+                .dispatch(
+                    "persistent-mock",
+                    MockResponseCommand::Wait {
+                        id: hold_id.clone(),
+                    },
+                )
+                .await?;
+            while let Some(event) = stream.try_next()? {
+                assert!(!matches!(event, ProviderEvent::Execution { observation }
+                    if matches!(observation.update(), forge_provider_api::lifecycle::ExecutionUpdate::Finished { .. })));
+            }
+            provider
+                .response_control
+                .dispatch(
+                    "persistent-mock",
+                    MockResponseCommand::Release { id: hold_id },
+                )
+                .await?;
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let event = stream
+                        .recv()
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("session stream closed after one prompt"))?;
+                    if let ProviderEvent::Execution { observation } = event
+                        && matches!(
+                            observation.update(),
+                            forge_provider_api::lifecycle::ExecutionUpdate::Finished { .. }
+                        )
+                    {
+                        assert_eq!(observation.scope(), &scope);
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                }
+            })
+            .await??;
+        }
+        provider.shutdown().await?;
+        assert!(stream.recv().await?.is_none());
+        Ok(())
+    }
+}
+
 impl forge_provider_api::progress::TurnProgress for ProviderCompletion {
-    fn session_id(&self) -> Option<&str> {
-        self.provider_session_id.as_deref()
+    fn session_id(&self) -> Option<&forge_provider_api::ProviderSessionId> {
+        self.provider_session_id.as_ref()
     }
 
     fn runtime(&self) -> &ProviderRuntime {

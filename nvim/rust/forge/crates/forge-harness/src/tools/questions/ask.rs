@@ -94,6 +94,7 @@ pub(super) async fn execute(
             };
         }
         let operation_id = uuid::Uuid::new_v4().to_string();
+        let authority = crate::tools::TaskAuthority::capture(&runtime.context);
         let exchange_id = runtime
             .context
             .question_exchange_id
@@ -101,26 +102,41 @@ pub(super) async fn execute(
             .context("question has no originating exchange")?;
         if wait {
             let answers = controller
-                .ask_wait(&operation_id, exchange_id, task.as_ref(), drafts)
+                .ask_wait_authorized(
+                    &operation_id,
+                    exchange_id,
+                    task.as_ref(),
+                    drafts,
+                    authority.as_ref(),
+                )
                 .await?;
+            if let Some(authority) = &authority {
+                authority.validate_scope()?;
+            }
             return Ok(crate::tools::ControlToolResult {
                 invocation: None,
                 message: serde_json::json!({"answers": answers}).to_string(),
             });
         }
-        let ids = controller.ask(
-            &operation_id,
-            exchange_id,
-            if runtime.context.question_discussion {
-                crate::question::QuestionOrigin::Discussion(task.as_ref())
-            } else {
-                task.as_ref().map_or(
-                    crate::question::QuestionOrigin::Chat,
-                    crate::question::QuestionOrigin::Task,
-                )
-            },
-            drafts,
-        )?;
+        let publish = || {
+            controller.ask(
+                &operation_id,
+                exchange_id,
+                if runtime.context.question_discussion {
+                    crate::question::QuestionOrigin::Discussion(task.as_ref())
+                } else {
+                    task.as_ref().map_or(
+                        crate::question::QuestionOrigin::Chat,
+                        crate::question::QuestionOrigin::Task,
+                    )
+                },
+                drafts,
+            )
+        };
+        let ids = match authority {
+            Some(authority) => authority.commit(publish)?,
+            None => publish()?,
+        };
         return Ok(crate::tools::ControlToolResult {
             invocation: None,
             message: serde_json::json!({"question_ids":ids}).to_string(),
@@ -153,4 +169,40 @@ pub(super) async fn execute(
         invocation: Some(invocation),
         message: "Question set accepted".into(),
     })
+}
+
+/// Publish a required question synchronously so its answer wait can outlive the runtime lock.
+pub(crate) fn begin_wait(
+    runtime: &crate::tools::runtime::ControlToolRuntime,
+    invocation: &crate::tools::ControlToolInvocation,
+) -> crate::tools::ToolResult<crate::question::OwnedQuestionWait> {
+    crate::tools::validate_arguments(invocation)?;
+    let controller = runtime
+        .context
+        .questions
+        .as_ref()
+        .context("waiting questions require the session question controller")?;
+    crate::tools::error::ensure!(
+        runtime.context.question_discussion || !controller.snapshot()?.required_pending(),
+        "required questions must be resolved before continuing task work"
+    );
+    let task = super::state::current_task(runtime)?;
+    let mut drafts: Vec<crate::question::QuestionDraft> =
+        serde_json::from_value(invocation.arguments["questions"].clone())?;
+    for draft in &mut drafts {
+        draft.requirement = crate::question::QuestionRequirement::Required;
+    }
+    let authority = crate::tools::TaskAuthority::capture(&runtime.context);
+    let exchange = runtime
+        .context
+        .question_exchange_id
+        .as_deref()
+        .context("question has no originating exchange")?;
+    Ok(controller.begin_owned_wait(
+        &uuid::Uuid::new_v4().to_string(),
+        exchange,
+        task.as_ref(),
+        drafts,
+        authority.as_ref(),
+    )?)
 }

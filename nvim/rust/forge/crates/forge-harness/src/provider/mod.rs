@@ -17,6 +17,12 @@ pub(crate) mod mcp;
 pub mod mock_response;
 mod prompt;
 pub(crate) mod retry;
+mod session_events;
+pub(crate) use session_events::{
+    CompletionSlot, ExecutionCertificate, HostEffectBatch, NativeExecutionCertificate,
+    TerminalBoundary,
+};
+pub(crate) mod session_execution;
 mod steering;
 pub mod submission;
 pub use forge_provider_api::ServiceTier;

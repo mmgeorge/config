@@ -1,6 +1,6 @@
 use super::event_decoder::CopilotEventDecoder;
 use super::turn::{CopilotTurnEvent, CopilotTurnEventGuard};
-use super::{event_stream, rejection, retry};
+use super::{rejection, retry};
 use anyhow::{Context, Result};
 use forge_provider_api::completion::ProviderCompletion;
 use forge_provider_api::input::{MessageInput, PromptInput};
@@ -41,15 +41,14 @@ pub async fn run(
     control: &dyn TurnControl,
     trace: Arc<dyn ProviderTrace>,
 ) -> Result<TurnResult, ProviderError> {
+    let owned_session = session;
     let session = &session.inner;
-    let mut subscription = event_stream::SessionEventStream::new(
-        session,
-        |_| true,
-        trace.clone(),
-        options.correlation_id.clone(),
-    );
-    let mut output = ProviderCompletion {
-        provider_session_id: Some(session.id().to_string()),
+    let output = ProviderCompletion {
+        provider_session_id: Some(session.id().to_string().try_into().map_err(
+            |error: forge_provider_api::ProviderSessionIdError| ProviderError::Protocol {
+                message: error.to_string(),
+            },
+        )?),
         capability: options.capability,
         runtime: ProviderRuntime {
             provider: "Copilot CLI".into(),
@@ -57,8 +56,21 @@ pub async fn run(
         },
         ..Default::default()
     };
-    let mut decoder =
+    let decoder =
         CopilotEventDecoder::new(sink.invocation_scope()?.clone(), options.workspace.clone());
+    let retained_context = Arc::new(tokio::sync::Mutex::new(super::intake::TurnContext {
+        decoder,
+        output,
+        sink: sink.clone(),
+    }));
+    let mut subscription = owned_session
+        .events
+        .attach(retained_context.clone())
+        .await?;
+    let mut active_context = retained_context.lock().await;
+    let super::intake::TurnContext {
+        decoder, output, ..
+    } = &mut *active_context;
     let initial_task_snapshot = session
         .rpc()
         .plan()
@@ -72,7 +84,7 @@ pub async fn run(
         .is_some_and(|row_list| !row_list.is_empty())
     {
         decoder
-            .publish_task_snapshot(initial_task_data, "copilot-root".into(), &mut output, sink)
+            .publish_task_snapshot(initial_task_data, "copilot-root".into(), output, sink)
             .await?;
     }
     let provider_text = input_text(session, &options.input).await?;
@@ -98,7 +110,7 @@ pub async fn run(
     message_input.prompt.push_str(&prompt);
     let message = super::input::message(message_input);
     turn_event_guard
-        .send(history.cursor.clone(), async {
+        .send(history.cursor.clone(), options.receipt.as_ref().map(|receipt| forge_provider_api::lifecycle::SubmissionId::try_from(receipt.id().to_owned())).transpose().map_err(|error| ProviderError::Protocol { message: error.to_string() })?, async {
             trace.record(
                 &options.correlation_id,
                 "copilot.session.send",
@@ -120,6 +132,7 @@ pub async fn run(
         .await?;
     let mut tool_names = std::collections::HashMap::new();
     let mut execution_turn_stopped = false;
+    let mut foreground_emitted = false;
     let mut retry_failure = None;
     let mut retry_idle_deadline = None;
     let mut rejection = rejection::RejectionState::default();
@@ -127,6 +140,10 @@ pub async fn run(
     let processing: std::result::Result<(), ProviderError> = async {
         loop {
             tokio::select! {
+                settled = turn_event.idle_settled() => {
+                    settled?;
+                    break;
+                },
                 _ = async {
                     match retry_idle_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
@@ -157,20 +174,24 @@ pub async fn run(
                     }
                     trace.record(&options.correlation_id, "copilot.session.event", trace_payload);
                     if completes_exchange(&provider_event) {
-                        if !execution_turn_stopped && (provider_aborted || provider_event.data.get("aborted").and_then(Value::as_bool) == Some(true)) {
-                            decoder.finish_failure(forge_provider_api::turn::TurnOutcome::Cancelled, sink).await?;
-                            return Err(ProviderError::Cancelled);
-                        }
+                        let aborted = !execution_turn_stopped && (provider_aborted || provider_event.data.get("aborted").and_then(Value::as_bool) == Some(true));
                         if decoder.root_address().is_none() {
                             continue;
                         }
-                        decoder.decode(&provider_event, &mut output, sink).await?;
+                        decoder.decode(&provider_event, output, sink).await?;
                         output.provider_checkpoint_id = if provider_event.ephemeral == Some(true) {
                             provider_event.parent_id.clone()
                         } else {
                             Some(provider_event.id.clone())
                         };
-                        break;
+                        turn_event.observe_idle_at(&provider_event, if aborted { super::turn::IdleOutcome::Aborted } else { super::turn::IdleOutcome::Completed })?;
+                        if aborted {
+                            tokio::time::timeout(std::time::Duration::from_secs(15), turn_event.idle_settled()).await
+                                .map_err(|_| ProviderError::DeliveryUncertain { message: "Copilot aborted before delivery settled".into() })??;
+                            decoder.finish_failure(forge_provider_api::turn::TurnOutcome::Cancelled, sink).await?;
+                            return Err(ProviderError::Cancelled);
+                        }
+                        continue;
                     }
                     if provider_event.event_type == "session.todos_changed" {
                         let task_snapshot = session
@@ -185,7 +206,7 @@ pub async fn run(
                                 .agent_id
                                 .clone()
                                 .unwrap_or_else(|| "copilot-root".into()),
-                            &mut output,
+                            output,
                             sink,
                         ).await?;
                         continue;
@@ -200,7 +221,7 @@ pub async fn run(
                         && let Some(code) = retry::transient_code(&provider_event.data)
                         && provider_event.agent_id.is_none()
                         && decoder.replay_safe()
-                        && (native_replay_safe(&output) && control.status().await?.replay_safe)
+                        && (native_replay_safe(output) && control.status().await?.replay_safe)
                         && let Some(address) = decoder.root_address()
                     {
                         retry_failure = Some(forge_provider_api::retry::RetryableFailure {
@@ -210,7 +231,16 @@ pub async fn run(
                         retry_idle_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
                         continue;
                     }
-                    decoder.decode(&provider_event, &mut output, sink).await?;
+                    decoder.decode(&provider_event, output, sink).await?;
+                    if !foreground_emitted
+                        && let (Some((_, event_id)), Some(root)) = (turn_event.foreground_anchor()?, decoder.root_address()) {
+                            let address = forge_provider_api::TurnAddress { turn_id: event_id.into(), ..root };
+                            let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
+                                address.scope.clone(), forge_provider_api::lifecycle::ExecutionUpdate::Started { address },
+                            ).map_err(|error| ProviderError::Protocol { message: error.to_string() })?;
+                            sink.send_wait(forge_provider_api::ProviderEvent::Execution { observation }).await?;
+                            foreground_emitted = true;
+                    }
                     if provider_event.agent_id.is_none() && !execution_turn_stopped {
                         let call_id = provider_event.data.get("toolCallId").and_then(Value::as_str);
                         if provider_event.event_type == "tool.execution_start"
@@ -256,7 +286,7 @@ pub async fn run(
             .finish_failure(forge_provider_api::turn::TurnOutcome::Failed, sink)
             .await?;
         if decoder.replay_safe()
-            && (native_replay_safe(&output) && control.status().await?.replay_safe)
+            && (native_replay_safe(output) && control.status().await?.replay_safe)
         {
             return Err(ProviderError::Retryable(failure.into()));
         }
@@ -295,7 +325,7 @@ pub async fn run(
         decoder.finish_success(sink).await?;
     }
     Ok(TurnResult {
-        completion: output,
+        completion: output.clone(),
         answered_rejection: rejection.answered,
     })
 }
@@ -328,6 +358,7 @@ async fn input_text(session: &Arc<Session>, input: &PromptInput) -> Result<Strin
                 .rpc()
                 .commands()
                 .invoke(CommandsInvokeRequest {
+                    origin: None,
                     name: name.clone(),
                     input: (!arguments.is_empty()).then(|| arguments.clone()),
                 })

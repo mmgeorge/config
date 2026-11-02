@@ -24,6 +24,8 @@ use crate::session::{ProviderForkState, SessionLeaseConflict, SessionStore};
 use crate::storage::SqliteStore;
 use crate::task::command as session_command;
 
+#[path = "service/check_completion.rs"]
+mod check_completion;
 #[path = "service/input.rs"]
 mod input_delivery;
 #[cfg(test)]
@@ -238,7 +240,7 @@ impl HarnessService {
                     .conversation_history()?;
                 let request = controller.catalog_request.read().await.clone();
                 let text = controller
-                    .provider
+                    .provider_handle()
                     .generate_text(request, purpose, model, None, &history)
                     .await?;
                 return Ok(json!({"text": purpose.validate(&text)?}));
@@ -247,7 +249,7 @@ impl HarnessService {
                 let request = controller.catalog_request.read().await.clone();
                 tokio::time::timeout(
                     Duration::from_secs(8),
-                    controller.provider.terminate_terminal(request, id),
+                    controller.provider_handle().terminate_terminal(request, id),
                 )
                 .await
                 .context("background terminal termination timed out")??;
@@ -255,7 +257,7 @@ impl HarnessService {
             }
             crate::buffer::session::PresentationRequest::BackgroundTerminals => {
                 if !controller
-                    .provider
+                    .provider_handle()
                     .descriptor()
                     .capability
                     .background_terminals
@@ -740,9 +742,7 @@ impl HarnessService {
                 .await?);
         }
         let Some(identity) = identity else {
-            return self
-                .dispatch_request(session_id, request, sink, admission)
-                .await;
+            return Box::pin(self.dispatch_request(session_id, request, sink, admission)).await;
         };
         let identity: CommandIdentity = serde_json::from_value(identity)?;
         let registry = self.registry().await?;
@@ -788,9 +788,8 @@ impl HarnessService {
             }
             Ok(())
         });
-        let result = self
-            .dispatch_request(session_id, request, &recorded, admission)
-            .await;
+        let result =
+            Box::pin(self.dispatch_request(session_id, request, &recorded, admission)).await;
         if let Err(error) = &result {
             let code = if error.is::<crate::broker::RequestNotAdmitted>() {
                 "not_admitted"
@@ -1027,7 +1026,7 @@ impl HarnessService {
     pub async fn shutdown(&self, deadline: Duration) -> Result<()> {
         tokio::time::timeout(deadline, self.background.shutdown())
             .await
-            .context("Background shutdown timed out")?;
+            .context("Background shutdown timed out")??;
         self.accepting.store(false, Ordering::Release);
         tokio::time::timeout(deadline, async {
             let mut child_quiescence = Vec::new();
@@ -1053,7 +1052,7 @@ impl HarnessService {
                     controller.plan_review.close_all()?;
                     *controller.mcp_discovery.lock().await = Default::default();
                     controller.cancellation.request(false);
-                    if let Some(control) = controller.provider.mock_response_control() {
+                    if let Some(control) = controller.provider_handle().mock_response_control() {
                         control.cancel_session(None);
                     }
                     if let Some(id) = controller.checks.active()? {
@@ -1079,12 +1078,6 @@ impl HarnessService {
                 while let Some(result) = task.join_next().await {
                     result.context("Harness provider fork task failed")?;
                 }
-                registry
-                    .runtime
-                    .provider_handle()
-                    .shutdown()
-                    .await
-                    .context("collect Harness provider runtime")?;
                 let controller_list: Vec<_> = registry
                     .controller_by_id
                     .read()
@@ -1092,6 +1085,17 @@ impl HarnessService {
                     .values()
                     .cloned()
                     .collect();
+                for controller in &controller_list {
+                    controller
+                        .finish_compactions()
+                        .await
+                        .context("collect retained session compactions")?;
+                }
+                registry
+                    .runtime
+                    .shutdown()
+                    .await
+                    .context("collect Harness provider runtime")?;
                 for controller in controller_list {
                     if let Some(task) = controller.input_task.lock().await.take() {
                         task.await.context("input worker shutdown failed")?;
@@ -1244,14 +1248,10 @@ impl HarnessService {
     }
 }
 
-/// Preserve an intake failure until every preceding observation has been delivered.
-enum SessionObservationIntake {
-    Receiving,
-    Closed(std::result::Result<(), crate::provider::events::EventDeliveryError>),
-}
-
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
+    compaction_workers: Mutex<CompactionWorkers>,
+    compaction_failures: std::sync::Mutex<CompactionFailureLog>,
     questions: Arc<crate::question::QuestionController>,
     provider_startup: Mutex<Option<tokio::task::JoinHandle<()>>>,
     provider_startup_error: std::sync::Mutex<Option<String>>,
@@ -1272,16 +1272,62 @@ struct SessionController {
     agent_provider_factory: crate::agent::AgentProviderFactory,
     parent_input: crate::provider::SteeringLane,
     session_event_task: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
+    undo_task: Mutex<Option<RetainedUndoTask>>,
     plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
     revision_review: Arc<crate::plan::revision_review::RevisionReview>,
     broker: Mutex<HarnessBroker>,
     presentation: Arc<std::sync::Mutex<crate::buffer::session::SessionPresentation>>,
     cancellation: Arc<TurnCancellation>,
-    provider: Arc<crate::provider::Provider>,
+    provider: std::sync::RwLock<Arc<crate::provider::Provider>>,
+    provider_lane: Arc<tokio::sync::RwLock<()>>,
     catalog_request: Arc<RwLock<crate::provider::ProviderCatalogRequest>>,
     mcp_revision: AtomicU64,
     mcp_discovery: Mutex<(u64, crate::provider::mcp::McpDiscovery)>,
     permission: Arc<crate::provider::approval::PermissionCoordinator>,
+}
+
+/// Own compaction work independently of an individual request's response waiter.
+#[derive(Default)]
+struct CompactionWorkers {
+    tasks: JoinSet<Result<()>>,
+    failures: Vec<String>,
+    failure_overflow: bool,
+    stopping: bool,
+}
+
+impl CompactionWorkers {
+    fn record(&mut self, result: std::result::Result<Result<()>, tokio::task::JoinError>) {
+        let failure = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(format!("{error:#}")),
+            Err(error) => Some(format!("compaction owner task failed: {error}")),
+        };
+        if let Some(failure) = failure {
+            if self.failures.len() < forge_protocol::MAX_PENDING_FRAMES {
+                self.failures.push(failure);
+            } else {
+                self.failure_overflow = true;
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct CompactionFailureLog {
+    failures: Vec<String>,
+    overflow: bool,
+}
+
+enum RetainedUndoTask {
+    Running {
+        operation_id: String,
+        task: tokio::task::JoinHandle<Result<()>>,
+        teardown_started: Arc<AtomicBool>,
+    },
+    Failed {
+        operation_id: String,
+        message: String,
+    },
 }
 
 struct PromptAdmission {
@@ -1299,6 +1345,143 @@ impl Drop for PromptAdmission {
 }
 
 impl SessionController {
+    fn record_compaction_failure(&self, message: String) -> Result<()> {
+        let mut log = self
+            .compaction_failures
+            .lock()
+            .map_err(|_| anyhow::anyhow!("compaction failure state poisoned"))?;
+        if log.failures.len() < forge_protocol::MAX_PENDING_FRAMES {
+            log.failures.push(message);
+        } else {
+            log.overflow = true;
+        }
+        Ok(())
+    }
+    /// Reject new work until a retained undo generation has completed successfully.
+    async fn check_undo_fence(&self) -> Result<()> {
+        let mut slot = self.undo_task.lock().await;
+        match slot.as_mut() {
+            None => Ok(()),
+            Some(RetainedUndoTask::Running {
+                operation_id,
+                task,
+                teardown_started,
+            }) if task.is_finished() => {
+                let operation_id = operation_id.clone();
+                let started = teardown_started.load(Ordering::Acquire);
+                match task
+                    .await
+                    .context("undo owner task panicked")
+                    .and_then(|result| result)
+                {
+                    Ok(()) => {
+                        *slot = None;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        if started {
+                            *slot = Some(RetainedUndoTask::Failed {
+                                operation_id,
+                                message: format!("{error:#}"),
+                            });
+                        } else {
+                            *slot = None;
+                        }
+                        Err(error)
+                    }
+                }
+            }
+            Some(RetainedUndoTask::Running { operation_id, .. }) => {
+                anyhow::bail!("undo {operation_id} is still collecting its provider generation")
+            }
+            Some(RetainedUndoTask::Failed {
+                operation_id,
+                message,
+            }) => anyhow::bail!(
+                "undo {operation_id} did not collect its provider generation: {message}"
+            ),
+        }
+    }
+
+    /// Complete submission reconciliation while its provider generation remains current.
+    async fn reconcile_submission_current(
+        &self,
+        submission: &Arc<crate::provider::submission::Submission>,
+    ) -> Result<crate::provider::submission::SubmissionRecord> {
+        let _generation = self.provider_lane.read().await;
+        let provider = self.provider_handle();
+        submission.reconcile(provider.as_ref()).await
+    }
+
+    /// Snapshot the current provider without retaining the generation lock across I/O.
+    fn provider_handle(&self) -> Arc<crate::provider::Provider> {
+        self.provider
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Register compaction before exposing its cancellable response waiter.
+    async fn retain_compaction(
+        &self,
+        work: impl std::future::Future<Output = Result<()>> + Send + 'static,
+    ) -> Result<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>> {
+        let mut owner = self.compaction_workers.lock().await;
+        while let Some(result) = owner.tasks.try_join_next() {
+            owner.record(result);
+        }
+        anyhow::ensure!(!owner.stopping, "session compaction owner is stopping");
+        anyhow::ensure!(
+            owner.tasks.len() < forge_protocol::MAX_PENDING_FRAMES,
+            "session compaction owner is full"
+        );
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        owner.tasks.spawn(async move {
+            let result = work.await;
+            let view = result
+                .as_ref()
+                .copied()
+                .map_err(|error| format!("{error:#}"));
+            let _ = reply.send(view);
+            result
+        });
+        Ok(receiver)
+    }
+
+    /// Join every retained compaction before releasing the native runtime.
+    async fn finish_compactions(&self) -> Result<()> {
+        let mut owner = self.compaction_workers.lock().await;
+        owner.stopping = true;
+        while let Some(result) = owner.tasks.join_next().await {
+            owner.record(result);
+        }
+        anyhow::ensure!(
+            owner.failures.is_empty() && !owner.failure_overflow,
+            "retained compaction failed: {}{}",
+            owner.failures.join("; "),
+            if owner.failure_overflow {
+                "; additional failures overflowed"
+            } else {
+                ""
+            }
+        );
+        let failures = self
+            .compaction_failures
+            .lock()
+            .map_err(|_| anyhow::anyhow!("compaction failure state poisoned"))?;
+        anyhow::ensure!(
+            failures.failures.is_empty() && !failures.overflow,
+            "retained compaction effects failed: {}{}",
+            failures.failures.join("; "),
+            if failures.overflow {
+                "; additional failures overflowed"
+            } else {
+                ""
+            }
+        );
+        Ok(())
+    }
+
     async fn start_provider(self: &Arc<Self>, sink: &MessageSender) {
         let mut startup = self.provider_startup.lock().await;
         if let Some(task) = startup.as_ref() {
@@ -1317,21 +1500,49 @@ impl SessionController {
             .provider_startup_error
             .lock()
             .expect("provider startup state poisoned") = None;
-        let request = self.broker.lock().await.initialization_request();
+        let (request, execution_registry) = {
+            let mut broker = self.broker.lock().await;
+            (broker.initialization_request(), broker.execution_registry())
+        };
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => {
+                let message = format!("Provider initialization failed: {error:#}");
+                *self
+                    .provider_startup_error
+                    .lock()
+                    .expect("provider startup state poisoned") = Some(message.clone());
+                let session_id = self.catalog_request.read().await.harness_session_id.clone();
+                let _ = sink
+                    .send_event(SessionEvent {
+                        session_id,
+                        event: "provider_event".into(),
+                        payload: json!({"kind":"error", "text":message}),
+                    })
+                    .await;
+                return;
+            }
+        };
         let Some(request) = request else {
             return;
         };
         let revision = self.mcp_revision.load(Ordering::Acquire);
-        let provider = Arc::clone(&self.provider);
+        let provider = self.provider_handle();
         let owner = Arc::downgrade(self);
         let sink = sink.clone();
-        *startup = Some(tokio::spawn(async move {
-            let mut initialized = provider.initialize_session(request.clone()).await;
+        let startup_session_id = request.harness_session_id.clone();
+        let startup_factory = || async move {
+            let mut initialized = async {
+                execution_registry.owner(request.owner()?).await?;
+                provider.initialize_session(request.clone()).await
+            }
+            .await;
             let Some(owner) = owner.upgrade() else {
                 return;
             };
             if owner.input_stopping.load(Ordering::Acquire)
                 || owner.mcp_revision.load(Ordering::Acquire) != revision
+                || !Arc::ptr_eq(&owner.provider_handle(), &provider)
             {
                 return;
             }
@@ -1352,11 +1563,15 @@ impl SessionController {
                     return Ok(());
                 };
                 let mut broker = owner.broker.lock().await;
-                if owner.mcp_revision.load(Ordering::Acquire) != revision {
+                if owner.mcp_revision.load(Ordering::Acquire) != revision
+                    || !Arc::ptr_eq(&owner.provider_handle(), &provider)
+                {
                     return Ok(());
                 }
-                if let Some(snapshot) = broker.retain_initialized_session(&request, provider_id)? {
-                    *owner.catalog_request.write().await = broker.provider_catalog_request();
+                if let Some(snapshot) =
+                    broker.retain_initialized_session(&request, provider_id.into())?
+                {
+                    *owner.catalog_request.write().await = broker.provider_catalog_request()?;
                     sink.send_event(SessionEvent {
                         session_id: request.harness_session_id.clone(),
                         event: "session_configured".into(),
@@ -1381,7 +1596,14 @@ impl SessionController {
                     })
                     .await;
             }
-        }));
+        };
+        self.trace.record(&startup_session_id, "future.stack_probe", json!({"phase":"provider.startup.construct","bytes":crate::trace::future_bytes(&startup_factory)}));
+        *startup = Some(tokio::spawn(startup_factory()));
+        self.trace.record(
+            &startup_session_id,
+            "future.stack_probe",
+            json!({"phase":"provider.startup.spawned","bytes":0}),
+        );
     }
 
     /// Gate dependent provider requests on completed, successful initialization.
@@ -1414,13 +1636,15 @@ impl SessionController {
         }
         let request = self.catalog_request.read().await.clone();
         let revision = self.mcp_revision.load(Ordering::Acquire);
+        let provider = self.provider_handle();
         let result = tokio::time::timeout(
             Duration::from_secs(8),
-            self.provider.background_terminals(request.clone()),
+            provider.background_terminals(request.clone()),
         )
         .await
         .context("background terminal query timed out");
         if revision != self.mcp_revision.load(Ordering::Acquire)
+            || !Arc::ptr_eq(&provider, &self.provider_handle())
             || configuring()?
             || !self.provider_ready().await
         {
@@ -1446,7 +1670,7 @@ impl SessionController {
             }
             let owner = crate::provider::ExecutionOwner::root(session_id);
             self.permission.cancel_owner(&owner, None).await?;
-            self.provider.cleanup_execution(session_id).await
+            self.provider_handle().cleanup_execution(session_id).await
         }
         .await;
         if let Err(error) = cleanup {
@@ -1470,7 +1694,7 @@ impl SessionController {
 
     /// Build one independently serialized controller from a durable broker session.
     fn new(mut broker: HarnessBroker) -> Result<Arc<Self>> {
-        let catalog_request = broker.provider_catalog_request();
+        let catalog_request = broker.provider_catalog_request()?;
         let observer = broker.observer();
         let input = Arc::new(crate::input::SessionInputQueue::open(
             &broker.data_root,
@@ -1479,6 +1703,8 @@ impl SessionController {
         )?);
         broker.input_wakeup = Some(input.changed.clone());
         Ok(Arc::new(Self {
+            compaction_workers: Mutex::new(CompactionWorkers::default()),
+            compaction_failures: std::sync::Mutex::new(CompactionFailureLog::default()),
             questions: broker.questions.clone(),
             provider_startup: Mutex::new(None),
             provider_startup_error: std::sync::Mutex::new(None),
@@ -1499,17 +1725,30 @@ impl SessionController {
             agent_provider_factory: broker.agent_provider_factory.clone(),
             parent_input: broker.parent_input.clone(),
             session_event_task: Mutex::new(None),
+            undo_task: Mutex::new(None),
             plan_review: Arc::clone(&broker.plan_review),
             revision_review: Arc::clone(&broker.revision_review),
             presentation: broker.presentation(),
             cancellation: broker.turn_cancellation(),
-            provider: broker.provider_handle(),
+            provider: std::sync::RwLock::new(broker.provider_handle()),
+            provider_lane: Arc::new(tokio::sync::RwLock::new(())),
             catalog_request: Arc::new(RwLock::new(catalog_request)),
             mcp_revision: AtomicU64::new(0),
             mcp_discovery: Mutex::new((0, crate::provider::mcp::McpDiscovery::default())),
             permission: broker.permission_coordinator(),
             broker: Mutex::new(broker),
         }))
+    }
+
+    /// Route direct controls through the retained owner rather than an adapter-local activity flag.
+    async fn steer_retained(
+        &self,
+        owner: crate::provider::ExecutionOwner,
+        input: crate::provider::SteeringInput,
+    ) -> Result<()> {
+        let registry = self.broker.lock().await.execution_registry();
+        registry.owner(owner).await?.steer_current(input).await?;
+        Ok(())
     }
 
     /// Deliver provider observations without blocking intake behind a foreground broker owner.
@@ -1521,50 +1760,62 @@ impl SessionController {
             return Ok(());
         }
         let session_id = self.catalog_request.read().await.harness_session_id.clone();
-        let Some(mut stream) = self
-            .provider
-            .session_event_stream(crate::provider::ExecutionOwner::root(&session_id))
-            .await?
-        else {
-            return Ok(());
-        };
+        let registry = self.broker.lock().await.execution_registry();
+        registry
+            .owner(crate::provider::ExecutionOwner::root(&session_id))
+            .await?;
         let controller = Arc::downgrade(self);
-        let session_events = Arc::clone(&self.observer.session_events);
+        let session_events = self.observer.session_events();
         let message_sink = message_sink.clone();
         *task = Some(tokio::spawn(async move {
             let result: Result<()> = async {
-                let mut intake = SessionObservationIntake::Receiving;
                 loop {
-                    if !session_events.has_pending()?
-                        && let SessionObservationIntake::Closed(result) = &intake
-                    {
-                        return result.clone().map_err(Into::into);
-                    }
-                    let deliver = async {
+                    if session_events.has_pending()? {
+                        session_events.take_idle_settlement_request();
                         let Some(controller) = controller.upgrade() else {
-                            return Ok::<_, anyhow::Error>(None);
+                            return Ok(());
                         };
-                        let events = controller.broker.lock().await.drain_session_events()?;
-                        Ok(Some(events))
-                    };
-                    // Keep intake draining while a foreground request owns the broker.
-                    tokio::select! {
-                        observation = stream.recv(), if matches!(intake, SessionObservationIntake::Receiving) => {
-                            match observation {
-                                Ok(Some(observation)) => session_events.push(observation)?,
-                                Ok(None) => intake = SessionObservationIntake::Closed(Ok(())),
-                                Err(error) => intake = SessionObservationIntake::Closed(Err(error)),
-                            }
+                        let (publication, mut stream) = crate::broker::publication::channel();
+                        let (events, idle) = {
+                            let mut broker = controller.broker.lock().await;
+                            let events = broker.drain_session_events()?;
+                            let idle = broker.begin_idle_foreground(publication)?;
+                            (events, idle)
+                        };
+                        for event in events {
+                            message_sink.send_event(event).await?;
                         }
-                        events = deliver, if session_events.has_pending()? => {
-                            let Some(events) = events? else { return Ok(()); };
-                            for event in events {
-                                message_sink.send_event(event).await?;
-                            }
+                        if let Some((dispatch, job)) = idle {
+                            let output = message_sink.clone();
+                            let owner = session_id.clone();
+                            let forward = async move {
+                                while let Some(update) = stream.recv().await? {
+                                    let name = if matches!(&update, crate::broker::publication::SessionUpdate::DocumentChanged { .. }) {
+                                        "document_changed"
+                                    } else { "provider_event" };
+                                    output.send_event(SessionEvent {
+                                        session_id: owner.clone(),
+                                        event: name.into(),
+                                        payload: crate::broker::publication::encode_session_update(&update)?,
+                                    }).await?;
+                                }
+                                Ok::<(), anyhow::Error>(())
+                            };
+                            let (result, forwarded) = tokio::join!(
+                                drive_owned_foreground_initial(&controller, dispatch, &message_sink, Some(job)),
+                                forward,
+                            );
+                            let result = result?;
+                            forwarded?;
+                            for event in result.event { message_sink.send_event(event).await?; }
                         }
-                        // The active broker can empty the inbox between the two inspections.
-                        else => continue,
+                        continue;
                     }
+                    if session_events.is_closed() {
+                        return Ok(());
+                    }
+                    // The engine fills the bounded inbox independently of broker ownership.
+                    session_events.notified().await?;
                 }
             }
             .await;
@@ -1577,6 +1828,49 @@ impl SessionController {
             result
         }));
         Ok(())
+    }
+
+    /// Restart observation for an explicit new prompt after failed intake has drained.
+    async fn recover_session_events(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
+        let previous = self.observer.session_events();
+        if !previous.is_closed() && !self.task_controller.native_goal_is_uncertain() {
+            return Ok(());
+        }
+        let mut task = self.session_event_task.lock().await;
+        if !self.observer.session_events().is_closed()
+            && !self.task_controller.native_goal_is_uncertain()
+        {
+            return Ok(());
+        }
+        let session_id = self.catalog_request.read().await.harness_session_id.clone();
+        let registry = self.broker.lock().await.execution_registry();
+        if self.task_controller.native_goal_is_uncertain() {
+            self.broker.lock().await.recover_pending_configuration()?;
+        }
+        let goal_lane = self.task_controller.native_goal_lane();
+        let _goal_guard = if self.task_controller.native_goal_is_uncertain() {
+            Some(tokio::time::timeout(Duration::from_secs(30), goal_lane.lock()).await.map_err(|_| {
+                crate::provider::ProviderError::DeliveryUncertain { message: "native goal generation is still in flight; replacement was not attempted".into() }
+            })?)
+        } else {
+            None
+        };
+        if self.task_controller.native_goal_is_uncertain() {
+            registry
+                .fence(&crate::provider::ExecutionOwner::root(&session_id))
+                .await?;
+        }
+        if let Some(pending) = task.take() {
+            // The listener publishes its original failure before it exits.
+            let _reported_failure = pending.await.context("session observation task panicked")?;
+        }
+        let next = registry
+            .replace(crate::provider::ExecutionOwner::root(&session_id))
+            .await?;
+        self.task_controller.reset_native_goal_generation()?;
+        self.observer.replace_session_events(next);
+        drop(task);
+        self.attach_session_events(message_sink).await
     }
 
     /// Persist every final provider observation before releasing the session lease.
@@ -1672,47 +1966,86 @@ impl SessionController {
                         deadline,
                     )
                 });
-                let session_id = controller
-                    .catalog_request
-                    .read()
-                    .await
-                    .harness_session_id
-                    .clone();
-                let result = async {
+                let session_id = controller.observer.session_id().to_owned();
+                let captured = (|| -> Result<Option<Request>> {
                     broker.refresh_input_schedule()?;
                     if schedule.borrow().revision != current.revision || *cancellation.borrow() {
-                        return Ok(());
+                        return Ok(None);
                     }
-                    if let Some(request) = broker.expire_input(&mut active_deadline)? {
-                        if request.method == "session.question.continue" {
-                            message_sink
-                                .send_event(SessionEvent {
-                                    session_id: session_id.clone(),
-                                    event: "question_answered".into(),
-                                    payload: json!({"resolution_source":"timeout"}),
-                                })
-                                .await?;
-                        }
-                        let dispatch = async {
-                            let _ = dispatch_task_attempt(
-                                &mut broker,
-                                &session_id,
-                                request,
-                                &message_sink,
-                                Arc::clone(&controller.catalog_request),
-                            )
+                    broker.expire_input(&mut active_deadline)
+                })();
+                let (publication, mut stream) = crate::broker::publication::channel();
+                let output = message_sink.clone();
+                let stream_session = session_id.clone();
+                let forwarder = tokio::spawn(async move {
+                    while let Some(update) = stream.recv().await? {
+                        let payload = crate::broker::publication::encode_session_update(&update)?;
+                        let event = if matches!(
+                            &update,
+                            crate::broker::publication::SessionUpdate::DocumentChanged { .. }
+                        ) {
+                            "document_changed"
+                        } else {
+                            "provider_event"
+                        };
+                        output
+                            .send_event(SessionEvent {
+                                session_id: stream_session.clone(),
+                                event: event.into(),
+                                payload,
+                            })
                             .await?;
-                            Ok::<(), anyhow::Error>(())
-                        }
-                        .await;
-                        dispatch?;
                     }
                     Ok::<(), anyhow::Error>(())
+                });
+                let staged = match captured {
+                    Ok(Some(request)) if request.method == "session.approval.continue" => broker
+                        .with_publication_sink(&publication, |broker| {
+                            broker.begin_approval_timeout_dispatch(publication.clone())
+                        })
+                        .map(Some),
+                    Ok(Some(request)) => Err(anyhow::anyhow!(
+                        "unsupported timed input method: {}",
+                        request.method
+                    )),
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error),
+                };
+                drop(broker);
+                let result: Result<()> = async {
+                    if let Some((dispatch, delivery)) = staged? {
+                        for event in delivery.deliver_and_flush().await? {
+                            message_sink.send_event(event).await?;
+                        }
+                        if let Some(dispatch) = dispatch {
+                            let result =
+                                drive_owned_foreground(&controller, dispatch, &message_sink)
+                                    .await?;
+                            for event in result.event {
+                                message_sink.send_event(event).await?;
+                            }
+                            if let Some(failure) = result.response.error() {
+                                anyhow::bail!("{}", failure.message);
+                            }
+                        }
+                    }
+                    controller.broker.lock().await.refresh_input_schedule()?;
+                    Ok(())
                 }
                 .await;
-                let publication = broker.refresh_input_schedule();
-                let result = result.and(publication);
-                drop(broker);
+                drop(publication);
+                let forwarding = forwarder
+                    .await
+                    .context("timeout publication task failed")
+                    .and_then(|result| result);
+                let result = match (result, forwarding) {
+                    (Err(error), Err(delivery)) => {
+                        Err(error.context(format!("timeout publication failed: {delivery:#}")))
+                    }
+                    (Err(error), _) => Err(error),
+                    (_, Err(delivery)) => Err(delivery),
+                    (Ok(()), Ok(())) => Ok(()),
+                };
                 controller.coordinator.submissions.changed.notify_one();
                 match result {
                     Ok(()) => {}
@@ -2196,6 +2529,25 @@ async fn route_request(
         !controller.input_stopping.load(Ordering::Acquire),
         "Harness session is closing"
     );
+    let new_queued_submission = if method == RuntimeMethod::SessionInputApply {
+        let operation: crate::input::InputOperation =
+            crate::codec::from_value(request.params.clone())?;
+        matches!(&operation.action, crate::input::InputAction::Submit { .. })
+            && controller
+                .coordinator
+                .submissions
+                .operation(&operation.id)?
+                .is_none()
+    } else {
+        false
+    };
+    if method == RuntimeMethod::SessionPromptSubmit
+        || new_queued_submission
+        || (method == RuntimeMethod::SessionConfigure
+            && controller.task_controller.native_goal_is_uncertain())
+    {
+        controller.recover_session_events(message_sink).await?;
+    }
     controller.attach_session_events(message_sink).await?;
     controller.attach_input(message_sink).await?;
     if matches!(
@@ -2218,20 +2570,41 @@ async fn route_request(
             .as_object()
             .is_some_and(|fields| fields.len() == 1 && fields.contains_key("ask_model"))
     {
+        let _generation = controller.provider_lane.read().await;
+        let (prepared, job) = {
+            let broker = controller.broker.lock().await;
+            let prepared =
+                broker.prepare_ask_model_configuration(request.params["ask_model"].clone())?;
+            let job = if prepared.needs_catalog() {
+                Some(broker.prepare_configuration_catalog()?)
+            } else {
+                None
+            };
+            (prepared, job)
+        };
+        let models = if let Some(job) = job {
+            let result = job.run().await?;
+            controller
+                .broker
+                .lock()
+                .await
+                .commit_configuration_catalog(result)?
+        } else {
+            Vec::new()
+        };
         let result = controller
             .broker
             .lock()
             .await
-            .configure_ask_model(request.params["ask_model"].clone())
-            .await?;
+            .commit_ask_model_configuration(prepared, &models)?;
         message_sink
             .send_response(Response::success(request.id, result)?)
             .await?;
         return Ok(());
     }
     if method == RuntimeMethod::SessionProviderMockResponse {
-        let control = controller
-            .provider
+        let mock_provider = controller.provider_handle();
+        let control = mock_provider
             .mock_response_control()
             .context("provider.mock_response requires the mock provider")?;
         let command = serde_json::from_value(request.params)?;
@@ -2255,7 +2628,7 @@ async fn route_request(
         let mut model_list = tokio::time::timeout(
             Duration::from_secs(30),
             controller
-                .provider
+                .provider_handle()
                 .model_list(crate::provider::ProviderRequest {
                     execution_owner: catalog.execution_owner,
                     harness_session_id: catalog.harness_session_id,
@@ -2482,7 +2855,7 @@ async fn route_request(
     };
     if method == RuntimeMethod::SessionProviderSetup {
         let result = controller
-            .provider
+            .provider_handle()
             .setup(controller.catalog_request.read().await.clone())
             .await?;
         controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
@@ -2497,7 +2870,7 @@ async fn route_request(
             .context("authentication method is required")?
             .to_owned();
         controller
-            .provider
+            .provider_handle()
             .authenticate(controller.catalog_request.read().await.clone(), method)
             .await?;
         controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
@@ -2513,7 +2886,7 @@ async fn route_request(
         let manifest = tokio::time::timeout(
             Duration::from_secs(30),
             controller
-                .provider
+                .provider_handle()
                 .capabilities(controller.catalog_request.read().await.clone()),
         )
         .await
@@ -2575,7 +2948,10 @@ async fn route_request(
                     .as_str()
                     .context("run_id required")?;
                 if request.params["interrupt_execution"].as_bool() == Some(true)
-                    || controller.provider.has_active_turn(&session_id).await
+                    || controller
+                        .provider_handle()
+                        .has_active_turn(&session_id)
+                        .await
                 {
                     let _control = Arc::clone(&controller.coordinator.control)
                         .try_acquire_owned()
@@ -2693,6 +3069,28 @@ async fn route_request(
             .await;
     }
     if method == RuntimeMethod::SessionCommandApply {
+        if request.params.get("action").and_then(Value::as_str) == Some("compact") {
+            let owner = controller.clone();
+            let worker_registry = registry.clone();
+            let worker_session = session_id.clone();
+            let worker_sink = message_sink.clone();
+            let receiver = controller
+                .retain_compaction(async move {
+                    route_task_transition(
+                        worker_registry,
+                        owner,
+                        worker_session,
+                        request,
+                        &worker_sink,
+                    )
+                    .await
+                })
+                .await?;
+            return receiver
+                .await
+                .context("retained task compaction owner disappeared")?
+                .map_err(anyhow::Error::msg);
+        }
         return route_task_transition(registry, controller, session_id, request, message_sink)
             .await;
     }
@@ -2760,6 +3158,21 @@ async fn route_request(
         return Ok(());
     }
 
+    if method == RuntimeMethod::SessionCompact {
+        let owner = controller.clone();
+        let worker_session = session_id.clone();
+        let worker_sink = message_sink.clone();
+        let receiver = controller
+            .retain_compaction(async move {
+                run_retained_manual_compaction(owner, worker_session, request, worker_sink).await
+            })
+            .await?;
+        return receiver
+            .await
+            .context("retained manual compaction owner disappeared")?
+            .map_err(anyhow::Error::msg);
+    }
+
     let (event_sink, mut event_stream) = crate::broker::publication::channel();
     let (mut broker, _admission) = acquire_request_broker(&controller, method).await?;
     let message_sink_for_event = message_sink.clone();
@@ -2791,13 +3204,22 @@ async fn route_request(
         Ok::<(), anyhow::Error>(())
     });
     let shutdown = method == RuntimeMethod::HostShutdown;
-    let mut result = Box::pin(broker.dispatch_stream(request, event_sink)).await;
+    let mut result = if method == RuntimeMethod::SessionPromptSubmit {
+        drive_foreground_dispatch(&controller, broker, request, event_sink, message_sink).await?
+    } else if method == RuntimeMethod::SessionCheckComplete {
+        check_completion::drive(&controller, broker, request, event_sink, message_sink).await
+    } else if method == RuntimeMethod::SessionConfigure {
+        drive_direct_configuration(&controller, broker, request, event_sink).await
+    } else {
+        let result = Box::pin(broker.dispatch_stream(request, event_sink)).await;
+        drop(broker);
+        result
+    };
     event_forwarder.await??;
     for event in result.event.drain(..) {
         message_sink.send_event(event).await?;
     }
-    let catalog_request = broker.provider_catalog_request();
-    drop(broker);
+    let catalog_request = controller.broker.lock().await.provider_catalog_request()?;
     if catalog_request.provider_session_id.is_some() {
         *controller
             .provider_startup_error
@@ -3046,6 +3468,7 @@ async fn route_task_transition(
     }
     operation.state = "accepted".into();
     operation.revision += 1;
+    let mut retained_compaction_execution = None;
     let result = async {
         sink.send_control_response(Response::success(request.id, operation.view())?)
             .await?;
@@ -3085,14 +3508,21 @@ async fn route_task_transition(
                 .map(str::to_owned);
         }
         retain_configuration_event(&mut store, &operation)?;
-        Box::pin(execute_task_transition(
-            &registry,
-            &controller,
-            &mut operation,
-            &mut store,
-            sink,
-        ))
-        .await
+        let registry_ref = &registry;
+        let controller_ref = &controller;
+        let operation_ref = &mut operation;
+        let store_ref = &mut store;
+        let retained_ref = &mut retained_compaction_execution;
+        let transition = move || {
+            let operation = operation_ref;
+            let store = store_ref;
+            let retained = retained_ref;
+            execute_task_transition_inner(registry_ref, controller_ref, operation, store, sink, retained)
+        };
+        controller.trace.record(&session_id, "future.stack_probe", json!({"phase":"task.transition.construct","bytes":crate::trace::future_bytes(&transition)}));
+        let transition = Box::pin(transition());
+        controller.trace.record(&session_id, "future.stack_probe", json!({"phase":"task.transition.boxed","bytes":0}));
+        transition.await
     }
     .await;
     if operation.action["action"] == "configure" {
@@ -3203,14 +3633,35 @@ fn retain_configuration_event(
     })
 }
 
+#[cfg(test)]
 async fn execute_task_transition(
     registry: &SessionControllerRegistry,
-    controller: &SessionController,
+    controller: &Arc<SessionController>,
     operation: &mut crate::task::TaskOperation,
     store: &mut SqliteStore,
     sink: &MessageSender,
 ) -> Result<()> {
+    let mut retained = None;
+    execute_task_transition_inner(registry, controller, operation, store, sink, &mut retained).await
+}
+
+async fn execute_task_transition_inner(
+    registry: &SessionControllerRegistry,
+    controller: &Arc<SessionController>,
+    operation: &mut crate::task::TaskOperation,
+    store: &mut SqliteStore,
+    sink: &MessageSender,
+    retained_compaction_execution: &mut Option<ExecutionPermit>,
+) -> Result<()> {
     let mut action = operation.action.clone();
+    if action["action"] != "undo" {
+        controller.check_undo_fence().await?;
+    }
+    if let Some(object) = action.as_object_mut() {
+        object
+            .entry("operation_id")
+            .or_insert_with(|| json!(operation.id));
+    }
     if let Some(selection) = operation.permission_selection {
         action["permission_selection"] = serde_json::to_value(selection)?;
     }
@@ -3300,7 +3751,7 @@ async fn execute_task_transition(
                 .cancel_owner(&approval_owner, None)
                 .await?;
             if let Err(error) = controller
-                .provider
+                .provider_handle()
                 .cleanup_execution(&operation.session_id)
                 .await
             {
@@ -3345,119 +3796,733 @@ async fn execute_task_transition(
         payload: operation.view(),
     })
     .await?;
+    if action["action"] == "undo" {
+        let outcome = drive_owned_undo(controller, &action, sink, execution).await;
+        operation.exchange_id = store
+            .list_exchange(&operation.session_id)?
+            .last()
+            .map(|exchange| exchange.id.clone());
+        outcome?;
+        return Ok(());
+    }
     let mut broker = controller.broker.lock().await;
     let request = Request {
         id: 0,
         method: "session.command.apply".into(),
         params: action,
     };
-    let outcome = dispatch_task_attempt(
-        &mut broker,
-        &operation.session_id,
-        request,
-        sink,
-        Arc::clone(&controller.catalog_request),
-    )
-    .await;
-    *controller.catalog_request.write().await = broker.provider_catalog_request();
-    drop(broker);
+    let immediate = session_command::SessionCommand::parse_request(&request)?.is_some();
+    let outcome = if matches!(
+        request.params["action"].as_str(),
+        Some("permission" | "compact" | "configure")
+    ) {
+        drop(broker);
+        // Keep nested configuration phase state off the task transition's stack.
+        let configuration = || {
+            dispatch_owned_configuration(controller, &operation.session_id, &request.params, sink)
+        };
+        controller.trace.record(&operation.session_id, "future.stack_probe", json!({"phase":"configuration.construct","bytes":crate::trace::future_bytes(&configuration)}));
+        let configuration = Box::pin(configuration());
+        controller.trace.record(
+            &operation.session_id,
+            "future.stack_probe",
+            json!({"phase":"configuration.boxed","bytes":0}),
+        );
+        configuration.await
+    } else if immediate {
+        let result = broker.dispatch_immediate_task_command(&request)?;
+        let catalog = broker.provider_catalog_request()?;
+        drop(broker);
+        *controller.catalog_request.write().await = catalog;
+        let continuing = result
+            .event
+            .iter()
+            .any(|event| event.event == "goal_continue_requested");
+        for event in result.event {
+            sink.send_event(event).await?;
+        }
+        if let Some(failure) = result.response.error() {
+            if matches!(failure.code.as_str(), "turn_cancelled" | "turn_retracted") {
+                Err(anyhow::Error::new(crate::broker::TurnCancelled))
+            } else {
+                Err(anyhow::anyhow!("{}", failure.message))
+            }
+        } else {
+            Ok(continuing)
+        }
+    } else {
+        let action = request.params["action"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        drop(broker);
+        Err(anyhow::anyhow!("unknown task action: {action}"))
+    };
+    if operation.action["action"] == "compact" {
+        *retained_compaction_execution = Some(execution);
+    } else {
+        drop(execution);
+    }
     operation.exchange_id = store
         .list_exchange(&operation.session_id)?
         .last()
         .map(|exchange| exchange.id.clone());
     outcome?;
-    drop(execution);
     let _ = registry;
     Ok(())
 }
 
-async fn dispatch_task_attempt(
-    broker: &mut HarnessBroker,
-    session_id: &str,
-    request: Request,
+/// Settle an older exchange without holding the broker across checkpoint or observation waits.
+async fn settle_prior_for_undo(controller: &SessionController, sink: &MessageSender) -> Result<()> {
+    let mut prior = match controller.broker.lock().await.begin_prior_finalization()? {
+        Some(prior) => prior,
+        None => return Ok(()),
+    };
+    let mut pending = None;
+    loop {
+        let mut events = Vec::new();
+        let action = match pending.take() {
+            Some(action) => Ok(action),
+            None => controller
+                .broker
+                .lock()
+                .await
+                .advance_prior_finalization(&mut prior, &mut events),
+        };
+        for event in events {
+            sink.send_event(event).await?;
+        }
+        let action = match action {
+            Ok(action) => action,
+            Err(error) => {
+                let cleanup = controller
+                    .broker
+                    .lock()
+                    .await
+                    .abort_prior_finalization(&mut prior, &error);
+                return match cleanup {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => {
+                        Err(error.context(format!("prior settlement cleanup failed: {cleanup:#}")))
+                    }
+                };
+            }
+        };
+        match action {
+            crate::broker::PriorFinalizationAction::Ready => return Ok(()),
+            crate::broker::PriorFinalizationAction::Wait(job) => {
+                if let Err(error) = job.run().await {
+                    let cleanup = controller
+                        .broker
+                        .lock()
+                        .await
+                        .abort_prior_finalization(&mut prior, &error);
+                    return match cleanup {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => {
+                            Err(error
+                                .context(format!("prior settlement cleanup failed: {cleanup:#}")))
+                        }
+                    };
+                }
+            }
+            crate::broker::PriorFinalizationAction::Initial(job) => {
+                let result = job.run().await;
+                if let Err(error) = controller
+                    .broker
+                    .lock()
+                    .await
+                    .apply_prior_initial(&mut prior, result)
+                {
+                    let cleanup = controller
+                        .broker
+                        .lock()
+                        .await
+                        .abort_prior_finalization(&mut prior, &error);
+                    return match cleanup {
+                        Ok(()) => Err(error),
+                        Err(cleanup) => {
+                            Err(error
+                                .context(format!("prior settlement cleanup failed: {cleanup:#}")))
+                        }
+                    };
+                }
+            }
+            crate::broker::PriorFinalizationAction::Final(job) => {
+                let result = job.run().await;
+                let mut events = Vec::new();
+                let action = controller.broker.lock().await.apply_prior_final(
+                    &mut prior,
+                    result,
+                    &mut events,
+                );
+                for event in events {
+                    sink.send_event(event).await?;
+                }
+                match action {
+                    Ok(action) => pending = Some(action),
+                    Err(error) => {
+                        let cleanup = controller
+                            .broker
+                            .lock()
+                            .await
+                            .abort_prior_finalization(&mut prior, &error);
+                        return match cleanup {
+                            Ok(()) => Err(error),
+                            Err(cleanup) => Err(error
+                                .context(format!("prior settlement cleanup failed: {cleanup:#}"))),
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Retire the old provider before committing rollback and installing a fresh observation owner.
+async fn drive_owned_undo(
+    controller: &Arc<SessionController>,
+    action: &Value,
     sink: &MessageSender,
-    catalog_request: Arc<RwLock<crate::provider::ProviderCatalogRequest>>,
+    execution: ExecutionPermit,
+) -> Result<()> {
+    let operation_id = action
+        .get("operation_id")
+        .and_then(Value::as_str)
+        .context("undo operation identity is missing")?
+        .to_owned();
+    let mut slot = controller.undo_task.lock().await;
+    if slot.is_none() {
+        let owner = controller.clone();
+        let action = action.clone();
+        let sink = sink.clone();
+        let teardown_started = Arc::new(AtomicBool::new(false));
+        let started = teardown_started.clone();
+        let task = tokio::spawn(async move {
+            let _execution = execution;
+            run_owned_undo(&owner, &action, &sink, started).await
+        });
+        *slot = Some(RetainedUndoTask::Running {
+            operation_id: operation_id.clone(),
+            task,
+            teardown_started,
+        });
+    }
+    match slot.as_mut().expect("undo task installed") {
+        RetainedUndoTask::Failed {
+            operation_id: failed,
+            message,
+        } => {
+            anyhow::bail!("undo {failed} could not collect its native generation: {message}")
+        }
+        RetainedUndoTask::Running {
+            operation_id: running,
+            task,
+            teardown_started,
+        } => {
+            anyhow::ensure!(
+                running == &operation_id,
+                "another undo generation is still owned"
+            );
+            let result = task
+                .await
+                .context("undo owner task panicked")
+                .and_then(|result| result);
+            match result {
+                Ok(()) => {
+                    *slot = None;
+                    Ok(())
+                }
+                Err(error) => {
+                    if teardown_started.load(Ordering::Acquire) {
+                        let message = format!("{error:#}");
+                        *slot = Some(RetainedUndoTask::Failed {
+                            operation_id,
+                            message,
+                        });
+                    } else {
+                        *slot = None;
+                    }
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+async fn run_owned_undo(
+    controller: &Arc<SessionController>,
+    action: &Value,
+    sink: &MessageSender,
+    teardown_started: Arc<AtomicBool>,
+) -> Result<()> {
+    settle_prior_for_undo(controller, sink).await?;
+    let events = controller.broker.lock().await.prepare_undo_cancel()?;
+    for event in events {
+        sink.send_event(event).await?;
+    }
+    settle_prior_for_undo(controller, sink).await?;
+    controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
+    if let Some(startup) = controller.provider_startup.lock().await.take() {
+        startup
+            .await
+            .context("previous provider initialization task panicked")?;
+    }
+    let provider_generation = controller.provider_lane.clone().write_owned().await;
+    let mut teardown = controller
+        .broker
+        .lock()
+        .await
+        .prepare_undo_teardown(action)?;
+    teardown_started.store(true, Ordering::Release);
+    teardown.run().await?;
+    controller.finish_session_events().await?;
+    let (events, replacement, goal_lane) = {
+        let mut broker = controller.broker.lock().await;
+        let mut events = broker.drain_session_events()?;
+        let (rollback_events, goal_lane) = broker.commit_undo_teardown(teardown)?;
+        events.extend(rollback_events);
+        (events, broker.provider_handle(), goal_lane)
+    };
+    for event in events {
+        sink.send_event(event).await?;
+    }
+    controller.attach_session_events(sink).await?;
+    *controller
+        .provider
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement;
+    controller.task_controller.native_goal_written()?;
+    drop(goal_lane);
+    drop(provider_generation);
+    *controller
+        .provider_startup_error
+        .lock()
+        .expect("provider startup state poisoned") = None;
+    controller.start_provider(sink).await;
+    Ok(())
+}
+
+/// Commit configuration state, then deliver and resume outside broker ownership.
+async fn dispatch_owned_configuration(
+    controller: &SessionController,
+    session_id: &str,
+    action: &Value,
+    sink: &MessageSender,
 ) -> Result<bool> {
-    let (event_sink, mut event_stream) = crate::broker::publication::channel();
+    controller.trace.record(
+        session_id,
+        "future.stack_probe",
+        json!({"phase":"configuration.enter","bytes":0}),
+    );
+    let (publication, mut stream) = crate::broker::publication::channel();
     let output = sink.clone();
-    let routed_session = session_id.to_owned();
-    let data_root = broker.data_root().to_path_buf();
-    let forwarder = tokio::spawn(async move {
-        while let Some(event) = event_stream.recv().await? {
+    let session = session_id.to_owned();
+    let catalog = controller.catalog_request.clone();
+    let data_root = controller.broker.lock().await.data_root().to_path_buf();
+    let forwarder_factory = || async move {
+        while let Some(update) = stream.recv().await? {
             if let crate::broker::publication::SessionUpdate::ConfigurationProgress {
                 operation_id,
                 state,
-            } = &event
+            } = &update
             {
                 let mut store = SqliteStore::open(&data_root)?;
                 let mut operation = store
-                    .load_task_operation(&routed_session, operation_id)?
+                    .load_task_operation(&session, operation_id)?
                     .context("configuration operation is missing")?;
                 operation.state = state.as_str().into();
                 store.save_task_operation(&mut operation)?;
                 retain_configuration_event(&mut store, &operation)?;
                 output
                     .send_control_wait(Message::Event(SessionEvent {
-                        session_id: routed_session.clone(),
+                        session_id: session.clone(),
                         event: "task_operation".into(),
                         payload: operation.view(),
                     }))
                     .await?;
                 continue;
             }
-            if let crate::broker::publication::SessionUpdate::Configuration { catalog, .. } = &event
-            {
-                *catalog_request.write().await = catalog.as_ref().clone();
-                let payload = crate::broker::publication::encode_session_update(&event)?;
-                output
-                    .send_event(SessionEvent {
-                        session_id: routed_session.clone(),
-                        event: "session_configured".into(),
-                        payload: payload["data"].clone(),
-                    })
-                    .await?;
-                continue;
-            }
-            let (name, payload) = if matches!(
-                &event,
-                crate::broker::publication::SessionUpdate::DocumentChanged { .. }
-            ) {
-                (
-                    "document_changed",
-                    crate::broker::publication::encode_session_update(&event)?,
-                )
-            } else {
-                (
-                    "provider_event",
-                    crate::broker::publication::encode_session_update(&event)?,
-                )
-            };
+            let payload = crate::broker::publication::encode_session_update(&update)?;
+            let (event, payload) =
+                if let crate::broker::publication::SessionUpdate::Configuration {
+                    catalog: next,
+                    ..
+                } = &update
+                {
+                    *catalog.write().await = next.as_ref().clone();
+                    ("session_configured", payload["data"].clone())
+                } else if matches!(
+                    &update,
+                    crate::broker::publication::SessionUpdate::DocumentChanged { .. }
+                ) {
+                    ("document_changed", payload)
+                } else {
+                    ("provider_event", payload)
+                };
             output
                 .send_event(SessionEvent {
-                    session_id: routed_session.clone(),
-                    event: name.into(),
+                    session_id: session.clone(),
+                    event: event.into(),
                     payload,
                 })
                 .await?;
         }
         Ok::<(), anyhow::Error>(())
-    });
-    let result = Box::pin(broker.dispatch_stream(request, event_sink)).await;
-    forwarder.await??;
-    let continuing = result
-        .event
-        .iter()
-        .any(|event| event.event == "goal_continue_requested");
-    for event in result.event {
-        sink.send_event(event).await?;
-    }
-    if let Some(failure) = result.response.error() {
-        if matches!(failure.code.as_str(), "turn_cancelled" | "turn_retracted") {
-            return Err(anyhow::Error::new(crate::broker::TurnCancelled));
+    };
+    controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.forwarder.construct","bytes":crate::trace::future_bytes(&forwarder_factory)}));
+    let forwarder = forwarder_factory();
+    controller.trace.record(
+        session_id,
+        "future.stack_probe",
+        json!({"phase":"configuration.forwarder.ready","bytes":0}),
+    );
+    let operation_factory = || async move {
+        controller.trace.record(
+            session_id,
+            "future.stack_probe",
+            json!({"phase":"configuration.operation.enter","bytes":0}),
+        );
+        let outcome: Result<bool> = async {
+            let _provider_generation = if action["action"] == "configure" {
+                Some(controller.provider_lane.read().await)
+            } else {
+                None
+            };
+            let (delivery, resume) = if action["action"] == "configure" {
+                let phase = || run_owned_configuration_change(controller, session_id, action, sink, &publication);
+                controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.change.construct","bytes":crate::trace::future_bytes(&phase)}));
+                Box::pin(phase()).await?
+            } else if action["action"] == "compact" {
+                let phase = || run_owned_configuration_compaction(controller, action, sink, &publication);
+                controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.compaction.construct","bytes":crate::trace::future_bytes(&phase)}));
+                Box::pin(phase()).await?
+            } else {
+                let mut broker = controller.broker.lock().await;
+                let result = broker.with_publication_sink(&publication, |broker| {
+                    let captured = broker.prepare_permission_configuration(action)?;
+                    broker.commit_permission_configuration(captured)
+                })?;
+                (result.delivery, result.resume)
+            };
+            for event in delivery.deliver_and_flush().await? {
+                sink.send_event(event).await?;
+            }
+            if let Some(prompt) = resume {
+                let operation_id = action
+                    .get("operation_id")
+                    .and_then(Value::as_str)
+                    .context("permission operation identity is missing")?;
+                let progress = {
+                    let mut broker = controller.broker.lock().await;
+                    broker.with_publication_sink(&publication, |broker| {
+                        broker.prepare_permission_resume_progress(operation_id)
+                    })?
+                };
+                for event in progress.deliver_and_flush().await? {
+                    sink.send_event(event).await?;
+                }
+                let dispatch = {
+                    let mut broker = controller.broker.lock().await;
+                    broker.with_publication_sink(&publication, |broker| {
+                        broker.begin_permission_resume_dispatch(prompt, publication.clone())
+                    })?
+                };
+                if let Some(dispatch) = dispatch {
+                    let result = drive_owned_foreground(controller, dispatch, sink).await?;
+                    let continuing = result
+                        .event
+                        .iter()
+                        .any(|event| event.event == "goal_continue_requested");
+                    for event in result.event {
+                        sink.send_event(event).await?;
+                    }
+                    if let Some(failure) = result.response.error() {
+                        if matches!(failure.code.as_str(), "turn_cancelled" | "turn_retracted") {
+                            return Err(crate::broker::TurnCancelled.into());
+                        }
+                        anyhow::bail!("{}", failure.message);
+                    }
+                    return Ok(continuing);
+                }
+            }
+            Ok(false)
         }
-        anyhow::bail!("{}", failure.message);
+        .await;
+        drop(publication);
+        outcome
+    };
+    controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.operation.construct","bytes":crate::trace::future_bytes(&operation_factory)}));
+    let operation = operation_factory();
+    controller.trace.record(
+        session_id,
+        "future.stack_probe",
+        json!({"phase":"configuration.operation.ready","bytes":0}),
+    );
+    let (outcome, forwarding) = tokio::join!(operation, forwarder);
+    if action["action"] == "compact"
+        && let Err(error) = &forwarding
+    {
+        controller
+            .record_compaction_failure(format!("compaction event forwarder failed: {error:#}"))?;
     }
+    let continuing = outcome?;
+    forwarding?;
     Ok(continuing)
+}
+
+/// Run the provider-backed configuration phase as independently owned work.
+async fn run_owned_configuration_change(
+    controller: &SessionController,
+    session_id: &str,
+    action: &Value,
+    sink: &MessageSender,
+    publication: &crate::broker::publication::SessionUpdateSink,
+) -> Result<(crate::broker::PendingProviderDelivery, Option<String>)> {
+    controller.trace.record(
+        session_id,
+        "future.stack_probe",
+        json!({"phase":"configuration.applying.prepare","bytes":0}),
+    );
+    let operation_id = action.get("operation_id").and_then(Value::as_str);
+    let applying = {
+        let mut broker = controller.broker.lock().await;
+        broker.with_publication_sink(publication, |broker| {
+            broker.prepare_configuration_progress(
+                operation_id,
+                crate::broker::publication::ConfigurationProgressState::Applying,
+            )
+        })?
+    };
+    if let Some(delivery) = applying {
+        for event in delivery.deliver_and_flush().await? {
+            sink.send_event(event).await?;
+        }
+    }
+    controller.trace.record(
+        session_id,
+        "future.stack_probe",
+        json!({"phase":"configuration.applying.delivered","bytes":0}),
+    );
+    let (preparation, catalog_job) = {
+        let broker = controller.broker.lock().await;
+        let params = action
+            .get("config")
+            .cloned()
+            .context("configuration is required")?;
+        let preparation = broker.prepare_configuration(params)?;
+        let job = if preparation.needs_catalog(&broker) {
+            Some(broker.prepare_configuration_catalog()?)
+        } else {
+            None
+        };
+        (preparation, job)
+    };
+    let models = if let Some(job) = catalog_job {
+        let factory = || job.run();
+        controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.catalog.construct","bytes":crate::trace::future_bytes(&factory)}));
+        let result = factory().await?;
+        controller.trace.record(
+            session_id,
+            "future.stack_probe",
+            json!({"phase":"configuration.catalog.ready","bytes":0}),
+        );
+        controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.catalog.result_size","bytes":std::mem::size_of_val(&result)}));
+        let broker = controller.broker.lock().await;
+        controller.trace.record(
+            session_id,
+            "future.stack_probe",
+            json!({"phase":"configuration.catalog.locked","bytes":0}),
+        );
+        let models = broker.commit_configuration_catalog(result)?;
+        controller.trace.record(
+            session_id,
+            "future.stack_probe",
+            json!({"phase":"configuration.catalog.validated","bytes":0}),
+        );
+        models
+    } else {
+        Vec::new()
+    };
+    let (mut candidate, reconcile) = {
+        let broker = controller.broker.lock().await;
+        controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.candidate.prepare","bytes":std::mem::size_of_val(preparation.as_ref())}));
+        let candidate = broker.build_configuration_candidate(preparation, &models)?;
+        controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.candidate.built","bytes":std::mem::size_of_val(candidate.as_ref())}));
+        let reconcile = broker.prepare_candidate_reconcile(&candidate)?;
+        (candidate, reconcile)
+    };
+    if let Some(job) = reconcile {
+        let result = job.run().await?;
+        controller
+            .broker
+            .lock()
+            .await
+            .certify_candidate_reconcile(&mut candidate, result)?;
+    }
+    let committed = {
+        let mut broker = controller.broker.lock().await;
+        broker.with_publication_sink(publication, |broker| {
+            broker.commit_configuration_candidate(candidate)
+        })?
+    };
+    if let Some(job) = committed.cleanup {
+        let result = job.run().await?;
+        controller
+            .broker
+            .lock()
+            .await
+            .commit_configuration_reconcile(result)?;
+    }
+    if action.pointer("/config/settings_revision").is_some() {
+        let verifying = {
+            let mut broker = controller.broker.lock().await;
+            broker.with_publication_sink(publication, |broker| {
+                broker.prepare_configuration_progress(
+                    operation_id,
+                    crate::broker::publication::ConfigurationProgressState::Verifying,
+                )
+            })?
+        };
+        if let Some(delivery) = verifying {
+            for event in delivery.deliver_and_flush().await? {
+                sink.send_event(event).await?;
+            }
+        }
+        controller
+            .broker
+            .lock()
+            .await
+            .confirm_configuration_application(action)?;
+    }
+    let mut notices = {
+        let mut broker = controller.broker.lock().await;
+        broker.with_publication_sink(publication, |broker| {
+            broker.prepare_configuration_mcp_notices()
+        })?
+    };
+    for delivery in std::mem::take(&mut notices.deliveries) {
+        for event in delivery.deliver_and_flush().await? {
+            sink.send_event(event).await?;
+        }
+    }
+    controller
+        .broker
+        .lock()
+        .await
+        .commit_configuration_mcp_notices(notices)?;
+    let mut broker = controller.broker.lock().await;
+    let result = broker.with_publication_sink(publication, |broker| {
+        broker.finish_compaction_configuration(action)
+    })?;
+    Ok((result.delivery, result.resume))
+}
+
+/// Run compaction as a separate owned phase, preserving its terminal publication.
+async fn run_owned_configuration_compaction(
+    controller: &SessionController,
+    action: &Value,
+    sink: &MessageSender,
+    publication: &crate::broker::publication::SessionUpdateSink,
+) -> Result<(crate::broker::PendingProviderDelivery, Option<String>)> {
+    let (job, started) = {
+        let mut broker = controller.broker.lock().await;
+        broker.with_publication_sink(publication, |broker| {
+            broker.prepare_owned_compaction(crate::broker::CompactionProvenance::Manual)
+        })?
+    };
+    let start: Result<()> = async {
+        for event in started.deliver_and_flush().await? {
+            sink.send_event(event).await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = start {
+        let original = format!("{error:#}");
+        controller.record_compaction_failure(format!(
+            "compaction start publication failed: {original}"
+        ))?;
+        let aborted = {
+            let mut broker = controller.broker.lock().await;
+            broker.with_publication_sink(publication, |broker| {
+                broker.abort_owned_compaction(job, error)
+            })
+        };
+        let aborted = match aborted {
+            Ok(result) => result,
+            Err(error) => {
+                controller
+                    .record_compaction_failure(format!("compaction abort failed: {error:#}"))?;
+                return Err(error)
+                    .with_context(|| format!("compaction start publication failed: {original}"));
+            }
+        };
+        let (terminal, failure, _) = aborted;
+        let terminal_result: Result<()> = async {
+            for event in terminal.deliver_and_flush().await? {
+                sink.send_event(event).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = &terminal_result {
+            controller.record_compaction_failure(format!(
+                "terminal compaction publication failed: {error:#}"
+            ))?;
+        }
+        if let Some(failure) = failure {
+            return match terminal_result {
+                Ok(()) => Err(failure),
+                Err(delivery) => Err(failure.context(format!(
+                    "terminal compaction publication failed: {delivery:#}"
+                ))),
+            };
+        }
+        terminal_result?;
+        anyhow::bail!("compaction start publication failed: {original}");
+    }
+    let captured = job.run().await;
+    let (finished, failure, _) = {
+        let mut broker = controller.broker.lock().await;
+        match broker.with_publication_sink(publication, |broker| {
+            broker.commit_owned_compaction(captured)
+        }) {
+            Ok(result) => result,
+            Err(error) => {
+                controller.record_compaction_failure(format!(
+                    "compaction result commit failed: {error:#}"
+                ))?;
+                return Err(error);
+            }
+        }
+    };
+    let delivered: Result<()> = async {
+        for event in finished.deliver_and_flush().await? {
+            sink.send_event(event).await?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = &delivered {
+        controller.record_compaction_failure(format!(
+            "terminal compaction publication failed: {error:#}"
+        ))?;
+    }
+    if let Some(error) = failure {
+        return match delivered {
+            Ok(()) => Err(error),
+            Err(delivery) => Err(error.context(format!(
+                "terminal compaction publication failed: {delivery:#}"
+            ))),
+        };
+    }
+    delivered?;
+    let mut broker = controller.broker.lock().await;
+    let result = broker.with_publication_sink(publication, |broker| {
+        broker.finish_compaction_configuration(action)
+    })?;
+    Ok((result.delivery, result.resume))
 }
 
 async fn route_new_session(
@@ -3713,6 +4778,7 @@ async fn acquire_request_broker(
     controller: &SessionController,
     method: RuntimeMethod,
 ) -> Result<(MutexGuard<'_, HarnessBroker>, Option<ExecutionPermit>)> {
+    controller.check_undo_fence().await?;
     let admission = if method.requires_provider_fork() {
         None
     } else {
@@ -3724,6 +4790,581 @@ async fn acquire_request_broker(
         .await
         .context("Session maintenance did not release the broker within 10 seconds")?;
     Ok((broker, admission))
+}
+
+/// Own the complete manual compaction and its forwarder independently of its waiter.
+async fn run_retained_manual_compaction(
+    controller: Arc<SessionController>,
+    session_id: String,
+    request: Request,
+    sink: MessageSender,
+) -> Result<()> {
+    let (broker, execution) =
+        acquire_request_broker(&controller, RuntimeMethod::SessionCompact).await?;
+    let (publication, mut stream) = crate::broker::publication::channel();
+    let forwarded = sink.clone();
+    let event_session = session_id.clone();
+    let forwarder = async move {
+        while let Some(update) = stream.recv().await? {
+            let (event, payload) = if matches!(
+                &update,
+                crate::broker::publication::SessionUpdate::DocumentChanged { .. }
+            ) {
+                (
+                    "document_changed",
+                    crate::broker::publication::encode_session_update(&update)?,
+                )
+            } else {
+                (
+                    "provider_event",
+                    crate::broker::publication::encode_session_update(&update)?,
+                )
+            };
+            forwarded
+                .send_event(SessionEvent {
+                    session_id: event_session.clone(),
+                    event: event.into(),
+                    payload,
+                })
+                .await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    };
+    let (outcome, forwarding) = tokio::join!(
+        drive_manual_compaction(&controller, broker, request, publication, &sink),
+        forwarder,
+    );
+    let (mut result, retained_failure) = outcome;
+    if let Some(failure) = retained_failure {
+        controller.record_compaction_failure(failure)?;
+    }
+    forwarding.context("manual compaction event forwarding failed")?;
+    for event in result.event.drain(..) {
+        sink.send_event(event).await?;
+    }
+    let catalog = controller.broker.lock().await.provider_catalog_request()?;
+    if catalog.provider_session_id.is_some() {
+        *controller
+            .provider_startup_error
+            .lock()
+            .map_err(|_| anyhow::anyhow!("provider startup state poisoned"))? = None;
+    }
+    *controller.catalog_request.write().await = catalog;
+    controller.coordinator.submissions.changed.notify_one();
+    sink.send_response(result.response).await?;
+    drop(execution);
+    Ok(())
+}
+
+/// Apply direct configuration through owned provider phases and short authority checks.
+async fn drive_direct_configuration(
+    controller: &SessionController,
+    mut broker: MutexGuard<'_, HarnessBroker>,
+    request: Request,
+    publication: crate::broker::publication::SessionUpdateSink,
+) -> crate::broker::DispatchResult {
+    let id = request.id;
+    broker.trace_foreground_request(&request);
+    drop(broker);
+    let outcome: Result<(Value, Vec<SessionEvent>)> = async {
+        let _provider_generation = controller.provider_lane.read().await;
+        let (preparation, catalog) = {
+            let broker = controller.broker.lock().await;
+            let preparation = broker.prepare_configuration(request.params)?;
+            let catalog = if preparation.needs_catalog(&broker) {
+                Some(broker.prepare_configuration_catalog()?)
+            } else {
+                None
+            };
+            (preparation, catalog)
+        };
+        let models = if let Some(job) = catalog {
+            let result = job.run().await?;
+            controller
+                .broker
+                .lock()
+                .await
+                .commit_configuration_catalog(result)?
+        } else {
+            Vec::new()
+        };
+        let (mut candidate, reconcile) = {
+            let broker = controller.broker.lock().await;
+            let candidate = broker.build_configuration_candidate(preparation, &models)?;
+            let reconcile = broker.prepare_candidate_reconcile(&candidate)?;
+            (candidate, reconcile)
+        };
+        if let Some(job) = reconcile {
+            let result = job.run().await?;
+            controller
+                .broker
+                .lock()
+                .await
+                .certify_candidate_reconcile(&mut candidate, result)?;
+        }
+        let committed = {
+            let mut broker = controller.broker.lock().await;
+            broker.with_publication_sink(&publication, |broker| {
+                broker.commit_configuration_candidate(candidate)
+            })?
+        };
+        if let Some(cleanup) = committed.cleanup {
+            let result = cleanup.run().await?;
+            controller
+                .broker
+                .lock()
+                .await
+                .commit_configuration_reconcile(result)?;
+        }
+        Ok((committed.value, committed.events))
+    }
+    .await;
+    let result = match outcome {
+        Ok((value, event)) => match Response::success(id, value) {
+            Ok(response) => crate::broker::DispatchResult { response, event },
+            Err(error) => crate::broker::DispatchResult {
+                response: Response::failure(id, "encode_response", error.to_string()),
+                event: Vec::new(),
+            },
+        },
+        Err(error) => crate::broker::DispatchResult {
+            response: Response::failure(
+                id,
+                "request_failed",
+                crate::storage::error_message(&error),
+            ),
+            event: Vec::new(),
+        },
+    };
+    let mut broker = controller.broker.lock().await;
+    broker
+        .with_publication_sink(&publication, |broker| {
+            Ok(broker.finish_owned_external_request(id, RuntimeMethod::SessionConfigure, result))
+        })
+        .unwrap_or_else(|error| crate::broker::DispatchResult {
+            response: Response::failure(
+                id,
+                "request_failed",
+                crate::storage::error_message(&error),
+            ),
+            event: Vec::new(),
+        })
+}
+
+/// Run a manual compaction without retaining broker ownership across provider work or delivery.
+async fn drive_manual_compaction(
+    controller: &SessionController,
+    mut broker: MutexGuard<'_, HarnessBroker>,
+    request: Request,
+    publication: crate::broker::publication::SessionUpdateSink,
+    sink: &MessageSender,
+) -> (crate::broker::DispatchResult, Option<String>) {
+    let id = request.id;
+    let mut retained_failure = None;
+    let outcome: Result<Value> = async {
+        let (job, started) = broker.with_publication_sink(&publication, |broker| {
+            broker.prepare_owned_compaction(crate::broker::CompactionProvenance::Manual)
+        })?;
+        drop(broker);
+        let start: Result<()> = async {
+            for event in started.deliver_and_flush().await? {
+                sink.send_event(event).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = start {
+            let original = format!("{error:#}");
+            retained_failure = Some(format!("compaction start publication failed: {original}"));
+            let (terminal, failure, _) = {
+                let mut broker = controller.broker.lock().await;
+                match broker.with_publication_sink(&publication, |broker| {
+                    broker.abort_owned_compaction(job, error)
+                }) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        retained_failure = Some(format!("compaction abort failed: {error:#}"));
+                        return Err(error).with_context(|| {
+                            format!("compaction start publication failed: {original}")
+                        });
+                    }
+                }
+            };
+            let delivered: Result<()> = async {
+                for event in terminal.deliver_and_flush().await? {
+                    sink.send_event(event).await?;
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = &delivered {
+                retained_failure =
+                    Some(format!("terminal compaction publication failed: {error:#}"));
+            }
+            if let Some(failure) = failure {
+                return match delivered {
+                    Ok(()) => Err(failure),
+                    Err(error) => Err(failure
+                        .context(format!("terminal compaction publication failed: {error:#}"))),
+                };
+            }
+            delivered?;
+            anyhow::bail!("compaction start publication failed: {original}");
+        }
+        let captured = job.run().await;
+        let (terminal, failure) = {
+            let mut broker = controller.broker.lock().await;
+            let (terminal, failure, _) = match broker
+                .with_publication_sink(&publication, |broker| {
+                    broker.commit_owned_compaction(captured)
+                }) {
+                Ok(result) => result,
+                Err(error) => {
+                    retained_failure = Some(format!("compaction result commit failed: {error:#}"));
+                    return Err(error);
+                }
+            };
+            (terminal, failure)
+        };
+        let delivered: Result<()> = async {
+            for event in terminal.deliver_and_flush().await? {
+                sink.send_event(event).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = &delivered {
+            retained_failure = Some(format!("terminal compaction publication failed: {error:#}"));
+        }
+        if let Some(error) = failure {
+            return match delivered {
+                Ok(()) => Err(error),
+                Err(delivery) => Err(error.context(format!(
+                    "terminal compaction publication failed: {delivery:#}"
+                ))),
+            };
+        }
+        delivered?;
+        Ok(serde_json::to_value(
+            controller.broker.lock().await.snapshot()?,
+        )?)
+    }
+    .await;
+    let response = match outcome {
+        Ok(value) => match Response::success(id, value) {
+            Ok(response) => crate::broker::DispatchResult {
+                response,
+                event: Vec::new(),
+            },
+            Err(error) => crate::broker::DispatchResult {
+                response: Response::failure(id, "encode_response", error.to_string()),
+                event: Vec::new(),
+            },
+        },
+        Err(error) => crate::broker::DispatchResult {
+            response: Response::failure(
+                id,
+                "request_failed",
+                crate::storage::error_message(&error),
+            ),
+            event: Vec::new(),
+        },
+    };
+    (response, retained_failure)
+}
+
+/// Run owned foreground effects outside the broker and apply each result under its owner lock.
+async fn drive_foreground_dispatch(
+    controller: &SessionController,
+    mut broker: MutexGuard<'_, HarnessBroker>,
+    request: Request,
+    sink: crate::broker::publication::SessionUpdateSink,
+    message_sink: &MessageSender,
+) -> Result<crate::broker::DispatchResult> {
+    let id = request.id;
+    broker.trace_foreground_request(&request);
+    let data_root = broker.data_root().to_path_buf();
+    let requires_attachments = broker.foreground_requires_attachments(&request);
+    drop(broker);
+    let result = async {
+        let requires_attachments = requires_attachments?;
+        let attachments = if requires_attachments {
+            crate::attachment::resolve_input(&data_root, &request.params).await?
+        } else {
+            Vec::new()
+        };
+        let mut broker = controller.broker.lock().await;
+        let mut transaction = broker.begin_foreground_dispatch(request, sink)?;
+        transaction.set_attachments(attachments)?;
+        drop(broker);
+        drive_owned_foreground(controller, transaction, message_sink).await
+    }
+    .await;
+    let broker = controller.broker.lock().await;
+    match &result {
+        Ok(response) => broker.trace_foreground_response(id, response),
+        Err(error) => broker.trace_foreground_error(id, error),
+    }
+    result
+}
+
+/// Drive an already admitted foreground transaction without retaining broker ownership.
+async fn drive_owned_foreground(
+    controller: &SessionController,
+    transaction: crate::broker::ForegroundDispatch,
+    message_sink: &MessageSender,
+) -> Result<crate::broker::DispatchResult> {
+    Box::pin(drive_owned_foreground_initial(
+        controller,
+        transaction,
+        message_sink,
+        None,
+    ))
+    .await
+}
+
+async fn drive_owned_foreground_initial(
+    controller: &SessionController,
+    mut transaction: crate::broker::ForegroundDispatch,
+    message_sink: &MessageSender,
+    initial: Option<crate::broker::ForegroundJob>,
+) -> Result<crate::broker::DispatchResult> {
+    let mut jobs: tokio::task::JoinSet<(bool, Result<crate::broker::ForegroundSignal>)> =
+        tokio::task::JoinSet::new();
+    let mut publications = std::collections::VecDeque::new();
+    let mut publication_active = false;
+    let mut publication_drain_requested = false;
+    let mut deferred_failure = None;
+    if let Some(job) = initial {
+        let publication = job.is_publication();
+        publication_active = publication;
+        jobs.spawn(run_foreground_job(job, publication));
+    }
+    loop {
+        let (signal, completed_publication) = if let Some(error) = deferred_failure.take() {
+            (crate::broker::ForegroundSignal::EffectFailed(error), false)
+        } else if publication_drain_requested && jobs.is_empty() && publications.is_empty() {
+            publication_drain_requested = false;
+            (crate::broker::ForegroundSignal::PublicationDrained, false)
+        } else {
+            tokio::select! {
+                signal = transaction.next() => (signal.unwrap_or_else(crate::broker::ForegroundSignal::EffectFailed), false),
+                result = jobs.join_next(), if !jobs.is_empty() => {
+                    match result {
+                        Some(Ok((publication, result))) => (result.unwrap_or_else(crate::broker::ForegroundSignal::EffectFailed), publication),
+                        Some(Err(error)) => (crate::broker::ForegroundSignal::EffectFailed(anyhow::anyhow!("foreground effect task failed: {error}")), false),
+                        None => (crate::broker::ForegroundSignal::EffectFailed(anyhow::anyhow!("foreground effect task disappeared")), false),
+                    }
+                }
+            }
+        };
+        let signal = match signal {
+            crate::broker::ForegroundSignal::ObservationPublicationNeedsForward { events } => {
+                let result = async {
+                    for event in events {
+                        message_sink.send_event(event).await?;
+                    }
+                    Ok(Vec::new())
+                }
+                .await;
+                crate::broker::ForegroundSignal::ObservationPublicationDelivered(result)
+            }
+            crate::broker::ForegroundSignal::CommandEventsNeedForward { events } => {
+                let result = async {
+                    for event in events {
+                        message_sink.send_event(event).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                crate::broker::ForegroundSignal::CommandEventsForwarded(result)
+            }
+            crate::broker::ForegroundSignal::CommandNeedsForward { events } => {
+                let result = async {
+                    for event in events {
+                        message_sink.send_event(event).await?;
+                    }
+                    Ok(Vec::new())
+                }
+                .await;
+                crate::broker::ForegroundSignal::CommandPublished(result)
+            }
+            crate::broker::ForegroundSignal::PermissionNeedsForward { events } => {
+                let result = async {
+                    for event in events {
+                        message_sink.send_event(event).await?;
+                    }
+                    Ok(Vec::new())
+                }
+                .await;
+                crate::broker::ForegroundSignal::PermissionPublished(result)
+            }
+            crate::broker::ForegroundSignal::AdmissionEventsNeedForward { events } => {
+                let result = async {
+                    for event in events {
+                        message_sink.send_event(event).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                crate::broker::ForegroundSignal::AdmissionEventsForwarded(result)
+            }
+            crate::broker::ForegroundSignal::FailureAdmissionEventsNeedForward { events } => {
+                let result = async {
+                    for event in events {
+                        message_sink.send_event(event).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                crate::broker::ForegroundSignal::FailureAdmissionEventsForwarded(result)
+            }
+            crate::broker::ForegroundSignal::FailurePublicationNeedsForward { events } => {
+                let result = async {
+                    for event in events {
+                        message_sink.send_event(event).await?;
+                    }
+                    Ok(Vec::new())
+                }
+                .await;
+                crate::broker::ForegroundSignal::FailurePublicationCompleted(result)
+            }
+            crate::broker::ForegroundSignal::AutoCompactionNeedsForward { events } => {
+                let result = async {
+                    for event in events {
+                        message_sink.send_event(event).await?;
+                    }
+                    Ok(Vec::new())
+                }
+                .await;
+                crate::broker::ForegroundSignal::AutoCompactionPublished(result)
+            }
+            crate::broker::ForegroundSignal::CheckRepairNeedsForward { events } => {
+                let result = async {
+                    for event in events {
+                        message_sink.send_event(event).await?;
+                    }
+                    Ok(Vec::new())
+                }
+                .await;
+                crate::broker::ForegroundSignal::CheckRepairPublished(result)
+            }
+            crate::broker::ForegroundSignal::ClarificationNeedsForward { events } => {
+                let result = async {
+                    for event in events {
+                        message_sink.send_event(event).await?;
+                    }
+                    Ok(Vec::new())
+                }
+                .await;
+                crate::broker::ForegroundSignal::ClarificationPublished(result)
+            }
+            crate::broker::ForegroundSignal::FinalResponseNeedsForward { events } => {
+                let result = async {
+                    for event in events {
+                        message_sink.send_event(event).await?;
+                    }
+                    Ok(Vec::new())
+                }
+                .await;
+                crate::broker::ForegroundSignal::FinalResponsePublished(result)
+            }
+            crate::broker::ForegroundSignal::PlanTerminalNeedsForward { events, receipts } => {
+                let result = async {
+                    for event in events {
+                        message_sink.send_event(event).await?;
+                    }
+                    receipts.acknowledge()?;
+                    Ok(Vec::new())
+                }
+                .await;
+                crate::broker::ForegroundSignal::PlanTerminalPublished(result)
+            }
+            signal => signal,
+        };
+        let action = {
+            let publication_sink = transaction.publication_sink()?;
+            let mut broker = controller.broker.lock().await;
+            broker.with_publication_sink(&publication_sink, |broker| {
+                match broker.step_foreground(&mut transaction, signal) {
+                    Ok(action) => Ok(action),
+                    Err(error) => broker.fail_foreground_dispatch(&mut transaction, error),
+                }
+            })?
+        };
+        if completed_publication {
+            publication_active = false;
+            if let Some(job) = publications.pop_front() {
+                publication_active = true;
+                jobs.spawn(run_foreground_job(job, true));
+            }
+        }
+        match action {
+            crate::broker::ForegroundAction::Wait => {}
+            crate::broker::ForegroundAction::WaitForPublicationDrain => {
+                publication_drain_requested = true;
+            }
+            crate::broker::ForegroundAction::Effect(job) => {
+                if jobs.len() + publications.len() >= forge_protocol::MAX_PENDING_FRAMES {
+                    deferred_failure = Some(
+                        crate::provider::ProviderError::Observation(
+                            forge_provider_api::lifecycle::ObservationFailure::Overflow,
+                        )
+                        .into(),
+                    );
+                    continue;
+                }
+                let publication = job.is_publication();
+                if publication && publication_active {
+                    publications.push_back(job);
+                } else {
+                    publication_active |= publication;
+                    jobs.spawn(run_foreground_job(job, publication));
+                }
+            }
+            crate::broker::ForegroundAction::CancelJobsAndEffect(job) => {
+                publication_drain_requested = false;
+                let publication = job.is_publication();
+                if publication && publication_active {
+                    publications.push_back(job);
+                } else {
+                    publication_active |= publication;
+                    jobs.spawn(run_foreground_job(job, publication));
+                }
+            }
+            crate::broker::ForegroundAction::Finish => {
+                anyhow::ensure!(
+                    jobs.is_empty() && publications.is_empty(),
+                    "foreground settlement still has pending effects"
+                );
+                return controller
+                    .broker
+                    .lock()
+                    .await
+                    .finish_foreground(transaction);
+            }
+            crate::broker::ForegroundAction::FinishFailure(error) => {
+                anyhow::ensure!(
+                    jobs.is_empty() && publications.is_empty(),
+                    "foreground failure still has pending effects"
+                );
+                return Err(error);
+            }
+        }
+    }
+}
+
+/// Preserve the publication lane even when an owned effect panics.
+async fn run_foreground_job(
+    job: crate::broker::ForegroundJob,
+    publication: bool,
+) -> (bool, Result<crate::broker::ForegroundSignal>) {
+    use futures_util::FutureExt;
+    let result = std::panic::AssertUnwindSafe(job.run()).catch_unwind().await;
+    (
+        publication,
+        result.unwrap_or_else(|_| Err(anyhow::anyhow!("foreground effect task panicked"))),
+    )
 }
 
 async fn quiesce_children(controller: &SessionController) -> Result<crate::agent::AgentQuiescence> {
@@ -3764,6 +5405,33 @@ async fn quiesce_children(controller: &SessionController) -> Result<crate::agent
     .await
     .context("children did not release execution ownership within 35 seconds")??;
     Ok(quiescence)
+}
+
+async fn request_foreground_native_cancel(
+    controller: &SessionController,
+    session_id: &str,
+    restore_prompt: bool,
+) -> Result<()> {
+    if *controller.cancellation.subscribe().borrow() {
+        return Ok(());
+    }
+    controller
+        .cancellation
+        .request_native_cancel(restore_prompt);
+    let owner = crate::provider::ExecutionOwner::root(session_id);
+    controller.permission.cancel_owner(&owner, None).await?;
+    let provider = controller.provider_handle();
+    match tokio::time::timeout(Duration::from_secs(15), provider.cancel_session(session_id)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            controller.cancellation.request(restore_prompt);
+            Err(error.context("native cancellation failed"))
+        }
+        Err(_) => {
+            controller.cancellation.request(restore_prompt);
+            anyhow::bail!("native cancellation exceeded 15 seconds")
+        }
+    }
 }
 
 async fn route_control_request(
@@ -3997,11 +5665,18 @@ async fn route_control_request(
             .await?;
         return Ok(true);
     }
-    let _control = if matches!(
+    let _control = if matches!(method, RuntimeMethod::SessionTurnCancel) {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                Arc::clone(&controller.coordinator.control).acquire_owned(),
+            )
+            .await
+            .context("timed out waiting for session cancellation control")??,
+        )
+    } else if matches!(
         method,
-        RuntimeMethod::SessionTurnCancel
-            | RuntimeMethod::SessionTurnRestart
-            | RuntimeMethod::SettingsMcpSetEnabled
+        RuntimeMethod::SessionTurnRestart | RuntimeMethod::SettingsMcpSetEnabled
     ) {
         Some(
             Arc::clone(&controller.coordinator.control)
@@ -4015,6 +5690,17 @@ async fn route_control_request(
     let response = match method {
         RuntimeMethod::SessionTurnCancel => {
             validate_root_control(request.params.get("target"))?;
+            controller.broker.lock().await.cancel_question_delivery()?;
+            let cancellation_requested = *controller.cancellation.subscribe().borrow();
+            if cancellation_requested {
+                message_sink
+                    .send_control_response(Response::success(
+                        request.id,
+                        json!({ "cancel_requested": true }),
+                    )?)
+                    .await?;
+                return Ok(true);
+            }
             {
                 let _child_quiescence = quiesce_children(controller).await?;
                 let restore_prompt = request
@@ -4022,41 +5708,31 @@ async fn route_control_request(
                     .get("restore_prompt_if_no_output")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                if let Ok(mut broker) = controller.broker.try_lock() {
-                    controller.cancellation.request(restore_prompt);
-                    let result = broker.dispatch(request.clone()).await;
-                    for event in result.event {
-                        message_sink.send_event(event).await?;
+                let update = controller.coordinator.submissions.suspend(true, None)?;
+                controller.publish_input(update, message_sink).await?;
+                match Arc::clone(&controller.coordinator.execution).try_acquire_owned() {
+                    Ok(_idle_owner) => {
+                        let mut broker = controller.broker.lock().await;
+                        controller.cancellation.request(restore_prompt);
+                        let result = broker.dispatch(request.clone()).await;
+                        for event in result.event {
+                            message_sink.send_event(event).await?;
+                        }
+                        message_sink.send_control_response(result.response).await?;
+                        return Ok(true);
                     }
-                    message_sink.send_control_response(result.response).await?;
-                    return Ok(true);
+                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                        request_foreground_native_cancel(
+                            controller,
+                            &catalog_request.harness_session_id,
+                            restore_prompt,
+                        )
+                        .await?;
+                    }
+                    Err(tokio::sync::TryAcquireError::Closed) => {
+                        anyhow::bail!("session execution admission is closed");
+                    }
                 }
-                controller
-                    .cancellation
-                    .begin_cleanup(false, restore_prompt)?;
-                let approval_owner = crate::provider::ExecutionOwner::root(
-                    &controller.catalog_request.read().await.harness_session_id,
-                );
-                controller
-                    .permission
-                    .cancel_owner(&approval_owner, None)
-                    .await?;
-                let cleanup = controller
-                    .provider
-                    .cleanup_execution(&catalog_request.harness_session_id)
-                    .await;
-                if let Err(error) = cleanup {
-                    controller.cancellation.fail_cleanup(&error);
-                    return Err(error);
-                }
-                controller.cancellation.request(restore_prompt);
-                let approval_owner = crate::provider::ExecutionOwner::root(
-                    &controller.catalog_request.read().await.harness_session_id,
-                );
-                controller
-                    .permission
-                    .cancel_owner(&approval_owner, None)
-                    .await?;
             }
             Some(Response::success(
                 request.id,
@@ -4074,7 +5750,7 @@ async fn route_control_request(
                 .cancel_owner(&approval_owner, None)
                 .await?;
             if let Err(error) = controller
-                .provider
+                .provider_handle()
                 .cleanup_execution(&catalog_request.harness_session_id)
                 .await
             {
@@ -4107,7 +5783,7 @@ async fn route_control_request(
                 crate::attachment::resolve_input(&controller.data_root, &request.params).await?;
             let input = crate::provider::ProviderInput::from_text(text.clone())
                 .with_attachments(attachments.clone());
-            let provider = controller.provider.descriptor().kind;
+            let provider = controller.provider_handle().descriptor().kind;
             let submission_catalog = catalog_request.clone();
             let submission = controller
                 .submission_store
@@ -4124,8 +5800,10 @@ async fn route_control_request(
                 controller.parent_input.steer(input).await?;
             } else {
                 controller
-                    .provider
-                    .steer_session(&catalog_request.harness_session_id, input)
+                    .steer_retained(
+                        crate::provider::ExecutionOwner::root(&catalog_request.harness_session_id),
+                        input,
+                    )
                     .await?;
             }
             Some(Response::success(
@@ -4158,7 +5836,9 @@ async fn route_control_request(
             request.id,
             tokio::time::timeout(
                 Duration::from_secs(30),
-                controller.provider.skill_list(catalog_request.clone()),
+                controller
+                    .provider_handle()
+                    .skill_list(catalog_request.clone()),
             )
             .await
             .context("skill discovery exceeded 30 seconds")??,
@@ -4179,7 +5859,7 @@ async fn route_control_request(
             }
             let server_list = discovery
                 .1
-                .snapshot(controller.provider.clone(), catalog_request.clone())
+                .snapshot(controller.provider_handle(), catalog_request.clone())
                 .await?;
             Some(Response::success(request.id, server_list)?)
         }
@@ -4232,6 +5912,42 @@ mod tests {
         ProviderRequest, TextGeneration,
     };
     use forge_diff::cache::CacheLimits;
+
+    #[tokio::test]
+    async fn retained_compaction_outlives_dropped_waiter_and_joins() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
+        let controller = SessionController::new(broker)?;
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let waiter = controller
+            .retain_compaction(async move {
+                let _ = started.send(());
+                release_rx.await.context("compaction release disappeared")?;
+                Ok(())
+            })
+            .await?;
+        drop(waiter);
+        started_rx.await?;
+        let mut shutdown = Box::pin(controller.finish_compactions());
+        assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
+        release
+            .send(())
+            .map_err(|_| anyhow::anyhow!("compaction task disappeared"))?;
+        tokio::time::timeout(Duration::from_secs(2), shutdown).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_compaction_failure_remains_visible_across_shutdown_retries() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
+        let controller = SessionController::new(broker)?;
+        controller.record_compaction_failure("terminal delivery failed".into())?;
+        assert!(controller.finish_compactions().await.is_err());
+        assert!(controller.finish_compactions().await.is_err());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn lsp_callbacks_enforce_session_and_request_ownership() -> Result<()> {
@@ -4699,6 +6415,7 @@ mod tests {
     #[tokio::test]
     async fn isolated_generation_uses_configured_model_without_a_conversation() -> Result<()> {
         let provider = GenerationProvider {
+            fixture_events: Default::default(),
             request: std::sync::Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
             fail: false,
@@ -4743,6 +6460,7 @@ mod tests {
             }
         }
         let unsupported = SteeringProvider {
+            fixture_events: Default::default(),
             request: Mutex::new(Vec::new()),
         };
         let error = generate_isolated_text(
@@ -4762,6 +6480,7 @@ mod tests {
         );
         assert!(diagnostic.contains("text_generation"), "{diagnostic}");
         let failing = GenerationProvider {
+            fixture_events: Default::default(),
             request: std::sync::Mutex::new(Vec::new()),
             shutdown: AtomicBool::new(false),
             fail: true,
@@ -4839,6 +6558,7 @@ mod tests {
 
     #[derive(Default)]
     struct TerminalInventoryProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         started: Notify,
         release: Notify,
         calls: AtomicU64,
@@ -4866,13 +6586,34 @@ mod tests {
             self.release.notified().await;
             anyhow::bail!("connection closed")
         }
-        async fn prompt_stream(
+
+        async fn session_events(
             &self,
-            _: ProviderRequest,
-            _: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            Err(anyhow::anyhow!("terminal fixture cannot prompt").into())
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
         }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
         async fn shutdown(&self) -> Result<()> {
             Ok(())
         }
@@ -4885,8 +6626,21 @@ mod tests {
         async fn has_active_turn(&self, _: &str) -> bool {
             false
         }
-        async fn active_session_id_for(&self, _: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _: &str,
+        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
+        }
+    }
+
+    impl TerminalInventoryProvider {
+        async fn run_native(
+            &self,
+            _: ProviderRequest,
+            _: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
+            Err(anyhow::anyhow!("terminal fixture cannot prompt").into())
         }
     }
 
@@ -4899,14 +6653,14 @@ mod tests {
             .open_session(1, initialize(&fixture, "mock"))
             .await?;
         let registry = service.registry().await?;
-        let mut controller = registry
+        let controller = registry
             .controller_by_id
             .write()
             .await
             .remove(registry.initial_session_id())
             .unwrap();
         let provider = Arc::new(TerminalInventoryProvider::default());
-        Arc::get_mut(&mut controller).unwrap().provider = provider.clone();
+        *controller.provider.write().unwrap() = provider.clone();
         registry
             .controller_by_id
             .write()
@@ -4970,6 +6724,7 @@ mod tests {
     }
 
     struct GenerationProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         request: std::sync::Mutex<Vec<GenerationCall>>,
         shutdown: AtomicBool,
         fail: bool,
@@ -5003,13 +6758,34 @@ mod tests {
                 capability: Default::default(),
             }
         }
-        async fn prompt_stream(
+
+        async fn session_events(
             &self,
-            _: ProviderRequest,
-            _: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            Err(anyhow::anyhow!("isolated generation must not submit a conversational turn").into())
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
         }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+
         async fn shutdown(&self) -> Result<()> {
             self.shutdown.store(true, Ordering::Release);
             Ok(())
@@ -5023,8 +6799,21 @@ mod tests {
         async fn has_active_turn(&self, _: &str) -> bool {
             false
         }
-        async fn active_session_id_for(&self, _: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _: &str,
+        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
+        }
+    }
+
+    impl GenerationProvider {
+        async fn run_native(
+            &self,
+            _: ProviderRequest,
+            _: ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
+            Err(anyhow::anyhow!("isolated generation must not submit a conversational turn").into())
         }
     }
 
@@ -5937,6 +7726,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configuration_dispatch_keeps_owned_phase_state_bounded() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let session_id = opened.result().context("session missing")?["session"]["id"]
+            .as_str()
+            .context("session identity missing")?
+            .to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        let action = json!({"action":"configure","config":{"model":"fixture"}});
+        let dispatch = || dispatch_owned_configuration(&controller, &session_id, &action, &sink);
+        let bytes = crate::trace::future_bytes(&dispatch);
+        assert!(
+            bytes <= 32 * 1024,
+            "configuration dispatcher retains {bytes} inline bytes"
+        );
+        service.shutdown(Duration::from_secs(5)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn pending_configuration_patches_execute_without_losing_fields() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let service = service();
@@ -6317,28 +8131,50 @@ mod tests {
             .as_str()
             .context("missing hold ID")?
             .to_owned();
-        let provider = controller.provider.clone();
+        let registry = controller.broker.lock().await.execution_registry();
+        let engine = registry
+            .owner(crate::provider::ExecutionOwner::root(&session_id))
+            .await?;
+        let submissions = controller.submission_store.clone();
         let prompt_session = session_id.clone();
         let prompt = tokio::spawn(async move {
-            provider
-                .prompt(crate::provider::ProviderRequest {
-                    execution_owner: None,
-                    harness_session_id: prompt_session,
-                    workspace: ".".into(),
-                    input: crate::provider::ProviderInput::from_text("held prompt"),
-                    mode: crate::provider::PromptMode::Chat,
-                    model: "mock-model".into(),
-                    effort: "low".into(),
-                    context_window: None,
-                    service_tier: Default::default(),
-                    access: Default::default(),
-                    approval_mode: crate::session::ApprovalMode::Ask,
-                    provider_session_id: None,
-                    submission: None,
-                    recovered_input: Vec::new(),
-                    control_context: None,
-                })
-                .await
+            let request = crate::provider::ProviderRequest {
+                execution_owner: None,
+                harness_session_id: prompt_session,
+                workspace: ".".into(),
+                input: crate::provider::ProviderInput::from_text("held prompt"),
+                mode: crate::provider::PromptMode::Chat,
+                model: "mock-model".into(),
+                effort: "low".into(),
+                context_window: None,
+                service_tier: Default::default(),
+                access: Default::default(),
+                approval_mode: crate::session::ApprovalMode::Ask,
+                provider_session_id: None,
+                submission: None,
+                recovered_input: Vec::new(),
+                control_context: None,
+            };
+            let scope =
+                crate::provider::InvocationScope::new(request.owner()?, "mock-response-controls");
+            let (sink, mut stream) = crate::provider::events::channel(scope);
+            let execution = engine.run_once(request, sink, &submissions);
+            tokio::pin!(execution);
+            let mut event = Vec::new();
+            let mut open = true;
+            let completion = loop {
+                tokio::select! {
+                    result = &mut execution => break result?,
+                    observed = stream.recv(), if open => match observed? {
+                        Some(observed) => event.push(observed),
+                        None => open = false,
+                    },
+                }
+            };
+            while let Some(observed) = stream.try_next()? {
+                event.push(observed);
+            }
+            Ok::<_, anyhow::Error>(crate::provider::ProviderOutput { event, completion })
         });
         for (request_id, operation) in [(3, "wait"), (4, "release")] {
             tokio::time::timeout(
@@ -6399,7 +8235,8 @@ mod tests {
             .to_owned();
         let registry = service.registry().await?;
         let controller = registry.resolve(&session_id).await?;
-        let control = controller.provider.mock_response_control().unwrap();
+        let mock_provider = controller.provider_handle();
+        let control = mock_provider.mock_response_control().unwrap();
         let held = control
             .dispatch(
                 &session_id,
@@ -6680,21 +8517,28 @@ mod tests {
             .to_owned();
         let registry = service.registry().await.unwrap();
         let controller = registry.resolve(&session_id).await.unwrap();
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        // Bootstrap the session listener before holding the state lock that supplies its registry.
+        controller.attach_session_events(&sink).await.unwrap();
         let broker = controller.broker.lock().await;
         let discovery = controller.mcp_discovery.lock().await;
-        let (sink, mut output) = forge_protocol::outbound::channel();
         let configuring = service.dispatch(Some(session_id.clone()), Request {
             id: 2, method: "session.command.apply".into(),
             params: json!({"operation_id":"configure-responsive","action":"configure","config":{"effort":"low"}}),
         }, &sink);
         tokio::pin!(configuring);
         tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::select! {
-                result = &mut configuring => panic!("configuration completed before its owner released: {result:?}"),
-                frame = output.recv() => {
-                    let frame = frame.unwrap().unwrap();
-                    let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
-                    assert_eq!(value["result"]["state"], "accepted", "{value}");
+            loop {
+                tokio::select! {
+                    result = &mut configuring => panic!("configuration completed before its owner released: {result:?}"),
+                    frame = output.recv() => {
+                        let frame = frame.unwrap().unwrap();
+                        let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
+                        if value["id"] == 2 {
+                            assert_eq!(value["result"]["state"], "accepted", "{value}");
+                            break;
+                        }
+                    }
                 }
             }
         }).await.expect("configuration acknowledgement waited for MCP discovery");
@@ -6961,6 +8805,7 @@ mod tests {
     }
 
     struct SteeringProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         request: Mutex<Vec<(String, String)>>,
     }
 
@@ -6983,8 +8828,11 @@ mod tests {
             false
         }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
-            None
+        async fn active_session_id_for(
+            &self,
+            _session_id: &str,
+        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(None)
         }
 
         fn descriptor(&self) -> crate::provider::ProviderDescriptor {
@@ -6995,24 +8843,56 @@ mod tests {
             }
         }
 
-        async fn prompt_stream(
+        async fn session_events(
             &self,
-            _: crate::provider::ProviderRequest,
-            _: crate::provider::ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            Err(anyhow::anyhow!("steering must not start another provider request").into())
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
         }
 
-        async fn steer_session(
-            &self,
-            session_id: &str,
-            input: crate::provider::SteeringInput,
-        ) -> Result<()> {
-            self.request
-                .lock()
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
                 .await
-                .push((session_id.into(), input.text().to_owned()));
-            Ok(())
+        }
+
+        async fn session_steer(
+            self: std::sync::Arc<Self>,
+            owner: &crate::provider::ExecutionOwner,
+            scope: crate::provider::InvocationScope,
+            input: crate::provider::SteeringInput,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            if scope.owner != *owner {
+                return Err(crate::provider::ProviderError::Rejected {
+                    message: "steering crosses owner".into(),
+                });
+            }
+            let events = self.fixture_events.clone();
+            if !events.running(&scope).await? {
+                let request = events.continuation(&scope, input)?;
+                return self.session_prompt(request, scope).await;
+            }
+            events
+                .steer(&scope, input, |input| async move {
+                    self.steer_native(&owner.runtime_key(), input)
+                        .await
+                        .map_err(crate::provider::ProviderError::from)
+                })
+                .await
         }
 
         async fn stop_goal_session(&self, session_id: &str, clear: bool) -> Result<()> {
@@ -7025,6 +8905,30 @@ mod tests {
                 },
             ));
             Ok(())
+        }
+    }
+
+    impl SteeringProvider {
+        async fn steer_native(
+            &self,
+            session_id: &str,
+            input: crate::provider::SteeringInput,
+        ) -> Result<()> {
+            self.request
+                .lock()
+                .await
+                .push((session_id.into(), input.text().to_owned()));
+            Ok(())
+        }
+    }
+
+    impl SteeringProvider {
+        async fn run_native(
+            &self,
+            _: crate::provider::ProviderRequest,
+            _: crate::provider::ProviderEventSink,
+        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
+            Err(anyhow::anyhow!("steering must not start another provider request").into())
         }
     }
 
@@ -7698,6 +9602,7 @@ mod tests {
     }
 
     struct CheckCleanupProvider {
+        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
         started: tokio::sync::Notify,
         release: tokio::sync::Notify,
         completed: AtomicBool,
@@ -7721,8 +9626,11 @@ mod tests {
         async fn has_active_turn(&self, _: &str) -> bool {
             !self.completed.load(Ordering::Acquire)
         }
-        async fn active_session_id_for(&self, _: &str) -> Option<String> {
-            Some("old-provider-turn".into())
+        async fn active_session_id_for(
+            &self,
+            _: &str,
+        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+            Ok(Some("old-provider-turn".to_owned().try_into()?))
         }
         fn descriptor(&self) -> crate::provider::ProviderDescriptor {
             crate::provider::ProviderDescriptor {
@@ -7731,7 +9639,37 @@ mod tests {
                 capability: Default::default(),
             }
         }
-        async fn prompt_stream(
+
+        async fn session_events(
+            &self,
+            owner: crate::provider::ExecutionOwner,
+        ) -> std::result::Result<
+            crate::provider::events::ProviderEventStream,
+            crate::provider::ProviderError,
+        > {
+            let stream = self.fixture_events.subscribe(owner.clone())?;
+            Ok(stream)
+        }
+
+        async fn session_prompt(
+            self: std::sync::Arc<Self>,
+            request: crate::provider::ProviderRequest,
+            scope: crate::provider::InvocationScope,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let events = self.fixture_events.clone();
+            events
+                .submit(
+                    request,
+                    scope,
+                    crate::provider::TerminalBoundary::LocalFixture,
+                    move |request, sink| async move { self.run_native(request, sink).await },
+                )
+                .await
+        }
+    }
+
+    impl CheckCleanupProvider {
+        async fn run_native(
             &self,
             _: crate::provider::ProviderRequest,
             _: crate::provider::ProviderEventSink,
@@ -7759,18 +9697,19 @@ mod tests {
                     .is_none()
             );
             let registry = service.registry().await?;
-            let mut controller = registry
+            let controller = registry
                 .controller_by_id
                 .write()
                 .await
                 .remove(registry.initial_session_id())
                 .unwrap();
             let provider = Arc::new(CheckCleanupProvider {
+                fixture_events: Default::default(),
                 started: tokio::sync::Notify::new(),
                 release: tokio::sync::Notify::new(),
                 completed: AtomicBool::new(false),
             });
-            Arc::get_mut(&mut controller).unwrap().provider = provider.clone();
+            *controller.provider.write().unwrap() = provider.clone();
             registry
                 .controller_by_id
                 .write()
@@ -7906,11 +9845,12 @@ mod tests {
     async fn configuration_waits_for_maintenance_without_provider_cleanup() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
-        let mut controller = SessionController::new(broker).unwrap();
+        let controller = SessionController::new(broker).unwrap();
         let provider = Arc::new(SteeringProvider {
+            fixture_events: Default::default(),
             request: Mutex::new(Vec::new()),
         });
-        Arc::get_mut(&mut controller).unwrap().provider = provider.clone();
+        *controller.provider.write().unwrap() = provider.clone();
         for method in [RuntimeMethod::SessionConfigure] {
             let maintenance = controller.broker.lock().await;
             let mut acquisition = Box::pin(acquire_request_broker(&controller, method));
@@ -8154,11 +10094,12 @@ mod tests {
     async fn task_state_controls_never_wait_for_provider_or_broker() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
-        let mut controller = SessionController::new(broker)?;
+        let controller = SessionController::new(broker)?;
         let provider = Arc::new(SteeringProvider {
+            fixture_events: Default::default(),
             request: Mutex::new(Vec::new()),
         });
-        Arc::get_mut(&mut controller).unwrap().provider = provider.clone();
+        *controller.provider.write().unwrap() = provider.clone();
         let session_id = controller.observer.session_id().to_owned();
         let mut store = SqliteStore::open(&controller.data_root)?;
         let (sink, mut output) = forge_protocol::outbound::channel();
@@ -8514,6 +10455,502 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_reopen_applies_retained_question_effect() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let registry = service.registry().await?;
+        let controller = registry.resolve(registry.initial_session_id()).await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed_output = observed.clone();
+        let reader = tokio::spawn(async move {
+            while let Some(frame) = output.recv().await? {
+                let message: Value = serde_json::from_slice(frame.bytes())?;
+                observed_output.lock().unwrap().push(message);
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        controller.attach_session_events(&sink).await?;
+        let (scope, engine) = {
+            let mut broker = controller.broker.lock().await;
+            let result = broker
+                .dispatch(Request {
+                    id: 2,
+                    method: "session.prompt.submit".into(),
+                    params: json!({"text":"hello"}),
+                })
+                .await;
+            anyhow::ensure!(
+                result.response.error().is_none(),
+                "initial prompt failed: {:?}",
+                result.response.error()
+            );
+            broker.retained_idle_test_owner()?
+        };
+        engine
+            .publish_idle_test_effect(
+                scope.clone(),
+                crate::provider::ProviderCompletion {
+                    plan_question: Some(crate::plan::PlanQuestionSet {
+                        id: "idle-question".into(),
+                        questions: vec![crate::plan::PlanQuestion {
+                            id: "idle-choice".into(),
+                            header: "Choice".into(),
+                            question: "Which route?".into(),
+                            options: Vec::new(),
+                            allow_freeform: true,
+                        }],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        engine
+            .steer(
+                scope.clone(),
+                crate::provider::SteeringInput::AgentResult("continue".into()),
+            )
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let broker = controller.broker.lock().await;
+                let committed = broker.retained_idle_test_question(&scope, "idle-question")?;
+                let published = observed
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|message| {
+                        message["event"] == "question"
+                            && message["payload"]["exchange_id"] == scope.exchange_id.as_str()
+                            && message
+                                .pointer("/payload/elicitation/question_set/id")
+                                .and_then(Value::as_str)
+                                == Some("idle-question")
+                    })
+                    .count();
+                anyhow::ensure!(published <= 1, "idle question was published more than once");
+                if committed && published == 1 {
+                    broker.retained_idle_test_next_admission()?;
+                    return Ok::<(), anyhow::Error>(());
+                }
+                drop(broker);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "idle question effect was not applied; observations: {:?}",
+                observed.lock().unwrap()
+            )
+        })??;
+        service.shutdown(Duration::from_secs(5)).await?;
+        drop(sink);
+        reader.await??;
+        Ok(())
+    }
+
+    /// An unlocked broker does not mean its foreground owner has settled.
+    #[tokio::test]
+    async fn active_cancel_collects_native_terminal_and_preserves_queued_input() -> Result<()> {
+        use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
+        use crate::provider::mock_response::MockResponseCommand;
+        for (method, params) in [
+            ("session.turn.cancel", json!({})),
+            (
+                "session.command.apply",
+                json!({"operation_id":"pause-at-approval", "action":"pause"}),
+            ),
+        ] {
+            let fixture = tempfile::tempdir()?;
+            let service = service();
+            service
+                .open_session(1, initialize(&fixture, "mock"))
+                .await?;
+            let registry = service.registry().await?;
+            let session_id = registry.initial_session_id().to_owned();
+            let controller = registry.resolve(&session_id).await?;
+            let provider = controller.provider_handle();
+            let control = provider.mock_response_control().unwrap();
+            let hold = control
+                .dispatch(
+                    &session_id,
+                    MockResponseCommand::Hold {
+                        mode: None,
+                        any_session: false,
+                    },
+                )
+                .await?;
+            let (sink, mut output) = forge_protocol::outbound::channel();
+            let responses = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let seen = responses.clone();
+            let reader = tokio::spawn(async move {
+                while let Some(frame) = output.recv().await? {
+                    seen.lock()
+                        .unwrap()
+                        .push(serde_json::from_slice(frame.bytes())?);
+                }
+                Ok::<(), anyhow::Error>(())
+            });
+            controller.attach_input(&sink).await?;
+            let submit = |id: &str, intent: InputIntent| InputOperation {
+                id: format!("op-{id}"),
+                control_revision: 0,
+                after_control: None,
+                action: InputAction::Submit {
+                    message: Box::new(InputMessage {
+                        id: id.into(),
+                        revision: 0,
+                        text: id.into(),
+                        purpose: crate::input::InputPurpose::User,
+                        intent,
+                        delivery: Default::default(),
+                        route: None,
+                        attachments: vec![],
+                        config: None,
+                        reservation: None,
+                        submission_id: None,
+                        error: None,
+                    }),
+                },
+            };
+            controller
+                .coordinator
+                .submissions
+                .apply(submit("active", InputIntent::Auto))?;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                control.dispatch(
+                    &session_id,
+                    MockResponseCommand::Wait {
+                        id: hold["id"].as_str().unwrap().into(),
+                    },
+                ),
+            )
+            .await??;
+            controller
+                .coordinator
+                .submissions
+                .apply(submit("queued", InputIntent::Queue))?;
+            assert!(
+                controller.broker.try_lock().is_ok(),
+                "fixture must exercise an unlocked broker"
+            );
+            let question_ids = controller.questions.ask(
+                "active-cancel-questions",
+                &SqliteStore::read_only(&controller.data_root)?
+                    .latest_exchange(&session_id)?
+                    .context("active exchange is missing")?
+                    .id,
+                crate::question::QuestionOrigin::Tool(None),
+                [
+                    crate::question::QuestionRequirement::Required,
+                    crate::question::QuestionRequirement::Optional,
+                ]
+                .into_iter()
+                .map(|requirement| crate::question::QuestionDraft {
+                    header: "Layout".into(),
+                    question: "Which layout?".into(),
+                    requirement,
+                    options: Vec::new(),
+                })
+                .collect(),
+            )?;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                service.dispatch(
+                    Some(session_id.clone()),
+                    Request {
+                        id: 23,
+                        method: method.into(),
+                        params,
+                    },
+                    &sink,
+                ),
+            )
+            .await??;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while controller.coordinator.execution.available_permits() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(response) = responses
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|value| value["id"] == 23)
+                        .cloned()
+                    {
+                        anyhow::ensure!(
+                            response.get("error").is_none(),
+                            "cancel RPC failed: {response}"
+                        );
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await??;
+            let store = SqliteStore::open(&controller.data_root)?;
+            let exchanges = store.list_exchange(&session_id)?;
+            assert_eq!(exchanges.len(), 1);
+            assert_eq!(
+                exchanges[0].state(),
+                crate::exchange::ExchangeState::Cancelled
+            );
+            assert!(matches!(
+                controller.questions.snapshot()?.questions[0].resolution,
+                crate::question::QuestionResolution::Retired { .. }
+            ));
+            assert!(
+                controller
+                    .questions
+                    .apply(crate::question::QuestionCommand {
+                        operation_id: "required-after-cancel".into(),
+                        question_id: question_ids[0].clone(),
+                        revision: 1,
+                        action: crate::question::QuestionAction::Answer {
+                            answer: crate::question::QuestionAnswer::Other {
+                                text: "Tabs".into()
+                            }
+                        },
+                    })
+                    .is_err()
+            );
+            controller
+                .questions
+                .apply(crate::question::QuestionCommand {
+                    operation_id: "optional-after-cancel".into(),
+                    question_id: question_ids[1].clone(),
+                    revision: 1,
+                    action: crate::question::QuestionAction::Answer {
+                        answer: crate::question::QuestionAnswer::Other {
+                            text: "Tabs".into(),
+                        },
+                    },
+                })?;
+            controller.relay_questions(&sink).await?;
+            assert!(controller.questions.outbox()?.is_empty());
+            assert!(
+                !controller.task_input_is_current(&crate::input::InputPurpose::Question {
+                    question_id: question_ids[1].clone(),
+                    task_id: None,
+                    message_kind: crate::question::QuestionMessageKind::Answer,
+                })?
+            );
+            assert_eq!(
+                SqliteStore::read_only(&controller.data_root)?
+                    .list_exchange(&session_id)?
+                    .len(),
+                1,
+                "late answer dispatched a new exchange"
+            );
+            assert!(controller.coordinator.submissions.snapshot()?.suspended);
+            assert!(
+                controller
+                    .coordinator
+                    .submissions
+                    .snapshot()?
+                    .messages
+                    .iter()
+                    .any(|message| message.id == "queued")
+            );
+            assert!(!controller.observer.session_events().is_closed());
+            service.shutdown(Duration::from_secs(5)).await?;
+            drop(sink);
+            reader.await??;
+        }
+        Ok(())
+    }
+
+    /// Pause and the following UI cancel share one native cancellation.
+    #[tokio::test]
+    async fn planning_pause_then_cancel_preserves_terminal_and_queued_input() -> Result<()> {
+        use crate::input::{InputAction, InputIntent, InputMessage, InputOperation};
+        use crate::provider::mock_response::MockResponseCommand;
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let registry = service.registry().await?;
+        let session_id = registry.initial_session_id().to_owned();
+        let controller = registry.resolve(&session_id).await?;
+        let provider = controller.provider_handle();
+        let control = provider.mock_response_control().unwrap();
+        let hold = control
+            .dispatch(
+                &session_id,
+                MockResponseCommand::Hold {
+                    mode: None,
+                    any_session: false,
+                },
+            )
+            .await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let responses = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let seen = responses.clone();
+        let reader = tokio::spawn(async move {
+            while let Some(frame) = output.recv().await? {
+                seen.lock()
+                    .unwrap()
+                    .push(serde_json::from_slice(frame.bytes())?);
+            }
+            Ok::<(), anyhow::Error>(())
+        });
+        controller.attach_input(&sink).await?;
+        let submit = |id: &str, intent: InputIntent| InputOperation {
+            id: format!("op-{id}"),
+            control_revision: 0,
+            after_control: None,
+            action: InputAction::Submit {
+                message: Box::new(InputMessage {
+                    id: id.into(),
+                    revision: 0,
+                    text: id.into(),
+                    purpose: crate::input::InputPurpose::User,
+                    intent,
+                    delivery: Default::default(),
+                    route: None,
+                    attachments: vec![],
+                    config: None,
+                    reservation: None,
+                    submission_id: None,
+                    error: None,
+                }),
+            },
+        };
+        service.dispatch(
+            Some(session_id.clone()),
+            Request {
+                id: 22,
+                method: "session.command.apply".into(),
+                params: json!({"operation_id":"plan", "action":"plan", "text":"Inspect the project"}),
+            },
+            &sink,
+        ).await?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            control.dispatch(
+                &session_id,
+                MockResponseCommand::Wait {
+                    id: hold["id"].as_str().unwrap().into(),
+                },
+            ),
+        )
+        .await??;
+        controller
+            .coordinator
+            .submissions
+            .apply(submit("queued", InputIntent::Queue))?;
+        assert!(
+            controller.broker.try_lock().is_ok(),
+            "fixture must exercise an unlocked broker"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            service.dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 24,
+                    method: "session.command.apply".into(),
+                    params: json!({"operation_id":"pause", "action":"pause"}),
+                },
+                &sink,
+            ),
+        )
+        .await??;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            service.dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 23,
+                    method: "session.turn.cancel".into(),
+                    params: json!({}),
+                },
+                &sink,
+            ),
+        )
+        .await??;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while controller.coordinator.execution.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(response) = responses
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|value| value["id"] == 23)
+                    .cloned()
+                {
+                    anyhow::ensure!(
+                        response.get("error").is_none(),
+                        "cancel RPC failed: {response}"
+                    );
+                    break Ok::<(), anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        for id in [22, 24] {
+            let response = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let response = responses
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|value| value["id"] == id)
+                        .cloned();
+                    if let Some(response) = response {
+                        break response;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .with_context(|| format!("missing command response {id}"))?;
+            anyhow::ensure!(
+                response.get("error").is_none(),
+                "command RPC failed: {response}"
+            );
+        }
+        let store = SqliteStore::open(&controller.data_root)?;
+        let exchanges = store.list_exchange(&session_id)?;
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(
+            exchanges[0].state(),
+            crate::exchange::ExchangeState::Cancelled
+        );
+        assert!(controller.coordinator.submissions.snapshot()?.suspended);
+        assert!(
+            controller
+                .coordinator
+                .submissions
+                .snapshot()?
+                .messages
+                .iter()
+                .any(|message| message.id == "queued")
+        );
+        assert!(!controller.observer.session_events().is_closed());
+        service.shutdown(Duration::from_secs(5)).await?;
+        drop(sink);
+        reader.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Result<()> {
         use crate::input::{InputAction, InputEdit, InputIntent, InputMessage, InputOperation};
         use crate::provider::mock_response::MockResponseCommand;
@@ -8525,7 +10962,8 @@ mod tests {
         let registry = service.registry().await?;
         let controller = registry.resolve(registry.initial_session_id()).await?;
         let session_id = registry.initial_session_id().to_owned();
-        let control = controller.provider.mock_response_control().unwrap();
+        let mock_provider = controller.provider_handle();
+        let control = mock_provider.mock_response_control().unwrap();
         let held = control
             .dispatch(
                 &session_id,

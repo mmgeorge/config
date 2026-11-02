@@ -65,6 +65,9 @@ async fn read_history(session: &github_copilot_sdk::session::Session) -> Result<
             .rpc()
             .event_log()
             .read(EventLogReadRequest {
+                agent_ids: None,
+                direction: None,
+                include_ephemeral: Some(false),
                 agent_scope: Some(EventsAgentScope::Primary),
                 cursor: cursor.clone(),
                 max: None,

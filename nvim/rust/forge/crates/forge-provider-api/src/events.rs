@@ -11,6 +11,7 @@ use super::{
 pub struct ProviderEventSink {
     scope: EventScope,
     sender: MessageSender,
+    failure: std::sync::Arc<std::sync::Mutex<Option<EventDeliveryError>>>,
     delivery: std::sync::Arc<tokio::sync::Mutex<()>>,
     observer: Vec<std::sync::Arc<dyn EventObserver>>,
 }
@@ -20,15 +21,19 @@ pub struct ProviderEventStream {
     pending: Option<ProviderEvent>,
     queued: Option<ProviderEvent>,
     deadline: tokio::time::Instant,
+    deferred_error: Option<EventDeliveryError>,
 }
 
 struct EventReceiver {
     receiver: MessageReceiver,
+    failure: std::sync::Arc<std::sync::Mutex<Option<EventDeliveryError>>>,
     transfer: Option<(usize, usize, usize, String)>,
 }
 
 #[derive(Clone, Debug)]
 pub enum EventDeliveryError {
+    /// Preserve a native observation failure across bounded host delivery.
+    Observation(crate::lifecycle::ObservationFailure),
     Closed {
         message: String,
     },
@@ -66,6 +71,9 @@ impl EventDeliveryError {
 impl fmt::Display for EventDeliveryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Observation(failure) => {
+                write!(formatter, "provider observation failed: {failure}")
+            }
             Self::Closed { message } => {
                 write!(formatter, "provider event delivery closed: {message}")
             }
@@ -85,25 +93,40 @@ impl fmt::Display for EventDeliveryError {
     }
 }
 
-impl std::error::Error for EventDeliveryError {}
+impl std::error::Error for EventDeliveryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Observation(failure) => Some(failure),
+            Self::Closed { .. }
+            | Self::OwnershipMismatch { .. }
+            | Self::InvalidTransportData { .. }
+            | Self::IncompleteTransfer { .. }
+            | Self::Empty => None,
+        }
+    }
+}
 
 pub fn channel(scope: impl Into<EventScope>) -> (ProviderEventSink, ProviderEventStream) {
     let (sender, receiver) = outbound::channel();
+    let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
     (
         ProviderEventSink {
             scope: scope.into(),
             sender,
+            failure: failure.clone(),
             delivery: Default::default(),
             observer: Vec::new(),
         },
         ProviderEventStream {
             input: EventReceiver {
                 receiver,
+                failure,
                 transfer: None,
             },
             pending: None,
             queued: None,
             deadline: tokio::time::Instant::now(),
+            deferred_error: None,
         },
     )
 }
@@ -132,9 +155,13 @@ impl ProviderEventSink {
         &self,
         invocation: &InvocationScope,
     ) -> Result<Self, EventDeliveryError> {
-        let received = EventScope::from(invocation.clone());
+        self.bind_scope(EventScope::from(invocation.clone()))
+    }
+
+    /// Bind an owner-wide session publisher to an original event scope.
+    pub fn bind_scope(&self, received: EventScope) -> Result<Self, EventDeliveryError> {
         if !matches!(self.scope, EventScope::SessionOperation { .. })
-            || self.scope.owner() != &invocation.owner
+            || self.scope.owner() != received.owner()
         {
             return Err(EventDeliveryError::OwnershipMismatch {
                 expected: Box::new(self.scope.clone()),
@@ -148,14 +175,21 @@ impl ProviderEventSink {
     }
 
     fn validate(&self, event: &ProviderEvent) -> Result<(), EventDeliveryError> {
+        if let Some(error) = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Err(error);
+        }
         let received = event.scope();
         if received != self.scope {
             let error = EventDeliveryError::OwnershipMismatch {
                 expected: Box::new(self.scope.clone()),
                 received: Box::new(received),
             };
-            self.sender
-                .record_failure(&io::Error::other(error.to_string()));
+            self.fail(error.clone());
             return Err(error);
         }
         Ok(())
@@ -164,14 +198,15 @@ impl ProviderEventSink {
     pub async fn send_wait(&self, event: ProviderEvent) -> Result<(), EventDeliveryError> {
         self.validate(&event)?;
         for observer in &self.observer {
-            observer.before_delivery(&event)?;
+            observer
+                .before_delivery(&event)
+                .inspect_err(|error| self.fail(error.clone()))?;
         }
         let _delivery = self.delivery.lock().await;
         let mut additional = Vec::new();
         for observer in &self.observer {
             additional.extend(observer.additional_events(&event).inspect_err(|error| {
-                self.sender
-                    .record_failure(&io::Error::other(error.to_string()));
+                self.fail(error.clone());
             })?);
         }
         self.send_encoded(event).await?;
@@ -205,13 +240,30 @@ impl ProviderEventSink {
     pub fn send(&self, event: ProviderEvent) -> Result<(), EventDeliveryError> {
         self.validate(&event)?;
         for observer in &self.observer {
-            observer.before_delivery(&event)?;
+            observer
+                .before_delivery(&event)
+                .inspect_err(|error| self.fail(error.clone()))?;
         }
         self.sender.send(event).map_err(EventDeliveryError::queue)
     }
 
+    /// Record irreversible observation loss independently of ordinary queue capacity.
+    pub fn fail(&self, error: EventDeliveryError) {
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_or_insert(error.clone());
+        self.sender
+            .record_failure(&io::Error::other(error.to_string()));
+    }
+
     pub async fn failed(&self) -> EventDeliveryError {
-        EventDeliveryError::queue(self.sender.failed().await)
+        let error = EventDeliveryError::queue(self.sender.failed().await);
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or(error)
     }
 }
 
@@ -301,14 +353,26 @@ impl EventReceiver {
         Ok(None)
     }
 
+    /// Restore the typed producer cause after the byte transport reports failure.
+    fn failure(&self, error: EventDeliveryError) -> EventDeliveryError {
+        self.failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or(error)
+    }
+
     async fn receive(&mut self) -> Result<Option<ProviderEvent>, EventDeliveryError> {
         loop {
-            match self
-                .receiver
-                .recv()
-                .await
-                .map_err(EventDeliveryError::queue)?
-            {
+            let frame = match self.receiver.try_drain() {
+                Ok(frame) => Some(frame),
+                Err(_) => self
+                    .receiver
+                    .recv()
+                    .await
+                    .map_err(|error| self.failure(EventDeliveryError::queue(error)))?,
+            };
+            match frame {
                 Some(frame) => {
                     if let Some(event) = self.accept(frame.bytes())? {
                         return Ok(Some(event));
@@ -321,13 +385,17 @@ impl EventReceiver {
 
     fn try_receive(&mut self) -> Result<ProviderEvent, EventDeliveryError> {
         loop {
-            let frame = match self.receiver.try_recv() {
+            let frame = match self.receiver.try_drain() {
                 Ok(frame) => frame,
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-                    self.closed()?;
-                    return Err(EventDeliveryError::queue(error));
+                Err(error) => {
+                    if let Err(failure) = self.receiver.check() {
+                        return Err(self.failure(EventDeliveryError::queue(failure)));
+                    }
+                    if error.kind() == io::ErrorKind::UnexpectedEof {
+                        self.closed()?;
+                    }
+                    return Err(self.failure(EventDeliveryError::queue(error)));
                 }
-                Err(error) => return Err(EventDeliveryError::queue(error)),
             };
             if let Some(event) = self.accept(frame.bytes())? {
                 return Ok(event);
@@ -349,10 +417,16 @@ impl ProviderEventStream {
         self.input
             .receiver
             .check()
-            .map_err(EventDeliveryError::queue)
+            .map_err(|error| self.input.failure(EventDeliveryError::queue(error)))
     }
 
     pub async fn recv(&mut self) -> Result<Option<ProviderEvent>, EventDeliveryError> {
+        if self.pending.is_none()
+            && self.queued.is_none()
+            && let Some(error) = self.deferred_error.take()
+        {
+            return Err(error);
+        }
         if self.pending.is_none() {
             self.pending = match self.queued.take() {
                 Some(event) => Some(event),
@@ -366,7 +440,10 @@ impl ProviderEventStream {
             }
             let event = match tokio::time::timeout_at(self.deadline, self.input.receive()).await {
                 Err(_) | Ok(Ok(None)) => break,
-                Ok(Err(error)) => return Err(error),
+                Ok(Err(error)) => {
+                    self.deferred_error = Some(error);
+                    break;
+                }
                 Ok(Ok(Some(event))) => event,
             };
             if !merge_output(pending, &event) {
@@ -378,7 +455,12 @@ impl ProviderEventStream {
     }
 
     pub fn try_recv(&mut self) -> Result<ProviderEvent, EventDeliveryError> {
-        self.check()?;
+        if self.pending.is_none()
+            && self.queued.is_none()
+            && let Some(error) = self.deferred_error.take()
+        {
+            return Err(error);
+        }
         let mut event = match self.pending.take().or_else(|| self.queued.take()) {
             Some(event) => event,
             None => self.input.try_receive()?,
@@ -387,7 +469,10 @@ impl ProviderEventStream {
             let next = match self.input.try_receive() {
                 Ok(event) => event,
                 Err(EventDeliveryError::Empty | EventDeliveryError::Closed { .. }) => break,
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.deferred_error = Some(error);
+                    break;
+                }
             };
             if !merge_output(&mut event, &next) {
                 self.queued = Some(next);
@@ -457,6 +542,22 @@ pub async fn failed(sink: Option<&ProviderEventSink>) -> EventDeliveryError {
     }
 }
 
+/// Observe host policy without coupling provider delivery to host state owners.
+pub trait EventObserver: Send + Sync {
+    /// Observe execution state before waiting for ordered delivery.
+    fn before_delivery(&self, _event: &ProviderEvent) -> Result<(), EventDeliveryError> {
+        Ok(())
+    }
+
+    /// Produce host observations immediately after the event on the same delivery channel.
+    fn additional_events(
+        &self,
+        _event: &ProviderEvent,
+    ) -> Result<Vec<ProviderEvent>, EventDeliveryError> {
+        Ok(Vec::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +581,39 @@ mod tests {
                 update: crate::RuntimeUpdate::Progress { received_bytes: 42 },
             }])
         }
+    }
+
+    /// A sticky native failure follows already accepted output and retains its classification.
+    #[tokio::test]
+    async fn queued_output_precedes_typed_observation_failure() -> anyhow::Result<()> {
+        let (sink, mut stream) = channel(scope());
+        sink.send_wait(message(
+            "answer",
+            MessageUpdate::Delta {
+                text: "accepted".into(),
+            },
+        ))
+        .await?;
+        sink.fail(EventDeliveryError::Observation(
+            crate::lifecycle::ObservationFailure::Overflow,
+        ));
+        sink.fail(EventDeliveryError::Observation(
+            crate::lifecycle::ObservationFailure::Disconnected,
+        ));
+        assert!(matches!(stream.recv().await?, Some(ProviderEvent::Message {
+            update: MessageUpdate::Delta { text }, ..
+        }) if text == "accepted"));
+        assert!(matches!(
+            stream.recv().await,
+            Err(EventDeliveryError::Observation(
+                crate::lifecycle::ObservationFailure::Overflow
+            ))
+        ));
+        assert!(matches!(
+            sink.failed().await,
+            EventDeliveryError::Observation(crate::lifecycle::ObservationFailure::Overflow)
+        ));
+        Ok(())
     }
 
     /// Preserve host observations immediately after their native event on the same channel.
@@ -725,21 +859,5 @@ mod tests {
             stream.try_recv().unwrap().message_delta(),
             Some("partial tail")
         );
-    }
-}
-
-/// Observe host policy without coupling provider delivery to host state owners.
-pub trait EventObserver: Send + Sync {
-    /// Observe execution state before waiting for ordered delivery.
-    fn before_delivery(&self, _event: &ProviderEvent) -> Result<(), EventDeliveryError> {
-        Ok(())
-    }
-
-    /// Produce host observations immediately after the event on the same delivery channel.
-    fn additional_events(
-        &self,
-        _event: &ProviderEvent,
-    ) -> Result<Vec<ProviderEvent>, EventDeliveryError> {
-        Ok(Vec::new())
     }
 }
