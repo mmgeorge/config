@@ -404,14 +404,28 @@ impl ProviderBridge {
             .control_context
             .clone()
             .unwrap_or_else(|| crate::tools::ControlTurnContext::inactive(request.mode));
-        let tools = crate::tools::ControlToolRegistry
-            .definition_list_for_context(Some(&context), scope.owner.is_root());
         let directories = self
             .permissions
             .directories(Some(&self.root), &request, &scope)
             .map_err(|error| {
                 super::lifecycle_error::classify(ProviderOperation::AdmitInput, error)
             })?;
+        if let Some(lsp) = &context.lsp {
+            let protected_path = self
+                .permissions
+                .store()
+                .read()
+                .map_err(|_| failure(ProviderOperation::AdmitInput, ProviderFailureKind::Rejected))?
+                .open()
+                .0
+                .into();
+            lsp.bind_mutation_policy(directories.policy(), protected_path)
+                .map_err(|error| {
+                    super::lifecycle_error::classify(ProviderOperation::AdmitInput, error)
+                })?;
+        }
+        let tools = crate::tools::ControlToolRegistry
+            .definition_list_for_context(Some(&context), scope.owner.is_root());
         let permissions = Arc::new(
             crate::permissions::provider::ProviderPermissionContext::new(self.permissions.clone()),
         );

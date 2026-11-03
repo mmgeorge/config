@@ -31,6 +31,7 @@ pub(crate) struct HostInvocation {
     relay: tokio::sync::Mutex<HostEventRelay>,
     skills: Mutex<Option<crate::skill::SkillExecution>>,
     skill_observer: Option<Arc<dyn forge_provider_api::events::EventObserver>>,
+    lsp: Option<Arc<crate::tools::lsp::LspScope>>,
     state: Mutex<InvocationState>,
     changed: Notify,
 }
@@ -174,6 +175,7 @@ impl HostInvocation {
             .as_ref()
             .map(crate::skill::SkillExecution::event_observer);
         let checkpoint = context.checkpoint.clone();
+        let lsp = context.lsp.clone();
         Self {
             binding,
             scope,
@@ -190,6 +192,7 @@ impl HostInvocation {
             relay: tokio::sync::Mutex::new(relay),
             skills: Mutex::new(skills),
             skill_observer,
+            lsp,
             state: Mutex::new(InvocationState::default()),
             changed: Notify::new(),
         }
@@ -235,10 +238,14 @@ impl HostInvocation {
         Vec<forge_provider_api::ProviderEvent>,
         forge_provider_api::events::EventDeliveryError,
     > {
-        self.skill_observer.as_ref().map_or_else(
+        let mut additional = self.skill_observer.as_ref().map_or_else(
             || Ok(Vec::new()),
             |observer| observer.additional_events(event),
-        )
+        )?;
+        if let Some(lsp) = &self.lsp {
+            additional.extend(lsp.observe_changes(event));
+        }
+        Ok(additional)
     }
 
     /// Collect retained callback delivery after native execution has relinquished authority.

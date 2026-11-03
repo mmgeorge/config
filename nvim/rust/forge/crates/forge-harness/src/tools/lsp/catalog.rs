@@ -1,7 +1,7 @@
 use crate::tools::ControlToolDefinition;
 /// List source-navigation tools.
 pub(in crate::tools) fn definitions() -> Vec<ControlToolDefinition> {
-    vec![
+    let mut tools = vec![
         super::overview::definition(),
         super::symbols::definition(),
         super::definition::definition(),
@@ -11,10 +11,15 @@ pub(in crate::tools) fn definitions() -> Vec<ControlToolDefinition> {
         super::paths::definition(),
         super::diagnostics::definition(),
         super::status::definition(),
-    ]
+    ];
+    tools.extend(super::rename::definitions());
+    tools
 }
 /// Identify a source-navigation tool.
 pub(crate) fn is_tool(name: &str) -> bool {
+    if super::rename::is_mutation(name) {
+        return true;
+    }
     [
         super::overview::NAME,
         super::symbols::NAME,
@@ -35,6 +40,9 @@ pub(in crate::tools) async fn execute(
     invocation: crate::tools::ControlToolInvocation,
     output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
+    if super::rename::is_mutation(&invocation.name) {
+        return Box::pin(super::rename::execute(runtime, invocation)).await;
+    }
     match invocation.name.as_str() {
         super::overview::NAME => super::overview::execute(runtime, invocation, output).await,
         super::symbols::NAME => super::symbols::execute(runtime, invocation, output).await,

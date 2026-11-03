@@ -976,11 +976,7 @@ impl PermissionCoordinator {
                 .into_values()
                 .collect::<Vec<_>>()
         };
-        for pending in pending_list {
-            let _ = pending.response.send(ApprovalResolution::Cancel);
-            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
-        }
-        Ok(())
+        Self::cancel_pending(pending_list, event_sink).await
     }
 
     /// Cancel only approvals owned by the interrupted execution.
@@ -990,11 +986,27 @@ impl PermissionCoordinator {
         event_sink: Option<&ProviderEventSink>,
     ) -> Result<()> {
         let pending_list = self.take_owner_approvals(owner)?;
+        Self::cancel_pending(pending_list, event_sink).await
+    }
+
+    /// Publish cancellation on each request's own stream and release every waiter on failure.
+    async fn cancel_pending(
+        pending_list: Vec<PendingApproval>,
+        event_sink: Option<&ProviderEventSink>,
+    ) -> Result<()> {
+        let mut first_error = None;
         for pending in pending_list {
+            let sink = pending.resolution_sink.as_ref().or(event_sink);
+            let result = Self::emit_lifecycle(sink, "approval_cancelled", &pending.view).await;
             let _ = pending.response.send(ApprovalResolution::Cancel);
-            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
         }
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Begin cancellation synchronously after callback authority is checked.
@@ -1058,6 +1070,13 @@ pub(crate) struct DirectoryExecution {
     scope: crate::provider::InvocationScope,
     policy: Arc<DirectoryPolicy>,
     coordinator: Arc<PermissionCoordinator>,
+}
+
+impl DirectoryExecution {
+    /// Get the directory evaluator owned by this admitted provider invocation.
+    pub(crate) fn policy(&self) -> Arc<DirectoryPolicy> {
+        self.policy.clone()
+    }
 }
 
 impl Drop for DirectoryExecution {
@@ -2305,7 +2324,7 @@ mod test {
                     session_id: "root".into(),
                     agent_id: "first".into(),
                 },
-                Some(&channels[0].0),
+                None,
             )
             .await
             .unwrap();
@@ -2335,6 +2354,13 @@ mod test {
             .await
             .unwrap();
         assert_eq!(waiter.remove(0).await.unwrap(), ApprovalResolution::Cancel);
+        assert!(matches!(
+            channels[1].1.recv().await.unwrap().unwrap(),
+            ProviderEvent::Approval {
+                update: ApprovalUpdate::Cancelled(_),
+                ..
+            }
+        ));
     }
 
     fn evaluate_review(request: &PermissionRequest) -> PermissionEvaluation {
@@ -2807,7 +2833,7 @@ mod test {
                 .unwrap()
         });
         approval(event_stream.recv().await.unwrap().unwrap());
-        coordinator.cancel_all(Some(&event_sink)).await.unwrap();
+        coordinator.cancel_all(None).await.unwrap();
         assert!(matches!(
             event_stream.recv().await.unwrap().unwrap(),
             ProviderEvent::Approval {

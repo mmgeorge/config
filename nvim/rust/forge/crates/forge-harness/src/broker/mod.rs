@@ -14404,7 +14404,7 @@ mod test {
         assert!(result.is_err());
         let before = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(before.len(), 1);
-        assert_eq!(before[0].state(), ExchangeState::Running);
+        assert_eq!(before[0].state(), ExchangeState::Running, "{result:?}");
         assert_eq!(before[0].turn.len(), 1);
         assert_eq!(
             before[0].turn[0].state(),

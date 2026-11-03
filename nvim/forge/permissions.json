@@ -439,6 +439,9 @@
     "read": {
       "*": "allow"
     },
+    "tool": {
+      "lsp_overview": "allow"
+    },
     "webfetch": {
       "*": "allow"
     }

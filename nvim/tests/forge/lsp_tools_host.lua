@@ -2,14 +2,8 @@ vim.loader.enable(false)
 local root = vim.fs.normalize(vim.fn.getcwd())
 local language = vim.g.forge_test_language or "lua"
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
-local function copy(from, to)
-  vim.fn.mkdir(to, "p")
-  for name, kind in vim.fs.dir(from) do
-    if kind == "directory" then copy(from .. "/" .. name, to .. "/" .. name)
-    else assert(vim.uv.fs_copyfile(from .. "/" .. name, to .. "/" .. name)) end
-  end
-end
-copy(root .. "/nvim/tests/forge/fixtures/plan_navigation/" .. language, workspace)
+dofile(root .. "/nvim/tests/forge/support/plan_navigation_fixture.lua")
+  .copy(root .. "/nvim/tests/forge/fixtures/plan_navigation/" .. language, workspace)
 vim.fn.mkdir(data, "p")
 local function command(arguments, cwd)
   local result = vim.system(arguments, { cwd = cwd, text = true }):wait(30000)

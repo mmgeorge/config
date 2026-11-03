@@ -50,3 +50,6 @@ tree-sitter = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 junction = { workspace = true }
 windows = { workspace = true, features = ["Win32_System_Threading", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { workspace = true, features = ["Win32_Networking_WinSock"] }

@@ -331,15 +331,17 @@ impl Exchange {
         }
     }
 
-    /// Freeze execution before cleanup and checkpoint persistence begin.
+    /// Freeze execution for persistence, allowing later cleanup or capture failure to downgrade the outcome.
     pub fn begin_finalization(
         &mut self,
         outcome: ExchangeOutcome,
         now_ms: i64,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.finalization_outcome()
-                .is_none_or(|previous| previous == outcome),
+            outcome == ExchangeOutcome::Failed
+                || self
+                    .finalization_outcome()
+                    .is_none_or(|previous| previous == outcome),
             "finalization cannot change the recorded outcome"
         );
         anyhow::ensure!(

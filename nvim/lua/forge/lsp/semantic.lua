@@ -8,6 +8,7 @@ local methods = {
   hover = "textDocument/hover", document_symbols = "textDocument/documentSymbol",
   workspace_symbols = "workspace/symbol", calls = "textDocument/prepareCallHierarchy",
   diagnostics = "textDocument/diagnostic", call_root = "textDocument/prepareCallHierarchy",
+  rename = "textDocument/rename", rename_file = "workspace/willRenameFiles",
 }
 
 ---@class ForgeLspSemanticArguments
@@ -70,9 +71,11 @@ end
 ---@param arguments ForgeLspSemanticArguments
 ---@param authorize fun(paths: string[], receive: fun(allowed: table<string, boolean>?, failure: string?))
 ---@param receive fun(result: ForgeLspSemanticResult?, failure: string?)
+---@param budget? {remaining: integer}
+---@param readiness? table<integer, vim.lsp.Client>
 ---@return fun() cancel
 ---@return fun()? expire
-function M.request(workspace, arguments, authorize, receive, budget)
+function M.request(workspace, arguments, authorize, receive, budget, readiness)
   local finished, outstanding, attempted, responses, collecting = false, 0, 0, 0, false
   local requests, buffers, versions, clients, raw, warnings = {}, {}, {}, {}, {}, {}
   local result = { rows = {}, source = "workspace" }
@@ -484,7 +487,9 @@ function M.request(workspace, arguments, authorize, receive, budget)
     if not success then finish(tostring(failure)) end
   end
   if workspace_query and arguments.startup_issues then ready(nil, arguments.startup_issues)
-  else cancel_startup = require("forge.lsp.startup").wait(workspace, arguments.path or arguments.search_path, ready) end
+  else cancel_startup = require("forge.lsp.startup").wait(workspace, arguments.path or arguments.search_path, ready,
+    { method = workspace_query and arguments.operation == "diagnostics" and "workspace/diagnostic" or methods[arguments.operation],
+      ready = readiness }) end
   return function() finish("cancelled: LSP request cancelled.") end, expire
 end
 

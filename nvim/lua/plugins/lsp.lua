@@ -69,6 +69,7 @@ return {
         float = { border = "single" },
       })
 
+      vim.lsp.config('*', { capabilities = require('forge.lsp.rename').capabilities() })
       local capabilities = require('blink.cmp').get_lsp_capabilities()
 
       -- Forge owns attachment so native drafts and comments share its prose guards.

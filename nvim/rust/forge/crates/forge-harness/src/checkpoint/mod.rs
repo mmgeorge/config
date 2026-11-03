@@ -1,6 +1,7 @@
 mod capture;
 mod directory;
 mod failure;
+mod file_kind;
 mod gate;
 mod manifest;
 mod restore;

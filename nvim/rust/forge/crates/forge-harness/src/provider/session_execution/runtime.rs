@@ -1220,8 +1220,21 @@ impl SessionExecution {
                                 driver.fail_observation(failure);
                                 break;
                             }
-                            Err(_) => {
+                            Err(
+                                crate::provider::events::EventDeliveryError::OwnershipMismatch {
+                                    ..
+                                },
+                            ) => {
                                 driver.fail_observation(ObservationFailure::OwnershipConflict);
+                                break;
+                            }
+                            Err(
+                                crate::provider::events::EventDeliveryError::InvalidTransportData
+                                | crate::provider::events::EventDeliveryError::IncompleteTransfer {
+                                    ..
+                                },
+                            ) => {
+                                driver.fail_observation(ObservationFailure::Protocol);
                                 break;
                             }
                         }

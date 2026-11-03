@@ -61,7 +61,9 @@ end
 ---@return fun()
 function M.request(workspace, arguments, authorize, analyze, receive)
   local finished, active_cancel, active_expire = false, nil, nil
-  local startup_issues, draining
+  local source_listing = arguments.operation == "overview" or arguments.operation == "symbols" and (arguments.path ~= nil or not arguments.query)
+  local draining
+  local readiness = {}
   local result = { rows = {}, source = "live source", warnings = {}, omitted_visibility = {}, omitted_visibility_count = 0 }
   local captured = snapshots.new(authorize, analyze)
   local budget = arguments.operation == "paths" and { remaining = arguments.max_requests or 64 } or nil
@@ -100,7 +102,6 @@ function M.request(workspace, arguments, authorize, analyze, receive)
   local function query(request, callback, optional, controlled)
     if finished then return end
     local workspace_query = not request.path and (request.operation == "workspace_symbols" or request.operation == "diagnostics")
-    if workspace_query then request.startup_issues = startup_issues end
     local completed = false
     local cancel, expire = semantic.request(workspace, request, authorize, function(reply, failure)
       completed = true
@@ -119,7 +120,7 @@ function M.request(workspace, arguments, authorize, analyze, receive)
       end
       for _, warning in ipairs(reply.warnings or {}) do result.warnings[#result.warnings + 1] = warning end
       callback(reply)
-    end, budget)
+    end, budget, readiness)
     if not completed then active_cancel, active_expire = cancel, workspace_query and expire or nil end
   end
   local function get(path, callback, optional)
@@ -289,7 +290,9 @@ function M.request(workspace, arguments, authorize, analyze, receive)
       local client = source.select_client(assert(arguments.path), vim.filetype.match({ filename = arguments.path }) or "", source.loaded(arguments.path), "textDocument/hover", workspace)
       local callable = vim.tbl_contains({ "function_item", "function_signature_item", "function_declaration",
         "generator_function_declaration", "method_definition", "method_signature", "abstract_method_signature" }, declaration.kind)
-      if client and not callable then
+      if client and client.initialized and not callable
+        and not (client.progress and next(client.progress.pending or {})) then
+        readiness[client.id] = client
         local completed = false
         local cancel = semantic.request(workspace, { operation = "hover", path = arguments.path, line = arguments.line, column = arguments.column }, authorize, function(reply)
           completed = true
@@ -301,7 +304,7 @@ function M.request(workspace, arguments, authorize, analyze, receive)
             if not compact:find(declaration.signature, 1, true) then result.hover = hover end
           end
           next_relation()
-        end)
+        end, nil, readiness)
         if not completed then active_cancel = cancel end
       else next_relation() end
     end)
@@ -350,7 +353,7 @@ function M.request(workspace, arguments, authorize, analyze, receive)
   local function start()
     if finished then return end
     if arguments.operation == "paths" then paths()
-    elseif arguments.operation == "overview" or arguments.operation == "symbols" and (arguments.path or not arguments.query) then list()
+    elseif source_listing then list()
     elseif arguments.operation == "context" then context()
     else
       local request = vim.deepcopy(arguments) --[[@as ForgeLspSemanticArguments]]
@@ -382,7 +385,7 @@ function M.request(workspace, arguments, authorize, analyze, receive)
             local supported = {}
             for name in capabilities:gmatch("[^, ]+") do supported[name] = true end
             local mapped = { "overview", "symbols", "context", "diagnostics" }
-            for _, pair in ipairs({ { "definition", "definition" }, { "type_definition", "type" }, { "implementation", "implementation" }, { "references", "references" }, { "calls", "calls" }, { "calls", "paths" } }) do
+            for _, pair in ipairs({ { "definition", "definition" }, { "type_definition", "type" }, { "implementation", "implementation" }, { "references", "references" }, { "calls", "calls" }, { "calls", "paths" }, { "rename", "rename_symbol" }, { "rename_file", "rename_file" } }) do
               if supported[pair[1]] then mapped[#mapped + 1] = pair[2] end
             end
             row.text = row.text:match("^[^\n]+") .. "\n  " .. table.concat(mapped, ", ")
@@ -394,7 +397,7 @@ function M.request(workspace, arguments, authorize, analyze, receive)
     end
   end
   local function resolved_start()
-    local duration = arguments.operation == "paths" and 30 or 10
+    local duration = source_listing and 10 or arguments.operation == "paths" and 90 or 70
     timer:start(duration * 1000, 0, vim.schedule_wrap(function()
       if active_expire then draining = true active_expire()
       else finish("timeout: " .. arguments.operation .. " lookup exceeded " .. duration .. " seconds.") end
@@ -407,17 +410,7 @@ function M.request(workspace, arguments, authorize, analyze, receive)
     else start() end
   end
   if arguments.operation == "status" then start()
-  else
-    local completed = false
-    local cancel = require("forge.lsp.startup").wait(workspace, arguments.path, function(failure, issues)
-      completed = true
-      if finished then return end
-      active_cancel = nil
-      startup_issues = issues or {}
-      if failure then finish(failure) else resolved_start() end
-    end)
-    if not completed then active_cancel = cancel end
-  end
+  else resolved_start() end
   return function() finish("cancelled: LSP request cancelled.") end
 end
 

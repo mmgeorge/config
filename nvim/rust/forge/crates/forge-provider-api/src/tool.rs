@@ -12,11 +12,42 @@ pub struct ToolInvocation {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(from = "StoredToolDiagnostic")]
 pub struct ToolDiagnostic {
     /// Carry a normalized failure class, without native codes or verbatim messages.
     pub kind: crate::error::ProviderFailureKind,
     /// Preserve useful host or adapter text after native detail has been sanitized.
     pub message: crate::diagnostic::SanitizedMessage,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum StoredToolDiagnostic {
+    Current {
+        kind: crate::error::ProviderFailureKind,
+        message: crate::diagnostic::SanitizedMessage,
+    },
+    Legacy {
+        code: serde::de::IgnoredAny,
+        message: serde::de::IgnoredAny,
+    },
+}
+
+impl From<StoredToolDiagnostic> for ToolDiagnostic {
+    /// Normalize legacy diagnostics without restoring native codes or error text.
+    fn from(stored: StoredToolDiagnostic) -> Self {
+        match stored {
+            StoredToolDiagnostic::Current { kind, message } => Self { kind, message },
+            StoredToolDiagnostic::Legacy { code, message } => {
+                let _ = (code, message);
+                Self {
+                    kind: crate::error::ProviderFailureKind::Unknown,
+                    message: crate::diagnostic::SanitizedMessage::new("Tool execution failed")
+                        .expect("static diagnostic is nonempty"),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -172,6 +203,37 @@ pub enum ToolSemantics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Load old failed tools while keeping their native diagnostic details private.
+    #[test]
+    fn legacy_tool_diagnostics_are_normalized_on_load() {
+        for code in [serde_json::Value::Null, serde_json::json!("native-code")] {
+            let diagnostic: ToolDiagnostic = serde_json::from_value(serde_json::json!({
+                "code":code,"message":"private native error"
+            }))
+            .unwrap();
+            assert_eq!(diagnostic.kind, crate::error::ProviderFailureKind::Unknown);
+            let serialized = serde_json::to_string(&diagnostic).unwrap();
+            assert!(!serialized.contains("private native"));
+            assert!(!serialized.contains("native-code"));
+            assert_eq!(
+                serde_json::from_str::<ToolDiagnostic>(&serialized).unwrap(),
+                diagnostic
+            );
+        }
+        assert!(
+            serde_json::from_value::<ToolDiagnostic>(
+                serde_json::json!({"message":"missing category"})
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ToolDiagnostic>(serde_json::json!({
+                "kind":"invalid", "code":null, "message":"bad current category"
+            }))
+            .is_err()
+        );
+    }
 
     /// Preserve the existing denial wire shape while validating its diagnostic text.
     #[test]

@@ -2,6 +2,98 @@ use super::*;
 use crate::storage::SqliteStore;
 use std::collections::BTreeSet;
 
+#[cfg(windows)]
+struct LocalSocket(windows::Win32::Networking::WinSock::SOCKET);
+
+#[cfg(windows)]
+impl LocalSocket {
+    fn bind(path: &Path) -> Self {
+        use windows::Win32::Networking::WinSock::*;
+        let mut data = WSADATA::default();
+        // SAFETY: data is writable and Winsock is paired with cleanup in Drop.
+        assert_eq!(unsafe { WSAStartup(0x202, &mut data) }, 0);
+        // SAFETY: these constants request an AF_UNIX stream socket.
+        let socket = Self(unsafe { socket(i32::from(AF_UNIX), SOCK_STREAM, 0) }.unwrap());
+        let mut address = SOCKADDR_UN {
+            sun_family: ADDRESS_FAMILY(AF_UNIX),
+            ..Default::default()
+        };
+        let bytes = path.as_os_str().as_encoded_bytes();
+        assert!(bytes.len() < address.sun_path.len());
+        for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
+            *target = i8::from_ne_bytes([*byte]);
+        }
+        // SAFETY: address is a terminated AF_UNIX address with its complete structure size.
+        assert_eq!(
+            unsafe {
+                bind(
+                    socket.0,
+                    (&raw const address).cast(),
+                    i32::try_from(std::mem::size_of_val(&address)).unwrap(),
+                )
+            },
+            0
+        );
+        socket
+    }
+}
+
+#[cfg(windows)]
+impl Drop for LocalSocket {
+    fn drop(&mut self) {
+        // SAFETY: this guard owns the socket and one successful WSAStartup call.
+        unsafe {
+            windows::Win32::Networking::WinSock::closesocket(self.0);
+            windows::Win32::Networking::WinSock::WSACleanup();
+        }
+    }
+}
+
+/// Exclude runtime endpoints and binary data without deleting or restoring them as text.
+#[cfg(any(unix, windows))]
+#[test]
+fn snapshots_exclude_sockets_and_binary_contents() {
+    let repository = repository();
+    let data = tempfile::tempdir().unwrap();
+    let objects = ObjectStore::open(data.path()).unwrap();
+    let snapshot = GitCheckpoint::new(repository.path());
+    let before = snapshot
+        .capture_native(&objects, "session", 1, || Ok(()))
+        .unwrap();
+    let socket_path = repository.path().join("endpoint.tmp");
+    #[cfg(windows)]
+    let _socket = LocalSocket::bind(&socket_path);
+    #[cfg(unix)]
+    let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    fs::write(repository.path().join("asset.bin"), b"binary\0payload").unwrap();
+    fs::write(repository.path().join("tracked.txt"), b"now\0binary").unwrap();
+    fs::write(repository.path().join("new.txt"), "plain text\n").unwrap();
+    let after = snapshot
+        .capture_native(&objects, "session", 2, || Ok(()))
+        .unwrap();
+    for name in ["endpoint.tmp", "asset.bin", "tracked.txt"] {
+        assert!(after.excluded.contains(name), "{name} was not excluded");
+        assert!(!after.file.iter().any(|file| file.path == name));
+    }
+    assert_eq!(before.changed_paths(&after).unwrap(), vec!["new.txt"]);
+    let folder = super::super::directory::capture_directory(
+        repository.path(),
+        data.path(),
+        &objects,
+        "folder".into(),
+        3,
+    )
+    .unwrap();
+    assert!(folder.excluded.contains("endpoint.tmp") && folder.excluded.contains("asset.bin"));
+    snapshot.restore(&objects, &after, &before).unwrap();
+    assert!(fs::symlink_metadata(&socket_path).is_ok());
+    assert_eq!(
+        fs::read(repository.path().join("tracked.txt")).unwrap(),
+        b"now\0binary"
+    );
+    assert!(!repository.path().join("new.txt").exists());
+}
+
 #[test]
 fn checkpoints_ignore_lfs_assets_in_capture_read_diff_and_restore() {
     use super::super::restore::{RestoreJournal, RestorePreview};

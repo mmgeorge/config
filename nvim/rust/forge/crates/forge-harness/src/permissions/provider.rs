@@ -7,7 +7,6 @@ use crate::session::ApprovalMode;
 use anyhow::Result;
 use async_trait::async_trait;
 use forge_provider_api::permissions::{PermissionResponse, ProviderPermissions};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StandardMutex};
 
 pub(crate) const REJECT_ALL_GUIDANCE: &str = "Tool approval is set to reject all, and no user is reviewing requests. Commands and tools that saved permission rules do not allow are rejected automatically. Continue with the allowed tools and commands. Do not wait for approval, retry rejected operations, or work around the restrictions.";
@@ -17,6 +16,7 @@ struct PermissionState {
     checkpoint: Option<crate::checkpoint::ToolGate>,
     owner: Option<crate::provider::ExecutionOwner>,
     approval_mode: ApprovalMode,
+    lsp_mutations: bool,
     event_sink: Option<ProviderEventSink>,
 }
 
@@ -30,14 +30,14 @@ enum PermissionOrigin {
 pub(crate) struct ProviderPermissionContext {
     coordinator: Arc<PermissionCoordinator>,
     state: StandardMutex<PermissionState>,
-    retired: AtomicBool,
+    retired: tokio::sync::watch::Sender<bool>,
     approval_authority: Arc<ApprovalAuthority>,
 }
 
 impl ProviderPermissionContext {
     /// Check immutable invocation routing before or after an asynchronous permission decision.
     fn matches_scope(&self, scope: &forge_provider_api::InvocationScope) -> bool {
-        !self.retired.load(Ordering::Acquire)
+        !*self.retired.borrow()
             && self.state.lock().is_ok_and(|state| {
                 state
                     .event_sink
@@ -51,13 +51,14 @@ impl ProviderPermissionContext {
     pub(crate) fn new(coordinator: Arc<PermissionCoordinator>) -> Self {
         Self {
             coordinator,
-            retired: AtomicBool::new(false),
+            retired: tokio::sync::watch::channel(false).0,
             approval_authority: Arc::new(ApprovalAuthority::default()),
             state: StandardMutex::new(PermissionState {
                 task_authority: None,
                 checkpoint: None,
                 owner: None,
                 approval_mode: ApprovalMode::Ask,
+                lsp_mutations: false,
                 event_sink: None,
             }),
         }
@@ -72,7 +73,7 @@ impl ProviderPermissionContext {
         event_sink: Option<ProviderEventSink>,
     ) -> Result<()> {
         anyhow::ensure!(
-            !self.retired.load(Ordering::Acquire),
+            !*self.retired.borrow(),
             "provider permission context is retired"
         );
         let mut state = self
@@ -84,6 +85,7 @@ impl ProviderPermissionContext {
             checkpoint: None,
             owner: Some(owner),
             approval_mode,
+            lsp_mutations: false,
             event_sink,
         };
         Ok(())
@@ -93,7 +95,7 @@ impl ProviderPermissionContext {
 impl ProviderPermissionContext {
     /// Revoke this native generation before disconnecting its callback transport.
     pub(crate) fn retire(&self) -> Result<()> {
-        self.retired.store(true, Ordering::Release);
+        self.retired.send_replace(true);
         self.approval_authority.retire()?;
         Ok(())
     }
@@ -108,6 +110,11 @@ impl ProviderPermissionContext {
             .lock()
             .map_err(|_| anyhow::anyhow!("provider permission context lock poisoned"))?;
         state.checkpoint = context.and_then(|context| context.checkpoint.clone());
+        state.lsp_mutations = context.is_some_and(|context| {
+            crate::tools::lsp::allowed_mode(context.mode)
+                && !context.question_discussion
+                && context.lsp.as_ref().is_some_and(|scope| scope.available())
+        });
         state.task_authority = context.and_then(crate::tools::TaskAuthority::capture);
         Ok(())
     }
@@ -133,7 +140,13 @@ impl ProviderPermissions for ProviderPermissionContext {
                 ))
             })?;
         if let Some(gate) = checkpoint {
-            gate.wait().await.map_err(|_| {
+            let mut retired = self.retired.subscribe();
+            let result = tokio::select! {
+                biased;
+                _ = retired.wait_for(|retired| *retired) => return Err(ProviderError::Cancelled),
+                result = gate.wait() => result,
+            };
+            result.map_err(|_| {
                 ProviderError::Failure(forge_provider_api::ProviderFailure::new(
                     forge_provider_api::ProviderOperation::HostEffectPublication,
                     forge_provider_api::ProviderFailureKind::Rejected,
@@ -230,6 +243,31 @@ impl ProviderPermissionContext {
         };
         if protected {
             return deny("Automatically rejected because the target is protected by Harness.");
+        }
+        // Rename owns path authorization after the server computes the complete edit set.
+        // Never open a generic host-tool approval before that fail-closed check.
+        let is_rename = request.target_list.len() == 1
+            && matches!(&request.target_list[0],
+            crate::permissions::matcher::PermissionTarget::HostTool { name } if crate::tools::lsp::is_mutation(name));
+        if is_rename && self.state.lock().is_ok_and(|state| state.lsp_mutations) {
+            let evaluation = self
+                .coordinator
+                .store()
+                .read()
+                .ok()
+                .and_then(|store| store.compiled().evaluate(&request).ok());
+            return match evaluation {
+                Some(evaluation)
+                    if evaluation.decision
+                        == crate::permissions::document::PermissionDecision::Allow
+                        || (evaluation.decision
+                            == crate::permissions::document::PermissionDecision::Ask
+                            && evaluation.matched_pattern_list.is_empty()) =>
+                {
+                    PermissionResponse::Allow
+                }
+                _ => deny("LSP rename is not allowed by the saved tool policy."),
+            };
         }
         if origin == PermissionOrigin::SessionStorage {
             if request.target_list.is_empty()
@@ -344,6 +382,27 @@ fn denied(reason: &str, approval_mode: Option<ApprovalMode>) -> PermissionRespon
 mod tests {
     use super::*;
     use forge_provider_api::permissions::PermissionTarget;
+
+    #[tokio::test]
+    async fn retirement_releases_a_callback_waiting_for_checkpoint() -> anyhow::Result<()> {
+        let coordinator = PermissionCoordinator::transient(".")?;
+        let context = ProviderPermissionContext::new(coordinator);
+        let owner = crate::provider::ExecutionOwner::root("checkpoint-cancel");
+        let scope = crate::provider::InvocationScope::new(owner.clone(), "exchange");
+        let (sink, _events) = crate::provider::events::channel(scope.clone());
+        context.configure(owner, ApprovalMode::Ask, ".".into(), Some(sink))?;
+        let gate = crate::checkpoint::ToolGate::new();
+        context.state.lock().unwrap().checkpoint = Some(gate.clone());
+        let mut waiting = Box::pin(context.before_tool(&scope));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        context.retire()?;
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting).await?,
+            Err(ProviderError::Cancelled)
+        ));
+        assert!(!gate.ready());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn session_storage_respects_explicit_denial_and_invocation_retirement()

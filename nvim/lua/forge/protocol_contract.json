@@ -1,5 +1,5 @@
 {
-  "version": 32,
+  "version": 33,
   "node": {
     "kind": [
       "exchange",
@@ -238,6 +238,14 @@
         "id": "string",
         "workspace": "string",
         "arguments": "object"
+      }
+    },
+    "lsp.mutation": {
+      "route": "transport",
+      "required": {
+        "id": "string",
+        "workspace": "string",
+        "mutation": "object"
       }
     },
     "lsp.cancel": {

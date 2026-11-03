@@ -511,7 +511,7 @@ local function host_dispatch_message(message, timing)
       return
     end
   end
-  if message.event == "lsp.request" or message.event == "lsp.cancel" then
+  if message.event == "lsp.request" or message.event == "lsp.cancel" or message.event == "lsp.mutation" then
     require("forge.lsp.bridge").handle(message.event, message.payload, message.session_id, client.generation)
     return
   end

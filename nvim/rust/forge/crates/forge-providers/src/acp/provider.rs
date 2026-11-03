@@ -1354,7 +1354,28 @@ impl forge_provider_api::provider::Provider for AcpProvider {
         }
         let initialized = match self.initialize_handshake(&status, &request.workspace).await {
             Ok(initialized) => initialized,
-            Err(ProviderError::RuntimeVersion(_)) => {
+            Err(ProviderError::RuntimeVersion(error)) => {
+                versions.adapter = match error {
+                    forge_provider_api::version::RuntimeVersionError::Unsupported {
+                        detected,
+                        ..
+                    } => forge_provider_api::VersionObservation::Known {
+                        version: detected.to_string(),
+                    },
+                    forge_provider_api::version::RuntimeVersionError::Missing { .. } => {
+                        forge_provider_api::VersionObservation::NotReported
+                    }
+                    forge_provider_api::version::RuntimeVersionError::Malformed { .. } => {
+                        forge_provider_api::VersionObservation::Failed {
+                            failure: ProviderFailureKind::Protocol,
+                        }
+                    }
+                    forge_provider_api::version::RuntimeVersionError::Probe { .. } => {
+                        forge_provider_api::VersionObservation::Failed {
+                            failure: ProviderFailureKind::Initialization,
+                        }
+                    }
+                };
                 return Ok(forge_provider_api::ProviderSetup {
                     runtime: forge_provider_api::RuntimeAvailability::Incompatible,
                     origin,

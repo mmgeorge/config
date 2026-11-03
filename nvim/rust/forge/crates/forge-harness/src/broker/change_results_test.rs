@@ -42,6 +42,53 @@ fn assert_preserved(broker: &HarnessBroker, exchange: &Exchange, previous: &Exch
     }
 }
 
+/// Recover a failed completion checkpoint without masking its error with an outcome conflict.
+#[tokio::test]
+async fn failed_completion_checkpoint_can_finalize_as_failed() {
+    let repository = repository();
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let before = initial(&mut broker).await;
+    let mut exchange = running(&broker, &before.id);
+    std::fs::write(repository.path().join("seed.txt"), "changed\n").unwrap();
+    let connection = rusqlite::Connection::open(data.path().join("harness.sqlite3")).unwrap();
+    connection.execute_batch("CREATE TRIGGER reject_checkpoint BEFORE INSERT ON checkpoint_record BEGIN SELECT RAISE(ABORT, 'injected capture persistence failure'); END;").unwrap();
+    assert!(
+        broker
+            .capture_final_checkpoint(&mut exchange, ExchangeOutcome::Complete)
+            .await
+            .is_err()
+    );
+    let error = broker
+        .capture_final_checkpoint(&mut exchange, ExchangeOutcome::Failed)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("injected capture persistence failure"),
+        "{error:#}"
+    );
+    assert_eq!(exchange.state(), ExchangeState::Finalizing);
+    connection
+        .execute_batch("DROP TRIGGER reject_checkpoint")
+        .unwrap();
+    broker
+        .capture_final_checkpoint(&mut exchange, ExchangeOutcome::Failed)
+        .await
+        .unwrap();
+    assert_eq!(exchange.state(), ExchangeState::Failed);
+    assert!(exchange.finalization_error.is_none());
+    assert!(exchange.checkpoint_after.is_some());
+    assert_eq!(
+        broker
+            .store
+            .load_exchange(&exchange.id)
+            .unwrap()
+            .unwrap()
+            .state(),
+        ExchangeState::Failed
+    );
+}
+
 #[tokio::test]
 async fn checkpoint_commit_failure_preserves_previous_comparison() {
     for (recapture, recover_initial) in [(false, false), (true, false), (false, true)] {

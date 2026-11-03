@@ -125,6 +125,33 @@ mod tests {
     }
 
     #[test]
+    fn lsp_mutation_has_a_distinct_required_envelope() {
+        assert!(validate("session", "lsp.mutation", &json!({
+            "id":"rename", "workspace":".", "mutation":{"kind":"file","old_path":"a","new_path":"b"}
+        })).is_ok());
+        assert!(
+            validate(
+                "session",
+                "lsp.mutation",
+                &json!({
+                    "id":"rename", "workspace":".", "arguments":{}
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                "session",
+                "lsp.request",
+                &json!({
+                    "id":"read", "workspace":".", "arguments":{}
+                })
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn serialization_cannot_bypass_the_event_contract() {
         let mut event = SessionEvent {
             session_id: "session".into(),

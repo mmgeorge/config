@@ -10,7 +10,6 @@ use forge_provider_api::{
     GoalStopMode, ProviderError, ProviderEvent, ProviderFailure, ProviderModel, ProviderRuntime,
     catalog::ProviderCatalogRequest,
     completion::ProviderCompletion,
-    control::ToolCall,
     error::{ProviderFailureKind, ProviderOperation},
     events::{self, ProviderEventSink, ProviderEventStream},
     generation::ReasoningSelection,
@@ -90,6 +89,12 @@ pub struct CodexProvider {
     runtime: Arc<CodexRuntime>,
     bindings: Mutex<HashMap<BindingId, Arc<CodexBinding>>>,
     owners: Mutex<HashMap<forge_provider_api::ExecutionOwner, BindingId>>,
+    catalog: Mutex<Option<CatalogConnection>>,
+}
+
+enum CatalogConnection {
+    Starting(tokio::task::JoinHandle<Result<Arc<NativeRpc>, ProviderError>>),
+    Ready(Arc<NativeRpc>),
 }
 
 impl CodexProvider {
@@ -107,7 +112,61 @@ impl CodexProvider {
             runtime_root,
             bindings: Mutex::new(HashMap::new()),
             owners: Mutex::new(HashMap::new()),
+            catalog: Mutex::new(None),
         })
+    }
+
+    /// Initialize catalog discovery independently of any conversation or prompt.
+    async fn catalog_connection(&self) -> Result<Arc<NativeRpc>, ProviderError> {
+        let mut catalog = self.catalog.lock().await;
+        if catalog.is_none() {
+            let runtime = self.runtime.clone();
+            *catalog = Some(CatalogConnection::Starting(tokio::spawn(async move {
+                let connection = runtime.connect().await.map_err(|_| {
+                    failure(
+                        ProviderOperation::InspectRuntime,
+                        ProviderFailureKind::Transport,
+                    )
+                })?;
+                let rpc = Arc::new(NativeRpc::new(connection));
+                let initialized = async {
+                    rpc.request("initialize", json!({
+                        "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
+                        "capabilities":{"experimentalApi":true}
+                    }), ProviderOperation::InspectRuntime).await?;
+                    rpc.notify("initialized", Value::Null).await
+                }.await;
+                if let Err(primary) = initialized {
+                    return Err(match rpc.close().await {
+                        Ok(()) => primary,
+                        Err(secondary) => ProviderError::Combined {
+                            primary: Box::new(primary),
+                            secondary: vec![secondary],
+                        },
+                    });
+                }
+                Ok(rpc)
+            })));
+        }
+        let result = match catalog.as_mut().expect("catalog initialization installed") {
+            CatalogConnection::Ready(rpc) => return Ok(rpc.clone()),
+            CatalogConnection::Starting(task) => task.await.unwrap_or_else(|_| {
+                Err(failure(
+                    ProviderOperation::InspectRuntime,
+                    ProviderFailureKind::Runtime,
+                ))
+            }),
+        };
+        match result {
+            Ok(rpc) => {
+                *catalog = Some(CatalogConnection::Ready(rpc.clone()));
+                Ok(rpc)
+            }
+            Err(error) => {
+                *catalog = None;
+                Err(error)
+            }
+        }
     }
 
     async fn binding(&self, id: &BindingId) -> Result<Arc<CodexBinding>, ProviderError> {
@@ -1431,6 +1490,23 @@ impl Provider for CodexProvider {
     }
 
     async fn shutdown(&self) -> Result<(), ProviderError> {
+        let mut catalog = self.catalog.lock().await;
+        let catalog_result = match catalog.as_mut() {
+            Some(CatalogConnection::Starting(task)) => Some(task.await.unwrap_or_else(|_| {
+                Err(failure(
+                    ProviderOperation::CollectNativeRuntime,
+                    ProviderFailureKind::Runtime,
+                ))
+            })),
+            Some(CatalogConnection::Ready(rpc)) => Some(Ok(rpc.clone())),
+            None => None,
+        };
+        if let Some(Ok(rpc)) = &catalog_result {
+            *catalog = Some(CatalogConnection::Ready(rpc.clone()));
+            rpc.close().await?;
+        }
+        catalog.take();
+        drop(catalog);
         let bindings = self
             .bindings
             .lock()
@@ -1439,6 +1515,9 @@ impl Provider for CodexProvider {
             .cloned()
             .collect::<Vec<_>>();
         let mut errors = Vec::new();
+        if let Some(Err(error)) = catalog_result {
+            errors.push(error);
+        }
         for binding in bindings {
             if let Err(error) = self.retire_session(&binding).await {
                 errors.push(error);
@@ -1741,13 +1820,10 @@ impl Provider for CodexProvider {
 
     async fn model_list(
         &self,
-        request: ProviderCatalogRequest,
+        _request: ProviderCatalogRequest,
     ) -> Result<Vec<ProviderModel>, ProviderError> {
-        let session = self.request_binding(&request).await?;
-        let catalog = session
-            .rpc
-            .lock()
-            .await
+        let rpc = self.catalog_connection().await?;
+        let catalog = rpc
             .request(
                 "model/list",
                 json!({}),
@@ -3540,17 +3616,20 @@ async fn handle_native_request(
     let params = message.get("params").unwrap_or(&Value::Null);
     let response = match method {
         "item/tool/call" => {
-            let name = params.get("name").and_then(Value::as_str).ok_or_else(|| {
+            let call = super::decode::dynamic_tool_call(params).map_err(|_| {
                 failure(
                     ProviderOperation::NativeTransport,
                     ProviderFailureKind::Protocol,
                 )
             })?;
+            let name = call.name.as_str();
             if !request.tools.iter().any(|tool| tool.name == name) {
-                json!({"content":[{"type":"text","text":"The requested tool is not enabled for this invocation."}],"isError":true})
+                super::decode::dynamic_tool_response(
+                    "The requested tool is not enabled for this invocation.".into(),
+                    false,
+                )
             } else {
                 request.permissions.before_tool(&request.scope).await?;
-                let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
                 let authorization = request
                     .permissions
                     .authorize(
@@ -3567,30 +3646,23 @@ async fn handle_native_request(
                     )
                     .await;
                 match authorization {
-                    PermissionResponse::Allow => match request
-                        .provider_tools
-                        .call(
-                            &request.scope,
-                            ToolCall {
-                                name: name.to_owned(),
-                                arguments,
-                            },
-                        )
-                        .await
-                    {
-                        Ok(text) => {
-                            json!({"content":[{"type":"text","text":text}],"isError":false})
+                    PermissionResponse::Allow => {
+                        match request.provider_tools.call(&request.scope, call).await {
+                            Ok(text) => super::decode::dynamic_tool_response(text, true),
+                            Err(_) => super::decode::dynamic_tool_response(
+                                "The requested tool could not be completed.".into(),
+                                false,
+                            ),
                         }
-                        Err(_) => {
-                            json!({"content":[{"type":"text","text":"The requested tool could not be completed."}],"isError":true})
-                        }
-                    },
-                    PermissionResponse::Deny { reason } => {
-                        json!({"content":[{"type":"text","text":reason.unwrap_or_else(|| "The requested tool was denied.".into())}],"isError":true})
                     }
-                    PermissionResponse::Cancelled => {
-                        json!({"content":[{"type":"text","text":"The requested tool was cancelled."}],"isError":true})
-                    }
+                    PermissionResponse::Deny { reason } => super::decode::dynamic_tool_response(
+                        reason.unwrap_or_else(|| "The requested tool was denied.".into()),
+                        false,
+                    ),
+                    PermissionResponse::Cancelled => super::decode::dynamic_tool_response(
+                        "The requested tool was cancelled.".into(),
+                        false,
+                    ),
                 }
             }
         }

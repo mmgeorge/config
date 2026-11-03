@@ -34,3 +34,5 @@ rustup
 lld
 
 pdb
+
+lsp

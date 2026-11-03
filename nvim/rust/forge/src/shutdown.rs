@@ -9,6 +9,8 @@ use crate::runtime::SHUTDOWN_DEADLINE;
 /// Native workers can outlive this deadline. Their owners must report unfinished work first.
 pub fn run(entry: impl Future<Output = Result<()>>) -> Result<()> {
     let executor = tokio::runtime::Builder::new_multi_thread()
+        // Foreground settlement polls large provider futures; the Windows default stack can overflow.
+        .thread_stack_size(8 * 1024 * 1024)
         .enable_all()
         .build()
         .context("create Forge executor")?;

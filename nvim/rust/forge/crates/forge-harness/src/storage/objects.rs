@@ -90,6 +90,7 @@ impl ObjectStore {
     }
 
     /// Reads current bytes to EOF once and publishes only deviations from the Git baseline.
+    /// Exclude files containing NUL in the first 8 KiB during the existing read.
     /// Concurrent edits disable reuse rather than failing the capture.
     pub(crate) fn capture_file(
         &self,
@@ -97,7 +98,7 @@ impl ObjectStore {
         root: &Path,
         baseline: Option<&forge_git::checkpoint::BaseFile>,
         check: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<FileCapture> {
+    ) -> Result<Option<FileCapture>> {
         let stamp = source_stamp(source)?;
         let baseline_key = baseline
             .map(serde_json::to_string)
@@ -112,18 +113,19 @@ impl ObjectStore {
             && captured.stamp == stamp
             && (captured.unchanged || self.path(&captured.object_id)?.is_file())
         {
-            return Ok(FileCapture {
+            return Ok(Some(FileCapture {
                 object_id: (!captured.unchanged).then(|| captured.object_id.clone()),
                 #[cfg(test)]
                 reused: true,
                 stamp: Some(stamp),
-            });
+            }));
         }
         let mut input = fs::File::open(source)?;
         let opened = handle_stamp(&input)?;
         let mut temporary = tempfile::NamedTempFile::new_in(self.root.as_ref())?;
         let mut digest = Sha256::new();
         let mut buffer = [0; 64 * 1024];
+        let mut sniffed = 0;
         loop {
             check()?;
             let length = match input.read(&mut buffer) {
@@ -132,6 +134,11 @@ impl ObjectStore {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error.into()),
             };
+            let probe = length.min(8192 - sniffed);
+            if buffer[..probe].contains(&0) {
+                return Ok(None);
+            }
+            sniffed += probe;
             temporary.write_all(&buffer[..length])?;
             digest.update(&buffer[..length]);
         }
@@ -165,12 +172,12 @@ impl ObjectStore {
         } else {
             cache.remove(&cache_key);
         }
-        Ok(FileCapture {
+        Ok(Some(FileCapture {
             object_id: (!unchanged).then_some(identity),
             #[cfg(test)]
             reused: false,
             stamp: reusable.then_some(stamp),
-        })
+        }))
     }
 
     /// Compares a captured identity with an immutable Git blob without repeatedly reading that blob.
@@ -500,17 +507,20 @@ mod tests {
                     }
                     Ok(())
                 })
+                .unwrap()
                 .unwrap();
             assert!(changed);
             assert!(captured.stamp.is_none());
             assert_eq!(store.get(&captured.object_id.unwrap()).unwrap(), content);
             let settled = store
                 .capture_file(&source, directory.path(), None, &mut || Ok(()))
+                .unwrap()
                 .unwrap();
             assert!(!settled.reused);
             assert!(settled.stamp.is_some());
             let reused = store
                 .capture_file(&source, directory.path(), None, &mut || Ok(()))
+                .unwrap()
                 .unwrap();
             assert!(reused.reused);
         }

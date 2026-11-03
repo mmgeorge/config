@@ -64,6 +64,11 @@ dofile("nvim/tests/forge/plan_navigation_languages_host.lua")
 
 Set `forge_test_rust_analyzer` when rustup cannot find the analyzer. The fixture uses temporary directories by default. Set `forge_test_scratch` only to keep a failed workspace, and delete it afterward.
 
+Rust fixture manifests are stored as `Cargo.toml.fixture` so the checked-in test
+sources do not become live Cargo workspaces. The shared fixture copier materializes
+them as `Cargo.toml` only in the temporary test directory and skips build output.
+`plan_navigation_fixture.lua` verifies this boundary.
+
 ## Agent LSP tools
 
 After rebuilding, run `lsp_tools_host.lua` in a fresh Neovim with `forge_test_language` set to `lua`, `typescript`, or `rust`. It uses `forge_test_tsgo` and `forge_test_rust_analyzer` the same way as language navigation. The fixture drives the real control runtime through a mock model and a real language server. It checks disabled admission, dependency definitions, all eight tools, diagnostics, unsaved buffers, and reuse of the server when the editor opens source.

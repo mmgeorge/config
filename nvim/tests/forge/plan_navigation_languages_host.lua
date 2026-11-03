@@ -4,14 +4,7 @@ local language = assert(vim.g.forge_test_language, "set forge_test_language to r
 local workspace = vim.g.forge_test_scratch and vim.g.forge_test_scratch .. "/workspace" or vim.fn.tempname()
 local data = vim.g.forge_test_scratch and vim.g.forge_test_scratch .. "/data" or vim.fn.tempname()
 local fixture = root .. "/nvim/tests/forge/fixtures/plan_navigation/" .. language
-local function copy(source, destination)
-  assert(vim.fn.mkdir(destination, "p") == 1)
-  for name, kind in vim.fs.dir(source) do
-    if kind == "directory" then copy(source .. "/" .. name, destination .. "/" .. name)
-    else assert(vim.uv.fs_copyfile(source .. "/" .. name, destination .. "/" .. name)) end
-  end
-end
-copy(fixture, workspace)
+dofile(root .. "/nvim/tests/forge/support/plan_navigation_fixture.lua").copy(fixture, workspace)
 assert(vim.fn.mkdir(data, "p") == 1)
 vim.fn.mkdir(workspace .. "/src", "p")
 vim.fn.writefile({ "pub fn existing_change() {}" }, workspace .. "/src/change.rs")

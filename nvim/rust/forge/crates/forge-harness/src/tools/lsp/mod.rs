@@ -1,18 +1,23 @@
 mod calls;
 mod catalog;
+mod changes;
 mod context;
 mod definition;
 mod diagnostics;
+mod mutation_error;
 mod overview;
 mod paths;
 mod references;
+mod rename;
 mod render;
 mod request;
 mod schema;
 mod service;
 mod status;
 mod symbols;
+mod transaction;
 
 pub(crate) use catalog::is_tool;
 pub(in crate::tools) use catalog::{definitions, execute, record};
+pub(crate) use rename::{allowed_mode, is_mutation};
 pub(crate) use service::{LspLease, LspScope, LspService};

@@ -278,7 +278,17 @@ impl CompiledPermissionDocument {
                     self.best_rule(CATEGORY_ELEVATE, target, None)
                 }
                 PermissionTarget::Tool { target } => self.best_rule(CATEGORY_TOOL, target, None),
-                PermissionTarget::HostTool { name } => self.best_rule(CATEGORY_TOOL, name, None),
+                PermissionTarget::HostTool { name } => {
+                    let (decision, pattern) = self.best_rule(CATEGORY_TOOL, name, None);
+                    (
+                        if pattern.is_none() {
+                            PermissionDecision::Allow
+                        } else {
+                            decision
+                        },
+                        pattern,
+                    )
+                }
             };
             result_list.push(TargetEvaluation {
                 target: target.clone(),
@@ -318,6 +328,60 @@ mod test {
 
     fn compiled(source: &str) -> CompiledPermissionDocument {
         CompiledPermissionDocument::compile(parse_permission_document(source).unwrap(), "D:/repo")
+    }
+
+    /// Allow built-in tools by default while retaining explicit policy and resource checks.
+    #[test]
+    fn built_in_tools_default_to_allow_without_bypassing_saved_rules() {
+        let request = |target| PermissionRequest {
+            id: "built-in".into(),
+            provider: forge_provider_api::ProviderId::new("fixture").unwrap(),
+            reason: None,
+            target_list: vec![target],
+        };
+        let defaults = compiled(r#"{"permission":{}}"#);
+        for name in [
+            "lsp_status",
+            "lsp_rename_symbol",
+            "harness_config",
+            "goal_status",
+        ] {
+            let evaluation = defaults
+                .evaluate(&request(PermissionTarget::HostTool { name: name.into() }))
+                .unwrap();
+            assert_eq!(evaluation.decision, PermissionDecision::Allow);
+            assert!(evaluation.pending_target_list.is_empty());
+        }
+        for target in [
+            PermissionTarget::Tool {
+                target: "external_tool".into(),
+            },
+            PermissionTarget::Mcp {
+                target: "server/tool".into(),
+            },
+            PermissionTarget::Write {
+                path: "D:/repo/source.rs".into(),
+            },
+        ] {
+            assert_eq!(
+                defaults.evaluate(&request(target)).unwrap().decision,
+                PermissionDecision::Ask
+            );
+        }
+        let explicit =
+            compiled(r#"{"permission":{"tool":{"lsp_*":"deny","harness_config":"ask"}}}"#);
+        for (name, decision) in [
+            ("lsp_status", PermissionDecision::Deny),
+            ("harness_config", PermissionDecision::Ask),
+        ] {
+            assert_eq!(
+                explicit
+                    .evaluate(&request(PermissionTarget::HostTool { name: name.into() }))
+                    .unwrap()
+                    .decision,
+                decision
+            );
+        }
     }
 
     /// Deny unclassified operations even when the user allows every known tool.

@@ -39,7 +39,7 @@ pub struct CheckpointRecord {
     pub deleted: Vec<String>,
     /// Non-default checkout conversion sampled for baseline paths.
     pub checkout: BTreeMap<String, CheckoutRule>,
-    /// LFS paths excluded from capture and restoration, including after attribute changes.
+    /// LFS, binary, and special-file paths excluded from capture and restoration.
     #[serde(default)]
     pub excluded: BTreeSet<String>,
     /// Time at which capture completed.

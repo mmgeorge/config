@@ -105,6 +105,8 @@ async fn every_tool_validates_routes_and_returns_a_controlled_result() {
             "check_definition_edit" => json!({"expected_revision":"revision","config":{}}),
             "check_run" => json!({"check":"check"}),
             "check_status" | "check_detail" | "check_cancel" => json!({"run_id":"run"}),
+            "lsp_rename_symbol" => json!({"symbol":"Store","new_name":"Shelf"}),
+            "lsp_rename_file" => json!({"old_path":"a.rs","new_path":"b.rs"}),
             "lsp_calls" => json!({"direction":"incoming"}),
             "lsp_paths" => json!({"from":{"symbol":"start"},"to":{"symbol":"end"}}),
             "harness_session_search" => json!({"query":"topic"}),

@@ -1,12 +1,18 @@
 local source = require("forge.lsp.source")
 local M = {}
 
+---@class ForgeLspReadiness
+---@field method? string
+---@field ready? table<integer, vim.lsp.Client>
+---@field accepts? fun(client: vim.lsp.Client): boolean
+
 ---@class ForgeLspStartupJob
 ---@field path string
 ---@field filetype string
 ---@field filetypes string[]
 ---@field name string
 ---@field started integer
+---@field resolving_since? integer
 ---@field client? integer
 ---@field buffer? integer
 ---@field done? boolean
@@ -27,7 +33,7 @@ local M = {}
 
 ---@type table<string, ForgeLspStartup>
 local workspaces = {}
-local excluded = { [".git"] = true, node_modules = true, target = true, build = true, dist = true, [".cache"] = true }
+local excluded = { [".git"] = true, node_modules = true, target = true, vendor = true, build = true, dist = true, [".cache"] = true }
 local package_filetypes = {
   javascript = true, javascriptreact = true, typescript = true, typescriptreact = true,
   vue = true, svelte = true, astro = true, htmlangular = true,
@@ -97,8 +103,16 @@ local function launch(state, config, path, filetype, accept_root, on_resolved)
     job.buffer = buffer
     source.retain(buffer, owned)
     local resolved = vim.deepcopy(config)
+    resolved.capabilities = vim.tbl_deep_extend("force", resolved.capabilities or {}, require("forge.lsp.rename").capabilities())
     local start = vim.schedule_wrap(function(root)
       if state.closed or job.done then return end
+      if not job.resolving_since then return end
+      if vim.uv.now() - job.resolving_since >= 2000 then
+        job.rejected = true
+        settle(job)
+        return
+      end
+      job.resolving_since = nil
       job.root = root
       if accept_root and not accept_root(root) then
         job.rejected = true
@@ -119,6 +133,7 @@ local function launch(state, config, path, filetype, accept_root, on_resolved)
         if client.name == config.name and not client:is_stopped()
           and (same_root or vim.lsp.buf_is_attached(buffer, client.id)) then
           job.client = client.id
+          job.started = vim.uv.now()
           complete_resolution(job)
           return
         end
@@ -126,8 +141,9 @@ local function launch(state, config, path, filetype, accept_root, on_resolved)
       local ok, identity = pcall(vim.lsp.start, resolved, options)
       if not ok or not identity then
         settle(job, "startup_failed: " .. config.name .. " — " .. tostring(identity or "Server launch failed."))
-      else job.client = identity complete_resolution(job) end
+      else job.client = identity job.started = vim.uv.now() complete_resolution(job) end
     end)
+    job.resolving_since = vim.uv.now()
     local ok, root_error = pcall(function()
       if type(resolved.root_dir) == "function" then resolved.root_dir(buffer, start)
       else start(resolved.root_dir or (resolved.root_markers and vim.fs.root(buffer, resolved.root_markers))) end
@@ -142,7 +158,10 @@ local function poll(state)
   for _, job in pairs(state.jobs) do
     if not job.done then
       local client = job.client and vim.lsp.get_client_by_id(job.client)
-      if client and client.initialized and not client:is_stopped() then settle(job)
+      if job.resolving_since and vim.uv.now() - job.resolving_since >= 2000 then
+        job.rejected = true
+        settle(job)
+      elseif client and client.initialized and not client:is_stopped() then settle(job)
       elseif job.client and (not client or client:is_stopped()) then settle(job, "startup_failed: " .. job.name .. " stopped during initialization.")
       elseif vim.uv.now() - job.started >= 60000 then
         if job.client then settle(job, "timeout: " .. job.name .. " initialization exceeded 60 seconds.")
@@ -167,7 +186,8 @@ end
 ---@param state ForgeLspStartup
 ---@param candidates table<string, {path: string, filetype: string}[]>
 local function select_sources(state, candidates)
-  local remaining = vim.tbl_count(candidates)
+  local remaining = 0
+  for _, sources in pairs(candidates) do remaining = remaining + #sources end
   if remaining == 0 then state.discovering, state.discovered = false, true return end
   local function selected()
     remaining = remaining - 1
@@ -176,24 +196,16 @@ local function select_sources(state, candidates)
   for _, config in ipairs(state.configs) do
     local sources = candidates[config.name]
     if sources then
-      local index, roots = 1, {}
-      local next_source
-      next_source = function()
-        if state.closed then return end
-        local candidate = sources[index]
-        if not candidate then selected() return end
-        index = index + 1
+      local roots = {}
+      for _, candidate in ipairs(sources) do
         launch(state, config, candidate.path, candidate.filetype, function(root)
           if not root then return false end
           root = source.canonical(root)
           if roots[root] or not (source.inside(root, state.workspace) or source.inside(state.workspace, root)) then return false end
           roots[root] = true
           return true
-        end, function()
-          vim.schedule(next_source)
-        end)
+        end, selected)
       end
-      next_source()
     end
   end
 end
@@ -272,6 +284,17 @@ end
 ---@param workspace string
 ---@return ForgeLspStartup
 function M.start(workspace)
+  workspace = source.canonical(workspace)
+  for root, existing in pairs(workspaces) do
+    if existing.discovered and not existing.closed and source.inside(workspace, root) then
+      local running = true
+      for _, job in pairs(existing.jobs) do
+        local client = job.client and vim.lsp.get_client_by_id(job.client)
+        if job.failure or job.client and (not client or client:is_stopped()) then running = false break end
+      end
+      if running then return existing end
+    end
+  end
   local state = workspace_state(workspace)
   if state.discovered then
     for _, job in pairs(state.jobs) do
@@ -291,8 +314,10 @@ end
 ---@param workspace string
 ---@param path? string
 ---@param receive fun(failure?: string, issues?: table[])
+---@param options? ForgeLspReadiness
 ---@return fun() cancel
-function M.wait(workspace, path, receive)
+function M.wait(workspace, path, receive, options)
+  options = options or {}
   local file_request = path ~= nil
   if path and not source.loaded(path) then
     local stat, failure = vim.uv.fs_stat(path)
@@ -303,8 +328,33 @@ function M.wait(workspace, path, receive)
     end
     if stat.type == "directory" then workspace, path, file_request = path, nil, false end
   end
+  local scope = source.canonical(workspace)
   local state = file_request and workspace_state(workspace) or M.start(workspace)
   if path and source.inside(path, workspace) then prepare_path(state, source.canonical(path)) end
+  local ancestors = 0
+  if not file_request then
+    for _, config in ipairs(state.configs) do
+      local manifest = project_manifest(config)
+      if manifest then
+        ancestors = ancestors + 1
+        local function find(directory)
+          local candidate = directory .. "/" .. manifest
+          vim.uv.fs_stat(candidate, vim.schedule_wrap(function(_, stat)
+            if state.closed then ancestors = ancestors - 1 return end
+            if stat and stat.type == "file" then
+              launch(state, config, candidate, vim.filetype.match({ filename = candidate }) or "")
+              ancestors = ancestors - 1
+            else
+              local parent = vim.fs.dirname(directory)
+              if not parent or parent == directory then ancestors = ancestors - 1
+              else find(parent) end
+            end
+          end))
+        end
+        find(scope)
+      end
+    end
+  end
   local timer, started, finished = assert(vim.uv.new_timer()), vim.uv.now(), false
   local function finish(failure, cancelled, issues)
     if finished then return end
@@ -315,12 +365,12 @@ function M.wait(workspace, path, receive)
   timer:start(0, 50, vim.schedule_wrap(function()
     if state.closed then finish("cancelled: editor LSP startup closed") return end
     local expired = vim.uv.now() - started >= 60000
-    if not file_request and state.discovering and not expired then return end
+    if not file_request and (state.discovering or ancestors > 0) and not expired then return end
     if state.failure then finish(state.failure) return end
     poll(state)
     local filetype = path and vim.filetype.match({ filename = path })
     local failure, ready, issues = nil, false, {}
-    local pending = not file_request and state.discovering
+    local pending = not file_request and (state.discovering or ancestors > 0)
     local failed_clients = {}
     local function issue(name, root, message)
       root = type(root) == "string" and root or state.workspace
@@ -331,20 +381,37 @@ function M.wait(workspace, path, receive)
       if file_request then failure = failure or message end
     end
     local buffer = path and source.loaded(path)
+    local selected = path and options.method and not options.accepts
+      and source.select_client(path, filetype or "", buffer, options.method, workspace) or nil
+    local function relevant(client)
+      return not client.initialized
+        or (not selected or selected.id == client.id)
+          and (not options.method or client:supports_method(options.method, buffer))
+          and (not options.accepts or options.accepts(client))
+    end
     for _, client in ipairs(vim.lsp.get_clients({ _uninitialized = true })) do
       local config = client.config --[[@as vim.lsp.Config]]
       local attached = buffer and vim.lsp.buf_is_attached(buffer, client.id)
       if (source.belongs(client, workspace) or attached) and not client:is_stopped()
         and (not filetype or vim.tbl_contains(config.filetypes or {}, filetype))
-        and (not path or source.covers(client, path) or attached) then
-        if not client.initialized or client.progress and next(client.progress.pending or {}) ~= nil then
+        and (not path or source.covers(client, path) or attached) and relevant(client) then
+        if not client.initialized or not (options.ready and options.ready[client.id] == client)
+          and client.progress and next(client.progress.pending or {}) ~= nil then
           pending = true
           if expired then issue(client.name, client.root_dir or config.root_dir, "timeout: " .. client.name .. " initialization or indexing exceeded 60 seconds.") end
-        else ready = true end
+        else
+          ready = true
+          if options.ready then options.ready[client.id] = client end
+        end
       end
     end
     for _, job in pairs(state.jobs) do
-      if not file_request or path and source.canonical(job.path) == source.canonical(path) then
+      local client = job.client and vim.lsp.get_client_by_id(job.client)
+      local in_scope = not file_request and (source.inside(job.path, scope)
+          or job.root and source.inside(scope, job.root)
+          or source.inside(scope, vim.fs.dirname(job.path)) and (job.path:match("/Cargo%.toml$") or job.path:match("/package%.json$")))
+        or path and source.canonical(job.path) == source.canonical(path)
+      if in_scope and (not client or relevant(client)) then
         if not job.done then
           pending = true
           if expired then issue(job.name, job.root, "timeout: " .. job.name .. " initialization exceeded 60 seconds.") end

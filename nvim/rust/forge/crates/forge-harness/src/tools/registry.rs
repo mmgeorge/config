@@ -99,6 +99,13 @@ impl ControlToolRegistry {
                     return root && context.is_some_and(|context| context.checks.is_some());
                 }
                 if lsp::is_tool(definition.name) {
+                    if lsp::is_mutation(definition.name)
+                        && !context.is_some_and(|context| {
+                            lsp::allowed_mode(context.mode) && !context.question_discussion
+                        })
+                    {
+                        return false;
+                    }
                     return context
                         .and_then(|context| context.lsp.as_ref())
                         .is_some_and(|scope| scope.available());

@@ -10,7 +10,7 @@ The Rust host serves repository operations, GitHub operations, generated documen
 
 ## Executable
 
-The `forge` package builds a library and a thin executable. `src/main.rs` parses arguments and calls `forge::run`, and `src/lib.rs` owns the host, router, runtime, and shutdown modules. No freshness or fingerprint check ever triggers a build.
+The `forge` package builds a library and a thin executable. `src/main.rs` parses arguments and calls `forge::run`, and `src/lib.rs` owns the host, router, runtime, and shutdown modules. No freshness or fingerprint check ever triggers a build. Tokio worker threads use an 8 MiB stack so foreground provider settlement fits within the Windows host runtime.
 
 Windows launches an immutable cached copy under `executables/<source>/<identity>/` in the sidecar cache, so Cargo can replace the build output while an editor runs. Each host pins its image with a read handle until exit. macOS and Linux launch the build output directly, because running processes keep the replaced file. A running host never adopts a rebuild, so verification needs a fresh host.
 

@@ -1,6 +1,6 @@
 # Agent LSP tools
 
-Enable **LSP tools** in `/config` to expose nine read-only tools to root and child
+Enable **LSP tools** in `/config` to expose nine read-only tools and two rename tools to root and child
 agents. The setting defaults to off. Disabling it revokes agent requests without
 stopping editor servers or disabling plan navigation.
 
@@ -20,6 +20,8 @@ context or a semantic query. No tool moves the editor cursor.
 | `lsp_paths` | `from` and `to` selectors, `max_depth=5`, `max_paths=3`, `max_requests=64` | Complete static call paths in aligned trees |
 | `lsp_diagnostics` | Optional file/directory `path`, `severity=all` | File diagnostics, or workspace reports with per-server coverage when path is omitted or a directory |
 | `lsp_status` | Optional `path` | Server roots, initialization state, and supported capabilities |
+| `lsp_rename_symbol` | Target selector and required `new_name` | Apply a symbol rename across files |
+| `lsp_rename_file` | Required `old_path`, `new_path` | Move a file or directory and update references |
 
 Paths are workspace-relative or authorized absolute paths. Lines and columns start
 at one. Columns count Unicode code points, not bytes or screen cells. A returned
@@ -30,13 +32,21 @@ declarations before pagination. Name matching uses a case-insensitive substring 
 the short or qualified name. Without a path, a name query searches the language
 server's workspace symbols. `scope=all` can then include authorized dependency
 symbols outside the workspace.
+Overview and source-scoped symbol listings parse source directly, without starting
+language servers or waiting for indexing.
+Context with a local target also reads source directly; requested relationships
+and workspace name searches wait for the relevant servers. Optional hover is
+included only when its server is already ready. Semantic queries reuse server
+readiness within one tool call and check it again on the next call.
+Root discovery skips callbacks that do not answer within two seconds; a server
+that has started retains the longer initialization timeout.
 Rust searches request all symbol kinds from rust-analyzer rather than its default
 type-only search. Missing paths are rejected before language-server startup and
 do not affect later valid requests.
 
 ### Target selectors
 
-Definition, context, references, and calls share these selectors. Paths use the
+Definition, context, references, calls, and symbol rename share these selectors. Paths use the
 same selector independently for `from` and `to`.
 
 | Selector | Resolution |
@@ -297,6 +307,24 @@ partial coverage does not establish that the workspace has no diagnostics.
 Servers that only report diagnostics for opened files cannot certify full workspace
 coverage. Workspace-symbol queries use the same project discovery and coverage reporting.
 
-The tools do not create projects, install dependencies, apply edits, or execute
-arbitrary server commands. Existing dependency source remains subject to the read
-policy. Completion, rename, and code actions remain outside this interface.
+## Rename files and symbols
+
+Prefer `lsp_rename_symbol` for a symbol rename and `lsp_rename_file` for a file or directory move. The enabled LSP setting injects the LSP guidance immediately after Harness's system instructions, naming these tools and the semantic search tools. Read-only planning and question-discussion turns cannot invoke rename.
+
+```json
+{"path":"src/store.rs","symbol":"Store::save","new_name":"persist"}
+```
+
+```json
+{"old_path":"src/store.rs","new_path":"src/storage.rs"}
+```
+
+Both tools write to disk. They require existing read and write permission for every affected path, including move destinations and directory descendants. Missing permission returns an error without opening an approval prompt. Saved tool denials still apply. Any affected unsaved buffer rejects the whole operation; save or discard those changes before requesting a rename.
+
+Symbol rename uses `prepareRename` when supported and applies the server's complete workspace edit. That edit may include file creation, moves, or deletion. File rename requires a matching `workspace/willRenameFiles` provider and never falls back to a plain move. All matching providers must succeed, and incompatible edits reject the operation. A successful empty response means no reference edits are needed.
+
+The host validates the complete operation sequence, snapshots affected resources, rechecks source freshness, and rolls back filesystem changes on an application failure. Rollback failures identify affected paths. Open clean buffers follow committed contents and names, and the change set is attributed to the native tool in the Harness timeline. Server file-operation notifications are sent only after commit.
+
+Explicit file moves require a vacant destination. Server-returned operations honor their overwrite and ignore options. Cross-filesystem moves, symlink resources, non-file URIs, and nested resource operations returned by file-operation preparation are rejected. Output limits affect the summary only, never the applied edit set.
+
+The tools do not install dependencies or execute arbitrary server commands. Completion and code actions remain outside this interface.

@@ -24,6 +24,8 @@ Write-off denies every write, including writes to unknown paths, regardless of r
 
 `PermissionStore` loads one validated document from `stdpath("config")/forge/permissions.json`, edited through `:ForgePermissions`, and compiles its matchers once.
 
+Built-in host tools default to Allow at the tool-approval layer. Explicit saved tool rules still apply, including Ask and Deny. Resource permissions, directory scopes, write-off, protected paths, and tool-specific admission remain independent. External provider and MCP tools continue to require approval when no saved rule matches.
+
 ## Reported paths
 
 Adapters reconstruct the affected paths before the coordinator sees a request. Codex resolves item approvals from the matching file proposal, and ACP combines partial callbacks with its tool snapshot. Missing targets stay unresolved, and a malformed target list fails as a whole.

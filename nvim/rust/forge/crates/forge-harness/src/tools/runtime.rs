@@ -248,7 +248,8 @@ impl ControlToolRuntime {
                         | "plan_overview_read"
                 ) || (super::session::is_tool(&invocation.name)
                     || invocation.name == super::config::NAME)
-                    || super::lsp::is_tool(&invocation.name),
+                    || (super::lsp::is_tool(&invocation.name)
+                        && !super::lsp::is_mutation(&invocation.name)),
                 "question discussion cannot change task state or workspace content"
             );
         }

@@ -28,8 +28,10 @@ struct Selection {
 struct Pending {
     session: String,
     scope: Arc<LspScope>,
-    result: oneshot::Sender<Result<Reply>>,
+    result: oneshot::Sender<Result<Value>>,
     upload: Option<AnalysisUpload>,
+    response_upload: String,
+    mutation: bool,
 }
 
 struct AnalysisUpload {
@@ -72,6 +74,7 @@ pub(crate) struct LspService {
     pending: Mutex<HashMap<String, Pending>>,
     selection: Mutex<HashMap<String, Arc<Selection>>>,
     slots: Semaphore,
+    pub(super) mutations: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Default for LspService {
@@ -81,6 +84,7 @@ impl Default for LspService {
             pending: Mutex::new(HashMap::new()),
             selection: Mutex::new(HashMap::new()),
             slots: Semaphore::new(4),
+            mutations: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 }
@@ -143,6 +147,9 @@ impl LspService {
             interaction,
             workspace,
             policy,
+            mutation_policy: std::sync::RwLock::new(None),
+            protected_path: std::sync::RwLock::new(None),
+            changes: super::changes::ChangePublication::default(),
             cancelled,
             active: AtomicBool::new(true),
             authority: std::sync::RwLock::new(None),
@@ -159,18 +166,30 @@ impl LspService {
         id: &str,
         paths: Vec<String>,
     ) -> Result<Value> {
-        let scope = {
+        let (scope, mutation) = {
             let pending = self.pending.lock().unwrap();
             let request = pending.get(id).context("LSP request is no longer active")?;
             ensure!(
                 request.session == session,
                 "LSP response belongs to another session"
             );
-            request.scope.clone()
+            (request.scope.clone(), request.mutation)
         };
         let mut allowed = serde_json::Map::new();
         for path in paths {
-            allowed.insert(path.clone(), json!(scope.authorize(&path).await.is_ok()));
+            let permitted = if mutation {
+                let policy = scope
+                    .mutation_policy
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("LSP permission lock poisoned"))?
+                    .clone();
+                policy.is_some_and(|policy| {
+                    super::transaction::authorize(&scope, &policy, &path, false).is_ok()
+                })
+            } else {
+                scope.authorize(&path).await.is_ok()
+            };
+            allowed.insert(path, json!(permitted));
         }
         scope.check()?;
         Ok(Value::Object(allowed))
@@ -326,9 +345,29 @@ impl LspService {
             "LSP response belongs to another session"
         );
         request.scope.check()?;
+        if failure.is_none()
+            && let Some(part) = result.get("mutation_chunk")
+        {
+            let chunk = part.as_str().context("invalid mutation response chunk")?;
+            let offset = result["offset"]
+                .as_u64()
+                .context("missing mutation chunk offset")?;
+            let request = entry.into_mut();
+            ensure!(
+                usize::try_from(offset)? == request.response_upload.len(),
+                "invalid mutation chunk order"
+            );
+            request.response_upload.push_str(chunk);
+            return Ok(());
+        }
+        let result = if result.get("mutation_complete").and_then(Value::as_bool) == Some(true) {
+            serde_json::from_str(&request.response_upload).context("invalid mutation response")?
+        } else {
+            result
+        };
         let result = match failure {
             Some(failure) => Err(anyhow::anyhow!(failure)),
-            None => serde_json::from_value(result).context("invalid editor LSP response"),
+            None => Ok(result),
         };
         let request = entry.remove();
         let _ = request.result.send(result);
@@ -338,11 +377,15 @@ impl LspService {
 
 /// Limits LSP access to one authenticated live interaction and preference generation.
 pub(crate) struct LspScope {
-    service: Arc<LspService>,
-    session: String,
-    interaction: String,
-    workspace: PathBuf,
-    policy: Arc<CompiledPermissionDocument>,
+    pub(super) changes: super::changes::ChangePublication,
+    pub(super) service: Arc<LspService>,
+    pub(super) session: String,
+    pub(super) interaction: String,
+    pub(super) workspace: PathBuf,
+    pub(super) policy: Arc<CompiledPermissionDocument>,
+    pub(super) protected_path: std::sync::RwLock<Option<PathBuf>>,
+    pub(super) mutation_policy:
+        std::sync::RwLock<Option<Arc<crate::permissions::directory::DirectoryPolicy>>>,
     cancelled: Arc<AtomicBool>,
     active: AtomicBool,
     authority: std::sync::RwLock<Option<crate::tools::TaskAuthority>>,
@@ -356,7 +399,7 @@ impl LspScope {
         self.check().is_ok() && self.service.sender.lock().unwrap().is_some()
     }
 
-    fn check(&self) -> Result<()> {
+    pub(super) fn check(&self) -> Result<()> {
         ensure!(
             self.active.load(Ordering::Acquire) && !self.cancelled.load(Ordering::Acquire),
             "cancelled: LSP request cancelled."
@@ -425,6 +468,96 @@ impl LspScope {
         self.query(arguments).await
     }
 
+    /// Preserve native tool identity when attaching committed rename changes.
+    pub(crate) fn observe_changes(
+        &self,
+        event: &forge_provider_api::ProviderEvent,
+    ) -> Vec<forge_provider_api::ProviderEvent> {
+        self.changes.observe(event)
+    }
+
+    /// Bind effective directory access before the provider advertises mutating tools.
+    pub(crate) fn bind_mutation_policy(
+        &self,
+        policy: Arc<crate::permissions::directory::DirectoryPolicy>,
+        protected_path: PathBuf,
+    ) -> Result<()> {
+        *self
+            .protected_path
+            .write()
+            .map_err(|_| anyhow::anyhow!("LSP permission lock poisoned"))? = Some(protected_path);
+        *self
+            .mutation_policy
+            .write()
+            .map_err(|_| anyhow::anyhow!("LSP permission lock poisoned"))? = Some(policy);
+        Ok(())
+    }
+
+    /// Exchange one correlated mutation phase with the editor.
+    pub(super) async fn mutation_request(
+        self: &Arc<Self>,
+        id: &str,
+        mutation: Value,
+    ) -> Result<Value> {
+        self.check()?;
+        let _slot = self
+            .service
+            .slots
+            .try_acquire()
+            .context("busy: All LSP request slots are occupied.")?;
+        let sender = self
+            .service
+            .sender
+            .lock()
+            .unwrap()
+            .clone()
+            .context("disconnected: No editor connection.")?;
+        let (complete, result) = oneshot::channel();
+        self.service.pending.lock().unwrap().insert(
+            id.into(),
+            Pending {
+                session: self.session.clone(),
+                scope: self.clone(),
+                result: complete,
+                upload: None,
+                response_upload: String::new(),
+                mutation: true,
+            },
+        );
+        let flight = Flight {
+            service: self.service.clone(),
+            session: self.session.clone(),
+            id: id.into(),
+            sender: sender.clone(),
+        };
+        let event = SessionEvent {
+            session_id: self.session.clone(),
+            event: "lsp.mutation".into(),
+            payload: json!({"id":id,"workspace":self.workspace,"mutation":mutation}),
+        };
+        let received = tokio::time::timeout(Duration::from_secs(75), async {
+            sender.send_event(event).await?;
+            tokio::pin!(result);
+            let mut tick = tokio::time::interval(Duration::from_millis(25));
+            loop { tokio::select! {
+                result = &mut result => break result.context("disconnected: Editor closed during rename.")?,
+                _ = tick.tick() => self.check()?,
+            } }
+        }).await.context("timeout: Editor rename request expired.").and_then(|result| result);
+        drop(flight);
+        received
+    }
+
+    /// Release editor preparation even when an awaiting caller has been cancelled.
+    pub(super) fn release_mutation(&self, id: &str, committed: bool) {
+        if let Some(sender) = self.service.sender.lock().unwrap().clone() {
+            let _ = sender.send_control(forge_protocol::message::Message::Event(SessionEvent {
+                session_id: self.session.clone(), event: "lsp.mutation".into(),
+                payload: json!({"id":id,"workspace":self.workspace,"mutation":{"kind":"release","committed":committed}}),
+            }));
+        }
+    }
+
     /// Run a decoded query under the live editor scope and read policy.
     pub(super) async fn query(self: &Arc<Self>, mut arguments: Arguments) -> Result<String> {
         self.check()?;
@@ -471,6 +604,8 @@ impl LspScope {
                 scope: self.clone(),
                 result: complete,
                 upload: None,
+                response_upload: String::new(),
+                mutation: false,
             },
         );
         let flight = Flight {
@@ -500,7 +635,8 @@ impl LspScope {
         }).await.context("timeout: Editor did not complete LSP startup and query within its deadline.").and_then(|result| result);
         drop(flight);
         self.check()?;
-        let reply = received?;
+        let reply: Reply =
+            serde_json::from_value(received?).context("invalid editor LSP response")?;
         for row in reply.rows.iter().chain(&reply.omitted_visibility) {
             self.authorize(&row.path).await?;
             if let Some(path) = &row.excerpt_path {
@@ -586,7 +722,7 @@ mod tests {
             assert!(Arguments::parse(name, value).is_err());
         }
         assert!(Arguments::parse("lsp", json!({})).is_err());
-        assert_eq!(definitions().len(), 9);
+        assert_eq!(definitions().len(), 11);
     }
 
     async fn fixture() -> (

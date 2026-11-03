@@ -14,6 +14,20 @@ impl ProviderRequest {
         )
     }
 
+    /// Inject enabled LSP guidance immediately after the Harness system instructions.
+    fn lsp_guidance(&self) -> &'static str {
+        if self
+            .control_context
+            .as_ref()
+            .and_then(|context| context.lsp.as_ref())
+            .is_some_and(|scope| scope.available())
+        {
+            include_str!("../prompts/lsp.md")
+        } else {
+            ""
+        }
+    }
+
     /// Supply current interaction context even when a provider reuses a live session.
     pub(crate) fn interaction_contract(&self) -> String {
         let purpose = match self.mode {
@@ -58,16 +72,6 @@ impl ProviderRequest {
             crate::session::CheckShell::System if cfg!(windows) => "PowerShell 7 (pwsh)",
             crate::session::CheckShell::System => "the system login shell",
         };
-        let lsp = if self
-            .control_context
-            .as_ref()
-            .and_then(|context| context.lsp.as_ref())
-            .is_some_and(|scope| scope.available())
-        {
-            "\nLSP tools are available. Use lsp_overview for a map of a directory's public items, lsp_symbols to find names and their exact positions, and lsp_context for a declaration's documentation and source. Point lsp_definition (definition, type, or implementation), lsp_context, lsp_references, and lsp_calls at a short or qualified symbol name, optionally with a file, or at an exact path, line, and column. A path, line, and symbol together select one occurrence. An ambiguous query returns candidates, so pick one instead of guessing. Use lsp_paths with from and to selectors to find static call chains between two known points. Positions are 1-based and count Unicode code points. In excerpts, matching lines start with >, and declaration headers include columns you can reuse. Keep token_budget small, and follow next_offset or next_line only when you need more. Queries start the matching language servers when needed, reuse the editor's clients, and wait for them to initialize. Run lsp_diagnostics after edits, and omit its path for a workspace report with per-server coverage. Partial coverage and stale or unknown diagnostics do not prove that the code type-checks. lsp_status shows existing clients without starting servers and is not needed before each query. Use text search for literal strings or when semantic queries are unavailable."
-        } else {
-            ""
-        };
         let check_editing = if self
             .control_context
             .as_ref()
@@ -93,7 +97,8 @@ impl ProviderRequest {
             String::new()
         };
         format!(
-            "Current Harness interaction\nTool approval: {}.{approval_guidance}\nAccess configuration: {}.\nWhen write_access is off, file writes are rejected in every approval mode, and only the user can turn writes on with /write.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}, so setup commands must target that shell. Read check_definition_list for the live automatic_checks and check_timing settings. Automatic completion checks are off unless the user enables them. When they are on, they run at the configured point in the work queue. When they are off, run required validation with check_run. Read results with check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run the checks. A delegated agent without check tools leaves validation to its parent.\n{planning_feedback}{lsp}{harness}",
+            "{}Current Harness interaction\nTool approval: {}.{approval_guidance}\nAccess configuration: {}.\nWhen write_access is off, file writes are rejected in every approval mode, and only the user can turn writes on with /write.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}, so setup commands must target that shell. Read check_definition_list for the live automatic_checks and check_timing settings. Automatic completion checks are off unless the user enables them. When they are on, they run at the configured point in the work queue. When they are off, run required validation with check_run. Read results with check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run the checks. A delegated agent without check tools leaves validation to its parent.\n{planning_feedback}{harness}",
+            self.lsp_guidance(),
             self.approval_mode.label(),
             serde_json::to_string(&self.access).expect("access policy serializes")
         )
@@ -106,6 +111,55 @@ mod test {
     use crate::provider::{ProviderInput, ServiceTier};
     use crate::session::ApprovalMode;
     use crate::tools::ControlTurnContext;
+
+    #[test]
+    fn lsp_guidance_follows_system_and_disappears_when_disabled() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        let directory = tempfile::tempdir().unwrap();
+        let service = Arc::new(crate::tools::lsp::LspService::default());
+        let (sender, _receiver) = forge_protocol::outbound::channel();
+        service.attach(sender);
+        service.set_enabled("session", true);
+        let policy = Arc::new(
+            crate::permissions::matcher::CompiledPermissionDocument::compile(
+                crate::permissions::document::default_permission_document(),
+                directory.path(),
+            ),
+        );
+        let (scope, _lease) = service.scope(
+            "session".into(),
+            "turn".into(),
+            directory.path().into(),
+            policy,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
+        context.lsp = Some(scope);
+        let request = ProviderRequest {
+            execution_owner: None,
+            harness_session_id: "session".into(),
+            workspace: directory.path().display().to_string(),
+            input: ProviderInput::from_text("Find a symbol"),
+            mode: PromptMode::Chat,
+            model: "default".into(),
+            effort: "low".into(),
+            context_window: None,
+            service_tier: ServiceTier::Standard,
+            access: Default::default(),
+            approval_mode: ApprovalMode::Ask,
+            provider_session_id: None,
+            submission: None,
+            recovered_input: Vec::new(),
+            control_context: Some(context),
+        };
+        let message = request.system_message();
+        assert!(message.starts_with(&format!("{HARNESS_SYSTEM_MESSAGE}\n\n# LSP")));
+        assert!(request.interaction_contract().contains("lsp_rename_file"));
+        assert!(message.contains("lsp_rename_symbol") && message.contains("lsp_symbols"));
+        service.set_enabled("session", false);
+        assert!(!request.system_message().contains("# LSP"));
+        assert!(!request.interaction_contract().contains("lsp_rename_symbol"));
+    }
 
     #[test]
     fn background_profile_excludes_workflow_instructions_and_tools() {

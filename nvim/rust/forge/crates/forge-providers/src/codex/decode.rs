@@ -8,6 +8,28 @@ use forge_provider_api::{
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
 
+#[derive(serde::Deserialize)]
+struct DynamicToolCall {
+    tool: String,
+    arguments: Value,
+}
+
+/// Decode the app-server dynamic-tool request into the normalized host call.
+pub(super) fn dynamic_tool_call(
+    value: &Value,
+) -> Result<forge_provider_api::control::ToolCall, serde_json::Error> {
+    let call: DynamicToolCall = serde_json::from_value(value.clone())?;
+    Ok(forge_provider_api::control::ToolCall {
+        name: call.tool,
+        arguments: call.arguments,
+    })
+}
+
+/// Encode tool output with the app-server response fields and content discriminator.
+pub(super) fn dynamic_tool_response(text: String, success: bool) -> Value {
+    json!({"contentItems":[{"type":"inputText","text":text}],"success":success})
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("invalid Codex tool status")]
 struct InvalidCodexToolStatus;
@@ -892,6 +914,30 @@ pub fn first_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Match the installed app-server schema rather than an MCP response envelope.
+    #[test]
+    fn dynamic_tool_wire_contract_uses_tool_and_content_items() {
+        let call = super::dynamic_tool_call(&serde_json::json!({
+            "tool":"repository_status", "arguments":{"offset":0},
+            "callId":"call", "threadId":"thread", "turnId":"turn"
+        }))
+        .unwrap();
+        assert_eq!(call.name, "repository_status");
+        assert_eq!(call.arguments, serde_json::json!({"offset":0}));
+        assert!(
+            super::dynamic_tool_call(&serde_json::json!({
+                "name":"repository_status", "arguments":{}
+            }))
+            .is_err()
+        );
+        for success in [true, false] {
+            assert_eq!(
+                super::dynamic_tool_response("result".into(), success),
+                serde_json::json!({"contentItems":[{"type":"inputText","text":"result"}],"success":success})
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

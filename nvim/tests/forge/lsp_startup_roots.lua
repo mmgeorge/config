@@ -9,7 +9,9 @@ local nested_path, main_path = nested .. "/tool.lua", project .. "/z-app/main.lu
 vim.fn.writefile({ "return {}" }, nested_path)
 vim.fn.writefile({ "return {}" }, main_path)
 local original = { configs = vim.lsp.get_configs, start = vim.lsp.start,
-  client = vim.lsp.get_client_by_id, clients = vim.lsp.get_clients, attached = vim.lsp.buf_is_attached }
+  client = vim.lsp.get_client_by_id, clients = vim.lsp.get_clients, attached = vim.lsp.buf_is_attached, scan = vim.uv.fs_scandir }
+local scans = 0
+vim.uv.fs_scandir = function(...) scans = scans + 1 return original.scan(...) end
 local launched, clients = {}, {}
 local nested_only = false
 local main_root = directory
@@ -45,6 +47,9 @@ local success, failure = xpcall(function()
   await()
   assert(#launched == 2 and vim.tbl_contains(launched, source.canonical(directory))
     and vim.tbl_contains(launched, source.canonical(nested)), "workspace startup omitted a distinct root: " .. vim.inspect(launched))
+  local discovered_scans = scans
+  await(project)
+  assert(scans == discovered_scans, "subdirectory request repeated completed parent discovery")
   await(main_path)
   assert(#launched == 2, "first main-project request launched another server")
   await(nested_path)
@@ -66,6 +71,7 @@ startup.close()
 vim.lsp.get_configs, vim.lsp.start = original.configs, original.start
 vim.lsp.get_client_by_id, vim.lsp.get_clients = original.client, original.clients
 vim.lsp.buf_is_attached = original.attached
+vim.uv.fs_scandir = original.scan
 vim.fn.delete(directory, "rf")
 assert(success, failure)
 print("lsp_startup_roots: passed")

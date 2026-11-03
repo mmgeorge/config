@@ -22,6 +22,7 @@ pub(crate) fn capture_directory(
         "folder snapshots require Harness data in a separate directory; select a data_root outside the workspace root"
     );
     let mut file = Vec::new();
+    let mut excluded = std::collections::BTreeSet::new();
     let mut pending = vec![workspace.clone()];
     while let Some(directory) = pending.pop() {
         let mut entries = std::fs::read_dir(&directory)?
@@ -37,7 +38,17 @@ pub(crate) fn capture_directory(
                 pending.push(path);
                 continue;
             }
-            let (object_id, mode) = if metadata.is_symlink() {
+            let relative = path
+                .strip_prefix(&workspace)?
+                .to_str()
+                .context("workspace snapshot path is not UTF-8")?
+                .replace('\\', "/");
+            let kind = super::file_kind::classify(&path, &metadata)?;
+            if matches!(kind, super::file_kind::FileKind::Excluded) {
+                excluded.insert(relative);
+                continue;
+            }
+            let (object_id, mode) = if matches!(kind, super::file_kind::FileKind::Symlink) {
                 let target = std::fs::read_link(&path)?;
                 (
                     objects.put(target.as_os_str().as_encoded_bytes())?,
@@ -55,7 +66,18 @@ pub(crate) fn capture_directory(
                 };
                 #[cfg(not(unix))]
                 let mode = 0o100644;
-                (objects.put_file(&path)?, mode)
+                let Some(captured) =
+                    objects.capture_file(&path, &workspace, None, &mut || Ok(()))?
+                else {
+                    excluded.insert(relative);
+                    continue;
+                };
+                (
+                    captured
+                        .object_id
+                        .context("capture without a baseline requires an object")?,
+                    mode,
+                )
             } else {
                 anyhow::bail!(
                     "workspace snapshot cannot capture special file {}",
@@ -63,18 +85,19 @@ pub(crate) fn capture_directory(
                 );
             };
             file.push(CheckpointFile {
-                path: path
-                    .strip_prefix(&workspace)?
-                    .to_str()
-                    .context("workspace snapshot path is not UTF-8")?
-                    .replace('\\', "/"),
+                path: relative,
                 object_id,
                 mode,
             });
         }
     }
     file.sort_by(|left, right| left.path.cmp(&right.path));
-    let id = crate::plan::digest(&serde_json::to_vec(&(&session_id, &workspace, &file))?);
+    let id = crate::plan::digest(&serde_json::to_vec(&(
+        &session_id,
+        &workspace,
+        &file,
+        &excluded,
+    ))?);
     Ok(CheckpointRecord {
         id,
         session_id,
@@ -84,7 +107,7 @@ pub(crate) fn capture_directory(
         file,
         deleted: Vec::new(),
         checkout: Default::default(),
-        excluded: Default::default(),
+        excluded,
         created_at_ms: now_ms,
     })
 }

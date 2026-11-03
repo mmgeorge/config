@@ -410,6 +410,7 @@ impl GitCheckpoint {
         let mut deleted = inventory.missing.into_iter().collect::<Vec<_>>();
         let mut source = Vec::new();
         let mut reusable = true;
+        let mut excluded = inventory.excluded;
         for relative in &inventory.candidate {
             check()?;
             let path = self.file_path(relative)?;
@@ -436,10 +437,12 @@ impl GitCheckpoint {
                 }
                 continue;
             }
-            anyhow::ensure!(
-                metadata.is_file() || metadata.is_symlink(),
-                "unsupported checkpoint file kind: {relative}"
-            );
+            let kind = super::file_kind::classify(&path, &metadata)?;
+            if matches!(kind, super::file_kind::FileKind::Excluded) {
+                excluded.insert(relative.clone());
+                reusable = false;
+                continue;
+            }
             #[allow(unused_mut)]
             let mut mode = super::restore::file_mode(&metadata);
             #[cfg(windows)]
@@ -455,7 +458,7 @@ impl GitCheckpoint {
                 .base
                 .get(relative)
                 .filter(|base| base.mode == mode && base.checkout.unsupported.is_none());
-            let identity = if metadata.is_symlink() {
+            let identity = if matches!(kind, super::file_kind::FileKind::Symlink) {
                 let target = fs::read_link(&path)?;
                 let content = target.as_os_str().as_encoded_bytes();
                 let digest = crate::plan::digest(content);
@@ -491,6 +494,11 @@ impl GitCheckpoint {
                             });
                         }
                     };
+                let Some(captured) = captured else {
+                    excluded.insert(relative.clone());
+                    reusable = false;
+                    continue;
+                };
                 if let Some(stamp) = captured.stamp {
                     source.push((path.clone(), stamp));
                 } else {
@@ -522,7 +530,7 @@ impl GitCheckpoint {
             &file,
             &deleted,
             &checkout,
-            &inventory.excluded,
+            &excluded,
         ))?;
         let record = CheckpointRecord {
             id: crate::plan::digest(&manifest),
@@ -533,7 +541,7 @@ impl GitCheckpoint {
             file,
             deleted,
             checkout,
-            excluded: inventory.excluded,
+            excluded,
             created_at_ms: now_ms,
         };
         let cached = CachedCheckpoint {

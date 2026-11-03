@@ -1121,7 +1121,7 @@ pub struct PortableSettings {
     pub tool_timeout: Option<crate::session::InputTimeout>,
     /// Enables the root's model-facing child tools without restricting manual admission.
     pub subagent_tools: Option<bool>,
-    /// Enables read-only tools backed by the connected editor language servers.
+    /// Enables editor-backed code queries and permission-checked rename tools.
     pub lsp_tools: Option<bool>,
     /// Exposes read-only session history tools independently of configuration inspection.
     pub session_tools: Option<bool>,

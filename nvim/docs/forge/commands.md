@@ -279,6 +279,11 @@ A reported write while writing is off is rejected without a mode-switch popup.
 Use `/write` explicitly to enable workspace writes. Plan, Execute, Goal, and task
 resumption retain selected filesystem access.
 
+Built-in Harness tools, including LSP tools, are allowed without a tool-approval
+popup by default. Saved tool rules still apply. File access, write mode, and
+protected-path checks remain enforced. External MCP and provider tools keep their
+normal approval behavior.
+
 File-write permission popups offer **Always allow writes in this workspace** for
 paths inside the current workspace. The choice persists a workspace-specific rule,
 not filesystem-wide access. Explicit denials and protected files remain restricted.
@@ -329,6 +334,11 @@ workspaces. An active exchange without a saved comparison displays a pending ind
 During recapture, a nonempty previous comparison remains visible as **previous capture**.
 Failed recapture retains that comparison with the
 failure reason. Checkpoints remain available through `/undo`.
+
+Checkpoints capture text files and symlink targets. Sockets, pipes, devices, and
+files containing NUL in their first 8 KiB are excluded from comparison and file
+restoration. The binary check runs during the existing read, without a separate
+file scan.
 
 `/fork [name]` opens a child timeline with a snapshot of the source's visible history
 above its fork marker. New child messages append below that marker. Source updates do
@@ -486,9 +496,11 @@ file references for the agent to inspect with tools, rather than native document
 inputs. Import errors keep the original path and report the failure. Finish pending
 imports before submitting. Attempts during import retain the draft and show a notice.
 
-`/config` includes an **LSP** toggle under **Tools**. It enables the read-only
-[`lsp` tool](lsp-tools.md) for model-driven code exploration without
-changing interactive plan navigation or starting language servers.
+`/config` includes an **LSP** toggle under **Tools**. It enables the
+[LSP tools](lsp-tools.md) for code exploration and permission-checked symbol,
+file, and directory renames. It also adds LSP guidance after the
+Harness system prompt. Enabling the setting does not start language servers or
+change interactive plan navigation.
 
 `/config` opens five tabs: **Models**, **Workflow**, **Permissions**, **Tools**, and
 **System**. The window occupies the bottom 80% of the host at full width.

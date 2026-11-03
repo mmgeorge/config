@@ -10,6 +10,8 @@ Every Git interaction captures a baseline before its first provider turn and a t
 
 The initial status inventory defines the candidate set, so a clean file edited afterward belongs to the next checkpoint. This is per-file capture, not an atomic filesystem snapshot. Clean files resolve through the recorded tree, and only changed files need content acquisition. Capture streams each file into `ObjectStore::put_file`, compares source stamps before and after, and publishes an object only when both agree. A matching status observation reuses the previous record without enumeration or copying. The `checkpoint_latency` release example enforces a one-second budget for capture and persistence on a large worktree.
 
+Capture classifies filesystem entries before reading content. Symlinks retain their targets; sockets, pipes, and device files are excluded. Windows Unix-domain sockets are identified by their reparse tag rather than their regular-file metadata. During the existing regular-file read, a NUL byte in the first 8 KiB marks binary content for exclusion. This bounded heuristic adds no separate content read. Excluded paths are retained in the checkpoint exclusion set, so comparisons and restoration never treat skipped resources as deleted text files. Ordinary file-access errors remain failures.
+
 ## Tool barrier
 
 An edit made before the baseline exists cannot be undone, so tools wait for capture. The broker persists the baseline before releasing the exchange's tool barrier. Codex waits on a temporary PreToolUse command that runs `forge checkpoint-wait`, Copilot uses its pre-tool hook, and providers without a hook wait before the model request. A resumed Codex thread with background terminals also waits before inference, because terminal stdin bypasses its hook.
@@ -25,6 +27,8 @@ At terminal capture, `ProviderChangeIndex` collects paths from successful struct
 Checkpoint comparisons run on the runtime `DiffEngine`. `forge-diff::raw` uses histogram comparison with `imara-diff`, and its hunk identities include both source hashes, representations, and exact byte ranges. `SourceVersion` keeps complete bytes with a lazy SHA-256 identity. Saved patch presentation compares LF and CRLF lines by text and reports line-ending conversions separately, while the raw patch and restore keep the original bytes.
 
 Finalization commits the terminal checkpoint and exchange together, and only a successful commit replaces live comparison state. A failure keeps the earlier evidence and records the error. An empty patch shows no workspace-change row, and missing evidence shows **Workspace changes unavailable**.
+
+An in-progress finalization may change its intended outcome to Failed when capture or cleanup fails. Other outcome changes remain rejected, and a finished exchange cannot re-enter finalization. This lets failure handling retry capture or retain the original capture error instead of repeatedly failing on an outcome conflict.
 
 ## Object store
 
