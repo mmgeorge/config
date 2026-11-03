@@ -1380,11 +1380,15 @@ impl HarnessBroker {
                 .latest_exchange(&self.session.id)?
                 .context("interrupted exchange is missing")?;
             let notice = "Continue the interrupted request using the current repository and completed tool results. Do not repeat completed actions.";
-            Some(if previous.elicitation().is_some() {
-                notice.to_owned()
+            if previous.is_finished() {
+                None
             } else {
-                format!("{notice}\n\nOriginal request: {}", previous.prompt)
-            })
+                Some(if previous.elicitation().is_some() {
+                    notice.to_owned()
+                } else {
+                    format!("{notice}\n\nOriginal request: {}", previous.prompt)
+                })
+            }
         } else {
             None
         };

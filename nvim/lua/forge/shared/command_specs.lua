@@ -6,8 +6,8 @@ local M = {}
 
 ---@type ForgeStatusCommandSpec[]
 M.specs = {
-  { id = "toggle_visibility", label = "visibility", desc = "Toggle All/Public diff visibility", modes = "n", keymap = "diff", pinned = true, views = { status = true, pr = true, diff = true, review = true } },
-  { id = "toggle_presentation", label = "presentation", desc = "Toggle Full/Semantic diff presentation", modes = "n", keymap = "diff", pinned = true, views = { status = true, pr = true, diff = true, review = true } },
+  { id = "toggle_visibility", label = "visibility", desc = "Toggle All/Public diff visibility", modes = "n", keymap = "diff", pinned = false, views = { status = true, pr = true, diff = true, review = true } },
+  { id = "toggle_presentation", label = "presentation", desc = "Toggle Full/Semantic diff presentation", modes = "n", keymap = "diff", pinned = false, views = { status = true, pr = true, diff = true, review = true } },
   { id = "toggle", label = "toggle", desc = "Toggle fold", modes = "n", pinned = true, views = { status = true, pr = true, diff = true, review = true } },
   { id = "collapse_parent", label = "Collapse Parent", desc = "Collapse Parent", modes = "n", pinned = true, views = { status = true, pr = true, diff = true, review = true } },
   { id = "next_hunk", label = "next hunk", desc = "Jump to the next hunk", modes = "n", pinned = false, views = { status = true, diff = true } },

@@ -285,6 +285,14 @@ impl HarnessBroker {
             ForegroundSignal::Cleanup(ExecutionCleanup::Idle | ExecutionCleanup::Pending) => {
                 Ok(ForegroundAction::Wait)
             }
+            ForegroundSignal::Cleanup(ExecutionCleanup::RestartCollected) => {
+                // Collection proves quiescence even when no further native terminal arrives.
+                // Drain accepted observations before settling through the restart path.
+                transaction.native_open = false;
+                transaction.pending_native_ready = Some(Err(ProviderError::Cancelled));
+                self.collect_foreground_observations(transaction)?;
+                Ok(ForegroundAction::Wait)
+            }
             ForegroundSignal::Cleanup(ExecutionCleanup::Failed(message)) => self.fail_foreground(
                 transaction,
                 anyhow::anyhow!("execution cleanup failed: {message}"),

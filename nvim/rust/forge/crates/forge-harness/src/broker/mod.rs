@@ -1598,6 +1598,8 @@ pub(crate) enum ExecutionCleanup {
     #[default]
     Idle,
     Pending,
+    /// Native collection completed; settle the current exchange for configuration resumption.
+    RestartCollected,
     Failed(String),
 }
 
@@ -1712,7 +1714,7 @@ impl TurnCancellation {
     /// Wake host restart finalization after native collection already established quiescence.
     pub(crate) fn finish_restart_cleanup(&self) {
         self.restart.store(true, Ordering::Release);
-        self.request(false);
+        self.cleanup.send_replace(ExecutionCleanup::RestartCollected);
     }
 
     /// Retain provider delivery while cancellation waits for terminal execution evidence.
@@ -10572,11 +10574,11 @@ mod test {
     async fn collected_restart_wakes_finalization_without_native_terminal() {
         let cancellation = super::TurnCancellation::new();
         cancellation.begin_cleanup(true, false).unwrap();
-        let cancelled = cancellation.cancelled();
-        tokio::pin!(cancelled);
-        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        let mut cleanup = cancellation.cleanup.subscribe();
         cancellation.finish_restart_cleanup();
-        cancelled.await;
+        cleanup.changed().await.unwrap();
+        assert!(matches!(*cleanup.borrow(), super::ExecutionCleanup::RestartCollected));
+        assert!(!cancellation.requested.load(std::sync::atomic::Ordering::Acquire));
         assert!(
             cancellation
                 .restart
