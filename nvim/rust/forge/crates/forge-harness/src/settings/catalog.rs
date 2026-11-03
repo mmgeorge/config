@@ -1,5 +1,6 @@
 use crate::provider::ResourceScope;
 use anyhow::{Context, Result, ensure};
+use forge_provider_api::session::{McpLaunch, McpTransport};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -68,16 +69,6 @@ pub(crate) enum ServerTransport {
     Sse,
 }
 
-impl ServerTransport {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Stdio => "stdio",
-            Self::Http => "http",
-            Self::Sse => "sse",
-        }
-    }
-}
-
 enum ResolvedLaunch {
     Stdio {
         command: String,
@@ -94,35 +85,20 @@ struct RemoteLaunch {
 }
 
 impl ResolvedLaunch {
-    fn into_native(self) -> serde_json::Map<String, Value> {
-        let fields = match self {
+    fn into_transport(self) -> McpTransport {
+        match self {
             Self::Stdio {
                 command,
                 argument,
                 environment,
-            } => [
-                ("type", json!("stdio")),
-                ("command", json!(command)),
-                ("args", json!(argument)),
-                ("env", json!(environment)),
-            ]
-            .into_iter()
-            .collect::<Vec<_>>(),
-            Self::Http(remote) => vec![
-                ("type", json!("http")),
-                ("url", json!(remote.url)),
-                ("headers", json!(remote.headers)),
-            ],
-            Self::Sse(remote) => vec![
-                ("type", json!("sse")),
-                ("url", json!(remote.url)),
-                ("headers", json!(remote.headers)),
-            ],
-        };
-        fields
-            .into_iter()
-            .map(|(key, value)| (key.to_owned(), value))
-            .collect()
+            } => McpTransport::Stdio {
+                command,
+                arguments: argument,
+                environment,
+            },
+            Self::Http(RemoteLaunch { url, headers }) => McpTransport::Http { url, headers },
+            Self::Sse(RemoteLaunch { url, headers }) => McpTransport::Sse { url, headers },
+        }
     }
 }
 
@@ -163,18 +139,49 @@ impl ServerResource {
         })
     }
 
-    /// Resolve a native SDK launch definition without persisting credential values.
-    pub(crate) fn native(&self) -> Result<serde_json::Map<String, Value>> {
-        let mut launch = self.resolve()?.into_native();
-        for field in ["tools", "timeout", "cwd"] {
-            if let Some(value) = self.definition.get(field) {
-                launch.insert(field.into(), value.clone());
-            }
-        }
-        Ok(launch)
+    /// Resolve credentials into a typed, ephemeral launch request.
+    pub(crate) fn launch(&self) -> Result<McpLaunch> {
+        let timeout = self
+            .definition
+            .get("timeout")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .map(std::time::Duration::from_millis)
+                    .context("MCP timeout must be a nonnegative integer in milliseconds")
+            })
+            .transpose()?;
+        let working_directory = self
+            .definition
+            .get("cwd")
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(std::path::PathBuf::from)
+                    .context("MCP working directory must be text")
+            })
+            .transpose()?;
+        let tools = self
+            .definition
+            .get("tools")
+            .map(|value| {
+                let names = serde_json::from_value::<Vec<String>>(value.clone())
+                    .context("MCP tool selection must be an array of names")?;
+                Ok::<_, anyhow::Error>(forge_provider_api::session::McpToolSelection::from_names(
+                    names,
+                )?)
+            })
+            .transpose()?;
+        Ok(McpLaunch {
+            name: self.name.clone(),
+            transport: self.resolve()?.into_transport(),
+            timeout,
+            working_directory,
+            tools,
+        })
     }
 
-    /// Resolve credential references only into the ephemeral ACP launch payload.
+    /// Resolve credential references without constructing a native provider payload.
     fn resolve(&self) -> Result<ResolvedLaunch> {
         let definition = &self.definition;
         let mut native = super::import::NativeValues::default();
@@ -492,7 +499,7 @@ mod test {
         assert_eq!(skill[0].scope, Some(crate::provider::ResourceScope::Global));
         assert!(skill[0].user_invocable);
         assert!(skill[0].description.contains("check_definition_edit"));
-        for target in ["codexcli", "copilotcli", "claudecode", "antigravity-cli"] {
+        for target in ["fixture-alpha", "fixture-beta", "future-provider"] {
             assert!(ResourceCatalog::supports_target(&skill[0].targets, target));
         }
     }

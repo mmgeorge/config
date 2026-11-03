@@ -28,15 +28,32 @@ pub trait ScopedPermissions: Send + Sync {
 #[async_trait]
 pub trait ProviderPermissions: Send + Sync {
     /// Resolve one normalized permission request for its native session.
-    async fn authorize(&self, session_id: &str, request: PermissionRequest) -> PermissionResponse;
+    async fn authorize(
+        &self,
+        scope: &crate::InvocationScope,
+        request: PermissionRequest,
+    ) -> PermissionResponse;
+
+    /// Authorize verified private session storage while preserving host policy and revocation.
+    /// The adapter must first prove every target is a read/write beneath this binding's own
+    /// canonical storage directory, including symlink resolution. Ordinary work never uses this.
+    async fn authorize_session_storage(
+        &self,
+        scope: &crate::InvocationScope,
+        request: PermissionRequest,
+    ) -> PermissionResponse {
+        self.authorize(scope, request).await
+    }
 
     /// Wait for the host's pre-execution barrier before native tool execution.
-    async fn before_tool(&self) -> Result<(), ProviderError>;
+    async fn before_tool(&self, scope: &crate::InvocationScope) -> Result<(), ProviderError>;
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PermissionTarget {
+    /// Reject a request whose operation cannot be safely normalized.
+    Unknown,
     Command {
         command: String,
         #[serde(default)]
@@ -63,12 +80,16 @@ pub enum PermissionTarget {
     Tool {
         target: String,
     },
+    /// Identify a host-owned canonical tool independently of its advertised native alias.
+    HostTool {
+        name: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PermissionRequest {
     pub id: String,
-    pub provider: String,
+    pub provider: crate::ProviderId,
     pub reason: Option<String>,
     pub target_list: Vec<PermissionTarget>,
 }

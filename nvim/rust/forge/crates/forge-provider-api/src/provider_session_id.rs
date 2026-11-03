@@ -41,10 +41,34 @@ impl TryFrom<String> for ProviderSessionId {
     }
 }
 
+impl TryFrom<&str> for ProviderSessionId {
+    type Error = ProviderSessionIdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl std::str::FromStr for ProviderSessionId {
+    type Err = ProviderSessionIdError;
+
+    /// Validate a borrowed identity without interpreting its opaque contents.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.to_owned().try_into()
+    }
+}
+
 impl From<ProviderSessionId> for String {
     /// Encode the original native identity without changing its representation.
     fn from(value: ProviderSessionId) -> Self {
         value.0
+    }
+}
+
+impl std::fmt::Display for ProviderSessionId {
+    /// Render only the opaque identity; callers must not interpret its representation.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 

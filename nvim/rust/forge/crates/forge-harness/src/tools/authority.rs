@@ -167,7 +167,7 @@ mod test {
             !invoked.get(),
             "revoked authority invoked the native control callback"
         );
-        let crate::provider::ProviderError::Operation(failure) = error else {
+        let crate::provider::ProviderError::Failure(failure) = error else {
             panic!("authority failure lost its typed boundary");
         };
         assert_eq!(
@@ -303,7 +303,8 @@ mod test {
                     crate::session::ApprovalMode::Ask,
                     crate::permissions::matcher::PermissionRequest {
                         id: "rg".into(),
-                        provider: "test".into(),
+                        provider: forge_provider_api::ProviderId::new("test")
+                            .expect("static provider identity is valid"),
                         reason: None,
                         target_list: vec![crate::permissions::matcher::PermissionTarget::Command {
                             command: "rg --files".into(),

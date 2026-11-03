@@ -65,7 +65,7 @@ pub async fn generate(
     workspace: &str,
     request: &TextGenerationRequest,
     validator: &dyn TextValidator,
-) -> Result<String> {
+) -> std::result::Result<String, forge_provider_api::ProviderError> {
     let mut options = ClientOptions::new().with_cwd(workspace);
     if let Some(program) = command.first() {
         options = options
@@ -74,8 +74,18 @@ pub async fn generate(
     }
     let client = tokio::time::timeout(Duration::from_secs(20), Client::start(options))
         .await
-        .context("isolated Copilot SDK startup exceeded 20 seconds")?
-        .context("start isolated Copilot SDK client")?;
+        .map_err(|_| {
+            native_failure(
+                forge_provider_api::ProviderOperation::GenerateText,
+                forge_provider_api::ProviderFailureKind::Transport,
+            )
+        })?
+        .map_err(|_| {
+            native_failure(
+                forge_provider_api::ProviderOperation::GenerateText,
+                forge_provider_api::ProviderFailureKind::Initialization,
+            )
+        })?;
     complete_generation(client, command, workspace, request, validator).await
 }
 
@@ -86,7 +96,7 @@ async fn complete_generation(
     workspace: &str,
     request: &TextGenerationRequest,
     validator: &dyn TextValidator,
-) -> Result<String> {
+) -> std::result::Result<String, forge_provider_api::ProviderError> {
     let client = IsolatedClient {
         client: Some(client),
         collection: None,
@@ -97,15 +107,41 @@ async fn complete_generation(
     }
     .await;
     let shutdown = client.collect().await;
+    let result = result.map_err(|error| {
+        error
+            .downcast_ref::<forge_provider_api::ProviderError>()
+            .cloned()
+            .unwrap_or_else(|| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::GenerateText,
+                    forge_provider_api::ProviderFailureKind::Runtime,
+                )
+            })
+    });
+    let shutdown = shutdown.map_err(|_| {
+        native_failure(
+            forge_provider_api::ProviderOperation::Shutdown,
+            forge_provider_api::ProviderFailureKind::Runtime,
+        )
+    });
     match (result, shutdown) {
-        (Err(error), Err(shutdown)) => Err(forge_provider_api::ProviderError::Combined {
-            primary: Box::new(forge_provider_api::ProviderError::from(error)),
-            secondary: vec![forge_provider_api::ProviderError::from(shutdown)],
-        }
-        .into()),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(secondary)) => Err(forge_provider_api::ProviderError::Combined {
+            primary: Box::new(primary),
+            secondary: vec![secondary],
+        }),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
         (Ok(text), Ok(())) => Ok(text),
     }
+}
+
+fn native_failure(
+    operation: forge_provider_api::ProviderOperation,
+    kind: forge_provider_api::ProviderFailureKind,
+) -> forge_provider_api::ProviderError {
+    forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+        operation, kind,
+    ))
 }
 
 /// Own the temporary session and remove its stored state before the isolated client stops.
@@ -239,7 +275,7 @@ async fn summarize(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_provider_api::{ProviderError, version::RuntimeVersionError};
+    use forge_provider_api::ProviderError;
     use serde_json::{Value, json};
     use std::sync::Mutex;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -260,16 +296,15 @@ mod tests {
         }
     }
 
-    /// Connect the production isolated operation to a real SDK stream and private RPC recorder.
-    fn fixture(
-        version: &'static str,
-        completion: Completion,
-    ) -> (
+    type GenerationFixture = (
         Client,
         Arc<Mutex<Vec<String>>>,
         tokio::sync::oneshot::Receiver<()>,
         tokio::task::JoinHandle<()>,
-    ) {
+    );
+
+    /// Connect the production isolated operation to a real SDK stream and private RPC recorder.
+    fn fixture(version: &'static str, completion: Completion) -> GenerationFixture {
         let (client_write, mut peer_read) = tokio::io::duplex(64 * 1024);
         let (mut peer_write, client_read) = tokio::io::duplex(64 * 1024);
         let client = Client::from_streams(client_read, client_write, std::env::temp_dir()).unwrap();
@@ -386,10 +421,12 @@ mod tests {
     /// Exercise generation with explicit model selection without unrelated catalog RPCs.
     fn request() -> TextGenerationRequest {
         TextGenerationRequest {
+            workspace: ".".into(),
             model: "fixture-model".into(),
             reasoning: ReasoningSelection::Level("low".into()),
             instructions: "summarize".into(),
             input: "inspect".into(),
+            validator: Arc::new(Validator),
         }
     }
 
@@ -402,10 +439,10 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(
-                error.downcast_ref::<ProviderError>(),
-                Some(ProviderError::RuntimeVersion(
-                    RuntimeVersionError::Unsupported { .. }
-                ))
+                error,
+                ProviderError::RuntimeVersion(
+                    forge_provider_api::version::RuntimeVersionError::Unsupported { .. }
+                )
             ));
             peer.await.unwrap();
             assert_eq!(*methods.lock().unwrap(), ["status.get"]);
@@ -427,10 +464,12 @@ mod tests {
                     Completion::Success => {
                         assert_eq!(generation.await.unwrap().unwrap(), "Complete isolated text")
                     }
-                    Completion::Failure => assert!(
-                        format!("{:#}", generation.await.unwrap().unwrap_err())
-                            .contains("isolated send failed")
-                    ),
+                    Completion::Failure => {
+                        let error = generation.await.unwrap().unwrap_err();
+                        assert!(matches!(&error, ProviderError::Failure(failure)
+                            if failure.operation() == forge_provider_api::ProviderOperation::GenerateText));
+                        assert!(!format!("{error:#} {error:?}").contains("isolated send failed"));
+                    }
                     Completion::Cancel => {
                         sending.await.unwrap();
                         generation.abort();

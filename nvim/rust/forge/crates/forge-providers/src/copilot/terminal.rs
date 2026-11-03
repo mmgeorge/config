@@ -68,7 +68,9 @@ impl CopilotTerminalMonitor {
                     .await
                     .context("Copilot terminal query timed out")
                     .and_then(|result| result)
-                    .map_err(|error: anyhow::Error| format!("{error:#}"));
+                    .map_err(|_: anyhow::Error| {
+                        "Copilot terminal snapshot is unavailable".to_owned()
+                    });
                     let has_terminals = result
                         .as_ref()
                         .is_ok_and(|snapshot| !snapshot.terminal.is_empty());
@@ -91,8 +93,8 @@ impl CopilotTerminalMonitor {
                             update = event.recv() => match update {
                                 Ok(update) if update.event_type == "session.background_tasks_changed" => break,
                                 Ok(_) => {},
-                                Err(error) => {
-                                    let _ = send.send(Some(Err(format!("Copilot terminal event stream closed: {error:#}"))));
+                                Err(_) => {
+                                    let _ = send.send(Some(Err("Copilot terminal observation is unavailable".to_owned())));
                                     return;
                                 },
                             }
@@ -101,10 +103,12 @@ impl CopilotTerminalMonitor {
                 }
             };
             tokio::select! { _ = closing => {}, _ = observe => {} }
-            event
-                .close()
-                .await
-                .map_err(forge_provider_api::ProviderError::from)
+            event.close().await.map_err(|_| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::CollectEventReader,
+                    forge_provider_api::ProviderFailureKind::Runtime,
+                )
+            })
         });
         Self {
             session: monitored_session,
@@ -138,14 +142,24 @@ impl CopilotTerminalMonitor {
         let Some(task) = self.task.as_mut() else {
             return Ok(());
         };
-        let result = task
-            .await
-            .map_err(|error| forge_provider_api::ProviderError::Protocol {
-                message: format!("Copilot terminal monitor collection failed: {error}"),
-            });
+        let result = task.await.map_err(|_| {
+            native_failure(
+                forge_provider_api::ProviderOperation::CollectEventReader,
+                forge_provider_api::ProviderFailureKind::Runtime,
+            )
+        });
         self.task.take();
         result?
     }
+}
+
+fn native_failure(
+    operation: forge_provider_api::ProviderOperation,
+    kind: forge_provider_api::ProviderFailureKind,
+) -> forge_provider_api::ProviderError {
+    forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+        operation, kind,
+    ))
 }
 
 #[cfg(test)]

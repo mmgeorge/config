@@ -13,19 +13,22 @@ pub fn permission_from_copilot(
     // Notifications wrap the same request that older RPC calls sent directly.
     let params = params.get("permissionRequest").cloned().unwrap_or(params);
     let kind = params.get("kind").and_then(Value::as_str).unwrap_or(kind);
-    let encoded = params.to_string();
     let target_list = match kind {
-        "shell" => vec![PermissionTarget::Command {
-            command: params
+        "shell" => vec![
+            params
                 .get("fullCommandText")
                 .or_else(|| params.get("command"))
                 .or_else(|| params.get("fullCommand"))
                 .or_else(|| params.get("full_command"))
                 .and_then(Value::as_str)
-                .unwrap_or(&encoded)
-                .to_owned(),
-            shell: provider_shell(&params),
-        }],
+                .filter(|command| !command.trim().is_empty())
+                .map_or(PermissionTarget::Unknown, |command| {
+                    PermissionTarget::Command {
+                        command: command.to_owned(),
+                        shell: provider_shell(&params),
+                    }
+                }),
+        ],
         "write" => vec![provider_path(&params).map_or(
             PermissionTarget::UnknownFile {
                 operation: DirectoryOperation::Write,
@@ -38,49 +41,142 @@ pub fn permission_from_copilot(
             },
             |path| PermissionTarget::Read { path },
         )],
-        "url" => vec![PermissionTarget::Network {
-            target: params
+        "url" => vec![
+            params
                 .get("url")
                 .or_else(|| params.get("target"))
                 .and_then(Value::as_str)
-                .unwrap_or("*")
-                .to_owned(),
+                .filter(|target| !target.trim().is_empty())
+                .map_or(PermissionTarget::Unknown, |target| {
+                    PermissionTarget::Network {
+                        target: target.to_owned(),
+                    }
+                }),
+        ],
+        "mcp" => vec![match (
+            params.get("serverName").and_then(Value::as_str),
+            params
+                .get("toolName")
+                .or_else(|| params.get("tool_name"))
+                .or_else(|| params.get("name"))
+                .and_then(Value::as_str),
+        ) {
+            (Some(server), Some(tool)) if !server.trim().is_empty() && !tool.trim().is_empty() => {
+                PermissionTarget::Mcp {
+                    target: format!("{server}/{tool}"),
+                }
+            }
+            _ => PermissionTarget::Unknown,
         }],
-        "mcp" => vec![PermissionTarget::Mcp {
-            target: {
-                let tool = params
-                    .get("toolName")
-                    .or_else(|| params.get("tool_name"))
-                    .or_else(|| params.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("*");
-                params
-                    .get("serverName")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| tool.to_owned(), |server| format!("{server}/{tool}"))
-            },
-        }],
-        "custom-tool" | "hook" => vec![PermissionTarget::Tool {
-            target: params
+        "custom-tool" | "hook" => vec![
+            params
                 .get("toolName")
                 .and_then(Value::as_str)
-                .unwrap_or(kind)
-                .to_owned(),
-        }],
-        _ => normalize_permission_payload(&params, &encoded),
+                .filter(|name| !name.trim().is_empty())
+                .map_or(PermissionTarget::Unknown, |name| PermissionTarget::Tool {
+                    target: name.to_owned(),
+                }),
+        ],
+        _ => normalize_permission_payload(&params),
     };
     PermissionRequest {
         id,
-        provider: "Copilot CLI".into(),
-        reason: params
-            .get("reason")
-            .or_else(|| params.get("intention"))
-            .or_else(|| params.get("warning"))
-            .or_else(|| params.get("hookMessage"))
-            .or_else(|| params.get("toolDescription"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        provider: forge_provider_api::ProviderId::new("copilot")
+            .expect("registered Copilot identity"),
+        reason: None,
         target_list,
+    }
+}
+
+use async_trait::async_trait;
+use forge_provider_api::permissions::PermissionResponse;
+use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
+use github_copilot_sdk::hooks::{HookContext, PreToolUseInput, PreToolUseOutput, SessionHooks};
+use github_copilot_sdk::{PermissionRequestData, PermissionRequestKind, RequestId, SessionId};
+use std::sync::Arc;
+
+/// Bind native permission callbacks to the host's authorization policy.
+pub fn handler(
+    context: Arc<dyn super::provider::NativeCallbackRouter>,
+) -> Arc<dyn PermissionHandler> {
+    Arc::new(Callback { context })
+}
+
+/// Bind native pre-tool hooks to the host's checkpoint barrier.
+pub fn checkpoint_hooks(
+    context: Arc<dyn super::provider::NativeCallbackRouter>,
+) -> Arc<dyn SessionHooks> {
+    Arc::new(Callback { context })
+}
+
+struct Callback {
+    context: Arc<dyn super::provider::NativeCallbackRouter>,
+}
+
+#[async_trait]
+impl SessionHooks for Callback {
+    async fn on_pre_tool_use(
+        &self,
+        _input: PreToolUseInput,
+        _context: HookContext,
+    ) -> Option<PreToolUseOutput> {
+        match self.context.before_tool_native(None).await {
+            Ok(()) => None,
+            Err(_) => Some(PreToolUseOutput {
+                permission_decision: Some("deny".into()),
+                permission_decision_reason: Some(
+                    "Host pre-execution barrier rejected this operation".into(),
+                ),
+                modified_args: None,
+                additional_context: None,
+                suppress_output: None,
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl PermissionHandler for Callback {
+    async fn handle(
+        &self,
+        _session_id: SessionId,
+        request_id: RequestId,
+        data: PermissionRequestData,
+    ) -> PermissionResult {
+        let kind = permission_kind(data.kind);
+        let tool_call_id = data.tool_call_id.clone();
+        let params = serde_json::to_value(data).unwrap_or(Value::Null);
+        let request = permission_from_copilot(request_id.to_string(), kind, params, "");
+        let Some(tool_call_id) = tool_call_id.as_deref() else {
+            return PermissionResult::reject(None);
+        };
+        if self
+            .context
+            .before_tool_native(Some(tool_call_id))
+            .await
+            .is_err()
+        {
+            return PermissionResult::reject(None);
+        }
+        match self.context.authorize_native(tool_call_id, request).await {
+            PermissionResponse::Allow => PermissionResult::approve_once(),
+            PermissionResponse::Deny { reason } => PermissionResult::reject(reason),
+            PermissionResponse::Cancelled => PermissionResult::reject(None),
+        }
+    }
+}
+fn permission_kind(kind: Option<PermissionRequestKind>) -> &'static str {
+    match kind {
+        Some(PermissionRequestKind::Shell) => "shell",
+        Some(PermissionRequestKind::Write) => "write",
+        Some(PermissionRequestKind::Read) => "read",
+        Some(PermissionRequestKind::Url) => "url",
+        Some(PermissionRequestKind::Mcp) => "mcp",
+        Some(PermissionRequestKind::CustomTool) => "custom-tool",
+        Some(PermissionRequestKind::Memory) => "memory",
+        Some(PermissionRequestKind::Hook) => "hook",
+        Some(PermissionRequestKind::Unknown) | None => "unknown",
+        _ => "unknown",
     }
 }
 
@@ -91,17 +187,21 @@ mod tests {
 
     struct PermissionPolicy {
         response: PermissionResponse,
+        barrier_open: bool,
     }
 
     #[async_trait]
-    impl ProviderPermissions for PermissionPolicy {
+    impl super::super::provider::NativeCallbackRouter for PermissionPolicy {
         /// Verify the native callback's identity and normalized request at the host boundary.
-        async fn authorize(
+        async fn authorize_native(
             &self,
-            session_id: &str,
+            _call_id: &str,
             request: PermissionRequest,
         ) -> PermissionResponse {
-            assert_eq!(session_id, "native");
+            assert!(
+                self.barrier_open,
+                "closed barrier must prevent authorization"
+            );
             assert_eq!(request.id, "request");
             assert_eq!(
                 request.target_list,
@@ -112,10 +212,28 @@ mod tests {
             self.response.clone()
         }
 
-        /// Admit the unused pre-tool barrier for this permission-only fixture.
-        async fn before_tool(&self) -> Result<(), forge_provider_api::ProviderError> {
-            Ok(())
+        async fn call_native(
+            &self,
+            _: &str,
+            _: forge_provider_api::control::ToolCall,
+        ) -> Result<String, forge_provider_api::ProviderError> {
+            Err(forge_provider_api::ProviderError::Cancelled)
         }
+
+        async fn before_tool_native(
+            &self,
+            _: Option<&str>,
+        ) -> Result<(), forge_provider_api::ProviderError> {
+            if self.barrier_open {
+                Ok(())
+            } else {
+                Err(forge_provider_api::ProviderError::Cancelled)
+            }
+        }
+
+        async fn bind_native_call(&self, _: &str, _: &forge_provider_api::InvocationScope) {}
+
+        async fn release_native_call(&self, _: &str) {}
     }
 
     /// Preserve host authorization and denial feedback in the SDK response.
@@ -135,18 +253,100 @@ mod tests {
             ),
             (PermissionResponse::Cancelled, json!({"kind":"reject"})),
         ] {
-            let callback = handler(Arc::new(PermissionPolicy { response }));
+            let callback = handler(Arc::new(PermissionPolicy {
+                response,
+                barrier_open: true,
+            }));
             let result = callback
                 .handle(
                     SessionId::new("native"),
                     RequestId::new("request"),
-                    serde_json::from_value(json!({"kind":"write","path":"file.rs"})).unwrap(),
+                    serde_json::from_value(
+                        json!({"kind":"write","path":"file.rs","toolCallId":"tool"}),
+                    )
+                    .unwrap(),
                 )
                 .await;
             let PermissionResult::Decision { decision, .. } = result else {
                 panic!("native callback omitted its decision");
             };
             assert_eq!(serde_json::to_value(decision).unwrap(), expected);
+        }
+    }
+
+    /// Enforce the host barrier for tools that do not require an authorization prompt.
+    #[tokio::test]
+    async fn pre_tool_hook_enforces_host_barrier() {
+        for barrier_open in [true, false] {
+            let callback = checkpoint_hooks(Arc::new(PermissionPolicy {
+                response: PermissionResponse::Allow,
+                barrier_open,
+            }));
+            let result = callback
+                .on_pre_tool_use(
+                    serde_json::from_value(json!({
+                        "sessionId":"native", "timestamp":0.0, "cwd":".",
+                        "toolName":"read", "toolArgs":{}
+                    }))
+                    .unwrap(),
+                    HookContext {
+                        session_id: SessionId::new("native"),
+                    },
+                )
+                .await;
+            if barrier_open {
+                assert!(result.is_none());
+            } else {
+                assert_eq!(result.unwrap().permission_decision.as_deref(), Some("deny"));
+            }
+        }
+    }
+
+    /// Do not approve a permission callback after its invocation barrier has closed.
+    #[tokio::test]
+    async fn permission_callback_rejects_closed_barrier() {
+        let callback = handler(Arc::new(PermissionPolicy {
+            response: PermissionResponse::Allow,
+            barrier_open: false,
+        }));
+        let result = callback
+            .handle(
+                SessionId::new("native"),
+                RequestId::new("request"),
+                serde_json::from_value(
+                    json!({"kind":"write","path":"file.rs","toolCallId":"tool"}),
+                )
+                .unwrap(),
+            )
+            .await;
+        let PermissionResult::Decision { decision, .. } = result else {
+            panic!("native callback omitted its decision");
+        };
+        assert_eq!(
+            serde_json::to_value(decision).unwrap(),
+            json!({"kind":"reject"})
+        );
+    }
+
+    /// Reject incomplete native requests without manufacturing broad permission targets.
+    #[test]
+    fn incomplete_permission_targets_are_unknown() {
+        for (kind, payload) in [
+            ("url", json!({})),
+            ("url", json!({"url":" "})),
+            ("mcp", json!({"toolName":"read"})),
+            ("mcp", json!({"serverName":"server"})),
+            ("mcp", json!({"serverName":" ","toolName":"read"})),
+        ] {
+            let request = permission_from_copilot("request".into(), kind, payload, ".");
+            assert_eq!(request.target_list, vec![PermissionTarget::Unknown]);
+        }
+        for kind in ["read", "write"] {
+            let request = permission_from_copilot("request".into(), kind, json!({"path":" "}), ".");
+            assert!(matches!(
+                request.target_list[0],
+                PermissionTarget::UnknownFile { .. }
+            ));
         }
     }
 
@@ -180,78 +380,5 @@ mod tests {
             request.target_list[0],
             PermissionTarget::UnknownFile { .. }
         ));
-    }
-}
-
-use async_trait::async_trait;
-use forge_provider_api::permissions::{PermissionResponse, ProviderPermissions};
-use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
-use github_copilot_sdk::hooks::{HookContext, PreToolUseInput, PreToolUseOutput, SessionHooks};
-use github_copilot_sdk::{PermissionRequestData, PermissionRequestKind, RequestId, SessionId};
-use std::sync::Arc;
-
-/// Bind native permission callbacks to the host's authorization policy.
-pub fn handler(context: Arc<dyn ProviderPermissions>) -> Arc<dyn PermissionHandler> {
-    Arc::new(Callback { context })
-}
-
-/// Bind native pre-tool hooks to the host's checkpoint barrier.
-pub fn checkpoint_hooks(context: Arc<dyn ProviderPermissions>) -> Arc<dyn SessionHooks> {
-    Arc::new(Callback { context })
-}
-
-struct Callback {
-    context: Arc<dyn ProviderPermissions>,
-}
-
-#[async_trait]
-impl SessionHooks for Callback {
-    async fn on_pre_tool_use(
-        &self,
-        _input: PreToolUseInput,
-        _context: HookContext,
-    ) -> Option<PreToolUseOutput> {
-        self.context
-            .before_tool()
-            .await
-            .err()
-            .map(|error| PreToolUseOutput {
-                permission_decision: Some("deny".into()),
-                permission_decision_reason: Some(format!("{error:#}")),
-                ..Default::default()
-            })
-    }
-}
-
-#[async_trait]
-impl PermissionHandler for Callback {
-    async fn handle(
-        &self,
-        session_id: SessionId,
-        request_id: RequestId,
-        data: PermissionRequestData,
-    ) -> PermissionResult {
-        let kind = permission_kind(data.kind);
-        let params = serde_json::to_value(data).unwrap_or(Value::Null);
-        let request = permission_from_copilot(request_id.to_string(), kind, params, "");
-        match self.context.authorize(session_id.as_ref(), request).await {
-            PermissionResponse::Allow => PermissionResult::approve_once(),
-            PermissionResponse::Deny { reason } => PermissionResult::reject(reason),
-            PermissionResponse::Cancelled => PermissionResult::reject(None),
-        }
-    }
-}
-fn permission_kind(kind: Option<PermissionRequestKind>) -> &'static str {
-    match kind {
-        Some(PermissionRequestKind::Shell) => "shell",
-        Some(PermissionRequestKind::Write) => "write",
-        Some(PermissionRequestKind::Read) => "read",
-        Some(PermissionRequestKind::Url) => "url",
-        Some(PermissionRequestKind::Mcp) => "mcp",
-        Some(PermissionRequestKind::CustomTool) => "custom-tool",
-        Some(PermissionRequestKind::Memory) => "memory",
-        Some(PermissionRequestKind::Hook) => "hook",
-        Some(PermissionRequestKind::Unknown) | None => "unknown",
-        _ => "unknown",
     }
 }

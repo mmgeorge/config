@@ -48,10 +48,8 @@ jsonschema = { version = "0.49", default-features = false }
 junction = { version = "=2.1.0", default-features = false }
 libc = "0.2.189"
 memchr = "2"
-proc-macro2 = "1.0"
 process-wrap = { version = "=10.0.1", default-features = false }
 pulldown-cmark = { version = "=0.13.4", default-features = false }
-quote = "1.0"
 redb = "=2.6.3"
 regex = "1"
 reqwest = { version = "0.12.28", default-features = false }
@@ -71,7 +69,6 @@ spdx = "0.13.4"
 stacker = "=0.1.25"
 strip-ansi-escapes = "0.2.1"
 symspell_rs = "=7.0.1"
-syn = "2.0"
 tempfile = "3.23"
 thiserror = "2.0"
 tokio = "1.48"
@@ -107,7 +104,6 @@ unicode-segmentation = "=1.12.0"
 unicode-width = "=0.2.2"
 uuid = "1.18"
 windows = "0.62.2"
-zip = { version = "=2.4.2", default-features = false }
 
 [patch.crates-io]
 gix-path = { path = "vendor/gix-path" }
@@ -123,6 +119,7 @@ forge-git = { workspace = true }
 forge-github = { workspace = true }
 forge-harness = { workspace = true }
 forge-protocol = { workspace = true }
+forge-providers = { workspace = true }
 forge-review = { workspace = true }
 forge-status = { workspace = true }
 forge-text = { workspace = true }

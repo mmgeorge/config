@@ -3,13 +3,14 @@ use forge_provider_api::catalog::{
     CatalogMutation, McpDefinition, McpStatus, McpToolDefinition, SkillDefinition,
 };
 use forge_provider_api::input::MessageInput;
-use forge_provider_api::submission::{InputReceipt, SubmissionTarget};
+use forge_provider_api::submission::InputReceipt;
 use forge_provider_api::{Compaction, CompactionState, ProviderError, ProviderModel, ServiceTier};
 use github_copilot_sdk::rpc::*;
 use github_copilot_sdk::session_events::ReasoningSummary;
 use github_copilot_sdk::types::ContextTier;
 use github_copilot_sdk::{DeliveryMode, SessionId, SetModelOptions};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -29,6 +30,14 @@ pub struct CopilotSession {
 pub struct SkillSelection {
     pub name: String,
     pub enabled: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum SubmissionReconciliation {
+    Found(String),
+    NotFound,
+    Ambiguous,
+    ContentMismatch,
 }
 
 impl CopilotClient {
@@ -91,50 +100,12 @@ impl CopilotClient {
             }
         }
         .await;
-        result.map_err(ProviderError::from)
-    }
-    pub async fn set_skill_preference(
-        &self,
-        name: &str,
-        enabled: bool,
-    ) -> Result<(), ProviderError> {
-        let result: Result<()> = async {
-            let settings = self
-                .inner
-                .rpc()
-                .user()
-                .settings()
-                .get()
-                .await
-                .context("read Copilot disabled skills")?;
-            let mut disabled_skill_list = settings
-                .settings
-                .get("disabledSkills")
-                .and_then(|setting| setting.value.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|value| value.as_str().map(str::to_owned))
-                .collect::<Vec<_>>();
-            disabled_skill_list.retain(|disabled_name| disabled_name != name);
-            if !enabled {
-                disabled_skill_list.push(name.to_owned());
-                disabled_skill_list.sort();
-                disabled_skill_list.dedup();
-            }
-            self.inner
-                .rpc()
-                .skills()
-                .config()
-                .set_disabled_skills(SkillsConfigSetDisabledSkillsRequest {
-                    disabled_skills: disabled_skill_list,
-                })
-                .await
-                .context("persist Copilot disabled skills")?;
-
-            Ok(())
-        }
-        .await;
-        result.map_err(ProviderError::from)
+        result.map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        })
     }
     pub async fn discover_mcp(&self, workspace: &str) -> Result<Vec<McpDefinition>, ProviderError> {
         let result: Result<Vec<McpDefinition>> = async {
@@ -161,7 +132,13 @@ impl CopilotClient {
                         .r#type
                         .and_then(|transport| serde_json::to_value(transport).ok())
                         .and_then(|transport| transport.as_str().map(str::to_owned))
-                        .unwrap_or_else(|| "unknown".into()),
+                        .map(|transport| match transport.as_str() {
+                            "stdio" => forge_provider_api::catalog::McpTransportKind::Stdio,
+                            "http" => forge_provider_api::catalog::McpTransportKind::Http,
+                            "sse" => forge_provider_api::catalog::McpTransportKind::Sse,
+                            _ => forge_provider_api::catalog::McpTransportKind::Unknown,
+                        })
+                        .unwrap_or(forge_provider_api::catalog::McpTransportKind::Unknown),
                     status: if server.enabled {
                         McpStatus::Loading
                     } else {
@@ -178,36 +155,12 @@ impl CopilotClient {
             Ok(servers)
         }
         .await;
-        result.map_err(ProviderError::from)
-    }
-    pub async fn set_mcp_preference(&self, name: &str, enabled: bool) -> Result<(), ProviderError> {
-        let result: Result<()> = async {
-            if enabled {
-                self.inner
-                    .rpc()
-                    .mcp()
-                    .config()
-                    .enable(McpConfigEnableRequest {
-                        names: vec![name.into()],
-                    })
-                    .await
-                    .with_context(|| format!("persist enabled Copilot MCP {name}"))?;
-            } else {
-                self.inner
-                    .rpc()
-                    .mcp()
-                    .config()
-                    .disable(McpConfigDisableRequest {
-                        names: vec![name.into()],
-                    })
-                    .await
-                    .with_context(|| format!("persist disabled Copilot MCP {name}"))?;
-            }
-
-            Ok(())
-        }
-        .await;
-        result.map_err(ProviderError::from)
+        result.map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        })
     }
     pub async fn fork(
         &self,
@@ -230,7 +183,12 @@ impl CopilotClient {
                 .to_string())
         }
         .await;
-        result.map_err(ProviderError::from)
+        result.map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        })
     }
 }
 
@@ -251,29 +209,14 @@ impl CopilotSession {
         proof: &super::client_generation::CollectedClient,
     ) -> Result<(), ProviderError> {
         if !self.belongs_to(proof.failed_generation()) {
-            return Err(ProviderError::Rejected {
-                message: "Copilot session collection proof belongs to another client generation"
-                    .into(),
-            });
+            return Err(native_failure(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                forge_provider_api::error::ProviderFailureKind::Rejected,
+            ));
         }
         self.events.close().await?;
         self.inner.stop_event_loop().await;
         Ok(())
-    }
-
-    pub async fn send(&self, input: MessageInput) -> Result<String, ProviderError> {
-        self.ensure_healthy()?;
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.inner.send(super::input::message(input)),
-        )
-        .await
-        .map_err(|_| ProviderError::DeliveryUncertain {
-            message: "Copilot initial input acknowledgment exceeded 30 seconds".into(),
-        })?
-        .map_err(|error| ProviderError::Transport {
-            message: error.to_string(),
-        })
     }
 
     pub fn id(&self) -> String {
@@ -288,19 +231,20 @@ impl CopilotSession {
     pub async fn disconnect(&self) -> Result<(), ProviderError> {
         let intake = self.events.close().await;
         if self.events.client_stopped() {
-            return intake;
+            // A stopped transport is not proof that its process and resources were collected.
+            // Keep cleanup ownership until the runtime supplies a CollectedClient witness.
+            return intake.and_then(|()| self.generation.ensure_healthy());
         }
-        let native = self
-            .inner
-            .disconnect()
-            .await
-            .map_err(|error| ProviderError::Transport {
-                message: error.to_string(),
-            });
+        let native = self.inner.disconnect().await.map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        });
         match (intake, native) {
             (Err(cause), Err(cleanup)) => Err(ProviderError::PreparationCleanup {
-                cause: Arc::new(cause),
-                cleanup: Arc::new(cleanup),
+                cause: Box::new(cause),
+                cleanup: Box::new(cleanup),
             }),
             (Err(error), _) | (_, Err(error)) => Err(error),
             (Ok(()), Ok(())) => Ok(()),
@@ -310,13 +254,12 @@ impl CopilotSession {
         if self.events.client_stopped() {
             return Ok(());
         }
-        self.inner
-            .abort()
-            .await
-            .map(|_| ())
-            .map_err(|error| ProviderError::Transport {
-                message: error.to_string(),
-            })
+        self.inner.abort().await.map(|_| ()).map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::CancelSession,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        })
     }
 
     /// Report whether this binding belongs to a stopped native process.
@@ -333,9 +276,11 @@ impl CopilotSession {
             .set_model(model, Some(model_options(effort, context)))
             .await
             .map(|_| ())
-            .map_err(|error| ProviderError::Provider {
-                code: None,
-                message: error.to_string(),
+            .map_err(|_| {
+                native_failure(
+                    forge_provider_api::error::ProviderOperation::ReconcileSettings,
+                    forge_provider_api::error::ProviderFailureKind::Transport,
+                )
             })
     }
     pub async fn skills(&self) -> Result<Vec<SkillDefinition>, ProviderError> {
@@ -367,7 +312,12 @@ impl CopilotSession {
                 .collect())
         }
         .await;
-        result.map_err(ProviderError::from)
+        result.map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        })
     }
     pub async fn set_skill_enabled(
         &self,
@@ -397,7 +347,12 @@ impl CopilotSession {
             })
         }
         .await;
-        result.map_err(ProviderError::from)
+        result.map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::ReconcileSettings,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        })
     }
     pub async fn mcp_list(
         &self,
@@ -469,6 +424,9 @@ impl CopilotSession {
                     "failed" => McpStatus::Failed,
                     _ => McpStatus::Unavailable,
                 };
+                if discovered.transport == forge_provider_api::catalog::McpTransportKind::Unknown {
+                    status = McpStatus::Unavailable;
+                }
                 let startup_error = mcp_failure.get(&discovered.name);
                 if startup_error.is_some()
                     && matches!(
@@ -499,7 +457,13 @@ impl CopilotSession {
                                 .collect(),
                             None,
                         ),
-                        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+                        Err(_) => (
+                            Vec::new(),
+                            forge_provider_api::diagnostic::SanitizedMessage::new(
+                                "MCP tool catalog is unavailable",
+                            )
+                            .ok(),
+                        ),
                     }
                 } else {
                     (Vec::new(), None)
@@ -512,13 +476,25 @@ impl CopilotSession {
                     token_estimated: false,
                     enabled: discovered.enabled,
                     status,
-                    status_detail: status_entry
-                        .and_then(|server| server.error.clone())
-                        .or_else(|| {
-                            (status == McpStatus::Failed)
-                                .then(|| startup_error.cloned())
-                                .flatten()
-                        }),
+                    status_detail: if discovered.transport
+                        == forge_provider_api::catalog::McpTransportKind::Unknown
+                    {
+                        forge_provider_api::diagnostic::SanitizedMessage::new(
+                            "MCP transport is not supported by this provider",
+                        )
+                        .ok()
+                    } else if status_entry
+                        .and_then(|server| server.error.as_ref())
+                        .is_some()
+                        || startup_error.is_some()
+                    {
+                        forge_provider_api::diagnostic::SanitizedMessage::new(
+                            "MCP server reported a failure",
+                        )
+                        .ok()
+                    } else {
+                        None
+                    },
                     name: discovered.name,
                     transport: discovered.transport,
                     tools,
@@ -529,7 +505,12 @@ impl CopilotSession {
             Ok(definition_list)
         }
         .await;
-        result.map_err(ProviderError::from)
+        result.map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        })
     }
     pub async fn set_mcp_enabled(
         &self,
@@ -563,7 +544,12 @@ impl CopilotSession {
             })
         }
         .await;
-        result.map_err(ProviderError::from)
+        result.map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        })
     }
     pub async fn terminate_terminal(&self, id: &str) -> Result<(), ProviderError> {
         let result: Result<()> = async {
@@ -589,74 +575,96 @@ impl CopilotSession {
             Ok(())
         }
         .await;
-        result.map_err(ProviderError::from)
+        result.map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        })
     }
-    pub async fn reconcile_submission(
-        &self,
+    /// Reconcile a persisted cursor using only root input events and opaque accepted receipts.
+    pub async fn find_unclaimed_submission_in(
+        session: &github_copilot_sdk::session::Session,
         cursor: &str,
-        prompt: &str,
         known_receipts: &HashSet<String>,
-    ) -> Result<Option<String>, ProviderError> {
-        let result: Result<Option<String>> = async {
-            let mut cursor = cursor.to_owned();
-            let mut seen = std::collections::HashSet::new();
-            let mut receipt = None;
-            loop {
-                let history = self
-                    .inner
-                    .rpc()
-                    .event_log()
-                    .read(EventLogReadRequest {
-                        agent_ids: None,
-                        direction: None,
-                        include_ephemeral: Some(false),
-                        cursor: Some(cursor.clone()),
-                        agent_scope: Some(EventsAgentScope::Primary),
-                        types: Some(json!(["user.message"])),
-                        max: Some(100),
-                        wait_ms: Some(0),
-                    })
-                    .await
-                    .context("reconcile Copilot submission in native history")?;
-                anyhow::ensure!(
-                    history.cursor_status == EventsCursorStatus::Ok,
-                    "Copilot submission history boundary expired"
-                );
-                for event in history.events {
-                    if event.agent_id.is_none()
-                        && event.event_type == "user.message"
-                        && event.data.get("content").and_then(Value::as_str) == Some(prompt)
-                        && event
-                            .data
-                            .get("isAutopilotContinuation")
-                            .and_then(Value::as_bool)
-                            != Some(true)
-                        && event.data.get("source").is_none_or(Value::is_null)
-                    {
-                        let Some(message_id) = event.data.get("messageId").and_then(Value::as_str)
-                        else {
-                            continue;
-                        };
-                        if !known_receipts.contains(message_id) {
-                            if receipt.is_some() {
-                                return Ok(None);
-                            }
-                            receipt = Some(message_id.to_owned());
-                        }
-                    }
-                }
-                if !history.has_more {
-                    return Ok(receipt);
-                }
-                anyhow::ensure!(
-                    history.cursor != cursor && seen.insert(history.cursor.clone()),
-                    "Copilot submission history cursor did not advance"
-                );
-                cursor = history.cursor;
+        content_digest: Option<&str>,
+    ) -> std::result::Result<SubmissionReconciliation, ProviderError> {
+        let mut cursor = cursor.to_owned();
+        let mut seen = std::collections::HashSet::new();
+        let mut candidates = Vec::new();
+        loop {
+            let history = session
+                .rpc()
+                .event_log()
+                .read(EventLogReadRequest {
+                    agent_ids: None,
+                    direction: None,
+                    include_ephemeral: Some(false),
+                    cursor: Some(cursor.clone()),
+                    agent_scope: Some(EventsAgentScope::Primary),
+                    types: Some(json!(["user.message"])),
+                    max: Some(100),
+                    wait_ms: Some(0),
+                })
+                .await
+                .map_err(|_| {
+                    ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::RecoverSession,
+                        forge_provider_api::ProviderFailureKind::Transport,
+                    ))
+                })?;
+            if history.cursor_status != EventsCursorStatus::Ok {
+                return Err(ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::RecoverSession,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    ),
+                ));
             }
+            for event in history.events {
+                if event.agent_id.is_some()
+                    || event.event_type != "user.message"
+                    || event
+                        .data
+                        .get("isAutopilotContinuation")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    || event
+                        .data
+                        .get("source")
+                        .is_some_and(|source| !source.is_null())
+                {
+                    continue;
+                }
+                let Some(message_id) = event.data.get("messageId").and_then(Value::as_str) else {
+                    continue;
+                };
+                candidates.push((
+                    message_id.to_owned(),
+                    event
+                        .data
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                ));
+            }
+            if !history.has_more {
+                return Ok(resolve_unclaimed_submissions(
+                    &candidates,
+                    known_receipts,
+                    content_digest,
+                ));
+            }
+            if history.cursor == cursor || !seen.insert(history.cursor.clone()) {
+                return Err(ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::RecoverSession,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    ),
+                ));
+            }
+            cursor = history.cursor;
         }
-        .await;
-        result.map_err(ProviderError::from)
     }
     pub async fn rewind(
         &self,
@@ -717,7 +725,12 @@ impl CopilotSession {
             Ok(())
         }
         .await;
-        result.map_err(ProviderError::from)
+        result.map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        })
     }
     pub async fn compact(&self, id: String) -> Result<Compaction, ProviderError> {
         let result: Result<Compaction> = async {
@@ -744,43 +757,61 @@ impl CopilotSession {
             })
         }
         .await;
-        result.map_err(ProviderError::from)
+        result.map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        })
     }
     pub async fn steer(
         &self,
         input: MessageInput,
         receipt: Option<Arc<dyn InputReceipt>>,
+        scope: &forge_provider_api::InvocationScope,
+        workspace: &str,
     ) -> Result<String, ProviderError> {
         self.ensure_healthy()?;
-        let result: Result<String> = async {
-            let message = super::input::message(input).with_mode(DeliveryMode::Immediate);
-            if let Some(receipt) = &receipt {
-                let history = self
-                    .inner
-                    .rpc()
-                    .event_log()
-                    .tail()
-                    .await
-                    .context("capture Copilot steering history boundary")?;
-                self.ensure_healthy()?;
-                receipt
-                    .clone()
-                    .record_sending(SubmissionTarget::native("copilot", self.id(), serde_json::json!({"cursor":history.cursor,"prompt":message.prompt.clone()})))
-                    .await?;
-            }
+        let message = super::input::message(input).with_mode(DeliveryMode::Immediate);
+        if let Some(receipt) = &receipt {
+            let history = self.inner.rpc().event_log().tail().await.map_err(|_| {
+                ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::AdmitInput,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                ))
+            })?;
             self.ensure_healthy()?;
-            let accepted = self
-                .inner
-                .send(message)
-                .await
-                .context("steer active Copilot turn")?;
-            if let Some(receipt) = receipt {
-                receipt.record_accepted(accepted.clone()).await?;
-            }
-            Ok(accepted)
+            receipt
+                .clone()
+                .record_sending(Some(super::prompt::sending_recovery_token(
+                    scope.owner.clone(),
+                    receipt.id().clone(),
+                    workspace.to_owned(),
+                    self.id(),
+                    history.cursor,
+                    hex::encode(Sha256::digest(message.prompt.as_bytes())),
+                )?))
+                .await?;
         }
-        .await;
-        result.map_err(ProviderError::from)
+        self.ensure_healthy()?;
+        let accepted = self
+            .inner
+            .send(message)
+            .await
+            .map_err(|_| ProviderError::DeliveryUncertain)?;
+        if let Some(receipt) = receipt {
+            let receipt_id = receipt.id().clone();
+            receipt
+                .record_accepted(Some(super::prompt::accepted_recovery_token(
+                    receipt_id,
+                    scope.owner.clone(),
+                    self.id(),
+                    accepted.clone(),
+                )?))
+                .await
+                .map_err(|_| ProviderError::DeliveryUncertain)?;
+        }
+        Ok(accepted)
     }
     pub async fn reconcile_skills(&self, selected: &[SkillSelection]) -> Result<(), ProviderError> {
         let result: Result<()> = async {
@@ -838,7 +869,12 @@ impl CopilotSession {
             .and_then(|result| result)
         }
         .await;
-        result.map_err(ProviderError::from)
+        result.map_err(|_| {
+            native_failure(
+                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderFailureKind::Transport,
+            )
+        })
     }
 }
 
@@ -875,6 +911,47 @@ pub fn model_options(
         options = options.with_context_tier(context_tier);
     }
     options
+}
+
+/// Compare a native history message with the private digest in a Sending checkpoint.
+pub(super) fn content_matches(expected: Option<&str>, content: &str) -> bool {
+    expected.is_none_or(|expected| hex::encode(Sha256::digest(content.as_bytes())) == expected)
+}
+
+/// Select exactly one unclaimed history input matching the persisted content evidence.
+pub(super) fn resolve_unclaimed_submissions(
+    candidates: &[(String, Option<String>)],
+    known_receipts: &HashSet<String>,
+    content_digest: Option<&str>,
+) -> SubmissionReconciliation {
+    let unclaimed = candidates
+        .iter()
+        .filter(|(message_id, _)| !known_receipts.contains(message_id))
+        .collect::<Vec<_>>();
+    let matching = unclaimed
+        .iter()
+        .filter(|(_, content)| {
+            content_digest.is_none_or(|expected| {
+                content
+                    .as_deref()
+                    .is_some_and(|content| content_matches(Some(expected), content))
+            })
+        })
+        .map(|(message_id, _)| message_id.as_str())
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [message_id] => SubmissionReconciliation::Found((*message_id).to_owned()),
+        [] if unclaimed.is_empty() => SubmissionReconciliation::NotFound,
+        [] => SubmissionReconciliation::ContentMismatch,
+        _ => SubmissionReconciliation::Ambiguous,
+    }
+}
+
+fn native_failure(
+    operation: forge_provider_api::error::ProviderOperation,
+    kind: forge_provider_api::error::ProviderFailureKind,
+) -> ProviderError {
+    ProviderError::Failure(forge_provider_api::ProviderFailure::new(operation, kind))
 }
 
 #[cfg(test)]

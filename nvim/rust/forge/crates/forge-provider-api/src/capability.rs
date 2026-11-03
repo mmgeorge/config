@@ -1,4 +1,4 @@
-use crate::{ProviderDescriptor, ProviderKind};
+use crate::{ProviderDescriptor, ProviderId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -13,11 +13,94 @@ pub enum Support {
     Unsupported,
 }
 
+/// Identify a normalized capability independently of provider names or native protocol methods.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityId {
+    Prompt,
+    Cancel,
+    Resume,
+    Cleanup,
+    Tools,
+    Goals,
+    Queue,
+    Undo,
+    Plans,
+    Questions,
+    SessionDelete,
+    NativeFork,
+    NativeCompact,
+    NativeSteer,
+    NativeTurnRollback,
+    CompactionLifecycle,
+    BackgroundCompaction,
+    CompactionSummary,
+    CompactionMetrics,
+    ModelSelection,
+    EffortSelection,
+    FastMode,
+    UltrafastMode,
+    SkillCatalog,
+    McpCatalog,
+    ApprovalRules,
+    OsSandbox,
+    BackgroundTerminals,
+    FileDiff,
+    BackgroundTermination,
+    Recap,
+    RuntimeSetup,
+    Authentication,
+    AgentObserve,
+    AgentSpawn,
+    AgentFollowup,
+    AgentMessage,
+    AgentInterrupt,
+    AgentCrossProvider,
+    LspTools,
+    SubagentTools,
+    SessionTools,
+    NativeAgentSuppression,
+    SkillMutation,
+    NativeImport,
+    McpMutation,
+    McpRuntimeStatus,
+    McpToolCatalog,
+    FilesystemAccess,
+}
+
+/// Identify the layer that implements a normalized capability.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityOwner {
+    Forge,
+    Provider,
+}
+
+/// Specify when a changed setting takes effect.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityApplication {
+    Immediate,
+    Idle,
+    SessionRestart,
+    ServerRestart,
+    ExecutionRestart,
+}
+
+/// Describe whether capability discovery is ready for the selected runtime.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityAvailability {
+    Ready,
+    Starting,
+    Unavailable,
+}
+
 #[derive(Clone, Debug, Serialize)]
 /// Describes one user-visible operation and its application boundary.
 pub struct Capability {
     /// Identifies the operation across providers and menu refreshes.
-    pub id: &'static str,
+    pub id: CapabilityId,
     /// Names the menu group.
     pub group: &'static str,
     /// Names the operation in the menu.
@@ -25,11 +108,11 @@ pub struct Capability {
     /// Records whether every provider must implement this operation.
     pub required: bool,
     /// Identifies Forge or the provider as the implementation owner.
-    pub implementation: &'static str,
+    pub implementation: CapabilityOwner,
     /// Reports support independently of discovery availability.
     pub support: Support,
     /// Describes the configuration application boundary.
-    pub application: &'static str,
+    pub application: CapabilityApplication,
     /// Explains the observable restriction or guarantee.
     pub reason: String,
 }
@@ -38,7 +121,7 @@ pub struct Capability {
 /// Captures one coherent provider capability revision for presentation and dispatch.
 pub struct CapabilityManifest {
     /// Identifies the selected provider.
-    pub provider: ProviderKind,
+    pub provider: ProviderId,
     /// Identifies the provider in the menu.
     pub label: String,
     /// Changes when the capability schema changes.
@@ -46,7 +129,7 @@ pub struct CapabilityManifest {
     /// Retains the negotiated agent version when the transport exposes it.
     pub provider_version: Option<String>,
     /// Distinguishes startup discovery from ready and blocked runtime state.
-    pub availability: &'static str,
+    pub availability: CapabilityAvailability,
     /// Retains a bounded runtime explanation independent of feature support.
     pub availability_reason: Option<String>,
     /// Reports unavailable default resources without exposing credential values.
@@ -78,123 +161,123 @@ impl CapabilityManifest {
                 });
             };
         for (id, label) in [
-            ("prompt", "Streaming prompts"),
-            ("cancel", "Cancel active work"),
-            ("resume", "Resume conversation"),
-            ("cleanup", "Collect provider execution"),
-            ("tools", "Harness control tools"),
+            (CapabilityId::Prompt, "Streaming prompts"),
+            (CapabilityId::Cancel, "Cancel active work"),
+            (CapabilityId::Resume, "Resume conversation"),
+            (CapabilityId::Cleanup, "Collect provider execution"),
+            (CapabilityId::Tools, "Harness control tools"),
         ] {
             add(
                 id,
                 "Conversation",
                 label,
                 true,
-                "provider",
+                CapabilityOwner::Provider,
                 true,
-                "immediate",
+                CapabilityApplication::Immediate,
                 "Required provider contract",
             );
         }
         for (id, label) in [
-            ("goals", "Set, pause, resume, and clear goals"),
-            ("queue", "Queue prompts"),
-            ("undo", "Restore workspace checkpoint"),
-            ("plans", "Plan review and execution"),
-            ("questions", "Harness question forms"),
-            ("session_delete", "Delete Forge history"),
+            (CapabilityId::Goals, "Set, pause, resume, and clear goals"),
+            (CapabilityId::Queue, "Queue prompts"),
+            (CapabilityId::Undo, "Restore workspace checkpoint"),
+            (CapabilityId::Plans, "Plan review and execution"),
+            (CapabilityId::Questions, "Harness question forms"),
+            (CapabilityId::SessionDelete, "Delete Forge history"),
         ] {
             add(
                 id,
                 "Harness",
                 label,
                 false,
-                "forge",
+                CapabilityOwner::Forge,
                 true,
-                "immediate",
+                CapabilityApplication::Immediate,
                 "Forge owns this workflow",
             );
         }
         for (id, label, supported, reason) in [
             (
-                "native_fork",
+                CapabilityId::NativeFork,
                 "Fork provider conversation",
                 flags.native_fork,
                 "Requires native provider history fork",
             ),
             (
-                "native_compact",
+                CapabilityId::NativeCompact,
                 "Compact context manually",
                 flags.native_compact,
                 "Requires an explicit provider compaction operation",
             ),
             (
-                "native_steer",
+                CapabilityId::NativeSteer,
                 "Steer active work",
                 flags.native_steer,
                 "Queued prompts remain available when steering is unsupported",
             ),
             (
-                "native_turn_rollback",
+                CapabilityId::NativeTurnRollback,
                 "Retract output-free cancelled prompt",
                 flags.native_turn_rollback,
                 "Cancellation still stops work without history retraction",
             ),
             (
-                "compaction_lifecycle",
+                CapabilityId::CompactionLifecycle,
                 "Compaction timeline events",
                 flags.compaction.lifecycle,
                 "Shows provider evidence only",
             ),
             (
-                "background_compaction",
+                CapabilityId::BackgroundCompaction,
                 "Observe background compaction",
                 flags.compaction.background,
                 "Requires compaction events outside an active prompt",
             ),
             (
-                "compaction_summary",
+                CapabilityId::CompactionSummary,
                 "Compaction summary",
                 flags.compaction.summary,
                 "Requires a provider-exposed summary",
             ),
             (
-                "compaction_metrics",
+                CapabilityId::CompactionMetrics,
                 "Compaction metrics",
                 flags.compaction.metrics,
                 "Requires provider-exposed usage evidence",
             ),
             (
-                "model_selection",
+                CapabilityId::ModelSelection,
                 "Select model",
                 flags.model_selection,
                 "Model preferences remain specific to each provider",
             ),
             (
-                "effort_selection",
+                CapabilityId::EffortSelection,
                 "Select reasoning effort",
                 flags.effort_selection,
                 "Choices come from the selected provider",
             ),
             (
-                "fast_mode",
+                CapabilityId::FastMode,
                 "Fast service tier",
                 flags.fast_mode,
                 "Requires provider service-tier support",
             ),
             (
-                "ultrafast_mode",
+                CapabilityId::UltrafastMode,
                 "Ultrafast service tier",
                 flags.ultrafast_mode,
                 "Requires provider service-tier support",
             ),
             (
-                "skill_catalog",
+                CapabilityId::SkillCatalog,
                 "Select skills",
                 flags.catalog.skill,
                 "Requires an enforceable skill selection",
             ),
             (
-                "mcp_catalog",
+                CapabilityId::McpCatalog,
                 "Select MCP servers",
                 flags.catalog.mcp,
                 "Requires enforceable server selection",
@@ -205,80 +288,80 @@ impl CapabilityManifest {
                 "Provider",
                 label,
                 false,
-                "provider",
+                CapabilityOwner::Provider,
                 supported,
-                "immediate",
+                CapabilityApplication::Immediate,
                 reason,
             );
         }
         add(
-            "approval_rules",
+            CapabilityId::ApprovalRules,
             "Security",
             "Saved approval rules",
             true,
-            "forge",
+            CapabilityOwner::Forge,
             flags.permission_control,
-            "immediate",
+            CapabilityApplication::Immediate,
             "Forge persists rules and answers individual provider requests",
         );
         add(
-            "os_sandbox",
+            CapabilityId::OsSandbox,
             "Security",
             "Enforce OS sandbox",
             false,
-            "provider",
+            CapabilityOwner::Provider,
             flags.os_sandbox,
-            "session_restart",
+            CapabilityApplication::SessionRestart,
             "Only integrations that declare enforced OS isolation enable this control",
         );
         add(
-            "background_terminals",
+            CapabilityId::BackgroundTerminals,
             "Provider",
             "Inspect background terminals",
             false,
-            "provider",
+            CapabilityOwner::Provider,
             flags.background_terminals,
-            "immediate",
+            CapabilityApplication::Immediate,
             "Requires an explicit provider terminal inventory",
         );
         add(
-            "file_diff",
+            CapabilityId::FileDiff,
             "Provider",
             "Provider file diffs",
             false,
-            "provider",
+            CapabilityOwner::Provider,
             true,
-            "immediate",
+            CapabilityApplication::Immediate,
             "Projects structured provider changes into tool history and the exchange timeline",
         );
         add(
-            "background_termination",
+            CapabilityId::BackgroundTermination,
             "Provider",
             "Terminate one background terminal",
             false,
-            "provider",
+            CapabilityOwner::Provider,
             flags.integration.terminal_termination,
-            "immediate",
+            CapabilityApplication::Immediate,
             "Root cancellation remains available without independent terminal controls",
         );
         add(
-            "recap",
+            CapabilityId::Recap,
             "Harness",
             "Generate isolated recap and session name",
             false,
-            "provider",
+            CapabilityOwner::Provider,
             flags.integration.isolated_generation,
-            "immediate",
+            CapabilityApplication::Immediate,
             "Generation must not append to the main provider conversation",
         );
         for (id, label, supported) in [
             (
-                "runtime_setup",
+                CapabilityId::RuntimeSetup,
                 "Install supported provider runtime",
                 flags.integration.runtime_setup,
             ),
             (
-                "authentication",
+                CapabilityId::Authentication,
                 "Sign in from Forge",
                 flags.integration.authentication,
             ),
@@ -288,20 +371,29 @@ impl CapabilityManifest {
                 "Setup",
                 label,
                 false,
-                "forge",
+                CapabilityOwner::Forge,
                 supported,
-                "idle",
+                CapabilityApplication::Idle,
                 "Uses provider-advertised setup and sign-in methods, preserving native credentials",
             );
         }
         for (id, label) in [
-            ("agent_observe", "Inspect child timelines"),
-            ("agent_spawn", "Spawn independent child conversations"),
-            ("agent_followup", "Queue child follow-up tasks"),
-            ("agent_message", "Persist child informational messages"),
-            ("agent_interrupt", "Interrupt one child or all children"),
+            (CapabilityId::AgentObserve, "Inspect child timelines"),
             (
-                "agent_cross_provider",
+                CapabilityId::AgentSpawn,
+                "Spawn independent child conversations",
+            ),
+            (CapabilityId::AgentFollowup, "Queue child follow-up tasks"),
+            (
+                CapabilityId::AgentMessage,
+                "Persist child informational messages",
+            ),
+            (
+                CapabilityId::AgentInterrupt,
+                "Interrupt one child or all children",
+            ),
+            (
+                CapabilityId::AgentCrossProvider,
                 "Select each child's provider and model",
             ),
         ] {
@@ -310,94 +402,94 @@ impl CapabilityManifest {
                 "Harness",
                 label,
                 false,
-                "forge",
+                CapabilityOwner::Forge,
                 true,
-                "immediate",
+                CapabilityApplication::Immediate,
                 "Harness owns child identity, fresh history, task queues, cancellation, and durable outcomes",
             );
         }
         add(
-            "lsp_tools",
+            CapabilityId::LspTools,
             "Settings",
             "Query running editor language servers",
             false,
-            "forge",
+            CapabilityOwner::Forge,
             true,
-            "server_restart",
+            CapabilityApplication::ServerRestart,
             "Off by default. Read-only agent queries; interactive plan navigation stays available",
         );
         add(
-            "subagent_tools",
+            CapabilityId::SubagentTools,
             "Settings",
             "Enable root model delegation tools",
             false,
-            "forge",
+            CapabilityOwner::Forge,
             true,
-            "server_restart",
+            CapabilityApplication::ServerRestart,
             "Off by default. Manual child spawning remains available and children cannot delegate",
         );
         add(
-            "session_tools",
+            CapabilityId::SessionTools,
             "Settings",
             "Inspect and search Harness sessions",
             false,
-            "forge",
+            CapabilityOwner::Forge,
             true,
-            "server_restart",
+            CapabilityApplication::ServerRestart,
             "On by default. Disabling hides history tools but retains configuration inspection and the Harness skill",
         );
         add(
-            "native_agent_suppression",
+            CapabilityId::NativeAgentSuppression,
             "Provider",
             "Disable provider-native agent tools",
             false,
-            "provider",
+            CapabilityOwner::Provider,
             flags.integration.native_agent_suppression,
-            "session_restart",
+            CapabilityApplication::SessionRestart,
             "Requires an integration that can disable provider-native delegation",
         );
         add(
-            "skill_mutation",
+            CapabilityId::SkillMutation,
             "Settings",
             "Apply skill selection",
             false,
-            "provider",
+            CapabilityOwner::Provider,
             flags.catalog.skill,
-            "session_restart",
+            CapabilityApplication::SessionRestart,
             "Forge persists desired selection and verifies the provider result",
         );
         add(
-            "native_import",
+            CapabilityId::NativeImport,
             "Settings",
             "Import native skills and MCP definitions",
             false,
-            "forge",
+            CapabilityOwner::Forge,
             true,
-            "server_restart",
+            CapabilityApplication::ServerRestart,
             "Explicit source preview and selection. Imported entries start disabled and preserve native value references",
         );
         add(
-            "mcp_mutation",
+            CapabilityId::McpMutation,
             "Settings",
             "Apply MCP selection",
             false,
-            "provider",
+            CapabilityOwner::Provider,
             flags.catalog.mcp,
             if flags.catalog.live_mcp_mutation {
-                "immediate"
+                CapabilityApplication::Immediate
             } else {
-                "server_restart"
+                CapabilityApplication::ServerRestart
             },
             "Forge persists desired selection independently of native provider configuration",
         );
         for (id, label, supported) in [
             (
-                "mcp_runtime_status",
+                CapabilityId::McpRuntimeStatus,
                 "Inspect MCP connection status",
                 flags.integration.mcp_runtime_status,
             ),
             (
-                "mcp_tool_catalog",
+                CapabilityId::McpToolCatalog,
                 "Browse MCP tool definitions",
                 flags.integration.mcp_tool_catalog,
             ),
@@ -407,20 +499,20 @@ impl CapabilityManifest {
                 "Provider",
                 label,
                 false,
-                "provider",
+                CapabilityOwner::Provider,
                 flags.catalog.mcp && supported,
-                "immediate",
+                CapabilityApplication::Immediate,
                 "Requires provider observation of server readiness or tool inventory",
             );
         }
         capability.push(Capability {
-            id: "filesystem_access",
+            id: CapabilityId::FilesystemAccess,
             group: "Security",
             label: "Filesystem access scopes",
             required: false,
-            implementation: "forge",
+            implementation: CapabilityOwner::Forge,
             support: Support::Limited,
-            application: "execution_restart",
+            application: CapabilityApplication::ExecutionRestart,
             reason: "Scopes and write-off apply to reported file operations. Shell commands, MCP internals, and operations without permission callbacks retain provider-native restrictions".into(),
         });
         for limitation in &flags.integration.limitations {
@@ -441,20 +533,49 @@ impl CapabilityManifest {
             revision: 6,
             capability,
             provider_version: None,
-            availability: "ready",
+            availability: CapabilityAvailability::Ready,
             availability_reason: None,
             notice: Vec::new(),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 /// Rejects an optional operation without reporting empty discovery as success.
-pub struct UnsupportedCapability(pub &'static str);
+pub struct UnsupportedCapability(pub ProviderFeature);
+
+/// Identify an unsupported normalized feature without interpreting arbitrary strings.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFeature {
+    RuntimeSetup,
+    Authentication,
+    TerminalAuthentication,
+    ResourceSelection,
+    NativeFork,
+    CheckpointFork,
+    BackgroundTerminals,
+    BackgroundTermination,
+    TextGeneration,
+    ModelSelection,
+    ModelDefaultReset,
+    EffortSelection,
+    ReasoningDefaultReset,
+    ContextWindowSelection,
+    ServiceTier,
+    SkillCatalog,
+    SkillMutation,
+    McpCatalog,
+    McpMutation,
+    McpLaunchRequirements,
+    NativeCompact,
+    NativeGoal,
+    ImageInput,
+}
 
 impl std::fmt::Display for UnsupportedCapability {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "unsupported provider capability: {}", self.0)
+        write!(formatter, "unsupported provider capability: {:?}", self.0)
     }
 }
 
@@ -463,7 +584,7 @@ impl std::error::Error for UnsupportedCapability {}
 /// Records a restriction supplied by the integration that owns the operation.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct FeatureLimitation {
-    pub id: String,
+    pub id: CapabilityId,
     pub support: Support,
     pub reason: String,
 }
@@ -472,23 +593,59 @@ pub struct FeatureLimitation {
 mod test {
     use super::*;
 
+    /// Apply persisted capability IDs with the same outward spelling after typed decoding.
+    #[test]
+    fn capability_wire_identifiers_apply_the_expected_restrictions() {
+        let restriction = serde_json::json!({
+            "id": "file_diff", "support": "limited", "reason": "fixture restriction"
+        });
+        let limitation: FeatureLimitation = serde_json::from_value(restriction.clone()).unwrap();
+        let manifest = CapabilityManifest::from_descriptor(ProviderDescriptor {
+            kind: ProviderId::new("test-provider").unwrap(),
+            label: "Test provider".into(),
+            capability: crate::ProviderCapability {
+                integration: crate::model::ProviderIntegration {
+                    limitations: vec![limitation],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        });
+        let row = manifest
+            .capability
+            .iter()
+            .find(|row| row.id == CapabilityId::FileDiff)
+            .unwrap();
+        assert!(matches!(row.support, Support::Limited));
+        let encoded = serde_json::to_value(&manifest).unwrap();
+        let row = encoded["capability"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == "file_diff")
+            .unwrap();
+        assert_eq!(row["implementation"], "provider");
+        assert_eq!(row["application"], "immediate");
+        assert_eq!(encoded["availability"], "ready");
+        assert!(
+            serde_json::from_value::<FeatureLimitation>(serde_json::json!({
+                "id": "unrecognized_native_method", "support": "limited", "reason": "unmapped"
+            }))
+            .is_err()
+        );
+    }
+
     #[test]
     fn declarations_control_support_without_provider_identity() {
-        for provider in [
-            ProviderKind::Codex,
-            ProviderKind::Copilot,
-            ProviderKind::Claude,
-            ProviderKind::Antigravity,
-            ProviderKind::Mock,
-        ] {
+        for provider in ["one", "two", "three", "four", "five"] {
             let manifest = CapabilityManifest::from_descriptor(ProviderDescriptor {
-                kind: provider,
+                kind: ProviderId::new(format!("test-{provider}")).unwrap(),
                 label: "test".into(),
                 capability: crate::ProviderCapability {
                     integration: crate::model::ProviderIntegration {
                         runtime_setup: true,
                         limitations: vec![FeatureLimitation {
-                            id: "file_diff".into(),
+                            id: CapabilityId::FileDiff,
                             support: Support::Limited,
                             reason: "fixture restriction".into(),
                         }],
@@ -504,11 +661,23 @@ mod test {
                     .find(|entry| entry.id == id)
                     .unwrap()
             };
-            assert!(matches!(find("runtime_setup").support, Support::Supported));
-            assert!(matches!(find("os_sandbox").support, Support::Unsupported));
-            assert!(matches!(find("recap").support, Support::Unsupported));
-            assert!(matches!(find("file_diff").support, Support::Limited));
-            assert_eq!(find("file_diff").reason, "fixture restriction");
+            assert!(matches!(
+                find(CapabilityId::RuntimeSetup).support,
+                Support::Supported
+            ));
+            assert!(matches!(
+                find(CapabilityId::OsSandbox).support,
+                Support::Unsupported
+            ));
+            assert!(matches!(
+                find(CapabilityId::Recap).support,
+                Support::Unsupported
+            ));
+            assert!(matches!(
+                find(CapabilityId::FileDiff).support,
+                Support::Limited
+            ));
+            assert_eq!(find(CapabilityId::FileDiff).reason, "fixture restriction");
         }
     }
 }

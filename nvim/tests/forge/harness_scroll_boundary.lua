@@ -4,7 +4,7 @@ local transcript = vim.api.nvim_create_buf(false, true)
 local window = vim.api.nvim_get_current_win()
 vim.api.nvim_win_set_buf(window, transcript)
 layout.configure_transcript_window(window)
-vim.wo[window].winbar = "Read - Codex - Main"
+vim.wo[window].winbar = "Read - Fixture Alpha - Main"
 vim.cmd("belowright 3new")
 vim.api.nvim_win_set_height(window, 8)
 local height = vim.api.nvim_win_get_height(window) - 1

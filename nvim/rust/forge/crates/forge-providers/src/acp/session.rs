@@ -1,3 +1,4 @@
+use super::AcpKind as ProviderKind;
 use super::{AcpConnectionError, AcpHandler};
 use anyhow::{Context, Result, bail, ensure};
 use async_trait::async_trait;
@@ -5,15 +6,19 @@ use forge_provider_api::permissions::{PermissionResponse, ScopedPermissions};
 use forge_provider_api::*;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::{Mutex, RwLock};
 
 /// Owns native ACP events and conversation state, delegating policy to the host.
 pub struct AcpSessionState {
     kind: ProviderKind,
-    permission: Arc<dyn ScopedPermissions>,
+    permission: Option<Arc<dyn ScopedPermissions>>,
     active: RwLock<Option<ActiveTurn>>,
     retained: RwLock<Option<ActiveTurn>>,
+    history_replay: AtomicBool,
     operation: RwLock<Option<ActiveOperation>>,
     output: Mutex<forge_provider_api::completion::ProviderCompletion>,
     catalog: RwLock<Value>,
@@ -30,6 +35,8 @@ pub struct AcpSessionState {
 struct ActiveTurn {
     generation: Arc<()>,
     sink: ProviderEventSink,
+    permissions: Option<Arc<dyn forge_provider_api::permissions::ProviderPermissions>>,
+    execution_started: bool,
 }
 
 struct ActiveOperation {
@@ -44,13 +51,35 @@ struct AcpMessage {
     closed: bool,
 }
 
+/// Temporarily suppress observations caused only by ACP replaying saved history.
+pub(super) struct HistoryReplayGuard<'state> {
+    active: &'state AtomicBool,
+}
+
+impl Drop for HistoryReplayGuard<'_> {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
 impl AcpSessionState {
+    #[cfg(test)]
     pub fn new(kind: ProviderKind, permission: Arc<dyn ScopedPermissions>) -> Self {
+        Self::with_permission(kind, Some(permission))
+    }
+
+    /// Create session state whose permission authority is installed with each invocation.
+    pub fn new_native(kind: ProviderKind) -> Self {
+        Self::with_permission(kind, None)
+    }
+
+    fn with_permission(kind: ProviderKind, permission: Option<Arc<dyn ScopedPermissions>>) -> Self {
         Self {
             kind,
             permission,
             active: RwLock::new(None),
             retained: RwLock::new(None),
+            history_replay: AtomicBool::new(false),
             operation: RwLock::new(None),
             output: Mutex::new(forge_provider_api::completion::ProviderCompletion::default()),
             catalog: RwLock::new(json!({})),
@@ -70,9 +99,7 @@ impl AcpSessionState {
         sink: ProviderEventSink,
     ) -> Result<(), ProviderError> {
         if self.operation.read().await.is_some() {
-            return Err(ProviderError::Protocol {
-                message: "ACP invocation cannot replace an active session operation".into(),
-            });
+            return Err(provider_failure(ProviderFailureKind::Rejected));
         }
         let scope = sink.invocation_scope()?.clone();
         *self.retained.write().await = None;
@@ -85,8 +112,34 @@ impl AcpSessionState {
         *self.active.write().await = Some(ActiveTurn {
             generation: Arc::new(()),
             sink,
+            permissions: None,
+            execution_started: false,
         });
         Ok(())
+    }
+
+    /// Begin an invocation with its normalized host permission callback.
+    pub async fn begin_native(
+        &self,
+        session_id: &str,
+        sink: ProviderEventSink,
+        permissions: Arc<dyn forge_provider_api::permissions::ProviderPermissions>,
+    ) -> Result<(), ProviderError> {
+        self.begin(session_id, sink).await?;
+        if let Some(active) = self.active.write().await.as_mut() {
+            active.permissions = Some(permissions);
+        }
+        Ok(())
+    }
+
+    /// Suppress late history replay while a retained ACP conversation is loaded again.
+    pub(super) fn suppress_history_replay(&self) -> Result<HistoryReplayGuard<'_>, ProviderError> {
+        self.history_replay
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| provider_failure(ProviderFailureKind::Rejected))?;
+        Ok(HistoryReplayGuard {
+            active: &self.history_replay,
+        })
     }
 
     /// Publish live observations through active or retained original invocation ownership.
@@ -94,9 +147,56 @@ impl AcpSessionState {
         let sink = self
             .publication_sink()
             .await
-            .context("ACP observation has no retained owner")?;
+            .ok_or_else(|| provider_failure(ProviderFailureKind::Rejected))?;
+        let address = match event.turn_address().cloned() {
+            Some(address) => Some(address),
+            None => self.children.lock().await.root_address(),
+        };
+        let started = {
+            let mut active = self.active.write().await;
+            if let (Some(active), Some(address)) = (active.as_mut(), address) {
+                if !active.execution_started {
+                    active.execution_started = true;
+                    Some((active.sink.clone(), address))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((sink, address)) = started {
+            let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
+                address.scope.clone(),
+                forge_provider_api::lifecycle::ExecutionUpdate::Started { address },
+            )?;
+            sink.send_wait(ProviderEvent::Execution { observation })
+                .await?;
+        }
         sink.send_wait(event).await?;
         Ok(())
+    }
+
+    /// Report whether native observations established a turn for the active prompt.
+    pub async fn execution_started(&self) -> bool {
+        self.active
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|active| active.execution_started)
+            || self
+                .retained
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|retained| retained.execution_started)
+    }
+
+    /// Revoke invocation callback authority before a fenced process is collected.
+    pub async fn revoke_callbacks(&self) {
+        if let Some(active) = self.active.write().await.as_mut() {
+            active.permissions = None;
+        }
     }
 
     /// Get the active operation's publisher before falling back to a settled invocation.
@@ -125,14 +225,10 @@ impl AcpSessionState {
         sink: ProviderEventSink,
     ) -> Result<(), ProviderError> {
         if sink.scope().invocation().is_some() {
-            return Err(ProviderError::Protocol {
-                message: "ACP compaction requires a session-operation scope".into(),
-            });
+            return Err(provider_failure(ProviderFailureKind::Rejected));
         }
         if self.active.read().await.is_some() {
-            return Err(ProviderError::Protocol {
-                message: "ACP compaction cannot replace an active invocation".into(),
-            });
+            return Err(provider_failure(ProviderFailureKind::Rejected));
         }
         *self.output.lock().await = forge_provider_api::completion::ProviderCompletion::default();
         self.compaction.lock().await.clear();
@@ -145,6 +241,16 @@ impl AcpSessionState {
 
     pub async fn finish_compaction(&self) {
         *self.operation.write().await = None;
+    }
+
+    /// Get the most recently observed compaction result for the active operation.
+    pub async fn latest_compaction(&self) -> Option<Compaction> {
+        self.compaction
+            .lock()
+            .await
+            .values()
+            .max_by_key(|compaction| compaction.started_at_ms.or(compaction.completed_at_ms))
+            .cloned()
     }
 
     pub async fn has_active_work(&self) -> bool {
@@ -175,7 +281,7 @@ impl AcpSessionState {
         Ok(self
             .publication_sink()
             .await
-            .context("ACP update has no invocation owner")?
+            .ok_or_else(|| provider_failure(ProviderFailureKind::Rejected))?
             .invocation_scope()?
             .clone())
     }
@@ -285,14 +391,27 @@ impl AcpSessionState {
                     .collect::<Vec<_>>()
             };
             for address in addresses {
-                self.finish_messages(&address, outcome).await?;
+                self.finish_messages(&address, outcome)
+                    .await
+                    .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
             }
-            let events = self.children.lock().await.finish()?;
+            let events = self
+                .children
+                .lock()
+                .await
+                .finish()
+                .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
             for event in events {
                 self.emit(event).await?;
             }
             let root = self.children.lock().await.root_address();
-            if let Some(address) = root {
+            let started = self
+                .active
+                .read()
+                .await
+                .as_ref()
+                .is_some_and(|active| active.execution_started);
+            if started && let Some(address) = root {
                 self.emit(ProviderEvent::Turn {
                     address,
                     update: TurnUpdate::Finished {
@@ -313,10 +432,11 @@ impl AcpSessionState {
         &self,
         address: &TurnAddress,
         outcome: forge_provider_api::turn::TurnOutcome,
-    ) -> Result<()> {
+    ) -> Result<(), ProviderError> {
         if outcome == forge_provider_api::turn::TurnOutcome::Completed {
             self.classify_messages(address, MessageRole::Response)
-                .await?;
+                .await
+                .map_err(|_| provider_failure(ProviderFailureKind::Protocol))?;
         }
         let updates = {
             let mut messages = self.message.lock().await;
@@ -350,6 +470,11 @@ impl AcpSessionState {
             .await
             .clone()
             .context("ACP permission request has no active turn")?;
+        if let Some(permissions) = &active.permissions {
+            permissions
+                .before_tool(active.sink.invocation_scope()?)
+                .await?;
+        }
         let session_id = parameter["sessionId"].as_str().unwrap_or_default();
         let address = if let Some(id) = parameter["toolCall"]["toolCallId"].as_str() {
             self.tool_owner
@@ -394,7 +519,29 @@ impl AcpSessionState {
             }
         }
         let request = super::permission::permission_request(self.kind, &tool)?;
-        let resolution = self.permission.authorize(address, request).await?;
+        let resolution = if let Some(permissions) = &active.permissions {
+            match permissions.authorize(&address.scope, request).await {
+                forge_provider_api::permissions::PermissionResponse::Allow => {
+                    PermissionResponse::Allow
+                }
+                forge_provider_api::permissions::PermissionResponse::Deny { reason } => {
+                    PermissionResponse::Deny { reason }
+                }
+                forge_provider_api::permissions::PermissionResponse::Cancelled => {
+                    PermissionResponse::Cancelled
+                }
+            }
+        } else if let Some(permission) = &self.permission {
+            permission.authorize(address, request).await?
+        } else {
+            return Err(
+                ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::AdmitInput,
+                    forge_provider_api::ProviderFailureKind::Rejected,
+                ))
+                .into(),
+            );
+        };
         if !self
             .active
             .read()
@@ -430,6 +577,9 @@ impl AcpSessionState {
 
 impl AcpSessionState {
     async fn handle_notification(&self, method: &str, parameter: Value) -> Result<()> {
+        if self.history_replay.load(Ordering::Acquire) && method == "_claude/sdkMessage" {
+            return Ok(());
+        }
         if method == "_claude/sdkMessage" && self.kind == ProviderKind::Claude {
             if !self.has_observation_context().await
                 || !self
@@ -492,6 +642,14 @@ impl AcpSessionState {
             return Ok(());
         }
         let update = &parameter["update"];
+        if self.history_replay.load(Ordering::Acquire)
+            && !matches!(
+                update["sessionUpdate"].as_str(),
+                Some("available_commands_update" | "config_option_update" | "current_mode_update")
+            )
+        {
+            return Ok(());
+        }
         let session_id = parameter["sessionId"].as_str().unwrap_or_default();
         if !self.has_observation_context().await
             && !matches!(
@@ -615,10 +773,15 @@ impl AcpSessionState {
                     tool_id: id.into(),
                 };
                 let status = update["status"].as_str().unwrap_or("in_progress");
-                let status =
-                    ToolStatus::parse(status).map_err(|error| ProviderError::Protocol {
-                        message: format!("{error:#}"),
-                    })?;
+                let status = match status {
+                    "pending" | "in_progress" => ToolStatus::Running,
+                    "completed" => ToolStatus::Succeeded,
+                    "failed" => ToolStatus::Failed,
+                    "denied" => ToolStatus::Denied,
+                    "cancelled" => ToolStatus::Cancelled,
+                    "interrupted" => ToolStatus::Interrupted,
+                    _ => return Err(provider_failure(ProviderFailureKind::Protocol).into()),
+                };
                 let invocation = crate::acp::normalize_invocation(ToolInvocation {
                     semantics: Default::default(),
                     kind: match update["kind"].as_str() {
@@ -670,13 +833,18 @@ impl AcpSessionState {
                     ToolStatus::Succeeded => Some(ToolOutcome::Succeeded),
                     ToolStatus::Failed => Some(ToolOutcome::Failed {
                         diagnostic: ToolDiagnostic {
-                            code: None,
-                            message: tool_output(update)?
-                                .unwrap_or_else(|| "ACP tool failed".into()),
+                            kind: forge_provider_api::ProviderFailureKind::Unknown,
+                            message: forge_provider_api::diagnostic::SanitizedMessage::new(
+                                "Provider tool execution failed",
+                            )
+                            .expect("static diagnostic is valid"),
                         },
                     }),
                     ToolStatus::Denied => Some(ToolOutcome::Denied {
-                        reason: tool_output(update)?.unwrap_or_else(|| "ACP tool denied".into()),
+                        reason: forge_provider_api::diagnostic::SanitizedMessage::new(
+                            "Tool execution was denied by the provider",
+                        )
+                        .expect("static denial is nonempty"),
                     }),
                     ToolStatus::Cancelled => Some(ToolOutcome::Cancelled),
                     ToolStatus::Interrupted => Some(ToolOutcome::Interrupted),
@@ -773,11 +941,24 @@ impl AcpSessionState {
     }
 
     async fn handle_request(&self, method: &str, parameter: Value) -> Result<Value> {
+        if self.history_replay.load(Ordering::Acquire) {
+            return match method {
+                "session/request_permission" => Ok(json!({"outcome":{"outcome":"cancelled"}})),
+                _ => bail!("unsupported ACP client request during history reload"),
+            };
+        }
         match method {
             "session/request_permission" => self.authorize(parameter).await,
             _ => bail!("unsupported ACP client request: {method}"),
         }
     }
+}
+
+fn provider_failure(kind: ProviderFailureKind) -> ProviderError {
+    ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+        forge_provider_api::ProviderOperation::NativeTransport,
+        kind,
+    ))
 }
 
 fn tool_output(update: &Value) -> Result<Option<String>> {
@@ -890,12 +1071,16 @@ impl AcpHandler for AcpSessionState {
     async fn notification(&self, method: &str, parameter: Value) -> Result<(), AcpConnectionError> {
         self.handle_notification(method, parameter)
             .await
-            .map_err(|error| AcpConnectionError::Callback(Box::new(ProviderError::from(error))))
+            .map_err(|_| {
+                AcpConnectionError::Callback(Box::new(provider_failure(
+                    ProviderFailureKind::Protocol,
+                )))
+            })
     }
     async fn request(&self, method: &str, parameter: Value) -> Result<Value, AcpConnectionError> {
-        self.handle_request(method, parameter)
-            .await
-            .map_err(|error| AcpConnectionError::Callback(Box::new(ProviderError::from(error))))
+        self.handle_request(method, parameter).await.map_err(|_| {
+            AcpConnectionError::Callback(Box::new(provider_failure(ProviderFailureKind::Protocol)))
+        })
     }
 }
 
@@ -910,9 +1095,6 @@ impl AcpSessionState {
                 catalog[field] = value.clone();
             }
         }
-    }
-    pub async fn completion(&self) -> forge_provider_api::completion::ProviderCompletion {
-        self.output.lock().await.clone()
     }
     pub async fn take_completion(&self) -> forge_provider_api::completion::ProviderCompletion {
         std::mem::take(&mut *self.output.lock().await)
@@ -939,10 +1121,10 @@ mod tests {
     #[tokio::test]
     async fn tool_snapshots_keep_original_scope_until_the_next_invocation() -> Result<()> {
         let state = AcpSessionState::new(ProviderKind::Claude, Arc::new(Deny));
-        let (sink, _stream) = events::channel(InvocationScope::new(
-            ExecutionOwner::root("host"),
-            "exchange",
-        ));
+        let (sink, _stream) = events::channel(
+            BindingId::new("binding")?,
+            InvocationScope::new(ExecutionOwner::root("host"), "exchange"),
+        );
         state.begin("native", sink).await?;
         state.notification("session/update", json!({"sessionId":"native","update":{
             "sessionUpdate":"tool_call","toolCallId":"edit","kind":"edit","locations":[{"path":"one.rs"}]
@@ -962,8 +1144,10 @@ mod tests {
                 .await
                 .contains_key(&("native".into(), "edit".into()))
         );
-        let (next_sink, _next_stream) =
-            events::channel(InvocationScope::new(ExecutionOwner::root("host"), "next"));
+        let (next_sink, _next_stream) = events::channel(
+            BindingId::new("next-binding")?,
+            InvocationScope::new(ExecutionOwner::root("host"), "next"),
+        );
         state.begin("native", next_sink).await?;
         assert!(state.tool.lock().await.is_empty());
         let error = state
@@ -976,6 +1160,143 @@ mod tests {
                 forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict
             ))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_history_reload_does_not_republish_old_transcript_or_tools() -> Result<()> {
+        let state = AcpSessionState::new(ProviderKind::Claude, Arc::new(Deny));
+        let binding = BindingId::new("history-reload-binding".to_owned())?;
+        let scope = InvocationScope::new(ExecutionOwner::root("host"), "original-exchange");
+        let (sink, mut stream) = events::channel(binding, scope);
+        state.begin("native", sink).await?;
+        state
+            .finish(forge_provider_api::turn::TurnOutcome::Completed)
+            .await?;
+        while stream.try_next()?.is_some() {}
+
+        {
+            let _replay = state.suppress_history_replay()?;
+            state
+                .handle_notification("session/update", json!({"sessionId":"native","update":{
+                    "sessionUpdate":"agent_message_chunk","content":{"text":"replayed old answer"}
+                }}))
+                .await?;
+            state
+                .handle_notification(
+                    "session/update",
+                    json!({"sessionId":"native","update":{
+                        "sessionUpdate":"tool_call","toolCallId":"old-tool","kind":"edit"
+                    }}),
+                )
+                .await?;
+            state
+                .handle_notification(
+                    "session/update",
+                    json!({"sessionId":"native","update":{
+                        "sessionUpdate":"config_option_update","configOptions":[{"id":"model"}]
+                    }}),
+                )
+                .await?;
+        }
+
+        assert!(stream.try_next()?.is_none());
+        assert!(state.tool.lock().await.is_empty());
+        assert!(!state.execution_started().await);
+        assert_eq!(state.catalog().await["configOptions"][0]["id"], "model");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_tool_output_is_not_reused_as_denial_or_failure_diagnostic() -> Result<()> {
+        let state = AcpSessionState::new(ProviderKind::Claude, Arc::new(Deny));
+        let (sink, mut stream) = events::channel(
+            BindingId::new("tool-diagnostic-binding")?,
+            InvocationScope::new(ExecutionOwner::root("host"), "tool-diagnostic-exchange"),
+        );
+        state.begin("native", sink).await?;
+
+        for (tool_id, status) in [("denied-tool", "denied"), ("failed-tool", "failed")] {
+            state
+                .notification(
+                    "session/update",
+                    json!({"sessionId":"native","update":{
+                        "sessionUpdate":"tool_call_update",
+                        "toolCallId":tool_id,
+                        "status":status,
+                        "rawOutput":"native diagnostic sentinel"
+                    }}),
+                )
+                .await?;
+        }
+
+        let events = std::iter::from_fn(|| stream.try_next().transpose())
+            .map(|event| event.map(|event| event.event).map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::Tool {
+                    address,
+                    update:
+                        ToolUpdate::Output {
+                            update: TextUpdate::Replace(text),
+                        },
+                } if address.tool_id == forge_provider_api::ToolId::from("denied-tool")
+                    || address.tool_id == forge_provider_api::ToolId::from("failed-tool") =>
+                {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outputs,
+            ["native diagnostic sentinel", "native diagnostic sentinel"]
+        );
+
+        let outcomes = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderEvent::Tool {
+                    address,
+                    update: ToolUpdate::Finished { outcome },
+                } if address.tool_id == forge_provider_api::ToolId::from("denied-tool")
+                    || address.tool_id == forge_provider_api::ToolId::from("failed-tool") =>
+                {
+                    Some((address.tool_id.as_str(), outcome))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.len(), 2);
+        match outcomes[0] {
+            ("denied-tool", ToolOutcome::Denied { reason }) => {
+                assert_eq!(reason.as_str(), "Tool execution was denied by the provider");
+            }
+            _ => panic!("expected a normalized denied outcome"),
+        }
+        match outcomes[1] {
+            ("failed-tool", ToolOutcome::Failed { diagnostic }) => {
+                assert_eq!(
+                    diagnostic.message.as_str(),
+                    "Provider tool execution failed"
+                );
+            }
+            _ => panic!("expected a normalized failed outcome"),
+        }
+        assert!(outcomes.iter().all(|(_, outcome)| {
+            match outcome {
+                ToolOutcome::Denied { reason } => {
+                    !reason.as_str().contains("native diagnostic sentinel")
+                }
+                ToolOutcome::Failed { diagnostic } => !diagnostic
+                    .message
+                    .as_str()
+                    .contains("native diagnostic sentinel"),
+                _ => true,
+            }
+        }));
         Ok(())
     }
 }

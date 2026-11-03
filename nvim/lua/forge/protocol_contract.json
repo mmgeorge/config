@@ -1,5 +1,5 @@
 {
-  "version": 31,
+  "version": 32,
   "node": {
     "kind": [
       "exchange",
@@ -707,6 +707,12 @@
     "provider.model.pin.set": {
       "session_context": "optional",
       "readiness": "runtime",
+      "admission": "ordinary",
+      "recovery": "none"
+    },
+    "provider.registry.list": {
+      "session_context": "none",
+      "readiness": "host",
       "admission": "ordinary",
       "recovery": "none"
     },

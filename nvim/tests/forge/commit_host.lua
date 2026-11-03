@@ -19,8 +19,8 @@ local background_settings = require("forge.integrations.background_settings")
 local original_settings_request = background_settings.request
 background_settings.request = function(_, _, callback)
   callback({ settings = { models = {
-    codex = { model = "fixture-model", thinking = "low" },
-    copilot = { model = "fixture-model", thinking = "low" },
+    fixture_alpha = { model = "fixture-model", thinking = "low" },
+    fixture_beta = { model = "fixture-model", thinking = "low" },
   }, auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
 end
 

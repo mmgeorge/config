@@ -51,6 +51,36 @@ impl std::error::Error for CleanupWorkFailure {
     }
 }
 
+/// Classify task termination without retaining a panic payload or worker internals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CleanupJoinFailure {
+    Cancelled,
+    Panicked,
+}
+
+impl From<tokio::task::JoinError> for CleanupJoinFailure {
+    /// Normalize the terminal task result before it reaches retained diagnostics.
+    fn from(error: tokio::task::JoinError) -> Self {
+        if error.is_cancelled() {
+            Self::Cancelled
+        } else {
+            Self::Panicked
+        }
+    }
+}
+
+impl std::fmt::Display for CleanupJoinFailure {
+    /// Render the normalized task exit without the original panic text.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Cancelled => "cleanup worker was cancelled",
+            Self::Panicked => "cleanup worker panicked",
+        })
+    }
+}
+
+impl std::error::Error for CleanupJoinFailure {}
+
 /// Distinguish admission, worker, and collection failures without erased engine errors.
 #[derive(Debug)]
 pub(crate) enum CleanupError {
@@ -66,7 +96,7 @@ pub(crate) enum CleanupError {
     },
     Join {
         kind: CleanupWorkKind,
-        source: tokio::task::JoinError,
+        failure: CleanupJoinFailure,
     },
 }
 impl std::fmt::Display for CleanupError {
@@ -82,8 +112,8 @@ impl std::fmt::Display for CleanupError {
                 write!(f, "retained cleanup runtime unavailable: {source}")
             }
             Self::Work { kind, source } => write!(f, "retained {kind:?} failed: {source}"),
-            Self::Join { kind, source } => {
-                write!(f, "retained {kind:?} worker did not complete: {source}")
+            Self::Join { kind, failure } => {
+                write!(f, "retained {kind:?} worker did not complete: {failure}")
             }
         }
     }
@@ -94,31 +124,63 @@ impl std::error::Error for CleanupError {
         match self {
             Self::RuntimeUnavailable(error) => Some(error),
             Self::Work { source, .. } => Some(source),
-            Self::Join { source, .. } => Some(source),
+            Self::Join { failure, .. } => Some(failure),
             Self::Sealed | Self::CapacityExceeded { .. } | Self::Poisoned => None,
         }
     }
 }
 
-/// Share one original typed failure between its waiter and retained task owner.
+/// Share distinct typed failures between waiters and the retained task owner.
 #[derive(Clone, Debug)]
-pub(crate) struct RetainedCleanupFailure(Arc<CleanupError>);
+pub(crate) struct RetainedCleanupFailure {
+    primary: Arc<CleanupError>,
+    additional: Vec<Arc<CleanupError>>,
+}
+impl RetainedCleanupFailure {
+    /// Get the primary failure followed by independent cleanup failures.
+    pub(crate) fn failures(&self) -> impl Iterator<Item = &CleanupError> {
+        std::iter::once(self.primary.as_ref()).chain(self.additional.iter().map(Arc::as_ref))
+    }
+
+    /// Append shared causes once without nesting an earlier aggregate.
+    fn append(&mut self, failure: Self) {
+        for error in std::iter::once(failure.primary).chain(failure.additional) {
+            if !Arc::ptr_eq(&self.primary, &error)
+                && !self
+                    .additional
+                    .iter()
+                    .any(|known| Arc::ptr_eq(known, &error))
+            {
+                self.additional.push(error);
+            }
+        }
+    }
+}
 impl From<CleanupError> for RetainedCleanupFailure {
     /// Share a failed obligation without flattening its source chain.
     fn from(error: CleanupError) -> Self {
-        Self(Arc::new(error))
+        Self {
+            primary: Arc::new(error),
+            additional: Vec::new(),
+        }
     }
 }
 impl std::fmt::Display for RetainedCleanupFailure {
-    /// Describe the retained failure at a host reporting boundary.
+    /// Describe each retained failure once at a host reporting boundary.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(self.0.as_ref(), f)
+        for (index, error) in self.failures().enumerate() {
+            if index != 0 {
+                f.write_str("; ")?;
+            }
+            std::fmt::Display::fmt(error, f)?;
+        }
+        Ok(())
     }
 }
 impl std::error::Error for RetainedCleanupFailure {
-    /// Get the exact failed obligation retained by the registry.
+    /// Get the original primary obligation while retaining all causes for inspection.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(self.0.as_ref())
+        Some(self.primary.as_ref())
     }
 }
 
@@ -185,14 +247,15 @@ impl CleanupLedger {
     pub(super) fn record_failure(&self, error: CleanupError) {
         self.record_retained_failure(error.into());
     }
-    /// Preserve the first concrete failure even when the failure lock was poisoned.
+    /// Accumulate independent failures even when the failure lock was poisoned.
     fn record_retained_failure(&self, error: RetainedCleanupFailure) {
         let mut failure = self
             .failure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if failure.is_none() {
-            *failure = Some(error);
+        match failure.as_mut() {
+            Some(failure) => failure.append(error),
+            None => *failure = Some(error),
         }
     }
     /// Join each task without removing ownership if this collector is cancelled.
@@ -216,7 +279,7 @@ impl CleanupLedger {
                     Ok(Err(error)) => self.record_retained_failure(error),
                     Err(source) => self.record_failure(CleanupError::Join {
                         kind: task.kind,
-                        source,
+                        failure: source.into(),
                     }),
                 }
                 *handle = None;
@@ -272,14 +335,128 @@ mod tests {
     async fn cleanup_failure_is_reported_after_waiter_is_dropped() -> anyhow::Result<()> {
         let ledger = CleanupLedger::default();
         let receiver = ledger.start(CleanupWorkKind::OwnerFence, async {
-            Err(crate::provider::ProviderError::Rejected {
-                message: "native fence failed".into(),
-            }
-            .into())
+            Err(
+                crate::provider::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::FenceSession,
+                    forge_provider_api::ProviderFailureKind::Rejected,
+                ))
+                .into(),
+            )
         })?;
         drop(receiver);
         let error = ledger.collect().await.unwrap_err();
-        assert!(std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |error| error.source()).any(|cause| matches!(cause.downcast_ref::<crate::provider::ProviderError>(), Some(crate::provider::ProviderError::Rejected { message }) if message == "native fence failed")));
+        assert!(std::iter::successors(Some(&error as &(dyn std::error::Error + 'static)), |error| error.source()).any(|cause| matches!(cause.downcast_ref::<crate::provider::ProviderError>(), Some(crate::provider::ProviderError::Failure(failure)) if failure.operation() == forge_provider_api::ProviderOperation::FenceSession && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)));
+        Ok(())
+    }
+
+    /// Report each failed retained obligation once even if its shared result is seen twice.
+    #[tokio::test]
+    async fn collection_preserves_distinct_failures_without_nesting_or_duplicate_causes()
+    -> anyhow::Result<()> {
+        let ledger = CleanupLedger::default();
+        let first = RetainedCleanupFailure::from(CleanupError::Work {
+            kind: CleanupWorkKind::OwnerFence,
+            source: CleanupWorkFailure::Provider(crate::provider::ProviderError::Cancelled),
+        });
+        ledger.record_retained_failure(first.clone());
+        ledger.record_retained_failure(first.clone());
+        let receiver = ledger.start(CleanupWorkKind::ConfigurationWrite, async {
+            Err(crate::provider::ProviderError::DeliveryUncertain.into())
+        })?;
+        drop(receiver);
+        let report = ledger.collect().await.unwrap_err();
+        assert_eq!(first.failures().count(), 1);
+        assert_eq!(report.failures().count(), 2);
+        assert!(matches!(
+            report.failures().next(),
+            Some(CleanupError::Work {
+                kind: CleanupWorkKind::OwnerFence,
+                ..
+            })
+        ));
+        let text = report.to_string();
+        assert_eq!(text.matches("retained OwnerFence failed").count(), 1);
+        assert_eq!(
+            text.matches("retained ConfigurationWrite failed").count(),
+            1
+        );
+        ledger.collect().await?;
+        Ok(())
+    }
+
+    /// Discard raw task panic payloads before exposing any retained failure representation.
+    #[tokio::test]
+    async fn panicking_cleanup_worker_exposes_only_normalized_failure() -> anyhow::Result<()> {
+        let ledger = CleanupLedger::default();
+        let receiver = ledger.start(CleanupWorkKind::OwnerFence, async {
+            panic!("private-native-panic-marker credential-marker");
+        })?;
+        drop(receiver);
+        let report = ledger.collect().await.unwrap_err();
+        assert!(matches!(
+            report.failures().next(),
+            Some(CleanupError::Join {
+                kind: CleanupWorkKind::OwnerFence,
+                failure: CleanupJoinFailure::Panicked,
+            })
+        ));
+        for cause in std::iter::successors(
+            Some(&report as &(dyn std::error::Error + 'static)),
+            |error| error.source(),
+        ) {
+            let display = cause.to_string();
+            assert!(!display.contains("private-native-panic-marker"));
+            assert!(!display.contains("credential-marker"));
+            assert!(!cause.is::<tokio::task::JoinError>());
+        }
+        let debug = format!("{report:?}");
+        assert!(!debug.contains("private-native-panic-marker"));
+        assert!(!debug.contains("credential-marker"));
+        let normalized = crate::provider::lifecycle_error::classify_source(
+            forge_provider_api::ProviderOperation::CleanupExecution,
+            &report,
+        );
+        assert!(
+            matches!(normalized, crate::provider::ProviderError::Failure(failure)
+            if failure.kind() == forge_provider_api::ProviderFailureKind::Runtime)
+        );
+        Ok(())
+    }
+
+    /// Preserve task cancellation as a typed exit without exposing the runtime join error.
+    #[tokio::test]
+    async fn cancelled_cleanup_worker_retains_only_typed_exit() -> anyhow::Result<()> {
+        let ledger = CleanupLedger::default();
+        let receiver = ledger.start(
+            CleanupWorkKind::OwnerFence,
+            std::future::pending::<Result<(), CleanupWorkFailure>>(),
+        )?;
+        drop(receiver);
+        let task = ledger.state.lock().unwrap().tasks.front().unwrap().clone();
+        task.handle.lock().await.as_ref().unwrap().abort();
+        let report = ledger.collect().await.unwrap_err();
+        assert!(matches!(
+            report.failures().next(),
+            Some(CleanupError::Join {
+                kind: CleanupWorkKind::OwnerFence,
+                failure: CleanupJoinFailure::Cancelled,
+            })
+        ));
+        assert!(
+            std::iter::successors(
+                Some(&report as &(dyn std::error::Error + 'static)),
+                |error| error.source(),
+            )
+            .all(|error| !error.is::<tokio::task::JoinError>())
+        );
+        let normalized = crate::provider::lifecycle_error::classify_source(
+            forge_provider_api::ProviderOperation::CleanupExecution,
+            &report,
+        );
+        assert!(
+            matches!(normalized, crate::provider::ProviderError::Failure(failure)
+            if failure.kind() == forge_provider_api::ProviderFailureKind::Runtime)
+        );
         Ok(())
     }
 

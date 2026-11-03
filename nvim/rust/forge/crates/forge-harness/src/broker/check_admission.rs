@@ -336,8 +336,9 @@ impl HarnessBroker {
         if let Some(reason) = &tx.automatic.blocked {
             let update = super::publication::SessionUpdate::Diagnostic {
                 diagnostic: crate::provider::ProviderDiagnostic {
-                    code: None,
-                    message: reason.clone(),
+                    kind: forge_provider_api::ProviderFailureKind::Unknown,
+                    message: forge_provider_api::SanitizedMessage::new(reason.clone())
+                        .expect("host diagnostic is nonempty"),
                     fatal: false,
                 },
             };

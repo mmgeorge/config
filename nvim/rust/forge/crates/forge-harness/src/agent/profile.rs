@@ -101,10 +101,10 @@ impl AgentProfileDocument {
                 "reserved profile name: {name}"
             );
             ensure!(
-                matches!(
-                    profile.provider.as_str(),
-                    "inherit" | "codex" | "copilot" | "claude" | "antigravity"
-                ),
+                profile.provider == "inherit"
+                    || forge_providers::registry::select(&profile.provider)
+                        .and_then(|id| forge_providers::registry::resolve(&id))
+                        .is_ok_and(|registration| registration.selectable),
                 "profile {name} has an unsupported provider"
             );
             ensure!(

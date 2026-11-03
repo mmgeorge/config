@@ -1279,42 +1279,45 @@ mod test {
             ..WidthProfile::default()
         };
         let renderer = TranscriptRenderer::new(&profile)?;
-        for (source, expected) in [
+        for (command, shell, expected) in [
             (
-                r#"bash({"command":"rg -n 'TODO|FIXME' src","description":"Search source","initial_wait":30})"#,
+                "rg -n 'TODO|FIXME' src",
+                Some("bash"),
                 "rg -n 'TODO|FIXME' src",
             ),
+            ("rg -n TODO src", Some("bash"), "rg -n TODO src"),
             (
-                r#"functions.bash({"command":"bash -lc 'rg -n TODO src'"})"#,
-                "rg -n TODO src",
-            ),
-            (
-                r#"powershell({"command":"Get-Content src/main.rs -TotalCount 40"})"#,
+                "Get-Content src/main.rs -TotalCount 40",
+                Some("powershell"),
                 "Read · src/main.rs · first 40 lines",
             ),
             (
-                r#"shell({"command":"rg -n TODO src && git status --short"})"#,
+                "rg -n TODO src && git status --short",
+                Some("bash"),
                 "rg -n TODO src && git status --short",
             ),
+            ("rg -n TODO src", None, "rg -n TODO src"),
             (
-                r#"functions.exec_command({"cmd":"rg -n TODO src"})"#,
-                "rg -n TODO src",
-            ),
-            (
-                r#"run_shell_command({"command":"nu -c 'open --raw src/main.rs'"})"#,
+                "nu -c 'open --raw src/main.rs'",
+                None,
                 "Read · src/main.rs · raw",
             ),
         ] {
-            let (name, arguments) = source.split_once('(').unwrap();
-            let arguments = serde_json::from_str(arguments.strip_suffix(')').unwrap()).unwrap();
-            let invocation =
-                forge_providers::copilot::normalize_invocation(crate::provider::ToolInvocation {
-                    semantics: Default::default(),
-                    kind: crate::provider::ToolActivityKind::ToolCall,
-                    name: name.into(),
-                    title: source.into(),
-                    arguments,
-                });
+            let source = format!(
+                "fixture_command({})",
+                serde_json::json!({"command":command})
+            );
+            let invocation = crate::provider::ToolInvocation {
+                semantics: forge_provider_api::tool::ToolSemantics::Command {
+                    text: command.into(),
+                    shell: shell.map(str::to_owned),
+                    directory: None,
+                },
+                kind: crate::provider::ToolActivityKind::Command,
+                name: "fixture_command".into(),
+                title: command.into(),
+                arguments: serde_json::json!({"command":command}),
+            };
             let shell = match &invocation.semantics {
                 forge_provider_api::tool::ToolSemantics::Command { shell, .. } => shell.as_deref(),
                 _ => None,
@@ -1361,8 +1364,8 @@ mod test {
                 },
             )?;
             assert_eq!(completed.text, running.text);
-            let expanded_source = tool_source_rows(&profile, "tool_call", source)?.join("\n");
-            assert!(expanded_source.contains(source));
+            let expanded_source = tool_source_rows(&profile, "tool_call", &source)?.join("\n");
+            assert!(expanded_source.contains(&source));
             running.validate()?;
             completed.validate()?;
         }

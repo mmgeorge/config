@@ -30,9 +30,10 @@ impl Preferences {
                 !provider.trim().is_empty() && !choice.model.trim().is_empty(),
                 "Background model cannot be empty"
             );
-            let kind = forge_harness::provider::ProviderKind::parse(provider)?;
+            let kind = forge_providers::registry::select(provider)?;
             ensure!(
-                forge_harness::provider::registered_capability(kind)
+                forge_providers::registry::resolve(&kind)?
+                    .capability
                     .integration
                     .background_generation,
                 "This provider does not support Background sessions"
@@ -94,9 +95,11 @@ mod tests {
     #[test]
     fn defaults_persist_and_reject_stale_updates() -> Result<()> {
         let root = tempfile::tempdir()?;
+        let provider =
+            forge_providers::registry::nonselectable_id().expect("registry has a fixture");
         let make = || {
             serde_json::from_value::<SettingsRequest>(json!({"data_root":root.path(),"defaults":{
-            "models":{"codex":{"model":"gpt-6-luna","thinking":"low"}},
+            "models":{(provider.as_str()):{"model":"fixture-model","thinking":"low"}},
             "auto_compaction":{"enabled":true,"threshold_tokens":128000}}}))
             .unwrap()
         };
@@ -108,13 +111,16 @@ mod tests {
             .as_mut()
             .unwrap()
             .models
-            .get_mut("codex")
+            .get_mut(provider.as_str())
             .unwrap()
             .service_tier = ServiceTier::Fast;
         update.expected_revision = Some(0);
         let saved = apply(update)?;
         assert_eq!(saved["revision"], 1);
-        assert_eq!(saved["settings"]["models"]["codex"]["service_tier"], "fast");
+        assert_eq!(
+            saved["settings"]["models"][provider.as_str()]["service_tier"],
+            "fast"
+        );
         assert_eq!(apply(make())?["settings"], saved["settings"]);
         let mut stale = make();
         stale.settings = Some(stale.defaults.clone());

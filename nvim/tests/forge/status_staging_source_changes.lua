@@ -118,7 +118,7 @@ local ok, failure = xpcall(function()
   local rejected = 0
   for _, notice in ipairs(forge_manual.notices) do
     if notice.message:find("selected source changed", 1, true) then rejected = rejected + 1
-    else assert(notice.message:find("no Copilot OAuth token found", 1, true), notice.message) end
+    else error("Unexpected fixture notification: " .. notice.message) end
   end
   assert(rejected == 1, "unexpected rejection count")
   print("source changes: stale hunk rollback, fresh body, current whole-file bytes, and 9 MiB staging passed")

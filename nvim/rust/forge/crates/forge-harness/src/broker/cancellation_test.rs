@@ -1,8 +1,5 @@
 use super::*;
-use crate::provider::{
-    ProviderCompletion, ProviderError, ProviderEventSink, ToolActivityKind, ToolAddress,
-    ToolInvocation, ToolOutcome, ToolUpdate, TurnUpdate,
-};
+use crate::provider::{ProviderCompletion, TurnUpdate};
 use crate::turn::{ToolState, TurnOutcome, TurnState};
 use futures_util::FutureExt;
 use std::sync::atomic::AtomicUsize;
@@ -198,235 +195,194 @@ enum ProviderFailure {
     Stalled,
 }
 
-struct CancelledNativeProvider {
-    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+struct CancellationFixtureStats {
+    calls: Arc<AtomicUsize>,
+    cancellations: Arc<AtomicUsize>,
+}
+
+fn cancellation_fixture(
     failure: ProviderFailure,
-    calls: AtomicUsize,
-    cancellations: AtomicUsize,
-}
-
-#[async_trait::async_trait]
-impl crate::provider::ProviderAdapter for CancelledNativeProvider {
-    type Host = crate::provider::HarnessProviderHost;
-    /// Advertise the existing mock transport while exercising the real broker lifecycle.
-    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-        crate::provider::ProviderDescriptor {
-            kind: crate::provider::ProviderKind::Mock,
-            label: "Native cancellation fixture".into(),
-            capability: crate::provider::mock_capability(),
-        }
-    }
-
-    /// Require the broker's real checkpoint boundary before emitting native tool activity.
-    fn checkpoint_tool_gate(&self) -> bool {
-        true
-    }
-
-    /// Release the fixture without external resources.
-    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::Shutdown,
-                source,
-            )
-        })
-    }
-
-    /// Keep explicit cleanup independent from the provider's reported cancellation.
-    async fn cleanup_execution(
-        &self,
-        _: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
-                source,
-            )
-        })
-    }
-
-    /// Leave the adapter reusable after cancelled execution.
-    async fn cancel_session(
-        &self,
-        _: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.cancellations.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CancelSession,
-                source,
-            )
-        })
-    }
-
-    /// Report no outstanding provider turn after the synchronous fixture result.
-    async fn has_active_turn(&self, _: &str) -> bool {
-        false
-    }
-
-    /// Avoid inventing provider history for the fixture.
-    async fn active_session_id_for(
-        &self,
-        _: &str,
-    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-        Ok(None)
-    }
-
-    /// Emit native cancellation evidence on the first call and a successful subsequent response.
-    async fn session_events(
-        &self,
-        owner: crate::provider::ExecutionOwner,
-    ) -> std::result::Result<
-        crate::provider::events::ProviderEventStream,
-        crate::provider::ProviderError,
-    > {
-        let stream = self.fixture_events.subscribe(owner.clone())?;
-        Ok(stream)
-    }
-
-    async fn session_prompt(
-        self: std::sync::Arc<Self>,
-        request: crate::provider::ProviderRequest,
-        scope: crate::provider::InvocationScope,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let events = self.fixture_events.clone();
-        events
-            .submit(
-                request,
-                scope,
-                crate::provider::test_support::TerminalBoundary::LocalFixture,
-                move |request, sink| async move { self.run_native(request, sink).await },
-            )
-            .await
-    }
-}
-
-impl CancelledNativeProvider {
-    async fn run_native(
-        &self,
-        request: ProviderRequest,
-        sink: ProviderEventSink,
-    ) -> Result<ProviderCompletion, ProviderError> {
-        if let Some(checkpoint) = request
-            .control_context
-            .as_ref()
-            .and_then(|context| context.checkpoint.as_ref())
-        {
-            checkpoint.wait().await.map_err(ProviderError::from)?;
-        }
-        let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        let turn = crate::provider::test_support::address(
-            sink.invocation_scope()?,
-            "native-thread",
-            format!("native-turn-{call}"),
-        );
-        sink.send_wait(ProviderEvent::Execution {
-            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                turn.scope.clone(),
-                forge_provider_api::lifecycle::ExecutionUpdate::Started {
+    stats: Arc<CancellationFixtureStats>,
+) -> Arc<crate::provider::test_support::EventFixtureProvider> {
+    let descriptor = crate::provider::ProviderDescriptor {
+        kind: crate::provider::ProviderId::new("test-cancellation").expect("fixture ID is valid"),
+        label: "Normalized cancellation fixture".into(),
+        capability: crate::provider::test_support::fixture_capability(),
+    };
+    crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        move |request, sink, mut cancelled| {
+            let stats = stats.clone();
+            async move {
+                let call = stats.calls.fetch_add(1, Ordering::SeqCst);
+                let turn = crate::provider::TurnAddress {
+                    scope: request.scope.clone(),
+                    thread_id: "fixture-thread".into(),
+                    turn_id: format!("fixture-turn-{call}").into(),
+                };
+                let completion = forge_provider_api::completion::ProviderCompletion {
+                    provider_session_id: Some(
+                        "fixture-thread"
+                            .to_owned()
+                            .try_into()
+                            .expect("fixture ID is valid"),
+                    ),
+                    capability: crate::provider::test_support::fixture_capability(),
+                    ..Default::default()
+                };
+                sink.send_wait(ProviderEvent::Execution {
+                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                        request.scope.clone(),
+                        forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                            address: turn.clone(),
+                        },
+                    )?,
+                })
+                .await?;
+                sink.send_wait(ProviderEvent::Turn {
                     address: turn.clone(),
-                },
-            )
-            .expect("execution scope is derived from its native address"),
-        })
-        .await?;
-        sink.send_wait(ProviderEvent::Turn {
-            address: turn.clone(),
-            update: TurnUpdate::Started { started_at_ms: 1 },
-        })
-        .await?;
-        if call > 0 {
-            for event in crate::provider::test_support::message(
-                &turn,
-                "recovered",
-                Some(crate::provider::MessageRole::Response),
-                "AFTER-CANCEL-OK",
-            ) {
-                sink.send_wait(event).await?;
-            }
-            sink.send_wait(ProviderEvent::Turn {
-                address: turn,
-                update: TurnUpdate::Finished {
-                    outcome: TurnOutcome::Completed,
-                    completed_at_ms: 5,
-                },
-            })
-            .await?;
-            return Ok(ProviderCompletion::default());
-        }
-        let address = ToolAddress {
-            turn: turn.clone(),
-            tool_id: "denied-native-command".into(),
-        };
-        for update in [
-            ToolUpdate::Requested {
-                invocation: ToolInvocation {
-                    semantics: Default::default(),
-                    kind: ToolActivityKind::Command,
-                    name: "shell".into(),
-                    title: "Denied native command".into(),
-                    arguments: json!({"command":"write denied"}),
-                },
-            },
-            ToolUpdate::Started,
-        ] {
-            sink.send_wait(ProviderEvent::Tool {
-                address: address.clone(),
-                update,
-            })
-            .await?;
-        }
-        if matches!(self.failure, ProviderFailure::Stalled) {
-            loop {
-                sink.send_wait(ProviderEvent::Tool {
-                    address: address.clone(),
-                    update: ToolUpdate::Output {
-                        update: crate::provider::TextUpdate::Append("still running\n".into()),
+                    update: TurnUpdate::Started { started_at_ms: 1 },
+                })
+                .await?;
+                if call > 0 {
+                    for event in crate::provider::test_support::message(
+                        &turn,
+                        "recovered",
+                        Some(crate::provider::MessageRole::Response),
+                        "AFTER-CANCEL-OK",
+                    ) {
+                        sink.send_wait(event).await?;
+                    }
+                    let result = forge_provider_api::lifecycle::ExecutionResult::Completed {
+                        completion: completion.clone().into(),
+                    };
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: turn.clone(),
+                        update: TurnUpdate::Finished {
+                            outcome: TurnOutcome::Completed,
+                            completed_at_ms: 5,
+                        },
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                            request.scope.clone(),
+                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                                address: turn,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: 5,
+                                result,
+                            },
+                        )?,
+                    })
+                    .await?;
+                    return Ok(());
+                }
+                let tool = crate::provider::ToolAddress {
+                    turn: turn.clone(),
+                    tool_id: "fixture-shell".into(),
+                };
+                for update in [
+                    crate::provider::ToolUpdate::Requested {
+                        invocation: crate::provider::ToolInvocation {
+                            semantics: Default::default(),
+                            kind: crate::provider::ToolActivityKind::ToolCall,
+                            name: "shell".into(),
+                            title: "Denied fixture command".into(),
+                            arguments: json!({"command":"write denied"}),
+                        },
+                    },
+                    crate::provider::ToolUpdate::Started,
+                ] {
+                    sink.send_wait(ProviderEvent::Tool {
+                        address: tool.clone(),
+                        update,
+                    })
+                    .await?;
+                }
+                if matches!(failure, ProviderFailure::Stalled) {
+                    loop {
+                        tokio::select! {
+                            changed = cancelled.changed() => {
+                                if changed.is_ok() && *cancelled.borrow() {
+                                    stats.cancellations.fetch_add(1, Ordering::SeqCst);
+                                    sink.send_wait(ProviderEvent::Tool { address: tool.clone(), update: crate::provider::ToolUpdate::Finished {
+                                        outcome: crate::provider::ToolOutcome::Failed { diagnostic: crate::provider::ToolDiagnostic {
+                                            kind: forge_provider_api::ProviderFailureKind::Timeout,
+                                            message: forge_provider_api::diagnostic::SanitizedMessage::new("fixture tool timed out").expect("static diagnostic is valid"),
+                                        } },
+                                    }}).await?;
+                                    break;
+                                }
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                                sink.send_wait(ProviderEvent::Tool { address: tool.clone(), update: crate::provider::ToolUpdate::Output {
+                                    update: crate::provider::TextUpdate::Append("still running\n".into()),
+                                }}).await?;
+                            }
+                        }
+                    }
+                } else {
+                    sink.send_wait(ProviderEvent::Tool {
+                        address: tool,
+                        update: crate::provider::ToolUpdate::Finished {
+                            outcome: crate::provider::ToolOutcome::Denied {
+                                reason: forge_provider_api::diagnostic::SanitizedMessage::new(
+                                    "workspace policy",
+                                )
+                                .expect("static denial is nonempty"),
+                            },
+                        },
+                    })
+                    .await?;
+                }
+                let outcome = match failure {
+                    ProviderFailure::Cancelled => TurnOutcome::Cancelled,
+                    ProviderFailure::SimilarMessage | ProviderFailure::Stalled => {
+                        TurnOutcome::Failed
+                    }
+                };
+                sink.send_wait(ProviderEvent::Turn {
+                    address: turn.clone(),
+                    update: TurnUpdate::Finished {
+                        outcome,
+                        completed_at_ms: 4,
                     },
                 })
                 .await?;
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let result = if outcome == TurnOutcome::Cancelled {
+                    forge_provider_api::lifecycle::ExecutionResult::Cancelled {
+                        completion: completion.into(),
+                    }
+                } else {
+                    forge_provider_api::lifecycle::ExecutionResult::Failed {
+                        completion: completion.into(),
+                        failure: forge_provider_api::lifecycle::ExecutionFailure::Terminal {
+                            kind: if matches!(failure, ProviderFailure::Stalled) {
+                                forge_provider_api::ProviderFailureKind::Timeout
+                            } else {
+                                forge_provider_api::ProviderFailureKind::Unknown
+                            },
+                        },
+                    }
+                };
+                sink.send_wait(ProviderEvent::Execution {
+                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                        request.scope.clone(),
+                        forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                            address: turn,
+                            covered_submissions: vec![request.submission_id],
+                            completed_at_ms: 4,
+                            result,
+                        },
+                    )?,
+                })
+                .await?;
+                Ok(())
             }
-        }
-        sink.send_wait(ProviderEvent::Tool {
-            address,
-            update: ToolUpdate::Finished {
-                outcome: ToolOutcome::Denied {
-                    reason: "workspace policy".into(),
-                },
-            },
-        })
-        .await?;
-        let outcome = match self.failure {
-            ProviderFailure::Cancelled => TurnOutcome::Cancelled,
-            ProviderFailure::SimilarMessage => TurnOutcome::Failed,
-            ProviderFailure::Stalled => unreachable!("stalled provider never completes"),
-        };
-        sink.send_wait(ProviderEvent::Turn {
-            address: turn,
-            update: TurnUpdate::Finished {
-                outcome,
-                completed_at_ms: 4,
-            },
-        })
-        .await?;
-        Err(match self.failure {
-            ProviderFailure::Cancelled => ProviderError::Cancelled,
-            ProviderFailure::SimilarMessage => ProviderError::Provider {
-                code: Some("provider_failure".into()),
-                message: "provider execution cancelled".into(),
-            },
-            ProviderFailure::Stalled => unreachable!("stalled provider never completes"),
-        })
-    }
+        },
+    )
 }
-
 /// Preserve native denied-tool history while classifying the enclosing exchange as cancelled.
 #[tokio::test]
 async fn native_cancelled_error_preserves_denied_history_and_allows_next_prompt() -> Result<()> {
@@ -460,13 +416,13 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
             unit: crate::session::TimeoutUnit::S,
         };
     }
-    let provider = Arc::new(CancelledNativeProvider {
-        fixture_events: Default::default(),
-        failure,
-        calls: AtomicUsize::new(0),
-        cancellations: AtomicUsize::new(0),
+    let stats = Arc::new(CancellationFixtureStats {
+        calls: Arc::new(AtomicUsize::new(0)),
+        cancellations: Arc::new(AtomicUsize::new(0)),
     });
-    broker.provider = provider.clone();
+    let native = cancellation_fixture(failure, stats.clone());
+    let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    broker.provider = fixture.provider_handle();
     broker.turn_cancellation.arm(true);
     let result = broker
         .dispatch(Request {
@@ -489,7 +445,7 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
         expected_code
     );
     assert_eq!(
-        provider.calls.load(Ordering::SeqCst),
+        stats.calls.load(Ordering::SeqCst),
         1,
         "terminal provider results must not replay"
     );
@@ -517,7 +473,7 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
     assert_eq!(tool.id, "denied-native-command");
     if matches!(failure, ProviderFailure::Stalled) {
         assert_eq!(tool.state(), ToolState::Failed);
-        assert!(provider.cancellations.load(Ordering::SeqCst) > 0);
+        assert!(stats.cancellations.load(Ordering::SeqCst) > 0);
     } else {
         assert_eq!(tool.state(), ToolState::Denied);
     }
@@ -542,7 +498,7 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
         "{:?}",
         recovered.response.error()
     );
-    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(stats.calls.load(Ordering::SeqCst), 2);
     let history = broker.store.list_exchange(&broker.session.id)?;
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].state(), expected);

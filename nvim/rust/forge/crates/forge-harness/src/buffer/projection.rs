@@ -2192,22 +2192,16 @@ impl TimelineRenderer<'_> {
         if let Some(instructions) = &compaction.result.custom_instructions {
             details.push(format!("Focus instructions: {instructions}"));
         }
-        if let Some(status) = compaction.result.status_code {
-            details.push(format!("HTTP status: {status}"));
-        }
-        if let Some(request) = &compaction.result.request_id {
-            details.push(format!("Request ID: `{request}`"));
-        }
-        if let Some(request) = &compaction.result.service_request_id {
-            details.push(format!("Service request ID: `{request}`"));
-        }
-        if let Some(error) = &compaction.result.error {
+        if let Some(diagnostic) = &compaction.result.diagnostic {
             let label = if compaction.state == CompactionState::Failed {
                 "Failure"
             } else {
                 "Explanation"
             };
-            details.push(format!("{label}: {error}"));
+            details.push(format!(
+                "{label}: {} ({:?})",
+                diagnostic.message, diagnostic.kind
+            ));
         }
         if let Some(count) = compaction.result.tokens_removed {
             details.push(format!("Tokens removed: {count}"));
@@ -2217,12 +2211,6 @@ impl TimelineRenderer<'_> {
         }
         if let Some(count) = compaction.result.pre_compaction_messages_length {
             details.push(format!("Messages before compaction: {count}"));
-        }
-        if let Some(count) = compaction.result.checkpoint_number {
-            details.push(format!("Checkpoint: {count}"));
-        }
-        if let Some(path) = &compaction.result.checkpoint_path {
-            details.push(format!("Checkpoint path: `{path}`"));
         }
         if let Some(usage) = &compaction.result.compaction_tokens_used {
             if let Some(cost) = &usage.billing {
@@ -3057,7 +3045,7 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
                 };
                 format!(
                     " · {} · {}{speed}",
-                    crate::agent::provider_name(selection.provider),
+                    selection.provider.as_str(),
                     selection.model
                 )
             })
@@ -3394,7 +3382,14 @@ mod tests {
                             started_at_ms: Some(1),
                             completed_at_ms: Some(2),
                             result: CompactionResult {
-                                error: Some("Runtime closed".into()),
+                                diagnostic: Some(forge_provider_api::ProviderDiagnostic {
+                                    kind: forge_provider_api::ProviderFailureKind::Runtime,
+                                    message: forge_provider_api::SanitizedMessage::new(
+                                        "Runtime closed",
+                                    )
+                                    .unwrap(),
+                                    fatal: false,
+                                }),
                                 ..Default::default()
                             },
                         })
@@ -4636,8 +4631,11 @@ mod tests {
                         outcome: if status == "failed" {
                             ToolOutcome::Failed {
                                 diagnostic: crate::provider::ToolDiagnostic {
-                                    code: None,
-                                    message: "Invalid options".into(),
+                                    kind: forge_provider_api::ProviderFailureKind::Unknown,
+                                    message: forge_provider_api::SanitizedMessage::new(
+                                        "Invalid options",
+                                    )
+                                    .expect("fixture diagnostic is nonempty"),
                                 },
                             }
                         } else {
@@ -6533,7 +6531,7 @@ mod tests {
                     run.selection = Some(crate::agent::AgentSelection {
                         profile: "remote-explorer".into(),
                         instructions: String::new(),
-                        provider: crate::provider::ProviderKind::Codex,
+                        provider: forge_providers::registry::default_id(),
                         model: "gpt-6.1-sol".into(),
                         reasoning_effort: "high".into(),
                         context_window: None,
@@ -6553,7 +6551,10 @@ mod tests {
                     );
                 }
                 let selected = project_at(&selected_entry, &WidthProfile::default(), 7000).unwrap();
-                let expected = format!("s · Nested · codex · gpt-6.1-sol{suffix}");
+                let expected = format!(
+                    "s · Nested · {} · gpt-6.1-sol{suffix}",
+                    forge_providers::registry::default_id()
+                );
                 let heading = selected
                     .entry
                     .block
@@ -8836,8 +8837,9 @@ mod tests {
             *update = ToolUpdate::Finished {
                 outcome: ToolOutcome::Failed {
                     diagnostic: crate::provider::ToolDiagnostic {
-                        code: None,
-                        message: "test failed".into(),
+                        kind: forge_provider_api::ProviderFailureKind::Unknown,
+                        message: forge_provider_api::SanitizedMessage::new("test failed")
+                            .expect("fixture diagnostic is nonempty"),
                     },
                 },
             };

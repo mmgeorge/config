@@ -24,26 +24,6 @@ pub use state::{
     TaskPhase, WorkflowState,
 };
 
-#[cfg(test)]
-mod integration_test;
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-/// Captures a policy intent resolved once against authoritative session state.
-pub enum PermissionChange {
-    /// Toggle workspace and full reads without changing writes or approval.
-    ToggleReadScope,
-    /// Toggle writes between off and workspace without remembering full scope.
-    ToggleWriteEnabled,
-    /// Toggle enabled writes between workspace and full, enabling full from off.
-    ToggleWriteScope,
-    /// Change only the tool approval selection.
-    SetApproval { mode: ApprovalMode },
-    #[serde(rename = "enable_yolo")]
-    /// Toggle full unsandboxed Allow to full-access Ask with supported sandboxing.
-    ToggleYolo,
-}
-
 impl PermissionChange {
     /// Apply this intent to candidate state before validation and persistence.
     pub fn apply(
@@ -300,3 +280,23 @@ mod test {
 }
 
 pub use forge_provider_api::input::TaskKind;
+
+#[cfg(test)]
+mod integration_test;
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+/// Captures a policy intent resolved once against authoritative session state.
+pub enum PermissionChange {
+    /// Toggle workspace and full reads without changing writes or approval.
+    ToggleReadScope,
+    /// Toggle writes between off and workspace without remembering full scope.
+    ToggleWriteEnabled,
+    /// Toggle enabled writes between workspace and full, enabling full from off.
+    ToggleWriteScope,
+    /// Change only the tool approval selection.
+    SetApproval { mode: ApprovalMode },
+    #[serde(rename = "enable_yolo")]
+    /// Toggle full unsandboxed Allow to full-access Ask with supported sandboxing.
+    ToggleYolo,
+}

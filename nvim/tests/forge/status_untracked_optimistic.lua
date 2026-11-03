@@ -90,9 +90,7 @@ local ok, failure = xpcall(function()
   for _, file in ipairs(accepted[stage_updates + 1].file) do assert(file.section == initial_section[file.path], file.path .. " did not unstage immediately") end
   local unstaged = vim.system({ "git", "-C", forge_manual.fixture, "diff", "--cached", "--name-only" }, { text = true, timeout = 10000 }):wait()
   assert(unstaged.code == 0 and vim.trim(unstaged.stdout) == "", "index is not empty")
-  for _, notice in ipairs(forge_manual.notices) do
-    assert(notice.message:find("no Copilot OAuth token found", 1, true), notice.message)
-  end
+  assert(#forge_manual.notices == 0, vim.inspect(forge_manual.notices))
   print("all 75 files moved immediately and retained counts through every stage/unstage update")
 end, debug.traceback)
 status.apply_update = apply_update

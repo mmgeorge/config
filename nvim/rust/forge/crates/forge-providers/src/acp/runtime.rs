@@ -1,5 +1,5 @@
-use anyhow::{Context, Result, ensure};
-use forge_provider_api::ProviderKind;
+use super::AcpKind as ProviderKind;
+use anyhow::{Result, ensure};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -140,7 +140,9 @@ impl AcpRuntime {
 
 impl RuntimeStatus {
     /// Report the native executable selected for ACP and terminal authentication.
-    pub async fn provider_version(&self) -> Result<Option<String>> {
+    pub async fn provider_version(
+        &self,
+    ) -> Result<Option<String>, forge_provider_api::ProviderError> {
         let Some(program) = self.environment.get("CLAUDE_CODE_EXECUTABLE") else {
             return Ok(None);
         };
@@ -150,30 +152,45 @@ impl RuntimeStatus {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let child = forge_shell::process::spawn_owned(command)
-            .context("launch Claude Code version check")?;
-        let output = Box::into_pin(child.wait_with_output()).await?;
-        ensure!(
-            output.status.success(),
-            "Claude Code version check failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+            .map_err(|_| version_failure(forge_provider_api::ProviderFailureKind::Runtime))?;
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Box::into_pin(child.wait_with_output()),
+        )
+        .await
+        .map_err(|_| version_failure(forge_provider_api::ProviderFailureKind::Timeout))?
+        .map_err(|_| version_failure(forge_provider_api::ProviderFailureKind::Runtime))?;
+        if !output.status.success() {
+            return Err(version_failure(
+                forge_provider_api::ProviderFailureKind::Runtime,
+            ));
+        }
         parse_claude_version(&output.stdout).map(Some)
     }
 }
 
-fn parse_claude_version(output: &[u8]) -> Result<String> {
-    let output = std::str::from_utf8(output).context("Claude Code version is not UTF-8")?;
-    let version = output
-        .split_whitespace()
-        .next()
-        .context("Claude Code version is empty")?;
-    semver::Version::parse(version).context("Claude Code returned an invalid version")?;
+fn parse_claude_version(output: &[u8]) -> Result<String, forge_provider_api::ProviderError> {
+    let malformed = || version_failure(forge_provider_api::ProviderFailureKind::Protocol);
+    let output = std::str::from_utf8(output).map_err(|_| malformed())?;
+    let version = output.split_whitespace().next().ok_or_else(malformed)?;
+    semver::Version::parse(version).map_err(|_| malformed())?;
     Ok(version.to_owned())
+}
+
+fn version_failure(
+    kind: forge_provider_api::ProviderFailureKind,
+) -> forge_provider_api::ProviderError {
+    forge_provider_api::ProviderFailure::new(
+        forge_provider_api::ProviderOperation::InspectRuntime,
+        kind,
+    )
+    .into()
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use anyhow::Context;
 
     #[test]
     fn claude_version_is_independent_of_adapter_version() -> Result<()> {

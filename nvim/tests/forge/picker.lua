@@ -108,7 +108,7 @@ local ok, failure = pcall(function()
     "resizing did not restore the full source line")
   vim.api.nvim_buf_delete(text_buf, { force = true })
   local rows = {}
-  for index = 1, 40 do rows[index] = { label = "Session " .. index, detail = "codex" } end
+  for index = 1, 40 do rows[index] = { label = "Session " .. index, detail = "fixture_alpha" } end
   local scrolling_page = { subtitle = "Search current repository. Open in current tab.",
     search = {}, column_headers = { "Session", "Harness" }, option_list = rows }
   local first_frame = layout.viewport(layout.build(scrolling_page, 1, 100), 12)

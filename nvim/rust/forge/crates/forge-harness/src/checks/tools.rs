@@ -59,7 +59,6 @@ pub(crate) struct CheckToolScope {
     permissions: Arc<crate::provider::approval::PermissionCoordinator>,
     scope: crate::provider::InvocationScope,
     editing: Arc<AtomicBool>,
-    setup: bool,
     can_run: bool,
     agent: Arc<crate::agent::AgentCoordinator>,
     cancelled: Arc<AtomicBool>,
@@ -86,7 +85,6 @@ pub(crate) struct CheckAuthority {
     pub scope: crate::provider::InvocationScope,
     pub authorization_sink: ProviderEventSink,
     pub editing: Arc<AtomicBool>,
-    pub setup: bool,
     pub can_run: bool,
     pub agent: Arc<crate::agent::AgentCoordinator>,
     pub cancelled: Arc<AtomicBool>,
@@ -130,10 +128,6 @@ impl CheckToolScope {
         self.editing.load(Ordering::Acquire)
     }
 
-    pub(crate) fn is_setup(&self) -> bool {
-        self.setup
-    }
-
     pub(crate) fn open(
         runner: Arc<CheckSupervisor>,
         authority: CheckAuthority,
@@ -150,7 +144,6 @@ impl CheckToolScope {
             scope,
             authorization_sink,
             editing,
-            setup,
             can_run,
             agent,
             cancelled,
@@ -167,7 +160,6 @@ impl CheckToolScope {
             permissions,
             scope,
             editing,
-            setup,
             can_run,
             agent,
             cancelled,
@@ -401,7 +393,8 @@ impl CheckToolScope {
                 mode,
                 crate::permissions::matcher::PermissionRequest {
                     id: uuid::Uuid::new_v4().to_string(),
-                    provider: "harness-checks".into(),
+                    provider: forge_provider_api::ProviderId::new("harness-checks")
+                        .expect("static provider identity is valid"),
                     reason: Some("Configured project checks".into()),
                     target_list,
                 },

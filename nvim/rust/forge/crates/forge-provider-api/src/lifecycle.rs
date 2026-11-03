@@ -31,6 +31,23 @@ impl TryFrom<String> for SubmissionId {
     }
 }
 
+impl TryFrom<&str> for SubmissionId {
+    type Error = LifecycleError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl std::str::FromStr for SubmissionId {
+    type Err = LifecycleError;
+
+    /// Validate a borrowed identity without interpreting its opaque contents.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.to_owned().try_into()
+    }
+}
+
 impl From<SubmissionId> for String {
     /// Encode the original journal identity without adding a prefix.
     fn from(value: SubmissionId) -> Self {
@@ -149,9 +166,9 @@ pub enum ObservationFailure {
     /// The native stream ended outside intentional session teardown.
     Disconnected,
     /// Native dispatch may have occurred without an acknowledgment.
-    DeliveryUncertain { message: String },
+    DeliveryUncertain,
     /// Required native data violated the adapter's protocol.
-    Protocol { message: String },
+    Protocol,
     /// Foreground work conflicts with another admitted exchange on the same owner.
     OwnershipConflict,
 }
@@ -165,13 +182,8 @@ impl fmt::Display for ObservationFailure {
             }
             Self::Overflow => formatter.write_str("provider observation queue overflowed"),
             Self::Disconnected => formatter.write_str("provider observation disconnected"),
-            Self::DeliveryUncertain { message } => {
-                write!(formatter, "provider delivery is uncertain: {message}")
-            }
-            Self::Protocol { message } => write!(
-                formatter,
-                "provider observation violated its protocol: {message}"
-            ),
+            Self::DeliveryUncertain => formatter.write_str("provider delivery is uncertain"),
+            Self::Protocol => formatter.write_str("provider observation violated its protocol"),
             Self::OwnershipConflict => {
                 formatter.write_str("provider execution conflicts with the admitted owner")
             }
@@ -186,17 +198,17 @@ impl std::error::Error for ObservationFailure {}
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExecutionFailure {
     /// The native execution ended after the provider explicitly rejected the request.
-    Rejected { message: String },
+    Rejected,
     /// The adapter reported a terminal failure that is not safe to retry.
     Terminal {
-        code: Option<String>,
-        message: String,
+        #[serde(rename = "failure_kind")]
+        kind: crate::error::ProviderFailureKind,
     },
     /// The adapter proved the terminal failure produced no replay-sensitive output.
     Retryable {
         address: TurnAddress,
-        code: String,
-        message: String,
+        category: crate::retry::RetryCategory,
+        continuation: crate::ContinuationToken,
     },
 }
 
@@ -228,11 +240,26 @@ pub enum ExecutionUpdate {
         completed_at_ms: i64,
         result: ExecutionResult,
     },
+    /// Preserve a native terminal outcome whose required host effects could not be published.
+    PublicationFailed {
+        address: TurnAddress,
+        covered_submissions: Vec<SubmissionId>,
+        completed_at_ms: i64,
+        result: ExecutionResult,
+        failure: crate::session::HostEffectFailure,
+    },
     /// A native control operation reached terminal evidence without starting a turn.
     ResolvedWithoutExecution {
         covered_submissions: Vec<SubmissionId>,
         completed_at_ms: i64,
         result: ExecutionResult,
+    },
+    /// Preserve a terminal native control result when its host effects failed without any turn.
+    ResolutionPublicationFailed {
+        covered_submissions: Vec<SubmissionId>,
+        completed_at_ms: i64,
+        result: ExecutionResult,
+        failure: crate::session::HostEffectFailure,
     },
     /// Observation failed, possibly before a native turn identity existed.
     ObservationLost {
@@ -263,6 +290,12 @@ impl ExecutionObservation {
                 covered_submissions,
                 result,
                 ..
+            }
+            | ExecutionUpdate::PublicationFailed {
+                address,
+                covered_submissions,
+                result,
+                ..
             } => {
                 if address.scope != scope {
                     return Err(LifecycleError::OwnershipMismatch);
@@ -283,6 +316,11 @@ impl ExecutionObservation {
                 }
             }
             ExecutionUpdate::ResolvedWithoutExecution {
+                covered_submissions,
+                result,
+                ..
+            }
+            | ExecutionUpdate::ResolutionPublicationFailed {
                 covered_submissions,
                 result,
                 ..
@@ -414,5 +452,24 @@ mod tests {
             ExecutionUpdate::ObservationLost { .. }
         ));
         assert!(serde_json::from_str::<SubmissionId>("\"\"").is_err());
+    }
+
+    /// Preserve normalized failure categories independently of the tagged outcome shape.
+    #[test]
+    fn terminal_failure_round_trips_its_normalized_category() {
+        let result = ExecutionResult::Failed {
+            completion: ProviderCompletion::default().into(),
+            failure: ExecutionFailure::Terminal {
+                kind: crate::ProviderFailureKind::RateLimited,
+            },
+        };
+        let encoded = serde_json::to_value(&result).unwrap();
+        assert_eq!(encoded["kind"], "failed");
+        assert_eq!(encoded["failure"]["kind"], "terminal");
+        assert_eq!(encoded["failure"]["failure_kind"], "rate_limited");
+        assert_eq!(
+            serde_json::from_value::<ExecutionResult>(encoded).unwrap(),
+            result
+        );
     }
 }

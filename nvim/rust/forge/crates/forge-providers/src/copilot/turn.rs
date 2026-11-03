@@ -1,5 +1,5 @@
 use anyhow::Result;
-use forge_provider_api::{ProviderEvent, ProviderEventSink};
+use forge_provider_api::ProviderEventSink;
 use github_copilot_sdk::SessionEvent;
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -39,7 +39,6 @@ struct RootTurnEvidence {
 
 struct ConsumedInput {
     native_turn: NativeRootTurnId,
-    event_id: String,
     placement: InputPlacement,
 }
 
@@ -175,66 +174,8 @@ impl CopilotTurnEvent {
         Ok(())
     }
 
-    /// Restore filtered durable parent links without admitting replayed input or terminal events.
-    pub(crate) fn restore_ancestry(&self, events: &[SessionEvent]) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-        for event in events {
-            anyhow::ensure!(
-                event.ephemeral != Some(true),
-                "Copilot ancestry contains a replayed ephemeral event"
-            );
-            if let Some(previous) = state.event_parents.get(&event.id) {
-                anyhow::ensure!(
-                    previous == &event.parent_id,
-                    "Copilot durable ancestry conflicts with live observation"
-                );
-            }
-            anyhow::ensure!(
-                !event
-                    .parent_id
-                    .as_ref()
-                    .is_some_and(|parent| chain_contains(&state.event_parents, parent, &event.id)),
-                "Copilot durable ancestry contains a cycle"
-            );
-            state
-                .event_parents
-                .insert(event.id.clone(), event.parent_id.clone());
-        }
-        Ok(())
-    }
-
-    /// Check whether live terminal evidence permits a bounded durable ancestry lookup.
-    pub(crate) fn needs_ancestry(&self) -> Result<bool> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-        let Some(idle) = &state.terminal_event else {
-            return Ok(false);
-        };
-        Ok(state.accepted_submissions.keys().any(|message| {
-            state
-                .input_turns
-                .get(message)
-                .is_some_and(|input| match &input.placement {
-                    InputPlacement::FollowingStart { start_event } => {
-                        idle.root_turns
-                            .iter()
-                            .any(|turn| &turn.start_event == start_event)
-                            && input_root(&idle.root_turns, &state.event_parents, input).is_none()
-                    }
-                    InputPlacement::AwaitingStart | InputPlacement::RunningTurn { .. } => false,
-                })
-        }))
-    }
-
-    /// Certify host submissions only when each consumed turn ended before the retained idle.
-    pub fn certified_submissions(
-        &self,
-    ) -> Result<Vec<forge_provider_api::lifecycle::SubmissionId>> {
+    /// Validate accepted submissions against one correlated native idle boundary.
+    pub fn covered_submissions(&self) -> Result<Vec<forge_provider_api::lifecycle::SubmissionId>> {
         let state = self
             .state
             .lock()
@@ -267,7 +208,7 @@ impl CopilotTurnEvent {
                 .input_turns
                 .get(message)
                 .ok_or_else(|| anyhow::anyhow!("Copilot input lacks consumed turn identity"))?;
-            let root = input_root(&idle.root_turns, &state.event_parents, input);
+            let root = input_root(&idle.root_turns, input);
             let proven = covered.contains(message)
                 && root.is_some_and(|root| match idle.outcome {
                     IdleOutcome::Completed => matches!(root.phase, RootTurnPhase::Finished { .. }),
@@ -284,7 +225,7 @@ impl CopilotTurnEvent {
     }
 
     /// Group terminal-covered inputs by their exact native start and terminal outcome.
-    pub fn certified_executions(
+    pub fn terminal_executions(
         &self,
     ) -> Result<
         Vec<(
@@ -293,7 +234,7 @@ impl CopilotTurnEvent {
             forge_provider_api::lifecycle::ExecutionResult,
         )>,
     > {
-        self.certified_submissions()?;
+        self.covered_submissions()?;
         let state = self
             .state
             .lock()
@@ -312,10 +253,9 @@ impl CopilotTurnEvent {
                 .input_turns
                 .get(message)
                 .ok_or_else(|| anyhow::anyhow!("Copilot input lacks consumed turn identity"))?;
-            let root =
-                input_root(&idle.root_turns, &state.event_parents, input).ok_or_else(|| {
-                    anyhow::anyhow!("Copilot input has no correlated foreground start")
-                })?;
+            let root = input_root(&idle.root_turns, input).ok_or_else(|| {
+                anyhow::anyhow!("Copilot input has no correlated foreground start")
+            })?;
             let terminal = match (&root.phase, idle.outcome) {
                 (RootTurnPhase::Finished { .. }, _) => {
                     forge_provider_api::lifecycle::ExecutionResult::Completed {
@@ -369,10 +309,7 @@ impl CopilotTurnEvent {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
                 if state.uncertain_send {
-                    return Err(forge_provider_api::ProviderError::DeliveryUncertain {
-                        message: "Copilot send ended without acceptance evidence".into(),
-                    }
-                    .into());
+                    return Err(forge_provider_api::ProviderError::DeliveryUncertain.into());
                 }
                 if state.pending_sends == 0
                     && state
@@ -417,8 +354,10 @@ impl CopilotTurnEvent {
             TurnDelivery::Active(delivery) | TurnDelivery::Retained(delivery) => delivery,
             TurnDelivery::Idle => {
                 return Err(forge_provider_api::ProviderError::NotConsumed {
-                    cause: None,
-                    message: "Copilot session has no admitted input context".into(),
+                    continuation: forge_provider_api::ContinuationToken::new(
+                        uuid::Uuid::new_v4().as_bytes().to_vec(),
+                    )
+                    .expect("UUID continuation tokens are nonempty"),
                 }
                 .into());
             }
@@ -433,8 +372,10 @@ impl CopilotTurnEvent {
         }
         if delivery.admission == SendAdmission::Closed {
             return Err(forge_provider_api::ProviderError::NotConsumed {
-                cause: None,
-                message: "Copilot native idle closed this execution's input admission".into(),
+                continuation: forge_provider_api::ContinuationToken::new(
+                    uuid::Uuid::new_v4().as_bytes().to_vec(),
+                )
+                .expect("UUID continuation tokens are nonempty"),
             }
             .into());
         }
@@ -446,42 +387,14 @@ impl CopilotTurnEvent {
         })
     }
 
-    /// Fence future sends and wait only for a send that already owns dispatch.
-    pub async fn stop(&self) -> Result<bool> {
-        self.request_stop()?;
-        loop {
-            let changed = self.sends_changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if self
-                .state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?
-                .pending_sends
-                == 0
-            {
-                break;
-            }
-            changed.await;
-        }
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-        Ok(matches!(state.submission, NativeSubmission::Sent { .. }))
-    }
-
-    /// Fence new sends immediately and identify a submitted send that still needs collection.
-    pub fn request_stop(&self) -> Result<StopRequest> {
+    /// Fence new sends immediately; retained execution owns collection.
+    pub fn request_stop(&self) -> Result<()> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
         state.cancelled = true;
-        Ok(StopRequest {
-            submitted: matches!(state.submission, NativeSubmission::Sent { .. }),
-            sending: state.pending_sends != 0,
-        })
+        Ok(())
     }
 
     pub async fn wait_finished(&self) {
@@ -512,7 +425,7 @@ impl CopilotTurnEvent {
         let Some(input) = state.input_turns.get(message_id) else {
             return Ok(None);
         };
-        Ok(input_root(&state.root_turns, &state.event_parents, input)
+        Ok(input_root(&state.root_turns, input)
             .map(|root| (root.native_id.0.clone(), root.start_event.clone())))
     }
 
@@ -630,7 +543,6 @@ impl CopilotTurnEvent {
                         message_id.to_owned(),
                         ConsumedInput {
                             native_turn,
-                            event_id: event.id.clone(),
                             placement,
                         },
                     );
@@ -703,55 +615,6 @@ impl CopilotTurnEvent {
         state.submission = NativeSubmission::Unsent;
         Ok(())
     }
-
-    /// Publish steering only after the Copilot SDK accepts the immediate message.
-    pub async fn publish_steering(
-        &self,
-        text: String,
-        input_message_id: Option<String>,
-        task_start: Option<forge_provider_api::input::TaskStart>,
-    ) -> Result<()> {
-        let event_sink = {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-            match &state.delivery {
-                TurnDelivery::Active(active) | TurnDelivery::Retained(active) => {
-                    active.event_sink.clone()
-                }
-                TurnDelivery::Idle => None,
-            }
-        };
-        if let Some(event_sink) = event_sink {
-            let acknowledgement = match task_start {
-                Some(start) => forge_provider_api::InputAcknowledgement::TaskStarted {
-                    input_id: input_message_id,
-                    start,
-                    prompt: text,
-                },
-                None => forge_provider_api::InputAcknowledgement::Steering {
-                    input_id: input_message_id,
-                    text,
-                },
-            };
-            event_sink
-                .send_wait(ProviderEvent::InputAccepted {
-                    scope: event_sink.invocation_scope()?.clone(),
-                    acknowledgement,
-                })
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-/// Separates the native abort signal from collection of a committed SDK send.
-pub struct StopRequest {
-    /// Reports that a native send was admitted before the stop fence.
-    pub submitted: bool,
-    /// Reports that its SDK response has not yet released dispatch ownership.
-    pub sending: bool,
 }
 
 /// Retains send ownership and the exact native history boundary across prompt completion.
@@ -866,10 +729,7 @@ struct PendingSend<'a> {
 impl PendingSend<'_> {
     fn complete(mut self, message_id: Option<String>) -> Result<()> {
         if message_id.as_ref().is_some_and(String::is_empty) {
-            return Err(forge_provider_api::ProviderError::DeliveryUncertain {
-                message: "Copilot acknowledged a send without a message identity".into(),
-            }
-            .into());
+            return Err(forge_provider_api::ProviderError::DeliveryUncertain.into());
         }
         let mut state = self
             .owner
@@ -918,18 +778,15 @@ impl Drop for PendingSend<'_> {
     }
 }
 
-/// Resolve one concrete consumed root instance from live consumption or its input ancestry.
+/// Resolve one concrete root execution from native turn identity and event ordering.
 fn input_root<'a>(
     turns: &'a [RootTurnEvidence],
-    parents: &HashMap<String, Option<String>>,
     input: &ConsumedInput,
 ) -> Option<&'a RootTurnEvidence> {
     let root = consumed_root(turns, input)?;
     match &input.placement {
         InputPlacement::RunningTurn { .. } => Some(root),
-        InputPlacement::FollowingStart { start_event } => {
-            chain_contains(parents, start_event, &input.event_id).then_some(root)
-        }
+        InputPlacement::FollowingStart { .. } => Some(root),
         InputPlacement::AwaitingStart => None,
     }
 }
@@ -950,21 +807,6 @@ fn consumed_root<'a>(
 }
 
 /// Follow only known durable ancestry; missing links never prove input-to-start correlation.
-fn chain_contains(parents: &HashMap<String, Option<String>>, event: &str, ancestor: &str) -> bool {
-    let mut current = Some(event);
-    let mut seen = HashSet::new();
-    while let Some(id) = current {
-        if !seen.insert(id) {
-            return false;
-        }
-        if id == ancestor {
-            return true;
-        }
-        current = parents.get(id).and_then(Option::as_deref);
-    }
-    false
-}
-
 impl Drop for CopilotTurnEventGuard<'_> {
     fn drop(&mut self) {
         if let Ok(mut state) = self.owner.state.lock()
@@ -1061,13 +903,12 @@ mod tests {
             turn.observe(&idle)?;
             turn.observe_idle_at(&idle, IdleOutcome::Completed)?;
             if let Some(ack) = ack.take() {
-                assert!(turn.certified_submissions().is_err());
+                assert!(turn.covered_submissions().is_err());
                 ack.send(()).unwrap();
                 send.await?;
             }
             turn.idle_settled().await?;
-            assert!(!turn.needs_ancestry()?);
-            let executions = turn.certified_executions()?;
+            let executions = turn.terminal_executions()?;
             assert_eq!(executions.len(), 1);
             assert_eq!(executions[0].0, "start-0");
             assert_eq!(executions[0].1, vec![submission]);
@@ -1146,11 +987,11 @@ mod tests {
             turn.observe(&idle)?;
             turn.observe_idle_at(&idle, IdleOutcome::Completed)?;
             if let Some(ack) = ack.take() {
-                assert!(turn.certified_submissions().is_err());
+                assert!(turn.covered_submissions().is_err());
                 ack.send(()).unwrap();
                 send.await?;
             }
-            let executions = turn.certified_executions()?;
+            let executions = turn.terminal_executions()?;
             assert_eq!(executions.len(), 1);
             assert_eq!(executions[0].0, "start");
             let covered = &executions[0].1;
@@ -1215,7 +1056,7 @@ mod tests {
         tokio::pin!(settled);
         assert!(futures_util::poll!(settled.as_mut()).is_pending());
         assert!(
-            turn.certified_submissions().is_err(),
+            turn.covered_submissions().is_err(),
             "reused loop ID borrowed a completed instance"
         );
         turn.observe(&live_event(
@@ -1233,7 +1074,7 @@ mod tests {
         turn.observe_idle_at(&old_idle, IdleOutcome::Completed)?;
         assert!(futures_util::poll!(settled.as_mut()).is_pending());
         assert!(
-            turn.certified_submissions().is_err(),
+            turn.covered_submissions().is_err(),
             "old idle gained a new instance"
         );
         let final_idle = live_event(
@@ -1245,7 +1086,7 @@ mod tests {
         turn.observe(&final_idle)?;
         turn.observe_idle_at(&final_idle, IdleOutcome::Completed)?;
         settled.await?;
-        let executions = turn.certified_executions()?;
+        let executions = turn.terminal_executions()?;
         assert_eq!(executions.len(), 2);
         assert_eq!(executions[0].0, "start-first");
         assert_eq!(executions[1].0, "start-second");
@@ -1294,19 +1135,13 @@ mod tests {
             futures_util::poll!(settled.as_mut()).is_pending(),
             "acceptance upgraded an unfinished idle"
         );
-        assert!(turn.certified_submissions().is_err());
+        assert!(turn.covered_submissions().is_err());
         let end = live_event(
             "end",
             Some("start"),
             "assistant.turn_end",
             serde_json::json!({"turnId":"0"}),
         )?;
-        turn.restore_ancestry(&[end.clone()])?;
-        assert!(futures_util::poll!(settled.as_mut()).is_pending());
-        assert!(
-            turn.certified_submissions().is_err(),
-            "durable replay completed a live loop"
-        );
         turn.observe(&end)?;
         assert!(
             futures_util::poll!(settled.as_mut()).is_pending(),
@@ -1315,7 +1150,7 @@ mod tests {
         turn.observe_idle_at(&idle, IdleOutcome::Completed)?;
         assert!(futures_util::poll!(settled.as_mut()).is_pending());
         assert!(
-            turn.certified_submissions().is_err(),
+            turn.covered_submissions().is_err(),
             "duplicate idle gained a later live finish"
         );
         let next = live_event(
@@ -1327,7 +1162,7 @@ mod tests {
         turn.observe(&next)?;
         turn.observe_idle_at(&next, IdleOutcome::Completed)?;
         settled.await?;
-        assert_eq!(turn.certified_submissions()?.len(), 1);
+        assert_eq!(turn.covered_submissions()?.len(), 1);
         Ok(())
     }
 
@@ -1450,9 +1285,9 @@ mod tests {
         Ok(())
     }
 
-    /// Certify ordered root lifecycle even when public APIs omit internal durable ancestry.
+    /// Certify a correlated root lifecycle without filtered durable ancestry records.
     #[tokio::test]
-    async fn parent_task_root_receipt_preserves_ack_order_and_durable_ancestry() -> Result<()> {
+    async fn root_receipt_completes_without_filtered_ancestry_in_either_ack_order() -> Result<()> {
         for acknowledge_first in [false, true] {
             let turn = CopilotTurnEvent::default();
             let guard = turn.activate(None, None)?;
@@ -1498,7 +1333,10 @@ mod tests {
             )?;
             turn.observe(&foreign)?;
             native_idle(&turn, "prior-idle")?;
-            assert!(futures_util::poll!(Box::pin(turn.idle_settled()).as_mut()).is_pending());
+            {
+                let pending = std::pin::pin!(turn.idle_settled());
+                assert!(futures_util::poll!(pending).is_pending());
+            }
             let user = event(
                 "user",
                 None,
@@ -1530,51 +1368,97 @@ mod tests {
             }
             turn.observe_idle_at(&idle, IdleOutcome::Completed)?;
             if let Some(ack) = ack.take() {
-                assert!(futures_util::poll!(Box::pin(turn.idle_settled()).as_mut()).is_pending());
+                {
+                    let pending = std::pin::pin!(turn.idle_settled());
+                    assert!(futures_util::poll!(pending).is_pending());
+                }
                 ack.send(()).unwrap();
                 send.await?;
             }
             turn.idle_settled().await?;
-            assert!(turn.needs_ancestry()?);
-            assert!(turn.certified_executions().is_err());
-            turn.restore_ancestry(&[event(
-                "filtered-system",
-                Some("user"),
-                "system.message",
-                serde_json::json!({}),
-            )?])?;
-            assert!(!turn.needs_ancestry()?);
-            assert_eq!(turn.certified_executions()?.len(), 1);
-            let skill = event(
-                "filtered-skill",
-                Some("start"),
-                "skill.context_delivered_ref",
-                serde_json::json!({}),
-            )?;
-            let usage = event(
-                "filtered-usage",
-                Some("finish"),
-                "session.usage_record",
-                serde_json::json!({}),
-            )?;
-            turn.restore_ancestry(&[skill])?;
-            assert_eq!(turn.certified_executions()?.len(), 1);
-            turn.restore_ancestry(&[usage.clone()])?;
-            let executions = turn.certified_executions()?;
+            let executions = turn.terminal_executions()?;
             assert_eq!(executions.len(), 1);
             assert_eq!(executions[0].0, "start");
             assert_eq!(executions[0].1, vec![submission]);
-            let mut conflict = usage;
-            conflict.parent_id = Some("foreign".into());
-            assert!(turn.restore_ancestry(&[conflict]).is_err());
-            let cycle = event(
-                "cycle",
-                Some("cycle"),
-                "session.usage_record",
-                serde_json::json!({}),
-            )?;
-            assert!(turn.restore_ancestry(&[cycle]).is_err());
+            assert_eq!(
+                executions[0].2,
+                forge_provider_api::lifecycle::ExecutionResult::Completed {
+                    completion: forge_provider_api::completion::ProviderCompletion::default()
+                        .into(),
+                }
+            );
         }
+        Ok(())
+    }
+
+    /// Keep repeated native turn numbers attached to their accepted input occurrence.
+    #[tokio::test]
+    async fn reused_native_turn_number_correlates_by_live_execution_occurrence() -> Result<()> {
+        let turn = CopilotTurnEvent::default();
+        let guard = turn.activate(None, None)?;
+        let first = forge_provider_api::lifecycle::SubmissionId::try_from("first".to_owned())?;
+        let second = forge_provider_api::lifecycle::SubmissionId::try_from("second".to_owned())?;
+        guard
+            .send("before-first".into(), Some(first.clone()), async {
+                Ok("receipt-first".into())
+            })
+            .await?;
+        let event = |id: &str, kind: &str, data| -> Result<SessionEvent> {
+            Ok(serde_json::from_value(serde_json::json!({
+                "id":id,"type":kind,"timestamp":"2026-11-02T17:01:44Z","data":data
+            }))?)
+        };
+        for observed in [
+            event(
+                "user-first",
+                "user.message",
+                serde_json::json!({"messageId":"receipt-first","turnId":"0","parentAgentTaskId":"root-task"}),
+            )?,
+            event(
+                "start-first",
+                "assistant.turn_start",
+                serde_json::json!({"turnId":"0"}),
+            )?,
+            event(
+                "end-first",
+                "assistant.turn_end",
+                serde_json::json!({"turnId":"0"}),
+            )?,
+        ] {
+            turn.observe(&observed)?;
+        }
+        turn.steer(Some(second.clone()), async { Ok("receipt-second".into()) })
+            .await?;
+        for observed in [
+            event(
+                "user-second",
+                "user.message",
+                serde_json::json!({"messageId":"receipt-second","turnId":"0","parentAgentTaskId":"root-task"}),
+            )?,
+            event(
+                "start-second",
+                "assistant.turn_start",
+                serde_json::json!({"turnId":"0"}),
+            )?,
+            event(
+                "end-second",
+                "assistant.turn_end",
+                serde_json::json!({"turnId":"0"}),
+            )?,
+            event("idle", "session.idle", serde_json::json!({}))?,
+        ] {
+            turn.observe(&observed)?;
+            if observed.event_type == "session.idle" {
+                turn.observe_idle_at(&observed, IdleOutcome::Completed)?;
+            }
+        }
+        turn.idle_settled().await?;
+        let executions = turn.terminal_executions()?;
+        assert_eq!(executions.len(), 2);
+        assert_eq!(executions[0].0, "start-first");
+        assert_eq!(executions[0].1, vec![first]);
+        assert_eq!(executions[1].0, "start-second");
+        assert_eq!(executions[1].1, vec![second]);
         Ok(())
     }
 
@@ -1589,7 +1473,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<forge_provider_api::ProviderError>(),
-            Some(forge_provider_api::ProviderError::DeliveryUncertain { .. })
+            Some(forge_provider_api::ProviderError::DeliveryUncertain)
         ));
         assert!(turn.idle_settled().await.is_err());
         Ok(())
@@ -1597,7 +1481,7 @@ mod tests {
 
     /// Certify a long execution without rejecting its complete native ancestry.
     #[tokio::test]
-    async fn terminal_certificate_preserves_long_event_history() -> Result<()> {
+    async fn terminal_outcome_preserves_long_event_history() -> Result<()> {
         let turn = CopilotTurnEvent::default();
         let guard = turn.activate(None, None)?;
         let submission = forge_provider_api::lifecycle::SubmissionId::try_from("long".to_owned())?;
@@ -1632,13 +1516,13 @@ mod tests {
             parent = Some(event.id);
         }
         turn.idle_settled().await?;
-        assert_eq!(turn.certified_submissions()?, vec![submission]);
+        assert_eq!(turn.covered_submissions()?, vec![submission]);
         Ok(())
     }
 
     /// Preserve host-to-native identity and require each completed turn in the idle chain.
     #[tokio::test]
-    async fn terminal_certificate_covers_only_inputs_with_completed_turns() -> Result<()> {
+    async fn terminal_outcome_covers_only_inputs_with_completed_turns() -> Result<()> {
         let turn = CopilotTurnEvent::default();
         let guard = turn.activate(None, None)?;
         let first = forge_provider_api::lifecycle::SubmissionId::try_from("first".to_owned())?;
@@ -1704,10 +1588,10 @@ mod tests {
             }
         }
         turn.idle_settled().await?;
-        let covered = turn.certified_submissions()?;
+        let covered = turn.covered_submissions()?;
         assert_eq!(covered.len(), 2);
         assert!(covered.contains(&first) && covered.contains(&second));
-        let executions = turn.certified_executions()?;
+        let executions = turn.terminal_executions()?;
         assert_eq!(executions.len(), 2);
         assert_eq!(executions[0].0, "start-a");
         assert_eq!(executions[0].1, vec![first]);
@@ -1745,10 +1629,10 @@ mod tests {
         turn.observe(&user)?;
         turn.observe(&idle)?;
         turn.observe_idle_at(&idle, IdleOutcome::Aborted)?;
-        assert!(turn.certified_submissions().is_err());
+        assert!(turn.covered_submissions().is_err());
         ack.send(()).unwrap();
         send.await?;
-        assert!(turn.certified_submissions().is_err());
+        assert!(turn.covered_submissions().is_err());
         Ok(())
     }
 
@@ -1849,7 +1733,10 @@ mod tests {
     async fn idle_context_keeps_steering_until_cancelled() -> Result<()> {
         let turn = CopilotTurnEvent::default();
         let scope = InvocationScope::new(ExecutionOwner::root("session"), "exchange");
-        let (sink, _events) = forge_provider_api::events::channel(scope.clone());
+        let (sink, _events) = forge_provider_api::events::channel(
+            forge_provider_api::BindingId::new("turn-idle").unwrap(),
+            scope.clone(),
+        );
         drop(turn.activate(Some(sink), None)?);
         assert!(!turn.is_active());
         assert_eq!(turn.event_sink().unwrap().invocation_scope()?, &scope);
@@ -1873,11 +1760,17 @@ mod tests {
         let turn = CopilotTurnEvent::default();
         let owner = ExecutionOwner::root("session");
         let old = InvocationScope::new(owner.clone(), "old");
-        let (sink, _events) = forge_provider_api::events::channel(old);
+        let (sink, _events) = forge_provider_api::events::channel(
+            forge_provider_api::BindingId::new("turn-old").unwrap(),
+            old,
+        );
         drop(turn.activate(Some(sink), None)?);
         turn.request_stop()?;
         let new = InvocationScope::new(owner, "new");
-        let (sink, _events) = forge_provider_api::events::channel(new.clone());
+        let (sink, _events) = forge_provider_api::events::channel(
+            forge_provider_api::BindingId::new("turn-new").unwrap(),
+            new.clone(),
+        );
         let guard = turn.activate(Some(sink), None)?;
         assert_eq!(turn.event_sink().unwrap().invocation_scope()?, &new);
         turn.steer(None, async { Ok("accepted".into()) }).await?;

@@ -340,7 +340,7 @@ mod test {
                 .input,
             Some(100)
         );
-        let mut partial = report("copilot", 100, None);
+        let mut partial = report("fixture-beta", 100, None);
         partial.usage.reasoning = None;
         let replay = partial.clone();
         let usage = metrics.usage(&address("parent", "two"), partial).unwrap();

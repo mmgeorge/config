@@ -11,6 +11,9 @@ use serde_json::json;
 
 use super::{Provider, ProviderRequest};
 use crate::trace::TraceStore;
+use forge_provider_api::{RecoveryToken, SubmissionId};
+
+const SUBMISSION_FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -19,21 +22,40 @@ pub enum SubmissionState {
     /// No adapter has crossed the dispatch boundary.
     Prepared,
     /// Dispatch may have happened. Absence of an acknowledgment does not permit replay.
-    Sending { target: SubmissionTarget },
+    Sending { target: Option<RecoveryToken> },
     /// Provider acknowledgment or correlated native history proves acceptance.
     Accepted {
-        receipt: String,
-        target: Option<SubmissionTarget>,
+        receipt: Option<RecoveryToken>,
+        target: Option<RecoveryToken>,
     },
     /// The user explicitly cancelled this submission.
     Cancelled,
 }
 
-pub use forge_provider_api::submission::SubmissionTarget;
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SubmissionPhase {
+    Prepared,
+    Sending,
+    Accepted,
+    Cancelled,
+}
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+impl From<&SubmissionState> for SubmissionPhase {
+    fn from(state: &SubmissionState) -> Self {
+        match state {
+            SubmissionState::Prepared => Self::Prepared,
+            SubmissionState::Sending { .. } => Self::Sending,
+            SubmissionState::Accepted { .. } => Self::Accepted,
+            SubmissionState::Cancelled => Self::Cancelled,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 /// Full input retained independently of exchange completion and diagnostic logging.
 pub struct SubmissionRecord {
+    format_version: u32,
     #[serde(default)]
     pub input_message_id: Option<String>,
     /// Host-generated UUID, also used for native input correlation.
@@ -46,6 +68,85 @@ pub struct SubmissionRecord {
     pub included: Vec<String>,
     /// Last failure, preserved even when the next prompt cannot reconcile delivery.
     pub error: Option<String>,
+}
+
+/// Read old delivery envelopes without interpreting the provider's checkpoint payload.
+impl<'de> Deserialize<'de> for SubmissionRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct StoredRecord {
+            format_version: Option<u32>,
+            #[serde(default)]
+            input_message_id: Option<String>,
+            id: String,
+            request: ProviderRequest,
+            delivery: serde_json::Value,
+            included: Vec<String>,
+            error: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(tag = "state", rename_all = "snake_case")]
+        enum LegacyDelivery {
+            Prepared,
+            Sending {
+                target: serde_json::Value,
+            },
+            Accepted {
+                receipt: serde_json::Value,
+                target: Option<serde_json::Value>,
+            },
+            Cancelled,
+        }
+        let stored = StoredRecord::deserialize(deserializer)?;
+        let legacy = stored.format_version.is_none();
+        let delivery = match stored.format_version {
+            Some(SUBMISSION_FORMAT_VERSION) => {
+                serde_json::from_value(stored.delivery).map_err(serde::de::Error::custom)?
+            }
+            None => {
+                let token =
+                    |value: serde_json::Value| -> std::result::Result<RecoveryToken, D::Error> {
+                        let bytes = serde_json::to_vec(&value).map_err(serde::de::Error::custom)?;
+                        RecoveryToken::new(bytes).map_err(serde::de::Error::custom)
+                    };
+                match serde_json::from_value::<LegacyDelivery>(stored.delivery)
+                    .map_err(serde::de::Error::custom)?
+                {
+                    LegacyDelivery::Prepared => SubmissionState::Prepared,
+                    LegacyDelivery::Sending { target } => SubmissionState::Sending {
+                        target: Some(token(target)?),
+                    },
+                    LegacyDelivery::Accepted { receipt, target } => SubmissionState::Accepted {
+                        receipt: Some(token(receipt)?),
+                        target: target.map(token).transpose()?,
+                    },
+                    LegacyDelivery::Cancelled => SubmissionState::Cancelled,
+                }
+            }
+            Some(_) => {
+                return Err(serde::de::Error::custom(
+                    "unsupported submission journal format",
+                ));
+            }
+        };
+        Ok(Self {
+            format_version: SUBMISSION_FORMAT_VERSION,
+            input_message_id: stored.input_message_id,
+            id: stored.id,
+            request: stored.request,
+            delivery,
+            included: stored.included,
+            error: if legacy {
+                stored
+                    .error
+                    .map(|_| "Earlier provider operation failed".to_owned())
+            } else {
+                stored.error
+            },
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -93,6 +194,7 @@ impl SubmissionStore {
         let submission = Arc::new(Submission {
             store: self.clone(),
             id: id.into(),
+            receipt_id: SubmissionId::try_from(id.to_owned())?,
             record: Mutex::new(record),
             acceptance: tokio::sync::watch::channel(accepted).0,
             steering_queued: tokio::sync::watch::channel(false).0,
@@ -169,7 +271,7 @@ impl SubmissionStore {
     pub fn prepare(
         self: &Arc<Self>,
         request: &ProviderRequest,
-        provider: super::ProviderKind,
+        provider: super::ProviderId,
     ) -> Result<Arc<Submission>> {
         self.prepare_identified(request, provider, None)
     }
@@ -177,7 +279,7 @@ impl SubmissionStore {
     fn prepare_identified(
         self: &Arc<Self>,
         request: &ProviderRequest,
-        provider: super::ProviderKind,
+        provider: super::ProviderId,
         input_message_id: Option<String>,
     ) -> Result<Arc<Submission>> {
         self.prepare_record(
@@ -191,12 +293,13 @@ impl SubmissionStore {
     fn prepare_record(
         self: &Arc<Self>,
         request: &ProviderRequest,
-        provider: super::ProviderKind,
+        provider: super::ProviderId,
         input_message_id: Option<String>,
         identity: PreparationIdentity,
     ) -> Result<Arc<Submission>> {
         let provider = serde_json::to_string(&provider)?;
         let record = SubmissionRecord {
+            format_version: SUBMISSION_FORMAT_VERSION,
             input_message_id,
             id: uuid::Uuid::new_v4().to_string(),
             request: request.clone(),
@@ -277,6 +380,7 @@ impl SubmissionStore {
         let submission = Arc::new(Submission {
             store: self.clone(),
             id: record.id.clone(),
+            receipt_id: SubmissionId::try_from(record.id.clone())?,
             record: Mutex::new(record),
             acceptance: tokio::sync::watch::channel(false).0,
             steering_queued: tokio::sync::watch::channel(false).0,
@@ -298,7 +402,7 @@ impl SubmissionStore {
     pub fn pending(
         &self,
         request: &ProviderRequest,
-        provider: super::ProviderKind,
+        provider: super::ProviderId,
         before: Option<&str>,
     ) -> Result<Vec<SubmissionRecord>> {
         let connection = self
@@ -325,7 +429,7 @@ impl SubmissionStore {
         self: &Arc<Self>,
         catalog: &super::ProviderCatalogRequest,
         input: super::ProviderInput,
-        provider: super::ProviderKind,
+        provider: super::ProviderId,
     ) -> Result<Arc<Submission>> {
         self.prepare_input(catalog, input, provider, None)
     }
@@ -334,7 +438,7 @@ impl SubmissionStore {
         self: &Arc<Self>,
         catalog: &super::ProviderCatalogRequest,
         input: super::ProviderInput,
-        provider: super::ProviderKind,
+        provider: super::ProviderId,
         input_message_id: Option<String>,
     ) -> Result<Arc<Submission>> {
         self.prepare_record(
@@ -349,7 +453,7 @@ impl SubmissionStore {
         self: &Arc<Self>,
         catalog: &super::ProviderCatalogRequest,
         input: super::ProviderInput,
-        provider: super::ProviderKind,
+        provider: super::ProviderId,
         id: &crate::task::TaskInputId,
     ) -> Result<Arc<Submission>> {
         self.prepare_record(
@@ -389,7 +493,7 @@ impl SubmissionStore {
             "provider.submission",
             json!({
                 "submission_id": record.id, "owner": record.request.execution_owner,
-                "delivery": record.delivery, "included": record.included, "error": record.error,
+                "delivery": SubmissionPhase::from(&record.delivery), "included": record.included, "error": record.error,
             }),
         );
     }
@@ -397,19 +501,33 @@ impl SubmissionStore {
     fn receipts(
         &self,
         request: &ProviderRequest,
-        provider: super::ProviderKind,
-    ) -> Result<std::collections::HashSet<String>> {
+        provider: super::ProviderId,
+    ) -> Result<Vec<RecoveryToken>> {
         let connection = self
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
-        let mut statement = connection.prepare("SELECT json_extract(payload,'$.delivery.receipt') FROM submission WHERE runtime=?1 AND provider=?2 AND json_extract(payload,'$.delivery.state')='accepted'")?;
-        Ok(statement
+        let mut statement = connection.prepare("SELECT payload FROM submission WHERE runtime=?1 AND provider=?2 AND json_extract(payload,'$.delivery.state')='accepted'")?;
+        let records = statement
             .query_map(
                 params![request.runtime_key()?, serde_json::to_string(&provider)?],
                 |row| row.get::<_, String>(0),
             )?
-            .collect::<std::result::Result<_, _>>()?)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        records
+            .into_iter()
+            .map(|payload| serde_json::from_str::<SubmissionRecord>(&payload))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map(|records| {
+                records
+                    .into_iter()
+                    .filter_map(|record| match record.delivery {
+                        SubmissionState::Accepted { receipt, .. } => receipt,
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .map_err(Into::into)
     }
 }
 
@@ -426,6 +544,7 @@ impl std::fmt::Debug for SubmissionStore {
 pub struct Submission {
     store: Arc<SubmissionStore>,
     id: String,
+    receipt_id: SubmissionId,
     record: Mutex<SubmissionRecord>,
     acceptance: tokio::sync::watch::Sender<bool>,
     steering_queued: tokio::sync::watch::Sender<bool>,
@@ -497,7 +616,7 @@ impl Submission {
         Ok(flight)
     }
 
-    /// Retain a pending ACP prompt response as live work without inventing acceptance.
+    /// Retain a pending prompt response as live work without inventing acceptance.
     pub(crate) fn begin_prompt(self: &Arc<Self>) -> Result<SubmissionFlight> {
         self.begin_dispatch(DispatchOperation::Prompt)
     }
@@ -601,10 +720,33 @@ impl Submission {
                 .store
                 .persist(move |store| store.receipts(&request, provider_kind))
                 .await?;
-            if let Some(receipt) = provider.reconcile_submission(&record, &known).await? {
-                self.persist(move |submission| submission.accepted(receipt))
+            let target = match &record.delivery {
+                SubmissionState::Sending { target } => target.as_ref(),
+                _ => None,
+            };
+            match provider
+                .reconcile_submission(&self.receipt_id, target, &known)
+                .await?
+            {
+                forge_provider_api::SubmissionEvidence::Accepted {
+                    receipt,
+                    provider_session_id,
+                } => {
+                    self.persist(move |submission| {
+                        submission.accepted(receipt)?;
+                        submission.update(|record| {
+                            record.request.provider_session_id = provider_session_id;
+                            Ok(())
+                        })
+                    })
                     .await?;
-                return self.record();
+                    return self.record();
+                }
+                forge_provider_api::SubmissionEvidence::NotAccepted => {
+                    self.persist(|submission| submission.rejected("Input was not accepted".into()))
+                        .await?;
+                }
+                forge_provider_api::SubmissionEvidence::Unknown => {}
             }
         }
         Ok(record)
@@ -633,7 +775,7 @@ impl Submission {
     }
 
     /// Persists the uncertain state before polling the external send future.
-    pub fn sending(&self, target: SubmissionTarget) -> Result<()> {
+    pub fn sending(&self, target: Option<RecoveryToken>) -> Result<()> {
         self.update(|record| {
             ensure!(
                 record.delivery == SubmissionState::Prepared,
@@ -645,7 +787,7 @@ impl Submission {
     }
 
     /// Atomically acknowledges this message and every earlier input it carried.
-    pub fn accepted(&self, receipt: String) -> Result<()> {
+    pub fn accepted(&self, receipt: Option<RecoveryToken>) -> Result<()> {
         let mut connection = self
             .store
             .connection
@@ -665,7 +807,7 @@ impl Submission {
             "cancelled submission cannot be acknowledged"
         );
         let target = match &record.delivery {
-            SubmissionState::Sending { target } => Some(target.clone()),
+            SubmissionState::Sending { target } => target.clone(),
             SubmissionState::Accepted { target, .. } => target.clone(),
             _ => None,
         };
@@ -724,8 +866,11 @@ impl Submission {
     pub fn rejected(&self, error: String) -> Result<()> {
         self.update(|record| {
             ensure!(
-                matches!(record.delivery, SubmissionState::Sending { .. }),
-                "submission was not dispatched"
+                matches!(
+                    record.delivery,
+                    SubmissionState::Prepared | SubmissionState::Sending { .. }
+                ),
+                "accepted or cancelled submission cannot be rejected"
             );
             record.delivery = SubmissionState::Prepared;
             record.error = Some(error);
@@ -794,10 +939,9 @@ impl Submission {
                 };
                 unresolved |= !steering || !active;
             }
-            ensure!(
-                !unresolved,
-                "an earlier submission has uncertain delivery; input remains saved"
-            );
+            if unresolved {
+                return Err(forge_provider_api::ProviderError::DeliveryUncertain.into());
+            }
         }
         transaction.execute(
             "UPDATE submission SET payload=?2 WHERE id=?1",
@@ -813,36 +957,22 @@ impl Submission {
     /// Reconciles prior uncertain input, then attaches only definitely undelivered context.
     pub async fn recover(&self, provider: &Provider, request: &mut ProviderRequest) -> Result<()> {
         let provider_kind = provider.descriptor().kind;
-        for pending in self.store.pending(request, provider_kind, Some(&self.id))? {
+        for pending in self
+            .store
+            .pending(request, provider_kind.clone(), Some(&self.id))?
+        {
             if pending.id == self.id {
                 continue;
             }
             if matches!(pending.delivery, SubmissionState::Sending { .. }) {
                 let handle = self.store.submission(&pending.id)?;
-                let known_receipts = self.store.receipts(request, provider_kind)?;
-                if let Some(receipt) = provider
-                    .reconcile_submission(&pending, &known_receipts)
-                    .await?
-                {
-                    handle.accepted(receipt)?;
+                let reconciled = handle.reconcile(provider).await?;
+                if matches!(reconciled.delivery, SubmissionState::Accepted { .. }) {
                     if request.provider_session_id.is_none() {
-                        request.provider_session_id = match &pending.delivery {
-                            SubmissionState::Sending { target } => target
-                                .conversation_id()
-                                .map(|id| id.to_owned().try_into())
-                                .transpose()?,
-                            _ => None,
-                        };
+                        request.provider_session_id = reconciled.request.provider_session_id;
                     }
-                } else {
-                    anyhow::bail!(
-                        "Submission {} has uncertain delivery. Both prompts remain saved. Reconciliation could not confirm provider acceptance. Last error: {}",
-                        pending.id,
-                        pending
-                            .error
-                            .as_deref()
-                            .unwrap_or("acknowledgment was not received")
-                    );
+                } else if matches!(reconciled.delivery, SubmissionState::Sending { .. }) {
+                    return Err(forge_provider_api::ProviderError::DeliveryUncertain.into());
                 }
             }
         }
@@ -864,86 +994,247 @@ impl Submission {
 
 #[async_trait::async_trait]
 impl forge_provider_api::submission::InputReceipt for Submission {
-    fn id(&self) -> &str {
-        self.id()
+    fn id(&self) -> &SubmissionId {
+        &self.receipt_id
     }
 
     async fn record_sending(
         self: Arc<Self>,
-        target: SubmissionTarget,
+        target: Option<RecoveryToken>,
     ) -> Result<(), forge_provider_api::ProviderError> {
         self.persist(move |submission| submission.sending(target))
             .await
-            .map_err(Into::into)
+            .map_err(
+                |error| match error.downcast::<forge_provider_api::ProviderError>() {
+                    Ok(error) => error,
+                    Err(_) => forge_provider_api::ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::RecordInput,
+                            forge_provider_api::ProviderFailureKind::Persistence,
+                        ),
+                    ),
+                },
+            )
     }
 
     async fn record_accepted(
         self: Arc<Self>,
-        receipt: String,
+        receipt: Option<RecoveryToken>,
     ) -> Result<(), forge_provider_api::ProviderError> {
         self.persist(move |submission| submission.accepted(receipt))
             .await
-            .map_err(Into::into)
+            .map_err(
+                |error| match error.downcast::<forge_provider_api::ProviderError>() {
+                    Ok(error) => error,
+                    Err(_) => forge_provider_api::ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::RecordInput,
+                            forge_provider_api::ProviderFailureKind::Persistence,
+                        ),
+                    ),
+                },
+            )
     }
 
     async fn record_rejected(
         self: Arc<Self>,
-        message: String,
+        reason: forge_provider_api::ProviderError,
     ) -> Result<(), forge_provider_api::ProviderError> {
-        self.persist(move |submission| submission.rejected(message))
+        self.persist(move |submission| submission.rejected(reason.to_string()))
             .await
-            .map_err(Into::into)
+            .map_err(
+                |error| match error.downcast::<forge_provider_api::ProviderError>() {
+                    Ok(error) => error,
+                    Err(_) => forge_provider_api::ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::RecordInput,
+                            forge_provider_api::ProviderFailureKind::Persistence,
+                        ),
+                    ),
+                },
+            )
     }
 
     async fn record_failure(
         self: Arc<Self>,
-        message: String,
+        reason: forge_provider_api::ProviderError,
     ) -> Result<(), forge_provider_api::ProviderError> {
-        self.persist(move |submission| submission.failed(message))
+        self.persist(move |submission| submission.failed(reason.to_string()))
             .await
-            .map_err(Into::into)
+            .map_err(
+                |error| match error.downcast::<forge_provider_api::ProviderError>() {
+                    Ok(error) => error,
+                    Err(_) => forge_provider_api::ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::RecordInput,
+                            forge_provider_api::ProviderFailureKind::Persistence,
+                        ),
+                    ),
+                },
+            )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{
-        PromptMode, ProviderCompletion, ProviderDescriptor, ProviderError, ProviderEventSink,
-        ProviderInput, ProviderKind,
-    };
+    use crate::provider::{PromptMode, ProviderInput};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    /// Keep a live ACP prompt distinct from lost delivery and preserve a continuation after its caller drops.
+    fn token(label: &str) -> RecoveryToken {
+        RecoveryToken::new(label.as_bytes().to_vec()).expect("fixture token is nonempty")
+    }
+
+    fn fixture_provider_id() -> super::super::ProviderId {
+        forge_providers::registry::nonselectable_id().expect("registry supplies fixture identity")
+    }
+
+    /// Preserve old input and delivery state while wrapping native evidence without decoding it.
+    #[test]
+    fn legacy_delivery_preserves_uncertainty_and_opaque_evidence() -> Result<()> {
+        let evidence = json!({"opaque_old_format":"private-native-canary"});
+        for state in ["prepared", "sending", "accepted", "cancelled"] {
+            let mut delivery = json!({"state":state});
+            if state == "sending" || state == "accepted" {
+                delivery["target"] = evidence.clone();
+            }
+            if state == "accepted" {
+                delivery["receipt"] = json!("private-receipt-canary");
+            }
+            let value = json!({
+                "id":"legacy-input", "request":request("saved input"), "delivery":delivery,
+                "included":[], "error":"private-native-error-canary",
+            });
+            let record: SubmissionRecord = serde_json::from_value(value)?;
+            assert_eq!(record.format_version, SUBMISSION_FORMAT_VERSION);
+            assert_eq!(record.request.input.text(), "saved input");
+            match record.delivery {
+                SubmissionState::Prepared => assert_eq!(state, "prepared"),
+                SubmissionState::Sending { target } => {
+                    assert_eq!(state, "sending");
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(target.unwrap().as_bytes())?,
+                        evidence
+                    );
+                }
+                SubmissionState::Accepted { receipt, .. } => {
+                    assert_eq!(state, "accepted");
+                    assert!(receipt.is_some());
+                }
+                SubmissionState::Cancelled => assert_eq!(state, "cancelled"),
+            }
+            assert_eq!(
+                record.error.as_deref(),
+                Some("Earlier provider operation failed")
+            );
+        }
+        let future = json!({
+            "format_version":SUBMISSION_FORMAT_VERSION + 1,
+            "id":"future", "request":request("saved input"),
+            "delivery":{"state":"prepared"}, "included":[], "error":null,
+        });
+        assert!(serde_json::from_value::<SubmissionRecord>(future).is_err());
+        Ok(())
+    }
+
+    /// Keep definite pre-dispatch rejection retryable without reopening accepted input.
+    #[tokio::test]
+    async fn receipt_records_rejection_before_dispatch_without_resetting_acceptance() -> Result<()>
+    {
+        use forge_provider_api::submission::InputReceipt;
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let input = store.prepare(&request("rejected input"), fixture_provider_id())?;
+        let reason = || {
+            forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::AdmitInput,
+                forge_provider_api::ProviderFailureKind::Rejected,
+            ))
+        };
+        input.clone().record_rejected(reason()).await?;
+        assert_eq!(input.record()?.delivery, SubmissionState::Prepared);
+        input.clone().record_sending(None).await?;
+        input.clone().record_rejected(reason()).await?;
+        assert_eq!(input.record()?.delivery, SubmissionState::Prepared);
+        input.clone().record_sending(None).await?;
+        input.clone().record_accepted(None).await?;
+        assert!(input.clone().record_rejected(reason()).await.is_err());
+        assert!(matches!(
+            input.record()?.delivery,
+            SubmissionState::Accepted { .. }
+        ));
+        Ok(())
+    }
+
+    /// Preserve uncertain delivery through the public receipt callback instead of reporting persistence failure.
+    #[tokio::test]
+    async fn receipt_preserves_uncertain_predecessor_category() -> Result<()> {
+        use forge_provider_api::submission::InputReceipt;
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let predecessor =
+            store.prepare(&request("first"), forge_providers::registry::default_id())?;
+        predecessor.sending(Some(token("first-target")))?;
+        let next = store.prepare(&request("next"), forge_providers::registry::default_id())?;
+        let error = next
+            .clone()
+            .record_sending(Some(token("next-target")))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            forge_provider_api::ProviderError::DeliveryUncertain
+        ));
+        assert_eq!(next.record()?.delivery, SubmissionState::Prepared);
+        Ok(())
+    }
+
+    /// Keep a live prompt distinct from lost delivery and preserve a continuation after its caller drops.
     #[test]
     fn live_prompt_allows_steering_until_its_dispatch_lifetime_ends() -> Result<()> {
         let root = tempfile::tempdir()?;
         let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
-        let original = store.prepare(&request("original"), ProviderKind::Claude)?;
+        let original = store.prepare(
+            &request("original"),
+            forge_providers::registry::alternate_id(&forge_providers::registry::default_id())
+                .expect("registry supplies an alternate identity"),
+        )?;
         let caller = original.begin_steering()?;
         let prompt = original.begin_prompt()?;
         assert!(original.begin_prompt().is_err());
-        let target = SubmissionTarget::native("acp", "session", serde_json::json!({}));
+        let target = Some(token("target"));
         original.sending(target.clone())?;
         drop(caller);
-        let steering = store.prepare(&request("steering"), ProviderKind::Claude)?;
+        let steering = store.prepare(
+            &request("steering"),
+            forge_providers::registry::alternate_id(&forge_providers::registry::default_id())
+                .expect("registry supplies an alternate identity"),
+        )?;
         let _steering = steering.begin_steering()?;
         steering.sending(target.clone())?;
-        steering.accepted("injected".into())?;
-        let next = store.prepare(&request("next normal prompt"), ProviderKind::Claude)?;
+        steering.accepted(Some(token("injected")))?;
+        let next = store.prepare(
+            &request("next normal prompt"),
+            forge_providers::registry::alternate_id(&forge_providers::registry::default_id())
+                .expect("registry supplies an alternate identity"),
+        )?;
         let _next = next.begin_prompt()?;
         assert!(
             next.sending(target.clone()).is_err(),
             "a normal prompt overlapped live work"
         );
         drop(prompt);
-        let later = store.prepare(&request("later steering"), ProviderKind::Claude)?;
+        let later = store.prepare(
+            &request("later steering"),
+            forge_providers::registry::alternate_id(&forge_providers::registry::default_id())
+                .expect("registry supplies an alternate identity"),
+        )?;
         let _later = later.begin_steering()?;
         assert!(
             later.sending(target.clone()).is_err(),
             "lost acknowledgment was treated as live"
         );
-        original.accepted("terminal prompt response".into())?;
+        original.accepted(Some(token("terminal prompt response")))?;
         later.sending(target)?;
         Ok(())
     }
@@ -952,17 +1243,17 @@ mod tests {
     fn live_steering_can_overlap_but_lost_acknowledgments_block_new_dispatch() -> Result<()> {
         let root = tempfile::tempdir()?;
         let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
-        let first = store.prepare(&request("first"), ProviderKind::Codex)?;
-        let second = store.prepare(&request("second"), ProviderKind::Codex)?;
-        let third = store.prepare(&request("third"), ProviderKind::Codex)?;
+        let first = store.prepare(&request("first"), forge_providers::registry::default_id())?;
+        let second = store.prepare(&request("second"), forge_providers::registry::default_id())?;
+        let third = store.prepare(&request("third"), forge_providers::registry::default_id())?;
         let first_flight = first.begin_steering()?;
         assert!(first.begin_steering().is_err());
         let second_flight = second.begin_steering()?;
         let third_flight = third.begin_steering()?;
-        let target = SubmissionTarget::native("codex", "thread", serde_json::json!({}));
+        let target = Some(token("target"));
         first.sending(target.clone())?;
         second.sending(target.clone())?;
-        second.accepted("second accepted first".into())?;
+        second.accepted(Some(token("second accepted first")))?;
         drop(second_flight);
         assert!(matches!(
             first.record()?.delivery,
@@ -976,9 +1267,12 @@ mod tests {
             "uncertain input cannot be replayed"
         );
         let error = third.sending(target.clone()).unwrap_err();
-        assert!(error.to_string().contains("uncertain delivery"));
+        assert!(matches!(
+            error.downcast_ref::<forge_provider_api::ProviderError>(),
+            Some(forge_provider_api::ProviderError::DeliveryUncertain)
+        ));
         assert_eq!(third.record()?.delivery, SubmissionState::Prepared);
-        first.accepted("late first acknowledgment".into())?;
+        first.accepted(Some(token("late first acknowledgment")))?;
         third.sending(target)?;
         drop(third_flight);
         Ok(())
@@ -989,10 +1283,10 @@ mod tests {
         let root = tempfile::tempdir()?;
         let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
         let request = request("pending");
-        let pending = store.prepare(&request, ProviderKind::Codex)?;
+        let pending = store.prepare(&request, forge_providers::registry::default_id())?;
         let connection = store.connection.lock().unwrap();
         let runtime = request.runtime_key()?;
-        let provider = serde_json::to_string(&ProviderKind::Codex)?;
+        let provider = serde_json::to_string(&forge_providers::registry::default_id())?;
         for state in ["accepted", "cancelled"] {
             connection.execute(
                 "INSERT INTO submission VALUES(?1,?2,?3,?4)",
@@ -1021,7 +1315,7 @@ mod tests {
         assert!(details.contains("submission_unfinished"), "{details}");
         drop(plan);
         drop(connection);
-        let result = store.pending(&request, ProviderKind::Codex, None)?;
+        let result = store.pending(&request, forge_providers::registry::default_id(), None)?;
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, pending.id());
         Ok(())
@@ -1035,23 +1329,18 @@ mod tests {
         let store = SubmissionStore::open(root.path(), trace.clone())?;
         let second = SubmissionStore::open(root.path(), trace)?;
         assert!(Arc::ptr_eq(&store, &second));
-        let submission = store.prepare(&request("message"), super::super::ProviderKind::Codex)?;
+        let submission =
+            store.prepare(&request("message"), forge_providers::registry::default_id())?;
         let alias = second.submission(submission.id())?;
         assert!(Arc::ptr_eq(&submission, &alias));
         let mut acceptance = alias.acceptance();
         submission
-            .persist(|submission| {
-                submission.sending(SubmissionTarget::native(
-                    "codex",
-                    "thread",
-                    serde_json::json!({}),
-                ))
-            })
+            .persist(|submission| submission.sending(Some(token("target"))))
             .await?;
         store.connection.lock().unwrap().execute_batch("CREATE TRIGGER fail_accept BEFORE UPDATE ON submission WHEN json_extract(NEW.payload,'$.delivery.state')='accepted' BEGIN SELECT RAISE(ABORT,'accept failed'); END;")?;
         assert!(
             submission
-                .persist(|submission| submission.accepted("receipt".into()))
+                .persist(|submission| submission.accepted(Some(token("receipt"))))
                 .await
                 .is_err()
         );
@@ -1066,7 +1355,7 @@ mod tests {
             .unwrap()
             .execute_batch("DROP TRIGGER fail_accept")?;
         submission
-            .persist(|submission| submission.accepted("receipt".into()))
+            .persist(|submission| submission.accepted(Some(token("receipt"))))
             .await?;
         acceptance.changed().await?;
         assert!(*acceptance.borrow());
@@ -1086,160 +1375,113 @@ mod tests {
         Ok(())
     }
 
-    struct ReceiptProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    struct ReceiptControl {
         fail_before_send: AtomicBool,
         lose_ack: AtomicBool,
         history_accepts: AtomicBool,
         send_count: AtomicUsize,
-        input: Mutex<Vec<ProviderRequest>>,
+        input: Mutex<Vec<forge_provider_api::session::PromptRequest>>,
     }
 
-    impl ReceiptProvider {
-        fn new() -> Self {
-            Self {
-                fixture_events: Default::default(),
-                fail_before_send: AtomicBool::new(false),
-                lose_ack: AtomicBool::new(false),
-                history_accepts: AtomicBool::new(false),
-                send_count: AtomicUsize::new(0),
-                input: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for ReceiptProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-        fn descriptor(&self) -> ProviderDescriptor {
-            ProviderDescriptor {
-                kind: ProviderKind::Codex,
-                label: "submission fixture".into(),
-                capability: crate::provider::ProviderCapability {
-                    integration: crate::provider::ProviderIntegration {
-                        tracked_submission: true,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            }
-        }
-        async fn has_active_turn(&self, _: &str) -> bool {
-            false
-        }
-        async fn cleanup_execution(
-            &self,
-            _: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-        async fn active_session_id_for(
-            &self,
-            _: &str,
-        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(Some("native-thread".to_owned().try_into()?))
-        }
-        async fn reconcile_submission(
-            &self,
-            _: &SubmissionRecord,
-            _: &std::collections::HashSet<String>,
-        ) -> Result<Option<String>> {
-            Ok(self
-                .history_accepts
-                .load(Ordering::SeqCst)
-                .then(|| "history-receipt".into()))
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-    }
-
-    impl ReceiptProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            sink: ProviderEventSink,
-        ) -> Result<ProviderCompletion, ProviderError> {
-            let output: anyhow::Result<ProviderCompletion> = async {
-                if self.fail_before_send.swap(false, Ordering::SeqCst) {
-                    anyhow::bail!("provider startup failed");
+    fn receipt_provider() -> (
+        Arc<crate::provider::test_support::EventFixtureProvider>,
+        Arc<ReceiptControl>,
+    ) {
+        let control = Arc::new(ReceiptControl {
+            fail_before_send: AtomicBool::new(false),
+            lose_ack: AtomicBool::new(false),
+            history_accepts: AtomicBool::new(false),
+            send_count: AtomicUsize::new(0),
+            input: Mutex::new(Vec::new()),
+        });
+        let log = control.clone();
+        let provider = crate::provider::test_support::EventFixtureProvider::new(
+            forge_provider_api::ProviderDescriptor {
+                kind: fixture_provider_id(),
+                label: "Generic fixture".into(),
+                capability: Default::default(),
+            },
+            move |request, sink, _cancelled| {
+                let log = log.clone();
+                async move {
+                    log.input.lock().unwrap().push(request.clone());
+                    let count = log.send_count.fetch_add(1, Ordering::SeqCst);
+                    let address = forge_provider_api::TurnAddress {
+                        scope: request.scope.clone(),
+                        thread_id: "fixture-session".into(),
+                        turn_id: format!("turn-{count}").into(),
+                    };
+                    sink.send_wait(forge_provider_api::ProviderEvent::Execution {
+                        observation: forge_provider_api::ExecutionObservation::new(
+                            request.scope.clone(),
+                            forge_provider_api::ExecutionUpdate::Started {
+                                address: address.clone(),
+                            },
+                        )?,
+                    })
+                    .await?;
+                    sink.send_wait(forge_provider_api::ProviderEvent::Execution {
+                        observation: forge_provider_api::ExecutionObservation::new(
+                            request.scope.clone(),
+                            forge_provider_api::ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: 1,
+                                result: forge_provider_api::ExecutionResult::Completed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion::default(
+                                        )
+                                        .into(),
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok(())
                 }
-                let submission = request.submission.as_ref().unwrap();
-                submission.sending(SubmissionTarget::native(
-                    "codex",
-                    "native-thread",
-                    serde_json::json!({}),
-                ))?;
-                let count = self.send_count.fetch_add(1, Ordering::SeqCst);
-                let address = crate::provider::TurnAddress {
-                    scope: sink.invocation_scope()?.clone(),
-                    thread_id: "native-thread".into(),
-                    turn_id: format!("turn-{count}").into(),
-                };
-                sink.send_wait(crate::provider::ProviderEvent::Execution {
-                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                        address.scope.clone(),
-                        forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                            address: address.clone(),
-                        },
-                    )
-                    .expect("execution scope is derived from its native address"),
-                })
-                .await?;
-                sink.send_wait(crate::provider::ProviderEvent::Turn {
-                    address,
-                    update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
-                })
-                .await?;
-                self.input.lock().unwrap().push(request.clone());
-                if self.lose_ack.swap(false, Ordering::SeqCst) {
-                    anyhow::bail!("connection lost after write");
-                }
-                submission.accepted("native-ack".into())?;
-                Ok(ProviderCompletion::default())
+            },
+        );
+        let admission = control.clone();
+        provider.with_admission(move |_request| {
+            if admission.fail_before_send.swap(false, Ordering::SeqCst) {
+                return Err(forge_provider_api::ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::AdmitInput,
+                        forge_provider_api::ProviderFailureKind::Rejected,
+                    ),
+                ));
             }
-            .await;
-            output.map_err(ProviderError::from)
-        }
+            if admission.lose_ack.swap(false, Ordering::SeqCst) {
+                return Err(forge_provider_api::ProviderError::DeliveryUncertain);
+            }
+            Ok(Some(
+                forge_provider_api::RecoveryToken::new(b"accepted-fixture".to_vec())
+                    .expect("nonempty token"),
+            ))
+        });
+        let history = control.clone();
+        provider.with_reconcile(move |_submission, _token, _accepted| {
+            if history.history_accepts.load(Ordering::SeqCst) {
+                forge_provider_api::SubmissionEvidence::Accepted {
+                    receipt: Some(
+                        forge_provider_api::RecoveryToken::new(b"history-fixture".to_vec())
+                            .expect("nonempty token"),
+                    ),
+                    provider_session_id: Some(
+                        "fixture-session"
+                            .try_into()
+                            .expect("fixture ID is nonempty"),
+                    ),
+                }
+            } else {
+                forge_provider_api::SubmissionEvidence::Unknown
+            }
+        });
+        (provider, control)
+    }
+
+    fn recovery_bridge() -> Result<crate::provider::test_support::ProviderTestSession> {
+        crate::provider::test_support::ProviderTestSession::from_native(receipt_provider().0)
     }
 
     fn request(text: &str) -> ProviderRequest {
@@ -1267,9 +1509,9 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace.clone())?;
-        let provider =
-            crate::provider::test_support::ProviderTestSession::new(ReceiptProvider::new())?;
-        provider.fail_before_send.store(true, Ordering::SeqCst);
+        let (native, control) = receipt_provider();
+        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+        control.fail_before_send.store(true, Ordering::SeqCst);
         let earlier = request("earlier instruction\nwith exact whitespace\n");
         assert!(
             crate::provider::test_support::retry_prompt(
@@ -1292,16 +1534,23 @@ mod tests {
             &store,
         )
         .await?;
-        let sent = provider.input.lock().unwrap();
+        let sent = control.input.lock().unwrap();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].recovered_input, vec![earlier.input.clone()]);
         assert_eq!(
-            sent[0].input.text(),
-            "new instruction replaces earlier scope"
+            sent[0]
+                .recovered_inputs
+                .iter()
+                .map(|input| input.input.clone())
+                .collect::<Vec<_>>(),
+            vec![earlier.input.normalized()]
+        );
+        assert_eq!(
+            sent[0].input,
+            forge_provider_api::PromptInput::Text("new instruction replaces earlier scope".into())
         );
         assert!(
             store
-                .pending(&earlier, super::super::ProviderKind::Codex, None)?
+                .pending(&earlier, fixture_provider_id(), None)?
                 .is_empty()
         );
         Ok(())
@@ -1313,14 +1562,14 @@ mod tests {
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace)?;
         let provider =
-            crate::provider::test_support::ProviderTestSession::new(ReceiptProvider::new())?;
+            crate::provider::test_support::ProviderTestSession::from_native(receipt_provider().0)?;
         let owned = store.prepare_identified(
             &request("owned input"),
-            super::super::ProviderKind::Codex,
+            fixture_provider_id(),
             Some("message-id".into()),
         )?;
         let mut next = request("next input");
-        let submission = store.prepare(&next, super::super::ProviderKind::Codex)?;
+        let submission = store.prepare(&next, fixture_provider_id())?;
         submission
             .recover(provider.as_provider(), &mut next)
             .await?;
@@ -1338,22 +1587,23 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace)?;
-        let prepared = store.prepare(&request("not sent"), super::super::ProviderKind::Codex)?;
+        let prepared = store.prepare(
+            &request("not sent"),
+            forge_providers::registry::default_id(),
+        )?;
         prepared.cancel()?;
         assert_eq!(prepared.record()?.delivery, SubmissionState::Cancelled);
-        let dispatched =
-            store.prepare(&request("dispatched"), super::super::ProviderKind::Codex)?;
-        dispatched.sending(SubmissionTarget::native(
-            "codex",
-            "thread",
-            serde_json::json!({}),
-        ))?;
+        let dispatched = store.prepare(
+            &request("dispatched"),
+            forge_providers::registry::default_id(),
+        )?;
+        dispatched.sending(Some(token("target")))?;
         dispatched.cancel()?;
         assert!(matches!(
             dispatched.record()?.delivery,
             SubmissionState::Sending { .. }
         ));
-        dispatched.accepted("receipt".into())?;
+        dispatched.accepted(Some(token("receipt")))?;
         dispatched.cancel()?;
         assert!(matches!(
             dispatched.record()?.delivery,
@@ -1370,7 +1620,7 @@ mod tests {
         let store = SubmissionStore::open(directory.path(), trace.clone())?;
         let first = store.prepare_record(
             &request("entry"),
-            super::super::ProviderKind::Codex,
+            forge_providers::registry::default_id(),
             Some("entry-id".into()),
             PreparationIdentity::Task,
         )?;
@@ -1382,16 +1632,12 @@ mod tests {
             activation.store(true, Ordering::SeqCst);
             Ok(())
         })?;
-        first.sending(SubmissionTarget::native(
-            "codex",
-            "thread",
-            serde_json::json!({}),
-        ))?;
-        first.accepted("receipt".into())?;
+        first.sending(Some(token("target")))?;
+        first.accepted(Some(token("receipt")))?;
         assert!(*accepted.borrow() && activated.load(Ordering::SeqCst));
         let duplicate = store.prepare_record(
             &request("entry"),
-            super::super::ProviderKind::Codex,
+            forge_providers::registry::default_id(),
             Some("entry-id".into()),
             PreparationIdentity::Task,
         )?;
@@ -1400,7 +1646,7 @@ mod tests {
             store
                 .prepare_record(
                     &request("changed"),
-                    super::super::ProviderKind::Codex,
+                    forge_providers::registry::default_id(),
                     Some("entry-id".into()),
                     PreparationIdentity::Task,
                 )
@@ -1413,7 +1659,7 @@ mod tests {
         let reopened = SubmissionStore::open(directory.path(), trace)?;
         let recovered = reopened.prepare_record(
             &request("entry"),
-            super::super::ProviderKind::Codex,
+            forge_providers::registry::default_id(),
             Some("entry-id".into()),
             PreparationIdentity::Task,
         )?;
@@ -1433,7 +1679,8 @@ mod tests {
             directory.path(),
             Arc::new(TraceStore::open(directory.path())?),
         )?;
-        let submission = store.prepare(&request("entry"), super::super::ProviderKind::Codex)?;
+        let submission =
+            store.prepare(&request("entry"), forge_providers::registry::default_id())?;
         let accepted = submission.acceptance();
         let attempts = Arc::new(AtomicUsize::new(0));
         let activation = attempts.clone();
@@ -1443,13 +1690,16 @@ mod tests {
             }
             Ok(())
         })?;
-        assert!(submission.accepted("receipt".into()).is_err());
+        assert!(submission.accepted(Some(token("receipt"))).is_err());
         assert!(matches!(
             submission.record()?.delivery,
             SubmissionState::Accepted { .. }
         ));
         assert!(!*accepted.borrow());
-        submission.reconcile(&ReceiptProvider::new()).await?;
+        let (native, control) = receipt_provider();
+        control.history_accepts.store(true, Ordering::SeqCst);
+        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+        submission.reconcile(provider.as_provider()).await?;
         assert!(*accepted.borrow());
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         Ok(())
@@ -1460,9 +1710,9 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace.clone())?;
-        let provider =
-            crate::provider::test_support::ProviderTestSession::new(ReceiptProvider::new())?;
-        provider.lose_ack.store(true, Ordering::SeqCst);
+        let (native, control) = receipt_provider();
+        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+        control.lose_ack.store(true, Ordering::SeqCst);
         assert!(
             crate::provider::test_support::retry_prompt(
                 &provider,
@@ -1475,26 +1725,32 @@ mod tests {
             .is_err()
         );
         for text in ["second", "third"] {
-            let error = crate::provider::test_support::retry_prompt(
-                &provider,
-                request(text),
-                None,
-                &trace,
-                &store,
-            )
-            .await
-            .unwrap_err();
-            assert!(error.to_string().contains("uncertain delivery"));
-            assert!(error.to_string().contains("connection lost after write"));
+            let mut input = request(text);
+            input.submission = Some(store.prepare(&input, fixture_provider_id())?);
+            let error =
+                crate::provider::test_support::retry_prompt(&provider, input, None, &trace, &store)
+                    .await
+                    .unwrap_err();
+            assert!(
+                error.chain().any(|cause| matches!(
+                cause.downcast_ref::<forge_provider_api::ProviderError>(),
+                Some(forge_provider_api::ProviderError::DeliveryUncertain
+                    | forge_provider_api::ProviderError::Observation(
+                        forge_provider_api::lifecycle::ObservationFailure::DeliveryUncertain))
+            )),
+                "{error:?}"
+            );
+            assert!(!error.to_string().contains("connection lost after write"));
         }
-        assert_eq!(provider.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(control.send_count.load(Ordering::SeqCst), 0);
         assert_eq!(
             store
-                .pending(&request(""), super::super::ProviderKind::Codex, None)?
+                .pending(&request(""), fixture_provider_id(), None)?
                 .len(),
             3
         );
-        provider.history_accepts.store(true, Ordering::SeqCst);
+        control.history_accepts.store(true, Ordering::SeqCst);
+        provider.recover(request("").owner()?).await?;
         crate::provider::test_support::retry_prompt(
             &provider,
             request("fourth"),
@@ -1503,17 +1759,17 @@ mod tests {
             &store,
         )
         .await?;
-        let sent = provider.input.lock().unwrap();
-        assert_eq!(sent.len(), 2);
+        let sent = control.input.lock().unwrap();
+        assert_eq!(sent.len(), 1);
         assert_eq!(
-            sent[1].provider_session_id.as_ref().map(|id| id.as_str()),
-            Some("native-thread")
-        );
-        assert_eq!(
-            sent[1].recovered_input,
+            sent[0]
+                .recovered_inputs
+                .iter()
+                .map(|input| input.input.clone())
+                .collect::<Vec<_>>(),
             vec![
-                ProviderInput::from_text("second"),
-                ProviderInput::from_text("third")
+                ProviderInput::from_text("second").normalized(),
+                ProviderInput::from_text("third").normalized()
             ]
         );
         Ok(())
@@ -1524,18 +1780,15 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace)?;
-        let original = store.prepare(&request("first"), super::super::ProviderKind::Codex)?;
-        let next = store.prepare(&request("second"), super::super::ProviderKind::Codex)?;
+        let original = store.prepare(&request("first"), fixture_provider_id())?;
+        let next = store.prepare(&request("second"), fixture_provider_id())?;
         let mut combined = request("second");
-        next.recover(&ReceiptProvider::new(), &mut combined).await?;
-        next.sending(SubmissionTarget::native(
-            "codex",
-            "thread",
-            serde_json::json!({}),
-        ))?;
+        let provider = recovery_bridge()?;
+        next.recover(provider.as_provider(), &mut combined).await?;
+        next.sending(Some(token("target")))?;
         store.connection.lock().unwrap().execute_batch(&format!(
             "CREATE TRIGGER fail_ack BEFORE UPDATE ON submission WHEN NEW.id='{}' BEGIN SELECT RAISE(ABORT,'disk commit failure'); END;", original.id()))?;
-        assert!(next.accepted("ack".into()).is_err());
+        assert!(next.accepted(Some(token("ack"))).is_err());
         assert_eq!(original.record()?.delivery, SubmissionState::Prepared);
         assert!(matches!(
             next.record()?.delivery,
@@ -1546,8 +1799,8 @@ mod tests {
             .lock()
             .unwrap()
             .execute_batch("DROP TRIGGER fail_ack")?;
-        next.accepted("ack".into())?;
-        next.accepted("duplicate ack".into())?;
+        next.accepted(Some(token("ack")))?;
+        next.accepted(Some(token("duplicate ack")))?;
         assert!(matches!(
             original.record()?.delivery,
             SubmissionState::Accepted { .. }
@@ -1564,21 +1817,18 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace)?;
-        let earlier = store.prepare(&request("earlier"), ProviderKind::Codex)?;
-        let current = store.prepare(&request("current"), ProviderKind::Codex)?;
-        let later = store.prepare(&request("later"), ProviderKind::Codex)?;
+        let earlier = store.prepare(&request("earlier"), fixture_provider_id())?;
+        let current = store.prepare(&request("current"), fixture_provider_id())?;
+        let later = store.prepare(&request("later"), fixture_provider_id())?;
         let mut input = request("current");
-        current.recover(&ReceiptProvider::new(), &mut input).await?;
+        let provider = recovery_bridge()?;
+        current.recover(provider.as_provider(), &mut input).await?;
         assert_eq!(
             input.recovered_input,
             vec![ProviderInput::from_text("earlier")]
         );
-        current.sending(SubmissionTarget::native(
-            "codex",
-            "thread",
-            serde_json::json!({}),
-        ))?;
-        current.accepted("ack".into())?;
+        current.sending(Some(token("target")))?;
+        current.accepted(Some(token("ack")))?;
         assert!(matches!(
             earlier.record()?.delivery,
             SubmissionState::Accepted { .. }
@@ -1608,18 +1858,21 @@ mod tests {
             arguments: "  exact arguments\n".into(),
             attachments,
         };
-        let earlier = store.prepare(&original, ProviderKind::Codex)?;
+        let earlier = store.prepare(&original, fixture_provider_id())?;
         drop(earlier);
         drop(store);
         let store = SubmissionStore::open(directory.path(), trace)?;
-        let next = store.prepare(&request("latest"), ProviderKind::Codex)?;
+        let next = store.prepare(&request("latest"), fixture_provider_id())?;
         let mut input = request("latest");
-        next.recover(&ReceiptProvider::new(), &mut input).await?;
+        let provider = recovery_bridge()?;
+        next.recover(provider.as_provider(), &mut input).await?;
         assert_eq!(input.recovered_input, vec![original.input]);
-        let native =
-            crate::provider::copilot::attachments::input("context", &input.input_attachments())?;
-        let files = native.attachments;
-        assert_eq!(std::fs::read(&files[0].path)?, bytes);
+        let files = input
+            .input_attachments()
+            .iter()
+            .map(crate::attachment::InputAttachment::prepare)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(files[0].contents.as_ref(), bytes);
         Ok(())
     }
 
@@ -1628,17 +1881,14 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace)?;
-        let original = store.prepare(&request("accepted"), ProviderKind::Codex)?;
-        original.sending(SubmissionTarget::native(
-            "codex",
-            "thread",
-            serde_json::json!({}),
-        ))?;
-        original.accepted("native ack".into())?;
+        let original = store.prepare(&request("accepted"), fixture_provider_id())?;
+        original.sending(Some(token("target")))?;
+        original.accepted(Some(token("native ack")))?;
         original.failed("stream timed out".into())?;
-        let next = store.prepare(&request("latest"), ProviderKind::Codex)?;
+        let next = store.prepare(&request("latest"), fixture_provider_id())?;
         let mut input = request("latest");
-        next.recover(&ReceiptProvider::new(), &mut input).await?;
+        let provider = recovery_bridge()?;
+        next.recover(provider.as_provider(), &mut input).await?;
         assert!(input.recovered_input.is_empty());
         assert_eq!(
             original.record()?.error.as_deref(),
@@ -1652,22 +1902,23 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace)?;
-        let original = store.prepare(&request("cancel me"), super::super::ProviderKind::Codex)?;
+        let original = store.prepare(&request("cancel me"), fixture_provider_id())?;
         original.cancel()?;
-        let next = store.prepare(&request("new"), super::super::ProviderKind::Codex)?;
+        let next = store.prepare(&request("new"), fixture_provider_id())?;
         let mut new = request("new");
-        next.recover(&ReceiptProvider::new(), &mut new).await?;
+        let provider = recovery_bridge()?;
+        next.recover(provider.as_provider(), &mut new).await?;
         assert!(new.recovered_input.is_empty());
-        next.sending(SubmissionTarget::Untracked)?;
+        next.sending(None)?;
         next.cancel()?;
         assert!(matches!(
             next.record()?.delivery,
             SubmissionState::Sending { .. }
         ));
-        let following = store.prepare(&request("following"), super::super::ProviderKind::Codex)?;
+        let following = store.prepare(&request("following"), fixture_provider_id())?;
         assert!(
             following
-                .recover(&ReceiptProvider::new(), &mut request("following"))
+                .recover(provider.as_provider(), &mut request("following"))
                 .await
                 .is_err()
         );

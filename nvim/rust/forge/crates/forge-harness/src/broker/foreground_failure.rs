@@ -229,22 +229,18 @@ impl RetractionGoalJob {
 
     pub(crate) async fn run(self) -> Result<()> {
         let lane = self.controller.native_goal_lane();
-        let guard = match tokio::time::timeout(std::time::Duration::from_secs(30), lane.lock())
-            .await
-        {
-            Ok(guard) => guard,
-            Err(_) => {
-                self.controller.mark_native_goal_uncertain();
-                let error = anyhow::Error::new(ProviderError::DeliveryUncertain {
-                    message: "native goal transport lane timed out; provider outcome is uncertain"
-                        .into(),
-                });
-                return Err(match self.registry.fence(&self.owner).await {
-                    Ok(()) => error,
-                    Err(cleanup) => error.context(cleanup),
-                });
-            }
-        };
+        let guard =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), lane.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.controller.mark_native_goal_uncertain();
+                    let error = anyhow::Error::new(ProviderError::DeliveryUncertain);
+                    return Err(match self.registry.fence(&self.owner).await {
+                        Ok(()) => error,
+                        Err(cleanup) => error.context(cleanup),
+                    });
+                }
+            };
         self.controller.ensure_native_goal_certain()?;
         anyhow::ensure!(
             same_retraction_task(
@@ -274,16 +270,11 @@ impl RetractionGoalJob {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
                 self.controller.mark_native_goal_uncertain();
-                Err(error.context(ProviderError::DeliveryUncertain { message: "native retraction goal update failed after dispatch; provider outcome is uncertain".into() }))
+                Err(anyhow::Error::new(error).context(ProviderError::DeliveryUncertain))
             }
             Err(_) => {
                 self.controller.mark_native_goal_uncertain();
-                Err(ProviderError::DeliveryUncertain {
-                    message:
-                        "native retraction goal restore timed out; provider outcome is uncertain"
-                            .into(),
-                }
-                .into())
+                Err(ProviderError::DeliveryUncertain.into())
             }
         };
         let epoch = match self.controller.native_goal_written() {
@@ -317,10 +308,7 @@ impl RetractionGoalJob {
             .is_err()
             {
                 self.controller.mark_native_goal_uncertain();
-                let error = anyhow::Error::new(ProviderError::DeliveryUncertain {
-                    message: "native goal reconciliation timed out; provider outcome is uncertain"
-                        .into(),
-                });
+                let error = anyhow::Error::new(ProviderError::DeliveryUncertain);
                 return Err(match self.registry.fence(&self.owner).await {
                     Ok(()) => error,
                     Err(cleanup) => error.context(cleanup),
@@ -328,7 +316,7 @@ impl RetractionGoalJob {
             }
         } else if changed {
             self.controller.mark_native_goal_uncertain();
-            let error = anyhow::Error::new(ProviderError::DeliveryUncertain { message: "task changed during native retraction goal restore; provider outcome is uncertain".into() });
+            let error = anyhow::Error::new(ProviderError::DeliveryUncertain);
             return Err(match self.registry.fence(&self.owner).await {
                 Ok(()) => error,
                 Err(cleanup) => error.context(cleanup),
@@ -427,8 +415,9 @@ impl HarnessBroker {
             update: crate::provider::ToolUpdate::Finished {
                 outcome: crate::provider::ToolOutcome::Failed {
                     diagnostic: crate::provider::ToolDiagnostic {
-                        code: Some("tool_timeout".into()),
-                        message: expired.to_string(),
+                        kind: forge_provider_api::ProviderFailureKind::Timeout,
+                        message: forge_provider_api::SanitizedMessage::new(expired.to_string())
+                            .expect("host diagnostic is nonempty"),
                     },
                 },
             },
@@ -541,10 +530,7 @@ impl HarnessBroker {
                     .tool_gate
                     .as_ref()
                     .context("blocked staged baseline has no tool gate")?
-                    .complete(Err(format!(
-                        "admission failed before checkpoint persistence: {:#}",
-                        failure.original
-                    )))?;
+                    .complete(Err(crate::checkpoint::CheckpointGateError::OwnerEnded));
                 AdmissionBaseline::Abort(AbortedBaseline::new(
                     runtime.checkpoint.take(),
                     registry.clone(),
@@ -992,10 +978,7 @@ impl HarnessBroker {
                 .tool_gate
                 .as_ref()
                 .context("blocked checkpoint gate is missing")?
-                .complete(Err(format!(
-                    "execution ended before checkpoint admission completed: {:#}",
-                    failure.original
-                )))?;
+                .complete(Err(crate::checkpoint::CheckpointGateError::OwnerEnded));
             // CleanupForeground has already joined and closed this execution owner.
             // Replacement must collect registry cleanup before opening its successor.
             let baseline =
@@ -1374,8 +1357,12 @@ impl HarnessBroker {
                     effects
                 } else {
                     let diagnostic = crate::provider::ProviderDiagnostic {
-                        code: None,
-                        message: format!("{:#}", failure.original),
+                        kind: forge_provider_api::ProviderFailureKind::Unknown,
+                        message: forge_provider_api::SanitizedMessage::new(format!(
+                            "{:#}",
+                            failure.original
+                        ))
+                        .expect("host diagnostic is nonempty"),
                         fatal: failure.original.downcast_ref::<TurnCancelled>().is_none(),
                     };
                     AppliedProviderEvent::Effects(vec![
@@ -1743,9 +1730,13 @@ mod tests {
     fn report_retains_original_and_typed_cleanup_failure() {
         let report = anyhow::Error::new(TurnCancelled).context(ForegroundFailureContext {
             original_message: "turn cancelled".into(),
-            cleanup: Some(ProviderError::Protocol {
-                message: "cleanup failed".into(),
-            }),
+            cleanup: Some(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::CleanupExecution,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                )
+                .into(),
+            ),
             secondary: Vec::new(),
         });
         assert!(report.downcast_ref::<TurnCancelled>().is_some());
@@ -1753,17 +1744,25 @@ mod tests {
             report
                 .downcast_ref::<ForegroundFailureContext>()
                 .and_then(|context| context.cleanup.as_ref()),
-            Some(ProviderError::Protocol { .. })
+            Some(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Protocol
         ));
-        assert!(report.to_string().contains("cleanup failed"));
+        assert!(
+            report
+                .to_string()
+                .contains("CleanupExecution failed: Protocol")
+        );
         let retracted = anyhow::Error::new(TurnRetracted {
             prompt: "retracted prompt".into(),
         })
         .context(ForegroundFailureContext {
             original_message: "Output-free turn retracted".into(),
-            cleanup: Some(ProviderError::Protocol {
-                message: "goal restore failed".into(),
-            }),
+            cleanup: Some(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::CleanupExecution,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                )
+                .into(),
+            ),
             secondary: Vec::new(),
         });
         assert!(retracted.downcast_ref::<TurnRetracted>().is_some());
@@ -1771,7 +1770,7 @@ mod tests {
             retracted
                 .downcast_ref::<ForegroundFailureContext>()
                 .and_then(|context| context.cleanup.as_ref()),
-            Some(ProviderError::Protocol { .. })
+            Some(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Protocol
         ));
     }
 

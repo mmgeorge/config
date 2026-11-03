@@ -15,19 +15,16 @@ local ModelOrder = {}
 ---@field picker_reasoning? string
 ---@field picker_context_window? string
 
---- Preserve the source catalog while applying the provider policy and pins first.
+--- Preserve the normalized catalog order while presenting pinned models first.
 ---@param model_list ForgeHarnessModel[]
----@param provider string
 ---@param pinned_id_set? table<string, boolean>
 ---@return ForgeHarnessModel[]
-function ModelOrder.order(model_list, provider, pinned_id_set)
-  local ranked_list = {}
-  for ordinal, model in ipairs(model_list) do ranked_list[ordinal] = { model = model } end
+function ModelOrder.order(model_list, pinned_id_set)
   local ordered_list = {}
   for _, pinned in ipairs({ true, false }) do
-    for _, entry in ipairs(ranked_list) do
-      if ((pinned_id_set or {})[entry.model.id] == true) == pinned then
-        ordered_list[#ordered_list + 1] = entry.model
+    for _, model in ipairs(model_list) do
+      if ((pinned_id_set or {})[model.id] == true) == pinned then
+        ordered_list[#ordered_list + 1] = model
       end
     end
   end

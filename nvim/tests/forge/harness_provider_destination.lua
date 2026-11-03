@@ -1,13 +1,14 @@
 vim.opt.runtimepath:prepend('nvim')
 local session = require('forge.session')
 local client = require('forge.client')
+dofile("nvim/tests/forge/support/provider_catalog.lua").install()
 local picker = require('forge.views.picker')
 local harness = require('forge.views.harness')
 local controller = require('forge.views.harness.controller')
 local session_picker = require('forge.views.harness.session_picker')
 local preview = require('forge.views.harness.session_preview')
 local state = session.harness
-state.session = { id = 'source', provider = 'codex', workspace = 'workspace' }
+state.session = { id = 'source', provider = 'fixture_alpha', workspace = 'workspace' }
 state.busy = false
 state.queue, state.pending_steer = {}, {}
 local spec, selected, list_failure, empty_list, previewed, notifications
@@ -44,17 +45,17 @@ client.request = function(request_specification, callback)
   assert(method == 'session.list' and params.scope == 'repo')
   if list_failure then callback(nil, 'list failed') return end
   callback(empty_list and {} or {
-    { id = 'chosen', provider = 'copilot', workspace = 'workspace', name = 'Chosen', created_at_ms = 1 },
-    { id = 'codex', provider = 'codex', workspace = 'workspace', name = 'Codex', created_at_ms = 2 },
-    { id = 'other-workspace', provider = 'copilot', workspace = 'elsewhere', name = 'Other', created_at_ms = 3 },
+    { id = 'chosen', provider = 'fixture_beta', workspace = 'workspace', name = 'Chosen', created_at_ms = 1 },
+    { id = 'fixture_alpha', provider = 'fixture_alpha', workspace = 'workspace', name = 'Fixture Alpha', created_at_ms = 2 },
+    { id = 'other-workspace', provider = 'fixture_beta', workspace = 'elsewhere', name = 'Other', created_at_ms = 3 },
   })
 end
 local function choose_provider()
   controller.select_provider()
   for _, option in ipairs(spec.page_list[1].option_list) do
-    if option.value == 'copilot' then spec.on_confirm({ option = option }) return end
+    if option.value == 'fixture_beta' then spec.on_confirm({ option = option }) return end
   end
-  error('missing Copilot provider')
+  error('missing Fixture Beta provider')
 end
 local function choose_destination(kind)
   for _, option in ipairs(spec.page_list[1].option_list) do
@@ -64,7 +65,7 @@ local function choose_destination(kind)
 end
 controller.select_provider()
 for _, option in ipairs(spec.page_list[1].option_list) do
-  if option.value == 'codex' then spec.on_confirm({ option = option }) break end
+  if option.value == 'fixture_alpha' then spec.on_confirm({ option = option }) break end
 end
 assert(spec.page_list[1].title == 'Select Harness' and selected == nil)
 choose_provider()
@@ -74,7 +75,7 @@ assert(#spec.page_list[1].option_list == 1 and #spec.action_list == 0)
 local option = spec.page_list[1].option_list[1]
 assert(option.id == 'chosen')
 local source_session = state.session
-state.session = { id = 'later-view', provider = 'codex', workspace = 'workspace' }
+state.session = { id = 'later-view', provider = 'fixture_alpha', workspace = 'workspace' }
 spec.on_change({ option = option })
 state.session = source_session
 assert(previewed.preview == 'chosen')
@@ -93,7 +94,7 @@ defer_preview = false
 spec.on_confirm({ option = option })
 closed_preview()
 assert(previewed == nil, 'a closed destination picker must reject late preview callbacks')
-assert(selected.provider == 'copilot' and selected.destination.session_id == 'chosen')
+assert(selected.provider == 'fixture_beta' and selected.destination.session_id == 'chosen')
 assert(state.session.id == 'source', 'selection changed the source before startup')
 selected = nil
 choose_provider()

@@ -23,11 +23,23 @@ require('forge.infra.notifications').error = function(message) errors[#errors + 
 controller.resolve_runtime_model = function() end
 local success, failure = xpcall(function()
   vim.fn.chdir(workspace)
-  require('forge').setup({ harness = { provider = 'codex' } })
+  require('forge').setup({})
   harness.open()
   assert(vim.wait(10000, function() return (session.harness.ready and session.harness.session) or #errors > 0 end, 10))
   assert(#errors == 0, table.concat(errors, '\n'))
   local source_id = session.harness.session.id
+  local config = require('forge.infra.config')
+  local provider_ids = {}
+  for provider, descriptor in pairs(config.options.harness.providers) do
+    if descriptor.selectable ~= false then provider_ids[#provider_ids + 1] = provider end
+  end
+  table.sort(provider_ids)
+  local initial_provider = session.harness.session.provider
+  local alternate_provider
+  for _, provider in ipairs(provider_ids) do
+    if provider ~= initial_provider then alternate_provider = alternate_provider or provider end
+  end
+  assert(alternate_provider, 'registry must expose multiple selectable providers')
   local source_tab = vim.api.nvim_get_current_tabpage()
   local tab_count = #vim.api.nvim_list_tabpages()
   local function request(method, params)
@@ -86,41 +98,42 @@ local success, failure = xpcall(function()
   config_picker.spec.on_field_action({ field = { id = 'provider' }, option = provider_option }, 'activate', 1)
   local provider_picker = picker._state_for_test()
   for _, option in ipairs(provider_picker.spec.page_list[1].option_list) do
-    if option.value == 'copilot' then provider_picker.spec.on_confirm({ option = option }) break end
+    if option.value == alternate_provider then provider_picker.spec.on_confirm({ option = option }) break end
   end
   local destination_picker = picker._state_for_test()
   destination_picker.spec.on_confirm({ option = destination_picker.spec.page_list[1].option_list[1] })
   picker.close(false)
-  settle('copilot')
+  settle(alternate_provider)
   local chosen_id = session.harness.session.id
   assert(chosen_id ~= source_id)
   local created
-  client.request({ method = 'session.new', params = { name = 'newer Copilot chat' }, session_id = assert(require("forge.session").harness.session).id }, function(result, request_error)
+  client.request({ method = 'session.new', params = { name = 'newer chat' }, session_id = assert(require("forge.session").harness.session).id }, function(result, request_error)
     assert(not request_error, request_error)
     created = result
   end)
   assert(vim.wait(3000, function() return created ~= nil end, 10))
   controller.activate_snapshot(created)
   assert(created.session.id ~= chosen_id)
-  switch_provider('codex', { kind = 'resume', session_id = source_id })
-  settle('codex')
+  switch_provider(initial_provider, { kind = 'resume', session_id = source_id })
+  settle(initial_provider)
   assert(session.harness.session.id == source_id)
-  switch_provider('copilot', { kind = 'resume', session_id = chosen_id })
-  settle('copilot')
+  switch_provider(alternate_provider, { kind = 'resume', session_id = chosen_id })
+  settle(alternate_provider)
   assert(session.harness.session.id == chosen_id, 'resumed latest instead of the selected session')
-  for _, provider in ipairs({ 'claude', 'antigravity' }) do
-    switch_provider(provider, { kind = 'new' })
-    settle(provider)
-    assert(session.harness.session.model == 'default', 'provider switch copied a foreign model')
+  for _, provider in ipairs(provider_ids) do
+    if provider ~= initial_provider and provider ~= alternate_provider then
+      switch_provider(provider, { kind = 'new' })
+      settle(provider)
+      assert(session.harness.session.model == 'default', 'provider switch copied a foreign model')
+    end
   end
-  switch_provider('copilot', { kind = 'resume', session_id = chosen_id })
-  settle('copilot')
-  local config = require('forge.infra.config')
-  config.options.harness.providers.codex.command = {}
-  switch_provider('codex', { kind = 'new' })
+  switch_provider(alternate_provider, { kind = 'resume', session_id = chosen_id })
+  settle(alternate_provider)
+  local source_provider = session.harness.session.provider
+  config.options.harness.providers[initial_provider].command = {}
+  switch_provider(initial_provider, { kind = 'new' })
   assert(vim.wait(10000, function() return #errors > 0 and session.harness.ready and not session.harness.switching_provider end, 10))
-  assert(session.harness.session.id == chosen_id and config.options.harness.provider == 'copilot')
-  assert(errors[1]:find('Codex provider requires', 1, true), errors[1])
+  assert(session.harness.session.provider == source_provider and config.options.harness.provider == source_provider)
 end, debug.traceback)
 picker.close(false)
 client.host_stop()

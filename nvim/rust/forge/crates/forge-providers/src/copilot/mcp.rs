@@ -4,7 +4,7 @@ use futures_util::{StreamExt, stream};
 use github_copilot_sdk::rpc::{McpDisableRequest, McpStartServerRequest};
 use github_copilot_sdk::session_events::McpServerStatus;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,40 +13,24 @@ use std::time::Duration;
 pub async fn start(
     session: &Arc<super::handle::CopilotSession>,
     launch: &[(String, serde_json::Map<String, Value>)],
-    trace: &dyn ProviderTrace,
-    harness_session_id: &str,
+    _trace: &dyn ProviderTrace,
+    _harness_session_id: &str,
     timeout: Duration,
 ) -> Result<HashMap<String, String>> {
     let session = &session.inner;
     // Timed-out starts may remain active natively; exclude unselected servers before launching them.
-    trace.record(harness_session_id, "copilot.mcp.selection_begin", json!({}));
     let selected = tokio::time::timeout(timeout, async {
-        trace.record(
-            harness_session_id,
-            "copilot.mcp.selection_step",
-            json!({"phase":"list.begin"}),
-        );
         let loaded = session
             .rpc()
             .mcp()
             .list_configured()
             .await
             .context("inspect Copilot MCP selection")?;
-        trace.record(
-            harness_session_id,
-            "copilot.mcp.selection_step",
-            json!({"phase":"list.complete"}),
-        );
         for server in loaded
             .servers
             .iter()
             .filter(|server| server.enabled && !launch.iter().any(|(name, _)| name == &server.name))
         {
-            trace.record(
-                harness_session_id,
-                "copilot.mcp.selection_step",
-                json!({"phase":"disable.begin", "server":server.name}),
-            );
             session
                 .rpc()
                 .mcp()
@@ -57,11 +41,6 @@ pub async fn start(
                 .with_context(|| {
                     format!("exclude unselected Copilot MCP server {}", server.name)
                 })?;
-            trace.record(
-                harness_session_id,
-                "copilot.mcp.selection_step",
-                json!({"phase":"disable.complete", "server":server.name}),
-            );
         }
         let verified = session
             .rpc()
@@ -80,18 +59,6 @@ pub async fn start(
     .await
     .context("Copilot MCP selection verification timed out")
     .and_then(|result| result);
-    match &selected {
-        Ok(()) => trace.record(
-            harness_session_id,
-            "copilot.mcp.selection_complete",
-            json!({"status":"ok"}),
-        ),
-        Err(error) => trace.record(
-            harness_session_id,
-            "copilot.mcp.selection_complete",
-            json!({"status":"failed", "error":format!("{error:#}")}),
-        ),
-    }
     selected?;
     // Start selected servers independently without extending another server's deadline.
     let request = launch
@@ -110,17 +77,10 @@ pub async fn start(
         .buffer_unordered(4);
     let mut failure = HashMap::new();
     while let Some((name, result)) = startup.next().await {
-        if let Err(error) = result {
-            let error = format!("{error:#}");
-            trace.record(
-                harness_session_id,
-                "copilot.mcp.start_failed",
-                json!({"server": name, "error": error}),
-            );
-            failure.insert(name, error);
+        if result.is_err() {
+            failure.insert(name, "MCP server startup failed".to_owned());
         }
     }
-    let logged_failure: HashSet<_> = failure.keys().cloned().collect();
     // Recheck exclusion before exposing native status for the selected servers.
     let verified = tokio::time::timeout(timeout, session.rpc().mcp().list_configured())
         .await
@@ -151,11 +111,9 @@ pub async fn start(
                         | McpServerStatus::NotConfigured
                 ) =>
             {
-                failure.entry(name.clone()).or_insert_with(|| {
-                    server.live.error.clone().unwrap_or_else(|| {
-                        format!("Copilot MCP server is {:?}", server.live.status)
-                    })
-                });
+                failure
+                    .entry(name.clone())
+                    .or_insert_with(|| "MCP server reported a failed state".to_owned());
             }
             None => {
                 failure
@@ -164,16 +122,6 @@ pub async fn start(
             }
             _ => {}
         }
-    }
-    for (name, error) in &failure {
-        if logged_failure.contains(name) {
-            continue;
-        }
-        trace.record(
-            harness_session_id,
-            "copilot.mcp.start_failed",
-            json!({"server": name, "error": error}),
-        );
     }
     Ok(failure)
 }

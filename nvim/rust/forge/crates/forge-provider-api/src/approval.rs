@@ -64,8 +64,8 @@ pub struct ApprovalRequestView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_owner: Option<crate::ExecutionOwner>,
     pub exchange_id: Option<String>,
-    pub turn_id: Option<String>,
-    pub provider: String,
+    pub turn_id: Option<crate::ProviderTurnId>,
+    pub provider: Option<crate::ProviderId>,
     pub reason: Option<String>,
     pub item_list: Vec<ApprovalItem>,
     /// Captures the original deadline independently of the active window.

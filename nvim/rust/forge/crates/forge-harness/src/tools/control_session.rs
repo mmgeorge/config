@@ -6,8 +6,8 @@ use crate::provider::{ProviderCompletion, ProviderDiagnostic, ProviderEvent, Pro
 use async_trait::async_trait;
 use forge_provider_api::control::ToolCall;
 use serde::Serialize;
-use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 /// The typed host boundary served by the private MCP endpoint.
 #[async_trait]
@@ -24,62 +24,170 @@ pub(crate) struct ControlReply {
 struct ActiveControl {
     executor: Arc<ControlToolExecutor>,
     sink: ProviderEventSink,
+    tools: std::collections::HashSet<String>,
+    output: Mutex<ProviderCompletion>,
+}
+
+#[derive(Default)]
+struct ControlState {
+    accepting: bool,
+    active: Option<Arc<ActiveControl>>,
+    pending_calls: usize,
 }
 
 /// Owns Harness tool execution and effects independently of native provider events.
 #[derive(Default)]
 pub(crate) struct ControlSession {
     definitions: RwLock<Vec<ControlToolDefinition>>,
-    active: Mutex<Option<ActiveControl>>,
-    output: Mutex<ProviderCompletion>,
+    state: StdMutex<ControlState>,
+    changed: Notify,
+}
+
+struct PendingControlCall<'session> {
+    session: &'session ControlSession,
+}
+
+impl Drop for PendingControlCall<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .session
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.pending_calls -= 1;
+        drop(state);
+        self.session.changed.notify_waiters();
+    }
 }
 
 impl ControlSession {
     pub(crate) fn new(definitions: Vec<ControlToolDefinition>) -> Self {
         Self {
             definitions: RwLock::new(definitions),
-            ..Self::default()
+            state: StdMutex::new(ControlState::default()),
+            changed: Notify::new(),
         }
     }
 
     pub(crate) async fn begin(&self, context: ControlTurnContext, sink: ProviderEventSink) {
         self.close().await;
-        *self.output.lock().await = ProviderCompletion::default();
-        *self.active.lock().await = Some(ActiveControl {
+        let active = Arc::new(ActiveControl {
             executor: Arc::new(ControlToolExecutor::new(context)),
             sink,
+            tools: self
+                .definitions
+                .read()
+                .await
+                .iter()
+                .map(|tool| tool.name.to_owned())
+                .collect(),
+            output: Mutex::new(ProviderCompletion::default()),
         });
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = Some(active);
+        state.accepting = true;
     }
 
     pub(crate) async fn take_output(&self) -> ProviderCompletion {
-        std::mem::take(&mut *self.output.lock().await)
+        let active = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .clone();
+        match active {
+            Some(active) => std::mem::take(&mut *active.output.lock().await),
+            None => ProviderCompletion::default(),
+        }
     }
 
     /// Revoke admission without waiting for an in-flight tool.
-    pub(crate) async fn cancel(&self) -> Option<Arc<ControlToolExecutor>> {
-        let executor = self
-            .active
-            .lock()
-            .await
-            .as_ref()
-            .map(|active| active.executor.clone());
+    pub(crate) fn cancel_admission(&self) -> Option<Arc<ControlToolExecutor>> {
+        let active = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.accepting = false;
+            state.active.clone()
+        };
+        let executor = active.map(|active| active.executor.clone());
         if let Some(executor) = &executor {
             executor.cancel();
         }
         executor
     }
 
+    pub(crate) async fn cancel(&self) -> Option<Arc<ControlToolExecutor>> {
+        self.cancel_admission()
+    }
+
     pub(crate) async fn close(&self) {
         if let Some(executor) = self.cancel().await {
             executor.close().await;
-            let mut active = self.active.lock().await;
-            if active
-                .as_ref()
-                .is_some_and(|active| Arc::ptr_eq(&active.executor, &executor))
-            {
-                *active = None;
-            }
         }
+        self.wait_for_calls().await;
+    }
+
+    /// Collect normal foreground effects without turning completion into tool cancellation.
+    pub(crate) async fn finish(&self) {
+        let active = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.accepting = false;
+            state.active.clone()
+        };
+        let executor = active.map(|active| active.executor.clone());
+        if let Some(executor) = executor {
+            executor.finish().await;
+        }
+        self.wait_for_calls().await;
+    }
+
+    async fn wait_for_calls(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_calls
+                == 0
+            {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    fn admit_call(&self, name: &str) -> ToolResult<(Arc<ActiveControl>, PendingControlCall<'_>)> {
+        let mut state = self.state.lock().map_err(|_| {
+            ToolError::MissingState("Tool is unavailable in the active invocation".into())
+        })?;
+        if !state.accepting {
+            return Err(ToolError::MissingState(
+                "Tool is unavailable in the active invocation".into(),
+            ));
+        }
+        let active = state
+            .active
+            .as_ref()
+            .filter(|active| active.tools.contains(name))
+            .cloned()
+            .ok_or_else(|| {
+                ToolError::MissingState("Tool is unavailable in the active invocation".into())
+            })?;
+        state.pending_calls = state.pending_calls.checked_add(1).ok_or_else(|| {
+            ToolError::MissingState("Tool is unavailable in the active invocation".into())
+        })?;
+        Ok((active, PendingControlCall { session: self }))
     }
 }
 
@@ -90,34 +198,18 @@ impl ControlEndpoint for ControlSession {
     }
 
     async fn call(&self, call: ToolCall) -> ToolResult<ControlReply> {
-        let (executor, sink) = self
-            .active
-            .lock()
-            .await
-            .as_ref()
-            .map(|active| (active.executor.clone(), active.sink.clone()))
-            .ok_or_else(|| {
-                ToolError::MissingState("Harness control called outside an active turn".into())
-            })?;
+        let (active, _pending) = self.admit_call(&call.name)?;
+        let executor = active.executor.clone();
+        let sink = active.sink.clone();
         let invocation = ControlToolInvocation {
             task_permit: None,
             name: call.name,
             arguments: call.arguments,
         };
         let outcome = executor.execute(invocation.clone()).await?;
-        let active = self.active.lock().await;
-        if !active
-            .as_ref()
-            .is_some_and(|active| Arc::ptr_eq(&active.executor, &executor))
-        {
-            return Err(ToolError::Rejected(
-                "Harness control result belongs to a collected turn".into(),
-            ));
-        }
         let result = match outcome.result {
             Ok(result) => result,
             Err(error) => {
-                drop(active);
                 let failure = super::control_tool_failure_json(
                     &invocation,
                     &error,
@@ -130,8 +222,11 @@ impl ControlEndpoint for ControlSession {
                         .clone()
                         .into(),
                     diagnostic: ProviderDiagnostic {
-                        code: None,
-                        message: format!("Harness tool {} failed: {failure}", invocation.name),
+                        kind: forge_provider_api::ProviderFailureKind::Rejected,
+                        message: forge_provider_api::SanitizedMessage::new(
+                            "Host tool execution failed",
+                        )
+                        .expect("static diagnostic is nonempty"),
                         fatal: false,
                     },
                 })
@@ -141,7 +236,7 @@ impl ControlEndpoint for ControlSession {
             }
         };
         if let Some(invocation) = result.invocation {
-            super::apply_invocation(&invocation, &mut *self.output.lock().await)?;
+            super::apply_invocation(&invocation, &mut *active.output.lock().await)?;
         }
         Ok(ControlReply {
             message: result.message,
@@ -163,15 +258,23 @@ mod tests {
         ))
     }
 
+    fn definitions(names: &[&str]) -> Vec<ControlToolDefinition> {
+        crate::tools::ControlToolRegistry
+            .definition_list()
+            .into_iter()
+            .filter(|definition| names.contains(&definition.name))
+            .collect()
+    }
+
     #[tokio::test]
     async fn cleanup_cancels_tool_waits_before_replacement_turn() -> Result<()> {
-        let state = ControlSession::default();
+        let state = ControlSession::new(definitions(&["goal_complete"]));
         let (sink, _stream) = channel();
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         let (_task_root, _task_store, task_controller) =
             crate::task::SessionTaskController::test_goal();
         context.bind_test_task_controller(task_controller);
-        context.checkpoint = Some(crate::checkpoint::ToolGate::new()?);
+        context.checkpoint = Some(crate::checkpoint::ToolGate::new());
         state.begin(context, sink.clone()).await;
         let mut pending = Box::pin(state.call(ToolCall {
             name: "goal_complete".into(),
@@ -183,7 +286,7 @@ mod tests {
         })
         .await?;
         assert!(outcome.unwrap_err().is::<crate::broker::TurnCancelled>());
-        assert!(!state.output.lock().await.evidence.structured_complete);
+        assert!(!state.take_output().await.evidence.structured_complete);
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         let (_task_root, _task_store, task_controller) =
             crate::task::SessionTaskController::test_goal();
@@ -195,15 +298,16 @@ mod tests {
                 arguments: json!({"summary":"replacement turn"}),
             })
             .await?;
-        assert!(state.output.lock().await.evidence.structured_complete);
-        assert!(state.output.lock().await.goal_control.is_some());
+        let output = state.take_output().await;
+        assert!(output.evidence.structured_complete);
+        assert!(output.goal_control.is_some());
         Ok(())
     }
 
     #[tokio::test]
     async fn malformed_agent_tool_returns_field_diagnostics_to_the_model_and_timeline() -> Result<()>
     {
-        let state = ControlSession::default();
+        let state = ControlSession::new(definitions(&["agent_spawn"]));
         let (sink, mut stream) = channel();
         state
             .begin(
@@ -229,7 +333,7 @@ mod tests {
                 .any(|item| item["path"] == "provider" && item["code"] == "unknown_field")
         );
         assert!(
-            matches!(stream.try_next()?, Some(ProviderEvent::Diagnostic { diagnostic, .. }) if diagnostic.message.contains("text"))
+            matches!(stream.try_next()?, Some(ProviderEvent::Diagnostic { diagnostic, .. }) if diagnostic.message.as_str().contains("text"))
         );
         Ok(())
     }

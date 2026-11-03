@@ -1,15 +1,9 @@
 /// Observe producer failure independently of the startup RPC held by the peer.
 struct StartupOverflowTrace {
-    failed: tokio::sync::Notify,
 }
 
 impl ProviderTrace for StartupOverflowTrace {
-    /// Signal only after the public subscription producer publishes its failure.
-    fn record(&self, _: &str, event: &str, _: Value) {
-        if event == "copilot.subscription.failed" {
-            self.failed.notify_one();
-        }
-    }
+    fn record(&self, _: forge_provider_api::trace::ProviderTraceRecord) {}
 }
 
 /// Publish one valid SDK notification without replying to its pending session startup.
@@ -31,15 +25,16 @@ async fn startup_notification(
     writer.flush().await.unwrap();
 }
 
+const _: () = assert!(
+    github_copilot_sdk::session::DEFAULT_EVENT_BUFFER_CAPACITY > forge_protocol::MAX_PENDING_FRAMES + 1,
+    "fixture must overflow Forge's queue before the public SDK buffer"
+);
+
 /// Fence startup overflow before create/resume responds and collect every retained startup owner.
 #[tokio::test]
 async fn startup_overflow_fails_generation_before_create_or_resume_response() {
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        assert!(
-            github_copilot_sdk::session::DEFAULT_EVENT_BUFFER_CAPACITY
-                > forge_protocol::MAX_PENDING_FRAMES + 1,
-            "fixture must overflow Forge's queue before the public SDK buffer"
-        );
+
         for _ in 0..10 {
             for resumed in [false, true] {
                 let runtime =
@@ -93,11 +88,11 @@ async fn startup_overflow_fails_generation_before_create_or_resume_response() {
                 let client = runtime.client(".").await.unwrap();
                 let observed_generation = client.generation.clone();
                 let trace = Arc::new(StartupOverflowTrace {
-                    failed: tokio::sync::Notify::new(),
                 });
                 let sessions = Arc::new(CopilotSessions::<tempfile::TempDir>::new(trace.clone()));
                 let owner = forge_provider_api::ExecutionOwner::root("startup-overflow");
                 let (sink, mut source) = forge_provider_api::events::channel(
+                    forge_provider_api::BindingId::new("startup-loss").unwrap(),
                     forge_provider_api::EventScope::SessionOperation {
                         owner: owner.clone(),
                         operation_id: "startup-source".into(),
@@ -137,6 +132,7 @@ async fn startup_overflow_fails_generation_before_create_or_resume_response() {
                                         resources: super::super::session::ResourceDiscovery::Native,
                                         excluded_tools: Vec::new(),
                                         tools: Vec::new(),
+                                        native_callbacks: None,
                                     },
                                     skills: None,
                                     mcp: None,
@@ -149,17 +145,16 @@ async fn startup_overflow_fails_generation_before_create_or_resume_response() {
                 });
 
                 // Producer failure is observable while the peer has supplied no startup result.
-                trace.failed.notified().await;
-                assert_eq!(
-                    observed_generation.failure(),
-                    Some(forge_provider_api::lifecycle::ObservationFailure::Overflow)
-                );
                 assert!(matches!(
                     source.recv().await,
                     Err(forge_provider_api::events::EventDeliveryError::Observation(
                         forge_provider_api::lifecycle::ObservationFailure::Overflow
                     ))
                 ));
+                assert_eq!(
+                    observed_generation.failure(),
+                    Some(forge_provider_api::lifecycle::ObservationFailure::Overflow)
+                );
                 let error = match startup.await.unwrap() {
                     Err(error) => error,
                     Ok(_) => panic!("startup overflow published a usable session"),

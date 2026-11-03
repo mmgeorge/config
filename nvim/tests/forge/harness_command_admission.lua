@@ -54,6 +54,7 @@ for _, prompt in ipairs({ "/sess", "/spawn", "/unrecognized extra text", "/works
 end
 warnings = {}
 local client = require("forge.client")
+dofile("nvim/tests/forge/support/provider_catalog.lua").install()
 require("forge.views.harness.prompt_history").record = function() end
 local requests = {}
 client.request = function(request_specification, callback)
@@ -143,9 +144,9 @@ vim.cmd("new")
 vim.api.nvim_set_current_buf(state.composer_buf)
 vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/x" })
 vim.api.nvim_win_set_cursor(0, { 1, 1 })
-state.session.provider = "codex"
+state.session.provider = "fixture_alpha"
 state.session.model = "default"
-state.model_provider = "codex"
+state.model_provider = "fixture_alpha"
 require("forge.views.harness.model_pins").get = function() return {} end
 state.model_list = {
   { id = "luna", is_default = true, service_tiers = { "fast" } },

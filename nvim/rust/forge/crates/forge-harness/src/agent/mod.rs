@@ -28,7 +28,7 @@ pub use capability::AgentCapability;
 pub use delegation::Delegation;
 pub use forge_provider_api::agent::AgentLifecycleEvent;
 pub use identity::{Agent, AgentExecutionState, AgentState};
-pub use provider::{AgentProviderFactory, provider_name};
+pub use provider::AgentProviderFactory;
 pub use registry::AgentRegistry;
 pub use runtime::AgentRuntime;
 pub use tool_scope::{AgentToolLease, AgentToolScope};

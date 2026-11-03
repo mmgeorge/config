@@ -18,6 +18,7 @@ pub enum SteeringInput {
     },
     TaskEntry {
         start: crate::exchange::TaskStart,
+        goal: Option<forge_provider_api::NativeGoalCommand>,
         text: String,
         submission: Arc<super::submission::Submission>,
     },
@@ -57,6 +58,13 @@ impl SteeringInput {
             _ => None,
         }
     }
+
+    pub(crate) fn goal(&self) -> Option<&forge_provider_api::NativeGoalCommand> {
+        match self {
+            Self::TaskEntry { goal, .. } => goal.as_ref(),
+            _ => None,
+        }
+    }
 }
 
 impl From<String> for SteeringInput {
@@ -91,6 +99,7 @@ struct SteeringState {
 struct SteeringSender {
     sender: mpsc::Sender<SteerCommand>,
     ordinary: Arc<Semaphore>,
+    #[cfg(test)]
     interrupt: Arc<Semaphore>,
 }
 
@@ -109,29 +118,22 @@ pub struct SteerCommand {
     pub attachments: Vec<crate::attachment::InputAttachment>,
     /// Durable input ownership shared with the native adapter.
     pub submission: Option<Arc<super::submission::Submission>>,
-    pub target: Option<SteerTarget>,
     pub operation: ActiveTurnOperation,
     completion: Option<oneshot::Sender<std::result::Result<(), ProviderError>>>,
     event_sink: Option<ProviderEventSink>,
     publish_input: bool,
     task_start: Option<crate::exchange::TaskStart>,
-}
-
-/// Identifies the provider child receiving steering or interruption.
-#[derive(Clone, Debug)]
-pub struct SteerTarget {
-    pub thread_id: String,
-    pub turn_id: String,
+    goal: Option<forge_provider_api::NativeGoalCommand>,
 }
 
 /// Defines the active-turn operation carried over the shared provider process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActiveTurnOperation {
     Steer,
+    #[cfg(test)]
     Interrupt,
+    #[cfg(test)]
     CleanupExecution,
-    PauseGoal,
-    ClearGoal,
 }
 
 impl SteeringLane {
@@ -147,19 +149,6 @@ impl SteeringLane {
             .is_some()
     }
 
-    /// Stop native goal continuation through the active provider reader.
-    pub async fn stop_goal(&self, clear: bool) -> Result<()> {
-        self.submit(
-            if clear {
-                ActiveTurnOperation::ClearGoal
-            } else {
-                ActiveTurnOperation::PauseGoal
-            },
-            None,
-            None,
-        )
-        .await
-    }
     /// Attach a receiver to the active provider turn before accepting steering input.
     pub fn activate(&self, event_sink: Option<ProviderEventSink>) -> Result<ActiveSteering> {
         let (sender, receiver) = mpsc::channel(MAX_STEERING_REQUESTS + 1);
@@ -173,6 +162,7 @@ impl SteeringLane {
         state.sender = Some(SteeringSender {
             sender,
             ordinary: Arc::new(Semaphore::new(MAX_STEERING_REQUESTS)),
+            #[cfg(test)]
             interrupt: Arc::new(Semaphore::new(1)),
         });
         Ok(ActiveSteering {
@@ -185,13 +175,13 @@ impl SteeringLane {
 
     /// Delivers input to the active turn and publishes only acknowledged user additions.
     pub async fn steer(&self, input: SteeringInput) -> Result<()> {
-        self.submit(ActiveTurnOperation::Steer, Some(input), None)
-            .await
+        self.submit(ActiveTurnOperation::Steer, Some(input)).await
     }
 
     /// Interrupt the parent and descendants and wait for terminal provider evidence.
+    #[cfg(test)]
     pub async fn cleanup_execution(&self) -> Result<()> {
-        self.submit(ActiveTurnOperation::CleanupExecution, None, None)
+        self.submit(ActiveTurnOperation::CleanupExecution, None)
             .await
     }
 
@@ -199,7 +189,6 @@ impl SteeringLane {
         &self,
         operation: ActiveTurnOperation,
         input: Option<SteeringInput>,
-        target: Option<SteerTarget>,
     ) -> Result<()> {
         let sender = self
             .state
@@ -208,19 +197,15 @@ impl SteeringLane {
             .sender
             .clone();
         let Some(sender) = sender else {
+            #[cfg(test)]
             if operation == ActiveTurnOperation::CleanupExecution {
                 return Ok(());
             }
-            return Err(ProviderError::NotConsumed {
-                cause: None,
-                message: "provider has no active turn to steer".into(),
-            }
-            .into());
+            return Err(not_admitted().into());
         };
         let admission = match operation {
-            ActiveTurnOperation::Steer
-            | ActiveTurnOperation::PauseGoal
-            | ActiveTurnOperation::ClearGoal => sender.ordinary,
+            ActiveTurnOperation::Steer => sender.ordinary,
+            #[cfg(test)]
             ActiveTurnOperation::Interrupt | ActiveTurnOperation::CleanupExecution => {
                 sender.interrupt
             }
@@ -241,6 +226,7 @@ impl SteeringLane {
             .unwrap_or_default();
         let submission = input.as_ref().and_then(SteeringInput::submission);
         let task_start = input.as_ref().and_then(SteeringInput::task_start).cloned();
+        let goal = input.as_ref().and_then(SteeringInput::goal).cloned();
         sender
             .sender
             .try_send(SteerCommand {
@@ -248,17 +234,14 @@ impl SteeringLane {
                 text,
                 attachments,
                 submission: submission.clone(),
-                target,
                 operation,
                 completion: Some(completion),
                 event_sink: None,
                 publish_input,
                 task_start,
+                goal,
             })
-            .map_err(|_| ProviderError::NotConsumed {
-                cause: None,
-                message: "active turn completed before steering input was sent".into(),
-            })?;
+            .map_err(|_| not_admitted())?;
         if let Some(submission) = submission {
             submission.mark_steering_queued();
         }
@@ -324,6 +307,7 @@ impl SteerCommand {
         match (&self.task_start, &self.submission) {
             (Some(start), Some(submission)) => SteeringInput::TaskEntry {
                 start: start.clone(),
+                goal: self.goal.clone(),
                 text: self.text.clone(),
                 submission: submission.clone(),
             },
@@ -391,9 +375,12 @@ impl SteerCommand {
                 Ok(None)
             }
             Err(error) => {
-                let not_consumed = error
-                    .downcast_ref::<ProviderError>()
-                    .is_some_and(|error| matches!(error, ProviderError::NotConsumed { .. }));
+                let not_consumed = error.downcast_ref::<ProviderError>().is_some_and(|error| {
+                    matches!(
+                        error,
+                        ProviderError::NotConsumed { .. } | ProviderError::PreparationFailed(_)
+                    )
+                });
                 let prepared = self
                     .submission
                     .as_ref()
@@ -465,7 +452,12 @@ impl SteerCommand {
             }
         }
         if let Some(completion) = self.completion.take() {
-            let _ = completion.send(result.map_err(ProviderError::from));
+            let _ = completion.send(result.map_err(|error| {
+                super::lifecycle_error::classify(
+                    forge_provider_api::ProviderOperation::AdmitInput,
+                    error,
+                )
+            }));
         }
     }
 }
@@ -483,18 +475,23 @@ impl Drop for SteerCommand {
                         super::submission::SubmissionState::Prepared
                     )
                 }) {
-                ProviderError::NotConsumed {
-                    cause: None,
-                    message: "active turn ended before steering input was sent".into(),
-                }
+                not_admitted()
             } else {
-                ProviderError::DeliveryUncertain {
-                    message: "active turn ended before steering input was acknowledged".into(),
-                }
+                ProviderError::DeliveryUncertain
             };
             let _ = completion.send(Err(error));
         }
     }
+}
+
+/// Prove local rejection without fabricating a provider continuation capability.
+fn not_admitted() -> ProviderError {
+    ProviderError::PreparationFailed(Box::new(ProviderError::Failure(
+        forge_provider_api::ProviderFailure::new(
+            forge_provider_api::ProviderOperation::AdmitInput,
+            forge_provider_api::ProviderFailureKind::Rejected,
+        ),
+    )))
 }
 
 #[cfg(test)]
@@ -526,7 +523,7 @@ mod test {
         let submission = store.prepare_steering(
             &catalog,
             crate::provider::ProviderInput::from_text("once"),
-            crate::provider::ProviderKind::Codex,
+            forge_providers::registry::default_id(),
         )?;
         let lane = SteeringLane::default();
         let mut active = lane.activate(None)?;
@@ -583,7 +580,7 @@ mod test {
         let submission = store.prepare_steering(
             &catalog,
             crate::provider::ProviderInput::from_text("once"),
-            crate::provider::ProviderKind::Codex,
+            forge_providers::registry::default_id(),
         )?;
         let lane = SteeringLane::default();
         let mut active = lane.activate(None)?;
@@ -594,7 +591,7 @@ mod test {
         }));
         assert!(futures_util::poll!(sending.as_mut()).is_pending());
         let command = active.receive().await.unwrap();
-        submission.sending(crate::provider::submission::SubmissionTarget::Untracked)?;
+        submission.sending(None)?;
         assert!(
             command
                 .settle_delivery(Err(anyhow::anyhow!("acknowledgment timed out")))
@@ -653,11 +650,10 @@ mod test {
         );
         let first = active.receive().await.unwrap();
         assert!(lane.steer("still full".into()).await.is_err());
-        let mut interrupt =
-            Box::pin(lane.submit(super::ActiveTurnOperation::Interrupt, None, None));
+        let mut interrupt = Box::pin(lane.submit(super::ActiveTurnOperation::Interrupt, None));
         assert!(futures_util::poll!(interrupt.as_mut()).is_pending());
         assert!(
-            lane.submit(super::ActiveTurnOperation::Interrupt, None, None)
+            lane.submit(super::ActiveTurnOperation::Interrupt, None)
                 .await
                 .is_err()
         );
@@ -686,7 +682,6 @@ mod test {
         let lane = SteeringLane::default();
         let mut active = lane.activate(None).unwrap();
         let text = "λ".repeat(65_537);
-        let target = "target".repeat(4097);
         let mut request = Box::pin(lane.submit(
             super::ActiveTurnOperation::Steer,
             Some(super::SteeringInput::User {
@@ -694,15 +689,10 @@ mod test {
                 attachments: Vec::new(),
                 submission: None,
             }),
-            Some(super::SteerTarget {
-                thread_id: target.clone(),
-                turn_id: "turn".into(),
-            }),
         ));
         assert!(futures_util::poll!(request.as_mut()).is_pending());
         let command = active.receive().await.unwrap();
         assert_eq!(command.text, text);
-        assert_eq!(command.target.as_ref().unwrap().thread_id, target);
         command.complete(Ok(())).await;
         request.await.unwrap();
     }
@@ -781,7 +771,7 @@ mod test {
         let submission = store.prepare_input(
             &catalog,
             crate::provider::ProviderInput::from_text(prompt),
-            crate::provider::ProviderKind::Codex,
+            forge_providers::registry::default_id(),
             Some("task-entry".into()),
         )?;
         let lane = SteeringLane::default();
@@ -789,6 +779,7 @@ mod test {
         let mut active = lane.activate(Some(event_sink))?;
         let mut delivery = Box::pin(lane.steer(super::SteeringInput::TaskEntry {
             start: start.clone(),
+            goal: None,
             text: prompt.into(),
             submission,
         }));
@@ -800,6 +791,7 @@ mod test {
                 start: forwarded,
                 text,
                 submission,
+                ..
             } => {
                 assert_eq!(forwarded, start);
                 assert_eq!(text, prompt);

@@ -35,6 +35,7 @@ pub struct PreparedApproval {
 
 impl ApprovalContext {
     /// Revoke all snapshots when a connection is cancelled or reused.
+    #[cfg(test)]
     pub fn clear(&self) {
         self.proposal
             .lock()
@@ -134,13 +135,6 @@ impl ApprovalContext {
 }
 
 impl PreparedApproval {
-    pub fn direct(request: PermissionRequest) -> Self {
-        Self {
-            request,
-            observation: None,
-        }
-    }
-
     /// Reject an acceptance if its proposal changed or retired after evaluation.
     pub fn validate(&self) -> Result<()> {
         if let Some((context, key, revision)) = &self.observation {
@@ -212,12 +206,8 @@ pub fn permission_from_provider(
 ) -> Result<PermissionRequest> {
     let params = message.get("params").unwrap_or(&Value::Null);
     let id = format!("approval-{}", Uuid::new_v4());
-    let provider = "Codex CLI";
-    let reason = params
-        .get("reason")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let encoded = params.to_string();
+    let provider = crate::registry::select("codex").expect("Codex is registered");
+    let reason = None;
     let target_list = if method == "mcpServer/elicitation/request" {
         let server = params
             .get("serverName")
@@ -249,15 +239,13 @@ pub fn permission_from_provider(
             |path| PermissionTarget::Read { path },
         )]
     } else if method.contains("permission") || method.contains("permissions") {
-        normalize_permission_payload(params, &encoded)
+        normalize_permission_payload(params)
     } else {
-        vec![PermissionTarget::Tool {
-            target: method.into(),
-        }]
+        vec![PermissionTarget::Unknown]
     };
     Ok(PermissionRequest {
         id,
-        provider: provider.into(),
+        provider,
         reason,
         target_list,
     })
@@ -334,9 +322,15 @@ fn provider_command(
     Ok((command, Some(CommandShell::Bash)))
 }
 
+fn digest(content: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(content))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_shell::command::normalize_command_in;
 
     fn started(thread: &str, turn: &str, item: &str, changes: Value) -> Value {
         json!({"method":"item/started","params":{"threadId":thread,"turnId":turn,
@@ -474,9 +468,162 @@ mod tests {
         );
         Ok(())
     }
-}
 
-fn digest(content: &[u8]) -> String {
-    use sha2::Digest;
-    hex::encode(sha2::Sha256::digest(content))
+    #[test]
+    fn provider_command_argv_retains_shell_script_boundaries() {
+        for (executable, script, shell) in [
+            (
+                "pwsh",
+                "1 | ForEach-Object { probe $_ }",
+                CommandShell::PowerShell,
+            ),
+            (
+                "/bin/bash",
+                "for x in one; do probe $x; done",
+                CommandShell::Bash,
+            ),
+            ("/bin/zsh", "repeat 2 probe x", CommandShell::Zsh),
+            ("nu", "[1] | each {|x| probe $x }", CommandShell::Nushell),
+        ] {
+            let request = permission_from_provider(
+                "item/commandExecution/requestApproval",
+                &json!({
+                    "params":{"args":[executable,"-c",script]}
+                }),
+                ".",
+            )
+            .unwrap();
+            assert_eq!(
+                request.target_list,
+                vec![PermissionTarget::Command {
+                    command: script.into(),
+                    shell: Some(shell),
+                }]
+            );
+            assert!(normalize_command_in(script, shell).failure.is_none());
+        }
+    }
+
+    #[test]
+    fn provider_command_quoting_roundtrips_every_supported_shell() {
+        for (executable, shell) in [
+            (
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+                CommandShell::PowerShell,
+            ),
+            (
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                CommandShell::PowerShell,
+            ),
+            ("/usr/bin/pwsh", CommandShell::PowerShell),
+            ("/bin/sh", CommandShell::Bash),
+            ("/bin/bash", CommandShell::Bash),
+            ("/bin/zsh", CommandShell::Zsh),
+            ("/opt/homebrew/bin/nu", CommandShell::Nushell),
+            (r"C:\Program Files\nu\bin\nu.exe", CommandShell::Nushell),
+        ] {
+            for source in [
+                r#"probe "timeline|markdown|table|wrap""#,
+                r#"probe 'one; two & three | four'"#,
+                r#"probe "" 'café 世界' 'C:\space path\file.txt'"#,
+                "probe first\nprobe second",
+                "probe 'quote\" and $value and `tick and \\path'",
+            ] {
+                let arguments = [executable, "-c", source];
+                let rendered = shlex::try_join(arguments).unwrap();
+                for params in [json!({"command":rendered}), json!({"args":arguments})] {
+                    let message =
+                        json!({"method":"item/commandExecution/requestApproval","params":params});
+                    let request = permission_from_provider(
+                        "item/commandExecution/requestApproval",
+                        &message,
+                        ".",
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        request.target_list,
+                        vec![PermissionTarget::Command {
+                            command: source.into(),
+                            shell: Some(shell),
+                        }]
+                    );
+                    let parsed = normalize_command_in(source, shell);
+                    assert!(parsed.failure.is_none(), "{shell:?}: {source}: {parsed:?}");
+                    let expected = if source.contains('\n') { 2 } else { 1 };
+                    assert_eq!(
+                        parsed.invocation_list.len(),
+                        expected,
+                        "{shell:?}: {source}"
+                    );
+                    assert!(
+                        parsed
+                            .invocation_list
+                            .iter()
+                            .all(|command| command.command_name == "probe")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_argv_preserves_literal_arguments_without_a_shell_launcher() {
+        let arguments = ["rg", "-n", "a|b;$(probe)", "", r"C:\space path\file.txt"];
+        for params in [
+            json!({"command":shlex::try_join(arguments).unwrap()}),
+            json!({"command":arguments}),
+            json!({"command":"rg", "args":&arguments[1..]}),
+        ] {
+            let message = json!({"method":"item/commandExecution/requestApproval","params":params});
+            let request =
+                permission_from_provider("item/commandExecution/requestApproval", &message, ".")
+                    .unwrap();
+            let PermissionTarget::Command { command, shell } = &request.target_list[0] else {
+                panic!()
+            };
+            let parsed = normalize_command_in(command, shell.unwrap());
+            assert!(parsed.failure.is_none(), "{command}: {parsed:?}");
+            assert_eq!(parsed.invocation_list.len(), 1);
+            assert_eq!(parsed.invocation_list[0].token_list, arguments);
+        }
+    }
+
+    #[test]
+    fn malformed_native_command_approval_payloads_are_rejected() {
+        for params in [
+            json!({"command":"pwsh -c 'unfinished"}),
+            json!({"command":""}),
+            json!({"args":[]}),
+            json!({"args":["pwsh", "-c", 42]}),
+            json!({"command":"rg\u{0}tail"}),
+        ] {
+            let message = json!({"method":"item/commandExecution/requestApproval","params":params});
+            let error =
+                permission_from_provider("item/commandExecution/requestApproval", &message, ".")
+                    .unwrap_err();
+            assert!(
+                error.downcast_ref::<CommandAnalysisError>().is_some(),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_approval_resolution_encodes_protocol_specific_replies() {
+        let command = json!({"method":"item/commandExecution/requestApproval"});
+        assert_eq!(
+            codex_response(&command, ApprovalResolution::TimedOut)["decision"],
+            "decline"
+        );
+        let permissions = json!({"method":"item/permissions/requestApproval","params":{"permissions":{"write":true}}});
+        assert_eq!(
+            codex_response(&permissions, ApprovalResolution::AllowOnce)["permissions"]["write"],
+            true
+        );
+        let elicitation = json!({"method":"mcpServer/elicitation/request"});
+        assert_eq!(
+            codex_response(&elicitation, ApprovalResolution::Cancel)["action"],
+            "cancel"
+        );
+    }
 }

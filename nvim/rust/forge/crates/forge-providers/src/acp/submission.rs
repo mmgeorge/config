@@ -1,19 +1,20 @@
 use super::AcpConnection;
+use forge_provider_api::submission::InputReceipt;
 use forge_provider_api::{
-    ProviderError,
-    submission::{InputReceipt, SubmissionTarget},
+    ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation, RecoveryToken,
 };
 use serde_json::Value;
 use std::sync::Arc;
+use uuid::Uuid;
 
-/// Select the ACP operation whose response can establish delivery evidence.
-#[derive(Clone, Copy)]
+/// Select the ACP v1 operation whose response provides delivery evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcpSubmission {
     Prompt,
     Steering,
 }
 
-/// Distinguish confirmed injection from accepted work without an observable terminal signal.
+/// Distinguish steering accepted for the active turn from a new unobservable turn.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SteeringAcceptance {
     Injected,
@@ -29,85 +30,50 @@ impl AcpSubmission {
     }
 }
 
-impl TryFrom<&str> for AcpSubmission {
-    type Error = ProviderError;
-    fn try_from(method: &str) -> Result<Self, Self::Error> {
-        match method {
-            "session/prompt" => Ok(Self::Prompt),
-            "_session/steering" => Ok(Self::Steering),
-            _ => Err(ProviderError::Provider {
-                code: None,
-                message: format!("ACP submission method is unsupported: {method}"),
-            }),
-        }
-    }
-}
-
-impl std::str::FromStr for AcpSubmission {
-    type Err = ProviderError;
-
-    fn from_str(method: &str) -> Result<Self, Self::Err> {
-        Self::try_from(method)
-    }
-}
-
 impl AcpConnection {
-    /// Decode steering outcomes only after recording native acceptance evidence.
+    /// Decode a steering response after its accepted delivery receipt is committed.
     pub async fn submit_steering(
         &self,
         parameter: Value,
-        submission: Option<Arc<dyn InputReceipt>>,
+        receipt: Option<Arc<dyn InputReceipt>>,
     ) -> Result<SteeringAcceptance, ProviderError> {
         let response = self
-            .submit(AcpSubmission::Steering, parameter, submission)
+            .submit(AcpSubmission::Steering, parameter, receipt)
             .await?;
         match response["outcome"].as_str() {
             Some("injected") => Ok(SteeringAcceptance::Injected),
             Some("startedNewTurn") => Ok(SteeringAcceptance::UnobservableExecution),
-            _ => Err(ProviderError::Protocol {
-                message: "ACP accepted an unsupported steering outcome".into(),
-            }),
+            _ => Err(failure(
+                ProviderOperation::AdmitInput,
+                ProviderFailureKind::Protocol,
+            )),
         }
     }
 
-    /// Commits delivery evidence around an ACP prompt or advertised steering request.
-    /// Cancellation after dispatch leaves the input uncertain. Only a valid native
-    /// response permits acceptance or the documented idle-steering fallback.
+    /// Commit ACP's provider-owned delivery evidence around one native send.
     pub async fn submit(
         &self,
         kind: AcpSubmission,
         parameter: Value,
-        submission: Option<Arc<dyn InputReceipt>>,
+        receipt: Option<Arc<dyn InputReceipt>>,
     ) -> Result<Value, ProviderError> {
         let method = kind.method();
-        let result: Result<Value, ProviderError> = async {
-            let session_id = parameter["sessionId"]
-                .as_str()
-                .ok_or_else(|| ProviderError::Provider {
-                    code: None,
-                    message: "ACP submission has no session ID".into(),
-                })?
-                .to_owned();
-            if let Some(submission) = submission.as_ref() {
-                let target = SubmissionTarget::native(
-                    "acp",
-                    session_id.clone(),
-                    serde_json::json!({"method":method}),
-                );
-                submission.clone().record_sending(target).await?;
-            }
+        let session_id = parameter["sessionId"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| failure(ProviderOperation::AdmitInput, ProviderFailureKind::Rejected))?;
+        let checkpoint = RecoveryToken::new(format!("v1\n{method}\n{session_id}").into_bytes())
+            .map_err(|_| failure(ProviderOperation::AdmitInput, ProviderFailureKind::Unknown))?;
+        if let Some(receipt) = &receipt {
+            receipt.clone().record_sending(Some(checkpoint)).await?;
+        }
+        let mut rejected_without_consumption = false;
+        let result = async {
             let response = self.request(method, parameter).await?;
-            if method == "session/prompt" {
-                // ACP v1 responds when the turn ends, not when input is accepted.
-                // Preserve uncertainty on disconnect. The v2 draft returns an acceptance
-                // messageId, enabling earlier receipts once both adapters support it:
-                // https://agentclientprotocol.com/protocol/v2/prompt-lifecycle
-                super::validate_prompt_response(response.clone()).map_err(|error| {
-                    ProviderError::Protocol {
-                        message: format!(
-                            "ACP prompt response does not confirm a completed turn: {error}"
-                        ),
-                    }
+            if kind == AcpSubmission::Prompt {
+                // ACP v1 acknowledges a prompt only after the native turn has ended.
+                super::prompt_outcome(&response).map_err(|_| {
+                    failure(ProviderOperation::AdmitInput, ProviderFailureKind::Protocol)
                 })?;
             } else {
                 match response["outcome"].as_str() {
@@ -115,38 +81,68 @@ impl AcpConnection {
                     Some("promptRequired")
                         if response["reason"].as_str() == Some("noRunningTurn") =>
                     {
-                        let error =
-                            "Active work finished before steering. Queue this prompt instead";
-                        // Claude's opted-in idle response guarantees no input was queued.
-                        // Other errors and unknown outcomes never authorize another send.
-                        if let Some(submission) = submission.as_ref() {
-                            submission.clone().record_rejected(error.into()).await?;
+                        rejected_without_consumption = true;
+                        let continuation = forge_provider_api::session::ContinuationToken::new(
+                            Uuid::new_v4().as_bytes().to_vec(),
+                        )
+                        .map_err(|_| {
+                            failure(ProviderOperation::AdmitInput, ProviderFailureKind::Unknown)
+                        })?;
+                        if let Some(receipt) = &receipt {
+                            receipt
+                                .clone()
+                                .record_rejected(failure(
+                                    ProviderOperation::AdmitInput,
+                                    ProviderFailureKind::Rejected,
+                                ))
+                                .await?;
                         }
-                        return Err(ProviderError::NotConsumed {
-                            cause: None,
-                            message: error.into(),
-                        });
+                        return Err(ProviderError::NotConsumed { continuation });
                     }
                     _ => {
-                        return Err(ProviderError::Protocol {
-                            message: format!("ACP steering acceptance is unknown: {response}"),
-                        });
+                        return Err(failure(
+                            ProviderOperation::AdmitInput,
+                            ProviderFailureKind::Protocol,
+                        ));
                     }
                 }
             }
-            if let Some(submission) = submission.as_ref() {
-                let receipt = format!("{method}:{session_id}");
-                submission.clone().record_accepted(receipt).await?;
+            if let Some(receipt) = &receipt {
+                let accepted =
+                    RecoveryToken::new(format!("accepted\n{method}\n{session_id}").into_bytes())
+                        .map_err(|_| {
+                            failure(ProviderOperation::AdmitInput, ProviderFailureKind::Unknown)
+                        })?;
+                receipt.clone().record_accepted(Some(accepted)).await?;
             }
             Ok(response)
         }
         .await;
-        if let Err(error) = &result
-            && let Some(submission) = submission
+        if let (Err(error), Some(receipt)) = (&result, receipt)
+            && !rejected_without_consumption
         {
-            let failure = format!("{error:#}");
-            submission.clone().record_failure(failure).await?;
+            let record_result = receipt
+                .record_failure(ProviderError::Failure(ProviderFailure::new(
+                    ProviderOperation::AdmitInput,
+                    match error {
+                        ProviderError::Failure(failure) => failure.kind(),
+                        ProviderError::Cancelled => ProviderFailureKind::Runtime,
+                        ProviderError::DeliveryUncertain => ProviderFailureKind::Transport,
+                        _ => ProviderFailureKind::Unknown,
+                    },
+                )))
+                .await;
+            if let Err(record_error) = record_result {
+                return Err(ProviderError::Combined {
+                    primary: Box::new(error.clone()),
+                    secondary: vec![record_error],
+                });
+            }
         }
         result
     }
+}
+
+fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderError {
+    ProviderError::Failure(ProviderFailure::new(operation, kind))
 }

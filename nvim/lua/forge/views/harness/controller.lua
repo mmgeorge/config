@@ -2194,7 +2194,7 @@ function M.select_provider()
       option_list[#option_list + 1] = {
         id = provider,
         label = provider_config.label,
-        detail = provider_config.detail .. (provider == current and " (current)" or ""),
+        detail = (provider_config.detail or provider_config.label) .. (provider == current and " (current)" or ""),
         value = provider,
       }
     end

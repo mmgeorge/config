@@ -214,9 +214,9 @@ mod context_usage_test {
     use super::ContextUsage;
 
     #[test]
-    fn normalizes_codex_context_against_the_reserved_baseline() {
-        let usage =
-            ContextUsage::with_baseline(275_000, 353_000, 12_000).expect("valid Codex usage");
+    fn normalizes_context_against_the_reserved_baseline() {
+        let usage = ContextUsage::with_baseline(275_000, 353_000, 12_000)
+            .expect("valid usage with reserved context");
         assert_eq!(usage.remaining_percent, 23);
         assert_eq!(usage.size, 353_000);
         assert!(ContextUsage::with_baseline(1, 12_000, 12_000).is_none());

@@ -186,6 +186,62 @@ local function session_provider_descriptor()
   }
 end
 
+---@param registry ForgeHarnessProviderRegistry
+local function adopt_provider_registry(registry)
+  if type(registry) ~= "table" or type(registry.providers) ~= "table"
+    or type(registry.default_provider) ~= "string" then
+    error("Forge returned an invalid provider registry")
+  end
+  local previous = config.options.harness.providers or {}
+  local providers = {}
+  for _, descriptor in ipairs(registry.providers) do
+    if type(descriptor.id) ~= "string" or type(descriptor.label) ~= "string"
+      or type(descriptor.command) ~= "table" then
+      error("Forge returned an invalid provider descriptor")
+    end
+    local configured = previous[descriptor.id] or {}
+    providers[descriptor.id] = vim.tbl_deep_extend("force", {
+      command = vim.deepcopy(descriptor.command),
+      label = descriptor.label,
+      detail = descriptor.detail,
+      selectable = descriptor.selectable,
+      capability = vim.deepcopy(descriptor.capability),
+      background_generation = type(descriptor.background_generation) == "table"
+        and vim.deepcopy(descriptor.background_generation) or nil,
+    }, configured)
+  end
+  config.options.harness.providers = providers
+  local background = {}
+  for id, descriptor in pairs(providers) do
+    if descriptor.background_generation or (config.options.background_generation or {})[id] then
+      background[id] = vim.tbl_deep_extend("force",
+        vim.deepcopy(descriptor.background_generation or {}),
+        vim.deepcopy((config.options.background_generation or {})[id] or {}))
+    end
+  end
+  config.options.background_generation = background
+  if not providers[registry.default_provider] then error("Forge registry default is missing") end
+  if config.harness_provider_explicit and not providers[config.options.harness.provider] then
+    error("Unknown Harness provider: " .. tostring(config.options.harness.provider))
+  end
+  if not config.harness_provider_explicit and not session.harness.session then
+    config.options.harness.provider = provider_preference.load(providers, registry.default_provider)
+  end
+end
+
+---@param callback fun(failure?: string)
+local function ensure_provider_registry(callback)
+  local client = host_state()
+  if client.provider_registry_generation == client.generation then callback(nil) return end
+  send_request(nil, "provider.registry.list", {}, function(registry, failure)
+    if failure then callback(failure) return end
+    local ok, apply_error = pcall(adopt_provider_registry, registry)
+    if not ok then callback(tostring(apply_error)) return end
+    client.provider_registry_generation = client.generation
+    callback(nil)
+  end)
+end
+
 ---@param callback ForgeCallback
 ---@param result? any
 ---@param start_error? string
@@ -834,6 +890,12 @@ function M.session_initialize(callback, initialize_options, startup)
   local client = host_state()
   local mode = initialize_options and initialize_options.services_only and "runtime" or "harness"
   if client[mode .. "_ready"] and client.process then
+    if client.provider_registry_generation ~= client.generation then
+      ensure_provider_registry(function(failure)
+        if failure then callback(nil, failure) else M.session_initialize(callback, initialize_options, startup) end
+      end)
+      return
+    end
     if mode == "harness" and initialize_options then
       if initialize_options.new_session_name ~= nil or initialize_options.lease_conflict_action == "new" then
         M.session_create({ name = initialize_options.new_session_name }, callback)
@@ -870,11 +932,14 @@ function M.session_initialize(callback, initialize_options, startup)
   M.host_start(function(_, failure, detail)
     if startup then startup.mark("host.ready", { error = failure }) end
     if failure then session_finish_initialize(mode, callback, nil, failure, detail) return end
-    session_send_initialize(callback, initialize_options, startup)
+    ensure_provider_registry(function(registry_failure)
+      if registry_failure then session_finish_initialize(mode, callback, nil, registry_failure)
+      else session_send_initialize(callback, initialize_options, startup) end
+    end)
   end)
 end
 
---- Resolve isolated generation launch settings without starting a provider.
+--- Resolve isolated generation launch settings from the loaded provider registry.
 ---@param selection? ForgeBackgroundSelection
 ---@return ForgeTextGenerationConfig? generation
 ---@return string? failure
@@ -882,9 +947,6 @@ function M.generation_get_config(selection)
   local harness_config = config.options.harness
   local selected = session.harness.session
   local provider = selected and selected.provider or harness_config.provider
-  if not selected and not config.harness_provider_explicit then
-    provider = provider_preference.load(harness_config.providers, provider)
-  end
   local configured = harness_config.providers[provider]
   if not configured then return nil, "Unknown Harness provider: " .. tostring(provider) end
   selection = selection or (config.options.background_generation or {})[provider]
@@ -903,40 +965,56 @@ function M.generation_get_config(selection)
   return generation
 end
 
+--- Load registry defaults before resolving Background settings, without opening a conversation.
+---@param callback fun(generation?: ForgeTextGenerationConfig, failure?: string)
+---@param selection? ForgeBackgroundSelection
+function M.generation_config(callback, selection)
+  M.host_start(function(_, startup_failure)
+    if startup_failure then callback(nil, startup_failure) return end
+    ensure_provider_registry(function(registry_failure)
+      if registry_failure then callback(nil, registry_failure) return end
+      callback(M.generation_get_config(selection))
+    end)
+  end)
+end
+
 ---@param params table
 ---@param callback ForgeCallback
 ---@param on_model? fun(model: string) Receives the configured generation model before request dispatch.
 ---@param selection? ForgeBackgroundSelection
 ---@return fun() cancel Cancels this generation without stopping the shared host.
 function M.generation_request(params, callback, on_model, selection)
-  local generation, failure = M.generation_get_config(selection)
-  if not generation then callback(nil, failure) return function() end end
-  if on_model then
-    local effort = generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or ""
-    on_model(generation.model .. effort .. " (" .. generation.provider.kind .. ")")
-  end
-  local label = generation.model .. (generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or "")
-  local owner, finished = host_state(), false
-  local request_id = M.request({ method = "repository.generation", params = vim.tbl_extend("force", params, { generation = generation }) }, function(...)
-    finished = true
-    callback(...)
-  end, function(progress)
+  local owner, finished, request_id = host_state(), false, nil
+  M.generation_config(function(generation, failure)
     if finished then return end
-    local event = progress.event
-    if not on_model or type(event) ~= "table" then return end
-    if event.kind == "runtime_resolved" and event.data and event.data.model then
-      label = event.data.model .. (generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or "")
-      on_model(label)
-    elseif event.kind == "reasoning_summary" and type(event.text) == "string" then
-      on_model(label .. "\n" .. event.text)
-    elseif event.kind == "status" and event.data and type(event.data.reasoning_summary) == "string" then
-      on_model(label .. "\n" .. event.data.reasoning_summary)
+    if not generation then finished = true callback(nil, failure) return end
+    if on_model then
+      local effort = generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or ""
+      on_model(generation.model .. effort .. " (" .. generation.provider.kind .. ")")
     end
-  end)
+    local label = generation.model .. (generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or "")
+    request_id = M.request({ method = "repository.generation", params = vim.tbl_extend("force", params, { generation = generation }) }, function(...)
+      finished = true
+      callback(...)
+    end, function(progress)
+      if finished then return end
+      local event = progress.event
+      if not on_model or type(event) ~= "table" then return end
+      if event.kind == "runtime_resolved" and event.data and event.data.model then
+        label = event.data.model .. (generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or "")
+        on_model(label)
+      elseif event.kind == "reasoning_summary" and type(event.text) == "string" then
+        on_model(label .. "\n" .. event.text)
+      elseif event.kind == "status" and event.data and type(event.data.reasoning_summary) == "string" then
+        on_model(label .. "\n" .. event.data.reasoning_summary)
+      end
+    end)
+  end, selection)
   return function()
     if finished then return end
     finished = true
-    if host_state() ~= owner or not request_id then return end
+    if not request_id then callback(nil, "Background generation cancelled") return end
+    if host_state() ~= owner then return end
     local pending = owner.pending[request_id]
     if not pending then return end
     if not pending.dispatched then

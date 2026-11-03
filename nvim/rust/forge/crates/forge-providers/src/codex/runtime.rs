@@ -112,12 +112,8 @@ impl CodexRuntime {
         }
     }
 
-    /// Return how many singleton process generations this runtime launched.
-    pub fn start_count(&self) -> u64 {
-        self.start_count.load(Ordering::Relaxed)
-    }
-
     /// Return the operating-system process identifier for the shared app-server.
+    #[cfg(test)]
     pub async fn process_id(&self) -> Option<u32> {
         self.server
             .lock()

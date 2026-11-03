@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use forge_provider_api::completion::ProviderCompletion;
 use forge_provider_api::lifecycle::{ExecutionObservation, ExecutionUpdate, ObservationFailure};
-use forge_provider_api::{ProviderError, ProviderEvent, ProviderEventSink};
+use forge_provider_api::{
+    ProviderError, ProviderEvent, ProviderEventSink, ProviderFailureKind, ProviderOperation,
+};
 use github_copilot_sdk::SessionEvent;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -99,7 +101,7 @@ impl SessionIntake {
                         command = receive.recv() => match command {
                             Some(Command::Attach { generation, context, scope, reply }) => {
                                 if matches!(state, IntakeState::Active { .. }) {
-                                    let _ = reply.send(Err(ProviderError::Rejected { message: "Copilot session already has a foreground observer".into() }));
+                                    let _ = reply.send(Err(native_failure(forge_provider_api::ProviderOperation::AdmitInput, forge_provider_api::ProviderFailureKind::Rejected)));
                                     continue;
                                 }
                                 let (sender, receiver) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
@@ -124,7 +126,7 @@ impl SessionIntake {
                             None => return Ok(()),
                         },
                         event = stream.recv() => {
-                            let event = event.map_err(ProviderError::from)?;
+                            let event = event.map_err(|_| native_failure(ProviderOperation::CollectEventReader, ProviderFailureKind::Transport))?;
                             let mut original = None;
                             for retained in &retired {
                                 if retained.lock().await.decoder.owns_event(&event) {
@@ -166,13 +168,16 @@ impl SessionIntake {
                     }
                 }
             }.await;
-            let result = result.and(stream.close().await.map_err(ProviderError::from));
+            let result = result.and(stream.close().await.map_err(|_| {
+                native_failure(
+                    ProviderOperation::CollectEventReader,
+                    ProviderFailureKind::Transport,
+                )
+            }));
             if let Err(error) = result {
                 let reason = match error {
                     ProviderError::Observation(reason) => reason,
-                    error => ObservationFailure::Protocol {
-                        message: error.to_string(),
-                    },
+                    _ => ObservationFailure::Protocol,
                 };
                 native.fail(reason);
                 let reason = native
@@ -262,8 +267,11 @@ impl SessionIntake {
         if self.commands.send(Command::Close { reply }).await.is_ok() {
             let _ = response.await;
         }
-        pending.await.map_err(|error| ProviderError::Protocol {
-            message: format!("Copilot intake task failed: {error}"),
+        pending.await.map_err(|_error| {
+            super::error::native_failure(
+                forge_provider_api::ProviderOperation::NativeTransport,
+                forge_provider_api::ProviderFailureKind::Protocol,
+            )
         })?;
         task.take();
         Ok(())
@@ -383,6 +391,13 @@ async fn decode_retained(
     Ok(())
 }
 
+fn native_failure(
+    operation: forge_provider_api::ProviderOperation,
+    kind: forge_provider_api::ProviderFailureKind,
+) -> ProviderError {
+    ProviderError::Failure(forge_provider_api::ProviderFailure::new(operation, kind))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,7 +450,8 @@ mod tests {
     ) {
         let intake = SessionIntake::new(stream, generation);
         let scope = InvocationScope::new(ExecutionOwner::root("session"), "exchange");
-        let (sink, mut observed) = forge_provider_api::events::channel(scope.clone());
+        let binding = forge_provider_api::BindingId::new("intake-fixture").unwrap();
+        let (sink, mut observed) = forge_provider_api::events::channel(binding, scope.clone());
         let mut decoder = CopilotEventDecoder::new(scope, ".".into());
         let mut output = ProviderCompletion {
             provider_session_id: Some("native".to_owned().try_into().unwrap()),
@@ -523,18 +539,23 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 match observed.recv().await? {
-                    Some(ProviderEvent::Message {
+                    Some(event)
+                        if matches!(&event.event, ProviderEvent::Message {
                         update: MessageUpdate::Completed { text },
                         ..
-                    }) if text == "accepted before loss" => prefix_preserved = true,
-                    Some(ProviderEvent::Execution { observation })
+                    } if text == "accepted before loss") =>
+                    {
+                        prefix_preserved = true
+                    }
+                    Some(event)
+                        if matches!(&event.event, ProviderEvent::Execution { observation }
                         if matches!(
                             observation.update(),
                             ExecutionUpdate::ObservationLost {
                                 failure: ObservationFailure::Disconnected,
                                 ..
                             }
-                        ) =>
+                        )) =>
                     {
                         break;
                     }
@@ -664,8 +685,8 @@ mod tests {
             assert!(matches!(receiver.recv().await, Err(ProviderError::Observation(ObservationFailure::Disconnected))));
             assert!(intake.client_stopped());
             drop(active);
-            assert!(matches!(observed.recv().await.unwrap(), Some(ProviderEvent::Execution { observation })
-                if matches!(observation.update(), ExecutionUpdate::ObservationLost { failure: ObservationFailure::Disconnected, .. })));
+            assert!(matches!(observed.recv().await.unwrap(), Some(event) if matches!(&event.event, ProviderEvent::Execution { observation }
+                if matches!(observation.update(), ExecutionUpdate::ObservationLost { failure: ObservationFailure::Disconnected, .. }))));
             intake.close().await.unwrap();
             assert!(matches!(intake.attach(context).await, Err(ProviderError::Observation(ObservationFailure::Disconnected))));
         }).await.unwrap();
@@ -700,7 +721,8 @@ mod tests {
         while observed.try_next().unwrap().is_some() {}
         drop(intake.attach(old).await.unwrap());
         let scope = InvocationScope::new(ExecutionOwner::root("session"), "next");
-        let (sink, _next_events) = forge_provider_api::events::channel(scope.clone());
+        let binding = forge_provider_api::BindingId::new("next-intake-fixture").unwrap();
+        let (sink, _next_events) = forge_provider_api::events::channel(binding, scope.clone());
         let mut decoder = CopilotEventDecoder::new(scope, ".".into());
         let mut output = ProviderCompletion {
             provider_session_id: Some("native".to_owned().try_into().unwrap()),
@@ -740,7 +762,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            late.scope().invocation().unwrap().exchange_id.as_str(),
+            late.event
+                .scope()
+                .invocation()
+                .unwrap()
+                .exchange_id
+                .as_str(),
             "exchange"
         );
         assert!(futures_util::poll!(std::pin::pin!(receiver.recv())).is_pending());
@@ -763,10 +790,11 @@ mod tests {
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Some(ProviderEvent::Message {
-                    update: MessageUpdate::Completed { text },
-                    ..
-                }) = observed.recv().await.unwrap()
+                if let Some(event) = observed.recv().await.unwrap()
+                    && let ProviderEvent::Message {
+                        update: MessageUpdate::Completed { text },
+                        ..
+                    } = event.event
                     && text == "late answer"
                 {
                     break;
@@ -794,8 +822,8 @@ mod tests {
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Some(ProviderEvent::Execution { observation }) =
-                    observed.recv().await.unwrap()
+                if let Some(event) = observed.recv().await.unwrap()
+                    && let ProviderEvent::Execution { observation } = event.event
                     && matches!(
                         observation.update(),
                         ExecutionUpdate::ObservationLost {

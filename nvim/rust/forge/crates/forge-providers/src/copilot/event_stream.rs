@@ -18,9 +18,6 @@ pub(crate) enum IntakeQueueStage {
 /// Retain diagnostic ownership independently of foreground decoder locks.
 #[derive(Clone)]
 pub(crate) struct QueueDiagnostics {
-    trace: Option<Arc<dyn ProviderTrace>>,
-    correlation: String,
-    native_session: String,
     reported: Arc<AtomicBool>,
 }
 
@@ -28,53 +25,19 @@ impl QueueDiagnostics {
     /// Record one bounded first-loss witness without entering an ordinary observation queue.
     pub(crate) fn lost(
         &self,
-        stage: IntakeQueueStage,
-        queued: usize,
-        capacity: usize,
-        scope: Option<&forge_provider_api::InvocationScope>,
-        event: Option<&SessionEvent>,
+        _stage: IntakeQueueStage,
+        _queued: usize,
+        _capacity: usize,
+        _scope: Option<&forge_provider_api::InvocationScope>,
+        _event: Option<&SessionEvent>,
     ) {
-        let Some(trace) = &self.trace else {
-            return;
-        };
-        if self.reported.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let stage = match stage {
-            IntakeQueueStage::Subscription => "native_subscription",
-            IntakeQueueStage::Unbound => "native_unbound",
-            IntakeQueueStage::Attachment => "native_attachment",
-            IntakeQueueStage::Foreground => "native_foreground",
-            IntakeQueueStage::Release => "native_release",
-        };
-        trace.record(&self.correlation, "provider.observation_queue_lost", serde_json::json!({
-            "provider":"copilot", "stage":stage, "queued":queued, "capacity":capacity,
-            "queued_bytes":null, "event_bytes":event.and_then(|event| serde_json::to_vec(event).ok()).map(|encoded| encoded.len()),
-            "source_scope":scope.map(|scope| forge_provider_api::EventScope::from(scope.clone())),
-            "owner":scope.map(|scope| &scope.owner), "native_session_id":self.native_session,
-            "native_event_id":event.map(|event| event.id.as_str()),
-            "native_event_type":event.map(|event| event.event_type.as_str()),
-        }));
+        self.reported.store(true, Ordering::Release);
     }
 
     /// Retain the SDK's public skipped-event count without inventing its private ring capacity.
     fn subscription_lagged(&self, skipped: u64) {
-        let Some(trace) = &self.trace else {
-            return;
-        };
-        if self.reported.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        trace.record(
-            &self.correlation,
-            "provider.observation_queue_lost",
-            serde_json::json!({
-                "provider":"copilot", "stage":"sdk_subscription", "queued":null, "capacity":null,
-                "queued_bytes":null, "event_bytes":null, "skipped":skipped,
-                "source_scope":null, "native_session_id":self.native_session,
-                "native_event_id":null, "native_event_type":null,
-            }),
-        );
+        let _ = skipped;
+        self.reported.store(true, Ordering::Release);
     }
 }
 
@@ -129,8 +92,8 @@ impl SessionEventStream {
         mut subscription: github_copilot_sdk::subscription::EventSubscription,
         session_id: String,
         accepts: fn(&SessionEvent) -> bool,
-        trace: Arc<dyn ProviderTrace>,
-        harness_session_id: String,
+        _trace: Arc<dyn ProviderTrace>,
+        _harness_session_id: String,
         initial: StartupState,
         generation: super::client_generation::ClientGeneration,
     ) -> Self {
@@ -138,9 +101,6 @@ impl SessionEventStream {
         let (startup, mut startup_state) = tokio::sync::watch::channel(initial);
         let stream_session_id = session_id.clone();
         let diagnostics = QueueDiagnostics {
-            trace: Some(trace.clone()),
-            correlation: harness_session_id.clone(),
-            native_session: session_id.clone(),
             reported: Arc::new(AtomicBool::new(false)),
         };
         let queue_diagnostics = diagnostics.clone();
@@ -170,9 +130,7 @@ impl SessionEventStream {
                                 RecvErrorKind::Closed => {
                                     forge_provider_api::lifecycle::ObservationFailure::Disconnected
                                 }
-                                _ => forge_provider_api::lifecycle::ObservationFailure::Protocol {
-                                    message: error.to_string(),
-                                },
+                                _ => forge_provider_api::lifecycle::ObservationFailure::Protocol,
                             };
                             return Err(failure);
                         }
@@ -198,13 +156,7 @@ impl SessionEventStream {
             .await;
             result.map_err(|failure| {
                 generation.fail(failure.clone());
-                let error = forge_provider_api::ProviderError::Observation(failure);
-                trace.record(
-                    &harness_session_id,
-                    "copilot.subscription.failed",
-                    serde_json::json!({"session_id": session_id, "error": format!("{error:#}")}),
-                );
-                error.into()
+                forge_provider_api::ProviderError::Observation(failure).into()
             })
         });
         Self {
@@ -227,9 +179,6 @@ impl SessionEventStream {
             session_id: "fixture".into(),
             startup: None,
             diagnostics: QueueDiagnostics {
-                trace: None,
-                correlation: "fixture".into(),
-                native_session: "fixture".into(),
                 reported: Arc::new(AtomicBool::new(false)),
             },
         }

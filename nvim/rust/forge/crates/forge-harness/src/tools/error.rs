@@ -104,6 +104,12 @@ impl From<anyhow::Error> for ToolError {
     }
 }
 
+impl From<crate::checkpoint::CheckpointGateError> for ToolError {
+    fn from(error: crate::checkpoint::CheckpointGateError) -> Self {
+        Self::Operation(Box::new(error))
+    }
+}
+
 impl From<crate::broker::TurnCancelled> for ToolError {
     fn from(error: crate::broker::TurnCancelled) -> Self {
         Self::Operation(Box::new(error))

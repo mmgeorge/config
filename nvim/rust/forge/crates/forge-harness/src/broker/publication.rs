@@ -276,8 +276,8 @@ pub fn encode_session_update(update: &SessionUpdate) -> anyhow::Result<Value> {
         ),
         SessionUpdate::Diagnostic { diagnostic } => (
             "error",
-            Some(diagnostic.message.clone()),
-            json!({"code":diagnostic.code,"fatal":diagnostic.fatal}),
+            Some(diagnostic.message.to_string()),
+            json!({"kind":diagnostic.kind,"fatal":diagnostic.fatal}),
         ),
         SessionUpdate::CheckFailure { run_id, error } => (
             "checks_configuration_error",
@@ -401,8 +401,9 @@ mod tests {
         let (sink, mut stream) = channel();
         sink.send_wait(SessionUpdate::Diagnostic {
             diagnostic: ProviderDiagnostic {
-                code: None,
-                message: "first".into(),
+                kind: forge_provider_api::ProviderFailureKind::Unknown,
+                message: forge_provider_api::SanitizedMessage::new("first")
+                    .expect("fixture diagnostic is nonempty"),
                 fatal: false,
             },
         })

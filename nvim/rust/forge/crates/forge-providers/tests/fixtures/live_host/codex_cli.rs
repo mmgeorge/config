@@ -1,0 +1,666 @@
+use super::collect::ProviderTestExt as _;
+use forge_harness::broker::{HarnessBroker, InitializeRequest};
+use forge_harness::plan::PlanPrompt;
+use forge_harness::provider::{
+    AgentUpdate, InvocationScope, MessageAddress, MessageClassification, MessageRole,
+    MessageUpdate, PromptMode, ProviderCatalogRequest, ProviderEvent, ProviderForkRequest,
+    ProviderInput, ProviderLaunch, ProviderRequest, ToolActivityKind, ToolOutcome, ToolUpdate,
+    TurnUpdate,
+};
+use forge_harness::session::ApprovalMode;
+use forge_protocol::message::Request;
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
+
+fn git(workspace: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(workspace)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {} failed", args.join(" "));
+}
+
+fn request(workspace: &Path, mode: PromptMode, text: &str) -> ProviderRequest {
+    ProviderRequest {
+        execution_owner: None,
+        harness_session_id: "harness-session".into(),
+        workspace: workspace.to_string_lossy().into_owned(),
+        input: ProviderInput::from_text(text),
+        mode,
+        model: "gpt-5.6-terra".into(),
+        effort: "low".into(),
+        context_window: None,
+        service_tier: forge_harness::provider::ServiceTier::Fast,
+        access: Default::default(),
+        approval_mode: ApprovalMode::Ask,
+        provider_session_id: None,
+        submission: None,
+        recovered_input: Vec::new(),
+        control_context: None,
+    }
+}
+
+fn observe_assistant_text(
+    event: &ProviderEvent,
+    classification: &mut HashMap<MessageAddress, MessageClassification>,
+) -> bool {
+    let ProviderEvent::Message { address, update } = event else {
+        return false;
+    };
+    match update {
+        MessageUpdate::Started {
+            classification: value,
+            ..
+        } => {
+            classification.insert(address.clone(), *value);
+        }
+        MessageUpdate::Classified { role } => {
+            classification.insert(address.clone(), MessageClassification::Known(*role));
+        }
+        _ => {}
+    }
+    matches!(
+        classification.get(address),
+        Some(
+            MessageClassification::Unclassified
+                | MessageClassification::Known(MessageRole::Commentary | MessageRole::Response)
+        )
+    ) && update.text().is_some_and(|text| !text.trim().is_empty())
+}
+
+#[tokio::test]
+#[ignore = "requires an installed and authenticated Codex CLI"]
+async fn lists_provider_owned_codex_model_metadata() {
+    let repository = tempfile::tempdir().unwrap();
+    let provider = super::provider_session(
+        "codex",
+        vec!["codex".into(), "app-server".into()],
+        repository.path(),
+        repository.path(),
+    )
+    .unwrap();
+
+    let model_list = tokio::time::timeout(
+        Duration::from_secs(30),
+        provider
+            .as_provider()
+            .model_list(request(repository.path(), PromptMode::Chat, "")),
+    )
+    .await
+    .expect("Codex model list timed out")
+    .unwrap();
+
+    assert!(!model_list.is_empty());
+    assert!(model_list.iter().all(|model| !model.id.is_empty()));
+    assert!(
+        model_list
+            .iter()
+            .all(|model| model.selected_reasoning.is_none())
+    );
+    assert!(model_list.iter().any(|model| !model.reasoning.is_empty()));
+    assert!(model_list.iter().any(|model| model.description.is_some()));
+}
+
+#[tokio::test]
+#[ignore = "requires authenticated Codex and configured skills and MCP servers"]
+async fn lists_provider_skills_and_complete_mcp_rows() {
+    let repository = tempfile::tempdir().unwrap();
+    let provider = super::provider_session(
+        "codex",
+        vec!["codex".into(), "app-server".into()],
+        repository.path(),
+        repository.path(),
+    )
+    .unwrap();
+    let catalog_request = ProviderCatalogRequest {
+        execution_owner: None,
+        harness_session_id: "catalog-session".into(),
+        workspace: repository.path().to_string_lossy().into_owned(),
+        access: Default::default(),
+        approval_mode: ApprovalMode::Ask,
+        provider_session_id: None,
+    };
+
+    let skill_list = tokio::time::timeout(
+        Duration::from_secs(30),
+        provider.as_provider().skill_list(catalog_request.clone()),
+    )
+    .await
+    .expect("Codex skill list timed out")
+    .unwrap();
+    assert!(!skill_list.is_empty());
+    assert!(skill_list.iter().all(|skill| !skill.name.is_empty()));
+    assert!(skill_list.iter().all(|skill| skill.path.is_some()));
+
+    let mut new_session_catalog_request = catalog_request;
+    new_session_catalog_request.harness_session_id = "new-catalog-session".into();
+    let mcp_list = tokio::time::timeout(
+        Duration::from_secs(30),
+        provider.as_provider().mcp_list(new_session_catalog_request),
+    )
+    .await
+    .expect("Codex MCP list timed out")
+    .unwrap();
+    assert!(!mcp_list.is_empty());
+    assert!(mcp_list.iter().all(|server| !server.name.is_empty()));
+    assert!(
+        mcp_list.iter().any(
+            |server| server.transport != forge_provider_api::catalog::McpTransportKind::Unknown
+        )
+    );
+    assert!(mcp_list.iter().any(|server| !server.tools.is_empty()));
+    assert!(
+        mcp_list
+            .iter()
+            .all(|server| server.tools.iter().all(|tool| !tool.name.is_empty()))
+    );
+    let fork = provider
+        .as_provider()
+        .fork(ProviderForkRequest {
+            source: request(repository.path(), PromptMode::Chat, ""),
+            target_harness_session_id: "prepared-fork-session".into(),
+            checkpoint_id: None,
+        })
+        .await
+        .unwrap();
+    assert!(!fork.provider_session_id.as_str().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires authenticated Codex and performs real planning, editing, and fork requests"]
+async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    git(
+        repository.path(),
+        &["config", "user.email", "harness@example.invalid"],
+    );
+    git(
+        repository.path(),
+        &["config", "user.name", "Harness Integration"],
+    );
+    fs::write(
+        repository.path().join("README.md"),
+        "# Harness integration\n",
+    )
+    .unwrap();
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "-qm", "seed"]);
+
+    let provider = super::provider_session(
+        "codex",
+        vec!["codex".into(), "app-server".into()],
+        repository.path(),
+        repository.path(),
+    )
+    .unwrap();
+    provider
+        .as_provider()
+        .model_list(request(repository.path(), PromptMode::Chat, ""))
+        .await
+        .unwrap();
+    let answer_request = ProviderRequest {
+        execution_owner: None,
+        model: "default".into(),
+        ..request(
+            repository.path(),
+            PromptMode::Chat,
+            "What is this repo? Answer in one sentence after reading README.md.",
+        )
+    };
+    let (answer_event_sink, mut answer_event_stream) = forge_harness::provider::events::channel(
+        InvocationScope::new(answer_request.owner().unwrap(), "answer"),
+    );
+    let mut answer_future =
+        Box::pin(provider.session_prompt_and_wait(answer_request, answer_event_sink));
+    let mut answer_events = Vec::new();
+    let mut answer_classification = HashMap::new();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            tokio::select! {
+                output = &mut answer_future => {
+                    panic!("Codex completed before streaming assistant output: {output:#?}");
+                }
+                event = answer_event_stream.recv() => {
+                    let event = event.expect("event delivery failed").expect("Codex closed the event stream before completion");
+                    if observe_assistant_text(&event, &mut answer_classification) {
+                        answer_events.push(event);
+                        break;
+                    }
+                    answer_events.push(event);
+                }
+            }
+        }
+    })
+    .await
+    .expect("Codex did not stream assistant output within 30 seconds");
+    let answered = tokio::time::timeout(Duration::from_secs(90), async {
+        let mut stream_open = true;
+        loop {
+            tokio::select! {
+                output = &mut answer_future => break output.unwrap(),
+                event = answer_event_stream.recv(), if stream_open => {
+                    if let Some(event) = event.expect("event delivery failed") {
+                        answer_events.push(event);
+                    } else {
+                        stream_open = false;
+                    }
+                }
+            }
+        }
+    })
+    .await
+    .expect("Codex response did not complete within 90 seconds");
+    while let Some(event) = answer_event_stream
+        .try_next()
+        .expect("final event delivery failed")
+    {
+        answer_events.push(event);
+    }
+    answer_classification.clear();
+    assert!(
+        answer_events
+            .iter()
+            .any(|event| observe_assistant_text(event, &mut answer_classification))
+    );
+    assert_eq!(answered.runtime.provider, "Codex CLI");
+    assert!(
+        answered
+            .runtime
+            .model
+            .as_deref()
+            .is_some_and(|model| model != "default" && !model.is_empty())
+    );
+    assert!(
+        answer_events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::Usage { update, .. }
+            if update.usage.output.is_some_and(|output| output > 0))),
+        "Codex should report final turn token usage"
+    );
+    let model_list = provider
+        .as_provider()
+        .model_list(request(repository.path(), PromptMode::Chat, ""))
+        .await
+        .unwrap();
+    let model = model_list
+        .iter()
+        .find(|model| model.id == "gpt-5.6-terra")
+        .expect("gpt-5.6-terra is required for the fast Harness integration test");
+    assert!(model.reasoning.iter().any(|effort| effort == "low"));
+
+    let planning_prompt = PlanPrompt::with_active_document(
+        PlanPrompt::draft(
+            "Create a concise plan to add harness-integration.txt containing exactly `verified` followed by a newline. Do not modify files.",
+        ),
+        r#"{"version":1,"plan_id":"plan","title":"Add harness integration marker","overview":"Planning in progress.","usage":null,"entity_changes":[],"flows":[],"tasks":[],"tests":[],"assumptions":[]}"#,
+    );
+    let planning = provider.session_prompt_and_collect(request(
+        repository.path(),
+        PromptMode::Plan,
+        &planning_prompt,
+    ));
+    let steering = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        provider
+            .steer_current(
+                forge_harness::provider::ExecutionOwner::root("harness-session"),
+                "Include the literal marker `STEERING_CONSTRAINT_7B3D` in the plan Overview."
+                    .into(),
+            )
+            .await
+    };
+    let (planned, steered) = tokio::join!(planning, steering);
+    let planned = planned.unwrap();
+    steered.unwrap();
+    assert!(
+        !planned.completion.plan_edit.is_empty(),
+        "Codex planning did not edit the broker-owned structured plan"
+    );
+    let plan_edit_json = serde_json::to_string_pretty(&planned.completion.plan_edit).unwrap();
+    assert!(
+        plan_edit_json.contains("STEERING_CONSTRAINT_7B3D"),
+        "Codex planning ignored the active-turn steering constraint: {plan_edit_json}"
+    );
+    assert!(!repository.path().join("harness-integration.txt").exists());
+
+    let mut execute = request(
+        repository.path(),
+        PromptMode::ExecutePlan,
+        "Execute the accepted plan now. Create harness-integration.txt containing exactly `verified` followed by a newline, then call goal_complete.",
+    );
+    execute.approval_mode = ApprovalMode::Allow;
+    execute.provider_session_id = planned.completion.provider_session_id.clone();
+    let (event_sink, mut event_stream) = forge_harness::provider::events::channel(
+        InvocationScope::new(execute.owner().unwrap(), "execution"),
+    );
+    let (executed, streamed_event_list) = tokio::time::timeout(Duration::from_secs(90), async {
+        let execution = provider.session_prompt_and_wait(execute.clone(), event_sink);
+        tokio::pin!(execution);
+        let mut streamed_event_list = Vec::new();
+        let mut stream_open = true;
+        let executed = loop {
+            tokio::select! {
+                output = &mut execution => break output.unwrap(),
+                event = event_stream.recv(), if stream_open => {
+                    if let Some(event) = event.expect("execution event delivery failed") {
+                        streamed_event_list.push(event);
+                    } else {
+                        stream_open = false;
+                    }
+                }
+            }
+        };
+        while let Some(event) = event_stream
+            .try_next()
+            .expect("final execution event delivery failed")
+        {
+            streamed_event_list.push(event);
+        }
+        (executed, streamed_event_list)
+    })
+    .await
+    .expect("Codex execution prompt timed out after provider-side completion");
+    assert!(!streamed_event_list.is_empty());
+    let mut tool_kind = HashMap::new();
+    let mut tool_change = HashMap::new();
+    let mut tool_outcome = HashMap::new();
+    for event in &streamed_event_list {
+        if let ProviderEvent::Tool { address, update } = event {
+            match update {
+                ToolUpdate::Requested { invocation } => {
+                    tool_kind.insert(address.clone(), invocation.kind);
+                }
+                ToolUpdate::Changes { changes } => {
+                    tool_change.insert(address.clone(), changes);
+                }
+                ToolUpdate::Finished { outcome } => {
+                    tool_outcome.insert(address.clone(), outcome);
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        tool_kind.iter().any(|(address, kind)| {
+            *kind == ToolActivityKind::FileChange
+                && matches!(tool_outcome.get(address), Some(ToolOutcome::Succeeded))
+                && tool_change.get(address).is_some_and(|changes| {
+                    changes.file.iter().any(|change| {
+                        change.path.replace('\\', "/") == "harness-integration.txt"
+                            && !change.diff.trim().is_empty()
+                    })
+                })
+        }),
+        "Codex did not stream a completed structured file change: {streamed_event_list:#?}"
+    );
+    assert_eq!(
+        fs::read_to_string(repository.path().join("harness-integration.txt")).unwrap(),
+        "verified\n"
+    );
+    assert!(
+        executed.evidence.structured_complete
+            || executed.evidence.native_state == Some(forge_harness::goal::GoalState::Complete)
+    );
+
+    execute.provider_session_id = executed.native.provider_session_id;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        provider.as_provider().goal_status(
+            execute.clone(),
+            forge_harness::provider::native_goal_update(
+                "Complete the plan".into(),
+                forge_harness::goal::GoalState::Paused,
+            ),
+        ),
+    )
+    .await
+    .expect("Codex goal pause timed out")
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        provider.as_provider().goal_status(
+            execute.clone(),
+            forge_harness::provider::native_goal_update(
+                "Complete the plan".into(),
+                forge_harness::goal::GoalState::Active,
+            ),
+        ),
+    )
+    .await
+    .expect("Codex goal resume timed out")
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        provider.as_provider().goal_status(
+            execute.clone(),
+            forge_harness::provider::NativeGoalUpdate::Absent,
+        ),
+    )
+    .await
+    .expect("Codex goal clear timed out")
+    .unwrap();
+    let forked = tokio::time::timeout(
+        Duration::from_secs(30),
+        provider.as_provider().fork(ProviderForkRequest {
+            source: execute,
+            target_harness_session_id: "forked-harness-session".into(),
+            checkpoint_id: None,
+        }),
+    )
+    .await
+    .expect("Codex fork timed out")
+    .unwrap();
+    assert!(!forked.provider_session_id.as_str().trim().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires authenticated Codex with subagents and performs real model requests"]
+async fn streams_structured_child_agent_lifecycle() {
+    let repository = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    fs::write(repository.path().join("README.md"), "# Child lifecycle\n").unwrap();
+    let provider = super::provider_session(
+        "codex",
+        vec!["codex".into(), "app-server".into()],
+        repository.path(),
+        repository.path(),
+    )
+    .unwrap();
+    let mut provider_request = request(
+        repository.path(),
+        PromptMode::Chat,
+        "Spawn an explorer subagent to read README.md and report its heading. Wait for it to finish.",
+    );
+    provider_request.approval_mode = ApprovalMode::Ask;
+    let output = tokio::time::timeout(
+        Duration::from_secs(90),
+        provider.session_prompt_and_collect(provider_request),
+    )
+    .await
+    .expect("Codex subagent turn exceeded 90 seconds")
+    .unwrap();
+    assert!(
+        output.event.iter().any(|event| matches!(
+            event,
+            ProviderEvent::Agent {
+                update: AgentUpdate::Lifecycle { .. },
+                ..
+            }
+        )),
+        "Codex did not emit a structured child lifecycle event: {:#?}",
+        output.event
+    );
+    let lifecycle_list = output
+        .event
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Agent {
+                update: AgentUpdate::Lifecycle { event },
+                ..
+            } => Some(event),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let child_thread_list = lifecycle_list
+        .iter()
+        .filter_map(|lifecycle| {
+            lifecycle
+                .conversation_id
+                .as_ref()
+                .map(forge_provider_api::ProviderSessionId::as_str)
+        })
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        child_thread_list.len(),
+        1,
+        "one requested child must not manufacture extra provider identities: {lifecycle_list:#?}"
+    );
+    let child_thread_id = child_thread_list.into_iter().next().unwrap();
+    let child_completion_index = output
+        .event
+        .iter()
+        .position(|event| {
+            matches!(event, ProviderEvent::Turn {
+            address, update: TurnUpdate::Finished { .. },
+        } if address.thread_id == child_thread_id)
+        })
+        .expect("the explorer must emit a terminal turn event for its provider identity");
+    let parent_thread_id = output
+        .completion
+        .provider_session_id
+        .as_ref()
+        .map(|id| id.as_str())
+        .expect("the parent turn must preserve its provider thread identity");
+    let mut message_classification = HashMap::new();
+    for event in &output.event {
+        observe_assistant_text(event, &mut message_classification);
+    }
+    let parent_response_index = output
+        .event
+        .iter()
+        .enumerate()
+        .skip(child_completion_index + 1)
+        .find_map(|(index, event)| {
+            matches!(event, ProviderEvent::Message {
+                address, update: MessageUpdate::Completed { text },
+            } if address.turn.thread_id == parent_thread_id
+                && message_classification.get(address).is_some_and(|classification| matches!(
+                    classification, MessageClassification::Unclassified
+                        | MessageClassification::Known(MessageRole::Commentary | MessageRole::Response)
+                ))
+                && text.contains("Child lifecycle"))
+            .then_some(index)
+        })
+        .expect("the parent must synthesize the child result after the child completes");
+    let parent_completion_index = output
+        .event
+        .iter()
+        .enumerate()
+        .skip(parent_response_index + 1)
+        .find_map(|(index, event)| {
+            matches!(event, ProviderEvent::Turn {
+                address, update: TurnUpdate::Finished { .. },
+            } if address.thread_id == parent_thread_id)
+            .then_some(index)
+        })
+        .expect("the parent turn must complete after reporting the child result");
+    assert!(
+        child_completion_index < parent_response_index
+            && parent_response_index < parent_completion_index,
+        "the explorer must emit a terminal turn event for its provider identity: {:#?}",
+        output.event
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires authenticated Codex and the configured local-code-explorer profile"]
+async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
+    let repository = tempfile::tempdir().unwrap();
+    let data_root = tempfile::tempdir().unwrap();
+    git(repository.path(), &["init", "-q"]);
+    fs::write(
+        repository.path().join("README.md"),
+        "# Broker child lifecycle\n",
+    )
+    .unwrap();
+    let mut broker = HarnessBroker::initialize(InitializeRequest {
+        background: None,
+        provider_launch_by_provider: Default::default(),
+        config_dir: None,
+        data_root: data_root.path().to_string_lossy().into_owned(),
+        permission_file: None,
+        workspace: repository.path().to_string_lossy().into_owned(),
+        client_id: "real-local-code-explorer-test".into(),
+        provider: ProviderLaunch {
+            kind: forge_providers::registry::select("codex").expect("registered provider"),
+            command: vec!["codex".into(), "app-server".into()],
+        },
+        model: "gpt-5.6-terra".into(),
+        effort: "low".into(),
+        session_id: None,
+        new_session_name: None,
+        goal_max_turns: 20,
+        lease_conflict_action: None,
+    })
+    .unwrap();
+    let dispatch = tokio::time::timeout(
+        Duration::from_secs(90),
+        broker.dispatch(Request {
+            id: 1,
+            method: "session.agent.start".into(),
+            params: serde_json::json!({
+                "profile": "code-explorer",
+                "text": "Read README.md and report its heading to the parent."
+            }),
+        }),
+    )
+    .await
+    .expect("the broker child-agent flow exceeded 90 seconds");
+    assert!(
+        dispatch.response.error().is_none(),
+        "the real /agent flow failed: {:#?}",
+        dispatch.response.error()
+    );
+    let snapshot = broker.snapshot().unwrap();
+    assert_eq!(
+        snapshot.agent.run.len(),
+        1,
+        "one request must create one durable child run"
+    );
+    let run = &snapshot.agent.run[0];
+    assert_eq!(run.definition, "local-code-explorer");
+    assert_eq!(run.state, forge_harness::agent::AgentState::Ready);
+    assert!(run.provider_thread_id.is_some());
+    assert_eq!(
+        snapshot.agent.exchange.len(),
+        1,
+        "the child timeline must persist under its run"
+    );
+    let parent = snapshot
+        .exchange
+        .iter()
+        .find(|exchange| {
+            exchange.node_list.iter().any(|node| {
+                matches!(
+                    node,
+                    forge_harness::exchange::ExchangeNode::AgentReference { agent }
+                        if agent.child_agent_id == run.id
+                )
+            })
+        })
+        .expect("the child run must reference its spawning parent interaction");
+    assert!(
+        parent
+            .turn
+            .iter()
+            .flat_map(|turn| turn.messages())
+            .any(|message| {
+                message.text().contains("Broker child lifecycle")
+                    || message.text().contains("# Broker child lifecycle")
+            })
+    );
+}

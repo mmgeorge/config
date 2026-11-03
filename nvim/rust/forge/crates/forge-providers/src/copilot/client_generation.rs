@@ -123,9 +123,10 @@ impl ClientGeneration {
     pub(crate) fn ensure_healthy(&self) -> Result<(), ProviderError> {
         match self.failure() {
             Some(reason) => Err(ProviderError::Observation(reason)),
-            None if self.0.stopped.load(Ordering::Acquire) => Err(ProviderError::Rejected {
-                message: "Copilot client generation has been collected".into(),
-            }),
+            None if self.0.stopped.load(Ordering::Acquire) => Err(native_failure(
+                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderFailureKind::SessionMissing,
+            )),
             None => Ok(()),
         }
     }
@@ -172,18 +173,20 @@ impl ClientGeneration {
         failed: &FailedGeneration,
     ) -> Result<CollectedClient, ProviderError> {
         if !failed.matches(self) {
-            return Err(ProviderError::Rejected {
-                message: "Copilot recovery token belongs to another client generation".into(),
-            });
+            return Err(native_failure(
+                forge_provider_api::error::ProviderOperation::RecoverSession,
+                forge_provider_api::error::ProviderFailureKind::Rejected,
+            ));
         }
         let mut collection = self.0.collection.lock().await;
         if matches!(*collection, Collection::Idle) {
             let client = self.0.client.clone();
             *collection = Collection::Running(tokio::spawn(async move {
-                client.stop().await.map_err(|error| {
-                    Arc::new(ProviderError::Transport {
-                        message: format!("collect failed Copilot client: {error}"),
-                    })
+                client.stop().await.map_err(|_| {
+                    Arc::new(native_failure(
+                        forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                        forge_provider_api::error::ProviderFailureKind::Transport,
+                    ))
                 })
             }));
         }
@@ -198,10 +201,11 @@ impl ClientGeneration {
                         Some(CleanupFailure::TimedOut),
                     )))
                 })?;
-            *collection = Collection::Complete(result.unwrap_or_else(|error| {
-                Err(Arc::new(ProviderError::Protocol {
-                    message: format!("Copilot client collection task failed: {error}"),
-                }))
+            *collection = Collection::Complete(result.unwrap_or_else(|_| {
+                Err(Arc::new(native_failure(
+                    forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::error::ProviderFailureKind::Runtime,
+                )))
             }));
         }
         match &*collection {
@@ -212,8 +216,8 @@ impl ClientGeneration {
                 })
             }
             Collection::Complete(Err(error)) => Err(ProviderError::PreparationCleanup {
-                cause: Arc::new(ProviderError::Observation(failed.failure())),
-                cleanup: error.clone(),
+                cause: Box::new(ProviderError::Observation(failed.failure())),
+                cleanup: Box::new(error.as_ref().clone()),
             }),
             Collection::Idle | Collection::Running(_) => {
                 unreachable!("collection is complete after joining its retained worker")
@@ -225,6 +229,15 @@ impl ClientGeneration {
     pub(crate) fn same(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+}
+
+fn native_failure(
+    operation: forge_provider_api::error::ProviderOperation,
+    kind: forge_provider_api::error::ProviderFailureKind,
+) -> ProviderError {
+    ProviderError::Failure(forge_provider_api::error::ProviderFailure::new(
+        operation, kind,
+    ))
 }
 
 #[cfg(test)]
@@ -244,10 +257,11 @@ mod tests {
         let failed = generation.failed().unwrap();
         let (release, released) = tokio::sync::oneshot::channel();
         *generation.0.collection.lock().await = Collection::Running(tokio::spawn(async move {
-            released.await.map_err(|error| {
-                Arc::new(ProviderError::Protocol {
-                    message: error.to_string(),
-                })
+            released.await.map_err(|_| {
+                Arc::new(native_failure(
+                    forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::error::ProviderFailureKind::Runtime,
+                ))
             })
         }));
         assert!(

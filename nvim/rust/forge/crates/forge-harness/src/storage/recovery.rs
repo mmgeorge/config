@@ -30,8 +30,14 @@ impl SqliteStore {
                 && compaction.state == crate::provider::CompactionState::Running
             {
                 compaction.state = crate::provider::CompactionState::Unconfirmed;
-                compaction.result.error =
-                    Some("Runtime stopped before compaction completion was confirmed".into());
+                compaction.result.diagnostic = Some(forge_provider_api::ProviderDiagnostic {
+                    kind: forge_provider_api::ProviderFailureKind::Transport,
+                    message: forge_provider_api::SanitizedMessage::new(
+                        "Runtime stopped before compaction completion was confirmed",
+                    )
+                    .expect("static diagnostic is nonempty"),
+                    fatal: false,
+                });
                 transaction.execute(
                     "UPDATE session_event_record SET payload=?2 WHERE id=?1",
                     params![event.id, serde_json::to_string(&event)?],

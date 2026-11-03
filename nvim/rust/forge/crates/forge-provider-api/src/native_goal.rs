@@ -1,3 +1,10 @@
+/// Select the native goal action for one admitted invocation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NativeGoalCommand {
+    Set { objective: String },
+    Resume { objective: String },
+}
+
 /// Select the complete provider-owned goal state without confusing suspension with absence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeGoalUpdate {

@@ -366,17 +366,18 @@ end
 --- Verify real configuration child editors restore their origin and reject stale responses.
 local function child_picker_return_preserves_configuration_location()
   local client = require("forge.client")
+dofile("nvim/tests/forge/support/provider_catalog.lua").install()
   local controller = require("forge.views.harness.controller")
   local settings = require("forge.views.harness.settings")
   local background = require("forge.integrations.background_settings")
   local original_request, original_configure, original_background = client.request, controller.configure, background.request
   local state = { session = {
-    id = "navigation-session", provider = "codex", model = "first", effort = "low", workspace = vim.fn.getcwd(),
+    id = "navigation-session", provider = "fixture_alpha", model = "first", effort = "low", workspace = vim.fn.getcwd(),
   }, capability = { model_selection = true, effort_selection = true, native_compact = true, os_sandbox = true } }
   local host = { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() }
   local pending_response, pending_background
   local preferences = { auto_compaction = { enabled = true, threshold_tokens = 128000 },
-    models = { codex = { model = "first", thinking = "low" } } }
+    models = { fixture_alpha = { model = "first", thinking = "low" } } }
   client.request = function(request, callback)
     if request.method == "host.trace.status" then callback({ enabled = false, path = vim.fn.tempname() })
     elseif request.method == "session.provider.model.list" then callback({
@@ -447,7 +448,7 @@ local function child_picker_return_preserves_configuration_location()
     select_field("main-model")
     press("<CR>")
     press("<CR>")
-    state.session = { id = "new-session", provider = "codex", model = "first" }
+    state.session = { id = "new-session", provider = "fixture_alpha", model = "first" }
     picker.open({ owner = "new-owner", page_list = { { id = "new", option_list = {} } } })
     pending_response()
     assert(picker.is_open("new-owner"), "old session callback replaced the new picker")

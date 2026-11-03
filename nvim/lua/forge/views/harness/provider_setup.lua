@@ -9,21 +9,39 @@ local M = {}
 ---@field id string
 ---@field label string
 ---@field description? string
----@field terminal boolean
----@field command? string[]
----@field environment? table<string, string>
+---@field interaction {kind: 'provider_managed'|'terminal', launch?: ForgeAuthenticationLaunch}
+
+---@class ForgeAuthenticationLaunch
+---@field program string
+---@field arguments string[]
+---@field environment table<string, string>
+---@field working_directory? string
 
 ---@class ForgeProviderRuntime
----@field available boolean
----@field managed boolean
----@field adapter_version? string
----@field provider_version? string
----@field version_error? string
----@field auth_methods ForgeProviderAuthentication[]
+---@field kind 'available'|'missing'|'incompatible'|'unavailable'
+
+---@class ForgeVersionObservation
+---@field kind 'known'|'not_reported'|'failed'
+---@field version? string
+---@field failure? string
+
+---@class ForgeProviderSetup
+---@field runtime ForgeProviderRuntime
+---@field origin 'configured'|'managed'
+---@field versions {provider: ForgeVersionObservation, adapter: ForgeVersionObservation}
+---@field authentication ForgeProviderAuthentication[]
 
 ---@param method ForgeProviderAuthentication
 ---@param callback fun(success: boolean)
 local function terminal_login(method, callback)
+  local launch = method.interaction.launch
+  if not launch or type(launch.program) ~= "string" then
+    notifications.error("Sign-in command is unavailable", "Provider sign-in")
+    callback(false)
+    return
+  end
+  local command = { launch.program }
+  vim.list_extend(command, launch.arguments or {})
   local buffer = vim.api.nvim_create_buf(false, true)
   local window = vim.api.nvim_open_win(buffer, true, {
     relative = "editor", border = "rounded", title = " Provider sign-in ",
@@ -48,7 +66,8 @@ local function terminal_login(method, callback)
   vim.api.nvim_create_autocmd("BufWipeout", { buffer = buffer, once = true,
     callback = function() finish(false) end })
   local launched, result = pcall(vim.api.nvim_buf_call, buffer, function()
-    return vim.fn.jobstart(method.command, { term = true, env = method.environment,
+    return vim.fn.jobstart(command, { term = true, env = launch.environment,
+      cwd = launch.working_directory,
       on_exit = function(_, code)
         vim.schedule(function()
           finish(code == 0, code ~= 0 and ("Sign-in exited with status " .. code .. ". See the terminal output.") or nil)
@@ -75,7 +94,7 @@ function M.open(options)
     return
   end
   local owner = "harness-provider-setup"
-  local runtime
+  local setup
   local failure
   local busy = false
   local phase = "Loading provider setup..."
@@ -87,19 +106,31 @@ function M.open(options)
   local function spec()
     local rows = {}
     if not busy then
-      if runtime and runtime.available then
-        for _, method in ipairs(runtime.auth_methods or {}) do
+      if setup then
+        for _, method in ipairs(setup.authentication or {}) do
           rows[#rows + 1] = { id = method.id, label = method.label, detail = method.description, value = method }
         end
       end
       rows[#rows + 1] = { id = "refresh", label = "Refresh setup", detail = "Check runtime and sign-in methods" }
     end
     local status = phase
-    if not busy and runtime then
-      local details = { runtime.available and "Provider runtime ready" or "Provider runtime is not installed" }
-      if runtime.provider_version then details[#details + 1] = "Provider version " .. runtime.provider_version end
-      if runtime.adapter_version then details[#details + 1] = "Adapter " .. runtime.adapter_version end
-      if runtime.version_error then details[#details + 1] = runtime.version_error end
+    if not busy and setup then
+      local labels = {
+        available = "Provider runtime ready",
+        missing = "Provider runtime is not installed",
+        incompatible = "Provider runtime requires an update",
+        unavailable = "Provider runtime is unavailable",
+      }
+      local details = { labels[setup.runtime.kind] or labels.unavailable }
+      local versions = setup.versions or {}
+      for _, component in ipairs({ { key = "provider", label = "Provider version" }, { key = "adapter", label = "Adapter" } }) do
+        local observation = versions[component.key]
+        if observation and observation.kind == "known" then
+          details[#details + 1] = component.label .. " " .. observation.version
+        elseif observation and observation.kind == "failed" then
+          details[#details + 1] = component.label .. " check failed (" .. observation.failure .. ")"
+        end
+      end
       status = table.concat(details, " · ")
     end
     return { owner = owner, host = options.host,
@@ -125,7 +156,7 @@ function M.open(options)
             refresh()
           elseif picker.is_open(owner) then picker.update(spec()) end
         end
-        if method.terminal then
+        if method.interaction.kind == "terminal" then
           picker.close()
           terminal_login(method, finished)
         else
@@ -153,7 +184,7 @@ function M.open(options)
       busy, failure = false, error
       session.harness.configuring = false
       require("forge.views.harness.controller").render()
-      if error then notifications.error(error, "Provider setup") else runtime = result end
+      if error then notifications.error(error, "Provider setup") else setup = result end
       if picker.is_open(owner) then picker.update(spec()) end
     end)
   end

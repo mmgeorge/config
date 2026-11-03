@@ -72,21 +72,21 @@ pub struct PermissionCoordinator {
     feedback_watch:
         Mutex<HashMap<crate::provider::ExecutionOwner, tokio::sync::watch::Sender<bool>>>,
     skill_by_owner: Mutex<HashMap<crate::provider::ExecutionOwner, Arc<crate::skill::SkillAccess>>>,
-    directory_by_owner: Mutex<HashMap<crate::provider::ExecutionOwner, Arc<DirectoryPolicy>>>,
+    directory_by_scope: Mutex<HashMap<crate::provider::InvocationScope, Arc<DirectoryPolicy>>>,
 }
 
 impl PermissionCoordinator {
     /// Report the captured write-off boundary for an active execution owner.
     pub(crate) fn writes_disabled(
         &self,
-        owner: Option<&crate::provider::ExecutionOwner>,
+        scope: Option<&crate::provider::InvocationScope>,
     ) -> Result<bool> {
         let policy = self
-            .directory_by_owner
+            .directory_by_scope
             .lock()
             .map_err(|_| anyhow::anyhow!("directory permission lock poisoned"))?;
-        Ok(owner
-            .and_then(|owner| policy.get(owner))
+        Ok(scope
+            .and_then(|scope| policy.get(scope))
             .is_some_and(|policy| policy.access.write_access == crate::session::WriteScope::Off))
     }
     pub fn new(store: Arc<RwLock<PermissionStore>>) -> Self {
@@ -97,7 +97,7 @@ impl PermissionCoordinator {
             feedback_by_owner: Mutex::new(HashMap::new()),
             feedback_watch: Mutex::new(HashMap::new()),
             skill_by_owner: Mutex::new(HashMap::new()),
-            directory_by_owner: Mutex::new(HashMap::new()),
+            directory_by_scope: Mutex::new(HashMap::new()),
         }
     }
 
@@ -105,8 +105,12 @@ impl PermissionCoordinator {
         self: &Arc<Self>,
         root: Option<&Path>,
         request: &crate::provider::ProviderRequest,
+        scope: &crate::provider::InvocationScope,
     ) -> Result<DirectoryExecution> {
-        let owner = request.owner()?;
+        anyhow::ensure!(
+            request.owner()? == scope.owner,
+            "directory policy belongs to a different invocation owner"
+        );
         let policy = Arc::new(DirectoryPolicy {
             access: request.access.clone(),
             workspace: request.workspace.clone().into(),
@@ -114,16 +118,16 @@ impl PermissionCoordinator {
             settings_root: root.map(Path::to_owned),
         });
         let mut directory = self
-            .directory_by_owner
+            .directory_by_scope
             .lock()
             .map_err(|_| anyhow::anyhow!("directory permission lock poisoned"))?;
         anyhow::ensure!(
-            !directory.contains_key(&owner),
+            !directory.contains_key(scope),
             "directory access already belongs to an active execution"
         );
-        directory.insert(owner.clone(), policy.clone());
+        directory.insert(scope.clone(), policy.clone());
         Ok(DirectoryExecution {
-            owner,
+            scope: scope.clone(),
             policy,
             coordinator: self.clone(),
         })
@@ -134,15 +138,15 @@ impl PermissionCoordinator {
         self: &Arc<Self>,
         root: Option<&Path>,
         request: &crate::provider::ProviderRequest,
-        provider: crate::provider::ProviderKind,
+        provider: crate::provider::ProviderId,
     ) -> Result<crate::skill::SkillExecution> {
-        let declaration = super::registered_capability(provider);
+        let declaration = forge_providers::registry::resolve(&provider)?.capability;
         let target = declaration
             .integration
             .resource_target
             .as_deref()
             .context("provider has no managed resource target")?;
-        let provider = crate::agent::provider_name(provider);
+        let provider = provider.as_str();
         let selected = if request.mode == crate::provider::PromptMode::Background {
             Vec::new()
         } else if let Some(root) = root {
@@ -320,14 +324,22 @@ impl PermissionCoordinator {
         event_sink: Option<&ProviderEventSink>,
         authority: Option<Arc<ApprovalAuthority>>,
     ) -> Result<ApprovalResolution> {
+        if request.target_list.is_empty()
+            || request
+                .target_list
+                .iter()
+                .any(|target| matches!(target, PermissionTarget::Unknown))
+        {
+            return Ok(ApprovalResolution::DenyPolicy);
+        }
         let directory_policy = address
             .as_ref()
-            .map(|address| &address.scope.owner)
-            .or_else(|| event_sink.map(|sink| sink.scope().owner()))
-            .map(|owner| {
-                self.directory_by_owner
+            .map(|address| &address.scope)
+            .or_else(|| event_sink.and_then(|sink| sink.scope().invocation()))
+            .map(|scope| {
+                self.directory_by_scope
                     .lock()
-                    .map(|directory| directory.get(owner).cloned())
+                    .map(|directory| directory.get(scope).cloned())
                     .map_err(|_| anyhow::anyhow!("directory permission lock poisoned"))
             })
             .transpose()?
@@ -358,8 +370,11 @@ impl PermissionCoordinator {
                     sink.send_wait(ProviderEvent::Diagnostic {
                         scope: sink.scope().clone(),
                         diagnostic: crate::provider::ProviderDiagnostic {
-                            code: Some("permission_evaluation_failed".into()),
-                            message: format!("Permission evaluation failed: {error:#}"),
+                            kind: forge_provider_api::ProviderFailureKind::Authorization,
+                            message: forge_provider_api::SanitizedMessage::new(
+                                "Permission evaluation failed",
+                            )
+                            .expect("static diagnostic is nonempty"),
                             fatal: false,
                         },
                     })
@@ -550,7 +565,7 @@ impl PermissionCoordinator {
             execution_owner: Some(scope.owner.clone()),
             exchange_id: Some(scope.exchange_id.to_string()),
             turn_id: None,
-            provider: "Harness".into(),
+            provider: None,
             reason: None,
             deadline: None,
             resolution_source: ResolutionSource::User,
@@ -708,6 +723,7 @@ impl PermissionCoordinator {
         exchange_id: &str,
         turn_id: Option<&str>,
     ) -> Result<Option<ApprovalRequestView>> {
+        let turn_id = turn_id.map(forge_provider_api::ProviderTurnId::from);
         let mut pending = self
             .pending_map
             .lock()
@@ -728,11 +744,11 @@ impl PermissionCoordinator {
             approval
                 .view
                 .turn_id
-                .as_deref()
-                .is_none_or(|owner| Some(owner) == turn_id),
+                .as_ref()
+                .is_none_or(|owner| Some(owner) == turn_id.as_ref()),
             "approval cannot change its owning turn"
         );
-        approval.view.turn_id = turn_id.map(str::to_owned);
+        approval.view.turn_id = turn_id;
         Ok(Some(approval.view.clone()))
     }
 
@@ -1039,19 +1055,19 @@ impl PermissionCoordinator {
 
 /// Revokes only the matching execution's reported file authorization when its provider settles.
 pub(crate) struct DirectoryExecution {
-    owner: crate::provider::ExecutionOwner,
+    scope: crate::provider::InvocationScope,
     policy: Arc<DirectoryPolicy>,
     coordinator: Arc<PermissionCoordinator>,
 }
 
 impl Drop for DirectoryExecution {
     fn drop(&mut self) {
-        if let Ok(mut directory) = self.coordinator.directory_by_owner.lock()
+        if let Ok(mut directory) = self.coordinator.directory_by_scope.lock()
             && directory
-                .get(&self.owner)
+                .get(&self.scope)
                 .is_some_and(|policy| Arc::ptr_eq(policy, &self.policy))
         {
-            directory.remove(&self.owner);
+            directory.remove(&self.scope);
         }
     }
 }
@@ -1059,7 +1075,7 @@ impl Drop for DirectoryExecution {
 fn target_rule_list(target: &PermissionTarget, broad: bool) -> Vec<(String, String)> {
     let mut rule_list = Vec::new();
     match target {
-        PermissionTarget::UnknownFile { .. } => {}
+        PermissionTarget::Unknown | PermissionTarget::UnknownFile { .. } => {}
         PermissionTarget::Command { command, shell } => {
             let normalization = normalize_command_in(command, shell.unwrap_or_default());
             if normalization.failure.is_some() {
@@ -1107,6 +1123,10 @@ fn target_rule_list(target: &PermissionTarget, broad: bool) -> Vec<(String, Stri
             CATEGORY_TOOL.into(),
             if broad { "*".into() } else { target.clone() },
         )),
+        PermissionTarget::HostTool { name } => rule_list.push((
+            CATEGORY_TOOL.into(),
+            if broad { "*".into() } else { name.clone() },
+        )),
     }
     rule_list.sort();
     rule_list.dedup();
@@ -1139,7 +1159,7 @@ fn approval_view(
         execution_owner: None,
         exchange_id: None,
         turn_id: None,
-        provider: request.provider.clone(),
+        provider: Some(request.provider.clone()),
         reason: request.reason.clone(),
         item_list: evaluation
             .pending_target_list
@@ -1156,6 +1176,7 @@ fn approval_view(
 
 fn approval_item(target: &PermissionTarget, index: usize) -> ApprovalItem {
     let (title, detail) = match target {
+        PermissionTarget::Unknown => ("Unknown operation".into(), "The operation could not be normalized".into()),
         PermissionTarget::UnknownFile { operation } => (
             format!("{operation:?} path not supplied"),
             "The provider did not report a file path. Directory limits and protected paths cannot be verified. Allow only this request or reject it.".into(),
@@ -1170,6 +1191,7 @@ fn approval_item(target: &PermissionTarget, index: usize) -> ApprovalItem {
         PermissionTarget::Mcp { target } => ("Call MCP tool".into(), target.clone()),
         PermissionTarget::Elevate { target } => ("Elevate process".into(), target.clone()),
         PermissionTarget::Tool { target } => ("Call provider tool".into(), target.clone()),
+        PermissionTarget::HostTool { name } => ("Call host tool".into(), name.clone()),
     };
     let exact_rule_list = target_rule_list(target, false);
     let broad_rule_list = target_rule_list(target, true);
@@ -1297,10 +1319,8 @@ pub use forge_provider_api::approval::{
 
 #[cfg(test)]
 mod test {
-    use crate::permissions::matcher::CommandAnalysisError;
-    use crate::provider::codex::approval::{codex_response, permission_from_provider};
-    use crate::provider::copilot::approval::permission_from_copilot;
     use crate::provider::{ApprovalUpdate, ExecutionOwner, InvocationScope, TurnAddress};
+    use forge_provider_api::permissions::{PermissionRequest, PermissionTarget};
     use forge_shell::shell::CommandShell;
 
     fn scope() -> InvocationScope {
@@ -1308,6 +1328,15 @@ mod test {
             owner: ExecutionOwner::root("approval"),
             exchange_id: "exchange".into(),
             invocation_id: "invocation".into(),
+        }
+    }
+
+    fn normalized_permission(id: &str, target_list: Vec<PermissionTarget>) -> PermissionRequest {
+        PermissionRequest {
+            id: id.into(),
+            provider: forge_provider_api::ProviderId::new("mock").unwrap(),
+            reason: None,
+            target_list,
         }
     }
 
@@ -1347,7 +1376,7 @@ mod test {
                             mode,
                             PermissionRequest {
                                 id: "decision".into(),
-                                provider: "test".into(),
+                                provider: forge_provider_api::ProviderId::new("mock").unwrap(),
                                 reason: None,
                                 target_list: vec![PermissionTarget::Tool {
                                     target: "sample".into(),
@@ -1394,8 +1423,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn directory_approval_persists_global_grants_before_releasing_copilot_requests()
-    -> Result<()> {
+    async fn directory_approval_persists_global_grants_before_releasing_requests() -> Result<()> {
         use super::*;
         let root = tempfile::tempdir()?;
         let workspace = root.path().join("workspace");
@@ -1447,31 +1475,54 @@ mod test {
             thread_id: "native".into(),
             turn_id: "turn".into(),
         });
-        let directories = coordinator.directories(Some(&settings_root), &request)?;
+        let directories = coordinator.directories(
+            Some(&settings_root),
+            &request,
+            &address.as_ref().unwrap().scope,
+        )?;
+        let later_scope = crate::provider::InvocationScope::new(request.owner()?, "later-policy");
+        let mut later_request = request.clone();
+        later_request.access.write_access = crate::session::WriteScope::Off;
+        let later_directories =
+            coordinator.directories(Some(&settings_root), &later_request, &later_scope)?;
+        assert!(coordinator.writes_disabled(Some(&later_scope))?);
+        assert!(!coordinator.writes_disabled(Some(&address.as_ref().unwrap().scope))?);
+        drop(later_directories);
+
         assert!(
             coordinator
-                .directories(Some(&settings_root), &request)
+                .directories(
+                    Some(&settings_root),
+                    &request,
+                    &address.as_ref().unwrap().scope
+                )
                 .is_err(),
             "live ownership was replaced"
         );
-        let mut permission = permission_from_copilot(
-            "directory".into(),
-            "read",
-            json!({"path":external.join("read.txt")}),
-            &request.workspace,
+        let mut permission = normalized_permission(
+            "directory",
+            vec![PermissionTarget::Read {
+                path: external.join("read.txt").to_string_lossy().into_owned(),
+            }],
         );
-        let write = permission_from_copilot(
-            "write".into(),
+        let write = normalized_permission(
             "write",
-            json!({"path":external.join("nested/new/deep/write.txt")}),
-            &request.workspace,
+            vec![PermissionTarget::Write {
+                path: external
+                    .join("nested/new/deep/write.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+            }],
         );
         permission.target_list.extend(write.target_list);
-        let write = permission_from_copilot(
-            "workspace-write".into(),
-            "write",
-            json!({"path":workspace.join("new/deep/write.txt")}),
-            &request.workspace,
+        let write = normalized_permission(
+            "workspace-write",
+            vec![PermissionTarget::Write {
+                path: workspace
+                    .join("new/deep/write.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+            }],
         );
         permission.target_list.extend(write.target_list);
         let original = permission.clone();
@@ -1597,11 +1648,14 @@ mod test {
             coordinator
                 .authorize(
                     ApprovalMode::Ask,
-                    permission_from_copilot(
-                        "saved-write".into(),
-                        "write",
-                        json!({"path":workspace.join("another/file.txt")}),
-                        &request.workspace
+                    normalized_permission(
+                        "saved-write",
+                        vec![PermissionTarget::Write {
+                            path: workspace
+                                .join("another/file.txt")
+                                .to_string_lossy()
+                                .into_owned()
+                        }]
                     ),
                     address.clone(),
                     None,
@@ -1622,11 +1676,11 @@ mod test {
             coordinator
                 .authorize(
                     ApprovalMode::Ask,
-                    permission_from_copilot(
-                        "protected".into(),
-                        "write",
-                        json!({"path":protected}),
-                        &request.workspace,
+                    normalized_permission(
+                        "protected",
+                        vec![PermissionTarget::Write {
+                            path: protected.clone()
+                        }]
                     ),
                     address.clone(),
                     None,
@@ -1635,16 +1689,24 @@ mod test {
             ApprovalResolution::DenyPolicy
         );
         drop(directories);
-        assert!(coordinator.directory_by_owner.lock().unwrap().is_empty());
-        let _directories = coordinator.directories(Some(&settings_root), &request)?;
+        assert!(coordinator.directory_by_scope.lock().unwrap().is_empty());
+        let _directories = coordinator.directories(
+            Some(&settings_root),
+            &request,
+            &address.as_ref().unwrap().scope,
+        )?;
         assert_eq!(
             coordinator
                 .authorize(ApprovalMode::Ask, original, address.clone(), None)
                 .await?,
             ApprovalResolution::AllowOnce
         );
-        let missing =
-            permission_from_copilot("missing".into(), "read", json!({}), &request.workspace);
+        let missing = normalized_permission(
+            "missing",
+            vec![PermissionTarget::UnknownFile {
+                operation: forge_provider_api::access::DirectoryOperation::Read,
+            }],
+        );
         assert!(matches!(
             missing.target_list[0],
             PermissionTarget::UnknownFile { .. }
@@ -1672,11 +1734,11 @@ mod test {
                 .to_string(),
             PermissionDecision::Deny,
         )])?;
-        let denied = permission_from_copilot(
-            "denied".into(),
-            "read",
-            json!({"path":path}),
-            &request.workspace,
+        let denied = normalized_permission(
+            "denied",
+            vec![PermissionTarget::Read {
+                path: path.to_string_lossy().into_owned(),
+            }],
         );
         assert_eq!(
             coordinator
@@ -1686,7 +1748,7 @@ mod test {
         );
         let invalid = PermissionRequest {
             id: "invalid".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("mock").unwrap(),
             reason: None,
             target_list: vec![PermissionTarget::Read {
                 path: String::new(),
@@ -1710,7 +1772,7 @@ mod test {
         let event = stream.recv().await.unwrap().unwrap();
         assert!(matches!(
             event,
-            ProviderEvent::Diagnostic { diagnostic, .. } if diagnostic.message.contains("empty")
+            ProviderEvent::Diagnostic { diagnostic, .. } if diagnostic.kind == forge_provider_api::ProviderFailureKind::Authorization && diagnostic.message.as_str() == "Permission evaluation failed"
         ));
         Ok(())
     }
@@ -1765,14 +1827,14 @@ mod test {
         let skills = coordinator.skills(
             Some(directory.path()),
             &request,
-            crate::provider::ProviderKind::Codex,
+            forge_providers::registry::default_id(),
         )?;
         let original = store.read().unwrap().open().1;
         let source = bundle.join("SKILL.md").display().to_string();
         let script = bundle.join("scripts/check.py").display().to_string();
         let operation = |target| PermissionRequest {
             id: "request".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("mock").unwrap(),
             reason: None,
             target_list: vec![target],
         };
@@ -1908,7 +1970,11 @@ mod test {
             .is_err()
         );
         let mut settings = crate::settings::SettingsStore::open(directory.path())?;
-        let catalog = settings.catalog(&request.workspace, &request.harness_session_id, "codex")?;
+        let catalog = settings.catalog(
+            &request.workspace,
+            &request.harness_session_id,
+            forge_providers::registry::default_id().as_str(),
+        )?;
         let mut desired = crate::settings::PortableSettings::default();
         desired.skill.insert(catalog.skill[0].id.clone(), false);
         settings.update(
@@ -1921,7 +1987,7 @@ mod test {
         let disabled = coordinator.skills(
             Some(directory.path()),
             &request,
-            crate::provider::ProviderKind::Codex,
+            forge_providers::registry::default_id(),
         )?;
         assert!(
             tokio::time::timeout(
@@ -1953,7 +2019,7 @@ mod test {
             for _callback in 0..1 {
                 let request = PermissionRequest {
                     id: "parse-error".into(),
-                    provider: "test".into(),
+                    provider: forge_provider_api::ProviderId::new("mock").unwrap(),
                     reason: None,
                     target_list: vec![PermissionTarget::Command {
                         command: "probe 'unfinished".into(),
@@ -1979,13 +2045,13 @@ mod test {
                 assert!(matches!(
                     event,
                     ProviderEvent::Diagnostic { diagnostic, .. }
-                        if diagnostic.message.contains("shell_command_parse_error")
+                        if diagnostic.message.as_str().contains("shell_command_parse_error")
                 ));
                 assert!(stream.try_recv().is_err());
             }
             let corrected = PermissionRequest {
                 id: "parse-error".into(),
-                provider: "test".into(),
+                provider: forge_provider_api::ProviderId::new("mock").unwrap(),
                 reason: None,
                 target_list: vec![PermissionTarget::Command {
                     command: "probe corrected".into(),
@@ -2052,7 +2118,7 @@ mod test {
                         ApprovalMode::Ask,
                         PermissionRequest {
                             id: "same-id".into(),
-                            provider: "test".into(),
+                            provider: forge_provider_api::ProviderId::new("mock").unwrap(),
                             reason: None,
                             target_list: vec![PermissionTarget::Command {
                                 command: "echo timeout".into(),
@@ -2076,7 +2142,10 @@ mod test {
         let pending = coordinator.pending_list().unwrap();
         let original = pending
             .iter()
-            .find(|view| view.execution_owner.as_ref().unwrap().session_id == "expired")
+            .find(|view| {
+                view.execution_owner.as_ref().unwrap().session_id
+                    == forge_provider_api::SessionId::from("expired")
+            })
             .unwrap();
         let original_deadline = original.deadline.as_ref().unwrap().expires_at_ms;
         coordinator
@@ -2117,13 +2186,6 @@ mod test {
         assert!(*expired_feedback.borrow_and_update());
         assert!(!waiting_feedback.has_changed().unwrap());
         assert_eq!(tasks.remove(0).await.unwrap(), ApprovalResolution::TimedOut);
-        assert_eq!(
-            codex_response(
-                &json!({"method":"item/commandExecution/requestApproval"}),
-                ApprovalResolution::TimedOut
-            )["decision"],
-            "decline"
-        );
         let pending = coordinator.pending_list().unwrap();
         assert_eq!(pending.len(), 1);
         assert!(pending[0].deadline.is_none());
@@ -2174,7 +2236,7 @@ mod test {
                     ApprovalMode::Ask,
                     PermissionRequest {
                         id: "abandoned".into(),
-                        provider: "test".into(),
+                        provider: forge_provider_api::ProviderId::new("mock").unwrap(),
                         reason: None,
                         target_list: vec![PermissionTarget::Command {
                             command: "probe".into(),
@@ -2216,7 +2278,7 @@ mod test {
                         ApprovalMode::Ask,
                         PermissionRequest {
                             id: "same-provider-id".into(),
-                            provider: "test".into(),
+                            provider: forge_provider_api::ProviderId::new("mock").unwrap(),
                             reason: None,
                             target_list: vec![PermissionTarget::Command {
                                 command: "probe task".into(),
@@ -2260,7 +2322,7 @@ mod test {
         assert_eq!(pending.len(), 1);
         assert_eq!(
             pending[0].execution_owner.as_ref().unwrap().agent_id,
-            "second"
+            forge_provider_api::AgentId::from("second")
         );
         coordinator
             .cancel_owner(
@@ -2286,90 +2348,10 @@ mod test {
     }
 
     #[test]
-    fn unwraps_copilot_permission_notifications_before_matching_policy() {
-        let request = permission_from_copilot(
-            "shell-one".into(),
-            "unknown",
-            json!({"permissionRequest": {
-                "kind":"shell", "fullCommandText":"Write-Output audit", "intention":"Run audit"
-            }, "requestId":"shell-one"}),
-            "D:/repo",
-        );
-        assert_eq!(
-            request.target_list,
-            vec![PermissionTarget::Command {
-                command: "Write-Output audit".into(),
-                shell: None
-            }]
-        );
-        assert_eq!(request.reason.as_deref(), Some("Run audit"));
-        let mcp = permission_from_copilot(
-            "mcp".into(),
-            "unknown",
-            json!({
-                "permissionRequest":{"kind":"mcp", "serverName":"github", "toolName":"search"}
-            }),
-            "D:/repo",
-        );
-        assert_eq!(
-            mcp.target_list,
-            vec![PermissionTarget::Mcp {
-                target: "github/search".into()
-            }]
-        );
-        let custom = permission_from_copilot(
-            "custom".into(),
-            "unknown",
-            json!({
-                "permissionRequest":{"kind":"custom-tool", "toolName":"question_ask", "toolDescription":"Ask a question"}
-            }),
-            "D:/repo",
-        );
-        assert_eq!(
-            custom.target_list,
-            vec![PermissionTarget::Tool {
-                target: "question_ask".into()
-            }]
-        );
-        assert_eq!(custom.reason.as_deref(), Some("Ask a question"));
-    }
-
-    #[test]
-    fn maps_copilot_permission_kinds_into_shared_targets() {
-        let write = permission_from_copilot(
-            "write-one".into(),
-            "write",
-            json!({ "fileName": "D:/repo/src/main.rs", "intention": "Apply edit" }),
-            "D:/repo",
-        );
-        assert_eq!(write.provider, "Copilot CLI");
-        assert_eq!(write.reason.as_deref(), Some("Apply edit"));
-        assert_eq!(
-            write.target_list,
-            vec![PermissionTarget::Write {
-                path: "D:/repo/src/main.rs".into(),
-            }]
-        );
-
-        let mcp = permission_from_copilot(
-            "mcp-one".into(),
-            "mcp",
-            json!({ "toolName": "github.search_code" }),
-            "D:/repo",
-        );
-        assert_eq!(
-            mcp.target_list,
-            vec![PermissionTarget::Mcp {
-                target: "github.search_code".into(),
-            }]
-        );
-    }
-
-    #[test]
     fn builds_exact_and_broad_command_choices() {
         let request = PermissionRequest {
             id: "one".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("mock").unwrap(),
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: "git status --short".into(),
@@ -2415,7 +2397,7 @@ mod test {
         let waiting_coordinator = Arc::clone(&coordinator);
         let waiting = tokio::spawn(async move {
             waiting_coordinator.authorize(ApprovalMode::Ask, PermissionRequest {
-                id: "versions".into(), provider: "test".into(), reason: None,
+                id: "versions".into(), provider: forge_provider_api::ProviderId::new("mock").unwrap(), reason: None,
                 target_list: vec![PermissionTarget::Command {
                     command: r#""C:/Program Files/PowerShell/7/pwsh.exe" -Command 'Get-Location; Get-ChildItem -Force; rustc --version; cargo --version; rustup show active-toolchain; rustc --version'"#.into(), shell: None
                 }],
@@ -2512,7 +2494,7 @@ mod test {
 
     #[test]
     fn permission_context_shows_only_the_script_and_marks_the_loop_command() {
-        let request = PermissionRequest { id:"loop".into(),provider:"test".into(),reason:None,
+        let request = PermissionRequest { id:"loop".into(),provider:forge_provider_api::ProviderId::new("mock").unwrap(),reason:None,
             target_list:vec![PermissionTarget::Command {
                 command:r#""C:\Program Files\PowerShell\7\pwsh.exe" -Command 'foreach ($iteration in 1..1) { whoami.exe /groups }'"#.into(),
                 shell:Some(CommandShell::PowerShell),
@@ -2538,74 +2520,40 @@ mod test {
     }
 
     #[test]
-    fn retains_shell_identity_and_argv_script_boundaries() {
-        for (executable, script, shell) in [
-            (
-                "pwsh",
-                "1 | ForEach-Object { probe $_ }",
-                CommandShell::PowerShell,
-            ),
-            (
-                "/bin/bash",
-                "for x in one; do probe $x; done",
-                CommandShell::Bash,
-            ),
-            ("/bin/zsh", "repeat 2 probe x", CommandShell::Zsh),
-            ("nu", "[1] | each {|x| probe $x }", CommandShell::Nushell),
+    fn normalized_command_permissions_retain_shell_identity_and_script_boundaries() {
+        for (script, shell) in [
+            ("1 | ForEach-Object { probe $_ }", CommandShell::PowerShell),
+            ("for x in one; do probe $x; done", CommandShell::Bash),
+            ("repeat 2 probe x", CommandShell::Zsh),
+            ("[1] | each {|x| probe $x }", CommandShell::Nushell),
         ] {
-            let request = permission_from_provider(
-                "item/commandExecution/requestApproval",
-                &json!({
-                    "params": { "args": [executable, "-c", script] }
-                }),
-                ".",
-            )
-            .unwrap();
+            let request = normalized_permission(
+                "id",
+                vec![PermissionTarget::Command {
+                    command: script.into(),
+                    shell: Some(shell),
+                }],
+            );
             assert_eq!(
                 request.target_list,
                 vec![PermissionTarget::Command {
                     command: script.into(),
-                    shell: Some(shell)
+                    shell: Some(shell),
                 }]
             );
             assert!(normalize_command_in(script, shell).failure.is_none());
-            let request = permission_from_copilot(
-                "id".into(),
-                "shell",
-                json!({
-                    "fullCommandText": script, "shell": executable
-                }),
-                ".",
-            );
-            assert_eq!(
-                request.target_list,
-                vec![PermissionTarget::Command {
-                    command: script.into(),
-                    shell: Some(shell)
-                }]
-            );
         }
     }
 
     #[test]
-    fn codex_transport_quoting_preserves_shell_scripts_and_approval_targets() {
-        let source =
-            r#"rg -n "timeline|markdown|table|wrap" C:\Users\mattm\.codex\memories\MEMORY.md"#;
-        let rendered = r#""C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command "rg -n \"timeline|markdown|table|wrap\" C:\\Users\\mattm\\.codex\\memories\\MEMORY.md""#;
-        let request = permission_from_provider(
-            "item/commandExecution/requestApproval",
-            &json!({"params": {"command": rendered,
-                "commandActions": [{"type":"unknown", "command":"misleading summary"}],
-                "proposedExecpolicyAmendment": ["unrelated"]}}),
-            ".",
-        )
-        .unwrap();
-        assert_eq!(
-            request.target_list,
+    fn normalized_shell_script_permission_matches_host_rules() {
+        let source = r#"rg -n "timeline|markdown|table|wrap" C:\Users\fixture\notes\REFERENCE.md"#;
+        let request = normalized_permission(
+            "id",
             vec![PermissionTarget::Command {
                 command: source.into(),
                 shell: Some(CommandShell::PowerShell),
-            }]
+            }],
         );
         let parsed = normalize_command_in(source, CommandShell::PowerShell);
         assert!(parsed.failure.is_none());
@@ -2616,7 +2564,7 @@ mod test {
                 "rg",
                 "-n",
                 "timeline|markdown|table|wrap",
-                r"C:\Users\mattm\.codex\memories\MEMORY.md",
+                r"C:\Users\fixture\notes\REFERENCE.md",
             ]
         );
         let rules = json!({"permission":{"bash":{"*":"ask", "rg *":"allow"}}});
@@ -2627,112 +2575,6 @@ mod test {
         let evaluation = compiled.evaluate(&request).unwrap();
         assert_eq!(evaluation.decision, PermissionDecision::Allow);
         assert!(evaluation.pending_target_list.is_empty());
-    }
-
-    #[test]
-    fn codex_transport_roundtrips_quoting_for_every_supported_shell() {
-        for (executable, shell) in [
-            (
-                r"C:\Program Files\PowerShell\7\pwsh.exe",
-                CommandShell::PowerShell,
-            ),
-            (
-                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-                CommandShell::PowerShell,
-            ),
-            ("/usr/bin/pwsh", CommandShell::PowerShell),
-            ("/bin/sh", CommandShell::Bash),
-            ("/bin/bash", CommandShell::Bash),
-            ("/bin/zsh", CommandShell::Zsh),
-            ("/opt/homebrew/bin/nu", CommandShell::Nushell),
-            (r"C:\Program Files\nu\bin\nu.exe", CommandShell::Nushell),
-        ] {
-            for source in [
-                r#"probe "timeline|markdown|table|wrap""#,
-                r#"probe 'one; two & three | four'"#,
-                r#"probe "" 'café 世界' 'C:\space path\file.txt'"#,
-                "probe first\nprobe second",
-                "probe 'quote\" and $value and `tick and \\path'",
-            ] {
-                let arguments = [executable, "-c", source];
-                let rendered = shlex::try_join(arguments).unwrap();
-                for params in [json!({"command":rendered}), json!({"args":arguments})] {
-                    let request = permission_from_provider(
-                        "item/commandExecution/requestApproval",
-                        &json!({"params":params}),
-                        ".",
-                    )
-                    .unwrap();
-                    assert_eq!(
-                        request.target_list,
-                        vec![PermissionTarget::Command {
-                            command: source.into(),
-                            shell: Some(shell),
-                        }]
-                    );
-                    let parsed = normalize_command_in(source, shell);
-                    assert!(parsed.failure.is_none(), "{shell:?}: {source}: {parsed:?}");
-                    let expected = if source.contains('\n') { 2 } else { 1 };
-                    assert_eq!(
-                        parsed.invocation_list.len(),
-                        expected,
-                        "{shell:?}: {source}"
-                    );
-                    assert!(
-                        parsed
-                            .invocation_list
-                            .iter()
-                            .all(|command| command.command_name == "probe")
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn provider_argv_preserves_literal_arguments_without_a_shell_launcher() {
-        let arguments = ["rg", "-n", "a|b;$(probe)", "", r"C:\space path\file.txt"];
-        for params in [
-            json!({"command":shlex::try_join(arguments).unwrap()}),
-            json!({"command":arguments}),
-            json!({"command":"rg", "args":&arguments[1..]}),
-        ] {
-            let request = permission_from_provider(
-                "item/commandExecution/requestApproval",
-                &json!({"params":params}),
-                ".",
-            )
-            .unwrap();
-            let PermissionTarget::Command { command, shell } = &request.target_list[0] else {
-                panic!()
-            };
-            let parsed = normalize_command_in(command, shell.unwrap());
-            assert!(parsed.failure.is_none(), "{command}: {parsed:?}");
-            assert_eq!(parsed.invocation_list.len(), 1);
-            assert_eq!(parsed.invocation_list[0].token_list, arguments);
-        }
-    }
-
-    #[test]
-    fn invalid_provider_transport_returns_parse_errors() {
-        for params in [
-            json!({"command":"pwsh -c 'unfinished"}),
-            json!({"command":""}),
-            json!({"args":[]}),
-            json!({"args":["pwsh", "-c", 42]}),
-            json!({"command":"rg\u{0}tail"}),
-        ] {
-            let error = permission_from_provider(
-                "item/commandExecution/requestApproval",
-                &json!({"params":params}),
-                ".",
-            )
-            .unwrap_err();
-            assert!(
-                error.downcast_ref::<CommandAnalysisError>().is_some(),
-                "{error:#}"
-            );
-        }
     }
 
     #[tokio::test]
@@ -2746,7 +2588,7 @@ mod test {
                 ApprovalMode::Allow,
                 PermissionRequest {
                     id: "callback".into(),
-                    provider: "test".into(),
+                    provider: forge_provider_api::ProviderId::new("mock").unwrap(),
                     reason: None,
                     target_list: vec![PermissionTarget::Write {
                         path: "review.txt".into(),
@@ -2783,7 +2625,7 @@ mod test {
                     ApprovalMode::Ask,
                     PermissionRequest {
                         id: "cancel-versions".into(),
-                        provider: "test".into(),
+                        provider: forge_provider_api::ProviderId::new("mock").unwrap(),
                         reason: None,
                         target_list: vec![PermissionTarget::Command {
                             command: "rustc --version; cargo --version".into(),
@@ -2827,7 +2669,7 @@ mod test {
         let coordinator = Arc::new(PermissionCoordinator::new(Arc::clone(&store)));
         let request = PermissionRequest {
             id: "approval-one".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("mock").unwrap(),
             reason: Some("inspect repository".into()),
             target_list: vec![PermissionTarget::Command {
                 command: "rg TODO src".into(),
@@ -2852,7 +2694,10 @@ mod test {
         assert_eq!(owned.exchange_id.as_deref(), Some("child-exchange"));
         let snapshot = coordinator.pending_list().unwrap();
         assert_eq!(snapshot[0].exchange_id, owned.exchange_id);
-        assert_eq!(snapshot[0].turn_id.as_deref(), Some("child-turn"));
+        assert_eq!(
+            snapshot[0].turn_id,
+            Some(forge_provider_api::ProviderTurnId::from("child-turn"))
+        );
         assert!(
             coordinator
                 .bind_owner(&view.id, "other-exchange", Some("other-turn"))
@@ -2904,7 +2749,7 @@ mod test {
                     ApprovalMode::Ask,
                     PermissionRequest {
                         id: "approval-deny".into(),
-                        provider: "test".into(),
+                        provider: forge_provider_api::ProviderId::new("mock").unwrap(),
                         reason: None,
                         target_list: vec![PermissionTarget::Command {
                             command: "rg TODO src".into(),
@@ -2948,7 +2793,7 @@ mod test {
                     ApprovalMode::Ask,
                     PermissionRequest {
                         id: "approval-cancel".into(),
-                        provider: "test".into(),
+                        provider: forge_provider_api::ProviderId::new("mock").unwrap(),
                         reason: None,
                         target_list: vec![PermissionTarget::Command {
                             command: "rg TODO".into(),
@@ -2995,7 +2840,7 @@ mod test {
         ] {
             let request = PermissionRequest {
                 id: "context".into(),
-                provider: "test".into(),
+                provider: forge_provider_api::ProviderId::new("mock").unwrap(),
                 reason: None,
                 target_list: vec![PermissionTarget::Command {
                     command: source.into(),
@@ -3033,63 +2878,47 @@ mod test {
     }
 
     #[test]
-    fn spaced_powershell_arrays_survive_provider_approval_transport() {
+    fn normalized_spaced_powershell_permission_uses_host_rules() {
         let source = "Get-Content Cargo.toml, .forge.json, .gitignore";
-        let captured = r#""C:\Program Files\PowerShell\7\pwsh.exe" -Command 'Get-Content Cargo.toml, .forge.json, .gitignore'"#;
-        let requests = [
-            permission_from_provider(
-                "item/commandExecution/requestApproval",
-                &json!({"params":{"command":captured}}),
+        let request = normalized_permission(
+            "spaced-array",
+            vec![PermissionTarget::Command {
+                command: source.into(),
+                shell: Some(CommandShell::PowerShell),
+            }],
+        );
+        assert_eq!(
+            request.target_list,
+            vec![PermissionTarget::Command {
+                command: source.into(),
+                shell: Some(CommandShell::PowerShell),
+            }]
+        );
+        for decision in ["allow", "ask", "deny"] {
+            let rules = json!({"permission":{"bash":{"*":"allow","Get-Content *":decision}}});
+            let compiled = crate::permissions::matcher::CompiledPermissionDocument::compile(
+                crate::permissions::document::parse_permission_document(&rules.to_string())
+                    .unwrap(),
                 ".",
-            )
-            .unwrap(),
-            permission_from_provider(
-                "item/commandExecution/requestApproval",
-                &json!({"params":{"args":["pwsh", "-Command", source]}}),
-                ".",
-            )
-            .unwrap(),
-            permission_from_copilot(
-                "spaced-array".into(),
-                "shell",
-                json!({"fullCommandText":source,"shell":"pwsh"}),
-                ".",
-            ),
-        ];
-        for request in requests {
-            assert_eq!(
-                request.target_list,
-                vec![PermissionTarget::Command {
-                    command: source.into(),
-                    shell: Some(CommandShell::PowerShell),
-                }]
             );
-            for decision in ["allow", "ask", "deny"] {
-                let rules = json!({"permission":{"bash":{"*":"allow","Get-Content *":decision}}});
-                let compiled = crate::permissions::matcher::CompiledPermissionDocument::compile(
-                    crate::permissions::document::parse_permission_document(&rules.to_string())
-                        .unwrap(),
-                    ".",
-                );
-                let evaluation = compiled.evaluate(&request).unwrap();
-                if decision == "ask" {
-                    let view = approval_view(&request, &evaluation);
-                    assert_eq!(view.item_list.len(), 1);
-                    assert_eq!(view.item_list[0].command_list[0].source, source);
-                    assert_eq!(
-                        view.item_list[0].command_list[0].focus_range_list,
-                        vec![0..source.len()]
-                    );
-                }
+            let evaluation = compiled.evaluate(&request).unwrap();
+            if decision == "ask" {
+                let view = approval_view(&request, &evaluation);
+                assert_eq!(view.item_list.len(), 1);
+                assert_eq!(view.item_list[0].command_list[0].source, source);
                 assert_eq!(
-                    evaluation.decision,
-                    match decision {
-                        "allow" => PermissionDecision::Allow,
-                        "ask" => PermissionDecision::Ask,
-                        _ => PermissionDecision::Deny,
-                    }
+                    view.item_list[0].command_list[0].focus_range_list,
+                    vec![0..source.len()]
                 );
             }
+            assert_eq!(
+                evaluation.decision,
+                match decision {
+                    "allow" => PermissionDecision::Allow,
+                    "ask" => PermissionDecision::Ask,
+                    _ => PermissionDecision::Deny,
+                }
+            );
         }
     }
 
@@ -3102,7 +2931,7 @@ mod test {
         };
         let request = PermissionRequest {
             id: "comma-arguments".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("mock").unwrap(),
             reason: None,
             target_list: vec![target.clone()],
         };

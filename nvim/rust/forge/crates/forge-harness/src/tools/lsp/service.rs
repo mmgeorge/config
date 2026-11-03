@@ -403,7 +403,8 @@ impl LspScope {
             .replace('\\', "/");
         let decision = self.policy.evaluate(&PermissionRequest {
             id: self.interaction.clone(),
-            provider: "harness-lsp".into(),
+            provider: forge_provider_api::ProviderId::new("harness-lsp")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Read { path }],
         })?;

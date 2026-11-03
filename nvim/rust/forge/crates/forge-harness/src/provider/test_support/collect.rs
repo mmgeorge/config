@@ -3,20 +3,18 @@
 use forge_harness as harness;
 
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use harness::provider::{
-    ExecutionOwner, InvocationScope, ProviderAdapter, ProviderCompletion, ProviderError,
-    ProviderEvent, ProviderEventSink, ProviderOutput, ProviderRequest,
+    ExecutionOwner, InvocationScope, ProviderCompletion, ProviderError, ProviderEvent,
+    ProviderEventSink, ProviderOutput, ProviderRequest,
 };
 use tokio::sync::Mutex;
 
 /// Retain one observer per owner across complete-result assertions.
-pub struct ProviderTestSession<P: ?Sized> {
-    provider: Arc<P>,
-    native: Arc<harness::provider::Provider>,
+pub struct ProviderTestSession {
+    provider: Arc<harness::provider::Provider>,
     registry: Arc<harness::provider::session_execution::SessionExecutionRegistry>,
     owners: Arc<Mutex<HashMap<ExecutionOwner, Arc<TestOwner>>>>,
     store: Arc<harness::provider::submission::SubmissionStore>,
@@ -43,43 +41,55 @@ impl Drop for TestOwner {
     }
 }
 
-impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost>> ProviderTestSession<P> {
-    /// Create a test-owned runtime without putting collection on the production trait.
-    pub fn new(provider: P) -> anyhow::Result<Self> {
-        Self::from_arc(Arc::new(provider))
-    }
-
-    /// Retain a concrete provider and its erased execution interface together.
-    pub fn from_arc(provider: Arc<P>) -> anyhow::Result<Self> {
-        let native: Arc<harness::provider::Provider> = provider.clone();
-        Self::attach(provider, native)
-    }
-}
-
-impl ProviderTestSession<harness::provider::Provider> {
+impl ProviderTestSession {
     /// Attach an existing heterogeneous provider to the complete-result fixture.
     pub fn from_dyn(provider: Arc<harness::provider::Provider>) -> anyhow::Result<Self> {
-        Self::attach(provider.clone(), provider)
-    }
-}
-
-impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized>
-    ProviderTestSession<P>
-{
-    fn attach(provider: Arc<P>, native: Arc<harness::provider::Provider>) -> anyhow::Result<Self> {
         let directory = Arc::new(tempfile::tempdir()?);
         let trace = Arc::new(harness::trace::TraceStore::open(directory.path())?);
+        Self::from_dyn_with_directory(provider, directory, trace)
+    }
+
+    /// Wrap a normalized native provider in the production bridge for isolated tests.
+    pub fn from_native<P>(native: Arc<P>) -> anyhow::Result<Self>
+    where
+        P: forge_provider_api::provider::Provider + 'static,
+    {
+        let directory = Arc::new(tempfile::tempdir()?);
+        let permission_store = Arc::new(std::sync::RwLock::new(
+            harness::permissions::store::PermissionStore::load(
+                directory.path().join("permissions.json"),
+                directory.path(),
+            )?,
+        ));
+        let permissions = Arc::new(harness::provider::approval::PermissionCoordinator::new(
+            permission_store,
+        ));
+        let trace = Arc::new(harness::trace::TraceStore::open(directory.path())?);
+        let native: Arc<dyn forge_provider_api::provider::Provider> = native;
+        let provider = Arc::new(harness::provider::Provider::new(
+            native,
+            permissions,
+            trace.clone(),
+            directory.path().to_path_buf(),
+        ));
+        Self::from_dyn_with_directory(provider, directory, trace)
+    }
+
+    fn from_dyn_with_directory(
+        provider: Arc<harness::provider::Provider>,
+        directory: Arc<tempfile::TempDir>,
+        trace: Arc<harness::trace::TraceStore>,
+    ) -> anyhow::Result<Self> {
         let store =
             harness::provider::submission::SubmissionStore::open(directory.path(), trace.clone())?;
         let registry = Arc::new(
             harness::provider::session_execution::SessionExecutionRegistry::new(
-                native.clone(),
-                trace.clone(),
+                provider.clone(),
+                trace,
             ),
         );
         Ok(Self {
             provider,
-            native,
             registry,
             owners: Arc::default(),
             store,
@@ -89,7 +99,12 @@ impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized>
 
     /// Get the production provider interface for journal reconciliation.
     pub fn as_provider(&self) -> &harness::provider::Provider {
-        self.native.as_ref()
+        self.provider.as_ref()
+    }
+
+    /// Clone the production bridge for service or controller test constructors.
+    pub fn provider_handle(&self) -> Arc<harness::provider::Provider> {
+        self.provider.clone()
     }
 
     /// Install session observation before native initialization can emit updates.
@@ -110,6 +125,69 @@ impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized>
         self.owner(owner).await?.engine.steer_current(input).await
     }
 
+    /// Run bounded retry-policy attempts through the production session engine and bridge.
+    pub async fn session_prompt_with_retry(
+        &self,
+        request: ProviderRequest,
+        sink: Option<ProviderEventSink>,
+        trace: &harness::trace::TraceStore,
+        store: &Arc<harness::provider::submission::SubmissionStore>,
+    ) -> Result<ProviderOutput, ProviderError> {
+        let owner = request.owner()?;
+        let scope = match &sink {
+            Some(sink) => sink.invocation_scope()?.clone(),
+            None => InvocationScope::new(owner.clone(), uuid::Uuid::new_v4().to_string()),
+        };
+        if scope.owner != owner {
+            return Err(ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::AdmitInput,
+                    forge_provider_api::ProviderFailureKind::Rejected,
+                ),
+            ));
+        }
+        let execution = self.owner(owner).await?;
+        let (output, mut stream) = harness::provider::events::channel(scope);
+        let mut completion: std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ProviderCompletion, ProviderError>>
+                    + Send
+                    + '_,
+            >,
+        > = Box::pin(async {
+            harness::provider::retry::execute(&execution.engine, request, output, trace, store)
+                .await
+                .map_err(|error| {
+                    harness::provider::lifecycle_error::classify(
+                        forge_provider_api::ProviderOperation::AdmitInput,
+                        error,
+                    )
+                })
+        });
+        let mut observed = Vec::new();
+        let mut stream_open = true;
+        loop {
+            tokio::select! {
+                result = &mut completion => {
+                    while let Ok(event) = stream.try_recv() {
+                        if let Some(sink) = &sink && !matches!(event, ProviderEvent::Execution { .. }) {
+                            sink.send_wait(event.clone()).await?;
+                        }
+                        observed.push(event);
+                    }
+                    return Ok(ProviderOutput { event: observed, completion: result? });
+                }
+                event = stream.recv(), if stream_open => {
+                    let Some(event) = event? else { stream_open = false; continue; };
+                    if let Some(sink) = &sink && !matches!(event, ProviderEvent::Execution { .. }) {
+                        sink.send_wait(event.clone()).await?;
+                    }
+                    observed.push(event);
+                }
+            }
+        }
+    }
+
     /// Replace a failed owner through the production recovery path before another test request.
     pub async fn recover(&self, owner: ExecutionOwner) -> anyhow::Result<()> {
         self.registry.owner(owner.clone()).await?.close().await?;
@@ -120,7 +198,7 @@ impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized>
             match inbox.drain() {
                 Ok(events) if events.is_empty() => break,
                 Ok(_) => {}
-                Err(error) if matches!(error, ProviderError::Observation(_)) => {
+                Err(ProviderError::Observation(_)) => {
                     break;
                 }
                 Err(error) => return Err(error.into()),
@@ -214,9 +292,12 @@ impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized>
             None => InvocationScope::new(owner.clone(), uuid::Uuid::new_v4().to_string()),
         };
         if scope.owner != owner {
-            return Err(ProviderError::Rejected {
-                message: "test observer belongs to another owner".into(),
-            });
+            return Err(ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::AdmitInput,
+                    forge_provider_api::ProviderFailureKind::Rejected,
+                ),
+            ));
         }
         let execution = self.owner(owner).await?;
         let (output, mut stream) = harness::provider::events::channel(scope.clone());
@@ -253,7 +334,9 @@ impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized>
                             completion = Box::pin(execution.engine.wait_ready(scope.clone()));
                         }
                         Err(harness::provider::session_execution::SettlementError::Unavailable) => {
-                            return Err(ProviderError::Protocol { message: "execution owner closed before settlement".into() });
+                            return Err(ProviderError::Observation(
+                                forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
+                            ));
                         }
                         Err(harness::provider::session_execution::SettlementError::Provider(error)) => return Err(error),
                     }
@@ -273,23 +356,15 @@ impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized>
     }
 }
 
-impl<P: ?Sized> Clone for ProviderTestSession<P> {
+impl Clone for ProviderTestSession {
     fn clone(&self) -> Self {
         Self {
             provider: self.provider.clone(),
-            native: self.native.clone(),
             registry: self.registry.clone(),
             owners: self.owners.clone(),
             store: self.store.clone(),
             _directory: self._directory.clone(),
         }
-    }
-}
-
-impl<P: ?Sized> Deref for ProviderTestSession<P> {
-    type Target = P;
-    fn deref(&self) -> &P {
-        &self.provider
     }
 }
 
@@ -308,9 +383,7 @@ pub trait ProviderTestExt {
 }
 
 #[async_trait]
-impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized> ProviderTestExt
-    for ProviderTestSession<P>
-{
+impl ProviderTestExt for ProviderTestSession {
     async fn session_prompt_and_collect(
         &self,
         request: ProviderRequest,
@@ -337,15 +410,16 @@ mod tests {
     async fn collected_result_retains_idle_continuation_observation() -> anyhow::Result<()> {
         let workspace = tempfile::tempdir()?;
         let trace = Arc::new(harness::trace::TraceStore::open(workspace.path())?);
-        let provider: Arc<harness::provider::Provider> = Arc::from(harness::provider::build(
+        let provider: Arc<harness::provider::Provider> = harness::provider::build(
             ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: Vec::new(),
             },
             harness::provider::approval::PermissionCoordinator::transient(workspace.path())?,
             trace,
             workspace.path().into(),
-        )?);
+        )?;
         let fixture = ProviderTestSession::from_dyn(provider.clone())?;
         let owner = ExecutionOwner::root("collector");
         let request = ProviderRequest {
@@ -354,7 +428,7 @@ mod tests {
             workspace: workspace.path().to_string_lossy().into_owned(),
             input: ProviderInput::from_text("hello"),
             mode: PromptMode::Chat,
-            model: "mock".into(),
+            model: "default".into(),
             effort: "default".into(),
             context_window: None,
             service_tier: Default::default(),
@@ -377,7 +451,8 @@ mod tests {
         let receipt = fixture.store.prepare_steering(
             &catalog,
             ProviderInput::from_text("continue"),
-            harness::provider::ProviderKind::Mock,
+            forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
         )?;
         fixture
             .steer_current(
@@ -390,20 +465,35 @@ mod tests {
             )
             .await?;
         let execution = fixture.owner(owner).await?;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let scope = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if execution.idle.lock().await.events.iter().any(|event| {
-                    matches!(
-                        event, ProviderEvent::Execution { observation }
-                        if matches!(observation.update(), ExecutionUpdate::Finished { .. })
-                    )
-                }) {
-                    break;
+                let scope =
+                    execution
+                        .idle
+                        .lock()
+                        .await
+                        .events
+                        .iter()
+                        .find_map(|event| match event {
+                            ProviderEvent::Execution { observation }
+                                if matches!(
+                                    observation.update(),
+                                    ExecutionUpdate::Finished { .. }
+                                ) =>
+                            {
+                                Some(observation.scope().clone())
+                            }
+                            _ => None,
+                        });
+                if let Some(scope) = scope {
+                    break scope;
                 }
                 tokio::task::yield_now().await;
             }
         })
         .await?;
+        let ready = execution.engine.wait_ready(scope).await?;
+        ready.ticket.commit().await?;
         fixture.close().await?;
         provider.shutdown().await?;
         Ok(())

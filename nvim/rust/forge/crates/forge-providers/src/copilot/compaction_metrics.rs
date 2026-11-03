@@ -168,8 +168,8 @@ impl From<NativeCompactionResult> for forge_provider_api::compaction::Compaction
             model,
             before_context,
             custom_instructions,
-            request_id,
-            service_request_id,
+            request_id: _,
+            service_request_id: _,
             status_code,
             summary_content,
             error,
@@ -178,32 +178,46 @@ impl From<NativeCompactionResult> for forge_provider_api::compaction::Compaction
             tokens_removed,
             pre_compaction_messages_length,
             messages_removed,
-            checkpoint_number,
-            checkpoint_path,
+            checkpoint_number: _,
+            checkpoint_path: _,
             compaction_tokens_used,
             context_window,
             conversation_tokens,
             system_tokens,
             tool_definitions_tokens,
         } = native;
+        let diagnostic =
+            (error.is_some() || status_code.is_some_and(|status| status >= 400)).then(|| {
+                forge_provider_api::ProviderDiagnostic {
+                    kind: match status_code {
+                        Some(401) => forge_provider_api::ProviderFailureKind::Authentication,
+                        Some(403) => forge_provider_api::ProviderFailureKind::Authorization,
+                        Some(408 | 504) => forge_provider_api::ProviderFailureKind::Timeout,
+                        Some(429) => forge_provider_api::ProviderFailureKind::RateLimited,
+                        Some(400 | 422) => forge_provider_api::ProviderFailureKind::Rejected,
+                        Some(500 | 502 | 503) => forge_provider_api::ProviderFailureKind::Transport,
+                        _ => forge_provider_api::ProviderFailureKind::Unknown,
+                    },
+                    message: forge_provider_api::SanitizedMessage::new(
+                        "Provider compaction failed",
+                    )
+                    .expect("static diagnostic is nonempty"),
+                    fatal: false,
+                }
+            });
         Self {
             context_tokens_before,
             context_tokens_after,
             model,
             before_context: before_context.map(Into::into),
             custom_instructions,
-            request_id,
-            service_request_id,
-            status_code,
             summary_content,
-            error,
+            diagnostic,
             pre_compaction_tokens,
             post_compaction_tokens,
             tokens_removed,
             pre_compaction_messages_length,
             messages_removed,
-            checkpoint_number,
-            checkpoint_path,
             compaction_tokens_used: compaction_tokens_used.map(Into::into),
             context_window: context_window.map(Into::into),
             conversation_tokens,
@@ -257,5 +271,42 @@ impl From<NativeCompactionCost> for forge_provider_api::compaction::CompactionCo
             }
         }
         Self { measurements }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Keep native diagnostics and storage metadata out of the shared compaction result.
+    #[test]
+    fn compaction_failure_is_normalized_before_publication() {
+        let native: NativeCompactionResult = serde_json::from_value(serde_json::json!({
+            "error":"private-native-error token=secret", "statusCode":401,
+            "requestId":"private-request", "serviceRequestId":"private-service",
+            "checkpointNumber":42, "checkpointPath":"private-checkpoint",
+            "summaryContent":"The useful summary", "tokensRemoved":12
+        }))
+        .unwrap();
+        let result: forge_provider_api::compaction::CompactionResult = native.into();
+        assert_eq!(
+            result.diagnostic.as_ref().unwrap().kind,
+            forge_provider_api::ProviderFailureKind::Authentication
+        );
+        assert_eq!(
+            result.summary_content.as_deref(),
+            Some("The useful summary")
+        );
+        assert_eq!(result.tokens_removed, Some(12));
+        let encoded = serde_json::to_string(&result).unwrap();
+        for marker in [
+            "private-",
+            "token=secret",
+            "status_code",
+            "checkpoint_path",
+            "request_id",
+        ] {
+            assert!(!encoded.contains(marker), "native marker escaped: {marker}");
+        }
     }
 }

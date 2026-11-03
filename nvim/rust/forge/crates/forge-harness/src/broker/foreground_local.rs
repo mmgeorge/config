@@ -315,7 +315,8 @@ mod tests {
                     ApprovalMode::Ask,
                     PermissionRequest {
                         id: "timed-approval".into(),
-                        provider: "test".into(),
+                        provider: forge_provider_api::ProviderId::new("fixture")
+                            .expect("fixture identity is valid"),
                         reason: None,
                         target_list: vec![PermissionTarget::Command {
                             command: "echo approval-timeout".into(),

@@ -84,7 +84,7 @@ impl SessionAdmission {
             Ok(previous) => previous,
             Err(_) => {
                 self.mark_native_goal_uncertain();
-                return Err(crate::provider::ProviderError::DeliveryUncertain { message: "native goal authority epoch exhausted; provider generation must be replaced".into() }.into());
+                return Err(crate::provider::ProviderError::DeliveryUncertain.into());
             }
         };
         let epoch = previous + 1;
@@ -109,9 +109,7 @@ impl SessionAdmission {
             .native_goal_uncertain
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            return Err(crate::provider::ProviderError::DeliveryUncertain {
-                message: "native goal transport is uncertain; replace the provider generation before retrying".into(),
-            }.into());
+            return Err(crate::provider::ProviderError::DeliveryUncertain.into());
         }
         Ok(())
     }
@@ -531,7 +529,7 @@ mod tests {
         let error = second.ensure_native_goal_certain().unwrap_err();
         assert!(matches!(
             error.downcast_ref::<crate::provider::ProviderError>(),
-            Some(crate::provider::ProviderError::DeliveryUncertain { .. })
+            Some(crate::provider::ProviderError::DeliveryUncertain)
         ));
         second.reset_native_goal_generation()?;
         first.ensure_native_goal_certain()?;

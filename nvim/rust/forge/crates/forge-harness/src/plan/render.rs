@@ -2239,9 +2239,9 @@ mod test {
             action: EntityChangeAction::Add,
             kind: EntityKind::Struct,
             renamed_from: None,
-            name: "CodexProvider".into(),
-            description: "Runs requests through Codex.".into(),
-            path: "src/codex.rs".into(),
+            name: "ExampleProvider".into(),
+            description: "Runs requests through Example.".into(),
+            path: "src/fixture-alpha.rs".into(),
             members: vec![
                 ProgramEntityMemberChange {
                     action: ChangeAction::Add,
@@ -2278,7 +2278,7 @@ mod test {
             renamed_from: None,
             name: "RequestCache".into(),
             description: "Stores request state.".into(),
-            path: "src/codex.rs".into(),
+            path: "src/fixture-alpha.rs".into(),
             members: Vec::new(),
             variants: Vec::new(),
             extends: None,
@@ -2296,13 +2296,13 @@ mod test {
             .find(|line| line.starts_with("*trait Provider"))
             .expect("paired declarations");
         let provider_path_column = declaration_line.find("[src/provider.rs]").unwrap();
-        let codex_path_column = declaration_line.find("[src/codex.rs]").unwrap();
+        let fixture_path_column = declaration_line.find("[src/fixture-alpha.rs]").unwrap();
         assert_eq!(
             provider_path_column,
             DIAGRAM_CONCRETE_COLUMN - "[src/provider.rs]".len()
         );
         assert_eq!(
-            codex_path_column,
+            fixture_path_column,
             DIAGRAM_CONCRETE_COLUMN + DIAGRAM_PATH_COLUMN_MAX + 4
         );
         assert!(rendered.markdown.contains("+ run(): Result"));
@@ -2315,11 +2315,11 @@ mod test {
             .find(|line| line.contains("~Cache RequestCache"))
             .expect("derived child declaration");
         assert_eq!(
-            child_line.find("[src/codex.rs]"),
+            child_line.find("[src/fixture-alpha.rs]"),
             Some(DIAGRAM_CONCRETE_COLUMN + DIAGRAM_PATH_COLUMN_MAX)
         );
         assert!(!rendered.markdown.contains("\n  [src/provider.rs]"));
-        assert!(!rendered.markdown.contains("\n  [src/codex.rs]"));
+        assert!(!rendered.markdown.contains("\n  [src/fixture-alpha.rs]"));
     }
 
     #[test]

@@ -15,10 +15,10 @@ pub fn message(input: MessageInput) -> MessageOptions {
         attachments
             .into_iter()
             .map(|attachment| {
-                let FileAttachment { path, display_name } = attachment;
+                let FileAttachment { path, label, .. } = attachment;
                 Attachment::File {
                     path,
-                    display_name: Some(display_name),
+                    display_name: Some(label),
                     line_range: None,
                 }
             })

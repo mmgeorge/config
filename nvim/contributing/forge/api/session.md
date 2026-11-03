@@ -1153,7 +1153,7 @@ Inspect the installed provider integration.
 
 ### Contract
 
-Calls the selected provider's inspection operation and returns runtime availability, separate native CLI and ACP adapter versions, and authentication methods. It never installs software. The operation requires idle source execution and no pending cleanup, and invalidates MCP discovery after success. Unsupported providers, active work, and handshake failures are errors. A missing adapter returns unavailable status. It does not send a chat prompt.
+Calls the selected provider's inspection operation and returns normalized `runtime.kind` (`available`, `missing`, `incompatible`, or `unavailable`), `origin` (`configured` or `managed`), independent `versions.provider` and `versions.adapter` observations, and `authentication` choices. Version observations are `known` with a version, `not_reported`, or `failed` with a normalized failure category. Authentication carries an opaque method ID, label, description, and either a provider-managed interaction or a terminal launch specification. Probe failure does not hide otherwise available authentication methods. It never installs software or sends model input. The operation requires idle execution and no pending cleanup, and invalidates MCP discovery after success. Unsupported providers and active work return typed errors; unavailable runtimes return their typed status.
 
 ## `session.provider.skill.list`
 

@@ -39,5 +39,5 @@ pub mod turn;
 pub mod workspace;
 
 #[cfg(test)]
-#[path = "../tests/live_provider/suite.rs"]
+#[path = "../../forge-providers/tests/fixtures/live_host/suite.rs"]
 mod live_provider;

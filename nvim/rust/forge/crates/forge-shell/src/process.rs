@@ -118,20 +118,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let installation = directory.path().join("npm bin");
         std::fs::create_dir(&installation).unwrap();
-        std::fs::write(installation.join("codex"), "#!/bin/sh\n").unwrap();
-        std::fs::write(installation.join("codex.cmd"), "@echo off\r\n").unwrap();
+        std::fs::write(installation.join("fixture-cli"), "#!/bin/sh\n").unwrap();
+        std::fs::write(installation.join("fixture-cli.cmd"), "@echo off\r\n").unwrap();
 
         assert_eq!(
-            executable_at("codex", directory.path(), installation.as_os_str()),
-            Some(installation.join("codex.cmd"))
+            executable_at("fixture-cli", directory.path(), installation.as_os_str()),
+            Some(installation.join("fixture-cli.cmd"))
         );
         assert_eq!(
-            executable_at("codex", &installation, std::ffi::OsStr::new("")),
-            Some(installation.join("codex.cmd"))
+            executable_at("fixture-cli", &installation, std::ffi::OsStr::new("")),
+            Some(installation.join("fixture-cli.cmd"))
         );
-        std::fs::remove_file(installation.join("codex.cmd")).unwrap();
+        std::fs::remove_file(installation.join("fixture-cli.cmd")).unwrap();
         assert_eq!(
-            executable_at("codex", directory.path(), installation.as_os_str()),
+            executable_at("fixture-cli", directory.path(), installation.as_os_str()),
             None
         );
     }
@@ -139,9 +139,9 @@ mod tests {
     #[test]
     fn explicit_windows_launcher_does_not_resolve_a_different_suffix() {
         let directory = tempfile::tempdir().unwrap();
-        let launcher = directory.path().join("codex.CMD");
+        let launcher = directory.path().join("fixture-cli.CMD");
         std::fs::write(&launcher, "@echo off\r\n").unwrap();
-        std::fs::write(directory.path().join("codex.exe.cmd"), "@echo off\r\n").unwrap();
+        std::fs::write(directory.path().join("fixture-cli.exe.cmd"), "@echo off\r\n").unwrap();
 
         assert_eq!(
             executable_at(
@@ -152,7 +152,7 @@ mod tests {
             Some(launcher)
         );
         assert_eq!(
-            executable_at("codex.exe", directory.path(), std::ffi::OsStr::new("")),
+            executable_at("fixture-cli.exe", directory.path(), std::ffi::OsStr::new("")),
             None
         );
     }
@@ -162,13 +162,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let installation = directory.path().join("npm bin");
         std::fs::create_dir(&installation).unwrap();
-        std::fs::write(installation.join("codex"), "#!/bin/sh\n").unwrap();
+        std::fs::write(installation.join("fixture-cli"), "#!/bin/sh\n").unwrap();
         std::fs::write(
-            installation.join("codex.cmd"),
+            installation.join("fixture-cli.cmd"),
             "@echo off\r\necho %~1 %~2\r\n",
         )
         .unwrap();
-        let launcher = executable_at("codex", directory.path(), installation.as_os_str()).unwrap();
+        let launcher = executable_at("fixture-cli", directory.path(), installation.as_os_str()).unwrap();
         let mut child = command(
             launcher.to_str().unwrap(),
             &["app-server".into(), "two words".into()],

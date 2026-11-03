@@ -30,6 +30,7 @@ pub enum CodexConnectionError {
 
 /// Retain transport size alongside decoded JSON or its precise parse failure.
 pub struct ReceivedMessage {
+    #[cfg(test)]
     pub encoded_bytes: usize,
     pub value: Result<Value, serde_json::Error>,
 }
@@ -37,9 +38,9 @@ pub struct ReceivedMessage {
 /// Keep the socket reader alive independently of any RPC or foreground consumer.
 pub struct CodexConnection {
     commands: mpsc::Sender<Command>,
-    received: mpsc::Receiver<ReceivedMessage>,
+    received: tokio::sync::Mutex<mpsc::Receiver<ReceivedMessage>>,
     failure: watch::Receiver<Option<CodexConnectionError>>,
-    task: Option<JoinHandle<()>>,
+    task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 enum Command {
@@ -72,14 +73,14 @@ impl CodexConnection {
         });
         Ok(Self {
             commands,
-            received,
+            received: tokio::sync::Mutex::new(received),
             failure: failures,
-            task: Some(task),
+            task: tokio::sync::Mutex::new(Some(task)),
         })
     }
 
     /// Await only the socket write; cancelling the waiter does not retract a queued write.
-    pub async fn send(&mut self, encoded: String) -> Result<(), CodexConnectionError> {
+    pub async fn send(&self, encoded: String) -> Result<(), CodexConnectionError> {
         if let Some(error) = self.failure.borrow().clone() {
             return Err(error);
         }
@@ -94,13 +95,19 @@ impl CodexConnection {
     }
 
     /// Drain retained frames in order before exposing sticky observation failure.
-    pub async fn receive(&mut self) -> Result<ReceivedMessage, CodexConnectionError> {
-        self.received.recv().await.ok_or_else(|| self.stopped())
+    pub async fn receive(&self) -> Result<ReceivedMessage, CodexConnectionError> {
+        self.received
+            .lock()
+            .await
+            .recv()
+            .await
+            .ok_or_else(|| self.stopped())
     }
 
     /// Close and collect the socket owner after the adapter has drained required native work.
-    pub async fn close(&mut self) -> Result<(), CodexConnectionError> {
-        let Some(task) = self.task.as_mut() else {
+    pub async fn close(&self) -> Result<(), CodexConnectionError> {
+        let mut task = self.task.lock().await;
+        let Some(running) = task.as_mut() else {
             return Ok(());
         };
         let (reply, response) = oneshot::channel();
@@ -113,10 +120,10 @@ impl CodexConnection {
         } else {
             Ok(())
         };
-        let collected = task.await.map_err(|error| {
+        let collected = running.await.map_err(|error| {
             CodexConnectionError::Closed(format!("Codex socket owner failed: {error}"))
         });
-        self.task.take();
+        task.take();
         collected?;
         result
     }
@@ -133,7 +140,7 @@ impl CodexConnection {
 impl Drop for CodexConnection {
     /// Prevent a cancelled initialization from leaving an unowned socket task behind.
     fn drop(&mut self) {
-        if let Some(task) = &self.task {
+        if let Some(task) = self.task.get_mut().as_ref() {
             task.abort();
         }
     }
@@ -180,7 +187,7 @@ async fn run_socket(
                     Message::Pong(_) | Message::Frame(_) => continue,
                     Message::Close(close) => return Err(CodexConnectionError::Closed(format!("shared Codex app-server closed the session channel: {close:?}"))),
                 };
-                let message = ReceivedMessage { encoded_bytes: encoded.len(), value: serde_json::from_str(&encoded) };
+                let message = ReceivedMessage { #[cfg(test)] encoded_bytes: encoded.len(), value: serde_json::from_str(&encoded) };
                 match publish.try_send(message) {
                     Ok(()) => {},
                     Err(mpsc::error::TrySendError::Full(_)) => return Err(CodexConnectionError::Overflow),
@@ -216,7 +223,7 @@ mod tests {
                 Message::Pong(vec![7].into())
             );
         });
-        let mut connection = CodexConnection::connect(&format!("ws://{address}"))
+        let connection = CodexConnection::connect(&format!("ws://{address}"))
             .await
             .unwrap();
         let message = connection.receive().await.unwrap();
@@ -235,7 +242,7 @@ mod tests {
             socket.send(Message::Text("{".into())).await.unwrap();
             socket.send(Message::Close(None)).await.unwrap();
         });
-        let mut connection = CodexConnection::connect(&format!("ws://{address}"))
+        let connection = CodexConnection::connect(&format!("ws://{address}"))
             .await
             .unwrap();
         let malformed = connection.receive().await.unwrap();
@@ -265,7 +272,7 @@ mod tests {
                 Message::Pong(vec![9].into())
             );
         });
-        let mut connection = CodexConnection::connect(&format!("ws://{address}"))
+        let connection = CodexConnection::connect(&format!("ws://{address}"))
             .await
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), server)

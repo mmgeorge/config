@@ -101,8 +101,11 @@ async fn settings(
         PathBuf::from(&registry.initialize.data_root).as_path(),
     )?;
     if method == RuntimeMethod::SettingsGet {
-        let snapshot =
-            settings.catalog(&workspace, session_key, &registry.initialize.provider.kind)?;
+        let snapshot = settings.catalog(
+            &workspace,
+            session_key,
+            registry.initialize.provider.kind.as_str(),
+        )?;
         let mut value = serde_json::to_value(snapshot.settings)?;
         value["catalog"] = json!({"mcp":snapshot.server,"skill":snapshot.skill});
         value["layers"] = json!({
@@ -122,7 +125,7 @@ async fn settings(
             &request.params,
             &workspace,
             session_key,
-            &registry.initialize.provider.kind,
+            registry.initialize.provider.kind.as_str(),
         )
         .await?;
         let result = serde_json::to_value(preview)?;
@@ -151,7 +154,11 @@ async fn settings(
             Some(revision) => revision,
             None if resource_mutation => {
                 settings
-                    .get(&workspace, session_key, &registry.initialize.provider.kind)?
+                    .get(
+                        &workspace,
+                        session_key,
+                        registry.initialize.provider.kind.as_str(),
+                    )?
                     .revision
             }
             None => anyhow::bail!("settings require expected_revision"),
@@ -182,7 +189,7 @@ async fn settings(
                 &request.params,
                 &workspace,
                 session_key,
-                &registry.initialize.provider.kind,
+                registry.initialize.provider.kind.as_str(),
             )
             .await?;
             settings = restored;

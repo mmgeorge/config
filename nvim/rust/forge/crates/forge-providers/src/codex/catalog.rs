@@ -1,7 +1,14 @@
 use forge_provider_api::ProviderModel;
-use forge_provider_api::catalog::{McpDefinition, McpStatus, McpToolDefinition, SkillDefinition};
+use forge_provider_api::catalog::{
+    McpDefinition, McpStatus, McpToolDefinition, McpTransportKind, SkillDefinition,
+};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+
+fn sanitized_diagnostic(message: &str) -> forge_provider_api::diagnostic::SanitizedMessage {
+    forge_provider_api::diagnostic::SanitizedMessage::new(message)
+        .expect("static diagnostic text is nonempty")
+}
 
 /// Decode native skill discovery into provider-neutral catalog entries.
 pub fn parse_skill_catalog(result: &Value) -> Vec<SkillDefinition> {
@@ -106,16 +113,12 @@ pub fn parse_mcp_catalog(result: &Value, config_result: &Value) -> Vec<McpDefini
             let tool_error = server
                 .get("toolsError")
                 .or_else(|| server.get("toolError"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+                .is_some_and(|error| !error.is_null())
+                .then(|| sanitized_diagnostic("Provider reported an MCP tool discovery error"));
             let error = server
                 .get("error")
-                .and_then(|error| {
-                    error
-                        .as_str()
-                        .or_else(|| error.get("message").and_then(Value::as_str))
-                })
-                .map(str::to_owned)
+                .is_some_and(|error| !error.is_null())
+                .then(|| sanitized_diagnostic("Provider reported an MCP server error"))
                 .or_else(|| tool_error.clone());
             let tool_value = server.get("tools");
             let status = if !enabled || status_text.contains("disabled") {
@@ -204,8 +207,13 @@ pub fn parse_mcp_catalog(result: &Value, config_result: &Value) -> Vec<McpDefini
                     })
                 })
                 .or_else(|| server.get("type").and_then(Value::as_str))
-                .unwrap_or("unknown")
-                .to_owned();
+                .map(|transport| match transport.to_ascii_lowercase().as_str() {
+                    "stdio" => McpTransportKind::Stdio,
+                    "http" => McpTransportKind::Http,
+                    "sse" => McpTransportKind::Sse,
+                    _ => McpTransportKind::Unknown,
+                })
+                .unwrap_or(McpTransportKind::Unknown);
             Some(McpDefinition {
                 scope: None,
                 source_path: None,
@@ -294,6 +302,20 @@ pub fn quoted_config_segment(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+/// Order this provider's native effort vocabulary before publishing its model catalog.
+fn ordered_efforts(mut choices: Vec<String>) -> Vec<String> {
+    let order = [
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    ];
+    choices.sort_by_key(|value| {
+        order
+            .iter()
+            .position(|item| *item == value)
+            .unwrap_or(order.len())
+    });
+    choices
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,13 +370,13 @@ mod tests {
         );
         assert_eq!(mcp_list.len(), 2);
         assert_eq!(mcp_list[0].name, "github");
-        assert_eq!(mcp_list[0].transport, "stdio");
+        assert_eq!(mcp_list[0].transport, McpTransportKind::Stdio);
         assert_eq!(mcp_list[0].status, McpStatus::Connected);
         assert_eq!(mcp_list[0].tools.len(), 2);
         assert!(mcp_list[0].token_count.is_some());
         assert!(mcp_list[0].token_estimated);
         assert_eq!(mcp_list[1].name, "legacy");
-        assert_eq!(mcp_list[1].transport, "http");
+        assert_eq!(mcp_list[1].transport, McpTransportKind::Http);
         assert_eq!(mcp_list[1].status, McpStatus::Disabled);
     }
 
@@ -380,20 +402,12 @@ mod tests {
             &json!({}),
         );
         assert_eq!(catalog[0].status, McpStatus::Failed);
-        assert_eq!(catalog[0].tool_error.as_deref(), Some("Discovery failed"));
+        assert_eq!(
+            catalog[0]
+                .tool_error
+                .as_ref()
+                .map(|message| message.as_str()),
+            Some("Provider reported an MCP tool discovery error"),
+        );
     }
-}
-
-/// Order this provider's native effort vocabulary before publishing its model catalog.
-fn ordered_efforts(mut choices: Vec<String>) -> Vec<String> {
-    let order = [
-        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-    ];
-    choices.sort_by_key(|value| {
-        order
-            .iter()
-            .position(|item| *item == value)
-            .unwrap_or(order.len())
-    });
-    choices
 }

@@ -663,11 +663,10 @@ impl SessionTaskController {
                     ) => Some(super::TaskContinuation {
                         id: super::TaskInputId::fresh(),
                         work: super::TaskWork::Provider {
-                            instruction: if goal.native {
-                                "/goal resume".into()
-                            } else {
-                                format!("Continue working toward this goal: {}", goal.objective)
-                            },
+                            instruction: format!(
+                                "Continue working toward this goal: {}",
+                                goal.objective
+                            ),
                         },
                         reason: "The active task requires another turn".into(),
                         delivery: crate::task::TaskInputDelivery::Pending,

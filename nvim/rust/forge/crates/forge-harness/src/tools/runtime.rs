@@ -10,6 +10,8 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct ControlTurnContext {
     pub(crate) provider_completion: Arc<crate::provider::CompletionSlot>,
+    /// One-use provider authorization to resume accepted history without resubmitting input.
+    pub(crate) provider_continuation: Option<forge_provider_api::ContinuationToken>,
     pub(crate) questions: Option<Arc<crate::question::QuestionController>>,
     pub(crate) question_exchange_id: Option<String>,
     pub(crate) question_discussion: bool,
@@ -18,7 +20,8 @@ pub struct ControlTurnContext {
     pub(crate) task_generation: Option<u64>,
     pub(crate) permission_snapshot: Option<super::authority::PermissionAuthoritySnapshot>,
     pub(crate) permission_required: bool,
-    pub(crate) native_goal: Option<String>,
+    pub(crate) native_goal: Option<forge_provider_api::NativeGoalCommand>,
+    pub(crate) task_start: Option<forge_provider_api::input::TaskStart>,
     pub(crate) submission_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub checkpoint: Option<crate::checkpoint::ToolGate>,
     pub agent: Option<Arc<crate::agent::AgentToolScope>>,
@@ -129,23 +132,27 @@ impl ControlTurnContext {
             }
             ExecutionResult::Cancelled { .. } => Err(ProviderError::Cancelled),
             ExecutionResult::Failed { failure, .. } => match failure {
-                ExecutionFailure::Rejected { message } => Err(ProviderError::Rejected {
-                    message: message.clone(),
-                }),
-                ExecutionFailure::Terminal { code, message } => Err(ProviderError::Provider {
-                    code: code.clone(),
-                    message: message.clone(),
-                }),
+                ExecutionFailure::Rejected => Err(ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::AdmitInput,
+                        forge_provider_api::ProviderFailureKind::Rejected,
+                    ),
+                )),
+                ExecutionFailure::Terminal { kind } => Err(ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::AdmitInput,
+                        *kind,
+                    ),
+                )),
                 ExecutionFailure::Retryable {
                     address,
-                    code,
-                    message,
+                    category,
+                    continuation,
                 } => Err(ProviderError::Retryable(Box::new(
                     forge_provider_api::retry::RetryableFailure {
                         address: address.clone(),
-                        code: code.clone(),
-                        message: message.clone(),
-                        detail: serde_json::Value::Null,
+                        category: *category,
+                        continuation: continuation.clone(),
                     },
                 ))),
             },
@@ -156,6 +163,7 @@ impl ControlTurnContext {
     pub fn inactive(mode: PromptMode) -> Self {
         Self {
             provider_completion: Default::default(),
+            provider_continuation: None,
             questions: None,
             question_exchange_id: None,
             question_discussion: false,
@@ -165,6 +173,7 @@ impl ControlTurnContext {
             permission_snapshot: None,
             permission_required: false,
             native_goal: None,
+            task_start: None,
             submission_cancelled: None,
             checkpoint: None,
             agent: None,
@@ -193,7 +202,6 @@ pub struct ControlToolRuntime {
     pub(super) terminal: bool,
     pub(super) completion: Option<(String, String)>,
     pub(super) inspected: BTreeMap<String, String>,
-    pub(super) patch_source_digests: BTreeMap<u64, BTreeMap<String, String>>,
 }
 
 /// Returns one accepted invocation or an idempotent provider-visible result.
@@ -212,12 +220,12 @@ impl ControlToolRuntime {
             terminal: false,
             completion: None,
             inspected: BTreeMap::new(),
-            patch_source_digests: BTreeMap::new(),
         }
     }
 
     /// Validate a control invocation and await broker persistence for execution controls.
     pub async fn invoke(&mut self, invocation: ControlToolInvocation) -> Result<ControlToolResult> {
+        self.ensure_submission_active()?;
         if let Some(authority) = super::TaskAuthority::capture(&self.context) {
             authority.validate_scope()?;
         }
@@ -272,6 +280,7 @@ impl ControlToolRuntime {
         mut invocation: ControlToolInvocation,
         output: ProviderCompletion,
     ) -> Result<ControlToolResult> {
+        self.ensure_submission_active()?;
         invocation.admit_turn_control(
             self.context.task_controller.as_deref(),
             self.context.task_permit.as_ref(),
@@ -283,6 +292,7 @@ impl ControlToolRuntime {
         if let Some(authority) = super::TaskAuthority::capture(&self.context) {
             authority.validate_scope()?;
         }
+        self.ensure_submission_active()?;
         invocation.admit_turn_control(
             self.context.task_controller.as_deref(),
             self.context.task_permit.as_ref(),
@@ -338,6 +348,19 @@ impl ControlToolRuntime {
         }
     }
 
+    /// Reject callbacks whose submission was cancelled before host execution.
+    fn ensure_submission_active(&self) -> Result<()> {
+        if self
+            .context
+            .submission_cancelled
+            .as_ref()
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(crate::broker::TurnCancelled.into());
+        }
+        Ok(())
+    }
+
     /// Indicates that the current provider turn must stop after delivering its execution result.
     pub(crate) fn execution_finished(&self) -> bool {
         self.completion.is_some()
@@ -346,11 +369,6 @@ impl ControlToolRuntime {
     /// Return the staged canonical document after accepted plan edits.
     pub fn plan_document(&self) -> Option<&PlanDocument> {
         self.plan_document.as_ref()
-    }
-
-    /// Retain first-capture identities when transports collect a patch for broker replay.
-    pub(crate) fn patch_source_digests(&self, version: u64) -> Option<&BTreeMap<String, String>> {
-        self.patch_source_digests.get(&version)
     }
 
     pub(super) fn require_editable_plan(&self) -> Result<()> {
@@ -407,12 +425,10 @@ mod test {
         let context = ControlTurnContext::inactive(PromptMode::Chat);
         let result = forge_provider_api::lifecycle::ExecutionResult::Failed {
             completion: forge_provider_api::completion::ProviderCompletion::default().into(),
-            failure: forge_provider_api::lifecycle::ExecutionFailure::Rejected {
-                message: "denied".into(),
-            },
+            failure: forge_provider_api::lifecycle::ExecutionFailure::Rejected,
         };
         assert!(matches!(context.complete_provider_execution(&result),
-            Err(crate::provider::ProviderError::Rejected { message }) if message == "denied"));
+            Err(crate::provider::ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected));
     }
 
     /// A host rejection remains distinct from the native turn's successful terminal evidence.
@@ -427,19 +443,34 @@ mod test {
             .provider_completion
             .publish_host_outcome(ExecutionResult::Failed {
                 completion: forge_provider_api::completion::ProviderCompletion::default().into(),
-                failure: ExecutionFailure::Rejected {
-                    message: "denied".into(),
-                },
+                failure: ExecutionFailure::Rejected,
             })
             .unwrap();
         let ProviderExecutionPreview {
             revision, outcome, ..
         } = context.preview_provider_execution(&native).unwrap();
         assert!(
-            matches!(outcome, Err(crate::provider::ProviderError::Rejected { message }) if message == "denied")
+            matches!(outcome, Err(crate::provider::ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)
         );
         assert!(matches!(native, ExecutionResult::Completed { .. }));
         assert!(context.commit_provider_execution(revision).unwrap());
+    }
+
+    /// Fence a queued control callback before it can inspect or mutate host state.
+    #[tokio::test]
+    async fn cancelled_submission_rejects_control_callback() {
+        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
+        context.submission_cancelled = Some(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let mut runtime = ControlToolRuntime::new(context);
+        let error = runtime
+            .invoke(ControlToolInvocation {
+                task_permit: None,
+                name: "unreachable_control".into(),
+                arguments: json!({}),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.is::<crate::broker::TurnCancelled>());
     }
 
     #[tokio::test]
@@ -832,10 +863,12 @@ mod test {
         crate::checks::configure_fixture(&workspace);
         ControlTurnContext {
             provider_completion: Default::default(),
+            provider_continuation: None,
             questions: None,
             question_exchange_id: None,
             question_discussion: false,
             native_goal: None,
+            task_start: None,
             submission_cancelled: None,
             checkpoint: None,
             agent: None,

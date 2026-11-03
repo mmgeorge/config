@@ -85,6 +85,7 @@ async fn detached_required_answer_continues_original_exchange_before_or_after_co
             question_id,
             task_id: None,
             message_kind: QuestionMessageKind::Answer,
+            reply: packet.reply.clone(),
         };
         let result = broker
             .dispatch(Request {
@@ -166,6 +167,8 @@ async fn detached_required_answer_rejects_cancelled_or_newer_exchange() -> Resul
         }
         let count = broker.store.list_exchange(&broker.session.id)?.len();
         broker.input_purpose = crate::input::InputPurpose::Question {
+            reply: crate::provider::test_support::question_reply(&question_id,
+                forge_provider_api::QuestionReplyResponse::Answer { answer: "JSON".into(), required_questions_remain: false }),
             question_id,
             task_id: None,
             message_kind: QuestionMessageKind::Answer,
@@ -274,15 +277,11 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
             fail: outcome == "fail",
         });
         let tool_ran = Arc::new(AtomicBool::new(false));
-        broker.provider = Arc::new(CheckpointProvider {
-            fixture_events: Default::default(),
-            preparation: Some(preparation.clone()),
-            native_rejection: None,
-            cleanup_error: None,
-            started: Arc::new(Notify::new()),
-            tool_ran: tool_ran.clone(),
-            active: Default::default(),
-        });
+        let provider_fixture = checkpoint_fixture(
+            repository.path().to_owned(), Some(preparation.clone()), Arc::new(Notify::new()),
+            tool_ran.clone(), Default::default(), None, false,
+        )?;
+        broker.provider = provider_fixture.provider_handle();
         let (sink, mut stream) = publication::channel();
         broker.event_sink = Some(sink);
         let session_id = broker.session.id.clone();

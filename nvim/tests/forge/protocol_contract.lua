@@ -37,7 +37,7 @@ local ok, failure = xpcall(function()
     kind = "prompt_submission", data = { document = "document", token = "1", state = "accepted" },
   } })
   decode({ session_id = "session", event = "provider_event", payload = {
-    kind = "runtime_resolved", data = { session_id = "session", provider = "Codex", model = vim.NIL },
+    kind = "runtime_resolved", data = { session_id = "session", provider = "Fixture Alpha", model = vim.NIL },
   } })
   decode({ session_id = "session", event = "provider_event", payload = {
     kind = "prompt_submission", data = { document = "document", token = 1, state = "accepted" },

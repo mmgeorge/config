@@ -1,10 +1,18 @@
 //! Native provider protocols and state independent of Harness workflows and policy.
 
-pub mod acp;
-pub mod codex;
-pub mod copilot;
-pub mod terminal;
+// Match the host recursion budget when proving nested SDK callback futures are Send.
+#![recursion_limit = "256"]
+
+mod acp;
+mod codex;
+mod copilot;
+mod mock;
+mod retained_task;
+mod terminal;
+mod tool_display;
 
 mod error;
+mod profile;
 
-pub mod permission_input;
+mod permission_input;
+pub mod registry;

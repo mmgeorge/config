@@ -1,6 +1,6 @@
 vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
 local state = require("forge.session").harness
-state.session = { id = "setup-test", provider = "claude" }
+state.session = { id = "setup-test", provider = "fixture" }
 local notices = {}
 vim.notify = function(message, level) notices[#notices + 1] = { message = message, level = level } end
 local available = false
@@ -20,11 +20,15 @@ package.loaded["forge.client"] = { request = function(request_specification, cal
     if method == "session.provider.setup" then
       refreshes = refreshes + 1
       assert(params.install == nil, "setup must never request installation")
-      callback({ available = available, managed = false,
-        adapter_version = available and "0.89.1" or nil, provider_version = not version_error and "2.1.302" or nil,
-        version_error = version_error,
-        auth_methods = available and { { id = "oauth", label = "OAuth", terminal = true, command = auth_command,
-          environment = { FORGE_AUTH_FIXTURE = "installed-cli" } } } or {},
+      callback({ runtime = { kind = available and "available" or "missing" }, origin = "configured",
+        versions = {
+          adapter = available and { kind = "known", version = "0.89.1" } or { kind = "not_reported" },
+          provider = version_error and { kind = "failed", failure = version_error } or { kind = "known", version = "2.1.302" },
+        },
+        authentication = available and { { id = "login", label = "Sign in", interaction = {
+          kind = "terminal", launch = { program = auth_command[1], arguments = { unpack(auth_command, 2) },
+            environment = { FORGE_AUTH_FIXTURE = "installed-cli" } },
+        } } } or {},
       })
     else callback({ authenticated = true }) end
   end)
@@ -48,16 +52,16 @@ assert(not selected("install"), "missing runtime exposed an installer")
 assert(spec.page_list[1].subtitle:find("Provider version 2.1.302", 1, true), "installed CLI version is hidden without an adapter")
 available = true
 spec.on_confirm({ option = option })
-spec, option = wait_for("oauth")
+spec, option = wait_for("login")
 assert(not selected("install"), "available runtime exposed an installer")
 assert(spec.page_list[1].subtitle:find("Provider version 2.1.302 · Adapter 0.89.1", 1, true), "CLI and adapter versions were conflated")
 spec.on_confirm({ option = option })
 assert(vim.wait(5000, function() return not state.configuring and refreshes == 3 end, 10), "successful terminal login did not refresh setup")
-wait_for("oauth")
+wait_for("login")
 local before = refreshes
 auth_command = { "node", "-e", "process.exit(7)" }
 setup.open({ host = host, session_id = "setup-test" })
-spec, option = wait_for("oauth")
+spec, option = wait_for("login")
 spec.on_confirm({ option = option })
 assert(vim.wait(5000, function() return not state.configuring end, 10), "failed login left configuration blocked")
 assert(refreshes == before + 1, "failed login was reported as successful")
@@ -67,7 +71,7 @@ for _, window in ipairs(vim.api.nvim_list_wins()) do
 end
 auth_command = { "node", "-e", "setInterval(() => {}, 1000)" }
 setup.open({ host = host, session_id = "setup-test" })
-spec, option = wait_for("oauth")
+spec, option = wait_for("login")
 before = refreshes
 spec.on_confirm({ option = option })
 local login_window = vim.api.nvim_get_current_win()
@@ -79,11 +83,11 @@ assert(vim.wait(5000, function()
   return not state.configuring and vim.fn.jobwait({ login_job }, 0)[1] ~= -1
 end, 10), "cancelled login retained its process or configuration lock")
 assert(refreshes == before, "cancelled login was reported as successful")
-version_error = "Claude Code version check failed: fixture error"
+version_error = "runtime"
 setup.open({ host = host, session_id = "setup-test" })
-spec, option = wait_for("oauth")
-assert(spec.page_list[1].subtitle:find(version_error, 1, true), "version failure was hidden")
-assert(option.value.terminal, "version failure removed authentication actions")
+spec, option = wait_for("login")
+assert(spec.page_list[1].subtitle:find("Provider version check failed (runtime)", 1, true), "version failure was hidden")
+assert(option.value.interaction.kind == "terminal", "version failure removed authentication actions")
 picker.close()
 print("harness_provider_setup: passed")
 vim.cmd("qa!")

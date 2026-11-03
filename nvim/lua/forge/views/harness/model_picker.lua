@@ -140,7 +140,7 @@ function ModelPicker.open(options)
   local source_model_list = vim.deepcopy(options.model_list)
   local provider = assert(options.provider, "model picker requires provider identity")
   local pinned_id_set = model_pins.get(provider) or {}
-  local model_list = model_order.order(source_model_list, provider, pinned_id_set)
+  local model_list = model_order.order(source_model_list, pinned_id_set)
   lifetime = lifetime + 1
   local owner = "harness-model-" .. lifetime
   local function is_current()
@@ -238,7 +238,7 @@ function ModelPicker.open(options)
             if failure then notifications.error("Failed to pin Harness model: " .. failure, "Harness model") return end
             if not is_current() then return end
             pinned_id_set = next_pin_set or {}
-            model_list = model_order.order(source_model_list, provider, pinned_id_set)
+            model_list = model_order.order(source_model_list, pinned_id_set)
             api.update(build_spec())
           end)
         end,

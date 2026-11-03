@@ -1,3 +1,5 @@
+type TestReceiptWaiters = Arc<std::sync::Mutex<Vec<(String, tokio::sync::oneshot::Sender<()>)>>>;
+
 fn save_child_profile(
     broker: &HarnessBroker,
     name: &str,
@@ -14,10 +16,9 @@ fn save_child_profile(
 }
 
 struct RoutingProvider {
-    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    kind: crate::provider::ProviderKind,
+    kind: crate::provider::ProviderId,
     turn: std::sync::atomic::AtomicUsize,
-    request: std::sync::Mutex<Vec<ProviderRequest>>,
+    request: Arc<std::sync::Mutex<Vec<forge_provider_api::PromptRequest>>>,
     reject_steering: bool,
 }
 
@@ -135,19 +136,11 @@ async fn profile_toggles_gate_fresh_and_retained_child_admission() -> Result<()>
 async fn profile_selection_captures_tuning_and_instructions_without_widening_permissions()
 -> Result<()> {
     use crate::agent::{AgentProfile, SpawnAgentRequest};
-    use crate::provider::ProviderKind;
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    broker
-        .agent_provider_factory
-        .register(Arc::new(RoutingProvider {
-            fixture_events: Default::default(),
-            kind: ProviderKind::Codex,
-            turn: std::sync::atomic::AtomicUsize::new(0),
-            request: Default::default(),
-            reject_steering: false,
-        }));
+    let (_routing, routing_fixture) = routing_fixture(forge_providers::registry::default_id(), false)?;
+    broker.agent_provider_factory.register(routing_fixture.provider_handle());
     let mut root =
         broker.provider_request(ProviderInput::from_text("parent secret"), PromptMode::Chat)?;
     root.model = "parent-model".into();
@@ -157,7 +150,7 @@ async fn profile_selection_captures_tuning_and_instructions_without_widening_per
         .agent_provider_factory
         .resolve(
             &root,
-            ProviderKind::Mock,
+            forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"),
             &SpawnAgentRequest {
                 profile: None,
                 text: "task".into(),
@@ -170,7 +163,7 @@ async fn profile_selection_captures_tuning_and_instructions_without_widening_per
         &broker,
         "review",
         AgentProfile {
-            provider: "codex".into(),
+            provider: forge_providers::registry::default_id().to_string(),
             model: "default".into(),
             reasoning_effort: "default".into(),
             service_tier: "default".into(),
@@ -185,9 +178,9 @@ async fn profile_selection_captures_tuning_and_instructions_without_widening_per
     };
     let selected = broker
         .agent_provider_factory
-        .resolve(&root, ProviderKind::Mock, &spawn)
+        .resolve(&root, forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"), &spawn)
         .await?;
-    assert_eq!(selected.provider, ProviderKind::Codex);
+    assert_eq!(selected.provider, forge_providers::registry::default_id());
     assert_eq!(selected.model, "fixture-model");
     assert_eq!(selected.reasoning_effort, "low");
     assert_eq!(selected.approval_mode, ApprovalMode::Ask);
@@ -216,7 +209,7 @@ async fn profile_selection_captures_tuning_and_instructions_without_widening_per
     assert!(request.control_context.is_none());
     let next = broker
         .agent_provider_factory
-        .resolve(&root, ProviderKind::Mock, &spawn)
+        .resolve(&root, forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"), &spawn)
         .await?;
     assert_eq!(next.model, "changed-parent-model");
     assert_eq!(next.instructions, "Changed instructions");
@@ -224,14 +217,14 @@ async fn profile_selection_captures_tuning_and_instructions_without_widening_per
         &broker,
         "review",
         AgentProfile {
-            provider: "codex".into(),
+            provider: forge_providers::registry::default_id().to_string(),
             ..Default::default()
         },
     )?;
     assert!(
         broker
             .agent_provider_factory
-            .resolve(&root, ProviderKind::Mock, &spawn)
+            .resolve(&root, forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"), &spawn)
             .await
             .is_err(),
         "a foreign provider must reject an inherited unavailable model"
@@ -267,7 +260,7 @@ fn admit_child_fixture(broker: &mut HarnessBroker, name: &str) -> Result<crate::
     let selection = crate::agent::AgentSelection {
         profile: "worker".into(),
         instructions: String::new(),
-        provider: crate::provider::ProviderKind::Mock,
+        provider: forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"),
         model: "mock".into(),
         reasoning_effort: "low".into(),
         context_window: None,
@@ -950,7 +943,7 @@ async fn child_approval_events_reach_the_wire_and_interrupt_preserves_sibling_ap
                     ApprovalMode::Ask,
                     PermissionRequest {
                         id: "approval".into(),
-                        provider: "Codex".into(),
+                        provider: forge_provider_api::ProviderId::new("fixture").expect("fixture identity is valid"),
                         reason: None,
                         target_list: vec![PermissionTarget::Command {
                             command: "probe task".into(),
@@ -1141,25 +1134,18 @@ async fn child_admission_and_followup_disable_unsupported_root_sandbox() -> Resu
     let mut root = broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?;
     root.access.sandbox = true;
     assert!(root.access.sandbox);
-    for provider in [
-        crate::provider::ProviderKind::Copilot,
-        crate::provider::ProviderKind::Claude,
-        crate::provider::ProviderKind::Antigravity,
-    ] {
-        broker
-            .agent_provider_factory
-            .register(Arc::new(RoutingProvider {
-                fixture_events: Default::default(),
-                kind: provider,
-                turn: std::sync::atomic::AtomicUsize::new(0),
-                request: Default::default(),
-                reject_steering: false,
-            }));
+    for provider in forge_providers::registry::descriptors()
+        .into_iter()
+        .filter(|entry| entry.selectable && entry.id != forge_providers::registry::default_id())
+        .map(|entry| entry.id)
+    {
+        let (_routing, routing_fixture) = routing_fixture(provider.clone(), false)?;
+        broker.agent_provider_factory.register(routing_fixture.provider_handle());
         save_child_profile(
             &broker,
             "unsandboxed",
             crate::agent::AgentProfile {
-                provider: crate::agent::provider_name(provider).into(),
+                provider: provider.as_str().into(),
                 model: "fixture-model".into(),
                 reasoning_effort: "low".into(),
                 ..Default::default()
@@ -1171,7 +1157,7 @@ async fn child_admission_and_followup_disable_unsupported_root_sandbox() -> Resu
         };
         let selected = broker
             .agent_provider_factory
-            .resolve(&root, crate::provider::ProviderKind::Codex, &spawn)
+            .resolve(&root, forge_providers::registry::default_id(), &spawn)
             .await?;
         assert!(!selected.access.sandbox);
         let mut agent = admission.agent.clone();
@@ -1202,7 +1188,7 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
     let selection = crate::agent::AgentSelection {
         profile: "worker".into(),
         instructions: String::new(),
-        provider: crate::provider::ProviderKind::Mock,
+        provider: forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"),
         model: "mock-model".into(),
         reasoning_effort: "low".into(),
         context_window: None,
@@ -1300,16 +1286,10 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
             .await
             .is_err()
     );
-    broker.child_provider_by_agent.insert(
-        first.agent.id.clone(),
-        Arc::new(RoutingProvider {
-            fixture_events: Default::default(),
-            kind: crate::provider::ProviderKind::Mock,
-            turn: std::sync::atomic::AtomicUsize::new(0),
-            request: Default::default(),
-            reject_steering: true,
-        }),
-    );
+    let (_routing, routing_fixture) = routing_fixture(
+        forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"), true,
+    )?;
+    broker.child_provider_by_agent.insert(first.agent.id.clone(), routing_fixture.provider_handle());
     let message = broker
         .handle_agent_request(
             crate::agent::AgentRequest {
@@ -1445,260 +1425,99 @@ async fn managed_child_replays_and_late_failures_preserve_sibling_and_followup_h
     Ok(())
 }
 
-#[async_trait::async_trait]
-impl crate::provider::ProviderAdapter for RoutingProvider {
-    type Host = crate::provider::HarnessProviderHost;
-    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-        crate::provider::ProviderDescriptor {
-            kind: self.kind,
-            label: crate::agent::provider_name(self.kind).into(),
-            capability: crate::provider::mock_capability(),
-        }
-    }
-    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.fixture_events.shutdown().await?;
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::Shutdown,
-                source,
-            )
-        })
-    }
-    async fn has_active_turn(&self, _session_id: &str) -> bool {
-        self.reject_steering
-    }
-    async fn session_steer(
-        self: std::sync::Arc<Self>,
-        owner: &crate::provider::ExecutionOwner,
-        scope: crate::provider::InvocationScope,
-        input: crate::provider::SteeringInput,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        if scope.owner != *owner {
-            return Err(crate::provider::ProviderError::Rejected {
-                message: "steering crosses owner".into(),
-            });
-        }
-        let events = self.fixture_events.clone();
-        if !events.running(&scope).await? {
-            let request = events.continuation(&scope, input)?;
-            return self.session_prompt(request, scope).await;
-        }
-        events
-            .steer(&scope, input, |input| async move {
-                self.steer_native(&owner.runtime_key(), input)
-                    .await
-                    .map_err(crate::provider::ProviderError::from)
-            })
-            .await
-    }
-    async fn cancel_session(
-        &self,
-        runtime_key: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.fixture_events.cancel_runtime(runtime_key).await?;
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CancelSession,
-                source,
-            )
-        })
-    }
-    async fn cleanup_execution(
-        &self,
-        runtime_key: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.fixture_events.cancel_runtime(runtime_key).await?;
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
-                source,
-            )
-        })
-    }
-    async fn fence_session(
-        &self,
-        owner: &crate::provider::ExecutionOwner,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.fixture_events.cancel(owner).await?;
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::FenceSession,
-                source,
-            )
-        })
-    }
-    async fn active_session_id_for(
-        &self,
-        _session_id: &str,
-    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-        Ok(None)
-    }
-    async fn model_list(
-        &self,
-        _request: ProviderRequest,
-    ) -> Result<Vec<crate::provider::ProviderModel>> {
-        Ok(vec![serde_json::from_value(
-            json!({"id":"fixture-model","reasoning":["low"],"default_reasoning":"low",
-            "service_tiers":["default","fast"],
-            "selected_reasoning":null,"context_window":[{"id":"extended","token_limit":200000}],"default_context_window":null,"selected_context_window":null,
-            "vision":false,"description":null,"is_default":true}),
-        )?])
-    }
-
-    async fn session_events(
-        &self,
-        owner: crate::provider::ExecutionOwner,
-    ) -> std::result::Result<
-        crate::provider::events::ProviderEventStream,
-        crate::provider::ProviderError,
-    > {
-        let stream = self.fixture_events.subscribe(owner.clone())?;
-        Ok(stream)
-    }
-
-    async fn session_prompt(
-        self: std::sync::Arc<Self>,
-        request: crate::provider::ProviderRequest,
-        scope: crate::provider::InvocationScope,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let events = self.fixture_events.clone();
-        events
-            .submit(
-                request,
-                scope,
-                crate::provider::test_support::TerminalBoundary::LocalFixture,
-                move |request, sink| async move { self.run_native(request, sink).await },
-            )
-            .await
-    }
-}
-
 impl RoutingProvider {
-    async fn steer_native(
-        &self,
-        _session_id: &str,
-        _input: crate::provider::SteeringInput,
-    ) -> Result<()> {
-        Err(anyhow::anyhow!("steering was not accepted"))
-    }
-}
-
-impl RoutingProvider {
-    async fn run_native(
-        &self,
-        request: ProviderRequest,
-        sink: ProviderEventSink,
-    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-        let fixture_scope = sink.invocation_scope()?.clone();
-        let fixture = crate::provider::test_support::FixtureStream::new(sink);
-        let sink = fixture.clone();
-        let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-
-        let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-let sink = Some(sink);
-        let ordinal = self.turn.fetch_add(1, Ordering::AcqRel);
-        let response = if request.owner()?.is_root() {
-            if ordinal == 0 {
-                let scope = request
-                    .control_context
-                    .as_ref()
-                    .and_then(|context| context.agent.as_ref())
-                    .context("missing root authority")?;
-                scope
-                    .invoke(
-                        "agent_spawn",
-                        json!({"profile":"routing-child","text":"CHILD_RESULT"}),
-                    )
-                    .await?;
-                "Waiting"
-            } else {
-                anyhow::ensure!(ordinal == 1, "root continuation duplicated");
-                anyhow::ensure!(
-                    request.provider_session_id.as_ref().map(|id| id.as_str()) == Some("root-history"),
-                    "root history changed"
-                );
-                anyhow::ensure!(
-                    matches!(&request.input,ProviderInput::Text {text, ..} if text.contains("CHILD_RESULT")),
-                    "missing child result"
-                );
-                "SYNTHESIZED_RESULT"
-            }
-        } else {
-            anyhow::ensure!(
-                request.control_context.is_none(),
-                "child inherited root workflow authority"
-            );
-            anyhow::ensure!(
-                request.provider_session_id.is_none(),
-                "fresh child inherited provider history"
-            );
-            anyhow::ensure!(
-                matches!(&request.input,ProviderInput::Text {text, ..} if text.ends_with("CHILD_RESULT")),
-                "child inherited parent transcript"
-            );
-            self.request.lock().unwrap().push(request.clone());
-            "CHILD_RESULT"
-        };
-        if let Some(sink) = sink {
-            sink.send_wait(completed_message(&crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
-                "routing-response", crate::provider::MessageRole::Response, response,
-            ))
-            .await?;
-        }
-        Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {  provider_session_id: Some(
-                if request.owner()?.is_root() {
-                    "root-history"
+    fn fixture(self: &Arc<Self>) -> Arc<crate::provider::test_support::EventFixtureProvider> {
+        let descriptor = crate::provider::ProviderDescriptor { kind: self.kind.clone(), label: self.kind.as_str().into(), capability: crate::provider::test_support::fixture_capability() };
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(self.turn.load(Ordering::Acquire)));
+        let captured = self.request.clone();
+        let handler = crate::provider::test_support::EventFixtureProvider::new(descriptor.clone(), move |request, sink, _cancelled| {
+            let turns = turns.clone(); let captured = captured.clone();
+            let descriptor = descriptor.clone();
+            async move {
+                captured.lock().unwrap().push(request.clone());
+                let ordinal = turns.fetch_add(1, Ordering::AcqRel);
+                let root = request.scope.owner.is_root();
+                let text = match &request.input { forge_provider_api::PromptInput::Text(text) => text.clone(), _ => String::new() };
+                let response = if root {
+                    if ordinal == 0 {
+                        crate::provider::test_support::call_tool(&request, "agent_spawn", json!({"profile":"routing-child","text":"CHILD_RESULT"})).await?;
+                        "Waiting"
+                    } else {
+                        if !text.contains("CHILD_RESULT") {
+                            return Err(crate::provider::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                                forge_provider_api::ProviderOperation::AdmitInput, forge_provider_api::ProviderFailureKind::Protocol,
+                            )));
+                        }
+                        "SYNTHESIZED_RESULT"
+                    }
                 } else {
-                    "child-history"
-                }
-                .to_owned().try_into()?,
-            ), capability: self.descriptor().capability, ..Default::default() }, ..Default::default() })
-
-        }.await;
-        output
-
-        }.await;
-        let result = result.map_err(crate::provider::ProviderError::from);
-        fixture.finish(&result).await?;
-        result
+                    if !text.ends_with("CHILD_RESULT") {
+                        return Err(crate::provider::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::AdmitInput, forge_provider_api::ProviderFailureKind::Protocol,
+                        )));
+                    }
+                    "CHILD_RESULT"
+                };
+                let scope = request.scope.clone();
+                let address = crate::provider::TurnAddress { scope: scope.clone(), thread_id: if root { "root-history" } else { "child-history" }.into(), turn_id: format!("routing-{ordinal}").into() };
+                sink.send_wait(ProviderEvent::Execution { observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                    scope.clone(), forge_provider_api::lifecycle::ExecutionUpdate::Started { address: address.clone() },
+                )? }).await?;
+                sink.send_wait(ProviderEvent::Turn { address: address.clone(), update: crate::provider::TurnUpdate::Started { started_at_ms: 1 } }).await?;
+                for event in completed_message(&address, "routing-response", crate::provider::MessageRole::Response, response) { sink.send_wait(event).await?; }
+                let completion = forge_provider_api::completion::ProviderCompletion {
+                    provider_session_id: Some(if root { "root-history" } else { "child-history" }.to_owned().try_into().expect("fixture ID is valid")),
+                    capability: descriptor.capability.clone(), ..Default::default()
+                };
+                sink.send_wait(ProviderEvent::Turn { address: address.clone(), update: crate::provider::TurnUpdate::Finished { outcome: crate::turn::TurnOutcome::Completed, completed_at_ms: 2 } }).await?;
+                sink.send_wait(ProviderEvent::Execution { observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                    scope, forge_provider_api::lifecycle::ExecutionUpdate::Finished { address, covered_submissions: vec![request.submission_id], completed_at_ms: 2,
+                        result: forge_provider_api::lifecycle::ExecutionResult::Completed { completion: completion.into() } },
+                )? }).await?;
+                Ok(())
+            }
+        });
+        let model = forge_provider_api::ProviderModel {
+            id: "fixture-model".into(), service_tiers: vec![forge_provider_api::ServiceTier::Standard, forge_provider_api::ServiceTier::Fast],
+            reasoning: vec!["low".into()], default_reasoning: Some("low".into()), selected_reasoning: None,
+            context_window: vec![forge_provider_api::ProviderContextWindow { id: "extended".into(), token_limit: Some(200_000) }],
+            default_context_window: None, selected_context_window: None, vision: false, description: None, is_default: true,
+        };
+        let provider = handler.with_models(vec![model]);
+        let reject_steering = self.reject_steering;
+        provider.with_steering(move |_request| async move {
+            if reject_steering {
+                Err(crate::provider::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::AdmitInput, forge_provider_api::ProviderFailureKind::Rejected,
+                )))
+            } else { Ok(()) }
+        });
+        provider
     }
 }
 
+fn routing_fixture(
+    kind: crate::provider::ProviderId,
+    reject_steering: bool,
+) -> Result<(Arc<RoutingProvider>, crate::provider::test_support::ProviderTestSession)> {
+    let native = Arc::new(RoutingProvider {
+        kind, turn: std::sync::atomic::AtomicUsize::new(0), request: Default::default(), reject_steering,
+    });
+    let fixture = crate::provider::test_support::ProviderTestSession::from_native(native.fixture())?;
+    Ok((native, fixture))
+}
 #[tokio::test]
 async fn cross_provider_children_resolve_profile_model_reasoning_and_service_tier() -> Result<()> {
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    broker
-        .agent_provider_factory
-        .register(Arc::new(RoutingProvider {
-            fixture_events: Default::default(),
-            kind: crate::provider::ProviderKind::Codex,
-            turn: std::sync::atomic::AtomicUsize::new(0),
-            request: Default::default(),
-            reject_steering: false,
-        }));
+    let (_routing, routing_fixture) = routing_fixture(forge_providers::registry::default_id(), false)?;
+    broker.agent_provider_factory.register(routing_fixture.provider_handle());
     save_child_profile(
         &broker,
         "configured-child",
         crate::agent::AgentProfile {
-            provider: "codex".into(),
+            provider: forge_providers::registry::default_id().to_string(),
             model: "fixture-model".into(),
             reasoning_effort: "low".into(),
             service_tier: "fast".into(),
@@ -1712,7 +1531,7 @@ async fn cross_provider_children_resolve_profile_model_reasoning_and_service_tie
     };
     let selection = broker
         .agent_provider_factory
-        .resolve(&root, crate::provider::ProviderKind::Mock, &spawn)
+        .resolve(&root, forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"), &spawn)
         .await?;
     assert_eq!(selection.model, "fixture-model");
     assert_eq!(selection.reasoning_effort, "low");
@@ -1754,7 +1573,7 @@ async fn durable_operation_receipts_prevent_duplicate_child_tasks_before_and_aft
         workspace: repository.path().to_string_lossy().into_owned(),
         client_id: "receipt-reopen".into(),
         provider: ProviderLaunch {
-            kind: "mock".into(),
+            kind: forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"),
             command: vec!["mock".into()],
         },
         model: "mock-model".into(),
@@ -1785,15 +1604,10 @@ async fn rejected_followup_preserves_inbox_and_current_root_policy() -> Result<(
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    broker
-        .agent_provider_factory
-        .register(Arc::new(RoutingProvider {
-            fixture_events: Default::default(),
-            kind: crate::provider::ProviderKind::Mock,
-            turn: std::sync::atomic::AtomicUsize::new(0),
-            request: Default::default(),
-            reject_steering: false,
-        }));
+    let (_routing, routing_fixture) = routing_fixture(
+        forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"), false,
+    )?;
+    broker.agent_provider_factory.register(routing_fixture.provider_handle());
     let admitted = broker
         .start_agent(json!({"profile":"worker","text":"CHILD_RESULT"}))
         .await?
@@ -1865,214 +1679,79 @@ async fn rejected_followup_preserves_inbox_and_current_root_policy() -> Result<(
 
 #[derive(Default)]
 struct ResultReceivingProvider {
-    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    turn: std::sync::atomic::AtomicUsize,
-    active: std::sync::atomic::AtomicBool,
-    incoming: tokio::sync::Notify,
-    receipt: std::sync::Mutex<Vec<(String, tokio::sync::oneshot::Sender<()>)>>,
-    message: std::sync::Mutex<Vec<String>>,
-    input: std::sync::Mutex<Vec<String>>,
-}
-
-#[async_trait::async_trait]
-impl crate::provider::ProviderAdapter for ResultReceivingProvider {
-    type Host = crate::provider::HarnessProviderHost;
-    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-        crate::provider::ProviderDescriptor {
-            kind: crate::provider::ProviderKind::Mock,
-            label: "Result receiver".into(),
-            capability: crate::provider::mock_capability(),
-        }
-    }
-    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::Shutdown,
-                source,
-            )
-        })
-    }
-    async fn has_active_turn(&self, _session_id: &str) -> bool {
-        self.active.load(Ordering::Acquire)
-    }
-    async fn cancel_session(
-        &self,
-        _session_id: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CancelSession,
-                source,
-            )
-        })
-    }
-    async fn cleanup_execution(
-        &self,
-        _session_id: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
-                source,
-            )
-        })
-    }
-    async fn active_session_id_for(
-        &self,
-        _session_id: &str,
-    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-        Ok(Some("result-parent-history".to_owned().try_into()?))
-    }
-    async fn session_steer(
-        self: std::sync::Arc<Self>,
-        owner: &crate::provider::ExecutionOwner,
-        scope: crate::provider::InvocationScope,
-        input: crate::provider::SteeringInput,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        if scope.owner != *owner {
-            return Err(crate::provider::ProviderError::Rejected {
-                message: "steering crosses owner".into(),
-            });
-        }
-        let events = self.fixture_events.clone();
-        if !events.running(&scope).await? {
-            let request = events.continuation(&scope, input)?;
-            return self.session_prompt(request, scope).await;
-        }
-        events
-            .steer(&scope, input, |input| async move {
-                self.steer_native(&owner.runtime_key(), input)
-                    .await
-                    .map_err(crate::provider::ProviderError::from)
-            })
-            .await
-    }
-
-    async fn session_events(
-        &self,
-        owner: crate::provider::ExecutionOwner,
-    ) -> std::result::Result<
-        crate::provider::events::ProviderEventStream,
-        crate::provider::ProviderError,
-    > {
-        let stream = self.fixture_events.subscribe(owner.clone())?;
-        Ok(stream)
-    }
-
-    async fn session_prompt(
-        self: std::sync::Arc<Self>,
-        request: crate::provider::ProviderRequest,
-        scope: crate::provider::InvocationScope,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let events = self.fixture_events.clone();
-        events
-            .submit(
-                request,
-                scope,
-                crate::provider::test_support::TerminalBoundary::LocalFixture,
-                move |request, sink| async move { self.run_native(request, sink).await },
-            )
-            .await
-    }
+    turn: Arc<std::sync::atomic::AtomicUsize>,
+    incoming: Arc<tokio::sync::Notify>,
+    receipt: TestReceiptWaiters,
+    message: Arc<std::sync::Mutex<Vec<String>>>,
+    input: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl ResultReceivingProvider {
-    async fn steer_native(
-        &self,
-        _session_id: &str,
-        input: crate::provider::SteeringInput,
-    ) -> Result<()> {
-        anyhow::ensure!(
-            matches!(input, crate::provider::SteeringInput::AgentResult(_)),
-            "child completion used user steering"
-        );
-        let (receipt, accepted) = tokio::sync::oneshot::channel();
-        self.receipt
-            .lock()
-            .unwrap()
-            .push((input.text().to_owned(), receipt));
-        self.incoming.notify_one();
-        accepted
-            .await
-            .context("parent stopped polling before result acceptance")
-    }
-}
-
-impl ResultReceivingProvider {
-    async fn run_native(
-        &self,
-        request: ProviderRequest,
-        sink: ProviderEventSink,
-    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-        let fixture_scope = sink.invocation_scope()?.clone();
-        let fixture = crate::provider::test_support::FixtureStream::new(sink);
-        let sink = fixture.clone();
-        let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-            let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let sink = Some(sink);
-                self.turn.fetch_add(1, Ordering::AcqRel);
-                self.input.lock().unwrap().push(request.input.text());
-                self.active.store(true, Ordering::Release);
-                if !request.input.text().starts_with("EXPLICIT_NEXT_TURN") {
-                    let scope = request
-                        .control_context
-                        .as_ref()
-                        .and_then(|context| context.agent.as_ref())
-                        .context("root authority missing")?;
+    fn fixture(self: &Arc<Self>) -> Arc<crate::provider::test_support::EventFixtureProvider> {
+        let descriptor = crate::provider::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id().expect("fixture identity exists"),
+            label: "Normalized child result receiver".into(), capability: crate::provider::test_support::fixture_capability(),
+        };
+        let turn = self.turn.clone(); let incoming = self.incoming.clone();
+        let receipt = self.receipt.clone(); let message = self.message.clone(); let input = self.input.clone();
+        let provider = crate::provider::test_support::EventFixtureProvider::new(descriptor, move |request, sink, _cancelled| {
+            let turn = turn.clone(); let incoming = incoming.clone(); let receipt = receipt.clone();
+            let message = message.clone(); let input = input.clone();
+            async move {
+                turn.fetch_add(1, Ordering::AcqRel);
+                let text = match &request.input { forge_provider_api::PromptInput::Text(text) => text.clone(), _ => String::new() };
+                input.lock().unwrap().push(text.clone());
+                if !text.starts_with("EXPLICIT_NEXT_TURN") {
                     for task in ["first", "second"] {
-                        scope
-                            .invoke(
-                                "agent_spawn",
-                                json!({"profile":"worker","text":format!("CHILD_REPORT_{task}")}),
-                            )
-                            .await?;
+                        crate::provider::test_support::call_tool(&request, "agent_spawn", json!({
+                            "profile":"worker", "text":format!("CHILD_REPORT_{task}"),
+                        })).await?;
                     }
                     loop {
-                        let notified = self.incoming.notified();
-                        for (message, receipt) in self.receipt.lock().unwrap().drain(..) {
-                            self.message.lock().unwrap().push(message);
-                            let _ = receipt.send(());
+                        let notified = incoming.notified();
+                        for (report, accepted) in receipt.lock().unwrap().drain(..) {
+                            message.lock().unwrap().push(report);
+                            let _ = accepted.send(());
                         }
-                        if self.message.lock().unwrap().len() == 2 {
-                            break;
-                        }
+                        if message.lock().unwrap().len() == 2 { break; }
                         notified.await;
                     }
                 }
-                self.active.store(false, Ordering::Release);
-                if let Some(sink) = sink {
-                    sink.send_wait(completed_message(
-                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
-                        "synthesized-response",
-                        crate::provider::MessageRole::Response,
-                        "SYNTHESIZED_RESULT",
-                    ))
-                    .await?;
-                }
-                Ok(crate::provider::ProviderCompletion {
-                    native: forge_provider_api::completion::ProviderCompletion {
-                        provider_session_id: Some(
-                            "result-parent-history".to_owned().try_into().unwrap(),
-                        ),
-                        capability: self.descriptor().capability,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                })
+                let scope = request.scope.clone();
+                let address = crate::provider::TurnAddress { scope: scope.clone(), thread_id: "result-parent-history".into(), turn_id: "result-parent-turn".into() };
+                sink.send_wait(ProviderEvent::Execution { observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                    scope.clone(), forge_provider_api::lifecycle::ExecutionUpdate::Started { address: address.clone() },
+                )? }).await?;
+                for event in completed_message(&address, "synthesized-response", crate::provider::MessageRole::Response, "SYNTHESIZED_RESULT") { sink.send_wait(event).await?; }
+                let completion = forge_provider_api::completion::ProviderCompletion {
+                    provider_session_id: Some("result-parent-history".to_owned().try_into().expect("fixture ID is valid")),
+                    capability: crate::provider::test_support::fixture_capability(), ..Default::default()
+                };
+                sink.send_wait(ProviderEvent::Turn { address: address.clone(), update: crate::provider::TurnUpdate::Finished { outcome: crate::turn::TurnOutcome::Completed, completed_at_ms: 1 } }).await?;
+                sink.send_wait(ProviderEvent::Execution { observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                    scope, forge_provider_api::lifecycle::ExecutionUpdate::Finished { address, covered_submissions: vec![request.submission_id], completed_at_ms: 1,
+                        result: forge_provider_api::lifecycle::ExecutionResult::Completed { completion: completion.into() } },
+                )? }).await?;
+                Ok(())
             }
-            .await;
-            output
-        }
-        .await;
-        let result = result.map_err(crate::provider::ProviderError::from);
-        fixture.finish(&result).await?;
-        result
+        });
+        let incoming = self.incoming.clone(); let receipt = self.receipt.clone();
+        provider.with_steering(move |request| {
+            let incoming = incoming.clone(); let receipt = receipt.clone();
+            async move {
+                let text = match request.input {
+                    forge_provider_api::PromptInput::Text(text) => text,
+                    forge_provider_api::PromptInput::Skill { name, arguments } => format!("/{name} {arguments}"),
+                    forge_provider_api::PromptInput::QuestionReply(reply) => reply.question,
+                };
+                let (accepted, wait) = tokio::sync::oneshot::channel();
+                receipt.lock().unwrap().push((text, accepted));
+                incoming.notify_one();
+                wait.await.map_err(|_| crate::provider::ProviderError::DeliveryUncertain)
+            }
+        })
     }
 }
-
 #[tokio::test]
 async fn child_results_reach_active_parent_once_without_wait() -> Result<()> {
     {
@@ -2080,7 +1759,8 @@ async fn child_results_reach_active_parent_once_without_wait() -> Result<()> {
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let provider = Arc::new(ResultReceivingProvider::default());
-        broker.provider = provider.clone();
+        let fixture = crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+        broker.provider = fixture.provider_handle();
         broker.agent_coordinator.set_enabled(true);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -2146,7 +1826,8 @@ async fn idle_child_result_is_retained_until_one_explicit_parent_turn() -> Resul
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let provider = Arc::new(ResultReceivingProvider::default());
-    broker.provider = provider.clone();
+    let fixture = crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+    broker.provider = fixture.provider_handle();
     let admission = admit_child_fixture(&mut broker, "idle-result")?;
     let owner = crate::provider::ExecutionOwner {
         session_id: (broker.session.id.clone()).into(),
@@ -2214,7 +1895,6 @@ async fn idle_child_result_is_retained_until_one_explicit_parent_turn() -> Resul
 }
 
 struct SuspendedParentProvider {
-    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
     blocked: AtomicBool,
     root_turn: std::sync::atomic::AtomicUsize,
     root_started: tokio::sync::Semaphore,
@@ -2226,7 +1906,6 @@ struct SuspendedParentProvider {
 impl Default for SuspendedParentProvider {
     fn default() -> Self {
         Self {
-            fixture_events: Default::default(),
             blocked: Default::default(),
             root_turn: Default::default(),
             root_started: tokio::sync::Semaphore::new(0),
@@ -2237,157 +1916,94 @@ impl Default for SuspendedParentProvider {
     }
 }
 
-#[async_trait::async_trait]
-impl crate::provider::ProviderAdapter for SuspendedParentProvider {
-    type Host = crate::provider::HarnessProviderHost;
-    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-        let mut capability = crate::provider::mock_capability();
+impl SuspendedParentProvider {
+    fn fixture(self: &Arc<Self>) -> Arc<crate::provider::test_support::EventFixtureProvider> {
+        let mut capability = crate::provider::test_support::fixture_capability();
         capability.native_steer = false;
-        crate::provider::ProviderDescriptor {
-            kind: crate::provider::ProviderKind::Mock,
+        let descriptor = crate::provider::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
             label: "Suspended parent".into(),
             capability,
-        }
-    }
-    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::Shutdown,
-                source,
-            )
-        })
-    }
-    async fn has_active_turn(&self, _session_id: &str) -> bool {
-        false
-    }
-    async fn cancel_session(
-        &self,
-        _session_id: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CancelSession,
-                source,
-            )
-        })
-    }
-    async fn cleanup_execution(
-        &self,
-        _session_id: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
-                source,
-            )
-        })
-    }
-    async fn active_session_id_for(
-        &self,
-        _session_id: &str,
-    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-        Ok(Some("suspended-history".to_owned().try_into()?))
-    }
-    async fn session_events(
-        &self,
-        owner: crate::provider::ExecutionOwner,
-    ) -> std::result::Result<
-        crate::provider::events::ProviderEventStream,
-        crate::provider::ProviderError,
-    > {
-        self.fixture_events.subscribe(owner)
-    }
-    async fn session_prompt(
-        self: std::sync::Arc<Self>,
-        request: ProviderRequest,
-        scope: crate::provider::InvocationScope,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let events = self.fixture_events.clone();
-        events
-            .submit(
-                request,
-                scope,
-                crate::provider::test_support::TerminalBoundary::LocalFixture,
-                move |request, sink| async move { self.run_native(request, sink).await },
-            )
-            .await
-    }
-}
-
-impl SuspendedParentProvider {
-    async fn run_native(
-        &self,
-        request: ProviderRequest,
-        sink: ProviderEventSink,
-    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-        let fixture_scope = sink.invocation_scope()?.clone();
-        let fixture = crate::provider::test_support::FixtureStream::new(sink);
-        let sink = fixture.clone();
-        let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-            let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let sink = Some(sink);
-                let response = if request.owner()?.is_root() {
-                    self.input.lock().unwrap().push(request.input.text());
-                    let ordinal = self.root_turn.fetch_add(1, Ordering::AcqRel);
+        };
+        let state = self.clone();
+        crate::provider::test_support::EventFixtureProvider::new(descriptor.clone(), move |request, sink, mut cancelled| {
+            let state = state.clone();
+            let descriptor = descriptor.clone();
+            async move {
+                let text = match &request.input {
+                    forge_provider_api::PromptInput::Text(text) => text.clone(),
+                    _ => String::new(),
+                };
+                let response = if request.scope.owner.is_root() {
+                    state.input.lock().unwrap().push(text.clone());
+                    let ordinal = state.root_turn.fetch_add(1, Ordering::AcqRel);
                     if ordinal == 0 {
-                        let scope = request
-                            .control_context
-                            .as_ref()
-                            .and_then(|context| context.agent.as_ref())
-                            .context("root authority missing")?;
                         for name in ["ONE", "TWO"] {
-                            scope
-                                .invoke(
-                                    "agent_spawn",
-                                    json!({"profile":"worker","text":format!("CHILD_{name}")}),
-                                )
-                                .await?;
+                            crate::provider::test_support::call_tool(
+                                &request,
+                                "agent_spawn",
+                                json!({"profile":"worker","text":format!("CHILD_{name}")}),
+                            ).await?;
                         }
                     }
-                    self.root_started.add_permits(1);
+                    state.root_started.add_permits(1);
+                    if state.blocked.load(Ordering::Acquire) && text == "Research both" {
+                        crate::provider::test_support::call_tool(
+                            &request,
+                            "question_ask",
+                            json!({"wait":true,"questions":[{"header":"Research scope","question":"Which research scope?","options":[],"allow_freeform":true}]}),
+                        ).await?;
+                    }
                     "PARENT_RESPONSE".to_owned()
                 } else {
-                    let index = usize::from(request.input.text().ends_with("CHILD_TWO"));
-                    self.child_started.add_permits(1);
-                    self.child_release[index].acquire().await?.forget();
+                    let index = usize::from(text.ends_with("CHILD_TWO"));
+                    state.child_started.add_permits(1);
+                    tokio::select! {
+                        _ = state.child_release[index].acquire() => {},
+                        _ = cancelled.changed() => return Err(crate::provider::ProviderError::Cancelled),
+                    }
                     format!("RESULT_{}", if index == 0 { "ONE" } else { "TWO" })
                 };
-                if let Some(sink) = sink {
-                    sink.send_wait(completed_message(
-                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
-                        "suspended-response",
-                        crate::provider::MessageRole::Response,
-                        response.clone(),
-                    ))
-                    .await?;
-                }
-                let mut output = crate::provider::ProviderCompletion {
-                    native: forge_provider_api::completion::ProviderCompletion {
-                        provider_session_id: Some(
-                            "suspended-history".to_owned().try_into().unwrap(),
-                        ),
-                        capability: self.descriptor().capability,
-                        ..Default::default()
-                    },
-                    ..Default::default()
+                let scope = request.scope.clone();
+                let root = scope.owner.is_root();
+                let address = crate::provider::TurnAddress {
+                    scope: scope.clone(),
+                    thread_id: if root { "suspended-history" } else { "child-history" }.into(),
+                    turn_id: format!("suspended-{}", state.root_turn.load(Ordering::Acquire)).into(),
                 };
-                if self.blocked.load(Ordering::Acquire) && request.input.text() == "Research both" {
-                    output.plan_question = Some(crate::plan::PlanQuestionSet::freeform(
-                        "Which research scope?".into(),
-                    ));
+                sink.send_wait(ProviderEvent::Execution {
+                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                        scope.clone(), forge_provider_api::lifecycle::ExecutionUpdate::Started { address: address.clone() },
+                    )?,
+                }).await?;
+                sink.send_wait(ProviderEvent::Turn {
+                    address: address.clone(), update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
+                }).await?;
+                for event in completed_message(&address, "suspended-response", crate::provider::MessageRole::Response, response) {
+                    sink.send_wait(event).await?;
                 }
-                Ok(output)
+                sink.send_wait(ProviderEvent::Turn {
+                    address: address.clone(), update: crate::provider::TurnUpdate::Finished {
+                        outcome: forge_provider_api::turn::TurnOutcome::Completed, completed_at_ms: 2,
+                    },
+                }).await?;
+                sink.send_wait(ProviderEvent::Execution {
+                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                        scope, forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                            address, covered_submissions: vec![request.submission_id], completed_at_ms: 2,
+                            result: forge_provider_api::lifecycle::ExecutionResult::Completed {
+                                completion: forge_provider_api::completion::ProviderCompletion {
+                                    provider_session_id: Some("suspended-history".to_owned().try_into().expect("fixture ID is valid")),
+                                    capability: descriptor.capability.clone(), ..Default::default()
+                                }.into(),
+                            },
+                        },
+                    )?,
+                }).await?;
+                Ok(())
             }
-            .await;
-            output
-        }
-        .await;
-        let result = result.map_err(crate::provider::ProviderError::from);
-        fixture.finish(&result).await?;
-        result
+        })
     }
 }
 
@@ -2399,8 +2015,9 @@ async fn suspended_parent_joins_children_and_user_input_wakes_without_native_ste
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let provider = Arc::new(SuspendedParentProvider::default());
-        broker.provider = provider.clone();
-        broker.agent_provider_factory.register(provider.clone());
+        let fixture = crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+        broker.provider = fixture.provider_handle();
+        broker.agent_provider_factory.register(fixture.provider_handle());
         broker.agent_coordinator.set_enabled(true);
         let coordinator = broker.agent_coordinator.clone();
         let input = broker.parent_input.clone();
@@ -2505,8 +2122,9 @@ async fn parent_cancellation_and_user_decision_prevent_child_continuation() -> R
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let provider = Arc::new(SuspendedParentProvider::default());
         provider.blocked.store(user_decision, Ordering::Release);
-        broker.provider = provider.clone();
-        broker.agent_provider_factory.register(provider.clone());
+        let fixture = crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+        broker.provider = fixture.provider_handle();
+        broker.agent_provider_factory.register(fixture.provider_handle());
         broker.agent_coordinator.set_enabled(true);
         let cancellation = broker.turn_cancellation();
         let coordinator = broker.agent_coordinator.clone();

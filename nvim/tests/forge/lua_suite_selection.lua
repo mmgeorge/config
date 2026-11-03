@@ -1,5 +1,5 @@
 local root = vim.fn.getcwd()
-local live_fixture = "nvim/tests/forge/harness_codex_activity.lua"
+local live_fixture = "nvim/rust/forge/crates/forge-providers/tests/fixtures/activity_host.lua"
 local mock_fixture = "nvim/tests/forge/plan_review_question_response_host.lua"
 
 local function select_suite(suite, files)

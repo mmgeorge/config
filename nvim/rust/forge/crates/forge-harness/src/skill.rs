@@ -4,8 +4,6 @@ use crate::permissions::shell::CommandShell;
 use crate::provider::{ExecutionOwner, ProviderEvent, ProviderEventSink};
 use crate::settings::SkillResource;
 use anyhow::{Context, Result};
-#[cfg(test)]
-use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -215,6 +213,11 @@ pub(crate) struct SkillExecution {
 }
 
 impl SkillExecution {
+    /// Observe normalized tool events without exposing provider wire decoding.
+    pub(crate) fn event_observer(&self) -> Arc<dyn forge_provider_api::events::EventObserver> {
+        Arc::new(SkillEventObserver(self.observer.clone()))
+    }
+
     /// Attach the shared observer to streamed delivery or annotate collected fallback events.
     pub(crate) fn sink(&self, sink: Option<ProviderEventSink>) -> Option<ProviderEventSink> {
         sink.map(|sink| sink.with_observer(Arc::new(SkillEventObserver(self.observer.clone()))))
@@ -405,17 +408,17 @@ mod tests {
         }
     }
 
-    fn requested(id: &str, name: &str, arguments: Value) -> ProviderEvent {
+    fn requested(id: &str, semantics: forge_provider_api::tool::ToolSemantics) -> ProviderEvent {
         event(
             id,
             ToolUpdate::Requested {
-                invocation: forge_providers::copilot::normalize_invocation(ToolInvocation {
-                    semantics: Default::default(),
+                invocation: ToolInvocation {
+                    semantics,
                     kind: ToolActivityKind::ToolCall,
-                    name: name.into(),
-                    title: name.into(),
-                    arguments,
-                }),
+                    name: "fixture-tool".into(),
+                    title: "Fixture tool".into(),
+                    arguments: json!({}),
+                },
             },
         )
     }
@@ -425,18 +428,19 @@ mod tests {
         let (_directory, access, bundle) = fixture();
         let path = bundle.join("SKILL.md").display().to_string();
         let command = format!("Get-Content -LiteralPath '{path}' -TotalCount 5");
-        for (name, arguments) in [
-            ("powershell", json!({"command":command})),
-            ("view", json!({"path":path})),
-            ("read", json!({"file_path":path})),
-            ("read", json!({"AbsolutePath":path})),
+        for semantics in [
+            forge_provider_api::tool::ToolSemantics::Command {
+                text: command,
+                shell: Some("powershell".into()),
+                directory: None,
+            },
+            forge_provider_api::tool::ToolSemantics::Read {
+                paths: vec![path.clone()],
+                directory: None,
+            },
         ] {
             let mut observer = SkillObserver::new(access.clone());
-            assert!(
-                observer
-                    .observe(&requested("read", name, arguments))
-                    .is_empty()
-            );
+            assert!(observer.observe(&requested("read", semantics)).is_empty());
             assert!(
                 observer
                     .observe(&event(
@@ -459,17 +463,16 @@ mod tests {
             assert_eq!(reads[0].tool_id, "read");
             assert!(observer.pending.is_empty());
         }
-        for (name, arguments) in [
-            ("search", json!({"path":path})),
-            ("list_directory", json!({"path":bundle})),
-            ("skill.invoked", json!({"path":path})),
-            (
-                "powershell",
-                json!({"command":format!("Write-Output '{path}'")}),
-            ),
+        for semantics in [
+            forge_provider_api::tool::ToolSemantics::Other,
+            forge_provider_api::tool::ToolSemantics::Command {
+                text: format!("Write-Output '{path}'"),
+                shell: Some("powershell".into()),
+                directory: None,
+            },
         ] {
             let mut observer = SkillObserver::new(access.clone());
-            observer.observe(&requested("unrelated", name, arguments));
+            observer.observe(&requested("unrelated", semantics));
             assert!(
                 observer
                     .observe(&event(
@@ -484,15 +487,22 @@ mod tests {
         for outcome in [
             ToolOutcome::Failed {
                 diagnostic: crate::provider::ToolDiagnostic {
-                    code: None,
-                    message: "exit 1".into(),
+                    kind: forge_provider_api::ProviderFailureKind::Runtime,
+                    message: forge_provider_api::SanitizedMessage::new("Fixture command failed")
+                        .unwrap(),
                 },
             },
             ToolOutcome::Cancelled,
             ToolOutcome::Interrupted,
         ] {
             let mut observer = SkillObserver::new(access.clone());
-            observer.observe(&requested("failed", "read", json!({"path":path})));
+            observer.observe(&requested(
+                "failed",
+                forge_provider_api::tool::ToolSemantics::Read {
+                    paths: vec![path.clone()],
+                    directory: None,
+                },
+            ));
             assert!(
                 observer
                     .observe(&event("failed", ToolUpdate::Finished { outcome }))
@@ -547,8 +557,10 @@ mod tests {
         let mut observer = SkillObserver::new(access.clone());
         observer.observe(&requested(
             "alias",
-            "read",
-            json!({"path":alias.join("SKILL.md")}),
+            forge_provider_api::tool::ToolSemantics::Read {
+                paths: vec![alias.join("SKILL.md").display().to_string()],
+                directory: None,
+            },
         ));
         let reads = observer.observe(&event(
             "alias",

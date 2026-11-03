@@ -56,9 +56,6 @@ pub(super) async fn apply_edit(
                 .insert(path.clone(), file.source_digest.clone());
         }
     }
-    runtime
-        .patch_source_digests
-        .insert(request.expected_version, request.source_digests.clone());
     if invocation.name == "plan_file_edit" {
         invocation.arguments["source_digests"] = serde_json::to_value(&request.source_digests)?;
     }

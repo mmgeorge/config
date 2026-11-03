@@ -192,7 +192,7 @@ function CommandSource:request_model_list(callback)
       end
       if session.harness ~= state or not state.session or state.session.id ~= session_id
         or state.session.provider ~= provider then callback({}) return end
-      callback(model_order.order(model_list, provider, pinned_id_set))
+      callback(model_order.order(model_list, pinned_id_set))
     end
     local pinned_id_set = model_pins.get(provider)
     if pinned_id_set then ordered(pinned_id_set) else model_pins.refresh(provider, ordered) end

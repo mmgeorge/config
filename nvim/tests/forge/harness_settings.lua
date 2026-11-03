@@ -3,10 +3,11 @@ vim.o.columns = 130
 vim.o.lines = 50
 require("forge").setup({ harness = { provider = "mock" } })
 local client = require("forge.client")
+dofile("nvim/tests/forge/support/provider_catalog.lua").install()
 local settings = require("forge.views.harness.settings")
 local picker = require("forge.views.picker")
 local path = vim.fn.tempname() .. ".jsonl"
-vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","session_id":"settings-session","payload":{"method":"turn/start","items":["a,b","c"]}}' }, path)
+vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","session_id":"settings-session","payload":{"method":"operation/start","items":["a,b","c"]}}' }, path)
 local enabled = false
 local controller = require("forge.views.harness.controller")
 local original_configure = controller.configure
@@ -26,7 +27,7 @@ package.loaded["mini.clue"] = {
 }
 local state
 local configured_session = {
-  id = "settings-session", provider = "codex", model = "mock-model", effort = "medium",
+  id = "settings-session", provider = "fixture_alpha", model = "mock-model", effort = "medium",
   plan_executor = { enabled = false, model = "mock-model", effort = "medium" }, plan_compact = false,
 }
 local original_request = client.request
@@ -34,9 +35,9 @@ local commit_settings = require("forge.integrations.background_settings")
 local original_commit_request = commit_settings.request
 commit_settings.request = function(_, _, callback)
   callback({ revision = 0,
-    settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 }, models = { codex = { model = "mock-model", thinking = "low" },
-      copilot = { model = "mock-model", thinking = "low" },
-      claude = { model = "mock-model" }, antigravity = { model = "mock-model" }, mock = { model = "mock-model" } } } })
+    settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 }, models = { fixture_alpha = { model = "mock-model", thinking = "low" },
+      fixture_beta = { model = "mock-model", thinking = "low" },
+      fixture_gamma = { model = "mock-model" }, fixture_delta = { model = "mock-model" }, mock = { model = "mock-model" } } } })
 end
 client.request = function(request_specification, callback)
   local session_id = request_specification.session_id
@@ -71,7 +72,7 @@ client.request = function(request_specification, callback)
     if params.shell then configured_session.shell = params.shell end
     if params.access then
       configured_session.access = vim.deepcopy(params.access)
-      if configured_session.provider ~= "codex" then configured_session.access.sandbox = false end
+      if not state.capability.os_sandbox then configured_session.access.sandbox = false end
     end
     if params.plan_executor_enabled ~= nil then configured_session.plan_executor.enabled = params.plan_executor_enabled end
     if params.plan_compact ~= nil then configured_session.plan_compact = params.plan_compact end
@@ -428,7 +429,7 @@ local success, failure = xpcall(function()
   key("provider", "<Left>")
   assert(picker.is_open("harness-config"), "Left opened an action")
   picker.close()
-  configured_session.provider, configured_session.provider_label = "copilot", "Copilot CLI"
+  configured_session.provider, configured_session.provider_label = "fixture_beta", "Fixture Beta"
   state.capability.os_sandbox = false
   settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
   local _, sandbox = find("sandbox")
@@ -457,7 +458,7 @@ local success, failure = xpcall(function()
   key("write-access", "<Right>")
   assert(configured_session.access.write_access == "workspace")
   picker.close()
-  for _, provider in ipairs({ "copilot", "claude", "antigravity", "mock" }) do
+  for _, provider in ipairs({ "fixture_beta", "fixture_gamma", "fixture_delta", "mock" }) do
     configured_session.provider = provider
     state.capability.os_sandbox = false
     settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
@@ -482,12 +483,12 @@ local success, failure = xpcall(function()
   local log_buffer = vim.api.nvim_get_current_buf()
   local log_text = table.concat(vim.api.nvim_buf_get_lines(log_buffer, 0, -1, false), "\n")
   assert(log_text:find("request  #1", 1, true), log_text)
-  assert(log_text:find('"method": "turn/start"', 1, true), log_text)
+  assert(log_text:find('"method": "operation/start"', 1, true), log_text)
   assert(log_text:find('"a,b"', 1, true), log_text)
   vim.fn.delete(path)
   vim.fn.maparg("R", "n", false, true).callback()
   assert(vim.api.nvim_buf_get_lines(log_buffer, 0, -1, false)[1] == "No log events yet")
-  vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","payload":{"method":"turn/start"}}' }, path)
+  vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","payload":{"method":"operation/start"}}' }, path)
   vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"response","payload":{"ok":true}}' }, path, "a")
   vim.fn.maparg("R", "n", false, true).callback()
   log_text = table.concat(vim.api.nvim_buf_get_lines(log_buffer, 0, -1, false), "\n")

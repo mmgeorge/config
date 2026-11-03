@@ -54,10 +54,10 @@ pub fn prepare_provider_fork(
         source.provider == configured_provider,
         "source session uses a different configured provider"
     );
-    source.access = crate::provider::registered_capability(crate::provider::ProviderKind::parse(
-        &source.provider,
-    )?)
-    .resolve_access(source.access);
+    source.access =
+        forge_providers::registry::resolve(&forge_providers::registry::select(&source.provider)?)?
+            .capability
+            .resolve_access(source.access);
 
     let target_session_id = Uuid::new_v4().to_string();
     let fork_point = ProviderForkPoint {

@@ -33,9 +33,24 @@ pub enum ProviderInput {
         /// Files explicitly admitted with the skill invocation.
         attachments: Vec<crate::attachment::InputAttachment>,
     },
+    QuestionReply {
+        reply: forge_provider_api::QuestionReply,
+        /// Carry host workflow context separately from the structured reply.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        context: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<crate::attachment::InputAttachment>,
+    },
 }
 
 impl ProviderInput {
+    /// Return workflow instructions that must not be encoded inside a native question reply.
+    pub(crate) fn additional_instructions(&self) -> &str {
+        match self {
+            Self::QuestionReply { context, .. } => context,
+            _ => "",
+        }
+    }
     /// Build ordinary provider input from admitted user text.
     pub fn from_text(text: impl Into<String>) -> Self {
         Self::Text {
@@ -57,6 +72,10 @@ impl ProviderInput {
             | Self::Skill {
                 attachments: selected,
                 ..
+            }
+            | Self::QuestionReply {
+                attachments: selected,
+                ..
             } => *selected = attachments,
         }
         self
@@ -65,7 +84,9 @@ impl ProviderInput {
     /// Return only the files already admitted alongside this input.
     pub(crate) fn attachments(&self) -> &[crate::attachment::InputAttachment] {
         match self {
-            Self::Text { attachments, .. } | Self::Skill { attachments, .. } => attachments,
+            Self::Text { attachments, .. }
+            | Self::Skill { attachments, .. }
+            | Self::QuestionReply { attachments, .. } => attachments,
         }
     }
 
@@ -101,6 +122,48 @@ impl ProviderInput {
             Self::Skill {
                 name, arguments, ..
             } => format!("${name} {arguments}"),
+            Self::QuestionReply { reply, .. } => match &reply.response {
+                forge_provider_api::QuestionReplyResponse::Answer { answer, .. }
+                | forge_provider_api::QuestionReplyResponse::Correction { answer, .. } => {
+                    answer.clone()
+                }
+                forge_provider_api::QuestionReplyResponse::Clarification { text, .. } => {
+                    text.clone()
+                }
+            },
+        }
+    }
+
+    /// Supply structured input without encoding any provider-specific envelope.
+    pub(crate) fn normalized(&self) -> forge_provider_api::PromptInput {
+        match self {
+            Self::Text { text, .. } => forge_provider_api::PromptInput::Text(text.clone()),
+            Self::Skill {
+                name, arguments, ..
+            } => forge_provider_api::PromptInput::Skill {
+                name: name.clone(),
+                arguments: arguments.clone(),
+            },
+            Self::QuestionReply { reply, .. } => {
+                forge_provider_api::PromptInput::QuestionReply(reply.clone())
+            }
+        }
+    }
+}
+
+pub use forge_provider_api::catalog::*;
+
+impl From<&ProviderInput> for forge_provider_api::input::PromptInput {
+    fn from(input: &ProviderInput) -> Self {
+        match input {
+            ProviderInput::Text { text, .. } => Self::Text(text.clone()),
+            ProviderInput::Skill {
+                name, arguments, ..
+            } => Self::Skill {
+                name: name.clone(),
+                arguments: arguments.clone(),
+            },
+            ProviderInput::QuestionReply { reply, .. } => Self::QuestionReply(reply.clone()),
         }
     }
 }
@@ -123,21 +186,5 @@ mod test {
             ProviderInput::parse("explain $walkthrough"),
             ProviderInput::from_text("explain $walkthrough")
         );
-    }
-}
-
-pub use forge_provider_api::catalog::*;
-
-impl From<&ProviderInput> for forge_provider_api::input::PromptInput {
-    fn from(input: &ProviderInput) -> Self {
-        match input {
-            ProviderInput::Text { text, .. } => Self::Text(text.clone()),
-            ProviderInput::Skill {
-                name, arguments, ..
-            } => Self::Skill {
-                name: name.clone(),
-                arguments: arguments.clone(),
-            },
-        }
     }
 }

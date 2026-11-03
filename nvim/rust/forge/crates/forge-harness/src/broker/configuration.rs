@@ -185,24 +185,13 @@ impl ConfigurationReconcileJob {
         worker
             .await
             .map_err(|error| {
-                anyhow::Error::new(error).context(
-                    crate::provider::ProviderError::DeliveryUncertain {
-                        message: "provider settings reconciliation worker failed".into(),
-                    },
-                )
+                anyhow::Error::new(error).context(crate::provider::ProviderError::DeliveryUncertain)
             })?
             .map_err(|error| {
-                anyhow::Error::new(error).context(
-                    crate::provider::ProviderError::DeliveryUncertain {
-                        message: "provider settings reconciliation did not confirm completion"
-                            .into(),
-                    },
-                )
+                anyhow::Error::new(error).context(crate::provider::ProviderError::DeliveryUncertain)
             })?;
         guard.registry.collect_cleanup().await.map_err(|error| {
-            anyhow::Error::new(error).context(crate::provider::ProviderError::DeliveryUncertain {
-                message: "provider settings worker could not be collected".into(),
-            })
+            anyhow::Error::new(error).context(crate::provider::ProviderError::DeliveryUncertain)
         })?;
         Ok(ConfigurationReconcileResult {
             authority: self.authority,
@@ -368,15 +357,18 @@ impl HarnessBroker {
                 "mcp.start_skipped",
                 json!({"resource_id":id,"reason":message}),
             );
-            deliveries.push(self.prepare_provider_delivery(AppliedProviderEvent::Update(
-                SessionUpdate::Diagnostic {
-                    diagnostic: crate::provider::ProviderDiagnostic {
-                        code: None,
-                        message: message.clone(),
-                        fatal: false,
+            deliveries.push(
+                self.prepare_provider_delivery(AppliedProviderEvent::Update(
+                    SessionUpdate::Diagnostic {
+                        diagnostic: crate::provider::ProviderDiagnostic {
+                            kind: forge_provider_api::ProviderFailureKind::Unknown,
+                            message: forge_provider_api::SanitizedMessage::new(message.clone())
+                                .expect("host diagnostic is nonempty"),
+                            fatal: false,
+                        },
                     },
-                },
-            ))?);
+                ))?,
+            );
         }
         Ok(ConfigurationMcpNotices {
             deliveries,
@@ -666,9 +658,10 @@ impl HarnessBroker {
         if let Some(access) = &access {
             configured.access = access.clone();
         }
-        configured.access = crate::provider::registered_capability(
-            crate::provider::ProviderKind::parse(&configured.provider)?,
-        )
+        configured.access = forge_providers::registry::resolve(
+            &forge_providers::registry::select(&configured.provider)?,
+        )?
+        .capability
         .resolve_access(configured.access.clone());
         let update_model_preference = requested_model.is_some()
             || requested_effort.is_some()
@@ -736,12 +729,7 @@ impl HarnessBroker {
         );
         if let Err(error) = self.validate_configuration_authority(&candidate.authority) {
             if candidate.uncertainty.is_some() {
-                return Err(
-                    error.context(crate::provider::ProviderError::DeliveryUncertain {
-                        message: "configuration authority changed after provider settings write"
-                            .into(),
-                    }),
-                );
+                return Err(error.context(crate::provider::ProviderError::DeliveryUncertain));
             }
             return Err(error);
         }
@@ -897,11 +885,7 @@ impl HarnessBroker {
                     ) {
                         self.execution_registry.record_cleanup_failure(cleanup);
                     }
-                    return Err(
-                        error.context(crate::provider::ProviderError::DeliveryUncertain {
-                            message: "configuration host commit requires durable recovery".into(),
-                        }),
-                    );
+                    return Err(error.context(crate::provider::ProviderError::DeliveryUncertain));
                 }
                 return Err(error);
             }
@@ -921,11 +905,7 @@ impl HarnessBroker {
             ) {
                 self.execution_registry.record_cleanup_failure(cleanup);
             }
-            return Err(
-                error.context(crate::provider::ProviderError::DeliveryUncertain {
-                    message: "configuration receipt requires durable recovery".into(),
-                }),
-            );
+            return Err(error.context(crate::provider::ProviderError::DeliveryUncertain));
         }
         let cleanup = if needs_cleanup {
             Some(self.prepare_configuration_cleanup()?)
@@ -1027,12 +1007,7 @@ impl HarnessBroker {
     ) -> Result<()> {
         if let Err(error) = self.validate_configuration_authority(&result.authority) {
             if result.uncertainty.is_some() {
-                return Err(
-                    error.context(crate::provider::ProviderError::DeliveryUncertain {
-                        message: "provider settings changed under stale configuration authority"
-                            .into(),
-                    }),
-                );
+                return Err(error.context(crate::provider::ProviderError::DeliveryUncertain));
             }
             return Err(error);
         }
@@ -1052,18 +1027,10 @@ impl HarnessBroker {
         mut result: ConfigurationReconcileResult,
     ) -> Result<()> {
         if let Err(error) = self.validate_configuration_authority(&result.authority) {
-            return Err(
-                error.context(crate::provider::ProviderError::DeliveryUncertain {
-                    message: "provider settings changed under stale configuration authority".into(),
-                }),
-            );
+            return Err(error.context(crate::provider::ProviderError::DeliveryUncertain));
         }
         self.validate_configuration_authority(&candidate.authority)
-            .map_err(|error| {
-                error.context(crate::provider::ProviderError::DeliveryUncertain {
-                    message: "configuration candidate changed after provider settings write".into(),
-                })
-            })?;
+            .map_err(|error| error.context(crate::provider::ProviderError::DeliveryUncertain))?;
         anyhow::ensure!(
             result.uncertainty.is_some(),
             "configuration reconciliation has no write guard"
@@ -1173,9 +1140,10 @@ impl HarnessBroker {
             change.apply(
                 &mut access,
                 &mut approval,
-                crate::provider::registered_capability(crate::provider::ProviderKind::parse(
+                forge_providers::registry::resolve(&forge_providers::registry::select(
                     &self.session.provider,
-                )?)
+                )?)?
+                .capability
                 .supports_sandbox(),
             );
         }
@@ -1242,7 +1210,7 @@ impl HarnessBroker {
             configured.approval_mode = captured.selected_approval;
             configured.approval_timeout = self.permission_coordinator.approval_timeout(&configured.id)?;
             if let Some(access) = &captured.selected_access { configured.access = access.clone(); }
-            configured.access = crate::provider::registered_capability(crate::provider::ProviderKind::parse(&configured.provider)?).resolve_access(configured.access);
+            configured.access = forge_providers::registry::resolve(&forge_providers::registry::select(&configured.provider)?)?.capability.resolve_access(configured.access);
             self.session = configured;
             self.permission_coordinator.configure_timeout(&self.session.id, self.session.approval_timeout)?;
             if let Err(error) = self.save_session() {
@@ -1450,9 +1418,10 @@ impl HarnessBroker {
                 change.apply(
                     &mut access,
                     &mut permission,
-                    crate::provider::registered_capability(crate::provider::ProviderKind::parse(
+                    forge_providers::registry::resolve(&forge_providers::registry::select(
                         &self.session.provider,
-                    )?)
+                    )?)?
+                    .capability
                     .supports_sandbox(),
                 );
             }

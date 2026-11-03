@@ -47,7 +47,10 @@ impl McpDiscovery {
                     for server in &mut self.servers {
                         if server.enabled {
                             server.status = McpStatus::Failed;
-                            server.status_detail = Some(format!("{error:#}"));
+                            server.status_detail = Some(
+                                forge_provider_api::SanitizedMessage::new("MCP discovery failed")
+                                    .expect("static diagnostic is nonempty"),
+                            );
                         }
                     }
                 }
@@ -98,6 +101,7 @@ impl McpDiscovery {
                 tokio::time::timeout(Duration::from_secs(120), provider.mcp_list(request))
                     .await
                     .context("MCP startup discovery timed out after 120 seconds")?
+                    .map_err(anyhow::Error::from)
             }));
         }
         Ok(self.servers.clone())
@@ -107,137 +111,34 @@ impl McpDiscovery {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::provider::{
-        ProviderCapability, ProviderDescriptor, ProviderEventSink, ProviderKind, ProviderRequest,
+    use crate::provider::ProviderDescriptor;
+    use forge_provider_api::{
+        ProviderError,
+        catalog::{
+            McpDefinition as NativeMcpDefinition, McpStatus as NativeMcpStatus, McpTransportKind,
+        },
+        events::ProviderEventSink,
     };
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
-    struct DiscoveryProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-        release: Notify,
-        calls: AtomicUsize,
-        unavailable_reason: Option<&'static str>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for DiscoveryProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        fn descriptor(&self) -> ProviderDescriptor {
-            ProviderDescriptor {
-                kind: ProviderKind::Mock,
-                label: "Discovery test".into(),
-                capability: ProviderCapability::default(),
-            }
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn mcp_configuration(&self, _: ProviderCatalogRequest) -> Result<Vec<McpDefinition>> {
-            let mut working = server("working", McpStatus::Unavailable);
-            working.status_detail = self.unavailable_reason.map(str::to_owned);
-            Ok(vec![working, server("unwired", McpStatus::Unavailable)])
-        }
-
-        async fn mcp_list(&self, _: ProviderCatalogRequest) -> Result<Vec<McpDefinition>> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.release.notified().await;
-            let mut failed = server("unwired", McpStatus::Failed);
-            failed.status_detail = Some("initialize connection closed".into());
-            Ok(vec![server("working", McpStatus::Connected), failed])
+    fn descriptor() -> ProviderDescriptor {
+        ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("fixture identity is available"),
+            label: "Normalized catalog fixture".into(),
+            capability: Default::default(),
         }
     }
 
-    impl DiscoveryProvider {
-        async fn run_native(
-            &self,
-            _: ProviderRequest,
-            _: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            Err(anyhow::anyhow!("catalog discovery must not prompt").into())
-        }
-    }
-
-    fn server(name: &str, status: McpStatus) -> McpDefinition {
-        McpDefinition {
+    fn native_server(name: &str, status: NativeMcpStatus) -> NativeMcpDefinition {
+        NativeMcpDefinition {
+            resource_id: None,
             scope: None,
             source_path: None,
-            resource_id: None,
             name: name.into(),
-            transport: "stdio".into(),
+            transport: McpTransportKind::Stdio,
             enabled: true,
             status,
             status_detail: None,
@@ -246,6 +147,50 @@ mod test {
             tools: Vec::new(),
             tool_error: None,
         }
+    }
+
+    fn bridge(
+        release: Arc<Notify>,
+        calls: Arc<AtomicUsize>,
+        unavailable_reason: Option<&'static str>,
+    ) -> Arc<Provider> {
+        let fixture = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor(),
+            |_request, _sink: ProviderEventSink, _cancelled| async { Ok::<(), ProviderError>(()) },
+        )
+        .with_mcp_configuration(move |_request| async move {
+            let mut working = native_server("working", NativeMcpStatus::Unavailable);
+            working.status_detail = unavailable_reason.map(|reason| {
+                forge_provider_api::diagnostic::SanitizedMessage::new(reason)
+                    .expect("fixture message is nonempty")
+            });
+            Ok(vec![
+                working,
+                native_server("unwired", NativeMcpStatus::Unavailable),
+            ])
+        })
+        .with_mcp_list(move |_request| {
+            let release = release.clone();
+            let calls = calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                let mut failed = native_server("unwired", NativeMcpStatus::Failed);
+                failed.status_detail = Some(
+                    forge_provider_api::diagnostic::SanitizedMessage::new(
+                        "connection could not be initialized",
+                    )
+                    .expect("fixture message is nonempty"),
+                );
+                Ok(vec![
+                    native_server("working", NativeMcpStatus::Connected),
+                    failed,
+                ])
+            }
+        });
+        let session = crate::provider::test_support::ProviderTestSession::from_native(fixture)
+            .expect("normalized fixture bridges successfully");
+        session.provider_handle()
     }
 
     fn request() -> ProviderCatalogRequest {
@@ -261,12 +206,7 @@ mod test {
 
     #[tokio::test]
     async fn closing_discovery_cancels_the_retained_provider_request() {
-        let provider = Arc::new(DiscoveryProvider {
-            fixture_events: Default::default(),
-            release: Notify::new(),
-            calls: AtomicUsize::new(0),
-            unavailable_reason: None,
-        });
+        let provider = bridge(Arc::new(Notify::new()), Arc::new(AtomicUsize::new(0)), None);
         let mut discovery = McpDiscovery::default();
         discovery.snapshot(provider, request()).await.unwrap();
         tokio::task::yield_now().await;
@@ -278,17 +218,19 @@ mod test {
 
     #[tokio::test]
     async fn known_credential_failure_stays_unavailable_while_other_servers_load() {
-        let provider = Arc::new(DiscoveryProvider {
-            fixture_events: Default::default(),
-            release: Notify::new(),
-            calls: AtomicUsize::new(0),
-            unavailable_reason: Some("credential reference is unset"),
-        });
+        let provider = bridge(
+            Arc::new(Notify::new()),
+            Arc::new(AtomicUsize::new(0)),
+            Some("credential reference is unset"),
+        );
         let mut discovery = McpDiscovery::default();
         let rows = discovery.snapshot(provider, request()).await.unwrap();
         assert_eq!(rows[0].status, McpStatus::Unavailable);
         assert_eq!(
-            rows[0].status_detail.as_deref(),
+            rows[0]
+                .status_detail
+                .as_ref()
+                .map(|message| message.as_str()),
             Some("credential reference is unset")
         );
         assert_eq!(rows[1].status, McpStatus::Loading);
@@ -296,12 +238,9 @@ mod test {
 
     #[tokio::test]
     async fn cold_requests_share_discovery_and_preserve_individual_server_failures() {
-        let provider = Arc::new(DiscoveryProvider {
-            fixture_events: Default::default(),
-            release: Notify::new(),
-            calls: AtomicUsize::new(0),
-            unavailable_reason: None,
-        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let provider = bridge(release.clone(), calls.clone(), None);
         let mut discovery = McpDiscovery::default();
         for _ in 0..3 {
             let rows = discovery
@@ -312,8 +251,8 @@ mod test {
             assert!(rows.iter().all(|row| row.status == McpStatus::Loading));
         }
         tokio::task::yield_now().await;
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-        provider.release.notify_one();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.notify_one();
         tokio::task::yield_now().await;
         let rows = discovery
             .snapshot(provider.clone(), request())
@@ -322,8 +261,11 @@ mod test {
         assert_eq!(rows[0].status, McpStatus::Connected);
         assert_eq!(rows[1].status, McpStatus::Failed);
         assert_eq!(
-            rows[1].status_detail.as_deref(),
-            Some("initialize connection closed")
+            rows[1]
+                .status_detail
+                .as_ref()
+                .map(|message| message.as_str()),
+            Some("connection could not be initialized")
         );
         assert_eq!(
             discovery
@@ -332,7 +274,7 @@ mod test {
                 .unwrap(),
             rows
         );
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         discovery.completed_at = Some(Instant::now() - Duration::from_secs(6));
         assert_eq!(
             discovery
@@ -342,9 +284,102 @@ mod test {
             rows
         );
         tokio::task::yield_now().await;
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
-        provider.release.notify_one();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        release.notify_one();
         tokio::task::yield_now().await;
         assert_eq!(discovery.snapshot(provider, request()).await.unwrap(), rows);
+    }
+}
+
+/// Merge runtime observations without replacing shared resource identity, selection, or preparation errors.
+pub(crate) fn merge_configured(
+    configured: Vec<McpDefinition>,
+    observed: Vec<McpDefinition>,
+) -> Vec<McpDefinition> {
+    let mut observed: std::collections::HashMap<_, _> = observed
+        .into_iter()
+        .map(|row| (row.name.clone(), row))
+        .collect();
+    configured
+        .into_iter()
+        .map(|mut row| {
+            if !row.enabled || row.status == McpStatus::Unavailable {
+                return row;
+            }
+            match observed.remove(&row.name) {
+                Some(live) => {
+                    row.status = live.status;
+                    row.status_detail = live.status_detail;
+                    row.token_count = live.token_count;
+                    row.token_estimated = live.token_estimated;
+                    row.tools = live.tools;
+                    row.tool_error = live.tool_error;
+                }
+                None => {
+                    row.status = McpStatus::Unavailable;
+                    row.status_detail = Some(
+                        forge_provider_api::SanitizedMessage::new(
+                            "Provider did not report this configured MCP server",
+                        )
+                        .expect("static diagnostic is nonempty"),
+                    );
+                }
+            }
+            row
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn server(name: &str, enabled: bool, status: McpStatus) -> McpDefinition {
+        McpDefinition {
+            resource_id: Some(format!("shared-{name}")),
+            scope: Some(forge_provider_api::catalog::ResourceScope::Workspace),
+            source_path: Some("shared-config".into()),
+            name: name.into(),
+            transport: forge_provider_api::catalog::McpTransportKind::Stdio,
+            enabled,
+            status,
+            status_detail: None,
+            token_count: None,
+            token_estimated: false,
+            tools: Vec::new(),
+            tool_error: None,
+        }
+    }
+
+    /// Keep configuration authoritative while importing only runtime readiness and tools.
+    #[test]
+    fn shared_catalog_retains_selection_identity_and_preparation_failures() {
+        let mut unavailable = server("missing", true, McpStatus::Unavailable);
+        unavailable.status_detail =
+            Some(forge_provider_api::SanitizedMessage::new("Executable is missing").unwrap());
+        let result = merge_configured(
+            vec![
+                server("active", true, McpStatus::Loading),
+                server("disabled", false, McpStatus::Disabled),
+                unavailable,
+                server("unreported", true, McpStatus::Loading),
+            ],
+            vec![
+                server("active", true, McpStatus::Connected),
+                server("disabled", true, McpStatus::Connected),
+                server("missing", true, McpStatus::Connected),
+                server("unselected", true, McpStatus::Connected),
+            ],
+        );
+        assert_eq!(result.len(), 4);
+        assert_eq!(result[0].status, McpStatus::Connected);
+        assert_eq!(result[0].resource_id.as_deref(), Some("shared-active"));
+        assert!(!result[1].enabled);
+        assert_eq!(result[1].status, McpStatus::Disabled);
+        assert_eq!(
+            result[2].status_detail.as_ref().unwrap().as_str(),
+            "Executable is missing"
+        );
+        assert_eq!(result[3].status, McpStatus::Unavailable);
     }
 }

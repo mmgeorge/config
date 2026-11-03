@@ -99,12 +99,14 @@ pub(crate) fn tool_updates(
         ToolStatus::Succeeded => Some(ToolOutcome::Succeeded),
         ToolStatus::Failed => Some(ToolOutcome::Failed {
             diagnostic: crate::provider::ToolDiagnostic {
-                code: None,
-                message: "tool execution failed".into(),
+                kind: forge_provider_api::ProviderFailureKind::Unknown,
+                message: forge_provider_api::SanitizedMessage::new("tool execution failed")
+                    .expect("host diagnostic is nonempty"),
             },
         }),
         ToolStatus::Denied => Some(ToolOutcome::Denied {
-            reason: "tool execution denied".into(),
+            reason: forge_provider_api::diagnostic::SanitizedMessage::new("tool execution denied")
+                .expect("static denial is nonempty"),
         }),
         ToolStatus::Cancelled => Some(ToolOutcome::Cancelled),
         ToolStatus::Interrupted => Some(ToolOutcome::Interrupted),

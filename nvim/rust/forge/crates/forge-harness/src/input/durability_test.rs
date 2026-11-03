@@ -1,5 +1,5 @@
 use super::*;
-use crate::provider::submission::{SubmissionStore, SubmissionTarget};
+use crate::provider::submission::SubmissionStore;
 
 #[derive(Clone, Copy, Debug)]
 enum DispatchCut {
@@ -215,16 +215,17 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
                 recovered_input: Vec::new(),
                 control_context: None,
             };
-            let submission = submissions.prepare(&request, crate::provider::ProviderKind::Codex)?;
+            let submission =
+                submissions.prepare(&request, forge_providers::registry::default_id())?;
             if matches!(boundary, DispatchCut::Sending | DispatchCut::Accepted) {
-                submission.sending(SubmissionTarget::native(
-                    "codex",
-                    "thread",
-                    serde_json::json!({}),
-                ))?;
+                submission.sending(Some(forge_provider_api::RecoveryToken::new(
+                    b"fixture-sending".to_vec(),
+                )?))?;
             }
             if matches!(boundary, DispatchCut::Accepted) {
-                submission.accepted("receipt".into())?;
+                submission.accepted(Some(forge_provider_api::RecoveryToken::new(
+                    b"fixture-receipt".to_vec(),
+                )?))?;
             }
             if matches!(boundary, DispatchCut::Cancelled) {
                 submission.cancel()?;

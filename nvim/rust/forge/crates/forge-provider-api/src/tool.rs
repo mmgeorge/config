@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ToolInvocation {
@@ -14,8 +13,10 @@ pub struct ToolInvocation {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ToolDiagnostic {
-    pub code: Option<String>,
-    pub message: String,
+    /// Carry a normalized failure class, without native codes or verbatim messages.
+    pub kind: crate::error::ProviderFailureKind,
+    /// Preserve useful host or adapter text after native detail has been sanitized.
+    pub message: crate::diagnostic::SanitizedMessage,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -29,8 +30,12 @@ pub enum TextUpdate {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolOutcome {
     Succeeded,
-    Failed { diagnostic: ToolDiagnostic },
-    Denied { reason: String },
+    Failed {
+        diagnostic: ToolDiagnostic,
+    },
+    Denied {
+        reason: crate::diagnostic::SanitizedMessage,
+    },
     Cancelled,
     Interrupted,
 }
@@ -95,15 +100,16 @@ pub enum ToolStatus {
 }
 
 impl ToolStatus {
-    pub fn parse(status: &str) -> anyhow::Result<Self> {
-        match status.to_ascii_lowercase().as_str() {
-            "pending" | "running" | "inprogress" | "in_progress" => Ok(Self::Running),
-            "completed" | "complete" | "success" | "succeeded" => Ok(Self::Succeeded),
-            "failed" | "error" => Ok(Self::Failed),
-            "denied" | "declined" | "rejected" => Ok(Self::Denied),
-            "cancelled" | "canceled" => Ok(Self::Cancelled),
+    /// Decode only the canonical host representation; native aliases belong to adapters.
+    pub fn parse(status: &str) -> Result<Self, ParseToolStatusError> {
+        match status {
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            "denied" => Ok(Self::Denied),
+            "cancelled" => Ok(Self::Cancelled),
             "interrupted" => Ok(Self::Interrupted),
-            _ => anyhow::bail!("unsupported provider tool status: {status}"),
+            _ => Err(ParseToolStatusError),
         }
     }
 
@@ -119,13 +125,17 @@ impl ToolStatus {
     }
 }
 
-impl std::ops::Deref for ToolStatus {
-    type Target = str;
+/// Reject a noncanonical status without retaining provider-specific text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ParseToolStatusError;
 
-    fn deref(&self) -> &str {
-        self.as_str()
+impl std::fmt::Display for ParseToolStatusError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("invalid normalized tool status")
     }
 }
+
+impl std::error::Error for ParseToolStatusError {}
 
 impl std::fmt::Display for ToolStatus {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -140,70 +150,6 @@ pub enum ToolActivityKind {
     Command,
     FileChange,
     ToolCall,
-}
-
-impl ToolInvocation {
-    /// Formats a call with sorted, credential-redacted arguments, decoding JSON strings first.
-    /// Returns `None` for an empty name or invalid encoded JSON.
-    pub fn call_title(name: &str, arguments: &Value) -> Option<String> {
-        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-        if name.is_empty() {
-            return None;
-        }
-        let arguments = match arguments {
-            Value::String(encoded) => serde_json::from_str(encoded).ok()?,
-            arguments => arguments.clone(),
-        };
-        let mut arguments = Self::redact_arguments(&arguments);
-        arguments.sort_all_objects();
-        Some(format!(
-            "{name}({})",
-            serde_json::to_string(&arguments).ok()?
-        ))
-    }
-
-    fn redact_arguments(value: &Value) -> Value {
-        match value {
-            Value::Array(values) => {
-                Value::Array(values.iter().map(Self::redact_arguments).collect())
-            }
-            Value::Object(values) => Value::Object(
-                values
-                    .iter()
-                    .map(|(key, value)| {
-                        let value = if Self::sensitive_argument(key) {
-                            Value::String("[REDACTED]".into())
-                        } else {
-                            Self::redact_arguments(value)
-                        };
-                        (key.clone(), value)
-                    })
-                    .collect(),
-            ),
-            _ => value.clone(),
-        }
-    }
-
-    fn sensitive_argument(key: &str) -> bool {
-        matches!(
-            key.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
-            "token"
-                | "apikey"
-                | "key"
-                | "secret"
-                | "password"
-                | "passphrase"
-                | "authorization"
-                | "bearer"
-                | "cookie"
-                | "session"
-                | "credential"
-                | "accesstoken"
-                | "refreshtoken"
-                | "clientsecret"
-                | "privatekey"
-        )
-    }
 }
 
 /// Carries the operation meaning without requiring native tool-name or argument parsing.
@@ -221,4 +167,24 @@ pub enum ToolSemantics {
         paths: Vec<String>,
         directory: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Preserve the existing denial wire shape while validating its diagnostic text.
+    #[test]
+    fn denial_reason_roundtrips_as_validated_text() {
+        let value =
+            serde_json::json!({"kind":"denied", "reason":"Host policy denied this operation"});
+        let outcome: ToolOutcome = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(outcome).unwrap(), value);
+        assert!(
+            serde_json::from_value::<ToolOutcome>(
+                serde_json::json!({"kind":"denied", "reason":" "})
+            )
+            .is_err()
+        );
+    }
 }

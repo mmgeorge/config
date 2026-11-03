@@ -6,7 +6,7 @@ This guide explains the retry contract and how to allow a new error. For the del
 
 ## Lifecycle
 
-`provider/retry.rs` owns retry policy shared by root, child, and Background sessions. Each attempt waits on the shared session execution engine, which separates submission acceptance from normalized terminal evidence. A successful submission RPC cannot trigger completion or a retry. Adapters classify native terminal errors as `RetryableFailure` only after checking `replay_safe`. The runner keeps the provider thread, model, settings, and control context, and submits a continuation rather than appending the user's message again. Retries stay in the same exchange.
+`provider/retry.rs` owns retry policy shared by root, child, and Background sessions. Each attempt waits on the shared session execution engine, which separates submission acceptance from normalized terminal evidence. A successful submission RPC cannot trigger completion or a retry. Adapters classify native terminal errors as `RetryableFailure` only after checking `replay_safe`. The runner passes the opaque continuation token and fresh callbacks to `Provider::continue_session`; the native owner retains the accepted history, model, settings, and input identity. Retries stay in the same exchange and do not append the user's message again.
 
 The first attempt has no delay. Five retries then wait 1, 5, 10, 30, and 60 seconds. The budget belongs to one runner invocation and does not reset after each error. After the fifth retry, or on any non-retryable error, the actual provider error goes through the normal failure path.
 
@@ -37,12 +37,12 @@ Sources:
 
 1. Capture the final error and the provider lifecycle before it from the session log, including the provider version, exact code, HTTP status, turn identity, and whether the provider continues on its own.
 2. Verify the metadata against the provider's schema or implementation. Establish whether the failure is temporary, whether native execution has ended, and whether any tool or model output can already have occurred. A message substring, a generic `recoverable` flag, or a broad HTTP range is not proof.
-3. Add the smallest exact match to `provider/codex/retry.rs` or `provider/copilot/retry.rs`, and keep unknown codes rejected. If safe termination or replay cannot be established, leave the error out and design reconciliation separately.
+3. Add the smallest exact match inside the corresponding private module in `forge-providers`, and keep unknown codes rejected. If safe termination or replay cannot be established, leave the error out and design reconciliation separately. The shared API and Harness must never inspect native codes or messages.
 4. Add a positive classifier case and neighboring negative cases. Exercise the adapter's terminal event, recovery, exhausted budget, cancellation, and output-before-failure paths. Leave the shared schedule and status logic unchanged.
 5. Update the allowlist with its evidence and provider version, run the targeted tests, rebuild, and verify the status in a fresh host.
 
 ## Diagnostics
 
-With Harness tracing enabled, `/log` keeps `provider.retry` entries for failed, scheduled, started, recovered, stopped, exhausted, and cancelled retries. Failed entries keep the complete structured error and provider thread and turn identity, and existing credential redaction applies.
+With Harness tracing enabled, `/log` keeps `provider.retry` entries for failed, scheduled, started, recovered, stopped, exhausted, and cancelled retries. Failed entries retain normalized categories and correlation identities; native codes, payloads, error text, and continuation bytes do not cross this boundary. Provider-specific reproduction data belongs in a private adapter fixture.
 
-The final UI error is always the actual provider error, not a generic retry-limit message.
+The final UI error preserves the normalized failure category rather than replacing it with a retry-limit message.

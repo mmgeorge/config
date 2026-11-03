@@ -33,6 +33,7 @@ impl CompactionJob {
         let output = std::panic::AssertUnwindSafe(self.provider.compact(self.request))
             .catch_unwind()
             .await
+            .map(|result| result.map_err(anyhow::Error::from))
             .unwrap_or_else(|_| Err(anyhow::anyhow!("provider compaction panicked")));
         CompactionResult {
             state: self.state,
@@ -161,7 +162,11 @@ impl HarnessBroker {
                 Err(error) => {
                     state.compaction.state = crate::provider::CompactionState::Failed;
                     state.compaction.completed_at_ms = Some(self.clock.now_ms());
-                    state.compaction.result.error = Some(format!("{error:#}"));
+                    state.compaction.result.diagnostic =
+                        Some(crate::provider::lifecycle_error::diagnostic(
+                            forge_provider_api::ProviderOperation::HostEffectPublication,
+                            error.as_ref(),
+                        ));
                     state.record.detail = SessionEventKind::Compaction {
                         compaction: state.compaction.into(),
                     };
@@ -197,7 +202,11 @@ impl HarnessBroker {
             Ok(output) => output,
             Err(error) => {
                 state.compaction.state = crate::provider::CompactionState::Failed;
-                state.compaction.result.error = Some(format!("{error:#}"));
+                state.compaction.result.diagnostic =
+                    Some(crate::provider::lifecycle_error::diagnostic(
+                        forge_provider_api::ProviderOperation::HostEffectPublication,
+                        error.as_ref(),
+                    ));
                 state.record.detail = SessionEventKind::Compaction {
                     compaction: state.compaction.into(),
                 };
@@ -253,12 +262,14 @@ impl HarnessBroker {
                 .map(|usage| usage.used);
         }
         let failed = state.compaction.state == crate::provider::CompactionState::Failed;
-        let message = state
-            .compaction
-            .result
-            .error
-            .clone()
-            .unwrap_or_else(|| "Provider compaction failed".into());
+        let message =
+            forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::CompactSession,
+                state.compaction.result.diagnostic.as_ref().map_or(
+                    forge_provider_api::ProviderFailureKind::Unknown,
+                    |diagnostic| diagnostic.kind,
+                ),
+            ));
         state.record.detail = SessionEventKind::Compaction {
             compaction: state.compaction.into(),
         };
@@ -296,11 +307,7 @@ impl HarnessBroker {
         let patch = self.reconcile_timeline()?;
         let mut delivery = self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?;
         if failed {
-            return Ok((
-                delivery,
-                Some(anyhow::anyhow!("{message}")),
-                state.provenance,
-            ));
+            return Ok((delivery, Some(message.into()), state.provenance));
         }
         delivery
             .events

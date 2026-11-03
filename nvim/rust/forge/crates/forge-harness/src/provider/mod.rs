@@ -1,4 +1,3 @@
-pub(crate) mod acp;
 pub mod approval;
 mod catalog;
 pub(crate) use catalog::select_model_settings;
@@ -9,20 +8,17 @@ pub use compaction::{
 pub use forge_provider_api::compaction;
 pub type ProviderCompactionRequest =
     forge_provider_api::compaction::ProviderCompactionRequest<ProviderRequest>;
-pub mod codex;
-pub mod copilot;
+mod bridge;
+mod completion;
 pub mod events;
 mod execution;
+mod host_invocation;
 pub(crate) mod lifecycle_error;
 pub(crate) mod mcp;
 pub mod mock_response;
 mod prompt;
 pub(crate) mod retry;
-mod session_events;
-pub(crate) use session_events::{
-    CompletionSlot, ExecutionCertificate, HostEffectBatch, NativeExecutionCertificate,
-    TerminalBoundary,
-};
+pub(crate) use completion::{CompletionSlot, HostEffectBatch};
 pub(crate) mod session_execution;
 mod steering;
 pub mod submission;
@@ -38,8 +34,8 @@ pub use execution::{
 };
 pub use forge_provider_api::terminal;
 pub use forge_provider_api::usage;
+pub use steering::SteeringInput;
 pub(crate) use steering::{ActiveSteering, SteerCommand, SteeringLane};
-pub use steering::{SteerTarget, SteeringInput};
 pub use text_generation::{BACKGROUND_SYSTEM_MESSAGE, TextGeneration};
 
 mod contract;

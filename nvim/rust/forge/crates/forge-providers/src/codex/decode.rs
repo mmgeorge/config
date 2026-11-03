@@ -1,12 +1,16 @@
 use anyhow::Result;
-use forge_provider_api::agent::{AgentExecutionState, AgentLifecycleEvent};
+use forge_provider_api::agent::AgentExecutionState;
 use forge_provider_api::context::ContextUsage;
 use forge_provider_api::{
     ChecklistStatus, ProviderChangeKind, ProviderChangeSet, ProviderChecklistEntry,
-    ProviderChecklistUpdate, ProviderFileChange, ToolActivityKind, ToolInvocation,
+    ProviderChecklistUpdate, ProviderFileChange, ToolActivityKind,
 };
 use serde_json::{Value, json};
 use std::{path::Path, time::Duration};
+
+#[derive(Debug, thiserror::Error)]
+#[error("invalid Codex tool status")]
+struct InvalidCodexToolStatus;
 
 pub struct CodexToolSnapshot {
     pub id: String,
@@ -18,6 +22,19 @@ pub struct CodexToolSnapshot {
     pub status: Option<forge_provider_api::ToolStatus>,
     pub change: ProviderChangeSet,
     pub output_delta: bool,
+}
+
+/// Retain native ancestry evidence privately until the adapter normalizes it.
+#[derive(Clone, Debug)]
+pub struct NativeAgentLifecycle {
+    pub operation: String,
+    pub starts_child: bool,
+    pub parent_thread_id: Option<String>,
+    pub provider_thread_id: Option<String>,
+    pub definition: Option<String>,
+    pub nickname: Option<String>,
+    pub task: Option<String>,
+    pub status: AgentExecutionState,
 }
 
 fn normalize_agent_status(status: &str) -> Option<AgentExecutionState> {
@@ -33,7 +50,7 @@ fn normalize_agent_status(status: &str) -> Option<AgentExecutionState> {
     }
 }
 
-pub fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifecycleEvent> {
+pub fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<NativeAgentLifecycle> {
     let encoded = params.to_string().to_ascii_lowercase();
     let method_lower = method.to_ascii_lowercase();
     if !method_lower.contains("subagent")
@@ -56,10 +73,6 @@ pub fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifec
             "/senderThreadId",
             "/sender_thread_id",
         ],
-    );
-    let turn_id = pointer_string(
-        params,
-        &["/turnId", "/turn_id", "/item/turnId", "/item/turn_id"],
     );
     let definition = first_string(item, &["agentType", "agent_type", "role"]);
     let nickname = first_string(item, &["agentNickname", "agent_nickname", "nickname"]);
@@ -88,12 +101,11 @@ pub fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifec
         );
         return provider_thread_id
             .map(|provider_thread_id| {
-                vec![AgentLifecycleEvent {
+                vec![NativeAgentLifecycle {
                     operation,
                     starts_child,
                     parent_thread_id,
                     provider_thread_id: Some(provider_thread_id),
-                    turn_id,
                     definition,
                     nickname,
                     task,
@@ -134,12 +146,11 @@ pub fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifec
                 }
             });
         let Some(status) = status else { continue };
-        lifecycle_list.push(AgentLifecycleEvent {
+        lifecycle_list.push(NativeAgentLifecycle {
             operation: operation.clone(),
             starts_child: operation.eq_ignore_ascii_case("spawnAgent"),
             parent_thread_id: parent_thread_id.clone(),
             provider_thread_id: Some(receiver_thread_id),
-            turn_id: turn_id.clone(),
             definition: definition.clone(),
             nickname: nickname.clone(),
             task: task.clone(),
@@ -148,12 +159,11 @@ pub fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifec
     }
     if lifecycle_list.is_empty() && operation.eq_ignore_ascii_case("spawnAgent") {
         let status_text = first_string(item, &["status", "state"]).unwrap_or_default();
-        lifecycle_list.push(AgentLifecycleEvent {
+        lifecycle_list.push(NativeAgentLifecycle {
             operation,
             starts_child: true,
             parent_thread_id,
             provider_thread_id: None,
-            turn_id,
             definition,
             nickname,
             task,
@@ -168,7 +178,7 @@ pub fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifec
 }
 
 /// Resolve child-agent lifecycle state from one raw provider message.
-pub fn agent_lifecycle_list(message: &Value) -> Vec<AgentLifecycleEvent> {
+pub fn agent_lifecycle_list(message: &Value) -> Vec<NativeAgentLifecycle> {
     let method = message
         .get("method")
         .and_then(Value::as_str)
@@ -524,10 +534,7 @@ pub fn normalize_tool_activity(
                         .then(|| "inProgress".to_owned())
                 })
         });
-    let status = status
-        .as_deref()
-        .map(forge_provider_api::ToolStatus::parse)
-        .transpose()?;
+    let status = status.as_deref().map(parse_tool_status).transpose()?;
     Ok(Some(CodexToolSnapshot {
         name: item
             .get("tool")
@@ -557,6 +564,22 @@ pub fn normalize_tool_activity(
         output_delta: method_lower.ends_with("/outputdelta")
             || method_lower.ends_with("/output_delta"),
     }))
+}
+
+/// Decode native Codex lifecycle spellings before exposing the canonical host status.
+fn parse_tool_status(
+    status: &str,
+) -> Result<forge_provider_api::ToolStatus, InvalidCodexToolStatus> {
+    use forge_provider_api::ToolStatus;
+    match status.to_ascii_lowercase().as_str() {
+        "pending" | "running" | "inprogress" | "in_progress" => Ok(ToolStatus::Running),
+        "completed" | "complete" | "success" | "succeeded" => Ok(ToolStatus::Succeeded),
+        "failed" | "error" => Ok(ToolStatus::Failed),
+        "denied" | "declined" | "rejected" => Ok(ToolStatus::Denied),
+        "cancelled" | "canceled" => Ok(ToolStatus::Cancelled),
+        "interrupted" => Ok(ToolStatus::Interrupted),
+        _ => Err(InvalidCodexToolStatus),
+    }
 }
 
 fn normalize_file_change_set(item: &Value, envelope: &Value, workspace: &str) -> ProviderChangeSet {
@@ -599,7 +622,7 @@ fn normalize_file_change_set(item: &Value, envelope: &Value, workspace: &str) ->
                 .or_else(|| change.get("patch"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            let (diff, reported_move) = ProviderFileChange::split_move_report(kind, source);
+            let (diff, reported_move) = split_move_report(kind, source);
             let move_path = change
                 .get("movePath")
                 .or_else(|| change.get("move_path"))
@@ -622,6 +645,21 @@ fn normalize_file_change_set(item: &Value, envelope: &Value, workspace: &str) ->
     ProviderChangeSet { file }
 }
 
+/// Separate a trailing move annotation from complete patch content.
+fn split_move_report(kind: ProviderChangeKind, diff: &str) -> (&str, Option<&str>) {
+    if matches!(kind, ProviderChangeKind::Add | ProviderChangeKind::Delete) {
+        return (diff, None);
+    }
+    let Some((patch, destination)) = diff.rsplit_once("\nMoved to: ") else {
+        return (diff, None);
+    };
+    let destination = destination.trim_end_matches(['\r', '\n']);
+    if destination.is_empty() || destination.contains(['\r', '\n']) {
+        return (diff, None);
+    }
+    (patch, Some(destination))
+}
+
 fn provider_change_path(path: &str, workspace: &str) -> String {
     if workspace.is_empty() {
         return path.to_owned();
@@ -638,12 +676,7 @@ fn provider_change_path(path: &str, workspace: &str) -> String {
 pub fn successful_file_change(activity: &CodexToolSnapshot) -> bool {
     activity.kind == ToolActivityKind::FileChange
         && !activity.change.is_empty()
-        && activity.status.as_deref().is_some_and(|status| {
-            matches!(
-                status.to_ascii_lowercase().as_str(),
-                "completed" | "complete" | "success" | "succeeded"
-            )
-        })
+        && activity.status == Some(forge_provider_api::ToolStatus::Succeeded)
 }
 
 fn tool_title(value: &Value) -> Option<String> {
@@ -699,12 +732,12 @@ fn callable_tool_title(item: &Value) -> Option<String> {
             |namespace| format!("{namespace}.{tool}"),
         );
     let arguments = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    ToolInvocation::call_title(&title, &arguments)
+    crate::tool_display::call_title(&title, &arguments)
 }
 
 fn generic_tool_title(item: &Value) -> Option<String> {
     let title = item.get("type").and_then(Value::as_str)?;
-    ToolInvocation::call_title(title, item)
+    crate::tool_display::call_title(title, item)
 }
 
 fn builtin_tool_title(item: &Value) -> Option<String> {
@@ -799,8 +832,11 @@ fn mcp_tool_output(item: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .is_some_and(|item_type| item_type.eq_ignore_ascii_case("mcpToolCall"))
         .then_some(())?;
-    if let Some(message) = item.pointer("/error/message").and_then(Value::as_str) {
-        return Some(strip_ansi_escapes::strip_str(message));
+    if item
+        .pointer("/error/message")
+        .is_some_and(|message| !message.is_null())
+    {
+        return Some("The MCP tool call failed.".into());
     }
     let result = item.get("result")?;
     let text_list = result

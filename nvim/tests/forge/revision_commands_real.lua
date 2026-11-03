@@ -34,7 +34,6 @@ local ok, failure = xpcall(function()
   vim.notify = function(message, level, options)
     notifications[#notifications + 1] = { message = tostring(message), level = level, options = options }
   end
-  package.loaded["forge.harness.providers.mock"] = { descriptor = function() error("completion initialized a provider") end }
   assert(#vim.fn.getcompletion("ForgeBranchDiff feature-", "cmdline") == 0)
   assert(vim.wait(10000, function()
     local values = vim.fn.getcompletion("ForgeBranchDiff feature-", "cmdline")

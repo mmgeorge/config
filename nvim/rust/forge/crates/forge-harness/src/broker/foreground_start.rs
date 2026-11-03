@@ -41,6 +41,10 @@ impl HarnessBroker {
                     arguments.push_str("\n\n");
                     arguments.push_str(&message);
                 }
+                ProviderInput::QuestionReply { context, .. } => {
+                    context.push_str("\n\n");
+                    context.push_str(&message);
+                }
             }
         }
 
@@ -123,7 +127,6 @@ impl HarnessBroker {
                 scope: scope.clone(),
                 authorization_sink: provider_event_sink.clone(),
                 editing: self.observer.check_editing.clone(),
-                setup: staged.exchange.check_setup.is_some(),
                 can_run: staged.exchange.check_setup.is_none()
                     && self.agent_coordinator.active_count() == 0
                     && execution.is_none(),
@@ -151,7 +154,6 @@ impl HarnessBroker {
             stream,
             ProviderSubmission {
                 request: request.clone(),
-                provider: self.provider.clone(),
                 engine: engine.clone(),
                 sink: provider_event_sink.clone(),
                 trace: self.trace.clone(),

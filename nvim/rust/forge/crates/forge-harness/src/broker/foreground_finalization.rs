@@ -232,9 +232,7 @@ impl ForegroundFinalization {
                 .tool_gate
                 .as_ref()
                 .context("blocked checkpoint gate is missing")?
-                .complete(Err(
-                    "turn cancelled before checkpoint admission completed".into()
-                ))?;
+                .complete(Err(crate::checkpoint::CheckpointGateError::OwnerEnded));
             runtime.checkpoint.take();
             exchange.finalization_error = None;
             exchange.finish(outcome, broker.clock.now_ms())?;
@@ -769,7 +767,6 @@ impl HarnessBroker {
                 transaction.request = request.clone();
                 let submission = ProviderSubmission {
                     request,
-                    provider: self.provider.clone(),
                     engine: transaction.engine.clone(),
                     sink: transaction.provider_event_sink.clone(),
                     trace: self.trace.clone(),
@@ -824,7 +821,6 @@ impl HarnessBroker {
                     transaction.request = request.clone();
                     let submission = ProviderSubmission {
                         request,
-                        provider: self.provider.clone(),
                         engine: transaction.engine.clone(),
                         sink: transaction.provider_event_sink.clone(),
                         trace: self.trace.clone(),
@@ -928,7 +924,6 @@ impl HarnessBroker {
                 transaction.request = request.clone();
                 let submission = ProviderSubmission {
                     request,
-                    provider: self.provider.clone(),
                     engine: transaction.engine.clone(),
                     sink: transaction.provider_event_sink.clone(),
                     trace: self.trace.clone(),

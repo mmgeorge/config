@@ -1,9 +1,10 @@
 use crate::{ProviderError, ProviderModel};
 
 /// Select reasoning independently of the purpose of a text request.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum ReasoningSelection {
     /// Use the provider's default reasoning level.
+    #[default]
     Default,
     /// Use the lowest level advertised by the selected model.
     Lowest,
@@ -12,8 +13,10 @@ pub enum ReasoningSelection {
 }
 
 /// Prepare an isolated text request without retaining Harness task state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TextGenerationRequest {
+    /// Select the admitted workspace for temporary native configuration and files.
+    pub workspace: String,
     /// Model selected by the caller.
     pub model: String,
     /// Reasoning policy selected by the caller.
@@ -22,6 +25,8 @@ pub struct TextGenerationRequest {
     pub instructions: String,
     /// Prepared evidence and user input for generation.
     pub input: String,
+    /// Apply the caller's output-specific acceptance rule before native cleanup completes.
+    pub validator: std::sync::Arc<dyn TextValidator>,
 }
 
 /// Validate generated text according to the host's requested output surface.

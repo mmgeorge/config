@@ -7,7 +7,7 @@ use crate::tools::session::catalog::{definitions, is_tool};
 fn session(id: &str, workspace: &Path) -> HarnessSession {
     serde_json::from_value(json!({
         "id":id,"primary_agent_id":HarnessSession::primary_agent_id(id),"name":id,
-        "workspace":workspace,"provider":"copilot","model":"default","effort":"medium",
+        "workspace":workspace,"provider":"fixture-beta","model":"default","effort":"medium",
         "provider_fork_state":{"state":"ready"},"approval_mode":"ask",
         "created_at_ms":1,"updated_at_ms":1
     }))
@@ -141,7 +141,7 @@ fn session_inspection_defaults_filters_config_and_readonly_storage() -> Result<(
 fn disabling_history_keeps_config_and_skill_but_revokes_runtime_reads() -> Result<()> {
     let fixture = Fixture::new()?;
     let mut settings = SettingsStore::open(fixture.root.path())?;
-    let snapshot = settings.get(&fixture.scope.session.workspace, "current", "copilot")?;
+    let snapshot = settings.get(&fixture.scope.session.workspace, "current", "fixture-beta")?;
     settings.update(
         snapshot.revision,
         SettingScope::Session,
@@ -204,8 +204,8 @@ fn disabling_history_keeps_config_and_skill_but_revokes_runtime_reads() -> Resul
             approval_mode: crate::session::ApprovalMode::Ask,
             provider_session_id: None,
         },
-        "copilot",
-        "copilotcli",
+        "fixture-beta",
+        "fixture-beta-target",
     )?;
     assert!(
         resources
@@ -263,21 +263,21 @@ fn log_metadata_excludes_private_content_and_reports_absence() -> Result<()> {
         "current",
         "provider.reply",
         json!({
-            "method":"turn/complete","status":"failed","reasoning":"private reasoning",
+            "method":"operation/complete","status":"failed","reasoning":"private reasoning",
             "authorization":"credential","body":"private transport","count":3
         }),
     );
     let log = fixture.invoke("harness_session_log", json!({}))?;
     let encoded = log.to_string();
-    assert!(encoded.contains("turn/complete"));
+    assert!(encoded.contains("operation/complete"));
     assert!(!encoded.contains("private") && !encoded.contains("credential"));
     let native = crate::trace::inspection_record(&json!({
-        "event":"copilot.session.event",
-        "payload":{"type":"tool.execution_complete","data":{
+        "event":"fixture-beta.session.event",
+        "payload":{"type":"operation.finished","data":{
             "tool_call_id":"call","success":true,"arguments":"credential","reasoningText":"private"
         }}
     }));
-    assert_eq!(native["payload"]["type"], "tool.execution_complete");
+    assert_eq!(native["payload"]["type"], "operation.finished");
     assert_eq!(native["payload"]["data"]["tool_call_id"], "call");
     assert_eq!(native["payload"]["data"]["success"], true);
     assert!(!native.to_string().contains("credential") && !native.to_string().contains("private"));

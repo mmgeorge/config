@@ -9,6 +9,7 @@ require("blink.cmp.config").merge_with({ sources = source_config })
 local sources = require("blink.cmp.sources.lib")
 local session = require("forge.session")
 local client = require("forge.client")
+dofile("nvim/tests/forge/support/provider_catalog.lua").install()
 local original_request, original_system = client.request, vim.system
 
 ---@param source table
@@ -42,12 +43,12 @@ local ok, failure = xpcall(function()
     "harness_commands", "harness_files",
   }), "the real composer did not select its Harness completion providers")
 
-  session.harness.session = { id = "completion-test", provider = "codex", workspace = "fixture-workspace" }
+  session.harness.session = { id = "completion-test", provider = "fixture_alpha", workspace = "fixture-workspace" }
   session.harness.capability = {
     model_selection = true, effort_selection = true,
     catalog = { skill = true, mcp = true },
   }
-  session.harness.model_provider = "codex"
+  session.harness.model_provider = "fixture_alpha"
   session.harness.model_list = { { id = "fixture-model", reasoning = { "low", "high" } } }
   client.request = function(request_specification, callback)
   local method = request_specification.method

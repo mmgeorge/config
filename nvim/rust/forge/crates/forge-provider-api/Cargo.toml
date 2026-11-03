@@ -10,11 +10,12 @@ async-trait = { workspace = true }
 forge-protocol = { workspace = true }
 forge-shell = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time", "macros", "rt-multi-thread"] }
-anyhow = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 semver = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
+anyhow = { workspace = true }
 tempfile = { workspace = true }

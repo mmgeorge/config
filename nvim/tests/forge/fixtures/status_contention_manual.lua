@@ -47,7 +47,8 @@ vim.notify = function(message, level, options)
   table.insert(forge_manual.notices, { message = tostring(message), level = level })
   original_notify(message, level, options)
 end
-require("forge").setup({ about_auto_generate = false })
+require("forge").setup({ about_auto_generate = false, harness = { provider = "mock" },
+  background_generation = { mock = { model = "fixture-model", reasoning_effort = "low" } } })
 forge_manual.state = require("forge.views.commands").open()
 vim.api.nvim_create_user_command("ForgeFixtureCompare", function()
   require("forge.client").request({ method = "repository.generation", params = {

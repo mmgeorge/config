@@ -7,8 +7,8 @@ pub use super::decode::is_denied;
 /// Rejects provider success when a root tool denial has no subsequent final response.
 #[derive(Default)]
 pub struct RejectionState {
-    /// Latest root denial not followed by a final answer.
-    pending: Option<String>,
+    /// A root denial has not received a later final answer.
+    pending: bool,
     /// A final root response addressed every denial observed in this prompt.
     pub answered: bool,
 }
@@ -22,14 +22,7 @@ impl RejectionState {
         match event.event_type.as_str() {
             "tool.execution_complete" if is_denied(&event.data) => {
                 self.answered = false;
-                self.pending = Some(
-                    event
-                        .data
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("The provider rejected the tool call.")
-                        .to_owned(),
-                );
+                self.pending = true;
             }
             "assistant.message"
                 if event
@@ -47,8 +40,8 @@ impl RejectionState {
                         None | Some("final_answer")
                     ) =>
             {
-                self.answered |= self.pending.is_some();
-                self.pending = None;
+                self.answered |= self.pending;
+                self.pending = false;
             }
             _ => {}
         }
@@ -59,12 +52,13 @@ impl RejectionState {
         if control_handoff {
             return Ok(());
         }
-        if let Some(reason) = &self.pending {
-            return Err(ProviderError::Rejected {
-                message: format!(
-                    "Copilot stopped after a tool rejection without a final response. Provider reported: {reason}"
+        if self.pending {
+            return Err(ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Rejected,
                 ),
-            });
+            ));
         }
         Ok(())
     }
@@ -97,13 +91,7 @@ mod tests {
             json!({"content":"Earlier answer","phase":"final_answer"}),
         ));
         state.observe(&rejected);
-        assert!(
-            state
-                .finish(output)
-                .unwrap_err()
-                .to_string()
-                .contains("Denied by policy")
-        );
+        assert!(state.finish(output).is_err());
         for kind in ["assistant.reasoning", "assistant.message_delta"] {
             state.observe(&event(kind, json!({"content":"Not a final response"})));
             assert!(state.finish(output).is_err());

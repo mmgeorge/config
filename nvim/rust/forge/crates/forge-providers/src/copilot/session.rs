@@ -2,11 +2,12 @@ use anyhow::{Context, Result};
 use forge_provider_api::control::{ControlToolDefinition, ProviderTools};
 use forge_provider_api::permissions::ProviderPermissions;
 use forge_provider_api::trace::ProviderTrace;
-use forge_provider_api::{PromptMode, ProviderError};
+use forge_provider_api::{
+    PromptMode, ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation,
+};
 use github_copilot_sdk::session_events::ReasoningSummary;
 use github_copilot_sdk::types::ToolSearchConfig;
 use github_copilot_sdk::{ResumeSessionConfig, SessionConfig, SessionId, SystemMessageConfig};
-use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -31,14 +32,15 @@ pub struct SessionOptions {
     pub resources: ResourceDiscovery,
     pub excluded_tools: Vec<String>,
     pub tools: Vec<ControlToolDefinition>,
+    pub native_callbacks: Option<Arc<dyn super::provider::NativeCallbackRouter>>,
 }
 
 /// Create or resume through the SDK while host callbacks retain policy and tools.
 pub async fn open(
     client: &super::handle::CopilotClient,
     options: SessionOptions,
-    permissions: Arc<dyn ProviderPermissions>,
-    tools: Arc<dyn ProviderTools>,
+    _permissions: Arc<dyn ProviderPermissions>,
+    _tools: Arc<dyn ProviderTools>,
     trace: Arc<dyn ProviderTrace>,
     correlation_id: &str,
 ) -> Result<super::handle::CopilotSession, ProviderError> {
@@ -57,14 +59,16 @@ pub async fn open(
         ResourceDiscovery::Native => None,
     };
     let disabled_mcp = if let Some(selection) = selection {
-        trace.record(correlation_id, "copilot.mcp.discovery_begin", json!({}));
         let discovered = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             client.discover_mcp(&options.workspace.to_string_lossy()),
         )
         .await
-        .map_err(|_| ProviderError::Transport {
-            message: "Copilot MCP discovery exceeded 30 seconds before session creation".into(),
+        .map_err(|_| {
+            ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::InitializeSession,
+                forge_provider_api::ProviderFailureKind::Transport,
+            ))
         })??;
         let mut disabled = discovered
             .into_iter()
@@ -73,11 +77,6 @@ pub async fn open(
             .collect::<Vec<_>>();
         disabled.sort();
         disabled.dedup();
-        trace.record(
-            correlation_id,
-            "copilot.mcp.discovery_complete",
-            json!({"disabled_servers":disabled}),
-        );
         Some(disabled)
     } else {
         None
@@ -92,18 +91,30 @@ pub async fn open(
         let managed = matches!(&options.resources, ResourceDiscovery::Managed { .. });
         let skill_directories = match &options.resources {
             ResourceDiscovery::Native => None,
-            ResourceDiscovery::Managed { skill_directories, .. } => Some(skill_directories.clone()),
+            ResourceDiscovery::Managed {
+                skill_directories, ..
+            } => Some(skill_directories.clone()),
         };
         let reasoning_effort = options.reasoning_effort.clone();
-        let tool_list = super::control::tool_list(options.tools, tools);
+        let callbacks: Arc<dyn super::provider::NativeCallbackRouter> = options
+            .native_callbacks
+            .clone()
+            .unwrap_or_else(|| Arc::new(super::provider::NoopNativeCallbacks));
+        let tool_list = super::control::tool_list(options.tools, callbacks.clone());
         let system_message = SystemMessageConfig::new()
-            .with_mode(if options.mode == PromptMode::Background { "replace" } else { "append" })
+            .with_mode(if options.mode == PromptMode::Background {
+                "replace"
+            } else {
+                "append"
+            })
             .with_content(options.system_message.clone());
         let permission_handler: Arc<dyn github_copilot_sdk::handler::PermissionHandler> =
             if options.mode == PromptMode::Background {
                 Arc::new(github_copilot_sdk::handler::DenyAllHandler)
-            } else { super::permission::handler(permissions.clone()) };
-        let checkpoint_hooks = super::permission::checkpoint_hooks(permissions);
+            } else {
+                super::permission::handler(callbacks.clone())
+            };
+        let checkpoint_hooks = super::permission::checkpoint_hooks(callbacks);
         let prepared = if let Some(session_id) = options.session_id.as_deref() {
             let mut config = ResumeSessionConfig::new(SessionId::new(session_id));
             config.suppress_resume_event = Some(true);
@@ -124,12 +135,6 @@ pub async fn open(
             config.skill_directories = skill_directories.clone();
             config.disabled_skills = managed.then(Vec::new);
             config.disabled_mcp_servers = disabled_mcp.clone();
-            trace.record(correlation_id, "copilot.session.resume", json!({
-                "session_id":session_id, "model":config.model, "reasoning_effort":config.reasoning_effort,
-                "context_tier":config.context_tier, "system_message":options.system_message,
-                "workspace":options.workspace, "streaming":true, "enable_config_discovery":!managed, "enable_skills":true,
-                "disabled_mcp_servers":config.disabled_mcp_servers,
-            }));
             if options.mode == PromptMode::Background {
                 config.available_tools = Some(Vec::new());
                 config.tools = Some(Vec::new());
@@ -150,9 +155,10 @@ pub async fn open(
                 .map_err(|error| match error.kind() {
                     github_copilot_sdk::ErrorKind::Session(
                         github_copilot_sdk::SessionErrorKind::NotFound(_),
-                    ) => anyhow::Error::new(ProviderError::SessionMissing {
-                        message: error.to_string(),
-                    }),
+                    ) => anyhow::Error::new(native_failure(
+                        ProviderOperation::RecoverSession,
+                        ProviderFailureKind::SessionMissing,
+                    )),
                     _ => error.into(),
                 })
                 .context("resume Copilot session")?
@@ -176,12 +182,6 @@ pub async fn open(
             config.skill_directories = skill_directories;
             config.disabled_skills = managed.then(Vec::new);
             config.disabled_mcp_servers = disabled_mcp.clone();
-            trace.record(correlation_id, "copilot.session.create", json!({
-                "model":config.model, "reasoning_effort":config.reasoning_effort,
-                "context_tier":config.context_tier, "system_message":options.system_message,
-                "workspace":options.workspace, "streaming":true, "enable_config_discovery":!managed, "enable_skills":true,
-                "disabled_mcp_servers":config.disabled_mcp_servers,
-            }));
             if options.mode == PromptMode::Background {
                 config.available_tools = Some(Vec::new());
                 config.tools = Some(Vec::new());
@@ -202,37 +202,111 @@ pub async fn open(
                 .context("prepare Copilot session")?
         };
         let mut events = super::event_stream::SessionEventStream::from_subscription(
-            prepared.subscribe(), native_id, |_| true,
-            trace.clone(), correlation_id.to_owned(), super::event_stream::StartupState::Pending,
+            prepared.subscribe(),
+            native_id,
+            |_| true,
+            trace.clone(),
+            correlation_id.to_owned(),
+            super::event_stream::StartupState::Pending,
             generation.clone(),
         );
         let start = || prepared.start();
-        fn future_bytes<F, Fut>(_: &F) -> usize
-        where F: FnOnce() -> Fut, Fut: std::future::Future { std::mem::size_of::<Fut>() }
-        trace.record(correlation_id, "future.stack_probe", json!({"phase":"copilot.prepared.start","bytes":future_bytes(&start)}));
-        let started = start().await.map_err(|error| match error.kind() {
-            github_copilot_sdk::ErrorKind::Session(github_copilot_sdk::SessionErrorKind::NotFound(_)) => anyhow::Error::new(ProviderError::SessionMissing { message: error.to_string() }),
-            _ => error.into(),
-        }).context("start prepared Copilot session");
+        let started = start()
+            .await
+            .map_err(|error| match error.kind() {
+                github_copilot_sdk::ErrorKind::Session(
+                    github_copilot_sdk::SessionErrorKind::NotFound(_),
+                ) => anyhow::Error::new(native_failure(
+                    ProviderOperation::RecoverSession,
+                    ProviderFailureKind::SessionMissing,
+                )),
+                _ => error.into(),
+            })
+            .context("start prepared Copilot session");
         events.finish_startup(match &started {
             Ok(_) => super::event_stream::StartupOutcome::Started,
             Err(_) => super::event_stream::StartupOutcome::Failed,
         });
         let session = match started {
             Ok(session) => session,
-            Err(error) => {
-                let cause = generation.failure().map(ProviderError::Observation)
-                    .unwrap_or_else(|| ProviderError::from(error));
-                if let Err(cleanup) = events.close().await {
-                    return Err(ProviderError::PreparationCleanup { cause: Arc::new(cause), cleanup: Arc::new(ProviderError::from(cleanup)) }.into());
+            Err(_error) => {
+                let cause = generation
+                    .failure()
+                    .map(ProviderError::Observation)
+                    .unwrap_or_else(|| {
+                        native_failure(
+                            ProviderOperation::InitializeSession,
+                            ProviderFailureKind::Initialization,
+                        )
+                    });
+                if let Err(_cleanup) = events.close().await {
+                    return Err(ProviderError::PreparationCleanup {
+                        cause: Box::new(cause),
+                        cleanup: Box::new(super::error::native_failure(
+                            ProviderOperation::CollectEventReader,
+                            ProviderFailureKind::Runtime,
+                        )),
+                    }
+                    .into());
                 }
                 return Err(cause.into());
             }
         };
-        trace.record(correlation_id, "future.stack_probe", json!({"phase":"copilot.prepared.ready","bytes":0}));
         Ok(super::handle::CopilotSession {
-            inner: Arc::new(session), events: super::intake::SessionIntake::new(events, generation.clone()), generation,
+            inner: Arc::new(session),
+            events: super::intake::SessionIntake::new(events, generation.clone()),
+            generation,
         })
-    }.await;
-    result.map_err(ProviderError::from)
+    }
+    .await;
+    result.map_err(|error| {
+        error.downcast::<ProviderError>().unwrap_or_else(|_| {
+            native_failure(
+                ProviderOperation::InitializeSession,
+                ProviderFailureKind::Initialization,
+            )
+        })
+    })
+}
+
+/// Resume a temporary read-only session to reconcile opaque submission evidence after restart.
+pub async fn open_recovery_session(
+    client: &super::handle::CopilotClient,
+    session_id: &str,
+    workspace: &std::path::Path,
+) -> Result<github_copilot_sdk::session::Session, ProviderError> {
+    client.ensure_healthy()?;
+    let mut config = ResumeSessionConfig::new(SessionId::new(session_id));
+    config.suppress_resume_event = Some(true);
+    config.working_directory = Some(workspace.to_owned());
+    config.available_tools = Some(Vec::new());
+    config.tools = Some(Vec::new());
+    config.enable_config_discovery = Some(false);
+    config.enable_skills = Some(false);
+    config.enable_file_hooks = Some(false);
+    config.hooks = Some(false);
+    config.skip_custom_instructions = Some(true);
+    config.mcp_servers = Some(Default::default());
+    config.enable_session_store = Some(true);
+    let prepared = client
+        .inner
+        .prepare_resume_session(
+            config.with_permission_handler(Arc::new(github_copilot_sdk::handler::DenyAllHandler)),
+        )
+        .map_err(|_| {
+            native_failure(
+                ProviderOperation::RecoverSession,
+                ProviderFailureKind::SessionMissing,
+            )
+        })?;
+    prepared.start().await.map_err(|_| {
+        native_failure(
+            ProviderOperation::RecoverSession,
+            ProviderFailureKind::SessionMissing,
+        )
+    })
+}
+
+fn native_failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderError {
+    ProviderError::Failure(ProviderFailure::new(operation, kind))
 }

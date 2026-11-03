@@ -3,7 +3,7 @@
 mod cleanup;
 mod inbox;
 pub(crate) use cleanup::{
-    CleanupError, CleanupWorkFailure, CleanupWorkKind, RetainedCleanupFailure,
+    CleanupError, CleanupJoinFailure, CleanupWorkFailure, CleanupWorkKind, RetainedCleanupFailure,
 };
 mod runtime;
 pub(crate) use inbox::{ObservationEnd, SessionObservationInbox};
@@ -52,7 +52,7 @@ struct InvocationState {
     scope: InvocationScope,
     submissions: HashMap<SubmissionId, DeliveryState>,
     executions: HashMap<(String, ProviderTurnId), NativeExecution>,
-    without_execution: Vec<(ExecutionResult, HashSet<SubmissionId>)>,
+    without_execution: Vec<NativeResolution>,
     covered: HashSet<SubmissionId>,
     observation_failure: Option<ObservationFailure>,
 }
@@ -62,7 +62,14 @@ enum NativeExecution {
     Finished {
         result: Box<ExecutionResult>,
         covered: HashSet<SubmissionId>,
+        publication_failure: Option<forge_provider_api::HostEffectFailure>,
     },
+}
+
+struct NativeResolution {
+    result: ExecutionResult,
+    covered: HashSet<SubmissionId>,
+    publication_failure: Option<forge_provider_api::HostEffectFailure>,
 }
 
 impl ExecutionState {
@@ -169,6 +176,11 @@ impl ExecutionState {
     ) -> Result<(), LifecycleError> {
         let (scope, update) = observation.into_parts();
         let state = self.invocation_mut(&scope)?;
+        let publication_failure = match &update {
+            ExecutionUpdate::PublicationFailed { failure, .. }
+            | ExecutionUpdate::ResolutionPublicationFailed { failure, .. } => Some(*failure),
+            _ => None,
+        };
         match update {
             ExecutionUpdate::Started { address } => {
                 state
@@ -177,6 +189,12 @@ impl ExecutionState {
                     .or_insert(NativeExecution::Running);
             }
             ExecutionUpdate::Finished {
+                address,
+                covered_submissions,
+                result,
+                ..
+            }
+            | ExecutionUpdate::PublicationFailed {
                 address,
                 covered_submissions,
                 result,
@@ -196,9 +214,13 @@ impl ExecutionState {
                 if let NativeExecution::Finished {
                     result: previous,
                     covered: previous_covered,
+                    publication_failure: previous_publication_failure,
                 } = execution
                 {
-                    if previous.as_ref() != &result || previous_covered != &covered {
+                    if previous.as_ref() != &result
+                        || previous_covered != &covered
+                        || previous_publication_failure != &publication_failure
+                    {
                         return Err(LifecycleError::TerminalConflict);
                     }
                     return Ok(());
@@ -208,11 +230,17 @@ impl ExecutionState {
                     NativeExecution::Finished {
                         result: Box::new(result),
                         covered,
+                        publication_failure,
                     },
                 );
                 state.covered.extend(covered_submissions);
             }
             ExecutionUpdate::ResolvedWithoutExecution {
+                covered_submissions,
+                result,
+                ..
+            }
+            | ExecutionUpdate::ResolutionPublicationFailed {
                 covered_submissions,
                 result,
                 ..
@@ -223,19 +251,25 @@ impl ExecutionState {
                     }
                 }
                 let covered: HashSet<_> = covered_submissions.iter().cloned().collect();
-                for (previous, previous_covered) in &state.without_execution {
-                    if previous_covered == &covered {
-                        return if previous == &result {
+                for previous in &state.without_execution {
+                    if previous.covered == covered {
+                        return if previous.result == result
+                            && previous.publication_failure == publication_failure
+                        {
                             Ok(())
                         } else {
                             Err(LifecycleError::TerminalConflict)
                         };
                     }
-                    if !previous_covered.is_disjoint(&covered) {
+                    if !previous.covered.is_disjoint(&covered) {
                         return Err(LifecycleError::TerminalConflict);
                     }
                 }
-                state.without_execution.push((result, covered));
+                state.without_execution.push(NativeResolution {
+                    result,
+                    covered,
+                    publication_failure,
+                });
                 state.covered.extend(covered_submissions);
             }
             ExecutionUpdate::ObservationLost { failure, .. } => {
@@ -378,6 +412,60 @@ mod tests {
         .unwrap();
         assert!(matches!(
             engine.observe(conflict),
+            Err(LifecycleError::TerminalConflict)
+        ));
+    }
+
+    /// Host publication failure cannot overwrite a known native no-turn result or skip receipt acceptance.
+    #[test]
+    fn no_execution_publication_failure_retains_result_and_requires_acceptance() {
+        let owner = ExecutionOwner::root("session");
+        let scope = InvocationScope::new(owner.clone(), "goal");
+        let mut engine = ExecutionState::new(owner);
+        engine.admit(scope.clone(), input("goal")).unwrap();
+        let result = ExecutionResult::Completed {
+            completion: ProviderCompletion::default().into(),
+        };
+        let observation = ExecutionObservation::new(
+            scope.clone(),
+            ExecutionUpdate::ResolutionPublicationFailed {
+                covered_submissions: vec![input("goal")],
+                completed_at_ms: 1,
+                result: result.clone(),
+                failure: forge_provider_api::HostEffectFailure::Uncertain,
+            },
+        )
+        .unwrap();
+        engine.observe(observation.clone()).unwrap();
+        engine.observe(observation).unwrap();
+        assert!(matches!(
+            engine.readiness(&scope).unwrap(),
+            ExecutionReadiness::Waiting
+        ));
+        engine
+            .delivery(&scope, &input("goal"), DeliveryState::Accepted)
+            .unwrap();
+        assert!(matches!(
+            engine.readiness(&scope).unwrap(),
+            ExecutionReadiness::Complete
+        ));
+        let retained = &engine.invocations[&scope.invocation_id].without_execution[0];
+        assert_eq!(retained.result, result);
+        assert_eq!(
+            retained.publication_failure,
+            Some(forge_provider_api::HostEffectFailure::Uncertain)
+        );
+        let contradictory = ExecutionObservation::new(
+            scope.clone(),
+            ExecutionUpdate::ResolvedWithoutExecution {
+                covered_submissions: vec![input("goal")],
+                completed_at_ms: 2,
+                result,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            engine.observe(contradictory),
             Err(LifecycleError::TerminalConflict)
         ));
     }

@@ -153,7 +153,8 @@ impl HarnessInspectionScope {
     fn allowed(&self, workspace: &str) -> Result<bool> {
         let mut request = PermissionRequest {
             id: "harness-inspection".into(),
-            provider: "harness".into(),
+            provider: forge_provider_api::ProviderId::new("harness")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Read {
                 path: workspace.into(),

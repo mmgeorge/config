@@ -90,7 +90,7 @@ end
 
 open_pr._set_state_path_for_test(state_path)
 reset()
-forge.setup({ pr_buffer_name = "ForgePRTest", harness = { provider = "copilot" } })
+forge.setup({ pr_buffer_name = "ForgePRTest", harness = { provider = "fixture_beta" } })
 gh.set_provider({
   system_async = function(command, _, cb)
     local key = command_key(command)
@@ -132,7 +132,7 @@ package.loaded["ai"] = { generate = function() error("PR generation bypassed Har
 package.loaded["forge.integrations.background_settings"] = {
   request = function(_, _, callback) callback({ settings = {} }) end,
   model = function(_, provider)
-    assert_true(provider == "copilot", "PR generation lost the selected provider")
+    assert_true(provider == "fixture_beta", "PR generation lost the selected provider")
     return { model = "test-background-model", thinking = "low" }
   end,
 }

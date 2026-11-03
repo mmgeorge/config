@@ -213,8 +213,11 @@ impl Turn {
         update: &crate::provider::MessageUpdate,
     ) -> Result<(), crate::provider::ProviderError> {
         use crate::provider::{MessageClassification, MessageUpdate, ProviderError};
-        let protocol = |message: &str| ProviderError::Protocol {
-            message: message.into(),
+        let protocol = |_message: &str| {
+            ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::CollectEventReader,
+                forge_provider_api::ProviderFailureKind::Protocol,
+            ))
         };
         if address.turn != self.provider || address.message_id.as_str().is_empty() {
             return Err(protocol(
@@ -586,7 +589,7 @@ mod tests {
                     text: "orphan".into()
                 }
             ),
-            Err(ProviderError::Protocol { .. })
+            Err(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Protocol
         ));
         assert!(turn.messages().is_empty());
         let started = MessageUpdate::Started {
@@ -620,7 +623,7 @@ mod tests {
                     text: "contradictory".into()
                 }
             ),
-            Err(ProviderError::Protocol { .. })
+            Err(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Protocol
         ));
         assert_eq!(turn.messages()[0].text(), "authoritative");
         let restored: super::Turn = serde_json::from_value(serde_json::to_value(turn)?)?;
@@ -750,8 +753,9 @@ mod tests {
         let failed = ToolUpdate::Finished {
             outcome: ToolOutcome::Failed {
                 diagnostic: crate::provider::ToolDiagnostic {
-                    code: None,
-                    message: "failed".into(),
+                    kind: forge_provider_api::ProviderFailureKind::Unknown,
+                    message: forge_provider_api::SanitizedMessage::new("failed")
+                        .expect("fixture diagnostic is nonempty"),
                 },
             },
         };

@@ -105,7 +105,7 @@ mod tests {
         validate(
             "provider",
             "runtime_resolved",
-            &json!({"data":{"session_id":"session","provider":"Codex","model":null}}),
+            &json!({"data":{"session_id":"session","provider":"Fixture Provider","model":null}}),
         )
         .unwrap();
         validate(

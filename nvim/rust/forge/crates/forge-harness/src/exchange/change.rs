@@ -91,23 +91,13 @@ impl ProviderDiffBuilder {
 }
 
 fn successful_file_change(tool: &ToolCall) -> bool {
-    tool.kind == "file_change" && !tool.failed && successful_status(&tool.status)
-}
-
-fn successful_status(status: &str) -> bool {
-    matches!(
-        status.to_ascii_lowercase().as_str(),
-        "completed" | "complete" | "success" | "succeeded"
-    )
+    tool.kind == "file_change" && !tool.failed && tool.state() == crate::turn::ToolState::Completed
 }
 
 fn merge_change(projection_list: &mut Vec<FileProjection>, change: &ProviderFileChange) {
     let path = normalize_path(&change.path);
     let move_path = change.move_path.as_deref().map(normalize_path);
-    let hunk_list = operation_hunk_list(
-        change.kind,
-        ProviderFileChange::split_move_report(change.kind, &change.diff).0,
-    );
+    let hunk_list = operation_hunk_list(change.kind, &change.diff);
     if let Some(projection) = projection_list.iter_mut().find(|projection| {
         projection.new_path.as_deref() == Some(path.as_str())
             || projection.old_path.as_deref() == Some(path.as_str())
@@ -256,23 +246,22 @@ mod test {
     }
 
     #[test]
-    fn saved_move_annotations_do_not_enter_patch_hunks() {
+    fn normalized_move_preserves_patch_content_and_destination() {
         let patch = "@@ -1 +1 @@\n-before\n+Moved to: source text\n";
-        let report = format!("{patch}\n\nMoved to: D:/workspace/src/moved.rs");
         let tool = file_tool(
             "move",
             "completed",
             vec![ProviderFileChange {
                 path: "src/original.rs".into(),
-                move_path: None,
-                kind: ProviderChangeKind::Update,
-                diff: report,
+                move_path: Some("src/moved.rs".into()),
+                kind: ProviderChangeKind::Move,
+                diff: patch.into(),
             }],
         );
         let diff = ProviderDiffBuilder::build(&[tool]).unwrap();
         let parsed = forge_diff::patch::UnifiedPatch::parse(&diff).unwrap();
         assert_eq!(parsed.file[0].hunk[0].row[1].text, "Moved to: source text");
-        assert!(!diff.contains("D:/workspace/src/moved.rs"));
+        assert!(diff.contains("+++ b/src/moved.rs"));
     }
 
     #[test]

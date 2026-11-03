@@ -228,6 +228,8 @@ pub(crate) fn resolve_path(path: &Path, workspace: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
+pub use forge_provider_api::access::{DirectoryGrant, DirectoryOperation};
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -265,7 +267,8 @@ mod test {
             ] {
                 let mut request = PermissionRequest {
                     id: "write".into(),
-                    provider: "test".into(),
+                    provider: forge_provider_api::ProviderId::new("test")
+                        .expect("static provider identity is valid"),
                     reason: None,
                     target_list: vec![target],
                 };
@@ -310,7 +313,8 @@ mod test {
             ] {
                 let mut request = PermissionRequest {
                     id: "file".into(),
-                    provider: "test".into(),
+                    provider: forge_provider_api::ProviderId::new("test")
+                        .expect("static provider identity is valid"),
                     reason: None,
                     target_list: vec![PermissionTarget::Read {
                         path: path.display().to_string(),
@@ -325,7 +329,8 @@ mod test {
             .push(external.display().to_string());
         let mut request = PermissionRequest {
             id: "file".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("test")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Read {
                 path: external.join("file").display().to_string(),
@@ -391,7 +396,8 @@ mod test {
         {
             let mut request = PermissionRequest {
                 id: "file".into(),
-                provider: "test".into(),
+                provider: forge_provider_api::ProviderId::new("test")
+                    .expect("static provider identity is valid"),
                 reason: None,
                 target_list: vec![PermissionTarget::Read {
                     path: "blocked/new-file".into(),
@@ -430,7 +436,8 @@ mod test {
         );
         let mut request = PermissionRequest {
             id: "file".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("test")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Read { path }],
         };
@@ -629,7 +636,8 @@ mod test {
         );
         let mut request = PermissionRequest {
             id: "file".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("test")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Read {
                 path: "alias/../file".into(),
@@ -740,7 +748,8 @@ mod test {
         );
         let mut request = PermissionRequest {
             id: "file".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("test")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Read {
                 path: first.join("file").display().to_string(),
@@ -784,5 +793,3 @@ mod test {
         Ok(())
     }
 }
-
-pub use forge_provider_api::access::{DirectoryGrant, DirectoryOperation};

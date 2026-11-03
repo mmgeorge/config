@@ -112,7 +112,8 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
     let prepared = journal.prepare_input(
         &catalog,
         crate::provider::ProviderInput::from_text("once"),
-        crate::provider::ProviderKind::Mock,
+        forge_providers::registry::nonselectable_id()
+            .expect("registry supplies a nonselectable fixture identity"),
         Some("gap".into()),
     )?;
     drop(controller);
@@ -123,14 +124,16 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
     let again = journal.prepare_input(
         &catalog,
         crate::provider::ProviderInput::from_text("once"),
-        crate::provider::ProviderKind::Mock,
+        forge_providers::registry::nonselectable_id()
+            .expect("registry supplies a nonselectable fixture identity"),
         Some("gap".into()),
     )?;
     assert_eq!(prepared.id(), again.id());
     let edited = journal.prepare_input(
         &catalog,
         crate::provider::ProviderInput::from_text("edited"),
-        crate::provider::ProviderKind::Mock,
+        forge_providers::registry::nonselectable_id()
+            .expect("registry supplies a nonselectable fixture identity"),
         Some("gap".into()),
     )?;
     assert_ne!(prepared.id(), edited.id());
@@ -142,7 +145,8 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
         journal
             .pending(
                 &edited.record()?.request,
-                crate::provider::ProviderKind::Mock,
+                forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 None
             )?
             .len(),

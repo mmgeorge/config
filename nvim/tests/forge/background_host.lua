@@ -32,7 +32,10 @@ local function call(method, params)
   assert(not failure, tostring(failure) .. "\n" .. tostring(client._client.stderr) .. "\n" .. vim.inspect(errors))
   return result
 end
-local generation = assert(client.generation_get_config())
+local generation, generation_failure
+client.generation_config(function(value, failure) generation, generation_failure = value, failure end)
+assert(vim.wait(20000, function() return generation ~= nil or generation_failure ~= nil end, 10))
+assert(generation, generation_failure)
 local preview = call("repository.generation", { operation = "preview", workspace = workspace, comparison = "head" })
 assert(preview.prompt.user:find("Current Background task: commit_message", 1, true))
 assert(preview.prompt.user:find("Conventional Commit", 1, true))

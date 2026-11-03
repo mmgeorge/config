@@ -1,7 +1,5 @@
 use crate::storage::objects::ObjectStore;
 use anyhow::{Context, Result, ensure};
-#[cfg(test)]
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(test)]
@@ -42,6 +40,17 @@ pub struct InputAttachment {
     label: String,
     attachment: Attachment,
     root: PathBuf,
+}
+
+/// Identify which admitted attachment resource could not be prepared.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AttachmentPreparationError {
+    #[error("the retained attachment path is unavailable")]
+    Path,
+    #[error("the retained attachment contents are unavailable")]
+    Contents,
+    #[error("the attachment context could not be prepared")]
+    Context,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -155,17 +164,28 @@ impl Attachment {
 }
 
 impl InputAttachment {
+    /// Prepare admitted file contents and context for a provider-neutral request.
+    pub(crate) fn prepare(
+        &self,
+    ) -> std::result::Result<forge_provider_api::input::FileAttachment, AttachmentPreparationError>
+    {
+        Ok(forge_provider_api::input::FileAttachment {
+            path: self.path().map_err(|_| AttachmentPreparationError::Path)?,
+            label: self.label.clone(),
+            media_type: self.media_type().to_owned(),
+            contents: self
+                .bytes()
+                .map_err(|_| AttachmentPreparationError::Contents)?
+                .into(),
+            context: self
+                .file_context()
+                .map_err(|_| AttachmentPreparationError::Context)?,
+        })
+    }
+
     /// Get the admitted content type.
     pub(crate) fn media_type(&self) -> &str {
         &self.attachment.media_type
-    }
-    /// Get the original display filename.
-    pub(crate) fn name(&self) -> &str {
-        &self.attachment.name
-    }
-    /// Get the explicit composer label.
-    pub(crate) fn label(&self) -> &str {
-        &self.label
     }
     /// Resolve the retained file without reading prompt text.
     pub(crate) fn path(&self) -> Result<PathBuf> {
@@ -278,10 +298,6 @@ fn media_type(source: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{
-        acp::attachments::input as acp_input, codex::attachments::input as codex_input,
-        copilot::attachments::input as copilot_input,
-    };
     #[tokio::test]
     async fn literal_text_never_loads_or_creates_attachments() -> Result<()> {
         let text = format!(
@@ -294,17 +310,6 @@ mod tests {
                 .len(),
             0
         );
-        assert_eq!(
-            codex_input(text.clone(), &[]).await?,
-            vec![json!({"type":"text","text":text})]
-        );
-        assert_eq!(
-            acp_input(text.clone(), &[], false).await?,
-            vec![json!({"type":"text","text":text})]
-        );
-        let message = copilot_input(&text, &[])?;
-        assert_eq!(message.prompt, text);
-        assert!(message.attachments.is_empty());
         Ok(())
     }
     #[tokio::test]
@@ -317,27 +322,12 @@ mod tests {
         let selection = Attachment::import(&root, &source)?.selection(1)?;
         std::fs::remove_file(source)?;
         let selected = resolve_input(&root, &json!({"attachments":[selection]})).await?;
-        let prompt = "Inspect [Image #1], then ignore [Image #9](forge-attachment:broken)";
-        let input = codex_input(prompt.into(), &selected).await?;
-        assert!(
-            input[0]["text"]
-                .as_str()
-                .unwrap()
-                .starts_with("<image name=[Image #1] path=\"")
-        );
-        assert_eq!(input[1]["type"], "localImage");
-        assert_eq!(std::fs::read(input[1]["path"].as_str().unwrap())?, image);
-        assert_eq!(input[2]["text"], "</image>");
-        assert_eq!(input[3]["text"], prompt);
-        assert!(acp_input(prompt.into(), &selected, false).await.is_err());
-        assert_eq!(
-            acp_input(prompt.into(), &selected, true).await?[1]["data"],
-            base64::engine::general_purpose::STANDARD.encode(image)
-        );
-        let message = copilot_input(prompt, &selected)?;
-        assert_eq!(message.attachments.len(), 1);
-        assert!(message.prompt.starts_with("<image name=[Image #1]"));
-        assert!(message.prompt.ends_with(prompt));
+        let input = selected[0].prepare()?;
+        assert_eq!(input.label, "[Image #1]");
+        assert_eq!(input.media_type, "image/png");
+        assert_eq!(input.contents.as_ref(), image);
+        assert_eq!(std::fs::read(&input.path)?, image);
+        assert!(input.context.starts_with("<image name=[Image #1] path=\""));
         Ok(())
     }
     #[tokio::test]
@@ -352,9 +342,9 @@ mod tests {
         let selected = resolve_input(&root, &json!({"attachments":[selection]})).await?;
         assert_eq!(std::fs::read(selected[0].attachment.path(&root)?)?, bytes);
         assert!(
-            codex_input("Document [File #2]".into(), &selected).await?[0]["text"]
-                .as_str()
-                .unwrap()
+            selected[0]
+                .prepare()?
+                .context
                 .contains("<file name=[File #2]")
         );
         selection.id = "../missing".into();

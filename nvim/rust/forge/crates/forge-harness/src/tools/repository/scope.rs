@@ -157,7 +157,8 @@ impl RepositoryToolScope {
             .context("repository path cannot be represented by the active read policy")?;
         let evaluation = self.policy.evaluate(&PermissionRequest {
             id: self.interaction.clone(),
-            provider: "harness-repository".into(),
+            provider: forge_provider_api::ProviderId::new("harness-repository")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Read { path: path.into() }],
         })?;
@@ -184,7 +185,8 @@ impl RepositoryToolScope {
             self.policy
                 .evaluate(&PermissionRequest {
                     id: self.interaction.clone(),
-                    provider: "harness-repository".into(),
+                    provider: forge_provider_api::ProviderId::new("harness-repository")
+                        .expect("static provider identity is valid"),
                     reason: None,
                     target_list: vec![PermissionTarget::Read {
                         path: self

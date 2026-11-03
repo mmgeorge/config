@@ -1,5 +1,5 @@
+use super::AcpKind as ProviderKind;
 use anyhow::Context;
-use forge_provider_api::ProviderKind;
 use forge_provider_api::permissions::{PermissionRequest, PermissionTarget};
 use serde_json::Value;
 
@@ -27,7 +27,10 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
             })
         });
     if let Some(target) = mcp_target {
-        target_list.push(PermissionTarget::Mcp { target });
+        target_list.push(match target.strip_prefix("forge-harness-control/") {
+            Some(name) => PermissionTarget::HostTool { name: name.into() },
+            None => PermissionTarget::Mcp { target },
+        });
     } else if tool["kind"] == "fetch" {
         target_list.push(PermissionTarget::Network {
             target: input["url"].as_str().unwrap_or("*").into(),
@@ -100,20 +103,14 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
                 Some("edit" | "delete" | "move") => PermissionTarget::UnknownFile {
                     operation: forge_provider_api::access::DirectoryOperation::Write,
                 },
-                _ => PermissionTarget::Tool {
-                    target: tool["title"].as_str().unwrap_or("ACP tool").into(),
-                },
+                _ => PermissionTarget::Unknown,
             });
         }
     }
     Ok(PermissionRequest {
-        id: format!("acp-{}", uuid::Uuid::new_v4()),
-        provider: match kind {
-            ProviderKind::Claude => "claude",
-            _ => "antigravity",
-        }
-        .into(),
-        reason: tool["title"].as_str().map(str::to_owned),
+        id: uuid::Uuid::new_v4().to_string(),
+        provider: kind.id(),
+        reason: None,
         target_list,
     })
 }
@@ -122,6 +119,34 @@ pub fn permission_request(kind: ProviderKind, tool: &Value) -> anyhow::Result<Pe
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Normalize provider tool aliases before invoking host permission policy.
+    #[test]
+    fn control_alias_is_a_canonical_host_tool() -> anyhow::Result<()> {
+        let request = permission_request(
+            ProviderKind::Claude,
+            &json!({
+                "_meta": {"mcp": {"server": "forge-harness-control", "tool": "plan_read"}}
+            }),
+        )?;
+        assert_eq!(
+            request.target_list,
+            vec![PermissionTarget::HostTool {
+                name: "plan_read".into()
+            }],
+        );
+        let external = permission_request(
+            ProviderKind::Claude,
+            &json!({"_meta": {"mcp": {"server": "external", "tool": "plan_read"}}}),
+        )?;
+        assert_eq!(
+            external.target_list,
+            vec![PermissionTarget::Mcp {
+                target: "external/plan_read".into()
+            }],
+        );
+        Ok(())
+    }
 
     #[test]
     fn includes_every_location_and_diff_path_and_rejects_partial_targets() -> anyhow::Result<()> {

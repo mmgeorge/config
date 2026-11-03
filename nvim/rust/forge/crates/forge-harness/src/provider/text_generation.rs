@@ -18,6 +18,21 @@ pub enum TextGeneration {
     PullRequestDescription,
 }
 
+impl forge_provider_api::TextValidator for TextGeneration {
+    /// Validate host output requirements without exposing a workflow type to the provider.
+    fn validate(
+        &self,
+        text: &str,
+    ) -> std::result::Result<String, forge_provider_api::ProviderError> {
+        TextGeneration::validate(*self, text).map_err(|_| {
+            forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::GenerateText,
+                forge_provider_api::ProviderFailureKind::Rejected,
+            ))
+        })
+    }
+}
+
 impl TextGeneration {
     /// Repeat the current task and response contract within a shared conversation.
     pub fn background_input(self, evidence: &str) -> String {
@@ -95,8 +110,6 @@ impl TextGeneration {
     }
 }
 
-pub(crate) use forge_provider_api::generation::lowest_effort;
-
 /// Capture recent visible conversation content without reasoning, diffs, or workflow status.
 pub(crate) fn history(entries: &[TimelineEntry]) -> Result<String> {
     let mut parts = Vec::new();
@@ -159,6 +172,7 @@ pub(crate) fn validate(text: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_provider_api::generation::lowest_effort;
 
     #[test]
     fn commit_message_preserves_body_and_large_output_and_rejects_empty_output() {
@@ -352,11 +366,5 @@ mod tests {
             "Recent work. Next step."
         );
         assert!(super::history(&[]).is_err());
-    }
-}
-
-impl forge_provider_api::generation::TextValidator for TextGeneration {
-    fn validate(&self, text: &str) -> Result<String, forge_provider_api::ProviderError> {
-        TextGeneration::validate(*self, text).map_err(Into::into)
     }
 }

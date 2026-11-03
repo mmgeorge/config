@@ -7,7 +7,6 @@ mod failure;
 mod invocation;
 pub(crate) mod mcp;
 mod registry;
-pub(crate) mod router;
 mod runtime;
 mod schema;
 mod stdio;
@@ -22,7 +21,6 @@ mod questions;
 pub mod repository;
 pub(crate) mod session;
 
-pub(crate) use agents::is_tool as is_agent_tool;
 pub(crate) use authority::{PermissionAuthoritySnapshot, TaskAuthority};
 pub use error::{ToolError, ToolResult};
 pub(crate) use executor::ControlToolExecutor;

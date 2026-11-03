@@ -182,12 +182,14 @@ fn reported_edit_groups_preserve_operation_order_and_failures() {
             "completed" => Some(ToolOutcome::Succeeded),
             "failed" => Some(ToolOutcome::Failed {
                 diagnostic: crate::provider::ToolDiagnostic {
-                    code: None,
-                    message: "write failed".into(),
+                    kind: forge_provider_api::ProviderFailureKind::Unknown,
+                    message: forge_provider_api::SanitizedMessage::new("write failed")
+                        .expect("host diagnostic is nonempty"),
                 },
             }),
             "denied" => Some(ToolOutcome::Denied {
-                reason: "write denied".into(),
+                reason: forge_provider_api::diagnostic::SanitizedMessage::new("write denied")
+                    .expect("static denial is nonempty"),
             }),
             "cancelled" => Some(ToolOutcome::Cancelled),
             "interrupted" => Some(ToolOutcome::Interrupted),

@@ -1,21 +1,26 @@
 use super::decode::*;
-use anyhow::Context;
 use anyhow::Result;
+use forge_provider_api::agent::{
+    AgentId as ProviderAgentId, AgentLifecycleEvent, AgentLifecycleKind,
+};
 use forge_provider_api::compaction::CompactionResult;
 use forge_provider_api::completion::GoalState;
 use forge_provider_api::completion::ProviderOutput;
-use forge_provider_api::control::ToolCall;
 use forge_provider_api::*;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::collections::HashSet;
+
+fn protocol_error() -> ProviderError {
+    ProviderError::Failure(ProviderFailure::new(
+        ProviderOperation::NativeTransport,
+        ProviderFailureKind::Protocol,
+    ))
+}
 
 #[derive(Default)]
 pub struct CodexNormalization {
     scope: Option<EventScope>,
     turn_owners: HashMap<(String, ProviderTurnId), InvocationScope>,
-    control_tools: HashSet<String>,
-    control_calls: Vec<ToolCall>,
     message: HashMap<MessageAddress, NativeMessage>,
     tool: HashMap<ToolAddress, NativeTool>,
     checklist: HashMap<(TurnAddress, String), ProviderChecklistUpdate>,
@@ -97,10 +102,7 @@ impl NativeToolRequest {
             if let (Some(previous), Some(current)) = (previous, current)
                 && previous != current
             {
-                return Err(ProviderError::Protocol {
-                    message: "Codex tool request replay changed its invocation".into(),
-                }
-                .into());
+                return Err(protocol_error().into());
             }
         }
         self.name = self.name.take().or(supplied.name);
@@ -114,13 +116,6 @@ impl NativeToolRequest {
 }
 
 impl CodexNormalization {
-    pub fn set_control_tools(&mut self, tools: impl IntoIterator<Item = String>) {
-        self.control_tools = tools.into_iter().collect();
-    }
-    pub fn take_control_calls(&mut self) -> Vec<ToolCall> {
-        std::mem::take(&mut self.control_calls)
-    }
-
     /// Bind new admission while preserving known native identities from the same owner.
     pub fn bind(&mut self, scope: Option<impl Into<EventScope>>) {
         let scope = scope.map(Into::into);
@@ -135,14 +130,7 @@ impl CodexNormalization {
                 .retain(|address, _| &address.turn.scope.owner == scope.owner());
         }
         self.scope = scope;
-        self.control_calls.clear();
         self.replay_sensitive = false;
-    }
-
-    /// Get the original invocation for a previously observed native turn.
-    pub fn retained_scope(&self, message: &Value) -> Option<&InvocationScope> {
-        let identity = Self::native_identity(message.get("params")?)?;
-        self.turn_owners.get(&identity)
     }
 
     /// Normalize only native turns already bound to an original invocation.
@@ -161,9 +149,7 @@ impl CodexNormalization {
         let previous = self.scope.replace(owner.into());
         let replay_sensitive = self.replay_sensitive;
         let mut output = ProviderOutput::default();
-        let result = self
-            .normalize(message, &mut output, None, workspace, false)
-            .await;
+        let result = self.normalize(message, &mut output, None, workspace).await;
         self.scope = previous;
         self.replay_sensitive = replay_sensitive;
         result?;
@@ -247,9 +233,7 @@ impl CodexNormalization {
         let previous = self.scope.replace(owner.into());
         let replay_sensitive = self.replay_sensitive;
         let mut output = ProviderOutput::default();
-        let result = self
-            .normalize(message, &mut output, None, workspace, false)
-            .await;
+        let result = self.normalize(message, &mut output, None, workspace).await;
         self.scope = previous;
         self.replay_sensitive = replay_sensitive;
         result?;
@@ -270,22 +254,13 @@ impl CodexNormalization {
         })
     }
 
-    fn required_address(&self, method: &str, params: &Value) -> Result<TurnAddress> {
-        self.address(params).ok_or_else(|| {
-            ProviderError::Protocol {
-                message: format!("Codex {method} omitted its required thread or turn identity"),
-            }
-            .into()
-        })
+    fn required_address(&self, _method: &str, params: &Value) -> Result<TurnAddress> {
+        Ok(self.address(params).ok_or_else(protocol_error)?)
     }
 
-    fn required_item_id(method: &str, params: &Value) -> Result<String> {
-        pointer_string(params, &["/itemId", "/item_id", "/item/id"]).ok_or_else(|| {
-            ProviderError::Protocol {
-                message: format!("Codex {method} omitted its required item identity"),
-            }
-            .into()
-        })
+    fn required_item_id(_method: &str, params: &Value) -> Result<String> {
+        Ok(pointer_string(params, &["/itemId", "/item_id", "/item/id"])
+            .ok_or_else(protocol_error)?)
     }
 
     fn text(
@@ -301,21 +276,13 @@ impl CodexNormalization {
             && let Some(previous) = state.role
             && classification != MessageClassification::Known(previous)
         {
-            return Err(ProviderError::Protocol {
-                message: format!("Codex message {:?} changed its known role from {previous:?} to {classification:?}", address.message_id),
-            }.into());
+            return Err(protocol_error().into());
         }
         if state.completed
             && let Some(text) = &text
             && ((completed && text != &state.text) || (!completed && !text.is_empty()))
         {
-            return Err(ProviderError::Protocol {
-                message: format!(
-                    "Codex message {:?} changed text after completion",
-                    address.message_id
-                ),
-            }
-            .into());
+            return Err(protocol_error().into());
         }
         if let Some(MessageClassification::Known(role)) = classification {
             if state.published && state.role.is_none() {
@@ -373,7 +340,6 @@ impl CodexNormalization {
         output: &mut ProviderOutput,
         sink: Option<&ProviderEventSink>,
         workspace: &str,
-        apply_control: bool,
     ) -> Result<()> {
         let Some(event_scope) = self.scope.clone() else {
             return Ok(());
@@ -403,14 +369,8 @@ impl CodexNormalization {
         if matches!(method, "item/started" | "item/completed") && item_type == "contextCompaction" {
             {
                 let id = Self::required_item_id(method, &params)?;
-                let thread_id =
-                    pointer_string(&params, &["/threadId", "/thread_id"]).ok_or_else(|| {
-                        ProviderError::Protocol {
-                            message: format!(
-                                "Codex {method} compaction omitted its required thread identity"
-                            ),
-                        }
-                    })?;
+                let thread_id = pointer_string(&params, &["/threadId", "/thread_id"])
+                    .ok_or_else(protocol_error)?;
                 events.push(ProviderEvent::Compaction {
                     scope: event_scope.clone(),
                     update: Box::new(Compaction {
@@ -445,8 +405,9 @@ impl CodexNormalization {
                 let event = ProviderEvent::Diagnostic {
                     scope: event_scope,
                     diagnostic: ProviderDiagnostic {
-                        code: None,
-                        message: first_text(&params).unwrap_or_else(|| params.to_string()),
+                        kind: super::retry::failure_kind(params.get("error").unwrap_or(&params)),
+                        message: SanitizedMessage::new("Provider reported an error.")
+                            .expect("static diagnostic text is nonempty"),
                         fatal: true,
                     },
                 };
@@ -472,10 +433,7 @@ impl CodexNormalization {
                     None | Some(Value::Null) => None,
                     Some(Value::String(phase)) => Some(phase.as_str()),
                     Some(_) => {
-                        return Err(ProviderError::Protocol {
-                            message: format!("Codex {method} supplied a non-string message phase"),
-                        }
-                        .into());
+                        return Err(protocol_error().into());
                     }
                 };
                 let classification = match phase {
@@ -486,12 +444,15 @@ impl CodexNormalization {
                         Some(MessageClassification::Known(MessageRole::Response))
                     }
                     None => None,
-                    Some(phase) => {
+                    Some(_phase) => {
                         events.push(ProviderEvent::Diagnostic {
                             scope: scope.clone().into(),
                             diagnostic: ProviderDiagnostic {
-                                code: Some("unknown_message_phase".into()),
-                                message: format!("Unsupported Codex message phase: {phase}"),
+                                kind: ProviderFailureKind::Protocol,
+                                message: SanitizedMessage::new(
+                                    "Provider reported an unsupported message phase.",
+                                )
+                                .expect("static diagnostic text is nonempty"),
                                 fatal: false,
                             },
                         });
@@ -652,20 +613,45 @@ impl CodexNormalization {
         } else {
             let lifecycle = normalize_agent_lifecycle(method, &params);
             if !lifecycle.is_empty() {
-                events.extend(lifecycle.into_iter().map(|event| ProviderEvent::Agent {
-                    scope: scope.clone(),
-                    update: AgentUpdate::Lifecycle { event },
-                }));
+                for native in lifecycle {
+                    let Some(thread_id) = native.provider_thread_id else {
+                        continue;
+                    };
+                    let Ok(agent_id) = ProviderAgentId::try_from(thread_id.clone()) else {
+                        continue;
+                    };
+                    let Ok(conversation_id) = ProviderSessionId::try_from(thread_id) else {
+                        continue;
+                    };
+                    let kind = if native.starts_child {
+                        AgentLifecycleKind::Started
+                    } else if native.status.is_active() {
+                        AgentLifecycleKind::Updated
+                    } else {
+                        AgentLifecycleKind::Finished
+                    };
+                    events.push(ProviderEvent::Agent {
+                        scope: scope.clone(),
+                        update: AgentUpdate::Lifecycle {
+                            event: AgentLifecycleEvent {
+                                agent_id,
+                                parent_agent_id: None,
+                                conversation_id: Some(conversation_id),
+                                kind,
+                                definition: native.definition,
+                                nickname: native.nickname,
+                                task: native.task,
+                                state: native.status,
+                            },
+                        },
+                    });
+                }
             } else if is_tool_lifecycle_event(&method.to_ascii_lowercase(), &params) {
                 {
                     let turn = self.required_address(method, &params)?;
                     let snapshot = normalize_tool_activity(method, &params, workspace)
-                        .map_err(|error| ProviderError::Protocol {
-                            message: format!("{error:#}"),
-                        })?
-                        .ok_or_else(|| ProviderError::Protocol {
-                            message: format!("Codex {method} omitted its required tool identity"),
-                        })?;
+                        .map_err(|_| protocol_error())?
+                        .ok_or_else(protocol_error)?;
                     let address = ToolAddress {
                         turn,
                         tool_id: snapshot.id.clone().into(),
@@ -683,12 +669,6 @@ impl CodexNormalization {
                             request: NativeToolRequest::default(),
                         });
                     native.request.observe(&params)?;
-                    if apply_control
-                        && let Some(invocation) =
-                            control_invocation(method, &params, &self.control_tools)?
-                    {
-                        self.control_calls.push(invocation);
-                    }
                     self.replay_sensitive = true;
                     output.completion.evidence.tool_called = true;
                     output.completion.evidence.workspace_changed |=
@@ -759,12 +739,16 @@ impl CodexNormalization {
                             ToolStatus::Succeeded => Some(ToolOutcome::Succeeded),
                             ToolStatus::Failed => Some(ToolOutcome::Failed {
                                 diagnostic: ToolDiagnostic {
-                                    code: None,
-                                    message: "Codex tool failed".into(),
+                                    kind: ProviderFailureKind::Unknown,
+                                    message: SanitizedMessage::new("Provider tool failed")
+                                        .expect("static diagnostic is valid"),
                                 },
                             }),
                             ToolStatus::Denied => Some(ToolOutcome::Denied {
-                                reason: "Codex tool denied".into(),
+                                reason: forge_provider_api::diagnostic::SanitizedMessage::new(
+                                    "Provider denied this tool call",
+                                )
+                                .expect("static denial is nonempty"),
                             }),
                             ToolStatus::Cancelled => Some(ToolOutcome::Cancelled),
                             ToolStatus::Interrupted => Some(ToolOutcome::Interrupted),
@@ -799,14 +783,17 @@ impl CodexNormalization {
             {
                 let retryable = params
                     .get("error")
-                    .and_then(super::retry::transient_code)
+                    .and_then(super::retry::transient_category)
                     .is_some();
                 if !retryable || self.replay_sensitive {
                     events.push(ProviderEvent::Diagnostic {
                         scope: scope.clone().into(),
                         diagnostic: ProviderDiagnostic {
-                            code: None,
-                            message: first_text(&params).unwrap_or_else(|| params.to_string()),
+                            kind: super::retry::failure_kind(
+                                params.get("error").unwrap_or(&params),
+                            ),
+                            message: SanitizedMessage::new("Provider reported an error.")
+                                .expect("static diagnostic text is nonempty"),
                             fatal: true,
                         },
                     });
@@ -863,74 +850,16 @@ pub fn native_goal_state(message: &Value, thread_id: &str) -> Option<GoalState> 
     }
 }
 
-fn control_tool_name<'value>(
-    method: &str,
-    value: &'value Value,
-    allowed: &HashSet<String>,
-) -> Option<&'value str> {
-    let method_lower = method.to_ascii_lowercase();
-    let envelope = value.get("update").unwrap_or(value);
-    let item = envelope.get("item").unwrap_or(envelope);
-    let dynamic_tool_call = method_lower == "item/tool/call"
-        || item
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|item_type| item_type.eq_ignore_ascii_case("dynamicToolCall"));
-    if !dynamic_tool_call {
-        return None;
-    }
-    ["tool", "name", "toolName", "tool_name"]
-        .into_iter()
-        .find_map(|key| item.get(key).and_then(Value::as_str))
-        .filter(|name| allowed.contains(*name))
-}
-
-fn find_control_arguments(value: &Value, control_name: &str) -> Option<Value> {
-    if value
-        .get("tool")
-        .or_else(|| value.get("name"))
-        .or_else(|| value.get("toolName"))
-        .or_else(|| value.get("tool_name"))
-        .and_then(Value::as_str)
-        == Some(control_name)
-        && let Some(arguments) = value.get("arguments")
-    {
-        if let Some(arguments) = arguments.as_str() {
-            return serde_json::from_str(arguments).ok();
-        }
-        return Some(arguments.clone());
-    }
-    match value {
-        Value::Array(item) => item
-            .iter()
-            .find_map(|item| find_control_arguments(item, control_name)),
-        Value::Object(map) => map
-            .values()
-            .find_map(|item| find_control_arguments(item, control_name)),
-        _ => None,
-    }
-}
-
-pub(super) fn control_invocation(
-    method: &str,
-    value: &Value,
-    allowed: &HashSet<String>,
-) -> Result<Option<ToolCall>> {
-    let Some(control_name) = control_tool_name(method, value, allowed) else {
-        return Ok(None);
-    };
-    let arguments = find_control_arguments(value, control_name)
-        .with_context(|| format!("{control_name} omitted its arguments object"))?;
-    Ok(Some(ToolCall {
-        name: control_name.to_owned(),
-        arguments,
-    }))
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
     use serde_json::json;
+
+    fn is_protocol(error: &anyhow::Error) -> bool {
+        error.downcast_ref::<ProviderError>().is_some_and(|error| {
+            matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Protocol)
+        })
+    }
 
     fn scope() -> InvocationScope {
         InvocationScope::new(ExecutionOwner::root("session"), "exchange")
@@ -962,7 +891,6 @@ mod test {
                 &mut output,
                 None,
                 "",
-                false,
             )
             .await?;
         normalization
@@ -972,7 +900,6 @@ mod test {
                 &mut output,
                 None,
                 "",
-                false,
             )
             .await?;
         assert!(output.event.iter().any(|event| matches!(
@@ -1063,7 +990,7 @@ mod test {
             let mut output = ProviderOutput::default();
             normalization.normalize(&json!({"method":"item/started","params":{
                 "threadId":"thread","turnId":"turn","item":{"type":"commandExecution","id":"command",
-                "command":"slow command","status":"inProgress"}}}), &mut output, None, "", false).await?;
+                "command":"slow command","status":"inProgress"}}}), &mut output, None, "").await?;
             normalization
                 .normalize(
                     &json!({"method":"turn/completed","params":{
@@ -1071,7 +998,6 @@ mod test {
                     &mut output,
                     None,
                     "",
-                    false,
                 )
                 .await?;
             assert!(!normalization.has_pending_background_tools());
@@ -1106,10 +1032,7 @@ mod test {
             let error = normalization
                 .text(address.clone(), None, Some(text.into()), completed)
                 .unwrap_err();
-            assert!(matches!(
-                ProviderError::from(error),
-                ProviderError::Protocol { .. }
-            ));
+            assert!(is_protocol(&error));
             assert_eq!(normalization.message[&address].text, "authoritative");
         }
         let empty = MessageAddress {
@@ -1161,10 +1084,7 @@ mod test {
             let error = normalization
                 .text(address.clone(), Some(classification), None, false)
                 .unwrap_err();
-            assert!(matches!(
-                ProviderError::from(error),
-                ProviderError::Protocol { .. }
-            ));
+            assert!(is_protocol(&error));
             assert_eq!(
                 normalization.message[&address].role,
                 Some(MessageRole::Commentary)
@@ -1187,23 +1107,23 @@ mod test {
             let mut normalization = CodexNormalization::default();
             let mut output = ProviderOutput::default();
             normalization
-                .normalize(&message, &mut output, None, "", false)
+                .normalize(&message, &mut output, None, "")
                 .await?;
             normalization.bind(Some(EventScope::SessionOperation {
                 owner: ExecutionOwner::root("session"),
                 operation_id: "catalog".into(),
             }));
             normalization
-                .normalize(&message, &mut output, None, "", false)
+                .normalize(&message, &mut output, None, "")
                 .await?;
             normalization.bind(Some(scope()));
             let error = normalization
-                .normalize(&message, &mut output, None, "", false)
+                .normalize(&message, &mut output, None, "")
                 .await
                 .unwrap_err();
             assert!(
-                matches!(ProviderError::from(error), ProviderError::Protocol { .. }),
-                "{message}"
+                is_protocol(&error),
+                "malformed native frame is classified as protocol failure"
             );
             assert!(output.event.is_empty());
             assert!(normalization.message.is_empty());
@@ -1212,7 +1132,7 @@ mod test {
         }
         let mut normalization = CodexNormalization::default();
         normalization.bind(Some(scope()));
-        normalization.normalize(&json!({"method":"item/commandExecution/requestApproval","params":{"threadId":"thread","turnId":"turn","command":"check"}}), &mut ProviderOutput::default(), None, "", false).await?;
+        normalization.normalize(&json!({"method":"item/commandExecution/requestApproval","params":{"threadId":"thread","turnId":"turn","command":"check"}}), &mut ProviderOutput::default(), None, "").await?;
         Ok(())
     }
 
@@ -1229,10 +1149,9 @@ mod test {
                     &mut output,
                     None,
                     "",
-                    false,
                 )
                 .await?;
-            normalization.normalize(&json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"message","delta":"text"}}), &mut output, None, "", false).await?;
+            normalization.normalize(&json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn","itemId":"message","delta":"text"}}), &mut output, None, "").await?;
             assert!(output.event.iter().any(|event| matches!(event, ProviderEvent::Message { update: MessageUpdate::Started { classification: MessageClassification::Unclassified, text }, .. } if text == "text")));
             assert!(!output.event.iter().any(|event| matches!(
                 event,
@@ -1241,7 +1160,7 @@ mod test {
                     ..
                 }
             )));
-            assert_eq!(output.event.iter().filter(|event| matches!(event, ProviderEvent::Diagnostic { diagnostic, .. } if diagnostic.code.as_deref() == Some("unknown_message_phase"))).count(), usize::from(!phase.is_null()));
+            assert_eq!(output.event.iter().filter(|event| matches!(event, ProviderEvent::Diagnostic { diagnostic, .. } if diagnostic.kind == ProviderFailureKind::Protocol && diagnostic.message.as_str() == "Provider reported an unsupported message phase.")).count(), usize::from(!phase.is_null()));
         }
         Ok(())
     }
@@ -1260,7 +1179,7 @@ mod test {
                 "item":{"type":"reasoning","id":"reasoning","summary":["final summary"],"content":["final thought"]}}}),
         ] {
             normalization
-                .normalize(&message, &mut output, None, "", false)
+                .normalize(&message, &mut output, None, "")
                 .await?;
         }
         assert_eq!(normalization.message.len(), 3);

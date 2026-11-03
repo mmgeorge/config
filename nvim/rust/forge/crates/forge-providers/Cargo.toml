@@ -10,6 +10,9 @@ forge-provider-api = { workspace = true }
 agent-client-protocol = { workspace = true, features = ["unstable_session_fork"] }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
+dunce = { workspace = true }
+home = { workspace = true }
 forge-shell = { workspace = true }
 forge-diff = { workspace = true }
 forge-protocol = { workspace = true }
@@ -29,6 +32,10 @@ uuid = { workspace = true, features = ["v4"] }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { workspace = true }
 tokio-util = { workspace = true, features = ["compat"] }
+tempfile = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+junction = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

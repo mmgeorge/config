@@ -47,7 +47,7 @@ fn broker_fixture() -> (tempfile::TempDir, HarnessBroker) {
         workspace: workspace.to_string_lossy().into_owned(),
         client_id: "permission-test".into(),
         provider: ProviderLaunch {
-            kind: "mock".into(),
+            kind: forge_providers::registry::nonselectable_id().expect("registry fixture"),
             command: vec!["mock".into()],
         },
         model: "mock".into(),

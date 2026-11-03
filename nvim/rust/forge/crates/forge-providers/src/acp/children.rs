@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, ensure};
-use forge_provider_api::agent::{AgentExecutionState, AgentLifecycleEvent};
+use forge_provider_api::agent::{AgentExecutionState, AgentLifecycleEvent, AgentLifecycleKind};
 use forge_provider_api::turn::TurnOutcome;
 use forge_provider_api::{AgentUpdate, InvocationScope, ProviderEvent, TurnAddress, TurnUpdate};
 use serde_json::Value;
@@ -115,18 +115,23 @@ impl AcpChildren {
             )
         };
         let lifecycle = AgentLifecycleEvent {
-            operation: kind.into(),
-            starts_child,
-            parent_thread_id: Some(parent.into()),
-            provider_thread_id: Some(id.into()),
-            turn_id: Some(address.turn_id.to_string()),
+            agent_id: id.to_owned().try_into()?,
+            parent_agent_id: (parent != self.root)
+                .then(|| parent.to_owned().try_into())
+                .transpose()?,
+            conversation_id: Some(id.to_owned().try_into()?),
+            kind: if starts_child {
+                AgentLifecycleKind::Started
+            } else {
+                AgentLifecycleKind::Finished
+            },
             definition: update["name"].as_str().map(str::to_owned),
             nickname: update["name"].as_str().map(str::to_owned),
             task: update["task"]
                 .as_str()
                 .or_else(|| update["prompt"].as_str())
                 .map(str::to_owned),
-            status: state,
+            state,
         };
         let lifecycle = ProviderEvent::Agent {
             scope: address.scope.clone(),
@@ -190,15 +195,16 @@ impl AcpChildren {
                 scope: child.address.scope.clone(),
                 update: AgentUpdate::Lifecycle {
                     event: AgentLifecycleEvent {
-                        operation: "subagent_state_update".into(),
-                        starts_child: false,
-                        parent_thread_id: Some(child.parent.clone()),
-                        provider_thread_id: Some(id.clone()),
-                        turn_id: Some(child.address.turn_id.to_string()),
+                        agent_id: id.clone().try_into()?,
+                        parent_agent_id: (child.parent != self.root)
+                            .then(|| child.parent.clone().try_into())
+                            .transpose()?,
+                        conversation_id: Some(id.clone().try_into()?),
+                        kind: AgentLifecycleKind::Finished,
                         definition: None,
                         nickname: None,
                         task: None,
-                        status: AgentExecutionState::Interrupted,
+                        state: AgentExecutionState::Interrupted,
                     },
                 },
             });
@@ -300,8 +306,8 @@ mod test {
         else {
             panic!("expected child lifecycle")
         };
-        assert!(lifecycle.starts_child);
-        assert_eq!(lifecycle.provider_thread_id.as_deref(), Some("child"));
+        assert_eq!(lifecycle.kind, AgentLifecycleKind::Started);
+        assert_eq!(lifecycle.agent_id.as_str(), "child");
         assert!(children.address("unannounced", false).is_none());
         assert_eq!(
             children.address("child", false).as_ref(),

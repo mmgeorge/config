@@ -14,29 +14,33 @@ pub enum ServiceTier {
     Ultrafast,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ServiceTierError {
+    #[error("current provider does not support the requested service tier")]
+    UnsupportedByProvider,
+    #[error("selected model does not support the requested service tier")]
+    UnsupportedByModel,
+}
+
 impl ServiceTier {
     /// Rejects accelerated tiers absent from the selected model's catalog entry.
-    pub fn validate_model(self, model: &super::ProviderModel) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self == Self::Standard || model.service_tiers.contains(&self),
-            "service tier {} is unavailable for model {}",
-            serde_json::to_value(self)?,
-            model.id
-        );
+    pub fn validate_model(self, model: &super::ProviderModel) -> Result<(), ServiceTierError> {
+        if self != Self::Standard && !model.service_tiers.contains(&self) {
+            return Err(ServiceTierError::UnsupportedByModel);
+        }
         Ok(())
     }
 
     /// Rejects accelerated tiers the selected provider does not advertise.
-    pub fn validate(self, capability: &super::ProviderCapability) -> anyhow::Result<()> {
+    pub fn validate(self, capability: &super::ProviderCapability) -> Result<(), ServiceTierError> {
         let supported = match self {
             Self::Standard => true,
             Self::Fast => capability.fast_mode,
             Self::Ultrafast => capability.ultrafast_mode,
         };
-        anyhow::ensure!(
-            supported,
-            "current provider does not support the requested service tier"
-        );
+        if !supported {
+            return Err(ServiceTierError::UnsupportedByProvider);
+        }
         Ok(())
     }
 }

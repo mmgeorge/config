@@ -3,12 +3,13 @@ use std::{fmt, io, time::Duration};
 use forge_protocol::outbound::{self, MessageReceiver, MessageSender};
 
 use super::{
-    EventScope, InvocationScope, MessageUpdate, ProviderError, ProviderEvent, TextUpdate,
-    ToolUpdate,
+    BindingId, BoundProviderEvent, EventScope, InvocationScope, MessageUpdate, ProviderError,
+    ProviderEvent, TextUpdate, ToolUpdate,
 };
 
 #[derive(Clone)]
 pub struct ProviderEventSink {
+    binding_id: BindingId,
     scope: EventScope,
     sender: MessageSender,
     failure: std::sync::Arc<std::sync::Mutex<Option<EventDeliveryError>>>,
@@ -17,6 +18,7 @@ pub struct ProviderEventSink {
 }
 
 pub struct ProviderEventStream {
+    binding_id: BindingId,
     input: EventReceiver,
     pending: Option<ProviderEvent>,
     queued: Option<ProviderEvent>,
@@ -34,35 +36,30 @@ struct EventReceiver {
 pub enum EventDeliveryError {
     /// Preserve a native observation failure across bounded host delivery.
     Observation(crate::lifecycle::ObservationFailure),
-    Closed {
-        message: String,
-    },
+    Closed,
     OwnershipMismatch {
         expected: Box<EventScope>,
         received: Box<EventScope>,
     },
-    InvalidTransportData {
-        message: String,
-    },
+    InvalidTransportData,
     IncompleteTransfer {
-        message: String,
+        received_parts: usize,
+        expected_parts: usize,
+        received_bytes: usize,
+        expected_bytes: usize,
     },
     Empty,
 }
 
 impl EventDeliveryError {
-    pub fn transport(error: impl fmt::Display) -> Self {
-        Self::InvalidTransportData {
-            message: error.to_string(),
-        }
+    pub fn transport(_error: impl fmt::Display) -> Self {
+        Self::InvalidTransportData
     }
 
     fn queue(error: io::Error) -> Self {
         match error.kind() {
             io::ErrorKind::WouldBlock => Self::Empty,
-            io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe => Self::Closed {
-                message: error.to_string(),
-            },
+            io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe => Self::Closed,
             _ => Self::transport(error),
         }
     }
@@ -74,20 +71,23 @@ impl fmt::Display for EventDeliveryError {
             Self::Observation(failure) => {
                 write!(formatter, "provider observation failed: {failure}")
             }
-            Self::Closed { message } => {
-                write!(formatter, "provider event delivery closed: {message}")
-            }
+            Self::Closed => formatter.write_str("provider event delivery closed"),
             Self::OwnershipMismatch { expected, received } => write!(
                 formatter,
                 "provider event crosses execution ownership: expected {expected:?}, received {received:?}"
             ),
-            Self::InvalidTransportData { message } => write!(
-                formatter,
-                "invalid provider event transport data: {message}"
-            ),
-            Self::IncompleteTransfer { message } => {
-                write!(formatter, "incomplete provider event transfer: {message}")
+            Self::InvalidTransportData => {
+                formatter.write_str("invalid provider event transport data")
             }
+            Self::IncompleteTransfer {
+                received_parts,
+                expected_parts,
+                received_bytes,
+                expected_bytes,
+            } => write!(
+                formatter,
+                "incomplete provider event transfer: {received_parts}/{expected_parts} parts and {received_bytes}/{expected_bytes} bytes"
+            ),
             Self::Empty => formatter.write_str("provider event queue is empty"),
         }
     }
@@ -97,20 +97,24 @@ impl std::error::Error for EventDeliveryError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Observation(failure) => Some(failure),
-            Self::Closed { .. }
+            Self::Closed
             | Self::OwnershipMismatch { .. }
-            | Self::InvalidTransportData { .. }
+            | Self::InvalidTransportData
             | Self::IncompleteTransfer { .. }
             | Self::Empty => None,
         }
     }
 }
 
-pub fn channel(scope: impl Into<EventScope>) -> (ProviderEventSink, ProviderEventStream) {
+pub fn channel(
+    binding_id: BindingId,
+    scope: impl Into<EventScope>,
+) -> (ProviderEventSink, ProviderEventStream) {
     let (sender, receiver) = outbound::channel();
     let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
     (
         ProviderEventSink {
+            binding_id: binding_id.clone(),
             scope: scope.into(),
             sender,
             failure: failure.clone(),
@@ -118,6 +122,7 @@ pub fn channel(scope: impl Into<EventScope>) -> (ProviderEventSink, ProviderEven
             observer: Vec::new(),
         },
         ProviderEventStream {
+            binding_id,
             input: EventReceiver {
                 receiver,
                 failure,
@@ -132,6 +137,11 @@ pub fn channel(scope: impl Into<EventScope>) -> (ProviderEventSink, ProviderEven
 }
 
 impl ProviderEventSink {
+    /// Get the binding generation that owns every event sent through this sink.
+    pub fn binding_id(&self) -> &BindingId {
+        &self.binding_id
+    }
+
     /// Attach a host observer while retaining the same ordered delivery channel.
     pub fn with_observer(mut self, observer: std::sync::Arc<dyn EventObserver>) -> Self {
         self.observer.push(observer);
@@ -143,11 +153,12 @@ impl ProviderEventSink {
     }
 
     pub fn invocation_scope(&self) -> Result<&InvocationScope, ProviderError> {
-        self.scope
-            .invocation()
-            .ok_or_else(|| ProviderError::Protocol {
-                message: "provider prompt requires an admitted invocation scope".into(),
-            })
+        self.scope.invocation().ok_or_else(|| {
+            ProviderError::Failure(crate::error::ProviderFailure::new(
+                crate::error::ProviderOperation::AdmitInput,
+                crate::error::ProviderFailureKind::Rejected,
+            ))
+        })
     }
 
     /// Bind a session observer to one original invocation without widening prompt delivery.
@@ -291,10 +302,10 @@ impl EventReceiver {
         let Some(part) = value.get("forge_event_part") else {
             if let Some((sequence, count, bytes, payload)) = &self.transfer {
                 return Err(EventDeliveryError::IncompleteTransfer {
-                    message: format!(
-                        "interrupted after {sequence}/{count} parts and {}/{bytes} bytes",
-                        payload.len()
-                    ),
+                    received_parts: *sequence,
+                    expected_parts: *count,
+                    received_bytes: payload.len(),
+                    expected_bytes: *bytes,
                 });
             }
             return serde_json::from_value(value)
@@ -308,13 +319,7 @@ impl EventReceiver {
             || part.payload.is_empty()
             || part.payload.len() > forge_protocol::MAX_SNAPSHOT_PART_BYTES
         {
-            return Err(EventDeliveryError::transport(format!(
-                "invalid part: sequence {}, count {}, total bytes {}, payload bytes {}",
-                part.sequence,
-                part.part_count,
-                part.total_bytes,
-                part.payload.len()
-            )));
+            return Err(EventDeliveryError::transport("invalid part"));
         }
         let transfer = self
             .transfer
@@ -328,17 +333,7 @@ impl EventReceiver {
                 .checked_add(part.payload.len())
                 .is_none_or(|length| length > transfer.2)
         {
-            return Err(EventDeliveryError::transport(format!(
-                "expected sequence {}, count {}, bytes {} with {} bytes retained; received sequence {}, count {}, bytes {}, payload bytes {}",
-                transfer.0,
-                transfer.1,
-                transfer.2,
-                transfer.3.len(),
-                part.sequence,
-                part.part_count,
-                part.total_bytes,
-                part.payload.len()
-            )));
+            return Err(EventDeliveryError::transport("inconsistent transfer part"));
         }
         transfer.0 += 1;
         transfer.3.push_str(&part.payload);
@@ -346,11 +341,16 @@ impl EventReceiver {
             return Ok(None);
         }
         let length = transfer.2;
+        let received_parts = transfer.0;
+        let expected_parts = transfer.1;
         let payload = std::mem::take(&mut transfer.3);
         self.transfer = None;
         if payload.len() != length {
             return Err(EventDeliveryError::IncompleteTransfer {
-                message: format!("completed with {} bytes, expected {length}", payload.len()),
+                received_parts,
+                expected_parts,
+                received_bytes: payload.len(),
+                expected_bytes: length,
             });
         }
         serde_json::from_str(&payload)
@@ -361,10 +361,10 @@ impl EventReceiver {
     fn closed(&self) -> Result<Option<ProviderEvent>, EventDeliveryError> {
         if let Some((sequence, count, bytes, payload)) = &self.transfer {
             return Err(EventDeliveryError::IncompleteTransfer {
-                message: format!(
-                    "closed after {sequence}/{count} transfer parts and {}/{bytes} bytes",
-                    payload.len()
-                ),
+                received_parts: *sequence,
+                expected_parts: *count,
+                received_bytes: payload.len(),
+                expected_bytes: *bytes,
             });
         }
         Ok(None)
@@ -424,10 +424,10 @@ impl EventReceiver {
 }
 
 impl ProviderEventStream {
-    pub fn try_next(&mut self) -> Result<Option<ProviderEvent>, EventDeliveryError> {
+    pub fn try_next(&mut self) -> Result<Option<BoundProviderEvent>, EventDeliveryError> {
         match self.try_recv() {
             Ok(event) => Ok(Some(event)),
-            Err(EventDeliveryError::Empty | EventDeliveryError::Closed { .. }) => Ok(None),
+            Err(EventDeliveryError::Empty | EventDeliveryError::Closed) => Ok(None),
             Err(error) => Err(error),
         }
     }
@@ -439,7 +439,7 @@ impl ProviderEventStream {
             .map_err(|error| self.input.failure(EventDeliveryError::queue(error)))
     }
 
-    pub async fn recv(&mut self) -> Result<Option<ProviderEvent>, EventDeliveryError> {
+    pub async fn recv(&mut self) -> Result<Option<BoundProviderEvent>, EventDeliveryError> {
         if self.pending.is_none()
             && self.queued.is_none()
             && let Some(error) = self.deferred_error.take()
@@ -470,10 +470,13 @@ impl ProviderEventStream {
                 break;
             }
         }
-        Ok(self.pending.take())
+        Ok(self.pending.take().map(|event| BoundProviderEvent {
+            binding_id: self.binding_id.clone(),
+            event,
+        }))
     }
 
-    pub fn try_recv(&mut self) -> Result<ProviderEvent, EventDeliveryError> {
+    pub fn try_recv(&mut self) -> Result<BoundProviderEvent, EventDeliveryError> {
         if self.pending.is_none()
             && self.queued.is_none()
             && let Some(error) = self.deferred_error.take()
@@ -487,7 +490,7 @@ impl ProviderEventStream {
         while batchable(&event) && output_bytes(&event) < 64 * 1024 {
             let next = match self.input.try_receive() {
                 Ok(event) => event,
-                Err(EventDeliveryError::Empty | EventDeliveryError::Closed { .. }) => break,
+                Err(EventDeliveryError::Empty | EventDeliveryError::Closed) => break,
                 Err(error) => {
                     self.deferred_error = Some(error);
                     break;
@@ -498,7 +501,10 @@ impl ProviderEventStream {
                 break;
             }
         }
-        Ok(event)
+        Ok(BoundProviderEvent {
+            binding_id: self.binding_id.clone(),
+            event,
+        })
     }
 }
 
@@ -580,7 +586,7 @@ pub trait EventObserver: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExecutionOwner, MessageAddress, MessageId, TurnAddress};
+    use crate::{BindingId, ExecutionOwner, MessageAddress, MessageId, TurnAddress};
     use serde_json::json;
 
     struct Observer {
@@ -605,7 +611,7 @@ mod tests {
     /// A sticky native failure follows already accepted output and retains its classification.
     #[tokio::test]
     async fn queued_output_precedes_typed_observation_failure() -> anyhow::Result<()> {
-        let (sink, mut stream) = channel(scope());
+        let (sink, mut stream) = channel(binding(), scope());
         sink.send_wait(message(
             "answer",
             MessageUpdate::Delta {
@@ -619,9 +625,11 @@ mod tests {
         sink.fail(EventDeliveryError::Observation(
             crate::lifecycle::ObservationFailure::Disconnected,
         ));
-        assert!(matches!(stream.recv().await?, Some(ProviderEvent::Message {
+        assert!(
+            matches!(stream.recv().await?, Some(super::BoundProviderEvent { event: ProviderEvent::Message {
             update: MessageUpdate::Delta { text }, ..
-        }) if text == "accepted"));
+        }, .. }) if text == "accepted")
+        );
         assert!(matches!(
             stream.recv().await,
             Err(EventDeliveryError::Observation(
@@ -639,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn host_observer_preserves_native_event_order() -> anyhow::Result<()> {
         for synchronous in [false, true] {
-            let (sink, mut stream) = channel(scope());
+            let (sink, mut stream) = channel(binding(), scope());
             let sink = sink.with_observer(std::sync::Arc::new(Observer { fail: false }));
             let event = message(
                 "observed",
@@ -654,12 +662,18 @@ mod tests {
             }
             assert!(matches!(
                 stream.try_next()?,
-                Some(ProviderEvent::Message { .. })
+                Some(super::BoundProviderEvent {
+                    event: ProviderEvent::Message { .. },
+                    ..
+                })
             ));
             assert!(matches!(
                 stream.try_next()?,
-                Some(ProviderEvent::Runtime {
-                    update: crate::RuntimeUpdate::Progress { received_bytes: 42 },
+                Some(super::BoundProviderEvent {
+                    event: ProviderEvent::Runtime {
+                        update: crate::RuntimeUpdate::Progress { received_bytes: 42 },
+                        ..
+                    },
                     ..
                 })
             ));
@@ -671,7 +685,7 @@ mod tests {
     #[tokio::test]
     async fn host_observer_failure_reaches_event_consumers() {
         for synchronous in [false, true] {
-            let (sink, stream) = channel(scope());
+            let (sink, stream) = channel(binding(), scope());
             let sink = sink.with_observer(std::sync::Arc::new(Observer { fail: true }));
             let event = message(
                 "observed",
@@ -692,7 +706,7 @@ mod tests {
     /// Preserve the accepted prefix and wake consumers when synchronous delivery cannot remain ordered.
     #[tokio::test]
     async fn synchronous_send_contention_reports_typed_observation_loss() -> anyhow::Result<()> {
-        let (sink, mut stream) = channel(scope());
+        let (sink, mut stream) = channel(binding(), scope());
         sink.send(message(
             "accepted",
             MessageUpdate::Delta {
@@ -712,9 +726,11 @@ mod tests {
             ))
         ));
         drop(delivery);
-        assert!(matches!(stream.recv().await?, Some(ProviderEvent::Message {
+        assert!(
+            matches!(stream.recv().await?, Some(super::BoundProviderEvent { event: ProviderEvent::Message {
             update: MessageUpdate::Delta { text }, ..
-        }) if text == "prefix"));
+        }, .. }) if text == "prefix")
+        );
         assert!(matches!(
             stream.recv().await,
             Err(EventDeliveryError::Observation(
@@ -736,6 +752,10 @@ mod tests {
         }
     }
 
+    fn binding() -> BindingId {
+        BindingId::new("binding").unwrap()
+    }
+
     fn message(id: &str, update: MessageUpdate) -> ProviderEvent {
         ProviderEvent::Message {
             address: MessageAddress {
@@ -754,10 +774,13 @@ mod tests {
     #[tokio::test]
     async fn session_observer_rebinds_only_its_owned_invocations() -> anyhow::Result<()> {
         let original = scope();
-        let (session_sink, mut stream) = channel(EventScope::SessionOperation {
-            owner: original.owner.clone(),
-            operation_id: "session-observer".into(),
-        });
+        let (session_sink, mut stream) = channel(
+            binding(),
+            EventScope::SessionOperation {
+                owner: original.owner.clone(),
+                operation_id: "session-observer".into(),
+            },
+        );
         let retained_sink = session_sink.invocation_sink(&original)?;
         let update = message(
             "retained",
@@ -767,14 +790,14 @@ mod tests {
         );
         retained_sink.send_wait(update).await?;
         let received = stream.recv().await?.expect("retained event was sent");
-        assert_eq!(received.scope(), EventScope::from(original.clone()));
+        assert_eq!(received.event.scope(), EventScope::from(original.clone()));
 
         let mut later = original.clone();
         later.invocation_id = "later-invocation".into();
         later.exchange_id = "later-exchange".into();
         assert!(retained_sink.invocation_sink(&later).is_err());
         let later_sink = session_sink.invocation_sink(&later)?;
-        assert!(later_sink.validate(&received).is_err());
+        assert!(later_sink.validate(&received.event).is_err());
 
         let mut sibling = original.clone();
         sibling.owner.agent_id = "another-agent".into();
@@ -786,35 +809,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_transfer_reports_expected_and_received_sequence() {
-        let (sink, mut stream) = channel(scope());
+    async fn malformed_transfer_reports_normalized_transport_failure() {
+        let (sink, mut stream) = channel(binding(), scope());
         sink.sender
             .send(json!({"forge_event_part": {
                 "sequence": 1, "part_count": 2, "total_bytes": 4, "payload": "ab"
             }}))
             .unwrap();
-        let error = stream.recv().await.unwrap_err().to_string();
-        assert!(error.contains("expected sequence 0"), "{error}");
-        assert!(error.contains("received sequence 1"), "{error}");
+        assert!(matches!(
+            stream.recv().await,
+            Err(EventDeliveryError::InvalidTransportData)
+        ));
     }
 
     #[tokio::test]
     async fn closed_transfer_reports_progress_instead_of_generic_eof() {
-        let (sink, mut stream) = channel(scope());
+        let (sink, mut stream) = channel(binding(), scope());
         sink.sender
             .send(json!({"forge_event_part": {
                 "sequence": 0, "part_count": 2, "total_bytes": 4, "payload": "ab"
             }}))
             .unwrap();
         drop(sink);
-        let error = stream.recv().await.unwrap_err().to_string();
-        assert!(error.contains("1/2 transfer parts"), "{error}");
-        assert!(error.contains("2/4 bytes"), "{error}");
+        assert!(matches!(
+            stream.recv().await,
+            Err(EventDeliveryError::IncompleteTransfer {
+                received_parts: 1,
+                expected_parts: 2,
+                received_bytes: 2,
+                expected_bytes: 4,
+            })
+        ));
     }
 
     #[tokio::test]
     async fn foreign_invocation_scope_is_rejected_before_delivery() {
-        let (sink, mut stream) = channel(scope());
+        let (sink, mut stream) = channel(binding(), scope());
         let mut foreign = scope();
         foreign.invocation_id = "foreign".into();
         let error = sink
@@ -833,7 +863,7 @@ mod tests {
 
     #[tokio::test]
     async fn message_batches_preserve_message_phase_and_snapshot_barriers() {
-        let (sink, mut stream) = channel(scope());
+        let (sink, mut stream) = channel(binding(), scope());
         let producer = async {
             for _ in 0..100 {
                 sink.send_wait(message("one", MessageUpdate::Delta { text: "λ".into() }))
@@ -859,18 +889,21 @@ mod tests {
         };
         let consumer = async {
             assert_eq!(
-                stream.recv().await.unwrap().unwrap().message_delta(),
+                stream.recv().await.unwrap().unwrap().event.message_delta(),
                 Some("λ".repeat(100).as_str())
             );
             assert!(matches!(
                 stream.recv().await.unwrap(),
-                Some(ProviderEvent::Message {
-                    update: MessageUpdate::Completed { .. },
+                Some(super::BoundProviderEvent {
+                    event: ProviderEvent::Message {
+                        update: MessageUpdate::Completed { .. },
+                        ..
+                    },
                     ..
                 })
             ));
             assert_eq!(
-                stream.recv().await.unwrap().unwrap().message_delta(),
+                stream.recv().await.unwrap().unwrap().event.message_delta(),
                 Some("second")
             );
         };
@@ -879,7 +912,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_events_preserve_barriers_and_full_content_under_backpressure() {
-        let (sink, mut stream) = channel(scope());
+        let (sink, mut stream) = channel(binding(), scope());
         let text = "λ\n".repeat(forge_protocol::MAX_FRAME_BYTES);
         let expected = text.clone();
         let producer = async move {
@@ -889,8 +922,12 @@ mod tests {
         };
         let consumer = async {
             match stream.recv().await.unwrap().unwrap() {
-                ProviderEvent::Message {
-                    update: MessageUpdate::Completed { text },
+                super::BoundProviderEvent {
+                    event:
+                        ProviderEvent::Message {
+                            update: MessageUpdate::Completed { text },
+                            ..
+                        },
                     ..
                 } => assert_eq!(text, expected),
                 event => panic!("unexpected event {event:?}"),
@@ -901,7 +938,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_receive_retains_partial_batch_for_final_drain() {
-        let (sink, mut stream) = channel(scope());
+        let (sink, mut stream) = channel(binding(), scope());
         sink.send_wait(message(
             "one",
             MessageUpdate::Delta {
@@ -924,7 +961,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            stream.try_recv().unwrap().message_delta(),
+            stream.try_recv().unwrap().event.message_delta(),
             Some("partial tail")
         );
     }

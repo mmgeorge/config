@@ -1,12 +1,14 @@
+use forge_provider_api::retry::RetryCategory;
 use serde_json::Value;
 
 /// Accepts explicit upstream connection/server status on a terminal query failure.
-pub fn transient_code(data: &Value) -> Option<String> {
+pub fn transient_category(data: &Value) -> Option<RetryCategory> {
     if data.get("errorType").and_then(Value::as_str) != Some("query") {
         return None;
     }
     match data.get("statusCode").and_then(Value::as_u64) {
-        Some(status @ (408 | 500 | 502 | 503 | 504)) => Some(format!("query.http.{status}")),
+        Some(503) => Some(RetryCategory::TemporaryCapacity),
+        Some(408 | 500 | 502 | 504) => Some(RetryCategory::TemporaryTransport),
         _ => None,
     }
 }
@@ -19,8 +21,8 @@ mod tests {
     #[test]
     fn unknown_categories_and_runtime_retries_are_not_replayed() {
         assert_eq!(
-            transient_code(&json!({"errorType":"query","statusCode":503})).as_deref(),
-            Some("query.http.503")
+            transient_category(&json!({"errorType":"query","statusCode":503})),
+            Some(RetryCategory::TemporaryCapacity)
         );
         for category in [
             "model_call",
@@ -32,18 +34,19 @@ mod tests {
             "context_limit",
             "unknown",
         ] {
-            assert!(transient_code(&json!({"errorType":category,"statusCode":503})).is_none());
+            assert!(transient_category(&json!({"errorType":category,"statusCode":503})).is_none());
         }
         for status in [400, 401, 403, 429] {
             assert!(
-                transient_code(
+                transient_category(
                     &json!({"errorType":"query","statusCode":status,"message":"network failure"})
                 )
                 .is_none()
             );
         }
         assert!(
-            transient_code(&json!({"errorType":"query","message":"model at capacity"})).is_none()
+            transient_category(&json!({"errorType":"query","message":"model at capacity"}))
+                .is_none()
         );
     }
 }

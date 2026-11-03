@@ -22,35 +22,9 @@ macro_rules! execution_identity {
                 Self(value.to_owned())
             }
         }
-        impl std::ops::Deref for $name {
-            type Target = str;
-            fn deref(&self) -> &str {
-                &self.0
-            }
-        }
         impl std::fmt::Display for $name {
             fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 self.0.fmt(formatter)
-            }
-        }
-        impl PartialEq<str> for $name {
-            fn eq(&self, other: &str) -> bool {
-                self.0 == other
-            }
-        }
-        impl PartialEq<&str> for $name {
-            fn eq(&self, other: &&str) -> bool {
-                self.0 == *other
-            }
-        }
-        impl PartialEq<String> for $name {
-            fn eq(&self, other: &String) -> bool {
-                self.0 == *other
-            }
-        }
-        impl PartialEq<$name> for String {
-            fn eq(&self, other: &$name) -> bool {
-                *self == other.0
             }
         }
     };
@@ -73,6 +47,16 @@ pub struct ExecutionOwner {
     pub agent_id: AgentId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum ExecutionOwnerError {
+    #[error("provider execution owner has an empty session identity")]
+    EmptySession,
+    #[error("provider execution owner has an empty agent identity")]
+    EmptyAgent,
+    #[error("provider execution owner belongs to another session")]
+    SessionMismatch,
+}
+
 impl ExecutionOwner {
     /// Derive an adapter lookup key while preserving legacy root-session controls.
     pub fn runtime_key(&self) -> String {
@@ -92,18 +76,23 @@ impl ExecutionOwner {
     }
 
     /// Validate an explicit owner before using it as a provider connection key.
-    pub fn resolve(owner: &Option<Self>, session_id: &str) -> anyhow::Result<Self> {
+    pub fn resolve(owner: &Option<Self>, session_id: &str) -> Result<Self, ExecutionOwnerError> {
+        if session_id.is_empty() {
+            return Err(ExecutionOwnerError::EmptySession);
+        }
         let owner = owner.clone().unwrap_or_else(|| Self::root(session_id));
-        anyhow::ensure!(
-            owner.session_id == session_id && !owner.agent_id.is_empty(),
-            "provider execution owner does not belong to the Harness session"
-        );
+        if owner.session_id != SessionId::from(session_id) {
+            return Err(ExecutionOwnerError::SessionMismatch);
+        }
+        if owner.agent_id.as_str().is_empty() {
+            return Err(ExecutionOwnerError::EmptyAgent);
+        }
         Ok(owner)
     }
 
     /// Distinguish child authority from the root's workflow authority.
     pub fn is_root(&self) -> bool {
-        self.agent_id == format!("{}:agent:primary", self.session_id)
+        self.agent_id == AgentId::from(format!("{}:agent:primary", self.session_id))
     }
 }
 

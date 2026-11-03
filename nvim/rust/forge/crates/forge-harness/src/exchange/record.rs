@@ -422,10 +422,11 @@ impl Exchange {
         let Some(scope) = event_scope.invocation() else {
             return Ok(false);
         };
-        if (scope.exchange_id != self.id
+        if (scope.exchange_id != forge_provider_api::ExchangeId::from(self.id.as_str())
             && !self.turn.iter().any(|turn| &turn.provider().scope == scope))
-            || scope.owner.session_id != self.session_id
-            || scope.owner.agent_id != self.agent_id
+            || scope.owner.session_id
+                != forge_provider_api::SessionId::from(self.session_id.as_str())
+            || scope.owner.agent_id != forge_provider_api::AgentId::from(self.agent_id.as_str())
         {
             return Ok(false);
         }
@@ -618,18 +619,20 @@ impl Exchange {
             "completed exchange rejects new turns"
         );
         anyhow::ensure!(
-            !address.thread_id.is_empty() && !address.turn_id.is_empty(),
+            !address.thread_id.is_empty() && !address.turn_id.as_str().is_empty(),
             "provider turn address is incomplete"
         );
         anyhow::ensure!(
-            (address.scope.exchange_id == self.id
+            (address.scope.exchange_id == forge_provider_api::ExchangeId::from(self.id.as_str())
                 || self
                     .turn
                     .iter()
                     .any(|turn| turn.provider().scope == address.scope))
-                && address.scope.owner.session_id == self.session_id
-                && address.scope.owner.agent_id == self.agent_id
-                && !address.scope.invocation_id.is_empty(),
+                && address.scope.owner.session_id
+                    == forge_provider_api::SessionId::from(self.session_id.as_str())
+                && address.scope.owner.agent_id
+                    == forge_provider_api::AgentId::from(self.agent_id.as_str())
+                && !address.scope.invocation_id.as_str().is_empty(),
             "provider invocation does not belong to this exchange"
         );
         if let Some(index) = self
@@ -666,11 +669,13 @@ impl Exchange {
             "native invocation binding requires a new running continuation exchange"
         );
         anyhow::ensure!(
-            address.scope.owner.session_id == self.session_id
-                && address.scope.owner.agent_id == self.agent_id
-                && !address.scope.invocation_id.is_empty()
+            address.scope.owner.session_id
+                == forge_provider_api::SessionId::from(self.session_id.as_str())
+                && address.scope.owner.agent_id
+                    == forge_provider_api::AgentId::from(self.agent_id.as_str())
+                && !address.scope.invocation_id.as_str().is_empty()
                 && !address.thread_id.is_empty()
-                && !address.turn_id.is_empty(),
+                && !address.turn_id.as_str().is_empty(),
             "native continuation invocation has a different execution owner"
         );
         self.turn.push(crate::turn::Turn::new(
@@ -718,12 +723,14 @@ impl Exchange {
             "native continuation has no retained invocation"
         );
         anyhow::ensure!(
-            address.scope.owner.session_id == self.session_id
-                && address.scope.owner.agent_id == self.agent_id,
+            address.scope.owner.session_id
+                == forge_provider_api::SessionId::from(self.session_id.as_str())
+                && address.scope.owner.agent_id
+                    == forge_provider_api::AgentId::from(self.agent_id.as_str()),
             "native continuation belongs to another owner"
         );
         anyhow::ensure!(
-            !address.thread_id.is_empty() && !address.turn_id.is_empty(),
+            !address.thread_id.is_empty() && !address.turn_id.as_str().is_empty(),
             "native continuation has no turn identity"
         );
         let ordinal = self
@@ -754,9 +761,11 @@ impl Exchange {
             "only a current completed exchange can revalidate host settlement"
         );
         anyhow::ensure!(
-            scope.exchange_id == self.id
-                && scope.owner.session_id == self.session_id
-                && scope.owner.agent_id == self.agent_id
+            scope.exchange_id == forge_provider_api::ExchangeId::from(self.id.as_str())
+                && scope.owner.session_id
+                    == forge_provider_api::SessionId::from(self.session_id.as_str())
+                && scope.owner.agent_id
+                    == forge_provider_api::AgentId::from(self.agent_id.as_str())
                 && self
                     .turn
                     .last()

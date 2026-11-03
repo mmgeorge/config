@@ -102,16 +102,10 @@ pub struct CompactionResult {
     pub before_context: Option<CompactionContext>,
     /// User focus text supplied to provider compaction when reported.
     pub custom_instructions: Option<String>,
-    /// Provider request correlation identity.
-    pub request_id: Option<String>,
-    /// Provider service correlation identity.
-    pub service_request_id: Option<String>,
-    /// Provider HTTP status accompanying a failed compaction request.
-    pub status_code: Option<u16>,
     /// Generated context summary, distinct from the complete retained model context.
     pub summary_content: Option<String>,
-    /// Failure details supplied by the provider.
-    pub error: Option<String>,
+    /// Normalized failure information; native diagnostics remain inside the adapter.
+    pub diagnostic: Option<crate::ProviderDiagnostic>,
     /// Conversation tokens before context replacement.
     pub pre_compaction_tokens: Option<u64>,
     /// Conversation tokens after context replacement.
@@ -122,10 +116,6 @@ pub struct CompactionResult {
     pub pre_compaction_messages_length: Option<u64>,
     /// Messages removed by context replacement.
     pub messages_removed: Option<u64>,
-    /// Provider checkpoint ordinal created by compaction.
-    pub checkpoint_number: Option<u64>,
-    /// Provider checkpoint location, retained as metadata rather than an editor target.
-    pub checkpoint_path: Option<String>,
     /// Provider-reported input, output, and cached input for the compaction request.
     pub compaction_tokens_used: Option<CompactionUsage>,
     /// Provider-reported context composition after manual compaction.
@@ -251,6 +241,22 @@ impl CompactionResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ignore obsolete native fields when loading history and never publish them again.
+    #[test]
+    fn legacy_compaction_diagnostics_do_not_escape_on_reload() {
+        let result: CompactionResult = serde_json::from_value(serde_json::json!({
+            "error":"private-native-error", "request_id":"private-request",
+            "service_request_id":"private-service", "status_code":503,
+            "checkpoint_path":"private-checkpoint", "checkpoint_number":42,
+            "summary_content":"Useful summary"
+        }))
+        .unwrap();
+        assert_eq!(result.summary_content.as_deref(), Some("Useful summary"));
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(!encoded.contains("private-"));
+        assert!(!encoded.contains("status_code"));
+    }
 
     #[test]
     fn compaction_late_confirmation_preserves_start_evidence_and_terminal_timing() {

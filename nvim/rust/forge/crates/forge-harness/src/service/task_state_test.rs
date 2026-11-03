@@ -2375,117 +2375,6 @@ async fn native_goal_reconciliation_tracks_acknowledged_session_state() -> Resul
     Ok(())
 }
 
-/// Hold native acknowledgments so service task changes can overtake transport completion.
-struct ControlledGoalTransport {
-    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    request: tokio::sync::mpsc::UnboundedSender<(
-        crate::provider::NativeGoalUpdate,
-        tokio::sync::oneshot::Sender<()>,
-    )>,
-}
-
-#[async_trait::async_trait]
-impl crate::provider::ProviderAdapter for ControlledGoalTransport {
-    type Host = crate::provider::HarnessProviderHost;
-    /// Release this in-process transport without starting provider processes.
-    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::Shutdown,
-                source,
-            )
-        })
-    }
-    /// Advertise native goal persistence through the normal service boundary.
-    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-        let mut capability = crate::provider::mock_capability();
-        capability.native_goal = true;
-        crate::provider::ProviderDescriptor {
-            kind: crate::provider::ProviderKind::Mock,
-            label: "Controlled goal transport".into(),
-            capability,
-        }
-    }
-    /// Transfer the goal fixture's owned observation stream to its execution engine.
-    async fn session_events(
-        &self,
-        owner: crate::provider::ExecutionOwner,
-    ) -> std::result::Result<
-        crate::provider::events::ProviderEventStream,
-        crate::provider::ProviderError,
-    > {
-        let stream = self.fixture_events.subscribe(owner.clone())?;
-        Ok(stream)
-    }
-
-    async fn session_prompt(
-        self: std::sync::Arc<Self>,
-        request: crate::provider::ProviderRequest,
-        scope: crate::provider::InvocationScope,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let events = self.fixture_events.clone();
-        events
-            .submit(
-                request,
-                scope,
-                crate::provider::TerminalBoundary::LocalFixture,
-                move |request, sink| async move { self.run_native(request, sink).await },
-            )
-            .await
-    }
-
-    /// Report the fixture's idle turn lane.
-    async fn has_active_turn(&self, _: &str) -> bool {
-        false
-    }
-    /// Collect the fixture's empty execution tree.
-    async fn cleanup_execution(
-        &self,
-        _: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
-                source,
-            )
-        })
-    }
-    /// Identify the native conversation retained by the fixture.
-    async fn active_session_id_for(
-        &self,
-        _: &str,
-    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
-        Ok(Some("native-thread".to_owned().try_into()?))
-    }
-    /// Delay a native write acknowledgment until the test releases its transport barrier.
-    async fn goal_status(
-        &self,
-        _: crate::provider::ProviderRequest,
-        update: crate::provider::NativeGoalUpdate,
-    ) -> Result<()> {
-        let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
-        self.request
-            .send((update, acknowledge))
-            .map_err(|_| anyhow::anyhow!("controlled goal transport closed"))?;
-        acknowledged
-            .await
-            .context("controlled goal acknowledgment dropped")?;
-        Ok(())
-    }
-}
-
-impl ControlledGoalTransport {
-    async fn run_native(
-        &self,
-        _: crate::provider::ProviderRequest,
-        _: crate::provider::ProviderEventSink,
-    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-        Err(anyhow::anyhow!("goal fixture does not execute prompts").into())
-    }
-}
-
 /// Prevent cancellation from clearing a paused native goal and repair superseded acknowledgments.
 #[tokio::test]
 async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -> Result<()> {
@@ -2495,10 +2384,33 @@ async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -
     let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
     let controller = SessionController::new(broker)?;
     let (request, mut received) = tokio::sync::mpsc::unbounded_channel();
-    *controller.provider.write().unwrap() = Arc::new(ControlledGoalTransport {
-        fixture_events: Default::default(),
-        request,
+    let mut descriptor = forge_providers::registry::descriptor(
+        &forge_providers::registry::nonselectable_id().expect("mock fixture identity"),
+    ).expect("mock fixture descriptor");
+    descriptor.capability.native_goal = true;
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        |_, _, _| async { Ok(()) },
+    ).with_goal_status(move |_, update| {
+        let request = request.clone();
+        async move {
+            let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
+            request.send((update, acknowledge)).map_err(|_| {
+                forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                ))
+            })?;
+            acknowledged.await.map_err(|_| {
+                forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                ))
+            })
+        }
     });
+    let provider_fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    *controller.provider.write().unwrap() = provider_fixture.provider_handle();
     let (sink, _output) = forge_protocol::outbound::channel();
     controller.start_provider(&sink).await;
     while !controller.provider_ready().await {
@@ -2507,9 +2419,6 @@ async fn native_goal_service_transport_preserves_pause_and_repairs_stale_ack() -
     controller.observer.set_native_goal_for_test(true)?;
     let mut store = SqliteStore::open(&controller.data_root)?;
     let session_id = controller.observer.session_id().to_owned();
-    let mut session = store.load_session(&session_id)?.unwrap();
-    session.provider_session_id = Some("native-thread".into());
-    store.save_session(&session)?;
     controller.task_controller.change(
         &mut store,
         None,

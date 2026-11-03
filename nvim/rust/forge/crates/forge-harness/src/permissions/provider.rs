@@ -1,5 +1,4 @@
 use super::matcher::PermissionRequest;
-use super::session_directory::SessionDirectory;
 use crate::provider::approval::{
     ApprovalAuthority, ApprovalResolution, PermissionCoordinator, protected_target,
 };
@@ -15,13 +14,16 @@ pub(crate) const REJECT_ALL_GUIDANCE: &str = "Tool approval is set to reject all
 
 struct PermissionState {
     task_authority: Option<crate::tools::TaskAuthority>,
-    cancelled: bool,
     checkpoint: Option<crate::checkpoint::ToolGate>,
     owner: Option<crate::provider::ExecutionOwner>,
     approval_mode: ApprovalMode,
-    workspace: String,
     event_sink: Option<ProviderEventSink>,
-    session_directory: Option<SessionDirectory>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PermissionOrigin {
+    Ordinary,
+    SessionStorage,
 }
 
 /// Own the authorization and checkpoint context used by native provider callbacks.
@@ -33,6 +35,18 @@ pub(crate) struct ProviderPermissionContext {
 }
 
 impl ProviderPermissionContext {
+    /// Check immutable invocation routing before or after an asynchronous permission decision.
+    fn matches_scope(&self, scope: &forge_provider_api::InvocationScope) -> bool {
+        !self.retired.load(Ordering::Acquire)
+            && self.state.lock().is_ok_and(|state| {
+                state
+                    .event_sink
+                    .as_ref()
+                    .and_then(|sink| sink.scope().invocation())
+                    .is_some_and(|active| active == scope)
+            })
+    }
+
     /// Create an inactive callback context bound to the shared permission coordinator.
     pub(crate) fn new(coordinator: Arc<PermissionCoordinator>) -> Self {
         Self {
@@ -41,13 +55,10 @@ impl ProviderPermissionContext {
             approval_authority: Arc::new(ApprovalAuthority::default()),
             state: StandardMutex::new(PermissionState {
                 task_authority: None,
-                cancelled: false,
                 checkpoint: None,
                 owner: None,
                 approval_mode: ApprovalMode::Ask,
-                workspace: ".".into(),
                 event_sink: None,
-                session_directory: None,
             }),
         }
     }
@@ -57,7 +68,7 @@ impl ProviderPermissionContext {
         &self,
         owner: crate::provider::ExecutionOwner,
         approval_mode: ApprovalMode,
-        workspace: String,
+        _workspace: String,
         event_sink: Option<ProviderEventSink>,
     ) -> Result<()> {
         anyhow::ensure!(
@@ -68,16 +79,12 @@ impl ProviderPermissionContext {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("provider permission context lock poisoned"))?;
-        let session_directory = state.session_directory.take();
         *state = PermissionState {
             task_authority: None,
-            cancelled: false,
             checkpoint: None,
             owner: Some(owner),
             approval_mode,
-            workspace,
             event_sink,
-            session_directory,
         };
         Ok(())
     }
@@ -88,15 +95,6 @@ impl ProviderPermissionContext {
     pub(crate) fn retire(&self) -> Result<()> {
         self.retired.store(true, Ordering::Release);
         self.approval_authority.retire()?;
-        Ok(())
-    }
-
-    /// Install the directory reported by the native session for limited automatic access.
-    pub(crate) fn set_session_directory(&self, directory: Option<SessionDirectory>) -> Result<()> {
-        self.state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("provider permission context lock poisoned"))?
-            .session_directory = directory;
         Ok(())
     }
 
@@ -113,68 +111,84 @@ impl ProviderPermissionContext {
         state.task_authority = context.and_then(crate::tools::TaskAuthority::capture);
         Ok(())
     }
-
-    /// Get whether a permission decision cancelled the current invocation.
-    pub(crate) fn cancelled(&self) -> Result<bool> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("provider permission context lock poisoned"))?
-            .cancelled)
-    }
-
-    /// Simulate an explicit user cancellation in host integration fixtures.
-    #[cfg(test)]
-    pub(crate) fn cancel(&self) -> Result<()> {
-        self.state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("provider permission context lock poisoned"))?
-            .cancelled = true;
-        Ok(())
-    }
 }
 
 #[async_trait]
 impl ProviderPermissions for ProviderPermissionContext {
-    async fn before_tool(&self) -> std::result::Result<(), ProviderError> {
-        if self.retired.load(Ordering::Acquire) {
+    async fn before_tool(
+        &self,
+        scope: &forge_provider_api::InvocationScope,
+    ) -> std::result::Result<(), ProviderError> {
+        if !self.matches_scope(scope) {
             return Err(ProviderError::Cancelled);
         }
         let checkpoint = self
             .state
             .lock()
             .map(|state| state.checkpoint.clone())
-            .map_err(|_| anyhow::anyhow!("provider checkpoint context lock poisoned"))?;
+            .map_err(|_| {
+                ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::HostEffectPublication,
+                    forge_provider_api::ProviderFailureKind::Rejected,
+                ))
+            })?;
         if let Some(gate) = checkpoint {
-            gate.wait().await.map_err(ProviderError::from)?;
+            gate.wait().await.map_err(|_| {
+                ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::HostEffectPublication,
+                    forge_provider_api::ProviderFailureKind::Rejected,
+                ))
+            })?;
         }
-        if self.retired.load(Ordering::Acquire) {
+        if !self.matches_scope(scope) {
             return Err(ProviderError::Cancelled);
         }
         Ok(())
     }
 
-    async fn authorize(&self, session_id: &str, request: PermissionRequest) -> PermissionResponse {
-        if self.retired.load(Ordering::Acquire) {
+    async fn authorize(
+        &self,
+        scope: &forge_provider_api::InvocationScope,
+        request: PermissionRequest,
+    ) -> PermissionResponse {
+        self.authorize_request(scope, request, PermissionOrigin::Ordinary)
+            .await
+    }
+
+    async fn authorize_session_storage(
+        &self,
+        scope: &forge_provider_api::InvocationScope,
+        request: PermissionRequest,
+    ) -> PermissionResponse {
+        self.authorize_request(scope, request, PermissionOrigin::SessionStorage)
+            .await
+    }
+}
+
+impl ProviderPermissionContext {
+    async fn authorize_request(
+        &self,
+        scope: &forge_provider_api::InvocationScope,
+        request: PermissionRequest,
+        origin: PermissionOrigin,
+    ) -> PermissionResponse {
+        if !self.matches_scope(scope) {
             return denied("Provider session observation was retired.", None);
         }
-        let (approval_mode, workspace, event_sink, owner, session_directory, task_authority) =
-            match self.state.lock() {
-                Ok(state) => (
-                    state.approval_mode,
-                    state.workspace.clone(),
-                    state.event_sink.clone(),
-                    state.owner.clone(),
-                    state.session_directory.clone(),
-                    state.task_authority.clone(),
-                ),
-                Err(_) => {
-                    return denied(
-                        "Automatically rejected because Harness permission context is unavailable.",
-                        None,
-                    );
-                }
-            };
+        let (approval_mode, event_sink, _owner, task_authority) = match self.state.lock() {
+            Ok(state) => (
+                state.approval_mode,
+                state.event_sink.clone(),
+                state.owner.clone(),
+                state.task_authority.clone(),
+            ),
+            Err(_) => {
+                return denied(
+                    "Automatically rejected because Harness permission context is unavailable.",
+                    None,
+                );
+            }
+        };
         let deny = |reason: &str| denied(reason, Some(approval_mode));
         if let Some(authority) = &task_authority
             && let Err(error) = authority.validate()
@@ -192,7 +206,7 @@ impl ProviderPermissions for ProviderPermissionContext {
                     }
             )
         }) {
-            match self.coordinator.writes_disabled(owner.as_ref()) {
+            match self.coordinator.writes_disabled(Some(scope)) {
                 Ok(true) => {
                     return deny(
                         "Automatically rejected because filesystem writing is off. The user can enable it with /write.",
@@ -217,46 +231,47 @@ impl ProviderPermissions for ProviderPermissionContext {
         if protected {
             return deny("Automatically rejected because the target is protected by Harness.");
         }
-        if let Some(directory) = session_directory {
-            match directory.approves(session_id, &request, std::path::Path::new(&workspace)) {
-                Ok(true) => {
-                    let evaluation = self
-                        .coordinator
-                        .store()
-                        .read()
-                        .map_err(|_| anyhow::anyhow!("permission store unavailable"))
-                        .and_then(|store| {
-                            store
-                                .compiled()
-                                .evaluate(&request)
-                                .map_err(anyhow::Error::from)
-                        });
-                    return match evaluation {
-                        Ok(evaluation)
-                            if evaluation.decision
-                                != crate::permissions::document::PermissionDecision::Deny =>
-                        {
-                            if self.retired.load(Ordering::Acquire) {
-                                deny("Provider session observation was retired.")
-                            } else {
-                                PermissionResponse::Allow
-                            }
-                        }
-                        Ok(_) => deny(
-                            "Automatically rejected by Harness permission policy for this session file.",
-                        ),
-                        Err(error) => deny(&format!(
-                            "Automatically rejected because Harness permission evaluation failed: {error:#}"
-                        )),
-                    };
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    return deny(&format!(
-                        "Automatically rejected because Harness session directory validation failed: {error:#}"
-                    ));
-                }
+        if origin == PermissionOrigin::SessionStorage {
+            if request.target_list.is_empty()
+                || request.target_list.iter().any(|target| {
+                    !matches!(
+                        target,
+                        crate::permissions::matcher::PermissionTarget::Read { .. }
+                            | crate::permissions::matcher::PermissionTarget::Write { .. }
+                    )
+                })
+            {
+                return deny("Invalid session storage permission request.");
             }
+            let evaluation = self
+                .coordinator
+                .store()
+                .read()
+                .map_err(|_| anyhow::anyhow!("permission store unavailable"))
+                .and_then(|store| {
+                    store
+                        .compiled()
+                        .evaluate(&request)
+                        .map_err(anyhow::Error::from)
+                });
+            return match evaluation {
+                Ok(evaluation)
+                    if evaluation.decision
+                        != crate::permissions::document::PermissionDecision::Deny =>
+                {
+                    if !self.matches_scope(scope) {
+                        deny("Provider session observation was retired.")
+                    } else {
+                        PermissionResponse::Allow
+                    }
+                }
+                Ok(_) => deny(
+                    "Automatically rejected by Harness permission policy for this session file.",
+                ),
+                Err(error) => deny(&format!(
+                    "Automatically rejected because Harness permission evaluation failed: {error:#}"
+                )),
+            };
         }
         match self
             .coordinator
@@ -274,7 +289,7 @@ impl ProviderPermissions for ProviderPermissionContext {
                 | ApprovalResolution::AllowExact
                 | ApprovalResolution::AllowBroad,
             ) => {
-                if self.retired.load(Ordering::Acquire) {
+                if !self.matches_scope(scope) {
                     return deny(
                         "Provider session observation was retired while approval was pending.",
                     );
@@ -302,17 +317,7 @@ impl ProviderPermissions for ProviderPermissionContext {
                 | ApprovalResolution::DenyExact
                 | ApprovalResolution::DenyBroad,
             ) => deny("Rejected by the user."),
-            Ok(ApprovalResolution::Cancel) => {
-                match self.state.lock() {
-                    Ok(mut state) => state.cancelled = true,
-                    Err(_) => {
-                        return deny(
-                            "Automatically rejected because Harness permission context is unavailable.",
-                        );
-                    }
-                }
-                PermissionResponse::Cancelled
-            }
+            Ok(ApprovalResolution::Cancel) => PermissionResponse::Cancelled,
             Err(error) => deny(&format!(
                 "Automatically rejected because Harness permission evaluation failed: {error:#}"
             )),
@@ -332,5 +337,58 @@ fn denied(reason: &str, approval_mode: Option<ApprovalMode>) -> PermissionRespon
             "Tool call rejected. The requested operation was not executed. Reason: {reason} \
          Do not retry or bypass this denial. Continue with permitted actions, or explain the blocker to the user. {guidance}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_provider_api::permissions::PermissionTarget;
+
+    #[tokio::test]
+    async fn session_storage_respects_explicit_denial_and_invocation_retirement()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let coordinator = PermissionCoordinator::transient(root.path())?;
+        let context = ProviderPermissionContext::new(coordinator.clone());
+        let owner = crate::provider::ExecutionOwner::root("storage-policy");
+        let scope = crate::provider::InvocationScope::new(owner.clone(), "exchange");
+        let (sink, _events) = crate::provider::events::channel(scope.clone());
+        context.configure(
+            owner,
+            ApprovalMode::Deny,
+            root.path().display().to_string(),
+            Some(sink),
+        )?;
+        let path = root.path().join("state.json").display().to_string();
+        let request = PermissionRequest {
+            id: "storage-read".into(),
+            provider: forge_provider_api::ProviderId::new("fixture")?,
+            reason: None,
+            target_list: vec![PermissionTarget::Read { path: path.clone() }],
+        };
+        assert!(matches!(
+            context
+                .authorize_session_storage(&scope, request.clone())
+                .await,
+            PermissionResponse::Allow
+        ));
+        coordinator.store().write().unwrap().set_rule_list(&[(
+            crate::permissions::document::CATEGORY_READ.into(),
+            path,
+            crate::permissions::document::PermissionDecision::Deny,
+        )])?;
+        assert!(matches!(
+            context
+                .authorize_session_storage(&scope, request.clone())
+                .await,
+            PermissionResponse::Deny { .. }
+        ));
+        context.retire()?;
+        assert!(matches!(
+            context.authorize_session_storage(&scope, request).await,
+            PermissionResponse::Deny { .. }
+        ));
+        Ok(())
     }
 }

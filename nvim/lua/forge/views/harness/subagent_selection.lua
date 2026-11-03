@@ -1,4 +1,5 @@
 local client = require("forge.client")
+local config = require("forge.infra.config")
 local model_options = require("forge.views.harness.model_options")
 
 ---@class ForgeSubagentModel
@@ -17,7 +18,16 @@ local model_options = require("forge.views.harness.model_options")
 local Selection = {}
 Selection.__index = Selection
 
-local provider_list = { "inherit", "codex", "copilot", "claude", "antigravity" }
+local function provider_choices()
+  local result = { "inherit" }
+  local provider_ids = {}
+  for provider, descriptor in pairs(config.options.harness.providers or {}) do
+    if descriptor.selectable ~= false then provider_ids[#provider_ids + 1] = provider end
+  end
+  table.sort(provider_ids)
+  for _, provider in ipairs(provider_ids) do result[#result + 1] = provider end
+  return result
+end
 
 local function cycle(values, value, direction)
   local position = direction > 0 and 0 or 1
@@ -84,7 +94,7 @@ function Selection:cycle(values, field, direction, done)
   if not root then done(nil, "Harness session changed. Reopen the profile editor") return end
   local updated = vim.deepcopy(values)
   local catalog_cache = self.catalog
-  if field == "provider" then updated.provider = cycle(provider_list, values.provider, direction) end
+  if field == "provider" then updated.provider = cycle(provider_choices(), values.provider, direction) end
   local provider = updated.provider == "inherit" and root.provider or updated.provider
   local function apply(catalog, failure)
     if failure then done(nil, failure) return end

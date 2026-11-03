@@ -474,7 +474,6 @@ impl HarnessBroker {
                 transaction.request.recovered_input.clear();
                 let provider = ProviderSubmission {
                     request: transaction.request.clone(),
-                    provider: self.provider.clone(),
                     engine: transaction.engine.clone(),
                     sink: transaction.provider_event_sink.clone(),
                     trace: self.trace.clone(),

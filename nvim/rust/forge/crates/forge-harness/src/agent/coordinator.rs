@@ -412,7 +412,7 @@ impl AgentCoordinator {
     }
 
     pub fn owns(&self, owner: &ExecutionOwner) -> bool {
-        owner.session_id == self.session_id
+        owner.session_id == forge_provider_api::SessionId::from(self.session_id.as_str())
     }
 
     pub fn activity(&self) -> watch::Receiver<u64> {

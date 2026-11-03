@@ -169,9 +169,10 @@ impl PortableSettings {
         if let Some(access) = &self.access {
             session.access = access.clone().validate()?;
         }
-        session.access = crate::provider::registered_capability(
-            crate::provider::ProviderKind::parse(&session.provider)?,
-        )
+        session.access = forge_providers::registry::resolve(&forge_providers::registry::select(
+            &session.provider,
+        )?)?
+        .capability
         .resolve_access(session.access.clone());
         if let Some(shell) = self.shell {
             shell.executable()?;
@@ -1462,13 +1463,13 @@ mod test {
         assert!(store.fork_session("source", "source").is_err());
         global.plan_compact = Some(true);
         store.update(3, SettingScope::Global, "workspace", "source", &global)?;
-        let fork = store.get("workspace", "fork", "claude")?;
+        let fork = store.get("workspace", "fork", "fixture-gamma")?;
         assert_eq!(fork.desired.plan_compact, Some(true));
         assert_eq!(fork.desired.skill, session.skill);
         assert_eq!(fork.desired.mcp, session.mcp);
         session.mcp.insert("mcp-id".into(), false);
         store.update(4, SettingScope::Session, "workspace", "source", &session)?;
-        assert!(store.get("workspace", "fork", "claude")?.desired.mcp["mcp-id"]);
+        assert!(store.get("workspace", "fork", "fixture-gamma")?.desired.mcp["mcp-id"]);
         assert!(
             store
                 .layer_settings(SettingScope::Session, "workspace", "new")?
@@ -1579,7 +1580,7 @@ mod test {
             }
         });
         loop {
-            let snapshot = reader.get("workspace", "session", "codex").unwrap();
+            let snapshot = reader.get("workspace", "session", "fixture-alpha").unwrap();
             if snapshot.revision > 0 {
                 assert_eq!(
                     snapshot.desired.skill.keys().collect::<Vec<_>>(),
@@ -1593,7 +1594,7 @@ mod test {
         writer.join().unwrap();
         assert_eq!(
             reader
-                .get("workspace", "session", "codex")
+                .get("workspace", "session", "fixture-alpha")
                 .unwrap()
                 .revision,
             128
@@ -1675,7 +1676,7 @@ mod test {
         assert_eq!(replay.revision, 1);
         assert_eq!(
             reopened
-                .get("workspace", "session", "claude")
+                .get("workspace", "session", "fixture-gamma")
                 .unwrap()
                 .revision,
             1
@@ -1713,7 +1714,7 @@ mod test {
         );
         assert_eq!(
             reopened
-                .get("workspace", "session", "claude")
+                .get("workspace", "session", "fixture-gamma")
                 .unwrap()
                 .desired
                 .plan_compact,
@@ -1755,7 +1756,12 @@ mod test {
                 &overriding,
             )
             .unwrap();
-        for provider in ["codex", "copilot", "claude", "antigravity"] {
+        for provider in [
+            "fixture-alpha",
+            "fixture-beta",
+            "fixture-gamma",
+            "fixture-delta",
+        ] {
             assert!(
                 store
                     .get("workspace", "session", provider)
@@ -1778,7 +1784,7 @@ mod test {
         assert!(
             !SettingsStore::open(fixture.path())
                 .unwrap()
-                .get("workspace", "session", "claude")
+                .get("workspace", "session", "fixture-gamma")
                 .unwrap()
                 .desired
                 .mcp["rulesync:sem"]
@@ -1793,19 +1799,19 @@ mod test {
         first
             .save_provider(
                 0,
-                "claude",
+                "fixture-gamma",
                 &serde_json::json!({"model":"haiku","effort":"low"}),
             )
             .unwrap();
         assert!(
             second
-                .save_provider(0, "claude", &serde_json::json!({"model":"other"}))
+                .save_provider(0, "fixture-gamma", &serde_json::json!({"model":"other"}))
                 .is_err()
         );
         second
-            .save_provider(1, "claude", &serde_json::json!({"effort":"high"}))
+            .save_provider(1, "fixture-gamma", &serde_json::json!({"effort":"high"}))
             .unwrap();
-        let snapshot = first.get("workspace", "session", "claude").unwrap();
+        let snapshot = first.get("workspace", "session", "fixture-gamma").unwrap();
         assert_eq!(snapshot.revision, 2);
         assert_eq!(
             snapshot.provider,
@@ -1813,17 +1819,17 @@ mod test {
         );
         assert!(
             first
-                .get("workspace", "session", "antigravity")
+                .get("workspace", "session", "fixture-delta")
                 .unwrap()
                 .provider
                 .is_null()
         );
         first
-            .save_provider(2, "claude", &serde_json::json!({"effort":null}))
+            .save_provider(2, "fixture-gamma", &serde_json::json!({"effort":null}))
             .unwrap();
         assert_eq!(
             first
-                .get("workspace", "session", "claude")
+                .get("workspace", "session", "fixture-gamma")
                 .unwrap()
                 .provider,
             serde_json::json!({"model":"haiku"})

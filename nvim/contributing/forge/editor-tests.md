@@ -13,7 +13,7 @@ Host fixtures need a built executable. See [Building and testing](building-and-t
 | `lua-test-live-integration` | Fixtures that use installed provider CLIs | Real, and may make model requests |
 | `lua-benchmark` | Benchmarks | Varies |
 
-Ordinary `lua-test` and its `all` selection exclude both integration suites and benchmarks. The registry rejects a live fixture submitted to the mock check. Run the live check only after checking credentials and each fixture's prerequisites. Its fixtures include `harness_skill_reads_host.lua`, `harness_codex_activity.lua`, and `harness_provider_switch_host.lua`.
+Ordinary `lua-test` and its `all` selection exclude both integration suites and benchmarks. The registry rejects a live fixture submitted to the mock check. Run the live check only after checking credentials and each fixture's prerequisites. Its fixtures include `forge-providers/tests/fixtures/skill_reads_host.lua`, `forge-providers/tests/fixtures/activity_host.lua`, and `harness_provider_switch_host.lua`.
 
 ## Run a fixture
 

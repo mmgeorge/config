@@ -458,11 +458,12 @@ impl HarnessBroker {
             self.collect_foreground_observations(transaction)?;
         }
         while let Some(observation) = transaction.pending_session_observations.pop_front() {
-            if observation
-                .scope()
-                .invocation()
-                .is_some_and(|scope| scope.exchange_id == transaction.state.interaction.id)
-            {
+            if observation.scope().invocation().is_some_and(|scope| {
+                scope.exchange_id
+                    == forge_provider_api::ExchangeId::from(
+                        transaction.state.interaction.id.as_str(),
+                    )
+            }) {
                 return match self.apply_foreground_observation(transaction, observation)? {
                     ForegroundEventApplication::Publication(job) => match *job {
                         ForegroundJob::Publication(delivery) => {

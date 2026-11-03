@@ -57,7 +57,8 @@ fn check_matrix(shell: CommandShell, fixture_list: &[&str]) {
         }
         let request = PermissionRequest {
             id: "matrix".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("test")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: source.clone(),
@@ -88,7 +89,8 @@ fn reject_matrix(shell: CommandShell, fixture_list: &[&str]) {
     for source in fixture_list {
         let request = PermissionRequest {
             id: "matrix".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("test")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: (*source).into(),
@@ -164,7 +166,8 @@ fn powershell_comma_arguments_keep_independent_permissions_and_source_ranges() {
             );
             let request = PermissionRequest {
                 id: "comma-arguments".into(),
-                provider: "test".into(),
+                provider: forge_provider_api::ProviderId::new("test")
+                    .expect("static provider identity is valid"),
                 reason: None,
                 target_list: vec![PermissionTarget::Command {
                     command: source.into(),
@@ -286,7 +289,8 @@ fn check_execution(shell: CommandShell, source: &str, expected: &[&str]) {
             );
             let request = PermissionRequest {
                 id: "execution".into(),
-                provider: "test".into(),
+                provider: forge_provider_api::ProviderId::new("test")
+                    .expect("static provider identity is valid"),
                 reason: None,
                 target_list: vec![PermissionTarget::Command {
                     command: source.into(),
@@ -772,7 +776,8 @@ fn wrapper_denials_and_body_denials_cannot_be_bypassed() {
     ] {
         let request = PermissionRequest {
             id: "wrapper".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("test")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: source.into(),
@@ -811,7 +816,8 @@ fn powershell_foreach_ranges_are_expressions_and_only_loop_commands_need_permiss
         assert_eq!(parsed.invocation_list[0].source, "whoami.exe /groups");
         let request = PermissionRequest {
             id: "range".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("test")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: source,

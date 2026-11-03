@@ -36,11 +36,49 @@ async fn recovery_frame(reader: &mut tokio::io::DuplexStream) -> Option<Value> {
     Some(serde_json::from_slice(&body).unwrap())
 }
 
+/// Publish one SDK notification with the durable bookkeeping parent deliberately omitted.
+async fn recovery_notification(
+    writer: &mut tokio::io::DuplexStream,
+    session_id: &Value,
+    event_id: &str,
+    parent_id: Option<&str>,
+    event_type: &str,
+    data: Value,
+) {
+    let mut event = serde_json::json!({
+        "id":event_id,
+        "type":event_type,
+        "timestamp":"2026-11-02T00:00:00Z",
+        "data":data,
+    });
+    if let Some(parent_id) = parent_id {
+        event["parentId"] = serde_json::Value::String(parent_id.to_owned());
+    }
+    let frame = serde_json::json!({
+        "jsonrpc":"2.0",
+        "method":"session.event",
+        "params":{"sessionId":session_id,"event":event},
+    });
+    let bytes = serde_json::to_vec(&frame).unwrap();
+    writer.write_all(format!("Content-Length: {}\r\n\r\n", bytes.len()).as_bytes()).await.unwrap();
+    writer.write_all(&bytes).await.unwrap();
+    writer.flush().await.unwrap();
+}
+
 impl RecoveryPeer {
     /// Attach a fresh peer to the same retained runtime without launching an external CLI.
     async fn attach(
         runtime: &super::super::runtime::CopilotRuntime,
         version: &'static str,
+    ) -> Self {
+        Self::attach_with_turns(runtime, version, false).await
+    }
+
+    /// Attach a peer that publishes incomplete-ancestry turns before each send acknowledgment.
+    async fn attach_with_turns(
+        runtime: &super::super::runtime::CopilotRuntime,
+        version: &'static str,
+        emit_turns: bool,
     ) -> Self {
         let (client_write, mut peer_read) = tokio::io::duplex(1 << 20);
         let (mut peer_write, client_read) = tokio::io::duplex(1 << 20);
@@ -52,6 +90,7 @@ impl RecoveryPeer {
         let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed = methods.clone();
         let task = tokio::spawn(async move {
+            let mut send_count = 0usize;
             loop {
                 let request = tokio::select! {
                     _ = &mut stopped => break,
@@ -61,13 +100,36 @@ impl RecoveryPeer {
                 observed.lock().unwrap().push(method.to_owned());
                 let result = match method {
                     "status.get" => serde_json::json!({"version":version}),
+                    "mcp.discover" => serde_json::json!({"servers":[]}),
                     "session.create" => {
                         serde_json::json!({"sessionId":request["params"]["sessionId"],"workspacePath":std::env::temp_dir()})
                     }
                     "session.options.update" | "session.detach" => {
                         serde_json::json!({"success":true})
                     }
-                    "session.send" => serde_json::json!({"messageId":"accepted-old-input"}),
+                    "session.plan.readSqlTodosWithDependencies" => serde_json::json!({"rows":[],"dependencies":[]} ),
+                    "session.eventLog.tail" => serde_json::json!({"cursor":format!("before-{send_count}")}),
+                    "session.send" => {
+                        let ordinal = send_count;
+                        send_count += 1;
+                        let message_id = format!("accepted-{ordinal}");
+                        if emit_turns {
+                            for (event_id, parent_id, event_type, data) in [
+                                (format!("user-{ordinal}"), None, "user.message", serde_json::json!({
+                                    "messageId":message_id,"parentAgentTaskId":"root-task","turnId":"0"
+                                })),
+                                (format!("start-{ordinal}"), Some(format!("user-{ordinal}")), "assistant.turn_start", serde_json::json!({"turnId":"0"})),
+                                (format!("answer-{ordinal}"), Some("omitted-usage-record".to_owned()), "assistant.message", serde_json::json!({
+                                    "messageId":format!("answer-{ordinal}"),"content":format!("full answer {ordinal}"),"phase":"final_answer","turnId":"0"
+                                })),
+                                (format!("end-{ordinal}"), Some(format!("answer-{ordinal}")), "assistant.turn_end", serde_json::json!({"turnId":"0"})),
+                                (format!("idle-{ordinal}"), Some("ephemeral-idle-parent".to_owned()), "session.idle", serde_json::json!({"mode":"interactive"})),
+                            ] {
+                                recovery_notification(&mut peer_write, &request["params"]["sessionId"], &event_id, parent_id.as_deref(), event_type, data).await;
+                            }
+                        }
+                        serde_json::json!({"messageId":message_id})
+                    },
                     "session.tasks.refresh" | "session.mcp.listConfigured" => continue,
                     other => panic!("unexpected recovery fixture RPC: {other}"),
                 };
@@ -163,6 +225,7 @@ async fn failed_mcp_configuration_collects_provisional_session_without_dead_deta
                                 resources: super::super::session::ResourceDiscovery::Native,
                                 excluded_tools: Vec::new(),
                                 tools: Vec::new(),
+                                native_callbacks: None,
                             },
                             skills: None,
                             mcp: Some(Vec::new()),
@@ -237,6 +300,16 @@ async fn recovery_session(
     client: CopilotClient,
     owner: &forge_provider_api::ExecutionOwner,
 ) -> Arc<CopilotSession> {
+    recovery_session_mode(sessions, client, owner, forge_provider_api::PromptMode::Chat).await
+}
+
+/// Prepare one real SDK session in a selected native interaction mode.
+async fn recovery_session_mode(
+    sessions: &Arc<CopilotSessions<tempfile::TempDir>>,
+    client: CopilotClient,
+    owner: &forge_provider_api::ExecutionOwner,
+    mode: forge_provider_api::PromptMode,
+) -> Arc<CopilotSession> {
     sessions
         .acquire(
             async move { Ok((client, None)) },
@@ -260,11 +333,12 @@ async fn recovery_session(
                         reasoning_effort: None,
                         context_tier: None,
                         workspace: std::env::temp_dir(),
-                        mode: forge_provider_api::PromptMode::Chat,
+                        mode,
                         system_message: String::new(),
                         resources: super::super::session::ResourceDiscovery::Native,
                         excluded_tools: Vec::new(),
                         tools: Vec::new(),
+                        native_callbacks: None,
                     },
                     skills: None,
                     mcp: None,
@@ -289,6 +363,7 @@ async fn failed_shared_generation_collects_all_sessions_before_revalidating_repl
         for id in ["idle-owner", "active-owner", "catalog-owner"] {
             let owner = forge_provider_api::ExecutionOwner::root(id);
             let (sink, stream) = forge_provider_api::events::channel(
+                forge_provider_api::BindingId::new("recovery-owner").unwrap(),
                 forge_provider_api::EventScope::SessionOperation {
                     owner: owner.clone(),
                     operation_id: "generation-observation".into(),
@@ -301,7 +376,7 @@ async fn failed_shared_generation_collects_all_sessions_before_revalidating_repl
             owned.push((owner, session, stream));
         }
         let scope = forge_provider_api::InvocationScope::new(owned[1].0.clone(), "active-exchange");
-        let (sink, _active_events) = forge_provider_api::events::channel(scope.clone());
+        let (sink, _active_events) = forge_provider_api::events::channel(forge_provider_api::BindingId::new("recovery-active").unwrap(), scope.clone());
         let context = Arc::new(Mutex::new(super::super::intake::TurnContext {
             decoder: super::super::event_decoder::CopilotEventDecoder::new(scope, ".".into()),
             output: Default::default(),

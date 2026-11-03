@@ -625,14 +625,14 @@ local success, failure = xpcall(function()
   picker.close(true)
   local child_permission = vim.deepcopy(permission)
   child_permission.id = "child-approval"
-  child_permission.provider = "Codex"
+  child_permission.provider = "Fixture Alpha"
   child_permission.execution_owner = {session_id="native-controller",agent_id="child"}
   state.selected_agent_run_id = "different-child"
   receive("provider_event", {kind="approval_requested",data=child_permission},"native-controller")
   assert(vim.wait(1000,approval_view.is_open))
   picker_instance = picker._state_for_test()
   local approval_page = picker_state.page(picker_instance.state,picker_instance.spec)
-  assert(approval_page.content_list[1].text == "Agent parser-review · Codex",
+  assert(approval_page.content_list[1].text == "Agent parser-review · Fixture Alpha",
     "approval must identify its requesting child")
   local interrupt_key = require("forge.shared.keymaps").view_keys_for("harness","cancel")[1]
   vim.fn.maparg(interrupt_key,"n",false,true).callback()

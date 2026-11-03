@@ -7,6 +7,15 @@ use crate::tool::{TextUpdate, ToolUpdate};
 use crate::*;
 use serde::{Deserialize, Serialize};
 
+/// Bind every normalized observation to the live session generation that produced it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BoundProviderEvent {
+    /// Identify the exact live provider binding; retired bindings cannot update replacements.
+    pub binding_id: crate::session::BindingId,
+    /// Carry the provider-neutral observation.
+    pub event: ProviderEvent,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderEvent {
@@ -116,8 +125,10 @@ pub enum InputAcknowledgement {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderDiagnostic {
-    pub code: Option<String>,
-    pub message: String,
+    /// Carry only a normalized failure category.
+    pub kind: crate::error::ProviderFailureKind,
+    /// Preserve user-actionable text after native details have been removed.
+    pub message: crate::diagnostic::SanitizedMessage,
     pub fatal: bool,
 }
 
@@ -202,9 +213,10 @@ impl ProviderEvent {
     }
 }
 
-/// Represents the provider identity and resolved model shown by Harness.
+/// Represent the provider display label and resolved model shown by Harness.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ProviderRuntime {
+    /// Display text only; use ProviderDescriptor.kind for machine identity.
     pub provider: String,
     pub model: Option<String>,
 }

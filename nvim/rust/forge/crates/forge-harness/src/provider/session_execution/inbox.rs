@@ -36,6 +36,7 @@ pub(crate) struct SessionObservationInbox {
         HashMap<crate::provider::InvocationId, Arc<crate::provider::tool_timeout::ToolWatchdog>>,
     >,
     background_tasks: Mutex<tokio::task::JoinSet<()>>,
+    background_collection: tokio::sync::Mutex<()>,
     watchdog_failure: Mutex<Option<Arc<forge_provider_api::error::ObservationCleanup>>>,
 }
 
@@ -116,9 +117,7 @@ impl SessionObservationInbox {
             .lock()
             .map_err(|_| inbox_poisoned("session event inbox poisoned"))?;
         if self.is_closed() {
-            return Err(ProviderError::Protocol {
-                message: "session observation generation is closed".into(),
-            });
+            return Err(inbox_poisoned("session observation generation is closed"));
         }
         if pending.len() == forge_protocol::MAX_PENDING_FRAMES {
             return Err(crate::provider::ProviderError::Observation(
@@ -222,20 +221,18 @@ impl SessionObservationInbox {
             .lock()
             .map_err(|_| inbox_poisoned("background watchdog task registry poisoned"))?;
         if self.is_closed() {
-            return Err(ProviderError::Protocol {
-                message: "session observation generation is closed".into(),
-            });
+            return Err(inbox_poisoned("session observation generation is closed"));
         }
         while let Some(result) = tasks.try_join_next() {
             if let Err(error) = result
                 && !error.is_cancelled()
             {
-                let failure = self.retain_watchdog_failure(ProviderError::Operation(
-                    forge_provider_api::error::ProviderOperationFailure::new(
+                let failure = self.retain_watchdog_failure(
+                    crate::provider::lifecycle_error::classify_source(
                         forge_provider_api::error::ProviderOperation::CollectEventReader,
-                        Arc::new(error),
+                        &error,
                     ),
-                ));
+                );
                 return Err(crate::provider::ProviderError::Cleanup(failure));
             }
         }
@@ -278,8 +275,9 @@ impl SessionObservationInbox {
                             update: crate::provider::ToolUpdate::Finished {
                                 outcome: crate::provider::ToolOutcome::Failed {
                                     diagnostic: crate::provider::ToolDiagnostic {
-                                        code: Some("tool_timeout".into()),
-                                        message: timeout.to_string(),
+                                        kind: forge_provider_api::ProviderFailureKind::Timeout,
+                                        message: forge_provider_api::SanitizedMessage::new("Tool execution timed out")
+                                            .expect("static diagnostic is nonempty"),
                                     },
                                 },
                             },
@@ -287,8 +285,9 @@ impl SessionObservationInbox {
                         inbox.push(ProviderEvent::Diagnostic {
                             scope: scope.clone().into(),
                             diagnostic: crate::provider::ProviderDiagnostic {
-                                code: Some("tool_timeout".into()),
-                                message: timeout.to_string(),
+                                kind: forge_provider_api::ProviderFailureKind::Timeout,
+                                message: forge_provider_api::SanitizedMessage::new("Tool execution timed out")
+                                    .expect("static diagnostic is nonempty"),
                                 fatal: true,
                             },
                         })
@@ -317,8 +316,9 @@ impl SessionObservationInbox {
                 let _ = inbox.push(ProviderEvent::Diagnostic {
                     scope: scope.into(),
                     diagnostic: crate::provider::ProviderDiagnostic {
-                        code: Some("tool_timeout_cleanup".into()),
-                        message: format!("Tool timeout cleanup failed: {error:#}"),
+                        kind: forge_provider_api::ProviderFailureKind::Runtime,
+                        message: forge_provider_api::SanitizedMessage::new("Tool timeout cleanup failed")
+                            .expect("static diagnostic is nonempty"),
                         fatal: true,
                     },
                 });
@@ -332,51 +332,44 @@ impl SessionObservationInbox {
 
     /// Abort and collect old-generation watchdogs before replacing their native owner.
     pub(crate) async fn retire_background(&self) -> Result<()> {
-        let mut failure = self
+        let _collection = self.background_collection.lock().await;
+        self.close();
+        self.background_tasks
+            .lock()
+            .map_err(|_| inbox_poisoned("background watchdog task registry poisoned"))?
+            .abort_all();
+        loop {
+            let result = std::future::poll_fn(|context| match self.background_tasks.lock() {
+                Ok(mut tasks) => tasks.poll_join_next(context).map(Ok),
+                Err(_) => std::task::Poll::Ready(Err(inbox_poisoned(
+                    "background watchdog task registry poisoned",
+                ))),
+            })
+            .await?;
+            let Some(result) = result else {
+                break;
+            };
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                self.retain_watchdog_failure(crate::provider::lifecycle_error::classify_source(
+                    forge_provider_api::error::ProviderOperation::CollectEventReader,
+                    &error,
+                ));
+            }
+        }
+        let failure = self
             .watchdog_failure
             .lock()
             .map_err(|_| inbox_poisoned("background watchdog failure lock poisoned"))?
             .clone();
-        let mut tasks = std::mem::take(
-            &mut *self
-                .background_tasks
-                .lock()
-                .map_err(|_| inbox_poisoned("background watchdog task registry poisoned"))?,
-        );
-        tasks.abort_all();
-        while let Some(result) = tasks.join_next().await {
-            if let Err(error) = result
-                && !error.is_cancelled()
-            {
-                failure.get_or_insert_with(|| {
-                    self.retain_watchdog_failure(ProviderError::Operation(
-                        forge_provider_api::error::ProviderOperationFailure::new(
-                            forge_provider_api::error::ProviderOperation::CollectEventReader,
-                            Arc::new(error),
-                        ),
-                    ))
-                });
-            }
-        }
-        if failure.is_none() {
-            failure = self
-                .watchdog_failure
-                .lock()
-                .map_err(|_| inbox_poisoned("background watchdog failure lock poisoned"))?
-                .clone();
-        }
         if let Some(failure) = failure {
-            *self
-                .watchdog_failure
-                .lock()
-                .map_err(|_| inbox_poisoned("background watchdog failure lock poisoned"))? =
-                Some(failure.clone());
             return Err(crate::provider::ProviderError::Cleanup(failure));
         }
         Ok(())
     }
 
-    /// Preserve the first monitor failure as a typed cleanup result across repeated collection.
+    /// Retain every monitor failure while preserving the first observation across collection.
     fn retain_watchdog_failure(
         &self,
         error: crate::provider::ProviderError,
@@ -391,18 +384,18 @@ impl SessionObservationInbox {
             .watchdog_failure
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        failure
-            .get_or_insert_with(|| {
-                Arc::new(forge_provider_api::error::ObservationCleanup::new(
-                    observation,
-                    None,
-                    None,
-                    Some(forge_provider_api::error::CleanupFailure::Failed(Box::new(
-                        error,
-                    ))),
-                ))
-            })
-            .clone()
+        let report = failure.get_or_insert_with(|| {
+            Arc::new(forge_provider_api::error::ObservationCleanup::new(
+                observation,
+                None,
+                None,
+                None,
+            ))
+        });
+        Arc::make_mut(report).record_collection_failure(
+            forge_provider_api::error::CleanupFailure::Failed(Box::new(error)),
+        );
+        report.clone()
     }
 
     /// Take queued events in provider order without holding the lock during delivery.
@@ -523,28 +516,98 @@ impl forge_provider_api::events::EventObserver for SessionObservationInbox {
     }
 }
 
-/// Identify poisoned synchronization without erasing its engine phase.
-#[derive(Debug)]
-struct InboxPoisoned(&'static str);
-impl std::fmt::Display for InboxPoisoned {
-    /// Describe the poisoned owned state.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
-    }
-}
-impl std::error::Error for InboxPoisoned {}
 /// Preserve typed inbox synchronization failures at the engine boundary.
-fn inbox_poisoned(component: &'static str) -> ProviderError {
-    ProviderError::Operation(forge_provider_api::error::ProviderOperationFailure::new(
+fn inbox_poisoned(_component: &'static str) -> ProviderError {
+    ProviderError::Failure(forge_provider_api::error::ProviderFailure::new(
         forge_provider_api::error::ProviderOperation::CollectEventReader,
-        Arc::new(InboxPoisoned(component)),
+        forge_provider_api::ProviderFailureKind::Runtime,
     ))
 }
 
 #[cfg(test)]
 mod tests {
+    /// Keep aborted-but-running workers owned when a background collection waiter is cancelled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_background_collection_retains_unjoined_workers() {
+        let inbox = std::sync::Arc::new(super::SessionObservationInbox::default());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        inbox
+            .background_tasks
+            .lock()
+            .unwrap()
+            .spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = wait.recv();
+            });
+        ready.await.unwrap();
+        let collecting = {
+            let inbox = inbox.clone();
+            tokio::spawn(async move { inbox.retire_background().await })
+        };
+        while !inbox.is_closed() {
+            tokio::task::yield_now().await;
+        }
+        collecting.abort();
+        assert!(collecting.await.unwrap_err().is_cancelled());
+        assert_eq!(inbox.background_tasks.lock().unwrap().len(), 1);
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), inbox.retire_background())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(inbox.background_tasks.lock().unwrap().is_empty());
+    }
+
+    /// Retain independent watchdog failures once without overwriting published snapshots.
+    #[tokio::test]
+    async fn watchdog_collection_preserves_all_failures_across_repeated_retirement() {
+        use forge_provider_api::{ProviderFailure, ProviderFailureKind, ProviderOperation};
+        let inbox = super::SessionObservationInbox::default();
+        let first = inbox.retain_watchdog_failure(
+            ProviderFailure::new(
+                ProviderOperation::CancelSession,
+                ProviderFailureKind::Transport,
+            )
+            .into(),
+        );
+        let second = inbox.retain_watchdog_failure(
+            ProviderFailure::new(
+                ProviderOperation::CollectEventReader,
+                ProviderFailureKind::Protocol,
+            )
+            .into(),
+        );
+        assert_eq!(first.collection().len(), 1);
+        assert_eq!(second.collection().len(), 2);
+        for _ in 0..2 {
+            let Err(crate::provider::ProviderError::Cleanup(report)) =
+                inbox.retire_background().await
+            else {
+                panic!("watchdog failures remain observable");
+            };
+            assert_eq!(report.collection().len(), 2);
+            assert_eq!(
+                report
+                    .to_string()
+                    .matches("provider observation failed:")
+                    .count(),
+                1
+            );
+        }
+    }
+
     use super::*;
     use anyhow::Result;
+
+    fn fixture_diagnostic(message: impl Into<String>) -> crate::provider::ProviderDiagnostic {
+        crate::provider::ProviderDiagnostic {
+            kind: forge_provider_api::ProviderFailureKind::Unknown,
+            message: forge_provider_api::SanitizedMessage::new(message)
+                .expect("fixture diagnostic is nonempty"),
+            fatal: false,
+        }
+    }
 
     /// Accept sustained traffic above one inbox capacity when the owner drains each bounded window.
     #[test]
@@ -559,11 +622,7 @@ mod tests {
         for index in 0..count {
             inbox.push(ProviderEvent::Diagnostic {
                 scope: scope.clone(),
-                diagnostic: crate::provider::ProviderDiagnostic {
-                    code: None,
-                    message: format!("frame-{index}: α🦀"),
-                    fatal: false,
-                },
+                diagnostic: fixture_diagnostic(format!("frame-{index}: α🦀")),
             })?;
             if (index + 1) % forge_protocol::MAX_PENDING_FRAMES == 0 {
                 loop {
@@ -576,7 +635,7 @@ mod tests {
                         let ProviderEvent::Diagnostic { diagnostic, .. } = frame else {
                             anyhow::bail!("bounded transfer changed an observation");
                         };
-                        observed.push(diagnostic.message);
+                        observed.push(diagnostic.message.to_string());
                     }
                 }
             }
@@ -603,11 +662,7 @@ mod tests {
                 owner: crate::provider::ExecutionOwner::root("session"),
                 operation_id: format!("operation-{index}"),
             },
-            diagnostic: crate::provider::ProviderDiagnostic {
-                code: None,
-                message: format!("frame-{index:03}: α🦀"),
-                fatal: false,
-            },
+            diagnostic: fixture_diagnostic(format!("frame-{index:03}: α🦀")),
         };
         for index in 0..forge_protocol::MAX_PENDING_FRAMES {
             inbox.push(event(index))?;
@@ -630,7 +685,7 @@ mod tests {
                 let ProviderEvent::Diagnostic { diagnostic, .. } = frame else {
                     anyhow::bail!("partial drain changed a frame");
                 };
-                observed.push(diagnostic.message);
+                observed.push(diagnostic.message.to_string());
             }
             assert!(
                 !inbox.ready_for_replacement()?,
@@ -663,19 +718,39 @@ mod tests {
     async fn timeout_cancels_native_work_even_when_publication_is_full() -> Result<()> {
         let data = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(data.path())?);
-        let provider: Arc<crate::provider::Provider> = Arc::from(crate::provider::build(
+        let provider: Arc<crate::provider::Provider> = crate::provider::build(
             crate::provider::ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: Vec::new(),
             },
             crate::provider::approval::PermissionCoordinator::transient(data.path())?,
             trace,
             data.path().into(),
-        )?);
+        )?;
         let scope = crate::provider::InvocationScope::new(
             crate::provider::ExecutionOwner::root("session"),
             "exchange",
         );
+        provider
+            .initialize_session(crate::provider::ProviderRequest {
+                execution_owner: Some(scope.owner.clone()),
+                harness_session_id: scope.owner.session_id.to_string(),
+                workspace: data.path().to_string_lossy().into_owned(),
+                input: crate::provider::ProviderInput::from_text("timeout fixture"),
+                mode: crate::provider::PromptMode::Chat,
+                model: "default".into(),
+                effort: "default".into(),
+                context_window: None,
+                service_tier: Default::default(),
+                access: Default::default(),
+                approval_mode: crate::session::ApprovalMode::Ask,
+                provider_session_id: None,
+                submission: None,
+                recovered_input: Vec::new(),
+                control_context: None,
+            })
+            .await?;
         let runtime_key = scope.owner.runtime_key();
         let control = provider.mock_response_control().unwrap();
         let held = control
@@ -720,8 +795,9 @@ mod tests {
             inbox.push(ProviderEvent::Diagnostic {
                 scope: scope.clone().into(),
                 diagnostic: crate::provider::ProviderDiagnostic {
-                    code: None,
-                    message: "accepted output".into(),
+                    kind: forge_provider_api::ProviderFailureKind::Unknown,
+                    message: forge_provider_api::SanitizedMessage::new("accepted output")
+                        .expect("fixture diagnostic is nonempty"),
                     fatal: false,
                 },
             })?;
@@ -752,10 +828,11 @@ mod tests {
             forge_provider_api::lifecycle::ObservationFailure::Overflow
         ));
         assert!(
-            matches!(cleanup.collection(), Some(forge_provider_api::error::CleanupFailure::Failed(error))
+            matches!(cleanup.collection(), [forge_provider_api::error::CleanupFailure::Failed(error)]
             if matches!(error.as_ref(), crate::provider::ProviderError::Observation(forge_provider_api::lifecycle::ObservationFailure::Overflow)))
         );
         assert!(inbox.retire_background().await.is_err());
+        provider.shutdown().await?;
         Ok(())
     }
 
@@ -764,15 +841,16 @@ mod tests {
     async fn idle_reopening_rearms_tool_deadlines_without_a_result_waiter() -> Result<()> {
         let data = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(data.path())?);
-        let provider: Arc<crate::provider::Provider> = Arc::from(crate::provider::build(
+        let provider: Arc<crate::provider::Provider> = crate::provider::build(
             crate::provider::ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: Vec::new(),
             },
             crate::provider::approval::PermissionCoordinator::transient(data.path())?,
             trace,
             data.path().into(),
-        )?);
+        )?;
         let inbox = Arc::new(SessionObservationInbox::default());
         let scope = crate::provider::InvocationScope::new(
             crate::provider::ExecutionOwner::root("session"),
@@ -814,7 +892,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 if inbox.drain()?.iter().any(|event| matches!(event,
-                    ProviderEvent::Diagnostic { diagnostic, .. } if diagnostic.code.as_deref() == Some("tool_timeout"))) {
+                    ProviderEvent::Diagnostic { diagnostic, .. } if diagnostic.kind == forge_provider_api::ProviderFailureKind::Timeout)) {
                     return Ok::<(), anyhow::Error>(());
                 }
                 inbox.notified().await?;
@@ -953,9 +1031,10 @@ mod tests {
                         operation_id: "old".into(),
                     },
                     diagnostic: crate::provider::ProviderDiagnostic {
-                        code: None,
-                        message: "stale".into(),
-                        fatal: false
+                        kind: forge_provider_api::ProviderFailureKind::Unknown,
+                        message: forge_provider_api::SanitizedMessage::new("stale")
+                            .expect("fixture diagnostic is nonempty"),
+                        fatal: false,
                     },
                 })
                 .is_err()
@@ -973,8 +1052,9 @@ mod tests {
                 operation_id: "initialization".into(),
             },
             diagnostic: crate::provider::ProviderDiagnostic {
-                code: None,
-                message: "before failure".into(),
+                kind: forge_provider_api::ProviderFailureKind::Unknown,
+                message: forge_provider_api::SanitizedMessage::new("before failure")
+                    .expect("fixture diagnostic is nonempty"),
                 fatal: false,
             },
         };

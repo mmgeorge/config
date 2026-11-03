@@ -7,7 +7,7 @@ pub struct AgentSelection {
     pub profile: String,
     pub instructions: String,
     /// Chooses the adapter independently of the root provider.
-    pub provider: crate::provider::ProviderKind,
+    pub provider: crate::provider::ProviderId,
     /// Retains the advertised model selected before task admission.
     pub model: String,
     /// Retains reasoning validated against that model's supported choices.

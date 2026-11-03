@@ -10,6 +10,25 @@ pub use forge_provider_api::control::ControlToolDefinition;
 pub struct ControlToolRegistry;
 
 impl ControlToolRegistry {
+    /// Register a stable superset without granting invocation authority to disabled tools.
+    pub(crate) fn registration_definitions(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+        mode: crate::provider::PromptMode,
+    ) -> Vec<ControlToolDefinition> {
+        if mode == crate::provider::PromptMode::Background {
+            return Vec::new();
+        }
+        self.definition_list()
+            .into_iter()
+            .filter(|definition| {
+                owner.is_root()
+                    || definition.name.starts_with("repository_")
+                    || lsp::is_tool(definition.name)
+            })
+            .collect()
+    }
+
     /// Build the complete provider-neutral control-tool definition list.
     pub fn definition_list(&self) -> Vec<ControlToolDefinition> {
         [
@@ -111,7 +130,7 @@ impl ControlToolRegistry {
             .collect()
     }
 
-    /// Advertise optional root tools before an ACP transport admits its first turn.
+    /// Advertise optional root tools before a provider transport admits its first turn.
     pub fn definition_list_for_owner(
         &self,
         owner: &crate::provider::ExecutionOwner,

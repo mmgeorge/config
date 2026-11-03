@@ -1,15 +1,92 @@
 mod collect;
-pub(crate) use super::session_events::{SessionEvents, TerminalBoundary};
+mod fixture;
 pub(crate) use collect::{ProviderTestExt, ProviderTestSession};
+pub(crate) use fixture::{EventFixtureProvider, call_tool};
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use super::{
     ExecutionOwner, InvocationScope, MessageAddress, MessageClassification, MessageId, MessageRole,
-    MessageUpdate, ProviderError, ProviderEvent, ProviderEventSink, ToolAddress, ToolInvocation,
-    ToolUpdate, TurnAddress, TurnUpdate,
+    MessageUpdate, ProviderEvent, ProviderEventSink, ToolAddress, ToolInvocation, ToolUpdate,
+    TurnAddress,
 };
+
+/// Build the normalized provider mock behind the production Harness bridge.
+pub(crate) fn build_mock(
+    root: std::path::PathBuf,
+    permissions: Arc<super::approval::PermissionCoordinator>,
+    trace: Arc<crate::trace::TraceStore>,
+) -> anyhow::Result<Arc<super::Provider>> {
+    let native = forge_providers::registry::nonselectable_id()
+        .ok_or_else(|| anyhow::anyhow!("registry has no test provider"))?;
+    super::build(
+        super::ProviderLaunch {
+            kind: native,
+            command: Vec::new(),
+        },
+        permissions,
+        trace,
+        root,
+    )
+}
+
+/// Use registry-advertised capabilities for normalized lifecycle fixtures.
+pub(crate) fn fixture_capability() -> super::ProviderCapability {
+    let id = forge_providers::registry::nonselectable_id().expect("registry has a test provider");
+    forge_providers::registry::resolve(&id)
+        .expect("test provider is registered")
+        .capability
+}
+
+/// Use the registry's launch defaults in tests that exercise host selection without native traffic.
+pub(crate) fn default_launch() -> super::ProviderLaunch {
+    let registration = forge_providers::registry::resolve(&forge_providers::registry::default_id())
+        .expect("registry default is registered");
+    super::ProviderLaunch {
+        kind: registration.id,
+        command: registration
+            .command
+            .iter()
+            .map(|part| (*part).to_owned())
+            .collect(),
+    }
+}
+
+/// Construct a normalized reply for tests whose assertion concerns host admission.
+pub(crate) fn question_reply(
+    question_id: &crate::question::QuestionId,
+    response: forge_provider_api::QuestionReplyResponse,
+) -> forge_provider_api::QuestionReply {
+    forge_provider_api::QuestionReply {
+        question_id: question_id.as_str().to_owned(),
+        revision: 1,
+        message_id: "fixture-reply".into(),
+        question: "Fixture question".into(),
+        response,
+    }
+}
+
+/// Classify a fixture's host filesystem failure without leaking its raw payload into events.
+pub(crate) fn io_failure(error: std::io::Error) -> super::ProviderError {
+    super::lifecycle_error::classify_source(
+        forge_provider_api::ProviderOperation::AdmitInput,
+        &error,
+    )
+}
+
+/// Consume one deterministic fixture gate without adding native error semantics.
+pub(crate) async fn wait_gate(gate: &tokio::sync::Semaphore) -> Result<(), super::ProviderError> {
+    gate.acquire()
+        .await
+        .map_err(|_| {
+            super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::AdmitInput,
+                forge_provider_api::ProviderFailureKind::Rejected,
+            ))
+        })?
+        .forget();
+    Ok(())
+}
 
 pub(crate) fn scope() -> InvocationScope {
     InvocationScope {
@@ -99,168 +176,16 @@ impl From<Vec<ProviderEvent>> for FixtureBatch {
     }
 }
 
-#[derive(Default)]
-struct Admission {
-    turn: HashSet<TurnAddress>,
-    settled: HashSet<TurnAddress>,
-    tool: HashSet<ToolAddress>,
-}
-
-#[derive(Clone)]
-pub(crate) struct FixtureStream {
-    sink: ProviderEventSink,
-    admission: Arc<Mutex<Admission>>,
-}
-
-impl FixtureStream {
-    pub(crate) fn new(sink: ProviderEventSink) -> Self {
-        Self {
-            sink,
-            admission: Arc::new(Mutex::new(Admission::default())),
-        }
-    }
-
-    fn prepare(&self, batch: FixtureBatch) -> Vec<ProviderEvent> {
-        let source = match batch {
-            FixtureBatch::Event(event) => vec![*event],
-            FixtureBatch::Sequence(event) => event,
-        };
-        let mut admission = self.admission.lock().expect("fixture admission lock");
-        let mut event = Vec::new();
-        for update in source {
-            if let Some(address) = update.turn_address()
-                && admission.turn.insert(address.clone())
-            {
-                let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
-                    address.scope.clone(),
-                    forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                        address: address.clone(),
-                    },
-                )
-                .expect("fixture execution address carries its own invocation scope");
-                event.push(ProviderEvent::Execution { observation });
-                if !matches!(
-                    &update,
-                    ProviderEvent::Turn {
-                        update: TurnUpdate::Started { .. },
-                        ..
-                    }
-                ) {
-                    event.push(ProviderEvent::Turn {
-                        address: address.clone(),
-                        update: TurnUpdate::Started { started_at_ms: 0 },
-                    });
-                }
-            }
-            if let ProviderEvent::Tool {
-                address,
-                update: ToolUpdate::Requested { .. },
-            } = &update
-                && !admission.tool.insert(address.clone())
-            {
-                continue;
-            }
-            if let ProviderEvent::Turn {
-                address,
-                update: TurnUpdate::Finished { .. },
-            } = &update
-            {
-                admission.settled.insert(address.clone());
-            }
-            event.push(update);
-        }
-        event
-    }
-
-    pub(crate) async fn send_wait(
-        &self,
-        batch: impl Into<FixtureBatch>,
-    ) -> Result<(), super::events::EventDeliveryError> {
-        for event in self.prepare(batch.into()) {
-            self.sink.send_wait(event).await?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn send(
-        &self,
-        batch: impl Into<FixtureBatch>,
-    ) -> Result<(), super::events::EventDeliveryError> {
-        for event in self.prepare(batch.into()) {
-            self.sink.send(event)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) async fn finish(
-        &self,
-        result: &Result<super::ProviderCompletion, ProviderError>,
-    ) -> Result<(), ProviderError> {
-        let outcome = match result {
-            Ok(_) => crate::turn::TurnOutcome::Completed,
-            Err(ProviderError::Cancelled) => crate::turn::TurnOutcome::Cancelled,
-            Err(_) => crate::turn::TurnOutcome::Failed,
-        };
-        let addresses: Vec<_> = {
-            let admission = self.admission.lock().expect("fixture admission lock");
-            admission
-                .turn
-                .iter()
-                .filter(|turn| !admission.settled.contains(*turn))
-                .cloned()
-                .collect()
-        };
-        for address in addresses {
-            self.sink
-                .send_wait(ProviderEvent::Turn {
-                    address,
-                    update: TurnUpdate::Finished {
-                        outcome,
-                        completed_at_ms: 100,
-                    },
-                })
-                .await?;
-        }
-        Ok(())
-    }
-}
-
 /// Supply an explicit observation drain for retry-policy tests that inspect only completion.
-pub(crate) async fn retry_prompt<P>(
-    provider: &ProviderTestSession<P>,
-    mut request: super::ProviderRequest,
+pub(crate) async fn retry_prompt(
+    provider: &ProviderTestSession,
+    request: super::ProviderRequest,
     sink: Option<ProviderEventSink>,
     trace: &crate::trace::TraceStore,
     store: &Arc<super::submission::SubmissionStore>,
-) -> anyhow::Result<super::ProviderCompletion>
-where
-    P: super::ProviderAdapter<Host = super::HarnessProviderHost> + ?Sized,
-{
-    if request.submission.is_none() {
-        request.submission = Some(store.prepare(&request, provider.descriptor().kind)?);
-    }
-    let (sink, mut drain) = match sink {
-        Some(sink) => (sink, None),
-        None => {
-            let (sink, stream) = super::events::channel(InvocationScope::new(
-                request.owner()?,
-                uuid::Uuid::new_v4().to_string(),
-            ));
-            (sink, Some(stream))
-        }
-    };
-    let pending =
-        super::retry::run_policy(request, sink, trace, |mut request, sink, _| async move {
-            if request.submission.is_none() {
-                request.submission = Some(store.prepare(&request, provider.descriptor().kind)?);
-            }
-            provider.session_prompt_and_wait(request, sink).await
-        });
-    tokio::pin!(pending);
-    loop {
-        tokio::select! {
-            result = &mut pending => return result,
-            event = async { match &mut drain { Some(stream) => stream.recv().await, None => std::future::pending().await } } => { event?; },
-        }
-    }
+) -> anyhow::Result<super::ProviderCompletion> {
+    Ok(provider
+        .session_prompt_with_retry(request, sink, trace, store)
+        .await?
+        .completion)
 }

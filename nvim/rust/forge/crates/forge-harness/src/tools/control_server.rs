@@ -29,7 +29,8 @@ struct ToolList {
 pub(crate) struct ControlServer {
     /// Retains the unguessable session-scoped endpoint used only by its provider.
     pub(crate) url: String,
-    driver: tokio::task::JoinHandle<()>,
+    stop: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    driver: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl ControlServer {
@@ -38,11 +39,13 @@ impl ControlServer {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
         let path = format!("/{}", uuid::Uuid::new_v4());
         let url = format!("http://{}{}", listener.local_addr()?, path);
+        let (stop, mut stopping) = tokio::sync::oneshot::channel();
         let driver = tokio::spawn(async move {
             let admission = Arc::new(tokio::sync::Semaphore::new(16));
             let mut connection = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
+                    _ = &mut stopping => break,
                     accepted = listener.accept() => {
                         let Ok((socket, _)) = accepted else { break };
                         let Ok(permit) = admission.clone().try_acquire_owned() else { continue };
@@ -56,14 +59,48 @@ impl ControlServer {
                     _ = connection.join_next(), if !connection.is_empty() => {}
                 }
             }
+            while connection.join_next().await.is_some() {}
         });
-        Ok(Self { url, driver })
+        Ok(Self {
+            url,
+            stop: std::sync::Mutex::new(Some(stop)),
+            driver: tokio::sync::Mutex::new(Some(driver)),
+        })
+    }
+
+    /// Stop admission and collect every connection already accepted by this endpoint.
+    pub(crate) async fn close(&self) -> std::result::Result<(), tokio::task::JoinError> {
+        if let Some(stop) = self
+            .stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = stop.send(());
+        }
+        let mut driver = self.driver.lock().await;
+        if let Some(task) = driver.as_mut() {
+            let result = task.await;
+            driver.take();
+            result?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for ControlServer {
     fn drop(&mut self) {
-        self.driver.abort();
+        if let Some(stop) = self
+            .stop
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = stop.send(());
+        }
+        if let Some(driver) = self.driver.get_mut().take() {
+            driver.abort();
+        }
     }
 }
 
@@ -223,6 +260,54 @@ mod tests {
         }
     }
 
+    struct InvocationHandler {
+        label: &'static str,
+        entered: Option<Arc<tokio::sync::Notify>>,
+        release: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ControlEndpoint for InvocationHandler {
+        async fn definitions(&self) -> Vec<ControlToolDefinition> {
+            Vec::new()
+        }
+
+        async fn call(&self, _: ToolCall) -> ToolResult<ControlReply> {
+            if let Some(entered) = &self.entered {
+                entered.notify_one();
+            }
+            if let Some(release) = &self.release {
+                release.notified().await;
+            }
+            Ok(ControlReply {
+                message: self.label.into(),
+            })
+        }
+    }
+
+    async fn call_label(client: &reqwest::Client, url: &str, id: u64) -> Result<String> {
+        let response: Value = client
+            .post(url)
+            .json(&json!({
+                "id":id,
+                "method":"tools/call",
+                "params":{"name":"fixture","arguments":{}}
+            }))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let payload: Value = serde_json::from_str(
+            response["result"]["content"][0]["text"]
+                .as_str()
+                .context("control call omitted its text result")?,
+        )?;
+        Ok(payload["message"]
+            .as_str()
+            .context("control call omitted its invocation label")?
+            .into())
+    }
+
     #[tokio::test]
     async fn typed_responses_preserve_http_lengths_and_mcp_outcomes() -> Result<()> {
         let server = ControlServer::start(Arc::new(Handler)).await?;
@@ -291,6 +376,58 @@ mod tests {
         let (_, request) = read_request(socket, "/control").await?;
         sender.await??;
         assert_eq!(request.unwrap()["params"]["content"], content);
+        Ok(())
+    }
+
+    /// Retiring one invocation endpoint drains its accepted call without redirecting it to a replacement.
+    #[tokio::test]
+    async fn invocation_endpoints_isolate_old_calls_and_retire_independently() -> Result<()> {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let old = Arc::new(InvocationHandler {
+            label: "old invocation",
+            entered: Some(entered.clone()),
+            release: Some(release.clone()),
+        });
+        let old_server = ControlServer::start(old).await?;
+        let new_server = ControlServer::start(Arc::new(InvocationHandler {
+            label: "new invocation",
+            entered: None,
+            release: None,
+        }))
+        .await?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
+
+        let old_url = old_server.url.clone();
+        let old_client = client.clone();
+        let old_call = tokio::spawn(async move { call_label(&old_client, &old_url, 1).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .context("old endpoint did not admit its call")?;
+
+        let old_server = Arc::new(old_server);
+        let closing_server = old_server.clone();
+        let mut closing = tokio::spawn(async move { closing_server.close().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut closing)
+                .await
+                .is_err(),
+            "retiring an invocation must wait for its already admitted call"
+        );
+        assert_eq!(
+            call_label(&client, &new_server.url, 2).await?,
+            "new invocation"
+        );
+
+        release.notify_one();
+        let old_response = old_call.await??;
+        assert_eq!(old_response, "old invocation");
+        closing.await??;
+        assert_eq!(
+            call_label(&client, &new_server.url, 3).await?,
+            "new invocation"
+        );
+        new_server.close().await?;
         Ok(())
     }
 }

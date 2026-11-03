@@ -35,5 +35,9 @@ pub struct ToolCall {
 #[async_trait]
 pub trait ProviderTools: Send + Sync {
     /// Admit and execute a model call, then return its model-visible response.
-    async fn call(&self, call: ToolCall) -> Result<String, ProviderError>;
+    async fn call(
+        &self,
+        scope: &crate::InvocationScope,
+        call: ToolCall,
+    ) -> Result<String, ProviderError>;
 }

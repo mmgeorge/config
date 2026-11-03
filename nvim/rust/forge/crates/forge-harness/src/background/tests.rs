@@ -39,7 +39,8 @@ async fn generate(
             purpose: crate::provider::TextGeneration::CommitMessage,
             config: crate::service::TextGenerationConfig {
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec![],
                 },
                 model: "mock-model".into(),
@@ -193,7 +194,8 @@ async fn background_reuses_one_provider_thread_for_commits_and_pull_requests() -
                 delivery: None,
                 config: crate::service::TextGenerationConfig {
                     provider: ProviderLaunch {
-                        kind: "mock".into(),
+                        kind: forge_providers::registry::nonselectable_id()
+                            .expect("registry supplies a nonselectable fixture identity"),
                         command: vec![],
                     },
                     model: "mock-model".into(),

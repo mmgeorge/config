@@ -1,7 +1,7 @@
 use super::{ResourceCatalog, SettingsStore, SkillResource};
 use crate::provider::{McpDefinition, McpStatus, ProviderCatalogRequest, SkillDefinition};
 use anyhow::{Result, ensure};
-use serde_json::Value;
+use forge_provider_api::session::{McpLaunch, McpTransport, ResourceSelection};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -13,31 +13,19 @@ pub(crate) struct SessionResources {
     pub(crate) selected_skill: Vec<SkillResource>,
     /// Contains every applicable server with credential failures isolated to its row.
     pub(crate) mcp: Vec<McpDefinition>,
-    /// Contains resolved native launch payloads and must never be serialized into history.
-    pub(crate) launch: Vec<(String, serde_json::Map<String, Value>)>,
+    /// Contains typed launch requests with ephemeral credentials, never persisted in history.
+    pub(crate) launch: Vec<McpLaunch>,
     /// Maps resources skipped for missing executables to their user-facing explanation.
     pub(crate) launch_notice: std::collections::HashMap<String, String>,
 }
 
 impl SessionResources {
-    /// Encode the selected launch payloads through ACP's portable server contract.
-    pub(crate) fn acp(&self) -> Result<Vec<Value>> {
-        self.launch.iter().map(|(name, launch)| {
-            ensure!(launch.get("tools").is_none_or(|tools| tools == &serde_json::json!(["*"]))
-                && launch.get("timeout").is_none() && launch.get("cwd").is_none(),
-                "ACP cannot preserve MCP tool selection, timeout, or working directory for {name}");
-            let mut fields = launch.clone();
-            fields.remove("tools");
-            if fields.get("type").and_then(Value::as_str) == Some("stdio") { fields.remove("type"); }
-            fields.insert("name".into(), serde_json::json!(name));
-            for key in ["env", "headers"] {
-                if let Some(value) = fields.get(key).and_then(Value::as_object) {
-                    let value = value.iter().map(|(name, value)|serde_json::json!({"name":name,"value":value})).collect::<Vec<_>>();
-                    fields.insert(key.into(), serde_json::json!(value));
-                }
-            }
-            Ok(Value::Object(fields))
-        }).collect()
+    /// Supply admitted selections without choosing any provider wire representation.
+    pub(crate) fn selection(&self) -> ResourceSelection {
+        ResourceSelection {
+            skills: self.skill.clone(),
+            mcp: self.launch.clone(),
+        }
     }
 
     /// Resolve persisted selection and reject provider-name collisions before launching a session.
@@ -47,9 +35,20 @@ impl SessionResources {
         provider: &str,
         target: &str,
     ) -> Result<Self> {
+        Self::load_with_selection(root, request, provider, target, None)
+    }
+
+    /// Resolve a proposed selection before committing it to the host settings store.
+    pub(crate) fn load_with_selection(
+        root: &Path,
+        request: &ProviderCatalogRequest,
+        provider: &str,
+        target: &str,
+        selection: Option<&super::PortableSettings>,
+    ) -> Result<Self> {
         let store = SettingsStore::open(root)?;
         let catalog = store.catalog(&request.workspace, &request.harness_session_id, provider)?;
-        let settings = catalog.settings;
+        let settings = selection.unwrap_or(&catalog.settings.desired);
         let mut selected_skill = Vec::new();
         let mut skill = Vec::new();
         let mut selected_name = HashSet::new();
@@ -57,7 +56,7 @@ impl SessionResources {
             if !ResourceCatalog::supports_target(&definition.targets, target) {
                 continue;
             }
-            let enabled = settings.desired.skill.get(&definition.id) != Some(&false);
+            let enabled = settings.skill.get(&definition.id) != Some(&false);
             if enabled {
                 ensure!(
                     selected_name.insert(definition.name.clone()),
@@ -86,14 +85,14 @@ impl SessionResources {
         let mut mcp = Vec::new();
         let mut launch = Vec::new();
         let mut launch_notice = std::collections::HashMap::new();
-        let mut selected_name = HashSet::from(["forge-harness-control".to_owned()]);
+        let mut selected_name = HashSet::new();
         for definition in catalog.server {
             if !ResourceCatalog::supports_target(&definition.targets, target) {
                 continue;
             }
-            let enabled = settings.desired.mcp.get(&definition.id) != Some(&false);
+            let enabled = settings.mcp.get(&definition.id) != Some(&false);
             let (status, status_detail) = if enabled {
-                match definition.native() {
+                match definition.launch() {
                     Ok(payload) => {
                         ensure!(
                             selected_name.insert(definition.name.clone()),
@@ -110,11 +109,15 @@ impl SessionResources {
                             launch_notice.insert(definition.id.clone(), message.clone());
                             (McpStatus::Unavailable, Some(message))
                         } else {
-                            launch.push((definition.name.clone(), payload));
+                            launch.push(payload);
                             (McpStatus::Loading, None)
                         }
                     }
-                    Err(error) => (McpStatus::Unavailable, Some(error.to_string())),
+                    Err(error) => {
+                        let message = error.to_string();
+                        launch_notice.insert(definition.id.clone(), message.clone());
+                        (McpStatus::Unavailable, Some(message))
+                    }
                 }
             } else {
                 (McpStatus::Disabled, None)
@@ -124,10 +127,21 @@ impl SessionResources {
                 source_path: Some(definition.source),
                 resource_id: Some(definition.id),
                 name: definition.name,
-                transport: definition.transport.as_str().into(),
+                transport: match definition.transport {
+                    super::catalog::ServerTransport::Stdio => {
+                        forge_provider_api::catalog::McpTransportKind::Stdio
+                    }
+                    super::catalog::ServerTransport::Http => {
+                        forge_provider_api::catalog::McpTransportKind::Http
+                    }
+                    super::catalog::ServerTransport::Sse => {
+                        forge_provider_api::catalog::McpTransportKind::Sse
+                    }
+                },
                 enabled,
                 status,
-                status_detail,
+                status_detail: status_detail
+                    .and_then(|message| forge_provider_api::SanitizedMessage::new(message).ok()),
                 token_count: None,
                 token_estimated: false,
                 tools: Vec::new(),
@@ -144,35 +158,33 @@ impl SessionResources {
     }
 }
 
-fn unavailable_command(
-    payload: &serde_json::Map<String, Value>,
-    workspace: &Path,
-) -> Option<String> {
-    if payload.get("type").and_then(Value::as_str) != Some("stdio") {
+fn unavailable_command(payload: &McpLaunch, workspace: &Path) -> Option<String> {
+    let McpTransport::Stdio {
+        command,
+        environment,
+        ..
+    } = &payload.transport
+    else {
         return None;
-    }
-    let command = payload.get("command")?.as_str()?;
+    };
     let directory = payload
-        .get("cwd")
-        .and_then(Value::as_str)
+        .working_directory
+        .as_ref()
         .map(|directory| workspace.join(directory))
         .unwrap_or_else(|| workspace.to_path_buf());
     let inherited_path = std::env::var_os("PATH").unwrap_or_default();
-    let path = payload
-        .get("env")
-        .and_then(Value::as_object)
-        .and_then(|environment| {
-            environment.iter().find(|(name, _)| {
-                if cfg!(windows) {
-                    name.eq_ignore_ascii_case("PATH")
-                } else {
-                    name.as_str() == "PATH"
-                }
-            })
+    let path = {
+        environment.iter().find(|(name, _)| {
+            if cfg!(windows) {
+                name.eq_ignore_ascii_case("PATH")
+            } else {
+                name.as_str() == "PATH"
+            }
         })
-        .and_then(|(_, value)| value.as_str())
-        .map(std::ffi::OsStr::new)
-        .unwrap_or(&inherited_path);
+    }
+    .map(|(_, value)| value.as_str())
+    .map(std::ffi::OsStr::new)
+    .unwrap_or(&inherited_path);
     crate::process::executable_at(command, &directory, path)
         .is_none()
         .then(|| command.to_owned())
@@ -196,8 +208,8 @@ mod test {
             (&global, "global-wildcard", vec!["*"]),
             (&local, "local-wildcard", vec!["*"]),
             (&local, "mixed-wildcard", vec!["neovim", "*"]),
-            (&local, "codex-only", vec!["codexcli"]),
-            (&local, "claude-only", vec!["claudecode"]),
+            (&local, "fixture-alpha-only", vec!["fixture-alpha-target"]),
+            (&local, "fixture-gamma-only", vec!["fixture-gamma-target"]),
             (&local, "other-target", vec!["neovim"]),
         ] {
             let skill_directory = directory.join("skills").join(name);
@@ -241,10 +253,18 @@ mod test {
             provider_session_id: None,
         };
         for (provider, target, provider_skill) in [
-            ("codex", "codexcli", Some("codex-only")),
-            ("copilot", "copilotcli", None),
-            ("claude", "claudecode", Some("claude-only")),
-            ("antigravity", "antigravity-cli", None),
+            (
+                "fixture-alpha",
+                "fixture-alpha-target",
+                Some("fixture-alpha-only"),
+            ),
+            ("fixture-beta", "fixture-beta-target", None),
+            (
+                "fixture-gamma",
+                "fixture-gamma-target",
+                Some("fixture-gamma-only"),
+            ),
+            ("fixture-delta", "fixture-delta-target", None),
         ] {
             let mut expected = vec![
                 "global-wildcard",
@@ -289,14 +309,20 @@ mod test {
             let mut launch: Vec<_> = loaded
                 .launch
                 .iter()
-                .map(|(name, _)| name.as_str())
+                .map(|launch| launch.name.as_str())
                 .collect();
             for actual in [&mut skill, &mut selected, &mut server, &mut launch] {
                 actual.sort_unstable();
                 assert_eq!(actual.as_slice(), expected.as_slice(), "{target}");
             }
         }
-        let loaded = SessionResources::load(root.path(), &request, "codex", "codexcli").unwrap();
+        let loaded = SessionResources::load(
+            root.path(),
+            &request,
+            "fixture-alpha",
+            "fixture-alpha-target",
+        )
+        .unwrap();
         let mut desired = super::super::PortableSettings::default();
         desired.skill.insert(
             loaded
@@ -330,10 +356,10 @@ mod test {
             )
             .unwrap();
         for (provider, target) in [
-            ("codex", "codexcli"),
-            ("copilot", "copilotcli"),
-            ("claude", "claudecode"),
-            ("antigravity", "antigravity-cli"),
+            ("fixture-alpha", "fixture-alpha-target"),
+            ("fixture-beta", "fixture-beta-target"),
+            ("fixture-gamma", "fixture-gamma-target"),
+            ("fixture-delta", "fixture-delta-target"),
         ] {
             let loaded = SessionResources::load(root.path(), &request, provider, target).unwrap();
             assert!(
@@ -381,7 +407,7 @@ mod test {
                 !loaded
                     .launch
                     .iter()
-                    .any(|(name, _)| name == "local-wildcard")
+                    .any(|launch| launch.name == "local-wildcard")
             );
         }
     }
@@ -392,11 +418,11 @@ mod test {
         let global = root.path().join("rulesync-global/.rulesync");
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(global.join("skills/shared-skill")).unwrap();
-        std::fs::create_dir_all(workspace.join(".rulesync/skills/claude-only")).unwrap();
-        std::fs::write(global.join("skills/shared-skill/SKILL.md"), "---\nname: shared-skill\ndescription: Shared fixture\ntargets: [copilotcli]\n---\nFixture").unwrap();
+        std::fs::create_dir_all(workspace.join(".rulesync/skills/fixture-gamma-only")).unwrap();
+        std::fs::write(global.join("skills/shared-skill/SKILL.md"), "---\nname: shared-skill\ndescription: Shared fixture\ntargets: [fixture-beta-target]\n---\nFixture").unwrap();
         std::fs::write(
-            workspace.join(".rulesync/skills/claude-only/SKILL.md"),
-            "---\nname: claude-only\ntargets: [claudecode]\n---\nFixture",
+            workspace.join(".rulesync/skills/fixture-gamma-only/SKILL.md"),
+            "---\nname: fixture-gamma-only\ntargets: [fixture-gamma-target]\n---\nFixture",
         )
         .unwrap();
         std::fs::write(global.join("mcp.json"), serde_json::json!({"mcpServers": {
@@ -414,14 +440,14 @@ mod test {
             provider_session_id: None,
         };
         let loaded =
-            SessionResources::load(root.path(), &request, "copilot", "copilotcli").unwrap();
+            SessionResources::load(root.path(), &request, "fixture-beta", "fixture-beta-target")
+                .unwrap();
         assert_eq!(loaded.skill.len(), 1);
         assert_eq!(loaded.selected_skill[0].name, "shared-skill");
         assert_eq!(loaded.launch.len(), 1);
-        assert_eq!(
-            loaded.launch[0].1["env"]["FIXTURE_TOKEN"],
-            "credential-fixture"
-        );
+        assert!(matches!(&loaded.launch[0].transport,
+            McpTransport::Stdio { environment, .. }
+                if environment.get("FIXTURE_TOKEN").map(String::as_str) == Some("credential-fixture")));
         assert!(
             !serde_json::to_string(&loaded.mcp)
                 .unwrap()
@@ -458,7 +484,7 @@ mod test {
             )
             .unwrap();
         assert!(
-            SessionResources::load(root.path(), &request, "copilot", "copilotcli")
+            SessionResources::load(root.path(), &request, "fixture-beta", "fixture-beta-target")
                 .unwrap()
                 .selected_skill
                 .is_empty()
@@ -474,10 +500,10 @@ mod test {
             )
             .unwrap();
         for (provider, target) in [
-            ("codex", "codexcli"),
-            ("copilot", "copilotcli"),
-            ("claude", "claudecode"),
-            ("antigravity", "antigravity-cli"),
+            ("fixture-alpha", "fixture-alpha-target"),
+            ("fixture-beta", "fixture-beta-target"),
+            ("fixture-gamma", "fixture-gamma-target"),
+            ("fixture-delta", "fixture-delta-target"),
         ] {
             let loaded = SessionResources::load(root.path(), &request, provider, target).unwrap();
             let missing = loaded
@@ -490,12 +516,13 @@ mod test {
             assert!(
                 missing
                     .status_detail
-                    .as_deref()
+                    .as_ref()
+                    .map(forge_provider_api::SanitizedMessage::as_str)
                     .unwrap()
                     .contains("FORGE_RESOURCE_TEST_MISSING_81D3")
             );
             assert_eq!(loaded.launch.len(), 1);
-            assert_eq!(loaded.launch[0].0, "selected");
+            assert_eq!(loaded.launch[0].name, "selected");
         }
     }
 }

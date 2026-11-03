@@ -1,14 +1,14 @@
 use async_trait::async_trait;
-use forge_provider_api::control::{ControlToolDefinition, ProviderTools, ToolCall};
+use forge_provider_api::control::{ControlToolDefinition, ToolCall};
 use github_copilot_sdk::{Tool, ToolInvocation, ToolResult, tool::ToolHandler};
 use std::sync::Arc;
 
 /// Bind host tool definitions to the native Copilot callback interface.
 pub fn tool_list(
     definitions: Vec<ControlToolDefinition>,
-    tools: Arc<dyn ProviderTools>,
+    callbacks: Arc<dyn super::provider::NativeCallbackRouter>,
 ) -> Vec<Tool> {
-    let handler: Arc<dyn ToolHandler> = Arc::new(ControlToolHandler { tools });
+    let handler: Arc<dyn ToolHandler> = Arc::new(ControlToolHandler { callbacks });
     definitions
         .into_iter()
         .map(|definition| {
@@ -22,7 +22,7 @@ pub fn tool_list(
 }
 
 struct ControlToolHandler {
-    tools: Arc<dyn ProviderTools>,
+    callbacks: Arc<dyn super::provider::NativeCallbackRouter>,
 }
 
 #[async_trait]
@@ -33,15 +33,18 @@ impl ToolHandler for ControlToolHandler {
     ) -> Result<ToolResult, github_copilot_sdk::Error> {
         let name = invocation.tool_name;
         let result = self
-            .tools
-            .call(ToolCall {
-                name: name.clone(),
-                arguments: invocation.arguments,
-            })
+            .callbacks
+            .call_native(
+                &invocation.tool_call_id,
+                ToolCall {
+                    name: name.clone(),
+                    arguments: invocation.arguments,
+                },
+            )
             .await;
         Ok(ToolResult::Text(match result {
             Ok(message) => message,
-            Err(error) => format!("{name} failed: {error:#}"),
+            Err(_) => format!("{name} failed"),
         }))
     }
 }

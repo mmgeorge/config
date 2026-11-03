@@ -49,6 +49,32 @@ pub enum McpStatus {
     Unavailable,
 }
 
+/// Identify one normalized MCP connection transport.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpTransportKind {
+    /// Launch a local process and communicate over standard input and output.
+    Stdio,
+    /// Connect to a remote HTTP endpoint.
+    Http,
+    /// Connect to a remote server-sent events endpoint.
+    Sse,
+    /// Report a provider-defined transport without exposing its native spelling.
+    Unknown,
+}
+
+impl McpTransportKind {
+    /// Get the stable normalized transport label for presentation or serialization.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::Http => "http",
+            Self::Sse => "sse",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Describes one cached tool nested under its owning MCP server.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct McpToolDefinition {
@@ -69,15 +95,17 @@ pub struct McpDefinition {
     /// Identifies the source configuration without exposing launch credentials.
     pub source_path: Option<String>,
     pub name: String,
-    pub transport: String,
+    pub transport: McpTransportKind,
     pub enabled: bool,
     pub status: McpStatus,
-    pub status_detail: Option<String>,
+    /// Carry sanitized user-facing readiness detail when status alone is insufficient.
+    pub status_detail: Option<crate::diagnostic::SanitizedMessage>,
     pub token_count: Option<u64>,
     pub token_estimated: bool,
     #[serde(default)]
     pub tools: Vec<McpToolDefinition>,
-    pub tool_error: Option<String>,
+    /// Carry sanitized catalog failure context without leaking native error text.
+    pub tool_error: Option<crate::diagnostic::SanitizedMessage>,
 }
 
 /// Reports a completed provider mutation and any required turn restart.
@@ -104,11 +132,11 @@ pub struct ProviderCatalogRequest {
 
 impl ProviderCatalogRequest {
     /// Resolve the independent catalog runtime without changing portable preference scope.
-    pub fn runtime_key(&self) -> anyhow::Result<String> {
+    pub fn runtime_key(&self) -> Result<String, crate::ExecutionOwnerError> {
         Ok(self.owner()?.runtime_key())
     }
     /// Validate the connection owner independently of the settings session identity.
-    pub fn owner(&self) -> anyhow::Result<crate::ExecutionOwner> {
+    pub fn owner(&self) -> Result<crate::ExecutionOwner, crate::ExecutionOwnerError> {
         crate::ExecutionOwner::resolve(&self.execution_owner, &self.harness_session_id)
     }
 }

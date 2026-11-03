@@ -1,10 +1,19 @@
 //! Exercise the production engine with independently controlled adapter acknowledgments.
 
 use super::*;
-use crate::provider::submission::{Submission, SubmissionStore, SubmissionTarget};
-use crate::provider::{PromptMode, ProviderAdapter, ProviderInput, SteeringInput};
+use crate::provider::submission::SubmissionStore;
+use crate::provider::{PromptMode, ProviderInput, SteeringInput};
 use anyhow::Context;
-use forge_provider_api::lifecycle::{ExecutionObservation, ExecutionResult};
+use forge_provider_api::{
+    ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation,
+    events::{self, ProviderEventSink, ProviderEventStream},
+    lifecycle::{ExecutionObservation, ExecutionResult},
+    provider::Provider as NativeProvider,
+    session::{
+        BindingId, ContinuationOutcome, InputAcceptance, SessionBinding, SessionRequest,
+        SteeringAcceptance, SteeringRequest,
+    },
+};
 
 enum Dispatch {
     Prompt {
@@ -20,28 +29,49 @@ enum Dispatch {
 
 /// Hold only adapter acknowledgments; lifecycle observations still use the real intake.
 struct ControlledProvider {
+    sessions: Mutex<HashMap<BindingId, Arc<ControlledSession>>>,
+    owners: Mutex<HashMap<ExecutionOwner, BindingId>>,
     streams: Mutex<HashMap<ExecutionOwner, ProviderEventSink>>,
+    invocations: Mutex<HashMap<InvocationScope, ProviderEventSink>>,
     dispatch: mpsc::Sender<Dispatch>,
     subscriptions: Mutex<HashMap<ExecutionOwner, usize>>,
     cleanup: Mutex<Vec<String>>,
     panic_prompt: bool,
 }
 
+struct ControlledSession {
+    owner: ExecutionOwner,
+    sink: ProviderEventSink,
+    stream: Mutex<Option<ProviderEventStream>>,
+}
+
 impl ControlledProvider {
-    /// Publish a normalized lifecycle certificate through its original owner's stream.
+    fn new(dispatch: mpsc::Sender<Dispatch>, panic_prompt: bool) -> Self {
+        Self {
+            sessions: Mutex::new(HashMap::new()),
+            owners: Mutex::new(HashMap::new()),
+            streams: Mutex::new(HashMap::new()),
+            invocations: Mutex::new(HashMap::new()),
+            dispatch,
+            subscriptions: Mutex::new(HashMap::new()),
+            cleanup: Mutex::new(Vec::new()),
+            panic_prompt,
+        }
+    }
+
+    /// Publish normalized lifecycle evidence through its original owner's stream.
     async fn publish(
         &self,
         scope: &InvocationScope,
         update: ExecutionUpdate,
     ) -> anyhow::Result<()> {
         let sink = self
-            .streams
+            .invocations
             .lock()
             .unwrap()
-            .get(&scope.owner)
+            .get(scope)
             .cloned()
-            .context("owner was not subscribed")?
-            .invocation_sink(scope)?;
+            .context("owner was not subscribed")?;
         sink.send_wait(ProviderEvent::Execution {
             observation: ExecutionObservation::new(scope.clone(), update)?,
         })
@@ -49,133 +79,259 @@ impl ControlledProvider {
         Ok(())
     }
 
-    /// Persist actual delivery before exposing the corresponding dispatch to the test.
-    fn accept(receipt: &Arc<Submission>) -> anyhow::Result<SubmissionId> {
-        receipt.sending(SubmissionTarget::Untracked)?;
-        receipt.accepted(format!("controlled:{}", receipt.id()))?;
-        Ok(SubmissionId::try_from(receipt.id().to_owned())?)
+    async fn accept(
+        receipt: Arc<dyn forge_provider_api::submission::InputReceipt>,
+    ) -> Result<SubmissionId, ProviderError> {
+        let id = receipt.id().clone();
+        let token =
+            forge_provider_api::RecoveryToken::new(format!("fixture:{}", id.as_str()).into_bytes())
+                .map_err(|_| {
+                    failure(ProviderOperation::RecordInput, ProviderFailureKind::Unknown)
+                })?;
+        receipt.clone().record_sending(Some(token.clone())).await?;
+        receipt.record_accepted(Some(token)).await?;
+        Ok(id)
+    }
+
+    async fn session(&self, binding: &BindingId) -> Result<Arc<ControlledSession>, ProviderError> {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(binding)
+            .cloned()
+            .ok_or_else(|| {
+                failure(
+                    ProviderOperation::NativeTransport,
+                    ProviderFailureKind::SessionMissing,
+                )
+            })
     }
 }
 
 #[async_trait::async_trait]
-impl ProviderAdapter for ControlledProvider {
-    type Host = crate::provider::HarnessProviderHost;
-
-    /// Install exactly one native observation stream for each execution owner.
-    async fn session_events(
+impl NativeProvider for ControlledProvider {
+    async fn initialize_session(
         &self,
-        owner: ExecutionOwner,
-    ) -> Result<crate::provider::events::ProviderEventStream, ProviderError> {
-        let (sink, stream) =
-            crate::provider::events::channel(crate::provider::EventScope::SessionOperation {
-                owner: owner.clone(),
-                operation_id: "controlled-intake".into(),
-            });
-        assert!(
-            self.streams
-                .lock()
-                .unwrap()
-                .insert(owner.clone(), sink)
-                .is_none()
-        );
-        *self.subscriptions.lock().unwrap().entry(owner).or_default() += 1;
-        Ok(stream)
+        request: SessionRequest,
+    ) -> Result<SessionBinding, ProviderError> {
+        let id = BindingId::new(uuid::Uuid::new_v4().to_string()).map_err(|_| {
+            failure(
+                ProviderOperation::InitializeSession,
+                ProviderFailureKind::Unknown,
+            )
+        })?;
+        let scope = forge_provider_api::EventScope::SessionOperation {
+            owner: request.owner.clone(),
+            operation_id: id.as_str().to_owned(),
+        };
+        let (sink, stream) = events::channel(id.clone(), scope);
+        let binding = SessionBinding {
+            id: id.clone(),
+            provider_session_id: request.provider_session_id,
+        };
+        let session = Arc::new(ControlledSession {
+            owner: request.owner.clone(),
+            sink: sink.clone(),
+            stream: Mutex::new(Some(stream)),
+        });
+        self.streams
+            .lock()
+            .unwrap()
+            .insert(request.owner.clone(), sink);
+        self.owners
+            .lock()
+            .unwrap()
+            .insert(request.owner, id.clone());
+        self.sessions.lock().unwrap().insert(id, session);
+        Ok(binding)
+    }
+
+    async fn take_session_events(
+        &self,
+        binding: &BindingId,
+    ) -> Result<ProviderEventStream, ProviderError> {
+        let session = self.session(binding).await?;
+        *self
+            .subscriptions
+            .lock()
+            .unwrap()
+            .entry(session.owner.clone())
+            .or_default() += 1;
+        session.stream.lock().unwrap().take().ok_or_else(|| {
+            failure(
+                ProviderOperation::CollectEventReader,
+                ProviderFailureKind::Rejected,
+            )
+        })
     }
 
     /// Acknowledge a prompt without publishing terminal evidence.
     async fn session_prompt(
-        self: Arc<Self>,
-        request: ProviderRequest,
-        scope: InvocationScope,
-    ) -> Result<(), ProviderError> {
-        if request.owner()? != scope.owner {
-            return Err(protocol("foreign controlled prompt"));
+        &self,
+        binding: &BindingId,
+        request: forge_provider_api::PromptRequest,
+    ) -> Result<InputAcceptance, ProviderError> {
+        let session = self.session(binding).await?;
+        if request.scope.owner != session.owner {
+            return Err(failure(
+                ProviderOperation::AdmitInput,
+                ProviderFailureKind::Rejected,
+            ));
         }
-        let input = Self::accept(
-            request
-                .submission
-                .as_ref()
-                .context("missing prompt receipt")?,
-        )?;
+        let input = Self::accept(request.receipt.clone()).await?;
+        let scope = request.scope.clone();
+        let sink = session.sink.invocation_sink(&scope)?;
+        self.invocations.lock().unwrap().insert(scope.clone(), sink);
         if self.panic_prompt {
             panic!("controlled native submission task panic");
         }
         self.dispatch
-            .send(Dispatch::Prompt { scope, input })
+            .send(Dispatch::Prompt {
+                scope,
+                input: input.clone(),
+            })
             .await
-            .map_err(|_| protocol("dispatch observer closed"))?;
-        Ok(())
+            .map_err(|_| {
+                failure(
+                    ProviderOperation::AdmitInput,
+                    ProviderFailureKind::Transport,
+                )
+            })?;
+        Ok(InputAcceptance {
+            submission_id: input,
+        })
     }
 
     /// Allow terminal evidence to precede an independently held steering acknowledgment.
     async fn session_steer(
-        self: Arc<Self>,
-        owner: &ExecutionOwner,
-        scope: InvocationScope,
-        input: SteeringInput,
-    ) -> Result<(), ProviderError> {
-        if scope.owner != *owner {
-            return Err(protocol("foreign controlled steer"));
+        &self,
+        binding: &BindingId,
+        request: SteeringRequest,
+    ) -> Result<SteeringAcceptance, ProviderError> {
+        let session = self.session(binding).await?;
+        if request.scope.owner != session.owner {
+            return Err(failure(
+                ProviderOperation::AdmitInput,
+                ProviderFailureKind::Rejected,
+            ));
         }
-        let receipt = input.submission().context("missing steering receipt")?;
-        let input = Self::accept(&receipt)?;
+        let scope = request.scope.clone();
+        let Some(receipt) = request.delivery.receipt().cloned() else {
+            return Ok(SteeringAcceptance::Context);
+        };
+        let input = Self::accept(receipt).await?;
+        let sink = session.sink.invocation_sink(&scope)?;
+        self.invocations.lock().unwrap().insert(scope.clone(), sink);
         let (acknowledgment, received) = oneshot::channel();
         self.dispatch
             .send(Dispatch::Steer {
                 scope,
-                input,
+                input: input.clone(),
                 acknowledgment,
             })
             .await
-            .map_err(|_| protocol("dispatch observer closed"))?;
-        received
-            .await
-            .map_err(|_| protocol("steering acknowledgment was abandoned"))?;
-        Ok(())
+            .map_err(|_| {
+                failure(
+                    ProviderOperation::AdmitInput,
+                    ProviderFailureKind::Transport,
+                )
+            })?;
+        received.await.map_err(|_| {
+            failure(
+                ProviderOperation::AdmitInput,
+                ProviderFailureKind::Transport,
+            )
+        })?;
+        Ok(SteeringAcceptance::Journaled {
+            submission_id: input,
+        })
     }
 
     /// Revoke this test owner's callbacks without touching another owner.
-    async fn fence_session(&self, owner: &ExecutionOwner) -> Result<(), ProviderError> {
+    async fn fence_session(&self, binding: &BindingId) -> Result<(), ProviderError> {
+        let session = self.session(binding).await?;
         self.cleanup
             .lock()
             .unwrap()
-            .push(format!("fence:{}", owner.runtime_key()));
+            .push(format!("fence:{}", session.owner.runtime_key()));
         Ok(())
     }
 
     /// Collect one runtime through the same cleanup path used by loss and explicit close.
-    async fn cleanup_execution(&self, key: &str) -> Result<(), ProviderError> {
-        self.cleanup.lock().unwrap().push(format!("collect:{key}"));
+    async fn cleanup_execution(&self, binding: &BindingId) -> Result<(), ProviderError> {
+        let session = self.session(binding).await?;
+        self.cleanup
+            .lock()
+            .unwrap()
+            .push(format!("collect:{}", session.owner.runtime_key()));
         Ok(())
     }
 
     /// Finish the fixture only after the registry has explicitly closed its engines.
     async fn shutdown(&self) -> Result<(), ProviderError> {
         self.streams.lock().unwrap().clear();
+        self.sessions.lock().unwrap().clear();
+        self.owners.lock().unwrap().clear();
         Ok(())
     }
 
     /// Describe only the synthetic provider contract exercised by this fixture.
-    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-        crate::provider::ProviderDescriptor {
-            kind: crate::provider::ProviderKind::Mock,
+    fn descriptor(&self) -> forge_provider_api::ProviderDescriptor {
+        forge_provider_api::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
             label: "Controlled owner fixture".into(),
-            capability: crate::provider::mock_capability(),
+            capability: Default::default(),
         }
     }
 
     /// Native work is externally terminated by the fixture's cleanup acknowledgment.
-    async fn has_active_turn(&self, _key: &str) -> bool {
+    async fn has_active_turn(&self, _owner: &ExecutionOwner) -> bool {
         false
     }
 
     /// Keep native identity optional without manufacturing a provider session.
     async fn active_session_id_for(
         &self,
-        _key: &str,
-    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
+        _owner: &ExecutionOwner,
+    ) -> Result<Option<forge_provider_api::ProviderSessionId>, ProviderError> {
         Ok(None)
     }
+
+    async fn cancel_session(&self, binding: &BindingId) -> Result<(), ProviderError> {
+        self.cleanup_execution(binding).await
+    }
+
+    async fn retire_session(&self, binding: &BindingId) -> Result<(), ProviderError> {
+        let session = self.session(binding).await?;
+        self.sessions.lock().unwrap().remove(binding);
+        self.owners.lock().unwrap().remove(&session.owner);
+        self.streams.lock().unwrap().remove(&session.owner);
+        Ok(())
+    }
+
+    async fn recover_session(
+        &self,
+        request: SessionRequest,
+        _token: Option<forge_provider_api::RecoveryToken>,
+    ) -> Result<SessionBinding, ProviderError> {
+        self.initialize_session(request).await
+    }
+
+    async fn continue_session(
+        &self,
+        _binding: &BindingId,
+        _request: forge_provider_api::ContinuationRequest,
+    ) -> Result<ContinuationOutcome, ProviderError> {
+        Err(failure(
+            ProviderOperation::AdmitInput,
+            ProviderFailureKind::Rejected,
+        ))
+    }
+}
+
+fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderError {
+    ProviderError::Failure(ProviderFailure::new(operation, kind))
 }
 
 /// Match production identities: managed children share a session, Background has its own.
@@ -197,7 +353,7 @@ fn request(owner: &ExecutionOwner, directory: &std::path::Path) -> ProviderReque
         harness_session_id: owner.session_id.to_string(),
         workspace: directory.to_string_lossy().into_owned(),
         input: ProviderInput::from_text("inspect"),
-        mode: if owner.session_id == "background-session" {
+        mode: if owner.session_id == forge_provider_api::SessionId::from("background-session") {
             PromptMode::Background
         } else {
             PromptMode::Chat
@@ -246,15 +402,15 @@ async fn committed_old_owner_execution_conflicts_with_new_active_exchange_withou
             let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
             let store = SubmissionStore::open(directory.path(),trace.clone())?;
             let (dispatch, mut calls) = mpsc::channel(16);
-            let peer = Arc::new(ControlledProvider { streams:Mutex::default(), dispatch,
-                subscriptions:Mutex::default(), cleanup:Mutex::default(), panic_prompt:false });
-            let registry = SessionExecutionRegistry::new(peer.clone(),trace);
+            let peer = Arc::new(ControlledProvider::new(dispatch, false));
+            let provider_session = crate::provider::test_support::ProviderTestSession::from_native(peer.clone())?;
+            let registry = SessionExecutionRegistry::new(provider_session.provider_handle(), trace);
             for owner in owners() {
                 let engine = registry.owner(owner.clone()).await?;
                 let observer = registry.observer(owner.clone())?;
                 let a = InvocationScope::new(owner.clone(),"committed-a");
                 let mut first_request = request(&owner,directory.path());
-                let receipt_a = store.prepare(&first_request,crate::provider::ProviderKind::Mock)?;
+                let receipt_a = store.prepare(&first_request,forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"))?;
                 first_request.submission = Some(receipt_a.clone());
                 let (sink_a, mut events_a) = crate::provider::events::channel(a.clone());
                 let running = engine.clone(); let journal = store.clone();
@@ -267,7 +423,7 @@ async fn committed_old_owner_execution_conflicts_with_new_active_exchange_withou
                 ready.ticket.commit().await?;
                 let b = InvocationScope::new(owner.clone(),"active-b");
                 let mut next_request = request(&owner,directory.path());
-                let receipt_b = store.prepare(&next_request,crate::provider::ProviderKind::Mock)?;
+                let receipt_b = store.prepare(&next_request,forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"))?;
                 next_request.submission = Some(receipt_b.clone());
                 let (sink_b, mut events_b) = crate::provider::events::channel(b.clone());
                 let running = engine.clone(); let journal = store.clone();
@@ -295,7 +451,7 @@ async fn committed_old_owner_execution_conflicts_with_new_active_exchange_withou
                 }
                 let prefix = observer.drain()?;
                 assert!(prefix.iter().any(|event| matches!(event,ProviderEvent::Execution {observation}
-                    if observation.scope()==&a && matches!(observation.update(),ExecutionUpdate::Started {address} if address.turn_id=="a-live-late"))));
+                    if observation.scope()==&a && matches!(observation.update(),ExecutionUpdate::Started {address} if address.turn_id==forge_provider_api::ProviderTurnId::from("a-live-late")))));
                 assert!(matches!(observer.end(),Some(super::super::ObservationEnd::Lost(ObservationFailure::OwnershipConflict))));
                 for receipt in [receipt_a,receipt_b] {
                     assert!(matches!(receipt.record()?.delivery,crate::provider::submission::SubmissionState::Accepted {..}));
@@ -319,20 +475,20 @@ async fn intentional_retirement_rejects_accepted_input_without_terminal_proof() 
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace.clone())?;
         let (dispatch, mut calls) = mpsc::channel(4);
-        let peer = Arc::new(ControlledProvider {
-            streams: Mutex::default(),
-            dispatch,
-            subscriptions: Mutex::default(),
-            cleanup: Mutex::default(),
-            panic_prompt: false,
-        });
-        let registry = SessionExecutionRegistry::new(peer.clone(), trace);
+        let peer = Arc::new(ControlledProvider::new(dispatch, false));
+        let provider_session =
+            crate::provider::test_support::ProviderTestSession::from_native(peer.clone())?;
+        let registry = SessionExecutionRegistry::new(provider_session.provider_handle(), trace);
         let owner = ExecutionOwner::root("missing-terminal");
         let engine = registry.owner(owner.clone()).await?;
         let observer = registry.observer(owner.clone())?;
         let scope = InvocationScope::new(owner.clone(), "accepted-without-start");
         let mut input = request(&owner, directory.path());
-        let receipt = store.prepare(&input, crate::provider::ProviderKind::Mock)?;
+        let receipt = store.prepare(
+            &input,
+            forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+        )?;
         input.submission = Some(receipt.clone());
         let (sink, _events) = crate::provider::events::channel(scope);
         let running = engine.clone();
@@ -377,7 +533,7 @@ async fn wait_finished(
 ) -> anyhow::Result<()> {
     loop {
         if let Some(ProviderEvent::Execution { observation }) = events.recv().await?
-            && matches!(observation.update(), ExecutionUpdate::Finished { address, .. } if address.turn_id == turn)
+            && matches!(observation.update(), ExecutionUpdate::Finished { address, .. } if address.turn_id == forge_provider_api::ProviderTurnId::from(turn))
         {
             return Ok(());
         }
@@ -401,11 +557,14 @@ fn steering(
     Ok(SteeringInput::User {
         text: "continue".into(),
         attachments: Vec::new(),
-        submission: Some(store.prepare_steering(
-            &catalog,
-            ProviderInput::from_text("continue"),
-            crate::provider::ProviderKind::Mock,
-        )?),
+        submission: Some(
+            store.prepare_steering(
+                &catalog,
+                ProviderInput::from_text("continue"),
+                forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+            )?,
+        ),
     })
 }
 
@@ -418,14 +577,11 @@ async fn every_owner_retains_pending_steering_and_idle_observation() -> anyhow::
             let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
             let store = SubmissionStore::open(directory.path(), trace.clone())?;
             let (dispatch, mut calls) = mpsc::channel(16);
-            let peer = Arc::new(ControlledProvider {
-                streams: Mutex::new(HashMap::new()),
-                dispatch,
-                subscriptions: Mutex::new(HashMap::new()),
-                cleanup: Mutex::new(Vec::new()),
-                panic_prompt: false,
-            });
-            let registry = SessionExecutionRegistry::new(peer.clone(), trace.clone());
+            let peer = Arc::new(ControlledProvider::new(dispatch, false));
+            let provider_session =
+                crate::provider::test_support::ProviderTestSession::from_native(peer.clone())?;
+            let registry =
+                SessionExecutionRegistry::new(provider_session.provider_handle(), trace.clone());
             for owner in owners() {
                 // Admit through the production registry and wait for an actual native dispatch.
                 let engine = registry.owner(owner.clone()).await?;
@@ -561,8 +717,9 @@ async fn every_owner_isolates_pending_control_cancellation_and_loss() -> anyhow:
                     let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
                     let store = SubmissionStore::open(directory.path(), trace.clone())?;
                     let (dispatch, mut calls) = mpsc::channel(16);
-                    let peer = Arc::new(ControlledProvider { streams: Mutex::new(HashMap::new()), dispatch, subscriptions: Mutex::new(HashMap::new()), cleanup: Mutex::new(Vec::new()), panic_prompt:false });
-                    let registry = SessionExecutionRegistry::new(peer.clone(), trace.clone());
+                    let peer = Arc::new(ControlledProvider::new(dispatch, false));
+                    let provider_session = crate::provider::test_support::ProviderTestSession::from_native(peer.clone())?;
+                    let registry = SessionExecutionRegistry::new(provider_session.provider_handle(), trace.clone());
                     let owners = owners();
                     let mut active = Vec::new();
 
@@ -629,22 +786,18 @@ async fn every_owner_isolates_pending_control_cancellation_and_loss() -> anyhow:
     }).await?
 }
 
-/// Preserve a panicking native submission's JoinError through real engine cleanup.
+/// Normalize a panicking submission without exposing its payload or losing owner fencing.
 #[tokio::test]
-async fn submission_task_failure_preserves_original_join_source() -> anyhow::Result<()> {
+async fn submission_task_failure_is_normalized_and_fences_owner() -> anyhow::Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
         let store = SubmissionStore::open(directory.path(), trace.clone())?;
         let (dispatch, _calls) = mpsc::channel(4);
-        let peer = Arc::new(ControlledProvider {
-            streams: Mutex::default(),
-            dispatch,
-            subscriptions: Mutex::default(),
-            cleanup: Mutex::default(),
-            panic_prompt: true,
-        });
-        let registry = SessionExecutionRegistry::new(peer.clone(), trace);
+        let peer = Arc::new(ControlledProvider::new(dispatch, true));
+        let provider_session =
+            crate::provider::test_support::ProviderTestSession::from_native(peer.clone())?;
+        let registry = SessionExecutionRegistry::new(provider_session.provider_handle(), trace);
         let owner = ExecutionOwner::root("submission-panic");
         let engine = registry.owner(owner.clone()).await?;
         let (sink, _events) =
@@ -656,17 +809,16 @@ async fn submission_task_failure_preserves_original_join_source() -> anyhow::Res
             Err(error) => error,
             Ok(_) => panic!("panicking submission completed"),
         };
-        assert!(matches!(error, ProviderError::Operation(_)));
+        assert!(matches!(&error, ProviderError::Failure(failure)
+            if failure.kind() == ProviderFailureKind::Runtime));
+        assert!(!format!("{error:?} {error}").contains("controlled native submission task panic"));
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
         let mut observed = false;
         while let Some(error) = source {
             observed |= error.downcast_ref::<tokio::task::JoinError>().is_some();
             source = error.source();
         }
-        assert!(
-            observed,
-            "engine discarded its actual submission worker failure"
-        );
+        assert!(!observed, "engine exposed an unnormalized worker failure");
         assert!(!engine.is_healthy().await);
         registry.close().await?;
         peer.shutdown().await?;

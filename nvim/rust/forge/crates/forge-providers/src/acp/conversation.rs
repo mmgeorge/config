@@ -1,20 +1,40 @@
+use super::AcpKind as ProviderKind;
 use super::session::AcpSessionState;
 use super::{AcpConnection, AcpConnectionError, AcpLaunch};
 use anyhow::{Context, Result, ensure};
 use forge_provider_api::catalog::{McpDefinition, McpStatus};
-use forge_provider_api::{
-    PromptMode, ProviderCapability, ProviderError, ProviderKind, ProviderModel,
-};
+use forge_provider_api::{PromptMode, ProviderCapability, ProviderError, ProviderModel};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Replace only the host control server while preserving admitted provider MCP launches.
+pub(super) fn configuration_with_tool_endpoint(
+    configuration: &serde_json::Value,
+    endpoint: Option<&forge_provider_api::session::HostToolEndpoint>,
+) -> Result<serde_json::Value, ProviderError> {
+    let mut configuration = configuration.clone();
+    let servers = configuration["mcpServers"]
+        .as_array_mut()
+        .ok_or_else(|| acp_failure(forge_provider_api::ProviderFailureKind::Protocol))?;
+    servers.retain(|server| server["name"] != "forge-harness-control");
+    if let Some(endpoint) = endpoint {
+        servers.insert(0, json!({
+            "type":"http",
+            "name":"forge-harness-control",
+            "url":endpoint.url.clone(),
+            "headers":endpoint.headers.iter().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>(),
+        }));
+    }
+    Ok(configuration)
+}
 
 /// Native session configuration prepared by the host's resource owner.
 pub struct ConversationOptions {
     pub kind: ProviderKind,
     pub workspace: String,
     pub session_id: Option<String>,
-    pub control_url: String,
+    pub control_endpoint: Option<forge_provider_api::session::HostToolEndpoint>,
     pub mcp_servers: Vec<Value>,
     pub resources: Vec<McpDefinition>,
     pub profile: PathBuf,
@@ -27,7 +47,7 @@ pub struct AcpConversation {
     transport: AcpConnection,
     state: Arc<AcpSessionState>,
     initialized: Value,
-    configuration: Value,
+    configuration: tokio::sync::Mutex<Value>,
 }
 
 impl AcpConversation {
@@ -54,8 +74,12 @@ impl AcpConversation {
                 == Some(true),
             "ACP agent cannot resume conversations, which Forge requires"
         );
-        let mut parameter = json!({"cwd":options.workspace,"mcpServers":[{"type":"http",
-            "name":"forge-harness-control","url":options.control_url,"headers":[]}]});
+        let mut servers = Vec::new();
+        if let Some(endpoint) = &options.control_endpoint {
+            let headers = endpoint.headers.iter().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>();
+            servers.push(json!({"type":"http","name":"forge-harness-control","url":endpoint.url,"headers":headers}));
+        }
+        let mut parameter = json!({"cwd":options.workspace,"mcpServers":servers});
         parameter["mcpServers"]
             .as_array_mut()
             .context("ACP MCP list missing")?
@@ -100,19 +124,14 @@ impl AcpConversation {
             .or(options.session_id)
             .context("ACP session response has no conversation identity")?;
         state.update_catalog(response.clone()).await;
-        Ok(Self { id, transport, state, initialized, configuration: parameter })
+        Ok(Self { id, transport, state, initialized, configuration: tokio::sync::Mutex::new(parameter) })
         }.await;
-        result.map_err(ProviderError::from)
+        result.map_err(|_| acp_failure(forge_provider_api::ProviderFailureKind::Initialization))
     }
 
     /// Get the negotiated provider conversation identity.
     pub fn id(&self) -> &str {
         &self.id
-    }
-
-    /// Get the native event owner without exposing its internal state.
-    pub fn state(&self) -> &Arc<AcpSessionState> {
-        &self.state
     }
 
     /// Report the native adapter version from the initialization handshake.
@@ -142,6 +161,59 @@ impl AcpConversation {
     /// Send a native operation while preserving its transport error category.
     pub async fn request(&self, method: &str, parameter: Value) -> Result<Value, ProviderError> {
         Ok(self.transport.request(method, parameter).await?)
+    }
+
+    /// Reload retained history with the exact invocation-owned host MCP endpoint.
+    ///
+    /// ACP exposes MCP launches when a session is created or loaded, so replacing the
+    /// endpoint requires reloading the existing provider session before accepting input.
+    /// Resource-owned MCP launches remain intact while the host callback server is swapped.
+    pub async fn bind_tool_endpoint(
+        &self,
+        endpoint: Option<&forge_provider_api::session::HostToolEndpoint>,
+    ) -> Result<(), ProviderError> {
+        let configuration = {
+            let current_configuration = self.configuration.lock().await;
+            let current = current_configuration["mcpServers"]
+                .as_array()
+                .and_then(|servers| {
+                    servers
+                        .iter()
+                        .find(|server| server["name"] == "forge-harness-control")
+                });
+            let desired = endpoint.map(|endpoint| json!({
+                "type":"http",
+                "name":"forge-harness-control",
+                "url":endpoint.url.clone(),
+                "headers":endpoint.headers.iter().map(|(name, value)| json!({"name":name,"value":value})).collect::<Vec<_>>(),
+            }));
+            if current == desired.as_ref() {
+                return Ok(());
+            }
+            if !self.supports_resume() {
+                return Err(forge_provider_api::capability::UnsupportedCapability(
+                    forge_provider_api::capability::ProviderFeature::McpLaunchRequirements,
+                )
+                .into());
+            }
+
+            configuration_with_tool_endpoint(&current_configuration, endpoint)?
+        };
+        let mut configuration = configuration;
+        configuration["sessionId"] = json!(self.id);
+        let _history_replay = self.state.suppress_history_replay()?;
+        let response = self
+            .transport
+            .request("session/load", configuration.clone())
+            .await?;
+        if response["sessionId"].as_str() != Some(self.id.as_str()) {
+            return Err(acp_failure(
+                forge_provider_api::ProviderFailureKind::Protocol,
+            ));
+        }
+        *self.configuration.lock().await = configuration;
+        self.state.update_catalog(response).await;
+        Ok(())
     }
 
     /// Commit native prompt or steering evidence through the host's receipt.
@@ -174,29 +246,90 @@ impl AcpConversation {
     }
 
     /// Fork the negotiated configuration and reject a reused source identity.
-    pub async fn fork(&self, workspace: &str) -> Result<String, ProviderError> {
-        let result: Result<String> = async {
-            ensure!(
-                self.initialized
-                    .pointer("/agentCapabilities/sessionCapabilities/fork")
-                    .is_some(),
-                "Claude ACP did not advertise fork"
-            );
-            let mut configuration = self.configuration.clone();
+    pub async fn fork(
+        &self,
+        workspace: &str,
+        mcp_servers: Vec<Value>,
+        skills: &[String],
+        profile: &std::path::Path,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<String, ProviderError> {
+        if self
+            .initialized
+            .pointer("/agentCapabilities/sessionCapabilities/fork")
+            .is_none()
+        {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::NativeFork,
+            )
+            .into());
+        }
+        async {
+            let mut configuration = self.configuration.lock().await.clone();
             configuration["sessionId"] = json!(self.id);
             configuration["cwd"] = json!(workspace);
+            configuration["mcpServers"] = json!(mcp_servers);
+            if let Some(options) = configuration.pointer_mut("/_meta/claudeCode/options") {
+                options["plugins"] = json!([{"type":"local","path":profile}]);
+                options["skills"] = json!(
+                    skills
+                        .iter()
+                        .map(|name| format!("forge-managed:{name}"))
+                        .collect::<Vec<_>>()
+                );
+            }
             let response = self
                 .transport
                 .request("session/fork", configuration)
                 .await?;
             let id = response["sessionId"]
                 .as_str()
-                .context("ACP fork did not create a conversation")?;
-            ensure!(id != self.id, "ACP fork returned the source conversation");
-            Ok(id.to_owned())
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| acp_failure(forge_provider_api::ProviderFailureKind::Protocol))?
+                .to_owned();
+            if id == self.id {
+                return Err(acp_failure(
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                ));
+            }
+            let catalog = self.state.catalog().await.clone();
+            if let Some(model) = model {
+                if let Some(option) = find_option(&catalog, "model") {
+                    self.transport
+                        .request(
+                            "session/set_config_option",
+                            json!({
+                                "sessionId":id,"configId":option["id"],"value":model
+                            }),
+                        )
+                        .await?;
+                } else {
+                    self.transport
+                        .request("session/set_model", json!({"sessionId":id,"modelId":model}))
+                        .await?;
+                }
+            }
+            if let Some(effort) = effort {
+                let option = find_option(&catalog, "thought_level")
+                    .or_else(|| find_option(&catalog, "effort"))
+                    .ok_or({
+                        forge_provider_api::capability::UnsupportedCapability(
+                            forge_provider_api::capability::ProviderFeature::EffortSelection,
+                        )
+                    })?;
+                self.transport
+                    .request(
+                        "session/set_config_option",
+                        json!({
+                            "sessionId":id,"configId":option["id"],"value":effort
+                        }),
+                    )
+                    .await?;
+            }
+            Ok(id)
         }
-        .await;
-        result.map_err(ProviderError::from)
+        .await
     }
 
     /// Apply native model, reasoning, and plan mode settings.
@@ -238,6 +371,11 @@ impl AcpConversation {
                 "configId":option["id"],"value":effort}),
                 )
                 .await?;
+        } else if effort != "default" {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::EffortSelection,
+            )
+            .into());
         }
         let modes = catalog
             .pointer("/modes/availableModes")
@@ -346,14 +484,11 @@ pub fn runtime_requirement(
     let minimum = match kind {
         ProviderKind::Claude => semver::Version::new(0, 99, 1),
         ProviderKind::Antigravity => semver::Version::new(1, 4, 5),
-        ProviderKind::Codex | ProviderKind::Copilot | ProviderKind::Mock => {
-            return Err(ProviderError::Protocol {
-                message: "non-ACP provider selected for ACP initialization".into(),
-            });
-        }
     };
     Ok(forge_provider_api::version::RuntimeRequirement::new(
-        kind, runtime, minimum,
+        kind.id(),
+        runtime,
+        minimum,
     ))
 }
 
@@ -363,15 +498,17 @@ pub fn initialization_failure(
     source: AcpConnectionError,
 ) -> ProviderError {
     match source {
-        source @ AcpConnectionError::Timeout { seconds, .. } => requirement
-            .probe_timed_out(std::time::Duration::from_secs(seconds), source)
+        AcpConnectionError::Timeout { seconds, .. } => requirement
+            .probe_timed_out(std::time::Duration::from_secs(seconds))
             .into(),
-        source @ (AcpConnectionError::Configuration(_)
+        AcpConnectionError::Configuration(_)
         | AcpConnectionError::Process { .. }
         | AcpConnectionError::Startup { .. }
         | AcpConnectionError::Protocol { .. }
         | AcpConnectionError::Remote { .. }
-        | AcpConnectionError::Callback(_)) => requirement.probe_failed(source).into(),
+        | AcpConnectionError::Callback(_) => requirement
+            .probe_failed(forge_provider_api::version::RuntimeProbeFailure::Unavailable)
+            .into(),
     }
 }
 
@@ -386,11 +523,18 @@ pub fn validate_initialization(
             .and_then(Value::as_str),
     )?;
     if initialized["protocolVersion"] != 1 {
-        return Err(ProviderError::Protocol {
-            message: "ACP agent did not negotiate protocol v1".into(),
-        });
+        return Err(acp_failure(
+            forge_provider_api::ProviderFailureKind::Protocol,
+        ));
     }
     Ok(validated)
+}
+
+fn acp_failure(kind: forge_provider_api::ProviderFailureKind) -> ProviderError {
+    ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+        forge_provider_api::ProviderOperation::InitializeSession,
+        kind,
+    ))
 }
 
 fn find_option<'catalog>(catalog: &'catalog Value, category: &str) -> Option<&'catalog Value> {

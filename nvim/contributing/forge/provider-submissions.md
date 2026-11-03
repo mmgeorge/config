@@ -10,7 +10,7 @@ This reference explains what counts as acceptance for each provider, and how to 
 
 Owner-targeted steering is registered with the shared session execution engine before dispatch. The adapter reports delivery separately from execution completion. Its 30-second acknowledgment deadline produces an uncertain-delivery error; it never silently queues another copy. Cancelling the owning turn still interrupts delivery.
 
-An explicit `NotConsumed` result permits a normal submission in the same invocation. The adapter waits for the prior native execution to close admission before that continuation. An accepted result, disconnect, or unknown outcome does not permit resending. A terminal event must cover every accepted input before the host result waiter completes.
+An explicit `NotConsumed` result carries a single-use opaque continuation token. The adapter binds it to the original request and waits for the prior native execution to close admission before continuation. Changing the input, scope, receipt, tools, attachments, or configuration invalidates that use without consuming the valid grant. An accepted result, disconnect, or unknown outcome does not permit resending. A terminal event must cover every accepted input before the host result waiter completes.
 
 | State | Meaning |
 | --- | --- |
@@ -66,18 +66,14 @@ Failure to reconcile blocks dispatch and reports the last error, keeping both th
 
 ## Add a provider
 
-Persist the correlation target before the first possible write, and acknowledge only a successful native response. Implement `Provider::reconcile_submission` with read-only, fully paginated history. Return a receipt only for a positively identified input, and `None` when acceptance cannot be proved. Never turn a timeout, an empty history page, or a message substring into a rejection.
+Persist the opaque correlation token before the first possible write, and acknowledge only a successful native response. Implement `Provider::reconcile_submission` with read-only, fully paginated history. Return `SubmissionEvidence::Accepted` only for a positively identified input, `NotAccepted` only for proven non-delivery, and `Unknown` otherwise. Never turn a timeout, an empty history page, or a message substring into a rejection.
 
 Test the write-before-acknowledge crash, acknowledgment commit failure, expired history, cancellation, attachments, and later queued input before enabling recovery.
 
 ## Verification and diagnostics
 
-This covers the classifiers, journal, and adapter boundaries. ACP tests use simulated peers and need Node.js, without provider credentials:
+Verify the journal and generic lifecycle fixtures in `forge-harness` and native classifiers and wire fixtures in `forge-providers`. Start with the affected compiler checks, then select the exact regression names from the changed module. ACP simulated peers need Node.js, without provider credentials.
 
-```nu
-cargo test --profile dev --locked -p forge-harness --lib provider:: -- --test-threads=1
-```
+After rebuilding, run `nvim/rust/forge/crates/forge-providers/tests/fixtures/submission_host.lua` in fresh headless Neovim processes, with `vim.g.forge_acp_fixture_kind` set to `"claude"` and `"antigravity"`, and `vim.g.forge_acp_fixture_lost_ack` set to `false` and `true`. It asserts that uncertain delivery blocks the next native send and keeps the original error.
 
-After rebuilding, run `nvim/tests/forge/harness_acp_submission_host.lua` in fresh headless Neovim processes, with `vim.g.forge_acp_fixture_kind` set to `"claude"` and `"antigravity"`, and `vim.g.forge_acp_fixture_lost_ack` set to `false` and `true`. It asserts that uncertain delivery blocks the next native send and keeps the original error.
-
-With tracing enabled, `provider.submission` log entries record each delivery transition, input ID, owner, and native target or receipt.
+With tracing enabled, `provider.submission` log entries record delivery transitions, input IDs, and owners. Native correlation tokens and receipt bytes remain private and are not logged.

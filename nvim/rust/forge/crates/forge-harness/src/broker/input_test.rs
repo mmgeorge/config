@@ -45,176 +45,65 @@ async fn ordinary_input_does_not_activate_a_pending_plan_entry() -> Result<()> {
 
 struct BoundarySteeringProvider {
     capability: crate::provider::ProviderCapability,
-    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    initial_started: tokio::sync::Semaphore,
-    initial_release: tokio::sync::Semaphore,
-    steering_deferred: tokio::sync::Semaphore,
-    continuation_started: tokio::sync::Semaphore,
-    continuation_accept: tokio::sync::Semaphore,
-    continuation_release: tokio::sync::Semaphore,
-    input: std::sync::Mutex<Vec<String>>,
-    fail_response: std::sync::atomic::AtomicBool,
+    initial_started: Arc<tokio::sync::Semaphore>,
+    initial_release: Arc<tokio::sync::Semaphore>,
+    steering_deferred: Arc<tokio::sync::Semaphore>,
+    continuation_started: Arc<tokio::sync::Semaphore>,
+    continuation_accept: Arc<tokio::sync::Semaphore>,
+    continuation_release: Arc<tokio::sync::Semaphore>,
+    input: Arc<std::sync::Mutex<Vec<String>>>,
+    fail_response: Arc<std::sync::atomic::AtomicBool>,
 }
 
-struct TaskStartEventProvider {
-    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    conflicting_replay: bool,
-}
-
-#[async_trait::async_trait]
-impl crate::provider::ProviderAdapter for TaskStartEventProvider {
-    type Host = crate::provider::HarnessProviderHost;
-    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-        crate::provider::ProviderDescriptor {
-            kind: crate::provider::ProviderKind::Mock,
-            label: "Task start fixture".into(),
-            capability: crate::provider::mock_capability(),
-        }
-    }
-    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.fixture_events.shutdown().await?;
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::Shutdown,
-                source,
-            )
-        })
-    }
-    async fn fence_session(
-        &self,
-        owner: &crate::provider::ExecutionOwner,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.fixture_events.cancel(owner).await?;
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::FenceSession,
-                source,
-            )
-        })
-    }
-    async fn has_active_turn(&self, _: &str) -> bool {
-        false
-    }
-    async fn cleanup_execution(
-        &self,
-        _: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
-                source,
-            )
-        })
-    }
-    async fn active_session_id_for(
-        &self,
-        _: &str,
-    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-        Ok(Some("task-start-thread".to_owned().try_into()?))
-    }
-
-    async fn session_events(
-        &self,
-        owner: crate::provider::ExecutionOwner,
-    ) -> std::result::Result<
-        crate::provider::events::ProviderEventStream,
-        crate::provider::ProviderError,
-    > {
-        let stream = self.fixture_events.subscribe(owner.clone())?;
-        Ok(stream)
-    }
-
-    async fn session_prompt(
-        self: std::sync::Arc<Self>,
-        request: crate::provider::ProviderRequest,
-        scope: crate::provider::InvocationScope,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let events = self.fixture_events.clone();
-        events
-            .submit(
-                request,
-                scope,
-                crate::provider::test_support::TerminalBoundary::LocalFixture,
-                move |request, sink| async move { self.run_native(request, sink).await },
-            )
-            .await
-    }
-}
-
-impl TaskStartEventProvider {
-    async fn run_native(
-        &self,
-        _request: ProviderRequest,
-        sink: crate::provider::ProviderEventSink,
-    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-        let scope = sink.invocation_scope()?.clone();
-        let fixture = crate::provider::test_support::FixtureStream::new(sink);
-        let address =
-            crate::provider::test_support::address(&scope, "task-start-thread", "task-start-turn");
-        fixture
-            .send_wait(ProviderEvent::Turn {
-                address,
-                update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
-            })
-            .await?;
-        let start = crate::exchange::TaskStart {
-            kind: crate::task::TaskKind::Goal,
-            title: "Reduce startup time".into(),
-        };
-        let mut acknowledgement = crate::provider::InputAcknowledgement::TaskStarted {
-            input_id: Some("task-entry".into()),
-            start,
-            prompt: "Complete startup work.\nVerify the result.".into(),
-        };
-        fixture
-            .send_wait(ProviderEvent::InputAccepted {
-                scope: scope.clone(),
-                acknowledgement: acknowledgement.clone(),
-            })
-            .await?;
-        if self.conflicting_replay
-            && let crate::provider::InputAcknowledgement::TaskStarted { prompt, .. } =
-                &mut acknowledgement
-        {
-            *prompt = "Conflicting instruction".into();
-        }
-        fixture
-            .send_wait(ProviderEvent::InputAccepted {
-                scope,
-                acknowledgement,
-            })
-            .await?;
-        let completion = crate::provider::ProviderCompletion {
-            native: forge_provider_api::completion::ProviderCompletion {
-                provider_session_id: Some("task-start-thread".to_owned().try_into().unwrap()),
-                capability: self.descriptor().capability,
-                ..Default::default()
-            },
+fn task_start_fixture(conflicting_replay: bool) -> Arc<crate::provider::test_support::EventFixtureProvider> {
+    let descriptor = crate::provider::ProviderDescriptor {
+        kind: crate::provider::ProviderId::new("test-task-start").expect("fixture ID is valid"),
+        label: "Normalized task-start fixture".into(),
+        capability: crate::provider::test_support::fixture_capability(),
+    };
+    crate::provider::test_support::EventFixtureProvider::new(descriptor, move |request, sink, _cancelled| async move {
+        let scope = request.scope.clone();
+        let address = crate::provider::TurnAddress { scope: scope.clone(), thread_id: "task-start-thread".into(), turn_id: "task-start-turn".into() };
+        let completion = forge_provider_api::completion::ProviderCompletion {
+            provider_session_id: Some("task-start-thread".to_owned().try_into().expect("fixture ID is valid")),
+            capability: crate::provider::test_support::fixture_capability(),
             ..Default::default()
         };
-        fixture.finish(&Ok(completion.clone())).await?;
-        Ok(completion)
-    }
+        sink.send_wait(ProviderEvent::Execution { observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+            scope.clone(), forge_provider_api::lifecycle::ExecutionUpdate::Started { address: address.clone() },
+        )? }).await?;
+        sink.send_wait(ProviderEvent::Turn { address: address.clone(), update: crate::provider::TurnUpdate::Started { started_at_ms: 0 } }).await?;
+        let start = forge_provider_api::input::TaskStart { kind: forge_provider_api::input::TaskKind::Goal, title: "Reduce startup time".into() };
+        let mut acknowledgement = forge_provider_api::InputAcknowledgement::TaskStarted {
+            input_id: Some("task-entry".into()), start, prompt: "Complete startup work.\nVerify the result.".into(),
+        };
+        sink.send_wait(ProviderEvent::InputAccepted { scope: scope.clone(), acknowledgement: acknowledgement.clone() }).await?;
+        if conflicting_replay {
+            if let forge_provider_api::InputAcknowledgement::TaskStarted { prompt, .. } = &mut acknowledgement {
+                *prompt = "Conflicting instruction".into();
+            }
+            sink.send_wait(ProviderEvent::InputAccepted { scope: scope.clone(), acknowledgement }).await?;
+        }
+        sink.send_wait(ProviderEvent::Turn { address: address.clone(), update: crate::provider::TurnUpdate::Finished {
+            outcome: crate::turn::TurnOutcome::Completed, completed_at_ms: 1,
+        }}).await?;
+        sink.send_wait(ProviderEvent::Execution { observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+            scope, forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                address, covered_submissions: vec![request.submission_id], completed_at_ms: 1,
+                result: forge_provider_api::lifecycle::ExecutionResult::Completed { completion: completion.into() },
+            },
+        )? }).await?;
+        Ok(())
+    })
 }
-
 #[tokio::test]
 async fn acknowledged_task_start_is_retained_once_inside_its_exchange() -> Result<()> {
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    broker.provider = Arc::new(TaskStartEventProvider {
-        fixture_events: Default::default(),
-        conflicting_replay: false,
-    });
+    let native = task_start_fixture(false);
+    let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    broker.provider = fixture.provider_handle();
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         broker.run_interaction(
@@ -407,10 +296,9 @@ async fn task_start_replay_rejects_reused_identity_with_different_content() -> R
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
-    broker.provider = Arc::new(TaskStartEventProvider {
-        fixture_events: Default::default(),
-        conflicting_replay: true,
-    });
+    let native = task_start_fixture(true);
+    let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    broker.provider = fixture.provider_handle();
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         broker.run_interaction(
@@ -441,14 +329,13 @@ async fn task_start_replay_rejects_reused_identity_with_different_content() -> R
 impl BoundarySteeringProvider {
     fn new() -> Self {
         Self {
-            capability: crate::provider::mock_capability(),
-            fixture_events: Default::default(),
-            initial_started: tokio::sync::Semaphore::new(0),
-            initial_release: tokio::sync::Semaphore::new(0),
-            steering_deferred: tokio::sync::Semaphore::new(0),
-            continuation_started: tokio::sync::Semaphore::new(0),
-            continuation_accept: tokio::sync::Semaphore::new(0),
-            continuation_release: tokio::sync::Semaphore::new(0),
+            capability: crate::provider::test_support::fixture_capability(),
+            initial_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            initial_release: Arc::new(tokio::sync::Semaphore::new(0)),
+            steering_deferred: Arc::new(tokio::sync::Semaphore::new(0)),
+            continuation_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            continuation_accept: Arc::new(tokio::sync::Semaphore::new(0)),
+            continuation_release: Arc::new(tokio::sync::Semaphore::new(0)),
             input: Default::default(),
             fail_response: Default::default(),
         }
@@ -463,238 +350,71 @@ async fn await_boundary_barrier(semaphore: &tokio::sync::Semaphore, name: &str) 
     Ok(())
 }
 
-#[async_trait::async_trait]
-impl crate::provider::ProviderAdapter for BoundarySteeringProvider {
-    type Host = crate::provider::HarnessProviderHost;
-    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-        crate::provider::ProviderDescriptor {
-            kind: crate::provider::ProviderKind::Codex,
-            label: "Boundary steering fixture".into(),
-            capability: {
-                let mut capability = self.capability.clone();
-                capability.integration.tracked_submission = true;
-                capability.integration.local_acceptance = false;
-                capability
-            },
-        }
-    }
-
-    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.fixture_events.shutdown().await?;
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::Shutdown,
-                source,
-            )
-        })
-    }
-    /// Fence and collect the fixture's admitted execution before owner teardown.
-    async fn fence_session(
-        &self,
-        owner: &crate::provider::ExecutionOwner,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.fixture_events.cancel(owner).await?;
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::FenceSession,
-                source,
-            )
-        })
-    }
-    async fn has_active_turn(&self, _: &str) -> bool {
-        true
-    }
-    async fn cleanup_execution(
-        &self,
-        _: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
-                source,
-            )
-        })
-    }
-    async fn active_session_id_for(
-        &self,
-        _: &str,
-    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-        Ok(Some("boundary-thread".to_owned().try_into()?))
-    }
-
-    async fn session_steer(
-        self: std::sync::Arc<Self>,
-        owner: &crate::provider::ExecutionOwner,
-        scope: crate::provider::InvocationScope,
-        input: crate::provider::SteeringInput,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        if scope.owner != *owner {
-            return Err(crate::provider::ProviderError::Rejected {
-                message: "steering crosses owner".into(),
-            });
-        }
-        let events = self.fixture_events.clone();
-        if !events.running(&scope).await? {
-            let request = events.continuation(&scope, input)?;
-            return self.session_prompt(request, scope).await;
-        }
-        let continuation = input.clone();
-        let provider = self.clone();
-        let result = events
-            .steer(&scope, input, |input| async move {
-                provider
-                    .steer_native(&owner.runtime_key(), input)
-                    .await
-                    .map_err(crate::provider::ProviderError::from)
-            })
-            .await;
-        if matches!(
-            &result,
-            Err(crate::provider::ProviderError::NotConsumed { .. })
-        ) {
-            events.wait_closed(&scope).await?;
-            let request = events.continuation(&scope, continuation)?;
-            return self.session_prompt(request, scope).await;
-        }
-        result
-    }
-
-    async fn session_events(
-        &self,
-        owner: crate::provider::ExecutionOwner,
-    ) -> std::result::Result<
-        crate::provider::events::ProviderEventStream,
-        crate::provider::ProviderError,
-    > {
-        let stream = self.fixture_events.subscribe(owner.clone())?;
-        Ok(stream)
-    }
-
-    async fn session_prompt(
-        self: std::sync::Arc<Self>,
-        request: crate::provider::ProviderRequest,
-        scope: crate::provider::InvocationScope,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let events = self.fixture_events.clone();
-        events
-            .submit(
-                request,
-                scope,
-                crate::provider::test_support::TerminalBoundary::LocalFixture,
-                move |request, sink| async move { self.run_native(request, sink).await },
-            )
-            .await
-    }
-}
-
 impl BoundarySteeringProvider {
-    async fn steer_native(&self, _: &str, _: crate::provider::SteeringInput) -> Result<()> {
-        self.steering_deferred.add_permits(1);
-        Err(crate::provider::ProviderError::NotConsumed {
-            cause: None,
-            message: "provider turn ended before steering dispatch".into(),
-        }
-        .into())
-    }
-}
-
-impl BoundarySteeringProvider {
-    async fn run_native(
-        &self,
-        request: ProviderRequest,
-        sink: crate::provider::ProviderEventSink,
-    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-        let fixture_scope = sink.invocation_scope()?.clone();
-        let fixture = crate::provider::test_support::FixtureStream::new(sink);
-        let sink = fixture.clone();
-        let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-            let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let sink = Some(sink);
-                let text = request.input.text();
-                self.input.lock().unwrap().push(text.clone());
+    fn fixture(self: &Arc<Self>) -> Arc<crate::provider::test_support::EventFixtureProvider> {
+        let mut capability = self.capability.clone();
+        capability.integration.tracked_submission = true;
+        capability.integration.local_acceptance = false;
+        let descriptor = crate::provider::ProviderDescriptor {
+            kind: crate::provider::ProviderId::new("test-boundary-steering").expect("fixture ID is valid"),
+            label: "Normalized boundary steering fixture".into(), capability: capability.clone(),
+        };
+        let initial_started = self.initial_started.clone(); let initial_release = self.initial_release.clone();
+        let continuation_started = self.continuation_started.clone(); let continuation_accept = self.continuation_accept.clone();
+        let continuation_release = self.continuation_release.clone(); let input = self.input.clone();
+        let fail_response = self.fail_response.clone(); let native_steer = capability.native_steer;
+        let provider = crate::provider::test_support::EventFixtureProvider::new(descriptor, move |request, sink, _cancelled| {
+            let initial_started = initial_started.clone(); let initial_release = initial_release.clone();
+            let continuation_started = continuation_started.clone(); let continuation_accept = continuation_accept.clone();
+            let continuation_release = continuation_release.clone(); let input = input.clone();
+            let fail_response = fail_response.clone();
+            let capability = capability.clone();
+            async move {
+                let text = match &request.input {
+                    forge_provider_api::PromptInput::Text(text) => text.clone(),
+                    forge_provider_api::PromptInput::Skill { name, arguments } => format!("/{name} {arguments}"),
+                    forge_provider_api::PromptInput::QuestionReply(reply) => reply.question.clone(),
+                };
+                input.lock().unwrap().push(text.clone());
                 let continuation = text == "boundary correction";
-                if continuation {
-                    self.continuation_started.add_permits(1);
-                    self.continuation_accept.acquire().await?.forget();
-                }
-                let submission = request
-                    .submission
-                    .as_ref()
-                    .context("missing tracked submission")?;
-                submission.sending(crate::provider::submission::SubmissionTarget::native(
-                    "codex",
-                    "boundary-thread",
-                    serde_json::json!({}),
-                ))?;
-                submission.accepted("boundary provider receipt".into())?;
-                let address = crate::provider::test_support::address(
-                    &fixture_scope,
-                    "boundary-thread",
-                    if continuation {
-                        "continuation-turn"
-                    } else {
-                        "initial-turn"
-                    },
-                );
-                if let Some(sink) = &sink {
-                    sink.send_wait(crate::provider::ProviderEvent::Turn {
-                        address: address.clone(),
-                        update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
+                if continuation { continuation_started.add_permits(1); crate::provider::test_support::wait_gate(&continuation_accept).await?; }
+                let address = crate::provider::TurnAddress { scope: request.scope.clone(), thread_id: "boundary-thread".into(),
+                    turn_id: if continuation { "continuation-turn" } else { "initial-turn" }.into() };
+                sink.send_wait(ProviderEvent::Execution { observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                    request.scope.clone(), forge_provider_api::lifecycle::ExecutionUpdate::Started { address: address.clone() },
+                )? }).await?;
+                sink.send_wait(ProviderEvent::Turn { address: address.clone(), update: crate::provider::TurnUpdate::Started { started_at_ms: 0 } }).await?;
+                if continuation { crate::provider::test_support::wait_gate(&continuation_release).await?; }
+                else { initial_started.add_permits(1); crate::provider::test_support::wait_gate(&initial_release).await?; }
+                let cancelled = fail_response.load(Ordering::Acquire) && (continuation || !native_steer);
+                let (outcome, result) = if cancelled {
+                    (crate::turn::TurnOutcome::Cancelled, forge_provider_api::lifecycle::ExecutionResult::Cancelled {
+                        completion: forge_provider_api::completion::ProviderCompletion {
+                            provider_session_id: Some("boundary-thread".to_owned().try_into().expect("fixture ID is valid")), capability: capability.clone(), ..Default::default()
+                        }.into(),
                     })
-                    .await?;
-                }
-                if continuation {
-                    self.continuation_release.acquire().await?.forget();
-                    if self
-                        .fail_response
-                        .load(std::sync::atomic::Ordering::Acquire)
-                    {
-                        return Err(crate::broker::TurnCancelled.into());
-                    }
                 } else {
-                    self.initial_started.add_permits(1);
-                    self.initial_release.acquire().await?.forget();
-                    if !self.capability.native_steer && self.fail_response.load(Ordering::Acquire) {
-                        return Err(crate::provider::ProviderError::Cancelled.into());
-                    }
-                }
-                if let Some(sink) = sink {
-                    sink.send_wait(completed_message(
-                        &address,
-                        "handled-response",
-                        crate::provider::MessageRole::Response,
-                        format!("handled {text}"),
-                    ))
-                    .await?;
-                }
-                Ok(crate::provider::ProviderCompletion {
-                    native: forge_provider_api::completion::ProviderCompletion {
-                        provider_session_id: Some("boundary-thread".to_owned().try_into().unwrap()),
-                        capability: self.descriptor().capability,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                })
+                    for event in completed_message(&address, "handled-response", crate::provider::MessageRole::Response, format!("handled {text}")) { sink.send_wait(event).await?; }
+                    (crate::turn::TurnOutcome::Completed, forge_provider_api::lifecycle::ExecutionResult::Completed {
+                        completion: forge_provider_api::completion::ProviderCompletion {
+                            provider_session_id: Some("boundary-thread".to_owned().try_into().expect("fixture ID is valid")), capability: capability.clone(), ..Default::default()
+                        }.into(),
+                    })
+                };
+                sink.send_wait(ProviderEvent::Turn { address: address.clone(), update: crate::provider::TurnUpdate::Finished { outcome, completed_at_ms: 1 } }).await?;
+                sink.send_wait(ProviderEvent::Execution { observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                    request.scope.clone(), forge_provider_api::lifecycle::ExecutionUpdate::Finished { address, covered_submissions: vec![request.submission_id], completed_at_ms: 1, result },
+                )? }).await?;
+                Ok(())
             }
-            .await;
-            output
-        }
-        .await;
-        let result = result.map_err(crate::provider::ProviderError::from);
-        fixture.finish(&result).await?;
-        result
+        });
+        let deferred = self.steering_deferred.clone();
+        provider.with_steering(move |_request| { let deferred = deferred.clone(); async move {
+            deferred.add_permits(1);
+            Err(crate::provider::ProviderError::NotConsumed { continuation: forge_provider_api::ContinuationToken::new(uuid::Uuid::new_v4().as_bytes().to_vec()).expect("UUID is nonempty") })
+        }})
     }
 }
-
 #[tokio::test]
 async fn deferred_steering_acknowledges_only_after_provider_acceptance() -> Result<()> {
     assert_deferred_steering_delivery(false).await
@@ -710,14 +430,15 @@ async fn cancelled_terminal_releases_undispatched_steering_before_retention() ->
     fixture.capability.native_steer = false;
     fixture.fail_response.store(true, Ordering::Release);
     let provider = Arc::new(fixture);
-    broker.provider = provider.clone();
+    let session = crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+    broker.provider = session.provider_handle();
     let lane = broker.parent_input.clone();
     let catalog = broker.provider_catalog_request()?;
     broker.turn_cancellation().arm(true);
     let submission = broker.submission_store.prepare_input(
         &catalog,
         ProviderInput::from_text("Retain café 東京"),
-        crate::provider::ProviderKind::Codex,
+        forge_providers::registry::default_id(),
         Some("cancelled-followup".into()),
     )?;
     let running = tokio::spawn(async move {
@@ -777,7 +498,8 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
             let data = tempfile::tempdir()?;
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
             let provider = Arc::new(BoundarySteeringProvider::new());
-            broker.provider = provider.clone();
+            let session = crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+            broker.provider = session.provider_handle();
             let lane = broker.parent_input.clone();
             let catalog = broker.provider_catalog_request()?;
             let cancellation = broker.turn_cancellation();
@@ -800,7 +522,7 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
             let submission = journal.prepare_input(
                 &catalog,
                 ProviderInput::from_text("boundary correction"),
-                crate::provider::ProviderKind::Codex,
+                forge_providers::registry::default_id(),
                 Some("cancel-boundary-message".into()),
             )?;
             let mut steering = Box::pin(lane.steer(crate::provider::SteeringInput::User {
@@ -865,7 +587,8 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let provider = Arc::new(BoundarySteeringProvider::new());
         provider.fail_response.store(fail_response, std::sync::atomic::Ordering::Release);
-        broker.provider = provider.clone();
+        let session = crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
+        broker.provider = session.provider_handle();
         let lane = broker.parent_input.clone();
         let catalog = broker.provider_catalog_request()?;
         let journal = crate::provider::submission::SubmissionStore::open(data.path(), broker.trace.clone())?;
@@ -876,7 +599,7 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
         });
         await_boundary_barrier(&provider.initial_started, "initial native start").await?;
         let submission = journal.prepare_input(&catalog,
-            ProviderInput::from_text("boundary correction"), crate::provider::ProviderKind::Codex, Some("boundary-message".into()))?;
+            ProviderInput::from_text("boundary correction"), forge_providers::registry::default_id(), Some("boundary-message".into()))?;
         let mut steering = Box::pin(lane.steer(crate::provider::SteeringInput::User {
             text: "boundary correction".into(), attachments: Vec::new(), submission: Some(submission.clone()),
         }));
@@ -905,166 +628,28 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
 
 /// Hold native steering admission while the original provider turn keeps running.
 struct SlowSteeringProvider {
-    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    inner: BoundarySteeringProvider,
-    steering_started: tokio::sync::Semaphore,
-    steering_release: tokio::sync::Semaphore,
+    inner: Arc<BoundarySteeringProvider>,
+    steering_started: Arc<tokio::sync::Semaphore>,
+    steering_release: Arc<tokio::sync::Semaphore>,
 }
-
-#[async_trait::async_trait]
-impl crate::provider::ProviderAdapter for SlowSteeringProvider {
-    type Host = crate::provider::HarnessProviderHost;
-
-    fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-        self.inner.descriptor()
-    }
-
-    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.fixture_events.shutdown().await?;
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::Shutdown,
-                source,
-            )
-        })
-    }
-    /// Fence and collect the fixture's admitted execution before owner teardown.
-    async fn fence_session(
-        &self,
-        owner: &crate::provider::ExecutionOwner,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.fixture_events.cancel(owner).await?;
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::FenceSession,
-                source,
-            )
-        })
-    }
-
-    async fn cleanup_execution(
-        &self,
-        _: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
-                source,
-            )
-        })
-    }
-
-    async fn has_active_turn(&self, _: &str) -> bool {
-        true
-    }
-
-    async fn active_session_id_for(
-        &self,
-        _: &str,
-    ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-        Ok(Some("boundary-thread".to_owned().try_into()?))
-    }
-
-    async fn session_events(
-        &self,
-        owner: crate::provider::ExecutionOwner,
-    ) -> std::result::Result<
-        crate::provider::events::ProviderEventStream,
-        crate::provider::ProviderError,
-    > {
-        let stream = self.fixture_events.subscribe(owner.clone())?;
-        Ok(stream)
-    }
-
-    async fn session_prompt(
-        self: std::sync::Arc<Self>,
-        request: crate::provider::ProviderRequest,
-        scope: crate::provider::InvocationScope,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let events = self.fixture_events.clone();
-        events
-            .submit(
-                request,
-                scope,
-                crate::provider::test_support::TerminalBoundary::LocalFixture,
-                move |request, sink| async move { self.run_native(request, sink).await },
-            )
-            .await
-    }
-
-    async fn session_steer(
-        self: std::sync::Arc<Self>,
-        owner: &crate::provider::ExecutionOwner,
-        scope: crate::provider::InvocationScope,
-        input: crate::provider::SteeringInput,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        if scope.owner != *owner {
-            return Err(crate::provider::ProviderError::Rejected {
-                message: "steering crosses owner".into(),
-            });
-        }
-        let events = self.fixture_events.clone();
-        if !events.running(&scope).await? {
-            let request = events.continuation(&scope, input)?;
-            return self.session_prompt(request, scope).await;
-        }
-        events
-            .steer(&scope, input, |input| async move {
-                self.steer_native(&owner.runtime_key(), input)
-                    .await
-                    .map_err(crate::provider::ProviderError::from)
-            })
-            .await
-    }
-}
-
-impl SlowSteeringProvider {
-    async fn steer_native(&self, _: &str, input: crate::provider::SteeringInput) -> Result<()> {
-        self.steering_started.add_permits(1);
-        self.steering_release.acquire().await?.forget();
-        let submission = input.submission().context("steering lost its journal")?;
-        submission.sending(crate::provider::submission::SubmissionTarget::native(
-            "codex",
-            "boundary-thread",
-            serde_json::json!({}),
-        ))?;
-        submission.accepted("native steering receipt".into())?;
-        Ok(())
-    }
-}
-
-impl SlowSteeringProvider {
-    async fn run_native(
-        &self,
-        request: ProviderRequest,
-        sink: crate::provider::ProviderEventSink,
-    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-        self.inner.run_native(request, sink).await
-    }
-}
-
-/// Retain one slow native admission until acknowledgment within the supported deadline.
 #[tokio::test]
 async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<()> {
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let provider = Arc::new(SlowSteeringProvider {
-        fixture_events: Default::default(),
-        inner: BoundarySteeringProvider::new(),
-        steering_started: tokio::sync::Semaphore::new(0),
-        steering_release: tokio::sync::Semaphore::new(0),
+        inner: Arc::new(BoundarySteeringProvider::new()),
+        steering_started: Arc::new(tokio::sync::Semaphore::new(0)),
+        steering_release: Arc::new(tokio::sync::Semaphore::new(0)),
     });
-    broker.provider = provider.clone();
+    let started = provider.steering_started.clone();
+    let release = provider.steering_release.clone();
+    let native = provider.inner.fixture().with_steering(move |_request| {
+        let started = started.clone(); let release = release.clone();
+        async move { started.add_permits(1); crate::provider::test_support::wait_gate(&release).await?; Ok(()) }
+    });
+    let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    broker.provider = fixture.provider_handle();
     let lane = broker.parent_input.clone();
     let catalog = broker.provider_catalog_request()?;
     let cancellation = broker.turn_cancellation();
@@ -1083,7 +668,7 @@ async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<
     let submission = journal.prepare_input(
         &catalog,
         ProviderInput::from_text("keep working"),
-        crate::provider::ProviderKind::Codex,
+        forge_providers::registry::default_id(),
         Some("slow-steering".into()),
     )?;
     let mut steering = std::pin::pin!(lane.steer(crate::provider::SteeringInput::User {

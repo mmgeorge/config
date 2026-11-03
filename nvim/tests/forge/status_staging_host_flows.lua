@@ -79,9 +79,7 @@ local function audit(phase)
     if mark[4].virt_text then installed = installed + 1 end
   end
   assert(installed == owned, phase .. ": orphan gutter marks")
-  for _, notice in ipairs(forge_manual.notices) do
-    assert(notice.message:find("no Copilot OAuth token found", 1, true), phase .. ": " .. notice.message)
-  end
+  assert(#forge_manual.notices == 0, vim.inspect(forge_manual.notices))
 end
 
 local function index_is(expected, phase)

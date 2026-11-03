@@ -10,12 +10,13 @@ local original_options, original_explicit = config.options, config.harness_provi
 local original_state = session.harness
 local generation, generated_session
 local preference_reads = 0
+local registry_fixture = dofile("nvim/tests/forge/support/provider_catalog.lua")
 
 builder.ensure = function(callback) callback({ ok = true, path = "generation-preference-fixture" }) end
 preference.load = function(provider_map, fallback)
-  assert(provider_map.copilot and fallback == "codex")
+  assert(provider_map.fixture_beta and fallback == "fixture_alpha")
   preference_reads = preference_reads + 1
-  return "copilot"
+  return "fixture_beta"
 end
 
 ---@param command string[]
@@ -29,6 +30,8 @@ local function launch_fixture(command, options)
       local result = {}
       if request.method == "host.initialize" then
         result.protocol_version = require("forge.protocol").VERSION
+      elseif request.method == "provider.registry.list" then
+        result = registry_fixture.registry()
       elseif request.method == "session.initialize" then
         error("Standalone generation initialized a conversation")
       elseif request.method == "repository.generation" then
@@ -49,7 +52,7 @@ local succeeded, failure = xpcall(function()
     client._host_reset_for_test()
     client._host_set_launcher_for_test(launch_fixture)
     generation, generated_session = nil, nil
-    config.setup(explicit and { harness_logging = false, harness = { provider = "codex" } }
+    config.setup(explicit and { harness_logging = false, harness = { provider = "fixture_alpha" } }
       or { harness_logging = false })
     session.activate_harness(session.new_harness_state())
     local completed = false
@@ -60,14 +63,14 @@ local succeeded, failure = xpcall(function()
         completed = true
       end)
     assert(vim.wait(1000, function() return completed end, 5), "commit generation startup timed out")
-    assert(generation.provider.kind == (explicit and "codex" or "copilot"),
+    assert(generation.provider.kind == (explicit and "fixture_alpha" or "fixture_beta"),
       "commit startup ignored the saved preference or explicit configuration")
     assert(vim.deep_equal(generation.provider.command,
       config.options.harness.providers[generation.provider.kind].command or {}),
       "generation lost the configured provider command")
     assert(preference_reads == 1, "explicit provider configuration read the saved preference")
-    assert(generation.model == "gpt-6-luna" and generation.reasoning_effort == "low",
-      "commit generation did not select Luna with low thinking")
+    assert(generation.model == "fixture-model" and generation.reasoning_effort == "low",
+      "commit generation did not use registry model defaults")
 
     assert(generated_session == nil, "cold generation attached a conversation")
     assert(not client._client.harness_ready and session.harness.session == nil,
@@ -81,7 +84,7 @@ local succeeded, failure = xpcall(function()
       end)
     assert(vim.wait(1000, function() return completed end, 5), "selected session generation timed out")
     assert(generated_session == nil, "generation attached the active conversation")
-    assert(generation.model == "gpt-6-luna" and generation.reasoning_effort == "low",
+    assert(generation.model == "fixture-model" and generation.reasoning_effort == "low",
       "commit generation inherited the active conversation model")
     assert(preference_reads == 1, "ready Harness reloaded the provider preference")
 
@@ -101,8 +104,8 @@ local succeeded, failure = xpcall(function()
 
     client._host_reset_for_test()
     client._host_set_launcher_for_test(launch_fixture)
-    config.options.harness.provider = "codex"
-    session.harness.session.provider = "codex"
+    config.options.harness.provider = "fixture_alpha"
+    session.harness.session.provider = "fixture_alpha"
     completed = false
     client.generation_request({ operation = "generate", workspace = "fixture", comparison = "staged" },
       function(_, request_error)
@@ -110,20 +113,22 @@ local succeeded, failure = xpcall(function()
         completed = true
       end)
     assert(vim.wait(1000, function() return completed end, 5), "selected provider restart timed out")
-    assert(generation.provider.kind == "codex" and preference_reads == 1,
+    assert(generation.provider.kind == "fixture_alpha" and preference_reads == 1,
       "host restart replaced the selected provider with its older saved preference")
   end
-  session.harness.session = { id = "selected-session", provider = "codex", model = "selected-model" }
-  config.options.background_generation.codex = { model = "" }
+  session.harness.session = { id = "selected-session", provider = "fixture_alpha", model = "selected-model" }
+  config.options.background_generation.fixture_alpha = { model = "" }
   local invalid_model
   client.generation_request({ operation = "generate", workspace = "fixture", comparison = "staged" },
     function(_, failure) invalid_model = failure end)
-  assert(invalid_model == "Invalid Background-generation model for provider: codex",
+  assert(vim.wait(1000, function() return invalid_model ~= nil end, 5), "configuration failure was not delivered")
+  assert(invalid_model == "Invalid Background-generation model for provider: fixture_alpha",
     "invalid model silently inherited the active conversation model")
   session.harness.session = { id = "foreign-session", provider = "missing-provider" }
   local request_error
   client.generation_request({ operation = "generate", workspace = "fixture", comparison = "staged" },
     function(_, failure) request_error = failure end)
+  assert(vim.wait(1000, function() return request_error ~= nil end, 5), "unknown provider failure was not delivered")
   assert(request_error == "Unknown Harness provider: missing-provider",
     "invalid provider configuration did not reach the caller")
 end, debug.traceback)

@@ -1,4 +1,3 @@
-pub(crate) mod acp;
 pub mod command;
 pub mod directory;
 pub mod document;
@@ -10,4 +9,3 @@ pub mod store;
 mod shell_tests;
 
 pub(crate) mod provider;
-pub(crate) mod session_directory;

@@ -262,6 +262,7 @@ impl CompiledPermissionDocument {
         let mut result_list = Vec::new();
         for target in &request.target_list {
             let (decision, matched_pattern) = match target {
+                PermissionTarget::Unknown => (PermissionDecision::Deny, None),
                 PermissionTarget::UnknownFile { .. } => (PermissionDecision::Ask, None),
                 PermissionTarget::Command { command, shell } => {
                     result_list.extend(self.evaluate_command(command, *shell)?);
@@ -277,6 +278,7 @@ impl CompiledPermissionDocument {
                     self.best_rule(CATEGORY_ELEVATE, target, None)
                 }
                 PermissionTarget::Tool { target } => self.best_rule(CATEGORY_TOOL, target, None),
+                PermissionTarget::HostTool { name } => self.best_rule(CATEGORY_TOOL, name, None),
             };
             result_list.push(TargetEvaluation {
                 target: target.clone(),
@@ -318,6 +320,24 @@ mod test {
         CompiledPermissionDocument::compile(parse_permission_document(source).unwrap(), "D:/repo")
     }
 
+    /// Deny unclassified operations even when the user allows every known tool.
+    #[test]
+    fn unknown_operations_cannot_match_a_wildcard_allow() {
+        let permission = compiled(
+            r#"{"permission":{"tool":{"*":"allow"},"mcp":{"*":"allow"},"bash":{"*":"allow"}}}"#,
+        );
+        let request = PermissionRequest {
+            id: "unknown".into(),
+            provider: forge_provider_api::ProviderId::new("fixture").unwrap(),
+            reason: None,
+            target_list: vec![PermissionTarget::Unknown],
+        };
+        assert_eq!(
+            permission.evaluate(&request).unwrap().decision,
+            PermissionDecision::Deny
+        );
+    }
+
     #[test]
     fn prefers_specific_command_denial_and_aggregates_compounds() {
         let permission = compiled(
@@ -325,7 +345,8 @@ mod test {
         );
         let allowed = PermissionRequest {
             id: "1".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("test")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: "git status && rg foo".into(),
@@ -364,7 +385,8 @@ mod test {
         ] {
             let request = PermissionRequest {
                 id: "nushell-file".into(),
-                provider: "test".into(),
+                provider: forge_provider_api::ProviderId::new("test")
+                    .expect("static provider identity is valid"),
                 reason: None,
                 target_list: vec![PermissionTarget::Command {
                     command: command.into(),
@@ -383,7 +405,8 @@ mod test {
     fn catch_all_command_rule_supplies_the_default_decision() {
         let request = PermissionRequest {
             id: "1".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("test")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: "cargo test".into(),
@@ -413,7 +436,8 @@ mod test {
             compiled(r#"{"permission":{"bash":{"*":"deny","git":"allow","git push":"ask"}}}"#);
         let mut request = PermissionRequest {
             id: "1".into(),
-            provider: "test".into(),
+            provider: forge_provider_api::ProviderId::new("test")
+                .expect("static provider identity is valid"),
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: String::new(),
@@ -455,7 +479,8 @@ mod test {
         for path in ["D:/repo/src/main.rs", "D:/outside.txt"] {
             let request = PermissionRequest {
                 id: "rule".into(),
-                provider: "test".into(),
+                provider: forge_provider_api::ProviderId::new("test")
+                    .expect("static provider identity is valid"),
                 reason: None,
                 target_list: vec![PermissionTarget::Write { path: path.into() }],
             };

@@ -151,10 +151,26 @@
 ---@field label string
 ---@field detail string
 ---@field selectable? boolean
+---@field capability? ForgeProviderCapability
+
+---@alias ForgeProviderCapability table<string, any> Normalized capability object supplied by the provider registry.
+
+---@class ForgeHarnessProviderDescriptor
+---@field id string
+---@field label string
+---@field selectable boolean
+---@field command string[]
+---@field detail string
+---@field capability ForgeProviderCapability
+---@field background_generation? ForgeBackgroundSelection
+
+---@class ForgeHarnessProviderRegistry
+---@field default_provider string
+---@field providers ForgeHarnessProviderDescriptor[]
 
 ---@class ForgeHarnessConfig
 ---@field config_dir? string
----@field provider "codex"|"copilot"|"mock"
+---@field provider string?
 ---@field model string
 ---@field effort string
 ---@field buffer_name string
@@ -222,14 +238,11 @@ M.defaults = {
   status_diff_viewport_threshold = 1200,
   status_diff_viewport_overscan = 80,
   about_auto_generate = true,
-  background_generation = {
-    codex = { model = "gpt-6-luna", reasoning_effort = "low" },
-    copilot = { model = "gpt-6-luna", reasoning_effort = "low" },
-  },
+  background_generation = {},
   walkthrough_inventory = "sem",
   branch_prefix = "matt9222/",
   harness = {
-    provider = "codex",
+    provider = nil,
     model = "default",
     effort = "medium",
     buffer_name = "ForgeHarness",
@@ -238,34 +251,7 @@ M.defaults = {
     composer_max_height = 12,
     goal_max_turns = 20,
     non_git_write_confirm = true,
-    providers = {
-      codex = {
-        command = { "codex", "app-server" },
-        label = "Codex CLI",
-        detail = "OpenAI Codex app-server",
-      },
-      copilot = {
-        command = {},
-        label = "Copilot CLI",
-        detail = "GitHub Copilot SDK",
-      },
-      claude = {
-        command = { "claude-agent-acp" },
-        label = "Claude Code",
-        detail = "Claude Code through ACP",
-      },
-      antigravity = {
-        command = { "agy_acp_server" },
-        label = "Antigravity",
-        detail = "Standalone Antigravity ACP server",
-      },
-      mock = {
-        command = { "mock" },
-        label = "Mock",
-        detail = "Harness test provider",
-        selectable = false,
-      },
-    },
+    providers = {},
   },
   picker = {
     choice_keys = { "n", "e", "i", "l", "u", "y" },
@@ -461,9 +447,6 @@ function M.setup(opts)
   end
   if options.walkthrough_inventory ~= "sem" and options.walkthrough_inventory ~= false then
     error('walkthrough_inventory must be "sem" or false')
-  end
-  if not options.harness.providers[options.harness.provider] then
-    error("harness.provider must name a configured harness provider")
   end
   local question_key_set = {}
   for _, key in ipairs(options.picker.choice_keys or {}) do

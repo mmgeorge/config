@@ -3,6 +3,7 @@ vim.loader.enable(false)
 require("forge").setup()
 
 local client = require("forge.client")
+dofile("nvim/tests/forge/support/provider_catalog.lua").install()
 local picker = require("forge.views.picker")
 local picker_state = require("forge.views.picker.state")
 local provider_catalog = require("forge.views.harness.provider_catalog")
@@ -83,7 +84,7 @@ end
 
 session.harness.session = {
   id = "provider-catalog-test",
-  provider = "codex",
+  provider = "fixture_alpha",
   workspace = "D:/repo",
 }
 session.harness.capability = {

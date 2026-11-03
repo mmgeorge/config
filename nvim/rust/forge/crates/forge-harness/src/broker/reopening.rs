@@ -11,6 +11,20 @@ use crate::provider::{
     ExecutionOwner, InvocationId, InvocationScope, ProviderDiagnostic, ProviderEvent, TurnAddress,
 };
 
+fn publication_diagnostic(scope: &InvocationScope) -> ProviderEvent {
+    ProviderEvent::Diagnostic {
+        scope: scope.clone().into(),
+        diagnostic: ProviderDiagnostic {
+            kind: forge_provider_api::ProviderFailureKind::Persistence,
+            message: forge_provider_api::SanitizedMessage::new(
+                "Required host effects could not be published",
+            )
+            .expect("static diagnostic is nonempty"),
+            fatal: true,
+        },
+    }
+}
+
 /// Preserve the original host workflow and its lease owners after foreground commit.
 pub(super) struct RetainedForeground {
     pub(super) transaction: Box<super::ForegroundTransaction>,
@@ -322,8 +336,16 @@ impl HarnessBroker {
             "late execution resolves to another owner"
         );
         let mut diagnostic = None;
+        let publication_failure = match &update {
+            ExecutionUpdate::PublicationFailed { failure, .. }
+            | ExecutionUpdate::ResolutionPublicationFailed { failure, .. } => Some(*failure),
+            _ => None,
+        };
         match update {
             ExecutionUpdate::ResolvedWithoutExecution { .. } => return Ok(Vec::new()),
+            ExecutionUpdate::ResolutionPublicationFailed { .. } => {
+                diagnostic = Some(publication_diagnostic(&scope));
+            }
             ExecutionUpdate::Started { address } => {
                 let current = self.store.current_exchange_state(&self.session.id)?;
                 ensure!(
@@ -355,6 +377,12 @@ impl HarnessBroker {
                 completed_at_ms,
                 result,
                 ..
+            }
+            | ExecutionUpdate::PublicationFailed {
+                address,
+                completed_at_ms,
+                result,
+                ..
             } => {
                 if !self.reopened_execution.matches(&address) {
                     return Ok(Vec::new());
@@ -379,9 +407,19 @@ impl HarnessBroker {
                         turn.finish(turn_outcome, completed_at_ms)?;
                     }
                 }
-                exchange.begin_finalization(outcome, completed_at_ms)?;
+                exchange.begin_finalization(
+                    if publication_failure.is_some() {
+                        ExchangeOutcome::Failed
+                    } else {
+                        outcome
+                    },
+                    completed_at_ms,
+                )?;
                 self.store.save_exchange(&exchange)?;
                 self.reopened_execution.finish(&scope);
+                if publication_failure.is_some() {
+                    diagnostic = Some(publication_diagnostic(&scope));
+                }
             }
             ExecutionUpdate::ObservationLost { failure, .. } => {
                 if !self.reopened_execution.active(&scope) {
@@ -393,8 +431,9 @@ impl HarnessBroker {
                 diagnostic = Some(ProviderEvent::Diagnostic {
                     scope: scope.into(),
                     diagnostic: ProviderDiagnostic {
-                        code: Some("execution_observation_lost".into()),
-                        message: failure.to_string(),
+                        kind: forge_provider_api::ProviderFailureKind::Protocol,
+                        message: forge_provider_api::SanitizedMessage::new(failure.to_string())
+                            .expect("normalized observation failures are nonempty"),
                         fatal: true,
                     },
                 });

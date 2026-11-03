@@ -1,20 +1,9 @@
 use super::*;
-#[cfg(test)]
-use crate::provider::ProviderAdapter as _;
 use crate::provider::{
-    Compaction, CompactionResult, CompactionState, EventScope, ExecutionOwner, ProviderCapability,
-    ProviderDescriptor, ProviderDiagnostic, ProviderEvent, ProviderEventSink, ProviderKind,
-    ProviderRequest,
+    Compaction, CompactionResult, CompactionState, EventScope, ExecutionOwner, ProviderDiagnostic,
+    ProviderEvent,
 };
-
-/// Supply a real bounded observation stream without starting a provider process.
-struct ObservationProvider {
-    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    owner: ExecutionOwner,
-    stream: std::sync::Mutex<Option<crate::provider::events::ProviderEventStream>>,
-    shutdown_delivery: std::sync::Mutex<Option<(ProviderEventSink, Vec<ProviderEvent>)>>,
-    foreground: Option<Arc<ForegroundObservationLoss>>,
-}
+use forge_provider_api::provider::Provider as _;
 
 /// Keep an accepted native prompt live until its observation boundary is lost.
 #[derive(Default)]
@@ -22,146 +11,70 @@ struct ForegroundObservationLoss {
     calls: std::sync::atomic::AtomicUsize,
     active: AtomicBool,
     fail: Notify,
-    submission: std::sync::Mutex<Option<Arc<crate::provider::submission::Submission>>>,
+    submission_id: std::sync::Mutex<Option<String>>,
 }
 
-#[async_trait::async_trait]
-impl crate::provider::ProviderAdapter for ObservationProvider {
-    type Host = crate::provider::HarnessProviderHost;
-    /// Publish any configured final observations, then close the fixture stream.
-    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            let delivery = self.shutdown_delivery.lock().unwrap().take();
-            if let Some((sink, events)) = delivery {
-                for event in events {
-                    sink.send_wait(event).await?;
-                }
+fn observation_descriptor() -> forge_provider_api::ProviderDescriptor {
+    forge_provider_api::ProviderDescriptor {
+        kind: forge_providers::registry::nonselectable_id().expect("mock fixture identity"),
+        label: "session observation fixture".into(),
+        capability: Default::default(),
+    }
+}
+
+fn session_test_diagnostic(message: impl Into<String>) -> ProviderDiagnostic {
+    ProviderDiagnostic {
+        kind: forge_provider_api::ProviderFailureKind::Unknown,
+        message: forge_provider_api::SanitizedMessage::new(message)
+            .expect("fixture diagnostic is nonempty"),
+        fatal: false,
+    }
+}
+
+fn observation_provider(
+    foreground: Option<Arc<ForegroundObservationLoss>>,
+) -> Arc<crate::provider::test_support::EventFixtureProvider> {
+    crate::provider::test_support::EventFixtureProvider::new(
+        observation_descriptor(),
+        move |request, sink, _cancelled| {
+            let foreground = foreground.clone();
+            async move {
+                let Some(foreground) = foreground else {
+                    return Ok(());
+                };
+                foreground.calls.fetch_add(1, Ordering::AcqRel);
+                foreground.active.store(true, Ordering::Release);
+                *foreground.submission_id.lock().unwrap() =
+                    Some(request.submission_id.as_str().to_owned());
+                let turn = crate::provider::TurnAddress {
+                    scope: request.scope.clone(),
+                    thread_id: "fixture-thread".into(),
+                    turn_id: "live-turn".into(),
+                };
+                let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
+                    request.scope.clone(),
+                    forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                        address: turn.clone(),
+                    },
+                )?;
+                sink.send_wait(ProviderEvent::Execution { observation })
+                    .await?;
+                sink.send_wait(ProviderEvent::Turn {
+                    address: turn,
+                    update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
+                })
+                .await?;
+                foreground.fail.notified().await;
+                foreground.active.store(false, Ordering::Release);
+                let failure =
+                    forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable;
+                sink.fail(forge_provider_api::events::EventDeliveryError::Observation(
+                    failure.clone(),
+                ));
+                Err(forge_provider_api::ProviderError::Observation(failure))
             }
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::Shutdown,
-                source,
-            )
-        })
-    }
-
-    /// Leave the observation-only fixture unchanged by execution cleanup.
-    async fn cleanup_execution(
-        &self,
-        _: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
-                source,
-            )
-        })
-    }
-
-    /// Accept cancellation without an active foreground execution.
-    async fn cancel_session(
-        &self,
-        _: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CancelSession,
-                source,
-            )
-        })
-    }
-
-    /// Retire the fixture's old event channel before a replacement subscribes.
-    async fn reset_session(
-        &self,
-        owner: &ExecutionOwner,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.fixture_events.reset_owner(owner).await?;
-            Ok(())
-        }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::ResetSession,
-                source,
-            )
-        })
-    }
-    async fn fence_session(
-        &self,
-        _: &ExecutionOwner,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::FenceSession,
-                source,
-            )
-        })
-    }
-
-    /// Retain native activity independently of the foreground broker lock.
-    async fn has_active_turn(&self, _: &str) -> bool {
-        self.foreground
-            .as_ref()
-            .is_some_and(|foreground| foreground.active.load(Ordering::Acquire))
-    }
-
-    /// Report that the fixture owns no native provider session.
-    async fn active_session_id_for(
-        &self,
-        _: &str,
-    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
-        Ok(None)
-    }
-
-    /// Describe the observation fixture without optional provider capabilities.
-    fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            kind: ProviderKind::Mock,
-            label: "session observation fixture".into(),
-            capability: ProviderCapability::default(),
-        }
-    }
-
-    /// Transfer the fixture stream only to its owning session collector.
-    async fn session_events(
-        &self,
-        owner: crate::provider::ExecutionOwner,
-    ) -> std::result::Result<
-        crate::provider::events::ProviderEventStream,
-        crate::provider::ProviderError,
-    > {
-        if let Some(native) = self.fixture_session_events(owner.clone()).await? {
-            return Ok(native);
-        }
-        self.fixture_events.subscribe(owner)
-    }
-
-    async fn session_prompt(
-        self: std::sync::Arc<Self>,
-        request: crate::provider::ProviderRequest,
-        scope: crate::provider::InvocationScope,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let events = self.fixture_events.clone();
-        let native_scope = scope.clone();
-        events
-            .submit(
-                request,
-                scope,
-                crate::provider::TerminalBoundary::LocalFixture,
-                move |request, sink| async move {
-                    self.run_native(request, native_scope, sink).await
-                },
-            )
-            .await
-    }
+        },
+    )
 }
 
 /// Deliver the old failure before installing a fresh owner observation generation.
@@ -174,21 +87,15 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
     }))?)?;
     let session_id = broker.snapshot()?.session.id.clone();
     let owner = ExecutionOwner::root(&session_id);
-    let provider = Arc::new(ObservationProvider {
-        fixture_events: Default::default(),
-        owner: owner.clone(),
-        stream: std::sync::Mutex::new(None),
-        shutdown_delivery: std::sync::Mutex::new(None),
-        foreground: None,
-    });
-    broker.set_provider_for_test(provider.clone());
+    let provider = observation_provider(None);
+    let _provider_fixture =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
+    broker.set_provider_for_test(_provider_fixture.provider_handle());
     let controller = SessionController::new(broker)?;
     let (message_sink, mut output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&message_sink).await?;
-    let old = provider.fixture_events.session_sink(&owner)?;
-    old.fail(crate::provider::events::EventDeliveryError::Closed {
-        message: "fixture loss".into(),
-    });
+    let old = provider.event_sink(&owner).await?;
+    old.fail(crate::provider::events::EventDeliveryError::Closed);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if controller
@@ -209,7 +116,7 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
     let failure: Value = serde_json::from_slice(frame.bytes())?;
     assert!(failure.to_string().contains("Session observation failed"));
     controller.recover_session_events(&message_sink).await?;
-    let replacement = provider.fixture_events.session_sink(&owner)?;
+    let replacement = provider.event_sink(&owner).await?;
     let scope = EventScope::SessionOperation {
         owner,
         operation_id: "replacement".into(),
@@ -218,11 +125,7 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
         .bind_scope(scope.clone())?
         .send_wait(ProviderEvent::Diagnostic {
             scope,
-            diagnostic: ProviderDiagnostic {
-                code: Some("replacement".into()),
-                message: "new generation".into(),
-                fatal: false,
-            },
+            diagnostic: session_test_diagnostic("new generation"),
         })
         .await?;
     let frame = tokio::time::timeout(Duration::from_secs(5), output.recv())
@@ -236,59 +139,12 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
                 owner: ExecutionOwner::root(&session_id),
                 operation_id: "old".into()
             },
-            diagnostic: ProviderDiagnostic {
-                code: None,
-                message: "stale".into(),
-                fatal: false
-            },
+            diagnostic: session_test_diagnostic("stale"),
         })
         .await
         .is_err()
     );
     Ok(())
-}
-
-impl ObservationProvider {
-    async fn fixture_session_events(
-        &self,
-        owner: ExecutionOwner,
-    ) -> Result<Option<crate::provider::events::ProviderEventStream>> {
-        assert_eq!(owner, self.owner);
-        Ok(self.stream.lock().unwrap().take())
-    }
-}
-
-impl ObservationProvider {
-    async fn run_native(
-        &self,
-        request: ProviderRequest,
-        scope: crate::provider::InvocationScope,
-        sink: ProviderEventSink,
-    ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-        let foreground = self
-            .foreground
-            .as_ref()
-            .expect("session observations must not submit a foreground prompt");
-        foreground.calls.fetch_add(1, Ordering::AcqRel);
-        foreground.active.store(true, Ordering::Release);
-        let submission = request
-            .submission
-            .context("foreground fixture requires input receipt")?;
-        submission.sending(crate::provider::submission::SubmissionTarget::Untracked)?;
-        submission.accepted("accepted before lifecycle loss".into())?;
-        *foreground.submission.lock().unwrap() = Some(submission);
-        crate::provider::test_support::FixtureStream::new(sink)
-            .send_wait(ProviderEvent::Turn {
-                address: crate::provider::test_support::address(&scope, "fixture", "live-turn"),
-                update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
-            })
-            .await?;
-        foreground.fail.notified().await;
-        foreground.active.store(false, Ordering::Release);
-        Err(crate::provider::ProviderError::Observation(
-            forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
-        ))
-    }
 }
 
 /// Settle accepted input and its open documents before releasing a failed foreground owner.
@@ -309,14 +165,11 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     }))?)?;
     let session_id = broker.snapshot()?.session.id.clone();
     let foreground = Arc::new(ForegroundObservationLoss::default());
-    let provider = Arc::new(ObservationProvider {
-        fixture_events: Default::default(),
-        owner: ExecutionOwner::root(&session_id),
-        stream: std::sync::Mutex::new(None),
-        shutdown_delivery: std::sync::Mutex::new(None),
-        foreground: Some(foreground.clone()),
-    });
-    broker.set_provider_for_test(provider.clone());
+    let owner = ExecutionOwner::root(&session_id);
+    let provider = observation_provider(Some(foreground.clone()));
+    let _provider_fixture =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
+    broker.set_provider_for_test(_provider_fixture.provider_handle());
     let presentation = broker.presentation();
     let document = DocumentId("transcript:observation-loss".into());
     let opened = presentation.lock().unwrap().open(
@@ -383,14 +236,15 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     })
     .await
     .context("accepted native prompt did not publish working status")??;
-    assert!(provider.has_active_turn(&session_id).await);
+    assert!(provider.has_active_turn(&owner).await);
     assert_eq!(controller.coordinator.execution.available_permits(), 0);
-    let submission = foreground
-        .submission
+    let submission_id = foreground
+        .submission_id
         .lock()
         .unwrap()
         .clone()
         .context("input was not accepted")?;
+    let submission = controller.submission_store.submission(&submission_id)?;
     assert!(matches!(
         submission.record()?.delivery,
         SubmissionState::Accepted { .. }
@@ -435,7 +289,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
         crate::exchange::ExchangeState::Failed
     );
     drop(broker);
-    assert!(!provider.has_active_turn(&session_id).await);
+    assert!(!provider.has_active_turn(&owner).await);
     assert_eq!(foreground.calls.load(Ordering::Acquire), 1);
     assert!(
         matches!(
@@ -483,7 +337,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     if let Some(task) = controller.input_task.lock().await.take() {
         tokio::time::timeout(Duration::from_secs(5), task).await??;
     }
-    provider.fixture_events.shutdown().await?;
+    provider.shutdown().await?;
     if let Err(error) =
         tokio::time::timeout(Duration::from_secs(5), controller.finish_session_events()).await?
     {
@@ -517,15 +371,10 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
         owner: owner.clone(),
         operation_id: "observation-fixture".into(),
     };
-    let (provider_sink, provider_stream) = crate::provider::events::channel(scope.clone());
-    let provider = Arc::new(ObservationProvider {
-        fixture_events: Default::default(),
-        owner,
-        stream: std::sync::Mutex::new(Some(provider_stream)),
-        shutdown_delivery: std::sync::Mutex::new(None),
-        foreground: None,
-    });
-    broker.set_provider_for_test(provider);
+    let provider = observation_provider(None);
+    let _provider_fixture =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
+    broker.set_provider_for_test(_provider_fixture.provider_handle());
     let controller = SessionController::new(broker)?;
     let (message_sink, mut output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&message_sink).await?;
@@ -533,6 +382,10 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     let diagnostic_count = forge_protocol::MAX_PENDING_FRAMES / 2;
     // Keep the native session stream open after the producer finishes. Dropping
     // its last sender would be an unexpected disconnect, not a drained session.
+    let provider_sink = provider
+        .event_sink(&owner)
+        .await?
+        .bind_scope(scope.clone())?;
     let session_sink = provider_sink.clone();
     let producer = tokio::spawn(async move {
         provider_sink
@@ -557,11 +410,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
             provider_sink
                 .send_wait(ProviderEvent::Diagnostic {
                     scope: scope.clone(),
-                    diagnostic: ProviderDiagnostic {
-                        code: Some("observation-fixture".into()),
-                        message: format!("observation-{sequence}"),
-                        fatal: false,
-                    },
+                    diagnostic: session_test_diagnostic(format!("observation-{sequence}")),
                 })
                 .await?;
         }
@@ -590,12 +439,12 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
             }
             assert_eq!(event["session_id"], session_id);
             // Provider initialization can publish runtime metadata before the
-            // fixture diagnostics; only diagnostic updates carry a code.
+            // fixture diagnostics; only diagnostic updates carry data.
             if event["payload"]["kind"] != "error" {
                 continue;
             }
             assert_eq!(
-                event["payload"]["data"]["code"], "observation-fixture",
+                event["payload"]["data"]["kind"], "unknown",
                 "unexpected provider error: {event}"
             );
             assert_eq!(
@@ -641,27 +490,23 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
         owner: owner.clone(),
         operation_id: "overflow".into(),
     };
-    let (sink, stream) = crate::provider::events::channel(scope.clone());
-    broker.set_provider_for_test(Arc::new(ObservationProvider {
-        fixture_events: Default::default(),
-        owner,
-        stream: std::sync::Mutex::new(Some(stream)),
-        shutdown_delivery: std::sync::Mutex::new(None),
-        foreground: None,
-    }));
+    let provider = observation_provider(None);
+    let _provider_fixture =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
+    broker.set_provider_for_test(_provider_fixture.provider_handle());
     let controller = SessionController::new(broker)?;
     let (output, _receiver) = forge_protocol::outbound::channel();
     controller.attach_session_events(&output).await?;
+    let sink = provider
+        .event_sink(&owner)
+        .await?
+        .bind_scope(scope.clone())?;
     let guard = controller.broker.lock().await;
     for sequence in 0..(forge_protocol::MAX_PENDING_FRAMES * 2) {
         if sink
             .send_wait(ProviderEvent::Diagnostic {
                 scope: scope.clone(),
-                diagnostic: ProviderDiagnostic {
-                    code: Some("overflow".into()),
-                    message: format!("observation-{sequence}"),
-                    fatal: false,
-                },
+                diagnostic: session_test_diagnostic(format!("observation-{sequence}")),
             })
             .await
             .is_err()
@@ -686,7 +531,10 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
         let ProviderEvent::Diagnostic { diagnostic, .. } = event else {
             panic!("unexpected accepted event: {event:?}")
         };
-        assert_eq!(diagnostic.message, format!("observation-{sequence}"));
+        assert_eq!(
+            diagnostic.message.as_str(),
+            format!("observation-{sequence}")
+        );
     }
     let error = inbox
         .drain()
@@ -753,31 +601,41 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
     let data_root = fixture.path().join("data");
     SqliteStore::open(&data_root)?.save_exchange(&exchange)?;
 
-    let (provider_sink, provider_stream) = crate::provider::events::channel(scope);
-    let provider = Arc::new(ObservationProvider {
-        fixture_events: Default::default(),
-        owner,
-        stream: std::sync::Mutex::new(Some(provider_stream)),
-        shutdown_delivery: std::sync::Mutex::new(Some((
-            provider_sink,
-            vec![
-                ProviderEvent::Tool {
-                    address: address.clone(),
-                    update: ToolUpdate::Output {
-                        update: TextUpdate::Append("STOPPED\n".into()),
-                    },
-                },
-                ProviderEvent::Tool {
-                    address,
-                    update: ToolUpdate::Finished {
-                        outcome: ToolOutcome::Interrupted,
-                    },
-                },
-            ],
-        ))),
-        foreground: None,
+    let provider = observation_provider(None);
+    let delivery = Arc::new(std::sync::Mutex::new(Some(vec![
+        ProviderEvent::Tool {
+            address: address.clone(),
+            update: ToolUpdate::Output {
+                update: TextUpdate::Append("STOPPED\n".into()),
+            },
+        },
+        ProviderEvent::Tool {
+            address,
+            update: ToolUpdate::Finished {
+                outcome: ToolOutcome::Interrupted,
+            },
+        },
+    ])));
+    let weak_provider = Arc::downgrade(&provider);
+    let shutdown_scope = scope.clone();
+    provider.with_shutdown(move || {
+        let provider = weak_provider
+            .upgrade()
+            .expect("fixture provider remains alive during shutdown");
+        let delivery = delivery.clone();
+        let scope = shutdown_scope.clone();
+        async move {
+            let sink = provider.invocation_sink(&scope).await?;
+            let events = delivery.lock().unwrap().take().unwrap_or_default();
+            for event in events {
+                sink.send_wait(event).await?;
+            }
+            Ok(())
+        }
     });
-    broker.set_provider_for_test(provider.clone());
+    let _provider_fixture =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
+    broker.set_provider_for_test(_provider_fixture.provider_handle());
     let execution = broker.execution_registry();
     let controller = SessionController::new(broker)?;
     let (message_sink, _output) = forge_protocol::outbound::channel();
@@ -838,20 +696,11 @@ async fn cancelled_session_observation_join_retains_collector_for_retry() -> Res
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
         "client_id":"observation-retry-fixture", "provider":{"kind":"mock","command":[]},
     }))?)?;
-    let owner = ExecutionOwner::root(&broker.snapshot()?.session.id);
-    let (provider_sink, provider_stream) =
-        crate::provider::events::channel(EventScope::SessionOperation {
-            owner: owner.clone(),
-            operation_id: "shutdown-retry".into(),
-        });
-    let provider = Arc::new(ObservationProvider {
-        fixture_events: Default::default(),
-        owner,
-        stream: std::sync::Mutex::new(Some(provider_stream)),
-        shutdown_delivery: std::sync::Mutex::new(None),
-        foreground: None,
-    });
-    broker.set_provider_for_test(provider);
+    let _owner = ExecutionOwner::root(&broker.snapshot()?.session.id);
+    let provider = observation_provider(None);
+    let provider_fixture =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
+    broker.set_provider_for_test(provider_fixture.provider_handle());
     let execution = broker.execution_registry();
     let controller = SessionController::new(broker)?;
     let (message_sink, _output) = forge_protocol::outbound::channel();
@@ -863,7 +712,7 @@ async fn cancelled_session_observation_join_retains_collector_for_retry() -> Res
     );
     assert!(controller.session_event_task.lock().await.is_some());
     execution.begin_orderly_shutdown().await?;
-    drop(provider_sink);
+    provider.shutdown().await?;
     execution.close().await?;
     tokio::time::timeout(Duration::from_secs(2), controller.finish_session_events()).await??;
     assert!(controller.session_event_task.lock().await.is_none());

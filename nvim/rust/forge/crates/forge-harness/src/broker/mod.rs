@@ -1,5 +1,3 @@
-#[cfg(test)]
-use crate::provider::ProviderAdapter as _;
 mod acceptance;
 #[cfg(test)]
 mod cancellation_test;
@@ -66,12 +64,10 @@ use crate::plan::{
     PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanState,
 };
 use crate::protocol::RuntimeMethod;
-#[cfg(test)]
-use crate::provider::ProviderForkRequest;
 use crate::provider::approval::{ApprovalRequestView, PermissionCoordinator};
 use crate::provider::{
     PromptMode, Provider, ProviderCapability, ProviderCatalogRequest, ProviderCompletion,
-    ProviderError, ProviderEvent, ProviderEventSink, ProviderInput, ProviderLaunch,
+    ProviderError, ProviderEvent, ProviderEventSink, ProviderId, ProviderInput, ProviderLaunch,
     ProviderRequest,
 };
 use crate::session::{
@@ -136,7 +132,7 @@ pub struct InitializeRequest {
     #[serde(default)]
     /// Supplies explicit launch descriptors for cross-provider children.
     #[serde(alias = "backend_launch_by_provider")]
-    pub provider_launch_by_provider: HashMap<String, ProviderLaunch>,
+    pub provider_launch_by_provider: HashMap<ProviderId, ProviderLaunch>,
     #[serde(default = "default_model")]
     pub model: String,
     #[serde(default = "default_effort")]
@@ -799,7 +795,7 @@ pub(crate) enum ForegroundJob {
     AgentSpawnSelect {
         factory: crate::agent::AgentProviderFactory,
         root: Box<ProviderRequest>,
-        root_provider: crate::provider::ProviderKind,
+        root_provider: crate::provider::ProviderId,
         spawn: crate::agent::SpawnAgentRequest,
         request: OwnedAgentRequest,
     },
@@ -887,7 +883,7 @@ impl ForegroundJob {
                 trace,
                 scope,
             } => {
-                trace.record(&scope.owner.session_id, "foreground.cleanup", json!({
+                trace.record(scope.owner.session_id.as_str(), "foreground.cleanup", json!({
                     "exchange_id":scope.exchange_id, "phase":"engine_close_started", "cause":format!("{original:#}"),
                 }));
                 let mut cleanup = if original.is::<TurnCancelled>() {
@@ -899,19 +895,20 @@ impl ForegroundJob {
                 } else {
                     engine.close().await
                 };
-                trace.record(&scope.owner.session_id, "foreground.cleanup", json!({
+                trace.record(scope.owner.session_id.as_str(), "foreground.cleanup", json!({
                     "exchange_id":scope.exchange_id, "phase":"engine_closed", "failure":cleanup.as_ref().err().map(ToString::to_string),
                 }));
                 while let Some(result) = native.join_next().await {
                     if let Err(error) = result
                         && cleanup.is_ok()
                     {
-                        cleanup = Err(ProviderError::Protocol {
-                            message: format!("provider task join failed: {error}"),
-                        });
+                        cleanup = Err(crate::provider::lifecycle_error::classify_source(
+                            forge_provider_api::ProviderOperation::CollectEventReader,
+                            &error,
+                        ));
                     }
                 }
-                trace.record(&scope.owner.session_id, "foreground.cleanup", json!({
+                trace.record(scope.owner.session_id.as_str(), "foreground.cleanup", json!({
                     "exchange_id":scope.exchange_id, "phase":"native_joined", "failure":cleanup.as_ref().err().map(ToString::to_string),
                 }));
                 Ok(ForegroundSignal::CleanupCompleted { original, cleanup })
@@ -1199,7 +1196,10 @@ impl ForegroundJob {
                 for input in undispatched {
                     if let Err(error) = input.cancel_undispatched().await {
                         return Ok(ForegroundSignal::SettlementCommitted(Err(
-                            SettlementError::Provider(ProviderError::from(error)),
+                            SettlementError::Provider(crate::provider::lifecycle_error::classify(
+                                forge_provider_api::ProviderOperation::HostEffectPublication,
+                                error,
+                            )),
                         )));
                     }
                 }
@@ -1314,7 +1314,7 @@ impl ForegroundTransaction {
                 biased;
                 () = cancellation.cancelled() => return Ok(ForegroundSignal::Native(NativeForegroundSignal::Cancelled)),
                 () = cancellation.native_cancel_expired() => return Ok(ForegroundSignal::EffectFailed(
-                    ProviderError::DeliveryUncertain { message: "native cancellation did not produce a terminal observation within 30 seconds".into() }.into(),
+                    ProviderError::DeliveryUncertain.into(),
                 )),
                 expired = watchdog.expired() => {
                     return Ok(ForegroundSignal::Native(NativeForegroundSignal::ToolExpired(expired?.context("tool watchdog ended during foreground execution")?)));
@@ -1379,7 +1379,6 @@ pub(crate) enum ProviderAttempt {
 
 pub(crate) struct ProviderSubmission {
     request: ProviderRequest,
-    provider: Arc<Provider>,
     engine: Arc<crate::provider::session_execution::SessionExecution>,
     sink: crate::provider::ProviderEventSink,
     trace: Arc<TraceStore>,
@@ -1390,17 +1389,8 @@ pub(crate) struct ProviderSubmission {
 }
 
 impl ProviderSubmission {
-    /// Submit one attempt after any required host checkpoint gate opens.
+    /// Submit one attempt; the normalized callback enforces host checkpoint admission.
     pub(crate) async fn run(self) -> Result<ProviderAttempt> {
-        if !self.provider.checkpoint_tool_gate()
-            && let Some(gate) = self
-                .request
-                .control_context
-                .as_ref()
-                .and_then(|context| context.checkpoint.as_ref())
-        {
-            gate.wait().await?;
-        }
         let acceptance_sink = self.sink.clone();
         let response = crate::provider::retry::execute_until_ready(
             self.engine.as_ref(),
@@ -1446,7 +1436,7 @@ impl ExchangeRuntime {
 impl Drop for ExchangeRuntime {
     fn drop(&mut self) {
         if let Some(gate) = &self.tool_gate {
-            let _ = gate.complete(Err("exchange ended before checkpoint persistence".into()));
+            gate.complete(Err(crate::checkpoint::CheckpointGateError::OwnerEnded));
         }
     }
 }
@@ -1550,12 +1540,12 @@ impl BrokerRuntime {
         let permission_coordinator =
             Arc::new(PermissionCoordinator::new(Arc::clone(&permission_store)));
         let trace = Arc::new(TraceStore::open(&data_root)?);
-        let provider = Arc::<Provider>::from(crate::provider::build(
+        let provider = crate::provider::build(
             request.provider.clone(),
             Arc::clone(&permission_coordinator),
             Arc::clone(&trace),
             data_root.clone(),
-        )?);
+        )?;
         Ok(Arc::new(Self {
             lsp: Arc::new(Default::default()),
             repositories,
@@ -1860,12 +1850,15 @@ pub struct HarnessBroker {
     pending_host_settlement: Option<Arc<crate::provider::session_execution::SettlementCell>>,
     settlement_events: Vec<SessionEvent>,
     agent_registry: AgentRegistry,
+    observed_agent_conversations: HashSet<(
+        crate::provider::InvocationId,
+        forge_provider_api::ProviderSessionId,
+    )>,
     agent_coordinator: Arc<crate::agent::AgentCoordinator>,
     pub(crate) agent_provider_factory: crate::agent::AgentProviderFactory,
     child_provider_by_agent: HashMap<String, Arc<Provider>>,
     child_execution_by_agent:
         HashMap<String, Arc<crate::provider::session_execution::SessionExecutionRegistry>>,
-    diagnostic_native_thread: HashSet<String>,
     mcp_notice: HashMap<String, String>,
     child_exchange_runtime_by_agent: HashMap<String, ChildExchangeRuntime>,
     presentation: Arc<std::sync::Mutex<SessionPresentation>>,
@@ -2006,7 +1999,7 @@ impl HarnessBroker {
                     "session uses a different workspace"
                 );
                 anyhow::ensure!(
-                    selected.provider == request.provider.kind,
+                    selected.provider == request.provider.kind.as_str(),
                     "session uses a different configured provider"
                 );
                 store.acquire_session_lease(session_id, &request.client_id)?
@@ -2021,7 +2014,7 @@ impl HarnessBroker {
                         .find(|session| {
                             session.background.is_none()
                                 && session.purpose == crate::session::SessionPurpose::Conversation
-                                && session.provider == request.provider.kind
+                                && session.provider == request.provider.kind.as_str()
                         })
                 };
                 match latest_session {
@@ -2033,7 +2026,7 @@ impl HarnessBroker {
                         let preference = if request.background.is_some() {
                             None
                         } else {
-                            store.load_preference(&workspace, &request.provider.kind)?
+                            store.load_preference(&workspace, request.provider.kind.as_str())?
                         };
                         let session_id = Uuid::new_v4().to_string();
                         let mut session = HarnessSession {
@@ -2042,7 +2035,7 @@ impl HarnessBroker {
                             id: session_id,
                             name: requested_new_session_name.unwrap_or_default().to_owned(),
                             workspace,
-                            provider: request.provider.kind.clone(),
+                            provider: request.provider.kind.to_string(),
                             provider_session_id: None,
                             provider_checkpoint_id: None,
                             provider_fork_state: ProviderForkState::Ready,
@@ -2302,11 +2295,11 @@ impl HarnessBroker {
             pending_host_settlement: None,
             settlement_events: Vec::new(),
             agent_registry,
+            observed_agent_conversations: HashSet::new(),
             agent_coordinator,
             agent_provider_factory,
             child_provider_by_agent: HashMap::new(),
             child_execution_by_agent: HashMap::new(),
-            diagnostic_native_thread: HashSet::new(),
             mcp_notice: HashMap::new(),
             child_exchange_runtime_by_agent: HashMap::new(),
             presentation,
@@ -2445,6 +2438,7 @@ impl HarnessBroker {
         });
         Some(crate::tools::ControlTurnContext {
             provider_completion: Default::default(),
+            provider_continuation: None,
             questions: Some(self.questions.clone()),
             question_exchange_id: self
                 .exchange_runtime
@@ -2458,13 +2452,28 @@ impl HarnessBroker {
                     .ok()
                     .flatten()
                     .and_then(|task| match task.workflow.clone() {
-                        crate::task::WorkflowSnapshot::Goal { goal } if goal.native => {
-                            Some(goal.objective)
-                        }
+                        crate::task::WorkflowSnapshot::Goal { goal } if goal.native => Some(
+                            if matches!(
+                                &self.input_purpose,
+                                crate::input::InputPurpose::TaskContinuation { .. }
+                            ) {
+                                forge_provider_api::NativeGoalCommand::Resume {
+                                    objective: goal.objective,
+                                }
+                            } else {
+                                forge_provider_api::NativeGoalCommand::Set {
+                                    objective: goal.objective,
+                                }
+                            },
+                        ),
                         _ => None,
                     })
             } else {
                 None
+            },
+            task_start: match &self.input_purpose {
+                crate::input::InputPurpose::TaskEntry { start, .. } => Some(start.clone()),
+                _ => None,
             },
             task_permit: callback_snapshot
                 .as_ref()
@@ -3115,7 +3124,7 @@ impl HarnessBroker {
             }
             RuntimeMethod::SessionAgentModelList => {
                 let provider =
-                    crate::provider::ProviderKind::parse(&required_text(&params, "provider")?)?;
+                    forge_providers::registry::select(&required_text(&params, "provider")?)?;
                 let model = self
                     .agent_provider_factory
                     .catalog(
@@ -3599,7 +3608,12 @@ impl HarnessBroker {
                         .iter()
                         .any(|approval| {
                             approval.execution_owner.as_ref().is_some_and(|owner| {
-                                owner.agent_id == agent.id && owner.session_id == self.session.id
+                                owner.agent_id
+                                    == forge_provider_api::AgentId::from(agent.id.as_str())
+                                    && owner.session_id
+                                        == forge_provider_api::SessionId::from(
+                                            self.session.id.as_str(),
+                                        )
                             })
                         });
                 let result = serde_json::to_value(crate::agent::AgentActivity::capture(
@@ -3763,7 +3777,7 @@ impl HarnessBroker {
                     .agent_provider_factory
                     .resolve(
                         &root,
-                        crate::provider::ProviderKind::parse(&self.session.provider)?,
+                        forge_providers::registry::select(&self.session.provider)?,
                         spawn,
                     )
                     .await?;
@@ -3950,7 +3964,7 @@ impl HarnessBroker {
             self.agent_registry.insert(agent.clone());
             self.agent_coordinator.retain(agent, task.clone())?;
             self.agent_coordinator
-                .settled(&owner.agent_id, &task.id, false)?;
+                .settled(owner.agent_id.as_str(), &task.id, false)?;
             self.child_provider_by_agent.remove(owner.agent_id.as_str());
             self.child_execution_by_agent
                 .remove(owner.agent_id.as_str());
@@ -3978,7 +3992,7 @@ impl HarnessBroker {
     ) -> Result<Option<(crate::provider::ExecutionOwner, String, anyhow::Error)>> {
         let owner = admission.owner().clone();
         anyhow::ensure!(
-            owner.session_id == self.session.id,
+            owner.session_id == forge_provider_api::SessionId::from(self.session.id.as_str()),
             "child execution belongs to another session"
         );
         let prepared = (|| -> Result<_> {
@@ -4008,7 +4022,8 @@ impl HarnessBroker {
                     .selection
                     .as_ref()
                     .context("child selection missing")?
-                    .provider,
+                    .provider
+                    .clone(),
             )?;
             let cancellation = self
                 .agent_coordinator
@@ -4185,7 +4200,8 @@ impl HarnessBroker {
         event: &mut Vec<SessionEvent>,
     ) -> Result<AppliedProviderEvent> {
         anyhow::ensure!(
-            owner.session_id == self.session.id && !owner.is_root(),
+            owner.session_id == forge_provider_api::SessionId::from(self.session.id.as_str())
+                && !owner.is_root(),
             "child event crosses execution ownership"
         );
         let binding = provider_event.scope();
@@ -4193,7 +4209,8 @@ impl HarnessBroker {
             .invocation()
             .context("child event requires invocation ownership")?;
         anyhow::ensure!(
-            scope.owner == owner && scope.exchange_id == task_id,
+            scope.owner == owner
+                && scope.exchange_id == forge_provider_api::ExchangeId::from(task_id),
             "child provider event has a different execution owner or task"
         );
         let mut task = self
@@ -4201,7 +4218,7 @@ impl HarnessBroker {
             .task(task_id)
             .context("child event has no admitted task")?;
         anyhow::ensure!(
-            task.agent_id == owner.agent_id,
+            forge_provider_api::AgentId::from(task.agent_id.as_str()) == owner.agent_id,
             "child event has a different task owner"
         );
         if task.completed_at_ms.is_some() {
@@ -4209,16 +4226,20 @@ impl HarnessBroker {
         }
         if let ProviderEvent::Agent {
             update: crate::provider::AgentUpdate::Lifecycle { event: lifecycle },
-            ..
+            scope,
         } = &provider_event
         {
-            self.apply_agent_lifecycle(lifecycle, Some(&task.parent_exchange_id), event)?;
+            self.apply_agent_lifecycle(lifecycle, Some(scope), event)?;
             return Ok(AppliedProviderEvent::Effects(Vec::new()));
         }
-        if provider_event
-            .turn_address()
-            .is_some_and(|address| self.diagnostic_native_thread.contains(&address.thread_id))
-        {
+        if provider_event.turn_address().is_some_and(|address| {
+            self.observed_agent_conversations
+                .iter()
+                .any(|(invocation, conversation)| {
+                    invocation == &address.scope.invocation_id
+                        && conversation.as_str() == address.thread_id
+                })
+        }) {
             return Ok(AppliedProviderEvent::Effects(Vec::new()));
         }
         let provider_thread_id = match &provider_event {
@@ -4231,7 +4252,7 @@ impl HarnessBroker {
                 .map(|address| address.thread_id.as_str()),
         };
         if let Some(thread_id) = provider_thread_id.filter(|id| !id.is_empty()) {
-            let mut agent = self.agent_coordinator.resolve(&owner.agent_id)?;
+            let mut agent = self.agent_coordinator.resolve(owner.agent_id.as_str())?;
             if agent.provider_thread_id.as_deref() != Some(thread_id) {
                 agent.provider_thread_id = Some(thread_id.to_owned());
                 self.store.save_agent_run(&agent)?;
@@ -4247,7 +4268,7 @@ impl HarnessBroker {
             ..
         } = &provider_event
         {
-            let mut agent = self.agent_coordinator.resolve(&owner.agent_id)?;
+            let mut agent = self.agent_coordinator.resolve(owner.agent_id.as_str())?;
             if let Some(model) = runtime.model.as_ref().filter(|model| !model.is_empty())
                 && let Some(selection) = agent.selection.as_mut()
             {
@@ -4262,7 +4283,7 @@ impl HarnessBroker {
             task.state = ExchangeState::Running;
             self.store.save_agent_task(&task)?;
             self.agent_coordinator.retain(
-                self.agent_coordinator.resolve(&owner.agent_id)?,
+                self.agent_coordinator.resolve(owner.agent_id.as_str())?,
                 task.clone(),
             )?;
         }
@@ -4366,8 +4387,10 @@ impl HarnessBroker {
                 .max(self.clock.now_ms()),
         );
         self.store.save_agent_task(&task)?;
-        self.agent_coordinator
-            .retain(self.agent_coordinator.resolve(&owner.agent_id)?, task)?;
+        self.agent_coordinator.retain(
+            self.agent_coordinator.resolve(owner.agent_id.as_str())?,
+            task,
+        )?;
         self.child_exchange_runtime_by_agent
             .insert(owner.agent_id.to_string(), runtime);
         let mut effects = Vec::new();
@@ -4392,7 +4415,8 @@ impl HarnessBroker {
             .task(&task_id)
             .context("child completion has no admitted task")?;
         anyhow::ensure!(
-            owner.session_id == self.session.id && task.agent_id == owner.agent_id,
+            owner.session_id == forge_provider_api::SessionId::from(self.session.id.as_str())
+                && forge_provider_api::AgentId::from(task.agent_id.as_str()) == owner.agent_id,
             "child completion crosses execution ownership"
         );
         if task.completed_at_ms.is_some() {
@@ -4421,16 +4445,17 @@ impl HarnessBroker {
             .task(&task_id)
             .context("child completion has no admitted task")?;
         anyhow::ensure!(
-            owner.session_id == self.session.id && task.agent_id == owner.agent_id,
+            owner.session_id == forge_provider_api::SessionId::from(self.session.id.as_str())
+                && forge_provider_api::AgentId::from(task.agent_id.as_str()) == owner.agent_id,
             "child completion crosses execution ownership"
         );
         if task.completed_at_ms.is_some() {
             return Ok((AppliedProviderEvent::Effects(Vec::new()), None));
         }
-        let mut agent = self.agent_coordinator.resolve(&owner.agent_id)?;
+        let mut agent = self.agent_coordinator.resolve(owner.agent_id.as_str())?;
         let interrupted = self
             .agent_coordinator
-            .cancellation(&owner.agent_id, &task_id)
+            .cancellation(owner.agent_id.as_str(), &task_id)
             .is_ok_and(|cancel| *cancel.borrow());
         let provider_cancelled = output
             .as_ref()
@@ -4507,9 +4532,11 @@ impl HarnessBroker {
         self.store.complete_agent_task(&agent, &task, &exchange)?;
         self.agent_registry.insert(agent.clone());
         self.agent_coordinator.retain(agent.clone(), task.clone())?;
-        let next =
-            self.agent_coordinator
-                .settled(&owner.agent_id, &task_id, cleanup_error.is_some())?;
+        let next = self.agent_coordinator.settled(
+            owner.agent_id.as_str(),
+            &task_id,
+            cleanup_error.is_some(),
+        )?;
         if cleanup_error.is_none() {
             self.child_provider_by_agent.remove(owner.agent_id.as_str());
             self.child_execution_by_agent
@@ -4522,15 +4549,16 @@ impl HarnessBroker {
     fn apply_agent_lifecycle(
         &mut self,
         lifecycle: &AgentLifecycleEvent,
-        _parent_exchange_id: Option<&str>,
+        scope: Option<&crate::provider::InvocationScope>,
         _event: &mut Vec<SessionEvent>,
     ) -> Result<Option<Agent>> {
-        if let Some(thread) = &lifecycle.provider_thread_id {
-            self.diagnostic_native_thread.insert(thread.clone());
+        if let (Some(scope), Some(conversation)) = (scope, &lifecycle.conversation_id) {
+            self.observed_agent_conversations
+                .insert((scope.invocation_id.clone(), conversation.clone()));
         }
         self.trace.record(
             &self.session.id,
-            "agent.native_diagnostic",
+            "agent.lifecycle",
             serde_json::to_value(lifecycle)?,
         );
         Ok(None)
@@ -5709,8 +5737,9 @@ impl HarnessBroker {
                 self.emit_session_update(
                     SessionUpdate::Diagnostic {
                         diagnostic: crate::provider::ProviderDiagnostic {
-                            code: None,
-                            message: reason.clone(),
+                            kind: forge_provider_api::ProviderFailureKind::Unknown,
+                            message: forge_provider_api::SanitizedMessage::new(reason.clone())
+                                .expect("host diagnostic is nonempty"),
                             fatal: false,
                         },
                     },
@@ -5759,8 +5788,7 @@ impl HarnessBroker {
         let tool_gate = self
             .checkpoint
             .as_ref()
-            .map(|_| crate::checkpoint::ToolGate::new())
-            .transpose()?;
+            .map(|_| crate::checkpoint::ToolGate::new());
         let checkpoint = self.checkpoint.clone().map(|checkpoint| {
             let objects = self.store.objects.clone();
             let repositories = Arc::clone(&self.repositories);
@@ -5849,8 +5877,8 @@ impl HarnessBroker {
                 saved
                     .as_ref()
                     .map(|_| ())
-                    .map_err(|error| format!("{error:#}")),
-            )?;
+                    .map_err(|_| crate::checkpoint::CheckpointGateError::Persistence),
+            );
         }
         self.trace.record(
             &self.session.id,
@@ -5967,8 +5995,9 @@ impl HarnessBroker {
             self.emit_session_update(
                 SessionUpdate::Diagnostic {
                     diagnostic: crate::provider::ProviderDiagnostic {
-                        code: None,
-                        message: message.clone(),
+                        kind: forge_provider_api::ProviderFailureKind::Unknown,
+                        message: forge_provider_api::SanitizedMessage::new(message.clone())
+                            .expect("host diagnostic is nonempty"),
                         fatal: false,
                     },
                 },
@@ -6102,9 +6131,7 @@ impl HarnessBroker {
                         .tool_gate
                         .as_ref()
                         .expect("blocked tool gate")
-                        .complete(Err(
-                            "turn cancelled before checkpoint admission completed".into()
-                        ))?;
+                        .complete(Err(crate::checkpoint::CheckpointGateError::OwnerEnded));
                     runtime.checkpoint.take();
                     interaction.finalization_error = None;
                     interaction.finish(outcome, self.clock.now_ms())?;
@@ -6207,7 +6234,8 @@ impl HarnessBroker {
     ) -> Result<OwnedForegroundTransaction> {
         anyhow::ensure!(
             scope.owner == crate::provider::ExecutionOwner::root(&self.session.id)
-                && scope.exchange_id == interaction.id,
+                && scope.exchange_id
+                    == forge_provider_api::ExchangeId::from(interaction.id.as_str()),
             "foreground transaction crosses execution ownership"
         );
         let runtime = self
@@ -6668,7 +6696,8 @@ impl HarnessBroker {
             .task(&task_id)
             .context("child completion has no admitted task")?;
         anyhow::ensure!(
-            owner.session_id == self.session.id && task.agent_id == owner.agent_id,
+            owner.session_id == forge_provider_api::SessionId::from(self.session.id.as_str())
+                && forge_provider_api::AgentId::from(task.agent_id.as_str()) == owner.agent_id,
             "child completion crosses execution ownership"
         );
         if task.completed_at_ms.is_some() {
@@ -6720,7 +6749,8 @@ impl HarnessBroker {
             .task(&task_id)
             .context("child completion disappeared")?;
         anyhow::ensure!(
-            owner.session_id == self.session.id && task.agent_id == owner.agent_id,
+            owner.session_id == forge_provider_api::SessionId::from(self.session.id.as_str())
+                && forge_provider_api::AgentId::from(task.agent_id.as_str()) == owner.agent_id,
             "child completion owner changed during approval cancellation"
         );
         if task.completed_at_ms.is_some() {
@@ -7088,14 +7118,14 @@ impl HarnessBroker {
                 {
                     root.model = model.clone();
                 }
-                let root_provider =
-                    match crate::provider::ProviderKind::parse(&self.session.provider) {
-                        Ok(provider) => provider,
-                        Err(error) => {
-                            let _ = owned.response.send(Err(error));
-                            return Ok(ForegroundAction::Wait);
-                        }
-                    };
+                let root_provider = match forge_providers::registry::select(&self.session.provider)
+                {
+                    Ok(provider) => provider,
+                    Err(error) => {
+                        let _ = owned.response.send(Err(error.into()));
+                        return Ok(ForegroundAction::Wait);
+                    }
+                };
                 Ok(ForegroundAction::Effect(ForegroundJob::AgentSpawnSelect {
                     factory: self.agent_provider_factory.clone(),
                     root: Box::new(root),
@@ -7205,7 +7235,9 @@ impl HarnessBroker {
                     .iter()
                     .any(|approval| {
                         approval.execution_owner.as_ref().is_some_and(|owner| {
-                            owner.agent_id == agent.id && owner.session_id == self.session.id
+                            owner.agent_id == forge_provider_api::AgentId::from(agent.id.as_str())
+                                && owner.session_id
+                                    == forge_provider_api::SessionId::from(self.session.id.as_str())
                         })
                     });
                 Ok(serde_json::to_value(crate::agent::AgentActivity::capture(
@@ -7295,8 +7327,9 @@ impl HarnessBroker {
             let mut agent = self.agent_coordinator.resolve(target)?;
             if let Some((owner, registry)) = &captured {
                 anyhow::ensure!(
-                    owner.session_id == self.session.id
-                        && owner.agent_id == agent.id
+                    owner.session_id
+                        == forge_provider_api::SessionId::from(self.session.id.as_str())
+                        && owner.agent_id == forge_provider_api::AgentId::from(agent.id.as_str())
                         && self
                             .child_execution_by_agent
                             .get(&agent.id)
@@ -7318,9 +7351,9 @@ impl HarnessBroker {
             let delivery = match result {
                 Ok(()) => crate::agent::MessageDelivery::Steered,
                 Err(error)
-                    if error.downcast_ref::<ProviderError>().is_some_and(|error| {
-                        matches!(error, ProviderError::DeliveryUncertain { .. })
-                    }) =>
+                    if error
+                        .downcast_ref::<ProviderError>()
+                        .is_some_and(|error| matches!(error, ProviderError::DeliveryUncertain)) =>
                 {
                     return Err(error.context(
                         "child message delivery is uncertain and was not queued for replay",
@@ -7510,7 +7543,8 @@ impl HarnessBroker {
                     approvals,
                 } = item;
                 anyhow::ensure!(
-                    owner.session_id == self.session.id
+                    owner.session_id
+                        == forge_provider_api::SessionId::from(self.session.id.as_str())
                         && self.agent_coordinator.resolve(&agent.id)?.id == agent.id,
                     "interrupted child authority changed during cleanup"
                 );
@@ -7579,7 +7613,7 @@ impl HarnessBroker {
                     self.agent_registry.insert(agent.clone());
                     self.agent_coordinator.retain(agent, task.clone())?;
                     self.agent_coordinator
-                        .settled(&owner.agent_id, &task.id, false)?;
+                        .settled(owner.agent_id.as_str(), &task.id, false)?;
                     self.child_provider_by_agent.remove(owner.agent_id.as_str());
                     self.child_execution_by_agent
                         .remove(owner.agent_id.as_str());
@@ -8058,7 +8092,7 @@ impl HarnessBroker {
             return Ok(AppliedProviderEvent::None);
         }
         if scope.invocation().is_some_and(|scope| {
-            scope.exchange_id != interaction.id
+            scope.exchange_id != forge_provider_api::ExchangeId::from(interaction.id.as_str())
                 && !interaction
                     .turn
                     .iter()
@@ -8104,9 +8138,9 @@ impl HarnessBroker {
             )),
             ProviderEvent::Agent {
                 update: crate::provider::AgentUpdate::Lifecycle { event: lifecycle },
-                ..
+                scope,
             } => {
-                self.apply_agent_lifecycle(&lifecycle, Some(&interaction.id), event)?;
+                self.apply_agent_lifecycle(&lifecycle, Some(&scope), event)?;
                 Ok(AppliedProviderEvent::None)
             }
             ProviderEvent::Agent { .. } => Ok(AppliedProviderEvent::None),
@@ -8299,7 +8333,12 @@ impl HarnessBroker {
         let mut effects = Vec::new();
         self.prepare_provider_observation(interaction, &provider_event);
         if provider_event.turn_address().is_some_and(|address| {
-            self.diagnostic_native_thread.contains(&address.thread_id)
+            self.observed_agent_conversations
+                .iter()
+                .any(|(invocation, conversation)| {
+                    invocation == &address.scope.invocation_id
+                        && conversation.as_str() == address.thread_id
+                })
                 || self
                     .agent_registry
                     .get_by_thread(&address.thread_id)
@@ -9356,22 +9395,18 @@ impl HarnessBroker {
         let owner = crate::provider::ExecutionOwner::root(&self.session.id);
         let expected = self.task_controller.current()?;
         let lane = self.task_controller.native_goal_lane();
-        let _lane = match tokio::time::timeout(std::time::Duration::from_secs(30), lane.lock())
-            .await
-        {
-            Ok(guard) => guard,
-            Err(_) => {
-                self.task_controller.mark_native_goal_uncertain();
-                let error = anyhow::Error::new(ProviderError::DeliveryUncertain {
-                    message: "native goal transport lane timed out; provider outcome is uncertain"
-                        .into(),
-                });
-                return Err(match registry.fence(&owner).await {
-                    Ok(()) => error,
-                    Err(cleanup) => error.context(cleanup),
-                });
-            }
-        };
+        let _lane =
+            match tokio::time::timeout(std::time::Duration::from_secs(30), lane.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    self.task_controller.mark_native_goal_uncertain();
+                    let error = anyhow::Error::new(ProviderError::DeliveryUncertain);
+                    return Err(match registry.fence(&owner).await {
+                        Ok(()) => error,
+                        Err(cleanup) => error.context(cleanup),
+                    });
+                }
+            };
         self.task_controller.ensure_native_goal_certain()?;
         anyhow::ensure!(
             foreground_failure::same_retraction_task(
@@ -9392,18 +9427,11 @@ impl HarnessBroker {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
                 self.task_controller.mark_native_goal_uncertain();
-                Err(error.context(ProviderError::DeliveryUncertain {
-                    message:
-                        "native goal update failed after dispatch; provider outcome is uncertain"
-                            .into(),
-                }))
+                Err(anyhow::Error::new(error).context(ProviderError::DeliveryUncertain))
             }
             Err(_) => {
                 self.task_controller.mark_native_goal_uncertain();
-                Err(ProviderError::DeliveryUncertain {
-                    message: "native goal update timed out; provider outcome is uncertain".into(),
-                }
-                .into())
+                Err(ProviderError::DeliveryUncertain.into())
             }
         };
         let epoch = match self.task_controller.native_goal_written() {
@@ -9431,12 +9459,7 @@ impl HarnessBroker {
         let _ = epoch;
         result?;
         if changed {
-            return Err(ProviderError::DeliveryUncertain {
-                message:
-                    "task changed during native goal update; canonical reconciliation is pending"
-                        .into(),
-            }
-            .into());
+            return Err(ProviderError::DeliveryUncertain.into());
         }
         Ok(())
     }
@@ -9673,7 +9696,7 @@ impl HarnessBroker {
         let native_cleanup = self.provider.shutdown().await;
         execution_cleanup?;
         native_cleanup?;
-        self.provider = Arc::from(replacement);
+        self.provider = replacement;
         session.provider_session_id = None;
         session.provider_checkpoint_id = None;
         session.provider_fork_state = ProviderForkState::Ready;
@@ -9730,6 +9753,15 @@ impl HarnessBroker {
             } => ProviderInput::Skill {
                 name,
                 arguments: format!("{context}{arguments}"),
+                attachments,
+            },
+            ProviderInput::QuestionReply {
+                reply,
+                context: previous,
+                attachments,
+            } => ProviderInput::QuestionReply {
+                reply,
+                context: format!("{context}{previous}"),
                 attachments,
             },
         })
@@ -9824,7 +9856,7 @@ impl HarnessBroker {
         let child = prepare_new_session(
             &self.data_root,
             &self.client_id,
-            &self.provider_launch.kind,
+            self.provider_launch.kind.as_str(),
             self.provider.descriptor().capability.native_compact,
             &self.session.id,
             &params,
@@ -9852,7 +9884,7 @@ impl HarnessBroker {
             "cross-worktree resume requires native fork"
         );
         anyhow::ensure!(
-            session.provider == self.provider_launch.kind,
+            session.provider == self.provider_launch.kind.as_str(),
             "session uses a different configured provider"
         );
         if session.id == self.session.id {
@@ -10091,7 +10123,8 @@ impl HarnessBroker {
             });
         };
         anyhow::ensure!(
-            scope.owner().session_id == self.session.id,
+            scope.owner().session_id
+                == forge_provider_api::SessionId::from(self.session.id.as_str()),
             "compaction crosses session ownership"
         );
         self.retain_external_compaction(*compaction, now_ms)?;
@@ -10154,14 +10187,17 @@ impl HarnessBroker {
             Ok(output) => output,
             Err(error) => {
                 compaction.state = crate::provider::CompactionState::Failed;
-                compaction.result.error = Some(format!("{error:#}"));
+                compaction.result.diagnostic = Some(crate::provider::lifecycle_error::diagnostic(
+                    forge_provider_api::ProviderOperation::CompactSession,
+                    &error,
+                ));
                 record.detail = SessionEventKind::Compaction {
                     compaction: compaction.into(),
                 };
                 self.store.save_session_event(&record)?;
                 let patch = self.reconcile_timeline()?;
                 self.emit_timeline_patch(patch, &mut event).await?;
-                return Err(error);
+                return Err(error.into());
             }
         };
         let observed = output.event.iter().rev().find_map(|event| match event {
@@ -10185,11 +10221,14 @@ impl HarnessBroker {
                 .map(|usage| usage.used);
         }
         let failed = compaction.state == crate::provider::CompactionState::Failed;
-        let failure = compaction
-            .result
-            .error
-            .clone()
-            .unwrap_or_else(|| "Provider compaction failed".into());
+        let failure =
+            forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::CompactSession,
+                compaction.result.diagnostic.as_ref().map_or(
+                    forge_provider_api::ProviderFailureKind::Unknown,
+                    |diagnostic| diagnostic.kind,
+                ),
+            ));
         record.detail = SessionEventKind::Compaction {
             compaction: compaction.into(),
         };
@@ -10218,7 +10257,9 @@ impl HarnessBroker {
         let snapshot = self.snapshot()?;
         let patch = self.reconcile_timeline()?;
         self.emit_timeline_patch(patch, &mut event).await?;
-        anyhow::ensure!(!failed, "{failure}");
+        if failed {
+            return Err(failure.into());
+        }
         event.push(self.event("context_compacted", serde_json::to_value(&snapshot)?)?);
         Ok((serde_json::to_value(&snapshot)?, event))
     }
@@ -10583,193 +10624,127 @@ mod test {
         Ok(())
     }
 
-    struct AutomaticCheckProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    fn automatic_check_fixture(
         turns: Arc<std::sync::atomic::AtomicUsize>,
         repair: bool,
         explicit: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for AutomaticCheckProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn checkpoint_tool_gate(&self) -> bool {
-            true
-        }
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Automatic check fixture".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-        async fn has_active_turn(&self, _: &str) -> bool {
-            false
-        }
-        async fn cleanup_execution(
-            &self,
-            _: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-        async fn cancel_session(
-            &self,
-            _: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-        async fn active_session_id_for(
-            &self,
-            _: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-        async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> {
-            Ok(false)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-    }
-
-    impl AutomaticCheckProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let fixture_scope = sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(sink);
-            let sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let sink = Some(sink);
-                    if let Some(checkpoint) = request
-                        .control_context
-                        .as_ref()
-                        .and_then(|context| context.checkpoint.as_ref())
-                    {
-                        checkpoint.wait().await?;
-                    }
-                    let turn = self.turns.fetch_add(1, Ordering::SeqCst);
-                    if turn == 0 || self.repair {
-                        std::fs::write(
-                            Path::new(&request.workspace).join("seed.txt"),
-                            if turn > 0 { "fixed" } else { "broken" },
-                        )?;
-                    }
-                    if turn == 0 && self.explicit {
-                        let context = request.control_context.as_ref().unwrap();
-                        let advertised = crate::tools::ControlToolRegistry
-                            .definition_list_for_context(Some(context), true);
-                        assert!(advertised.iter().any(|tool| tool.name == "check_run"));
-                        assert!(
-                            !crate::tools::ControlToolRegistry
-                                .definition_list_for_context(Some(context), false)
-                                .iter()
-                                .any(|tool| tool.name.starts_with("check_"))
-                        );
-                        let scope = request
-                            .control_context
-                            .as_ref()
-                            .unwrap()
-                            .checks
-                            .as_ref()
-                            .unwrap();
-                        let started: Value = serde_json::from_str(
-                            &scope.invoke("check_run", json!({"check":"verify"})).await?,
-                        )?;
-                        loop {
-                            let run: Value = serde_json::from_str(
-                                &scope
-                                    .invoke(
-                                        "check_status",
-                                        json!({"run_id":started["run_id"],"wait_ms":30000}),
-                                    )
-                                    .await?,
-                            )?;
-                            if run["state"] != "running" {
-                                break;
+        workspace: PathBuf,
+    ) -> Result<crate::provider::test_support::ProviderTestSession> {
+        let descriptor = crate::provider::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            label: "Automatic check fixture".into(),
+            capability: crate::provider::test_support::fixture_capability(),
+        };
+        let fixture =
+            crate::provider::test_support::EventFixtureProvider::new(
+                descriptor.clone(),
+                move |request, sink, _cancelled| {
+                    let turns = turns.clone();
+                    let workspace = workspace.clone();
+                    let descriptor = descriptor.clone();
+                    async move {
+                        let turn = turns.fetch_add(1, Ordering::SeqCst);
+                        if turn == 0 || repair {
+                            std::fs::write(
+                                workspace.join("seed.txt"),
+                                if turn > 0 { "fixed" } else { "broken" },
+                            )
+                            .map_err(|_| {
+                                crate::provider::ProviderError::Failure(
+                                    forge_provider_api::ProviderFailure::new(
+                                        forge_provider_api::ProviderOperation::NativeTransport,
+                                        forge_provider_api::ProviderFailureKind::Unknown,
+                                    ),
+                                )
+                            })?;
+                        }
+                        if turn == 0 && explicit {
+                            assert!(request.tools.iter().any(|tool| tool.name == "check_run"));
+                            assert!(!request.tools.iter().any(
+                                |tool| tool.name.starts_with("check_")
+                                    && tool.name != "check_run"
+                                    && tool.name != "check_status"
+                            ));
+                            let started = crate::provider::test_support::call_tool(
+                                &request,
+                                "check_run",
+                                json!({"check":"verify"}),
+                            )
+                            .await?;
+                            loop {
+                                let run = crate::provider::test_support::call_tool(
+                                    &request,
+                                    "check_status",
+                                    json!({"run_id":started["run_id"],"wait_ms":30000}),
+                                )
+                                .await?;
+                                if run["state"] != "running" {
+                                    break;
+                                }
                             }
                         }
-                    }
-                    if let Some(sink) = sink {
+                        let scope = request.scope.clone();
                         let address = crate::provider::TurnAddress {
-                            scope: fixture_scope.clone(),
+                            scope: scope.clone(),
                             thread_id: "automatic-check-stream".into(),
-                            turn_id: (turn.to_string()).into(),
+                            turn_id: turn.to_string().into(),
                         };
-                        sink.send_wait(completed_message(
+                        sink.send_wait(ProviderEvent::Execution {
+                            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                                scope.clone(),
+                                forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                                    address: address.clone(),
+                                },
+                            )?,
+                        })
+                        .await?;
+                        sink.send_wait(ProviderEvent::Turn {
+                            address: address.clone(),
+                            update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
+                        })
+                        .await?;
+                        for event in completed_message(
                             &address,
                             "repair-message",
                             crate::provider::MessageRole::Commentary,
                             "Check repair response",
-                        ))
-                        .await?;
+                        ) {
+                            sink.send_wait(event).await?;
+                        }
                         sink.send_wait(ProviderEvent::Turn {
-                            address,
+                            address: address.clone(),
                             update: crate::provider::TurnUpdate::Finished {
-                                outcome: crate::turn::TurnOutcome::Completed,
+                                outcome: forge_provider_api::turn::TurnOutcome::Completed,
                                 completed_at_ms: 100,
                             },
                         })
                         .await?;
+                        sink.send_wait(ProviderEvent::Execution {
+                            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                                scope,
+                                forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                                    address,
+                                    covered_submissions: vec![request.submission_id],
+                                    completed_at_ms: 100,
+                                    result:
+                                        forge_provider_api::lifecycle::ExecutionResult::Completed {
+                                            completion:
+                                                forge_provider_api::completion::ProviderCompletion {
+                                                    capability: descriptor.capability.clone(),
+                                                    ..Default::default()
+                                                }
+                                                .into(),
+                                        },
+                                },
+                            )?,
+                        })
+                        .await?;
+                        Ok(())
                     }
-                    Ok(crate::provider::ProviderCompletion::default())
-                }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
+                },
+            );
+        crate::provider::test_support::ProviderTestSession::from_native(fixture)
     }
 
     #[tokio::test]
@@ -10778,12 +10753,13 @@ mod test {
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.shell = crate::session::CheckShell::Nushell;
-        broker.provider = Arc::new(AutomaticCheckProvider {
-            fixture_events: Default::default(),
-            turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            repair: true,
-            explicit: false,
-        });
+        let provider = automatic_check_fixture(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            true,
+            false,
+            repository.path().to_owned(),
+        )?;
+        broker.provider = provider.provider_handle();
         std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true,"paths":["seed.txt"]},"action":{"command":"print ok","label":"Verify","category":"test"}}}}).to_string())?;
         assert!(!broker.snapshot()?.automatic_checks);
         broker
@@ -10831,12 +10807,9 @@ mod test {
         broker.session.approval_mode = ApprovalMode::Allow;
         broker.session.shell = crate::session::CheckShell::Nushell;
         let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        broker.provider = Arc::new(AutomaticCheckProvider {
-            fixture_events: Default::default(),
-            turns: turns.clone(),
-            repair: false,
-            explicit: false,
-        });
+        let provider =
+            automatic_check_fixture(turns.clone(), false, false, repository.path().to_owned())?;
+        broker.provider = provider.provider_handle();
         std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true,"paths":["seed.txt"]},"action":{"command":"print queue-pass","label":"Verify","category":"test"}}}}).to_string())?;
         assert_eq!(
             broker.snapshot()?.check_timing,
@@ -10879,12 +10852,13 @@ mod test {
             .configure_session(json!({"automatic_checks":true}))
             .await?;
         broker.session.shell = crate::session::CheckShell::Nushell;
-        broker.provider = Arc::new(AutomaticCheckProvider {
-            fixture_events: Default::default(),
-            turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            repair: true,
-            explicit: false,
-        });
+        let provider = automatic_check_fixture(
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            true,
+            false,
+            repository.path().to_owned(),
+        )?;
+        broker.provider = provider.provider_handle();
         std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true,"paths":["seed.txt"]},"action":{"command":"if ((open --raw seed.txt) | str contains fixed) { print ok } else { exit 7 }","label":"Verify","category":"test"}}}}).to_string())?;
         let (mut exchange, _, _) = broker
             .test_stage_interaction_for_turn("Resumed edit", true, broker.clock.now_ms())
@@ -10952,214 +10926,171 @@ mod test {
         );
     }
 
-    struct CheckpointProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    fn checkpoint_fixture(
+        workspace: PathBuf,
         preparation: Option<Arc<PreparationProbe>>,
         started: Arc<tokio::sync::Notify>,
         tool_ran: Arc<std::sync::atomic::AtomicBool>,
         active: Arc<std::sync::atomic::AtomicUsize>,
         native_rejection: Option<Arc<PreparationProbe>>,
-        cleanup_error: Option<fn() -> crate::provider::ProviderError>,
-    }
-
-    struct ActiveProviderProbe(Arc<std::sync::atomic::AtomicUsize>);
-
-    impl Drop for ActiveProviderProbe {
-        fn drop(&mut self) {
-            self.0.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for CheckpointProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        async fn fence_session(
-            &self,
-            _: &crate::provider::ExecutionOwner,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move {
-                // This fixture has no external callback registration to revoke.
-                Ok(())
-            }
-            .await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::FenceSession,
-                    source,
-                )
-            })
-        }
-        async fn reset_session(
-            &self,
-            owner: &crate::provider::ExecutionOwner,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move {
-                self.fixture_events.reset_owner(owner).await?;
-                Ok(())
-            }
-            .await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::ResetSession,
-                    source,
-                )
-            })
-        }
-        async fn prepare_turn(&self, _: &str) -> Result<()> {
-            if let Some(preparation) = &self.preparation {
-                preparation.started.notify_one();
-                preparation.release.notified().await;
-                anyhow::ensure!(!preparation.fail, "fixture preparation failed");
-            }
-            Ok(())
-        }
-        fn checkpoint_tool_gate(&self) -> bool {
-            true
-        }
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Checkpoint fixture".into(),
-                capability: crate::provider::mock_capability(),
+        cleanup_error: bool,
+    ) -> Result<crate::provider::test_support::ProviderTestSession> {
+        struct ActiveProbe(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for ActiveProbe {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
             }
         }
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-        async fn has_active_turn(&self, _: &str) -> bool {
-            false
-        }
-        async fn cleanup_execution(
-            &self,
-            session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            self.fixture_events.cancel_runtime(session_id).await?;
-            match self.cleanup_error {
-                Some(error) => Err(error()),
-                None => Ok(()),
-            }
-        }
-        async fn cancel_session(
-            &self,
-            session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            self.fixture_events.cancel_runtime(session_id).await?;
-            match self.cleanup_error {
-                Some(error) => Err(error()),
-                None => Ok(()),
-            }
-        }
-        async fn active_session_id_for(
-            &self,
-            _: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-        async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> {
-            Ok(true)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            if let Some(rejection) = &self.native_rejection {
-                rejection.started.notify_one();
-                rejection.release.notified().await;
-                return Err(crate::provider::ProviderError::PreparationFailed(Arc::new(
-                    crate::provider::ProviderError::Rejected {
-                        message: "fixture native preparation rejected".into(),
-                    },
-                )));
-            }
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-    }
-
-    impl CheckpointProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            _sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            if let Some(submission) = &request.submission {
-                submission.sending(crate::provider::submission::SubmissionTarget::Untracked)?;
-                submission.accepted("checkpoint fixture accepted input".into())?;
-            }
-            let fixture_scope = _sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(_sink);
-            let _sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let _sink = Some(_sink);
-                    self.active.fetch_add(1, Ordering::SeqCst);
-                    let _active = ActiveProviderProbe(Arc::clone(&self.active));
-                    _sink
-                        .as_ref()
-                        .context("checkpoint fixture requires events")?
-                        .send(ProviderEvent::Turn {
-                            address: crate::provider::TurnAddress {
-                                scope: fixture_scope.clone(),
-                                thread_id: "checkpoint-thread".into(),
-                                turn_id: "checkpoint-turn".into(),
-                            },
-                            update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
-                        })?;
-                    self.started.notify_one();
-                    request
-                        .control_context
-                        .as_ref()
-                        .and_then(|context| context.checkpoint.as_ref())
-                        .context("fixture requires a checkpoint barrier")?
-                        .wait()
+        let descriptor = crate::provider::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            label: "Normalized checkpoint fixture".into(),
+            capability: crate::provider::test_support::fixture_capability(),
+        };
+        let fixture = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor.clone(),
+            {
+                let started = started.clone();
+                let tool_ran = tool_ran.clone();
+                let active = active.clone();
+                move |request, sink, _cancelled| {
+                    let started = started.clone();
+                    let tool_ran = tool_ran.clone();
+                    let active = active.clone();
+                    let workspace = workspace.clone();
+                    let descriptor = descriptor.clone();
+                    async move {
+                        active.fetch_add(1, Ordering::SeqCst);
+                        let _active = ActiveProbe(active);
+                        let scope = request.scope.clone();
+                        let address = crate::provider::TurnAddress {
+                            scope: scope.clone(),
+                            thread_id: "checkpoint-thread".into(),
+                            turn_id: "checkpoint-turn".into(),
+                        };
+                        sink.send_wait(ProviderEvent::Execution {
+                            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                                scope.clone(),
+                                forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                                    address: address.clone(),
+                                },
+                            )?,
+                        })
                         .await?;
-                    self.tool_ran.store(true, Ordering::SeqCst);
-                    std::fs::write(
-                        Path::new(&request.workspace).join("seed.txt"),
-                        "tool changed workspace\n",
-                    )?;
-                    Ok(crate::provider::ProviderCompletion {
-                        native: forge_provider_api::completion::ProviderCompletion {
-                            capability: crate::provider::mock_capability(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    })
+                        sink.send_wait(ProviderEvent::Turn {
+                            address: address.clone(),
+                            update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
+                        })
+                        .await?;
+                        started.notify_one();
+                        if let Err(error) = request.turn_control.before_send(&scope).await {
+                            if matches!(error, crate::provider::ProviderError::Cancelled) {
+                                sink.send_wait(ProviderEvent::Turn {
+                                    address: address.clone(),
+                                    update: crate::provider::TurnUpdate::Finished {
+                                        outcome: forge_provider_api::turn::TurnOutcome::Cancelled,
+                                        completed_at_ms: 1,
+                                    },
+                                })
+                                .await?;
+                                sink.send_wait(ProviderEvent::Execution { observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                                scope, forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                                    address, covered_submissions: vec![request.submission_id], completed_at_ms: 1,
+                                    result: forge_provider_api::lifecycle::ExecutionResult::Cancelled { completion: forge_provider_api::completion::ProviderCompletion {
+                                        capability: descriptor.capability.clone(), ..Default::default()
+                                    }.into() },
+                                },
+                            )? }).await?;
+                                return Ok(());
+                            }
+                            return Err(error);
+                        }
+                        tool_ran.store(true, Ordering::SeqCst);
+                        std::fs::write(workspace.join("seed.txt"), "tool changed workspace\n")
+                            .map_err(|_| {
+                                crate::provider::ProviderError::Failure(
+                                    forge_provider_api::ProviderFailure::new(
+                                        forge_provider_api::ProviderOperation::NativeTransport,
+                                        forge_provider_api::ProviderFailureKind::Unknown,
+                                    ),
+                                )
+                            })?;
+                        sink.send_wait(ProviderEvent::Turn {
+                            address: address.clone(),
+                            update: crate::provider::TurnUpdate::Finished {
+                                outcome: forge_provider_api::turn::TurnOutcome::Completed,
+                                completed_at_ms: 2,
+                            },
+                        })
+                        .await?;
+                        sink.send_wait(ProviderEvent::Execution {
+                            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                                scope,
+                                forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                                    address,
+                                    covered_submissions: vec![request.submission_id],
+                                    completed_at_ms: 2,
+                                    result:
+                                        forge_provider_api::lifecycle::ExecutionResult::Completed {
+                                            completion:
+                                                forge_provider_api::completion::ProviderCompletion {
+                                                    capability: descriptor.capability.clone(),
+                                                    ..Default::default()
+                                                }
+                                                .into(),
+                                        },
+                                },
+                            )?,
+                        })
+                        .await?;
+                        Ok(())
+                    }
                 }
-                .await;
-                output
+            },
+        );
+        let fixture = fixture.with_pre_dispatch(move |_request| {
+            let preparation = preparation.clone();
+            let native_rejection = native_rejection.clone();
+            async move {
+                let (probe, kind) = match (preparation, native_rejection) {
+                    (Some(probe), _) => (
+                        Some(probe),
+                        Some(forge_provider_api::ProviderFailureKind::Runtime),
+                    ),
+                    (_, Some(probe)) => (
+                        Some(probe),
+                        Some(forge_provider_api::ProviderFailureKind::Rejected),
+                    ),
+                    _ => (None, None),
+                };
+                if let (Some(probe), Some(kind)) = (probe, kind) {
+                    probe.started.notify_one();
+                    probe.release.notified().await;
+                    if probe.fail || kind == forge_provider_api::ProviderFailureKind::Rejected {
+                        return Err(crate::provider::ProviderError::Failure(
+                            forge_provider_api::ProviderFailure::new(
+                                forge_provider_api::ProviderOperation::AdmitInput,
+                                kind,
+                            ),
+                        ));
+                    }
+                }
+                Ok(())
             }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
+        });
+        let fixture = if cleanup_error {
+            fixture.with_cleanup(|_| async {
+                Err(crate::provider::ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::CleanupExecution,
+                        forge_provider_api::ProviderFailureKind::Transport,
+                    ),
+                ))
+            })
+        } else {
+            fixture
+        };
+        crate::provider::test_support::ProviderTestSession::from_native(fixture)
     }
 
     /// A failed pre-baseline owner releases its own capture while an unrelated Git editor stays admitted.
@@ -11176,15 +11107,16 @@ mod test {
             });
             let tool_ran = Arc::new(AtomicBool::new(false));
             let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            broker.provider = Arc::new(CheckpointProvider {
-                fixture_events: Default::default(),
-                preparation: (!native_rejection).then(|| rejection.clone()),
-                native_rejection: native_rejection.then(|| rejection.clone()),
-                cleanup_error: None,
-                started: Arc::new(Notify::new()),
-                tool_ran: tool_ran.clone(),
-                active: active.clone(),
-            });
+            let provider = checkpoint_fixture(
+                repository.path().to_owned(),
+                (!native_rejection).then(|| rejection.clone()),
+                Arc::new(Notify::new()),
+                tool_ran.clone(),
+                active.clone(),
+                native_rejection.then(|| rejection.clone()),
+                false,
+            )?;
+            broker.provider = provider.provider_handle();
             let repositories = broker.repositories.clone();
             let handle = repositories
                 .open(repository.path().to_owned())
@@ -11226,9 +11158,9 @@ mod test {
             .context("failed execution waited for unrelated Git admission")?;
             let error = result.expect_err("pre-baseline failure became successful execution");
             let expected = if native_rejection {
-                "fixture native preparation rejected"
+                "Rejected"
             } else {
-                "fixture preparation failed"
+                "Runtime"
             };
             assert!(format!("{error:#}").contains(expected), "{error:#}");
             assert!(!error.is::<TurnCancelled>() && !error.is::<TurnRetracted>());
@@ -11261,7 +11193,8 @@ mod test {
                 broker.provider_request(ProviderInput::from_text(prompt), PromptMode::Chat)?;
             let pending = broker.submission_store.pending(
                 &query,
-                crate::provider::ProviderKind::Mock,
+                forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 None,
             )?;
             assert_eq!(pending.len(), 1);
@@ -11289,17 +11222,16 @@ mod test {
         let started = Arc::new(Notify::new());
         let tool_ran = Arc::new(AtomicBool::new(false));
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        broker.provider = Arc::new(CheckpointProvider {
-            fixture_events: Default::default(),
-            preparation: None,
-            native_rejection: None,
-            cleanup_error: Some(|| crate::provider::ProviderError::Protocol {
-                message: "fixture native cleanup failed".into(),
-            }),
-            started: started.clone(),
-            tool_ran: tool_ran.clone(),
-            active: active.clone(),
-        });
+        let provider = checkpoint_fixture(
+            repository.path().to_owned(),
+            None,
+            started.clone(),
+            tool_ran.clone(),
+            active.clone(),
+            None,
+            true,
+        )?;
+        broker.provider = provider.provider_handle();
         broker.capability.native_turn_rollback = true;
         let repositories = broker.repositories.clone();
         let handle = repositories
@@ -11360,10 +11292,11 @@ mod test {
                 anyhow::bail!("native cleanup lost its typed report: {error:#}");
             };
             anyhow::ensure!(
-                matches!(report.cancellation(), Some(
+                matches!(report.cancellation(), [
             forge_provider_api::error::CleanupFailure::Failed(error)
-        ) if matches!(error.as_ref(), crate::provider::ProviderError::Protocol { message }
-            if message == "fixture native cleanup failed")),
+        ] if matches!(error.as_ref(), crate::provider::ProviderError::Failure(failure)
+            if failure.operation() == forge_provider_api::ProviderOperation::CleanupExecution
+                && failure.kind() == forge_provider_api::ProviderFailureKind::Transport)),
                 "{error:#}"
             );
             anyhow::ensure!(
@@ -11402,7 +11335,9 @@ mod test {
                 exchanges[0]
                     .finalization_error
                     .as_deref()
-                    .is_some_and(|error| error.contains("fixture native cleanup failed")),
+                    .is_some_and(
+                        |error| error.contains("CleanupExecution") && error.contains("Transport")
+                    ),
                 "durable exchange lost native cleanup error"
             );
             anyhow::ensure!(
@@ -11425,15 +11360,16 @@ mod test {
         let started = Arc::new(Notify::new());
         let tool_ran = Arc::new(AtomicBool::new(false));
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        broker.provider = Arc::new(CheckpointProvider {
-            fixture_events: Default::default(),
-            preparation: None,
-            native_rejection: None,
-            cleanup_error: None,
-            started: Arc::clone(&started),
-            tool_ran: Arc::clone(&tool_ran),
-            active: Arc::clone(&active),
-        });
+        let provider = checkpoint_fixture(
+            repository.path().to_owned(),
+            None,
+            Arc::clone(&started),
+            Arc::clone(&tool_ran),
+            Arc::clone(&active),
+            None,
+            false,
+        )?;
+        broker.provider = provider.provider_handle();
         broker.capability.native_turn_rollback = true;
         broker.trace.configure(true)?;
         let repositories = Arc::clone(&broker.repositories);
@@ -11524,15 +11460,7 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir()?;
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
-            let provider = Arc::new(CleanupRetryProvider {
-                fixture_events: Default::default(),
-                started: Notify::new(),
-                complete: Notify::new(),
-                settled: Notify::new(),
-                native_settled: AtomicBool::new(false),
-                attempt: std::sync::atomic::AtomicUsize::new(1),
-                visible_output,
-            });
+            let (provider, signals) = cleanup_retry_provider(&broker, visible_output, false);
             broker.provider = provider.clone();
             broker.capability.native_turn_rollback = true;
             broker.trace.configure(true)?;
@@ -11560,13 +11488,13 @@ mod test {
             cancellation.arm(true);
             let session_id = broker.session.id.clone();
             let cancel = async {
-                provider.started.notified().await;
+                signals.started.notified().await;
                 if cleanup_before_completion {
                     cancellation.begin_cleanup(false, restore_prompt)?;
                     provider.cleanup_execution(&session_id).await?;
                 } else {
-                    provider.complete.notify_one();
-                    provider.settled.notified().await;
+                    signals.complete.notify_one();
+                    signals.settled.notified().await;
                     tokio::task::yield_now().await;
                     cancellation.begin_cleanup(false, restore_prompt)?;
                 }
@@ -11588,8 +11516,8 @@ mod test {
             repositories.writes.take_receipt(operation);
             let (result, cancelled) = result.with_context(|| format!(
                 "native abort completion waited for checkpoint finalization; cleanup_before_completion={cleanup_before_completion}, visible_output={visible_output}, restore_prompt={restore_prompt}, native_settled={}, cleanup_attempts={}, cancel_requested={}, stored={}",
-                provider.native_settled.load(Ordering::Acquire),
-                provider.attempt.load(Ordering::Acquire),
+                signals.native_settled.load(Ordering::Acquire),
+                signals.attempt.load(Ordering::Acquire),
                 cancellation.requested.load(Ordering::Acquire),
                 broker.store.list_exchange(&broker.session.id)
                     .and_then(|exchanges| Ok(serde_json::to_string(&exchanges)?))
@@ -11655,15 +11583,16 @@ mod test {
         broker.prompt_admission = Some((Some(document), 1));
         let (sink, mut stream) = publication::channel();
         broker.event_sink = Some(sink);
-        broker.provider = Arc::new(CheckpointProvider {
-            fixture_events: Default::default(),
-            preparation: None,
-            native_rejection: None,
-            cleanup_error: None,
-            started: started.clone(),
-            tool_ran: tool_ran.clone(),
-            active: Default::default(),
-        });
+        let provider = checkpoint_fixture(
+            repository.path().to_owned(),
+            None,
+            started.clone(),
+            tool_ran.clone(),
+            Default::default(),
+            None,
+            false,
+        )?;
+        broker.provider = provider.provider_handle();
         let repositories = broker.repositories.clone();
         let handle = repositories
             .open(repository.path().to_owned())
@@ -11966,151 +11895,127 @@ mod test {
         Ok(())
     }
 
-    struct DelegatingRootProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-        turn: AtomicU64,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for DelegatingRootProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            true
-        }
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(Some("parent-history".to_owned().try_into()?))
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-    }
-
-    impl DelegatingRootProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let fixture_scope = sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(sink);
-            let sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-
-            let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-let sink = Some(sink);
-            let turn = self.turn.fetch_add(1, Ordering::AcqRel);
-            if turn == 0 {
-                let scope = request
-                    .control_context
-                    .as_ref()
-                    .and_then(|context| context.agent.as_ref())
-                    .context("root has no authenticated agent lane")?;
-                let response = scope
-                    .invoke(
-                        "agent_spawn",
-                        json!({"profile":"worker","text":"CHILD_RESULT"}),
-                    )
-                    .await?;
-                assert!(response.contains("admitted"));
-            } else {
-                anyhow::ensure!(turn == 1, "parent continuation duplicated");
-                anyhow::ensure!(
-                    request.provider_session_id.as_ref().map(|id| id.as_str()) == Some("parent-history"),
-                    "parent lost its conversation"
-                );
-                anyhow::ensure!(
-                    matches!(&request.input,ProviderInput::Text {text, ..} if text.contains("CHILD_RESULT") && text.contains("\"response\"")),
-                    "parent continuation omitted child result"
-                );
-            }
-            if let Some(sink) = sink {
-                let response = if turn == 0 {
-                    "Waiting for child"
-                } else {
-                    "SYNTHESIZED_RESULT"
-                };
-                sink.send_wait(completed_message(&crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
-                    "root-response", crate::provider::MessageRole::Response, response,
-                ))
-                .await?;
-            }
-            Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {  provider_session_id: Some("parent-history".to_owned().try_into().unwrap()), capability: self.descriptor().capability, ..Default::default() }, ..Default::default() })
-
-        }.await;
-            output
-
-        }.await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
+    fn delegating_root_fixture() -> Result<(
+        Arc<AtomicU64>,
+        crate::provider::test_support::ProviderTestSession,
+    )> {
+        let descriptor = crate::provider::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            label: "Normalized mock".into(),
+            capability: crate::provider::test_support::fixture_capability(),
+        };
+        let turn = Arc::new(AtomicU64::new(0));
+        let provider =
+            crate::provider::test_support::EventFixtureProvider::new(descriptor.clone(), {
+                let turn = turn.clone();
+                move |request, sink, _cancelled| {
+                    let turn = turn.clone();
+                    let descriptor = descriptor.clone();
+                    async move {
+                        let ordinal = turn.fetch_add(1, Ordering::AcqRel);
+                        let text = match &request.input {
+                            forge_provider_api::PromptInput::Text(text) => text.clone(),
+                            _ => String::new(),
+                        };
+                        if ordinal == 0 {
+                            let result = crate::provider::test_support::call_tool(
+                                &request,
+                                "agent_spawn",
+                                json!({"profile":"worker","text":"CHILD_RESULT"}),
+                            )
+                            .await?;
+                            assert!(result.to_string().contains("admitted"));
+                        } else {
+                            assert!(ordinal == 1, "parent continuation duplicated");
+                            assert!(
+                                text.contains("CHILD_RESULT") && text.contains("\"response\""),
+                                "parent continuation omitted child result"
+                            );
+                        }
+                        let scope = request.scope.clone();
+                        let address = crate::provider::TurnAddress {
+                            scope: scope.clone(),
+                            thread_id: "parent-history".into(),
+                            turn_id: format!("root-{ordinal}").into(),
+                        };
+                        sink.send_wait(ProviderEvent::Execution {
+                            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                                scope.clone(),
+                                forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                                    address: address.clone(),
+                                },
+                            )?,
+                        })
+                        .await?;
+                        sink.send_wait(ProviderEvent::Turn {
+                            address: address.clone(),
+                            update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
+                        })
+                        .await?;
+                        let response = if ordinal == 0 {
+                            "Waiting for child"
+                        } else {
+                            "SYNTHESIZED_RESULT"
+                        };
+                        for event in completed_message(
+                            &address,
+                            "root-response",
+                            crate::provider::MessageRole::Response,
+                            response,
+                        ) {
+                            sink.send_wait(event).await?;
+                        }
+                        sink.send_wait(ProviderEvent::Turn {
+                            address: address.clone(),
+                            update: crate::provider::TurnUpdate::Finished {
+                                outcome: forge_provider_api::turn::TurnOutcome::Completed,
+                                completed_at_ms: 2,
+                            },
+                        })
+                        .await?;
+                        sink.send_wait(ProviderEvent::Execution {
+                            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                                scope,
+                                forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                                    address,
+                                    covered_submissions: vec![request.submission_id],
+                                    completed_at_ms: 2,
+                                    result:
+                                        forge_provider_api::lifecycle::ExecutionResult::Completed {
+                                            completion:
+                                                forge_provider_api::completion::ProviderCompletion {
+                                                    provider_session_id: Some(
+                                                        "parent-history"
+                                                            .to_owned()
+                                                            .try_into()
+                                                            .expect("fixture ID is valid"),
+                                                    ),
+                                                    capability: descriptor.capability.clone(),
+                                                    ..Default::default()
+                                                }
+                                                .into(),
+                                        },
+                                },
+                            )?,
+                        })
+                        .await?;
+                        Ok(())
+                    }
+                }
+            });
+        let provider = provider.with_active_session_id(|_| async {
+            Ok(Some(
+                "parent-history"
+                    .to_owned()
+                    .try_into()
+                    .expect("fixture ID is valid"),
+            ))
+        });
+        Ok((
+            turn,
+            crate::provider::test_support::ProviderTestSession::from_native(provider)?,
+        ))
     }
 
     #[tokio::test]
@@ -12119,11 +12024,8 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let provider = Arc::new(DelegatingRootProvider {
-            fixture_events: Default::default(),
-            turn: AtomicU64::new(0),
-        });
-        broker.provider = provider.clone();
+        let (turn, provider) = delegating_root_fixture()?;
+        broker.provider = provider.provider_handle();
         broker.agent_coordinator.set_enabled(true);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -12134,7 +12036,7 @@ let sink = Some(sink);
             ),
         )
         .await??;
-        assert_eq!(provider.turn.load(Ordering::Acquire), 2);
+        assert_eq!(turn.load(Ordering::Acquire), 2);
         let exchange = broker.store.list_exchange(&broker.session.id)?;
         assert_eq!(exchange.len(), 1);
         assert_eq!(exchange[0].state(), ExchangeState::Complete);
@@ -12157,8 +12059,9 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        for (provider, sandbox_supported) in [("codex", true), ("copilot", false)] {
-            broker.session.provider = provider.into();
+        for registration in forge_providers::registry::descriptors() {
+            let sandbox_supported = registration.capability.supports_sandbox();
+            broker.session.provider = registration.id.to_string();
             for admitted in [false, true] {
                 broker
                     .configure_session(json!({"access":crate::session::AccessPolicy {
@@ -12207,10 +12110,12 @@ let sink = Some(sink);
             access: Some(crate::session::AccessPolicy::default()),
             ..Default::default()
         };
-        for provider in ["copilot", "claude", "antigravity", "mock", "codex"] {
+        for registration in forge_providers::registry::descriptors() {
+            let provider = registration.id.as_str();
+            let sandbox_supported = registration.capability.supports_sandbox();
             broker.session.provider = provider.into();
             preferences.apply(&mut broker.session, true).unwrap();
-            assert_eq!(broker.session.access.sandbox, provider == "codex");
+            assert_eq!(broker.session.access.sandbox, sandbox_supported);
             for (enabled, mode) in [
                 (true, Some("mxc".to_owned())),
                 (false, Some("unelevated".to_owned())),
@@ -12251,7 +12156,7 @@ let sink = Some(sink);
                 let snapshot = broker.snapshot().unwrap();
                 assert_eq!(
                     snapshot.session.access.sandbox,
-                    enabled && provider == "codex"
+                    enabled && sandbox_supported
                 );
                 assert_eq!(snapshot.access_preference, requested);
                 let saved = crate::settings::SettingsStore::read_only(data.path())
@@ -12262,14 +12167,17 @@ let sink = Some(sink);
                 assert_eq!(saved.access.as_ref(), Some(&requested));
                 let mut restored = snapshot.session.clone();
                 saved.apply(&mut restored, true).unwrap();
-                assert_eq!(restored.access.sandbox, enabled && provider == "codex");
+                assert_eq!(restored.access.sandbox, enabled && sandbox_supported);
                 assert_eq!(restored.access.isolation_mode, mode);
-                restored.provider = "codex".into();
-                saved.apply(&mut restored, true).unwrap();
-                assert_eq!(
-                    restored.access.sandbox, enabled,
-                    "selected preference was lost before switching to Codex"
-                );
+                for target in forge_providers::registry::descriptors() {
+                    restored.provider = target.id.to_string();
+                    saved.apply(&mut restored, true).unwrap();
+                    assert_eq!(
+                        restored.access.sandbox,
+                        enabled && target.capability.supports_sandbox(),
+                        "selected preference changed during a provider switch"
+                    );
+                }
             }
         }
         assert!(preferences.access.unwrap().sandbox);
@@ -13336,11 +13244,11 @@ let sink = Some(sink);
                 .read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1)
                 .is_err()
         );
-        broker.provider = Arc::new(SemanticExecutionProvider {
-            fixture_events: Default::default(),
-            turn: Default::default(),
-            revision: plan.model_revision + 1,
-        });
+        broker.provider = semantic_execution_provider(
+            &broker,
+            plan.id.clone(),
+            u64::from(plan.model_revision + 1),
+        );
         let accepted = broker.dispatch(Request { id: 3, method: "session.plan.accept".into(),
             params: json!({"plan_id":plan.id,"digest":draft.review_digest,"approval_mode":"ask"}) }).await;
         assert!(
@@ -13375,133 +13283,401 @@ let sink = Some(sink);
         );
     }
 
-    #[derive(Default)]
-    struct NoProgressExecutionProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    fn workflow_fixture_bridge(
+        broker: &HarnessBroker,
+        native: std::sync::Arc<dyn forge_provider_api::provider::Provider>,
+    ) -> Arc<Provider> {
+        Arc::new(Provider::new(
+            native,
+            broker.permission_coordinator.clone(),
+            broker.trace.clone(),
+            broker.data_root.clone(),
+        ))
     }
 
-    struct StoppedExecutionProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-        cancelled: bool,
-    }
+    fn stopped_execution_provider(broker: &HarnessBroker, cancelled: bool) -> Arc<Provider> {
+        let descriptor = forge_provider_api::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("fixture identity is available"),
+            label: "Workflow lifecycle fixture".into(),
+            capability: Default::default(),
+        };
+        let native = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor,
+            move |request, sink, _cancelled| async move {
+                use forge_provider_api::lifecycle::{
+                    ExecutionFailure, ExecutionObservation, ExecutionResult, ExecutionUpdate,
+                };
+                use forge_provider_api::{ProviderEvent, ProviderFailureKind, TurnAddress};
 
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for StoppedExecutionProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("test provider cannot fork")
-        }
-    }
-
-    impl StoppedExecutionProvider {
-        async fn run_native(
-            &self,
-            _: ProviderRequest,
-            fixture_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let _fixture_scope = fixture_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(fixture_sink);
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    if self.cancelled {
-                        return Err(anyhow::Error::new(TurnCancelled));
+                let address = TurnAddress {
+                    scope: request.scope.clone(),
+                    thread_id: "workflow-fixture".into(),
+                    turn_id: "turn-1".into(),
+                };
+                let sink = sink.invocation_sink(&request.scope)?;
+                sink.send_wait(ProviderEvent::Execution {
+                    observation: ExecutionObservation::new(
+                        request.scope.clone(),
+                        ExecutionUpdate::Started {
+                            address: address.clone(),
+                        },
+                    )?,
+                })
+                .await?;
+                let completion = forge_provider_api::completion::ProviderCompletion::default();
+                let result = if cancelled {
+                    ExecutionResult::Cancelled {
+                        completion: completion.into(),
                     }
-                    anyhow::bail!("provider connection lost")
+                } else {
+                    ExecutionResult::Failed {
+                        completion: completion.into(),
+                        failure: ExecutionFailure::Terminal {
+                            kind: ProviderFailureKind::Transport,
+                        },
+                    }
+                };
+                sink.send_wait(ProviderEvent::Execution {
+                    observation: ExecutionObservation::new(
+                        request.scope.clone(),
+                        ExecutionUpdate::Finished {
+                            address,
+                            covered_submissions: vec![request.submission_id],
+                            completed_at_ms: 1,
+                            result,
+                        },
+                    )?,
+                })
+                .await?;
+                Ok::<(), forge_provider_api::ProviderError>(())
+            },
+        );
+        workflow_fixture_bridge(broker, native)
+    }
+
+    fn no_progress_execution_provider(broker: &HarnessBroker, plan_id: &str) -> Arc<Provider> {
+        let descriptor = forge_provider_api::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("fixture identity is available"),
+            label: "Workflow tool fixture".into(),
+            capability: Default::default(),
+        };
+        let plan_id = plan_id.to_owned();
+        let native = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor,
+            move |request, sink, _cancelled| {
+                let plan_id = plan_id.clone();
+                async move {
+                    use forge_provider_api::completion::{ProviderCompletion, TurnEvidence};
+                    use forge_provider_api::lifecycle::{
+                        ExecutionObservation, ExecutionResult, ExecutionUpdate,
+                    };
+                    use forge_provider_api::{ProviderEvent, TurnAddress};
+
+                    let _ = crate::provider::test_support::call_tool(
+                        &request,
+                        "plan_overview_read",
+                        json!({"plan_id":plan_id}),
+                    )
+                    .await?;
+                    assert!(
+                        crate::provider::test_support::call_tool(
+                            &request,
+                            "goal_complete",
+                            json!({"summary":"premature"}),
+                        )
+                        .await
+                        .is_err()
+                    );
+
+                    let address = TurnAddress {
+                        scope: request.scope.clone(),
+                        thread_id: "workflow-fixture".into(),
+                        turn_id: "turn-1".into(),
+                    };
+                    let sink = sink.invocation_sink(&request.scope)?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            request.scope.clone(),
+                            ExecutionUpdate::Started {
+                                address: address.clone(),
+                            },
+                        )?,
+                    })
+                    .await?;
+                    let completion = ProviderCompletion {
+                        evidence: TurnEvidence {
+                            tool_called: true,
+                            structured_complete: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            request.scope.clone(),
+                            ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: 1,
+                                result: ExecutionResult::Completed {
+                                    completion: completion.into(),
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok::<(), forge_provider_api::ProviderError>(())
                 }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
+            },
+        );
+        workflow_fixture_bridge(broker, native)
+    }
+
+    fn semantic_execution_provider(
+        broker: &HarnessBroker,
+        plan_id: String,
+        revision: u64,
+    ) -> Arc<Provider> {
+        let descriptor = forge_provider_api::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("fixture identity is available"),
+            label: "Semantic execution fixture".into(),
+            capability: Default::default(),
+        };
+        let turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fixture = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor.clone(),
+            move |request, sink, _cancelled| {
+                let descriptor = descriptor.clone();
+                let turn = turn.clone();
+                let plan_id = plan_id.clone();
+                async move {
+                    use forge_provider_api::lifecycle::{
+                        ExecutionObservation, ExecutionResult, ExecutionUpdate,
+                    };
+                    use forge_provider_api::tool::{ToolInvocation, ToolOutcome, ToolUpdate};
+                    use forge_provider_api::{ProviderEvent, ToolAddress, TurnAddress};
+
+                    let index = turn.fetch_add(1, Ordering::SeqCst);
+                    let scope = request.scope.clone();
+                    let address = TurnAddress {
+                        scope: scope.clone(),
+                        thread_id: "semantic-execution-fixture".into(),
+                        turn_id: format!("phase-{index}").into(),
+                    };
+                    let sink = sink.invocation_sink(&scope)?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            scope.clone(),
+                            ExecutionUpdate::Started {
+                                address: address.clone(),
+                            },
+                        )?,
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Started {
+                            started_at_ms: index as i64,
+                        },
+                    })
+                    .await?;
+
+                    let overview = crate::provider::test_support::call_tool(
+                        &request,
+                        "plan_overview_read",
+                        json!({"plan_id":plan_id}),
+                    )
+                    .await?;
+                    let expected_phase = match index {
+                        0 => "implement",
+                        1 | 3 | 4 => "verify",
+                        _ => "resolve",
+                    };
+                    assert_eq!(
+                        overview.pointer("/execution/phase").and_then(Value::as_str),
+                        Some(expected_phase)
+                    );
+                    let version = overview
+                        .get("version")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(revision);
+
+                    if index == 0 {
+                        assert!(crate::provider::test_support::call_tool(
+                            &request,
+                            "plan_file_edit",
+                            json!({"plan_id":plan_id,"expected_version":version,"patch":"*** Begin Patch\n*** End Patch"}),
+                        ).await.is_err(), "implementation phase exposed plan editing");
+                    }
+
+                    let mut evidence = Vec::new();
+                    if matches!(index, 1 | 3 | 4) {
+                        let id = format!("check-{index}");
+                        let tool_address = ToolAddress {
+                            turn: address.clone(),
+                            tool_id: id.clone().into(),
+                        };
+                        let invocation = ToolInvocation {
+                            semantics: Default::default(),
+                            kind: forge_provider_api::ToolActivityKind::Command,
+                            name: "fixture".into(),
+                            title: "Observe fixture".into(),
+                            arguments: Value::Null,
+                        };
+                        sink.send_wait(ProviderEvent::Tool {
+                            address: tool_address.clone(),
+                            update: ToolUpdate::Requested { invocation },
+                        })
+                        .await?;
+                        sink.send_wait(ProviderEvent::Tool {
+                            address: tool_address.clone(),
+                            update: ToolUpdate::Started,
+                        })
+                        .await?;
+                        sink.send_wait(ProviderEvent::Tool {
+                            address: tool_address.clone(),
+                            update: ToolUpdate::Output {
+                                update: forge_provider_api::tool::TextUpdate::Append(
+                                    if index == 1 {
+                                        "round reset failed"
+                                    } else {
+                                        "all checks passed"
+                                    }
+                                    .into(),
+                                ),
+                            },
+                        })
+                        .await?;
+                        sink.send_wait(ProviderEvent::Tool {
+                            address: tool_address,
+                            update: ToolUpdate::Finished {
+                                outcome: ToolOutcome::Succeeded,
+                            },
+                        })
+                        .await?;
+                        let observed = crate::provider::test_support::call_tool(
+                            &request,
+                            "plan_overview_read",
+                            json!({"plan_id":plan_id}),
+                        )
+                        .await?;
+                        let available = observed
+                            .pointer("/execution/verification_evidence")
+                            .and_then(Value::as_array)
+                            .expect("verification evidence is returned in Verify");
+                        let evidence_item = available
+                            .iter()
+                            .find(|item| {
+                                item.get("id").and_then(Value::as_str) == Some(id.as_str())
+                            })
+                            .expect("the completed tool call is available as evidence");
+                        assert_eq!(
+                            evidence_item.get("title").and_then(Value::as_str),
+                            Some("Observe fixture")
+                        );
+                        evidence.push(id);
+                    }
+
+                    let phase = match index {
+                        0 => "implement",
+                        2 => "resolve",
+                        _ => "verify",
+                    };
+                    let outcome = if index == 1 { "failed" } else { "passed" };
+                    let summary = if index == 1 {
+                        "Round reset retains score"
+                    } else {
+                        "Checked planned behavior"
+                    };
+                    let checks = if phase == "verify" {
+                        vec![json!({
+                            "category":"manual", "label":"fixture check", "outcome":outcome,
+                            "summary":summary, "evidence":evidence
+                        })]
+                    } else {
+                        Vec::<Value>::new()
+                    };
+                    let valid = json!({
+                        "phase":phase, "revision":revision, "summary":summary,
+                        "verification":{
+                            "outcome":outcome, "checks":checks, "evidence":evidence,
+                            "findings":if index == 1 { vec!["Round reset retains score"] } else { Vec::<&str>::new() }
+                        }
+                    });
+                    if index == 1 {
+                        let mut invalid = valid.clone();
+                        invalid["verification"]["evidence"] = json!(["unobserved-check"]);
+                        assert!(
+                            crate::provider::test_support::call_tool(
+                                &request,
+                                "plan_phase_done",
+                                invalid,
+                            )
+                            .await
+                            .is_err(),
+                            "unobserved completion ID was accepted as verification evidence"
+                        );
+                    }
+                    if index == 3 {
+                        let mut invalid = valid.clone();
+                        invalid["verification"]["evidence"] = json!(["check-1"]);
+                        assert!(
+                            crate::provider::test_support::call_tool(
+                                &request,
+                                "plan_phase_done",
+                                invalid,
+                            )
+                            .await
+                            .is_err(),
+                            "reused verification evidence was accepted"
+                        );
+                    }
+                    crate::provider::test_support::call_tool(&request, "plan_phase_done", valid)
+                        .await?;
+
+                    for event in completed_message(
+                        &address,
+                        format!("semantic-response-{index}"),
+                        crate::provider::MessageRole::Response,
+                        "Phase evidence recorded.",
+                    ) {
+                        sink.send_wait(event).await?;
+                    }
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Finished {
+                            outcome: forge_provider_api::turn::TurnOutcome::Completed,
+                            completed_at_ms: index as i64 + 1,
+                        },
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            scope,
+                            ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: index as i64 + 1,
+                                result: ExecutionResult::Completed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion {
+                                            capability: descriptor.capability.clone(),
+                                            ..Default::default()
+                                        }
+                                        .into(),
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok::<(), forge_provider_api::ProviderError>(())
+                }
+            },
+        );
+        workflow_fixture_bridge(broker, fixture)
     }
 
     #[tokio::test]
@@ -13510,15 +13686,16 @@ let sink = Some(sink);
             let repository = repository();
             let data = tempfile::tempdir()?;
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
-            broker.provider = Arc::from(crate::provider::build(
+            broker.provider = crate::provider::build(
                 ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 broker.permission_coordinator.clone(),
                 broker.trace.clone(),
                 broker.data_root.clone(),
-            )?);
+            )?;
             broker
                 .submit_prompt(json!({"text":"/plan add a reusable API"}))
                 .await?;
@@ -13528,10 +13705,8 @@ let sink = Some(sink);
                     .snapshot()?
                     .active_plan
                     .context("test plan missing")?;
-                broker.provider = Arc::new(StoppedExecutionProvider {
-                    fixture_events: Default::default(),
-                    cancelled: true,
-                });
+                let fixture_provider = stopped_execution_provider(&broker, true);
+                broker.provider = fixture_provider;
                 broker.dispatch_session_command(
                     "session.plan.accept",
                     json!({"plan_id":plan.id,"approval_mode":"ask"}),
@@ -13580,32 +13755,30 @@ let sink = Some(sink);
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
-            broker.provider = Arc::from(
-                crate::provider::build(
-                    ProviderLaunch {
-                        kind: "mock".into(),
-                        command: vec!["mock".into()],
-                    },
-                    Arc::clone(&broker.permission_coordinator),
-                    Arc::clone(&broker.trace),
-                    broker.data_root.clone(),
-                )
-                .unwrap(),
-            );
+            broker.provider = crate::provider::build(
+                ProviderLaunch {
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
+                    command: vec!["mock".into()],
+                },
+                Arc::clone(&broker.permission_coordinator),
+                Arc::clone(&broker.trace),
+                broker.data_root.clone(),
+            )
+            .unwrap();
             broker
                 .submit_prompt(json!({"text":"/plan add a reusable API"}))
                 .await
                 .unwrap();
             run_plan_to_input_boundary(&mut broker).await.unwrap();
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
-            broker.provider = Arc::new(StoppedExecutionProvider {
-                fixture_events: Default::default(),
-                cancelled,
-            });
+            let plan_id = plan.id.clone();
+            let fixture_provider = stopped_execution_provider(&broker, cancelled);
+            broker.provider = fixture_provider;
             broker
                 .dispatch_session_command(
                     "session.plan.accept",
-                    json!({"plan_id":plan.id,"approval_mode":"ask"}),
+                    json!({"plan_id":plan_id.clone(),"approval_mode":"ask"}),
                 )
                 .unwrap();
             let result = dispatch_pending_task_input(&mut broker).await;
@@ -13631,7 +13804,8 @@ let sink = Some(sink);
             assert_eq!(text.contains("Plan failed:"), !cancelled, "{text}");
             assert_eq!(text.matches("Plan accepted:").count(), 1);
             let stopped_id = stopped.id.clone();
-            broker.provider = Arc::new(NoProgressExecutionProvider::default());
+            let fixture_provider = no_progress_execution_provider(&broker, &plan_id);
+            broker.provider = fixture_provider;
             broker
                 .dispatch_session_command("session.goal.resume", json!({}))
                 .unwrap();
@@ -13652,152 +13826,6 @@ let sink = Some(sink);
         }
     }
 
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for NoProgressExecutionProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("test provider cannot fork")
-        }
-    }
-
-    impl NoProgressExecutionProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            fixture_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let _fixture_scope = fixture_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(fixture_sink);
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let context = request.control_context.unwrap();
-                    let plan_id = context.plan_document.as_ref().unwrap().plan_id.clone();
-                    let mut runtime = crate::tools::ControlToolRuntime::new(context);
-                    runtime
-                        .invoke(crate::tools::ControlToolInvocation {
-                            task_permit: None,
-                            name: "plan_overview_read".into(),
-                            arguments: json!({"plan_id":plan_id}),
-                        })
-                        .await?;
-                    assert!(
-                        runtime
-                            .invoke(crate::tools::ControlToolInvocation {
-                                task_permit: None,
-                                name: "goal_complete".into(),
-                                arguments: json!({"summary":"premature"})
-                            })
-                            .await
-                            .is_err()
-                    );
-                    Ok(crate::provider::ProviderCompletion {
-                        native: forge_provider_api::completion::ProviderCompletion {
-                            evidence: crate::goal::TurnEvidence {
-                                tool_called: true,
-                                structured_complete: true,
-                                ..Default::default()
-                            },
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    })
-                }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
-    }
-
     #[tokio::test]
     async fn semantic_execution_stalls_after_five_read_only_turns_and_resumes_the_same_phase() {
         let repository = repository();
@@ -13813,7 +13841,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "guard-test".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -13844,7 +13873,8 @@ let sink = Some(sink);
             .unwrap()
             .len();
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
-        broker.provider = Arc::new(NoProgressExecutionProvider::default());
+        let fixture_provider = no_progress_execution_provider(&broker, &plan.id);
+        broker.provider = fixture_provider;
         broker
             .dispatch_session_command(
                 "session.plan.accept",
@@ -13899,285 +13929,6 @@ let sink = Some(sink);
         assert_eq!(resumed.state, PlanExecutionState::Active);
         assert_eq!(resumed.phase, stalled.phase);
         assert_eq!(broker.active_goal().unwrap().continuation.turn_count, 1);
-    }
-
-    struct SemanticExecutionProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-        turn: std::sync::atomic::AtomicUsize,
-        revision: u32,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for SemanticExecutionProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("test provider cannot fork")
-        }
-    }
-
-    impl SemanticExecutionProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let fixture_scope = sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(sink);
-            let sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-
-            let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-let sink = Some(sink);
-            use crate::tools::{ControlToolInvocation, ControlToolRuntime};
-            let turn = self.turn.fetch_add(1, Ordering::SeqCst);
-            let address = crate::provider::TurnAddress {
-        scope: fixture_scope.clone(),
-        thread_id: "semantic-execution".into(),
-        turn_id: (format!("phase-{turn}")).into(),
-    };
-            sink.as_ref()
-                .unwrap()
-                .send_wait(ProviderEvent::Turn { address: address.clone(), update: crate::provider::TurnUpdate::Started { started_at_ms: 0 } })
-                .await?;
-            let context = request
-                .control_context
-                .clone()
-                .context("missing control context")?;
-            let document = context.plan_document.clone().unwrap();
-            let handoff: Value = serde_json::from_str(
-                &document.execution_json(context.execution.as_ref().unwrap().phase)?,
-            )
-            .unwrap();
-            if turn == 0 || turn == 2 {
-                assert!(handoff["document"].get("verification").is_none());
-                assert!(handoff["document"].get("tests").is_some());
-            } else {
-                assert!(handoff["document"].get("verification").is_some());
-            }
-            let mut runtime = ControlToolRuntime::new(context);
-            let phase = match turn {
-                0 => "implement",
-                2 => "resolve",
-                _ => "verify",
-            };
-            let mut arguments = json!({"phase":phase,"revision":self.revision,"summary":"Checked planned behavior"});
-            if turn == 0 {
-                let rejected = runtime.invoke(ControlToolInvocation { task_permit: None, name: "plan_file_edit".into(), arguments: json!({
-                    "plan_id":document.plan_id, "expected_version":document.version, "patch":"*** Begin Patch\n*** End Patch"}) }).await.unwrap_err();
-                assert!(rejected.to_string().contains("Resolve"));
-                for (path, overview) in &document.design.as_ref().unwrap().proposed {
-                    let path = Path::new(&request.workspace).join(path);
-                    std::fs::create_dir_all(path.parent().unwrap())?;
-                    std::fs::write(path, overview.replace("();", "() {}"))?;
-                }
-                std::fs::write(
-                    Path::new(&request.workspace).join("unexpected.rs"),
-                    "fn unexpected() {}",
-                )?;
-            } else if phase == "verify" {
-                let id = format!("check-{turn}");
-                sink.as_ref()
-                    .unwrap()
-                    .send_wait(crate::provider::test_support::tool(
-            &address.clone(), id.clone(),
-            crate::provider::ToolInvocation { semantics: Default::default(), kind: crate::provider::ToolActivityKind::Command, name: "fixture".into(),
-                title: "Observe fixture".into(), arguments: serde_json::Value::Null },
-            crate::turn::test_support::tool_updates(crate::provider::ToolStatus::Succeeded, Some(
-                                if turn == 1 {
-                                    "round reset failed"
-                                } else {
-                                    "all checks passed"
-                                }
-                                .into(),
-                            ), Default::default()),
-        ))
-                    .await?;
-                let checks = document.design.as_ref().unwrap().document.verification.iter().map(String::as_str)
-                    .map(str::trim).filter(|line| !line.is_empty()).map(|command| json!({
-                        "category":"manual", "label":command,
-                        "outcome":if turn == 1 { "failed" } else { "passed" },
-                        "summary":if turn == 1 { "Round reset retains score" } else { "All checks passed" },
-                        "evidence":[id]
-                    })).collect::<Vec<_>>();
-                arguments["verification"] = json!({"outcome":if turn == 1 { "failed" } else { "passed" },"checks":checks,"evidence":[id],"findings":if turn == 1 { vec!["Round reset retains score"] } else { Vec::<&str>::new() }});
-            }
-            if phase == "verify" {
-                let read = runtime
-                    .invoke(ControlToolInvocation {
-                        task_permit: None,
-                        name: "plan_overview_read".into(),
-                        arguments: json!({"plan_id":document.plan_id}),
-                    })
-                    .await
-                    .unwrap();
-                let inspection: Value = serde_json::from_str(&read.message).unwrap();
-                let available = inspection["execution"]["verification_evidence"]
-                    .as_array()
-                    .unwrap();
-                let reference = available
-                    .iter()
-                    .find(|evidence| evidence["id"] == format!("check-{turn}"))
-                    .unwrap();
-                assert_eq!(reference["title"], "Observe fixture");
-                assert_eq!(inspection["execution"]["phase"], "verify");
-                let mut invalid = arguments.clone();
-                invalid["verification"]["evidence"] = json!(["unobserved-check"]);
-                assert!(
-                    runtime
-                        .invoke(ControlToolInvocation {
-                            task_permit: None,
-                            name: "plan_phase_done".into(),
-                            arguments: invalid
-                        })
-                        .await
-                        .unwrap_err()
-                        .to_string()
-                        .contains("not a completed tool result")
-                );
-                if turn == 3 {
-                    let mut reused = arguments.clone();
-                    reused["verification"]["evidence"] = json!(["check-1"]);
-                    assert!(
-                        runtime
-                            .invoke(ControlToolInvocation {
-                                task_permit: None,
-                                name: "plan_phase_done".into(),
-                                arguments: reused
-                            })
-                            .await
-                            .unwrap_err()
-                            .to_string()
-                            .contains("reused verification evidence")
-                    );
-                }
-            }
-            let invocation = ControlToolInvocation {
-                task_permit: None,
-                name: "plan_phase_done".into(),
-                arguments,
-            };
-            let first = runtime.invoke(invocation.clone()).await?;
-            let repeated = runtime.invoke(invocation).await?;
-            assert_eq!(first.message, repeated.message);
-            assert!(
-                runtime
-                    .invoke(ControlToolInvocation {
-                        task_permit: None,
-                        name: "goal_complete".into(),
-                        arguments: json!({"summary":"premature"})
-                    })
-                    .await
-                    .is_err()
-            );
-            sink.as_ref()
-                .unwrap()
-                .send_wait(ProviderEvent::Usage { address: address.clone(), update: serde_json::from_value(json!({"id":format!("usage-{turn}"), "usage": {
-                    "input":100 + turn, "cached_input":10, "reasoning":2, "output":20 + turn
-                }, "cumulative": null, "cumulative_total": null}))? })
-                .await?;
-            sink.as_ref()
-                .unwrap()
-                .send_wait(ProviderEvent::Turn { address, update: crate::provider::TurnUpdate::Finished { outcome: crate::turn::TurnOutcome::Completed, completed_at_ms: 100 } })
-                .await?;
-            Ok(crate::provider::ProviderCompletion { native: forge_provider_api::completion::ProviderCompletion {  provider_session_id: Some("semantic-execution".to_owned().try_into().unwrap()), capability: crate::provider::ProviderCapability {
-                    approval_mode_list: vec![ApprovalMode::Ask],
-                    ..Default::default()
-                }, ..Default::default() }, ..Default::default() })
-
-        }.await;
-            output
-
-        }.await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
     }
 
     /// Render persisted timeline state through the native document projection.
@@ -14270,178 +14021,100 @@ let sink = Some(sink);
         }
     }
 
-    struct SaturatingProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    fn saturating_provider(
+        broker: &HarnessBroker,
         completed: bool,
         wait_for_capacity: bool,
         cancelled: Arc<AtomicBool>,
-    }
+    ) -> Arc<Provider> {
+        let descriptor = forge_provider_api::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("fixture identity is available"),
+            label: "Event delivery fixture".into(),
+            capability: Default::default(),
+        };
+        let cleanup_cancelled = cancelled.clone();
+        let native = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor,
+            move |request, sink, mut cancellation| {
+                let cancelled = cancelled.clone();
+                async move {
+                    use forge_provider_api::lifecycle::{ExecutionObservation, ExecutionResult, ExecutionUpdate};
+                    use forge_provider_api::message::{MessageClassification, MessageId, MessageRole, MessageUpdate};
+                    use forge_provider_api::{MessageAddress, ProviderEvent, TurnAddress};
 
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for SaturatingProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move {
-                self.cancelled.store(true, Ordering::Release);
-                Ok(())
-            }
-            .await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("fork unavailable")
-        }
-    }
-
-    impl SaturatingProvider {
-        async fn run_native(
-            &self,
-            _request: ProviderRequest,
-            event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
-            let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let address = crate::provider::MessageAddress {
-                        turn: crate::provider::test_support::address(
-                            &fixture_scope,
-                            "fixture",
-                            "turn",
-                        ),
-                        message_id: crate::provider::MessageId::Native("saturated-message".into()),
+                    let turn = TurnAddress {
+                        scope: request.scope.clone(),
+                        thread_id: "delivery-fixture-session".into(),
+                        turn_id: "delivery-fixture-turn".into(),
+                    };
+                    let sink = sink.invocation_sink(&request.scope)?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            request.scope.clone(), ExecutionUpdate::Started { address: turn.clone() },
+                        )?,
+                    }).await?;
+                    let address = MessageAddress {
+                        turn: turn.clone(),
+                        message_id: MessageId::Native("saturated-message".into()),
                     };
                     let mut text = String::new();
                     for sequence in 0..384 {
                         let delta = sequence.to_string();
                         text.push_str(&delta);
                         let update = if sequence == 0 {
-                            crate::provider::MessageUpdate::Started {
-                                classification: crate::provider::MessageClassification::Known(
-                                    crate::provider::MessageRole::Response,
-                                ),
+                            MessageUpdate::Started {
+                                classification: MessageClassification::Known(MessageRole::Response),
                                 text: delta,
                             }
                         } else {
-                            crate::provider::MessageUpdate::Delta { text: delta }
+                            MessageUpdate::Delta { text: delta }
                         };
-                        let event = ProviderEvent::Message {
-                            address: address.clone(),
-                            update,
-                        };
-                        if self.wait_for_capacity {
-                            event_sink.send_wait(event).await?;
+                        let event = ProviderEvent::Message { address: address.clone(), update };
+                        if wait_for_capacity {
+                            sink.send_wait(event).await?;
                         } else {
-                            let _ = event_sink.send(event);
+                            sink.send(event)?;
                         }
                     }
-                    if self.wait_for_capacity {
-                        event_sink
-                            .send_wait(ProviderEvent::Message {
-                                address,
-                                update: crate::provider::MessageUpdate::Completed { text },
-                            })
-                            .await?;
+                    if wait_for_capacity {
+                        sink.send_wait(ProviderEvent::Message {
+                            address: address.clone(),
+                            update: MessageUpdate::Completed { text },
+                        }).await?;
                     }
-                    if self.completed {
-                        Ok(crate::provider::ProviderCompletion::default())
-                    } else {
-                        std::future::pending().await
+                    if completed {
+                        sink.send_wait(ProviderEvent::Execution {
+                            observation: ExecutionObservation::new(
+                                request.scope.clone(),
+                                ExecutionUpdate::Finished {
+                                    address: turn,
+                                    covered_submissions: vec![request.submission_id],
+                                    completed_at_ms: 100,
+                                    result: ExecutionResult::Completed {
+                                        completion: forge_provider_api::completion::ProviderCompletion::default().into(),
+                                    },
+                                },
+                            )?,
+                        }).await?;
+                        return Ok::<(), forge_provider_api::ProviderError>(());
                     }
+                    if cancellation.changed().await.is_ok() {
+                        cancelled.store(true, Ordering::Release);
+                    }
+                    Ok(())
                 }
-                .await;
-                output
+            },
+        )
+        .with_cleanup_request(move |_binding| {
+            let cancelled = cleanup_cancelled.clone();
+            async move {
+                cancelled.store(true, Ordering::Release);
+                Ok::<(), forge_provider_api::ProviderError>(())
             }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
+        });
+        workflow_fixture_bridge(broker, native)
     }
-
     #[tokio::test]
     async fn event_saturation_cancels_pending_and_completed_provider_turns() {
         for completed in [false, true] {
@@ -14457,7 +14130,8 @@ let sink = Some(sink);
                     workspace: repository.path().to_string_lossy().into_owned(),
                     client_id: "saturation-test".into(),
                     provider: ProviderLaunch {
-                        kind: "mock".into(),
+                        kind: forge_providers::registry::nonselectable_id()
+                            .expect("registry supplies a nonselectable fixture identity"),
                         command: vec!["mock".into()],
                     },
                     model: "mock-model".into(),
@@ -14471,12 +14145,9 @@ let sink = Some(sink);
             )
             .unwrap();
             let cancelled = Arc::new(AtomicBool::new(false));
-            broker.provider = Arc::new(SaturatingProvider {
-                fixture_events: Default::default(),
-                completed,
-                wait_for_capacity: false,
-                cancelled: Arc::clone(&cancelled),
-            });
+            let fixture_provider =
+                saturating_provider(&broker, completed, false, cancelled.clone());
+            broker.provider = fixture_provider;
             let admitted = broker
                 .dispatch(Request {
                     id: 1,
@@ -14524,7 +14195,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "burst-test".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -14538,12 +14210,8 @@ let sink = Some(sink);
         )
         .unwrap();
         let cancelled = Arc::new(AtomicBool::new(false));
-        broker.provider = Arc::new(SaturatingProvider {
-            fixture_events: Default::default(),
-            completed: true,
-            wait_for_capacity: true,
-            cancelled: Arc::clone(&cancelled),
-        });
+        let fixture_provider = saturating_provider(&broker, true, true, cancelled.clone());
+        broker.provider = fixture_provider;
         for request_id in 1..=2 {
             let session_id = broker.session.id.clone();
             let (sink, mut stream) = publication::channel();
@@ -14611,198 +14279,121 @@ let sink = Some(sink);
         }));
     }
 
-    struct RestartProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    fn restart_provider(
+        broker: &HarnessBroker,
         cancellation: Arc<TurnCancellation>,
-        invocation: std::sync::atomic::AtomicUsize,
         clarification: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for RestartProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("restart test does not fork")
-        }
-    }
-
-    impl RestartProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
-            let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let event_sink = Some(event_sink);
-                    let invocation = self.invocation.fetch_add(1, Ordering::SeqCst);
-                    let mut event = ProviderEvent::Turn {
-                        address: crate::provider::TurnAddress {
-                            scope: fixture_scope.clone(),
-                            thread_id: "restart-thread".into(),
-                            turn_id: (format!("turn-{invocation}")).into(),
-                        },
-                        update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
+    ) -> (Arc<Provider>, Arc<std::sync::atomic::AtomicUsize>) {
+        let descriptor = forge_provider_api::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("fixture identity is available"),
+            label: "Restart lifecycle fixture".into(),
+            capability: Default::default(),
+        };
+        let invocation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let native_invocation = invocation.clone();
+        let native = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor,
+            move |request, sink, mut cancelled| {
+                let invocation = native_invocation.clone();
+                let cancellation = cancellation.clone();
+                async move {
+                    use forge_provider_api::lifecycle::{
+                        ExecutionObservation, ExecutionResult, ExecutionUpdate,
                     };
-                    let sink = event_sink.context("restart test requires event delivery")?;
-                    sink.send(event.clone())?;
-                    if invocation == 0 {
-                        self.cancellation.request_restart();
-                        return std::future::pending().await;
+                    use forge_provider_api::{ProviderEvent, TurnAddress};
+
+                    let attempt = invocation.fetch_add(1, Ordering::SeqCst);
+                    let address = TurnAddress {
+                        scope: request.scope.clone(),
+                        thread_id: "restart-fixture-session".into(),
+                        turn_id: format!("turn-{attempt}").into(),
+                    };
+                    let sink = sink.invocation_sink(&request.scope)?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            request.scope.clone(),
+                            ExecutionUpdate::Started {
+                                address: address.clone(),
+                            },
+                        )?,
+                    })
+                    .await?;
+                    if attempt == 0 {
+                        cancellation.request_restart();
+                        while !*cancelled.borrow_and_update() {
+                            cancelled
+                                .changed()
+                                .await
+                                .map_err(|_| forge_provider_api::ProviderError::Cancelled)?;
+                        }
+                        sink.send_wait(ProviderEvent::Execution {
+                            observation: ExecutionObservation::new(
+                                request.scope.clone(),
+                                ExecutionUpdate::Finished {
+                                    address,
+                                    covered_submissions: vec![request.submission_id],
+                                    completed_at_ms: 100,
+                                    result: ExecutionResult::Cancelled {
+                                        completion: forge_provider_api::completion::ProviderCompletion::default().into(),
+                                    },
+                                },
+                            )?,
+                        }).await?;
+                        return Ok::<(), forge_provider_api::ProviderError>(());
                     }
                     assert_eq!(
-                        request.provider_session_id.as_ref().map(|id| id.as_str()),
-                        Some("restart-thread")
+                        request.configuration.approval,
+                        crate::session::ApprovalMode::Allow
                     );
-                    assert_eq!(request.approval_mode, ApprovalMode::Allow);
-                    if self.clarification {
+                    if clarification {
+                        let forge_provider_api::PromptInput::QuestionReply(reply) = &request.input
+                        else {
+                            panic!("clarification must remain a structured question reply");
+                        };
+                        assert!(reply.question.contains("Why choose staged migration?"));
+                        assert!(request.instructions.contains("Pending elicitation:"));
                         assert!(
                             request
-                                .input
-                                .text()
-                                .contains("Why choose staged migration?")
-                        );
-                        assert!(request.input.text().contains("Pending elicitation:"));
-                        assert!(
-                            request
-                                .input
-                                .text()
+                                .instructions
                                 .contains("Do not continue the original request")
                                 || request
-                                    .input
-                                    .text()
+                                    .instructions
                                     .contains("Do not continue or submit the plan")
                         );
-                        assert!(!request.input.text().contains("Original request:"));
+                        assert!(!request.instructions.contains("Original request:"));
                     }
-                    if let ProviderEvent::Turn { update, .. } = &mut event {
-                        *update = crate::provider::TurnUpdate::Finished {
-                            outcome: crate::turn::TurnOutcome::Completed,
-                            completed_at_ms: 100,
-                        };
-                    }
-                    sink.send(event)?;
-                    Ok(crate::provider::ProviderCompletion {
-                        native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some(
-                                "restart-thread".to_owned().try_into().unwrap(),
-                            ),
-                            ..Default::default()
-                        },
-                        ..Default::default()
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            request.scope.clone(),
+                            ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: 100,
+                                result: ExecutionResult::Completed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion::default(
+                                        )
+                                        .into(),
+                                },
+                            },
+                        )?,
                     })
+                    .await?;
+                    Ok(())
                 }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
+            },
+        );
+        (workflow_fixture_bridge(broker, native), invocation)
     }
-
     #[tokio::test]
     async fn mode_restart_preserves_exchange_and_checkpoint_with_distinct_turns() {
         let repository = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.approval_mode = ApprovalMode::Ask;
-        broker.provider = Arc::new(RestartProvider {
-            fixture_events: Default::default(),
-            cancellation: Arc::clone(&broker.turn_cancellation),
-            invocation: std::sync::atomic::AtomicUsize::new(0),
-            clarification: false,
-        });
+        let (provider, _) = restart_provider(&broker, broker.turn_cancellation(), false);
+        broker.provider = provider;
         let result = broker
             .run_interaction(
                 "Original request".into(),
@@ -14902,14 +14493,10 @@ let sink = Some(sink);
                 .await?;
             assert_eq!(configured["active_task"], before);
             assert_eq!(events[0].payload["session"]["active_task"], before);
-            let provider = Arc::new(RestartProvider {
-                fixture_events: Default::default(),
-                cancellation: broker.turn_cancellation(),
-                invocation: std::sync::atomic::AtomicUsize::new(0),
-                clarification: false,
-            });
-            broker.provider = provider.clone();
-            broker.capability = crate::provider::mock_capability();
+            let (provider, invocation) =
+                restart_provider(&broker, broker.turn_cancellation(), false);
+            broker.provider = provider;
+            broker.capability = crate::provider::test_support::fixture_capability();
             for action in [
                 json!({"action":"configure","config":{"effort":"high"}}),
                 json!({"action":"permission","change":{"kind":"toggle_write_enabled"}}),
@@ -14939,7 +14526,7 @@ let sink = Some(sink);
                     "configuration changed projected {status} task: {action}"
                 );
                 assert_eq!(
-                    provider.invocation.load(Ordering::SeqCst),
+                    invocation.load(Ordering::SeqCst),
                     0,
                     "configuration resumed an idle provider for {status}: {action}"
                 );
@@ -15028,14 +14615,9 @@ let sink = Some(sink);
                 broker.input_purpose = crate::input::InputPurpose::User;
             }
             let before = broker.snapshot().unwrap();
-            let restart = Arc::new(RestartProvider {
-                fixture_events: Default::default(),
-                cancellation: broker.turn_cancellation(),
-                invocation: std::sync::atomic::AtomicUsize::new(0),
-                clarification: true,
-            });
+            let (restart, invocation) = restart_provider(&broker, broker.turn_cancellation(), true);
             broker.provider = restart.clone();
-            broker.capability = crate::provider::mock_capability();
+            broker.capability = crate::provider::test_support::fixture_capability();
             let (event_sink, mut event_stream) = publication::channel();
             broker.event_sink = Some(event_sink);
             let forwarded = tokio::spawn(async move {
@@ -15060,7 +14642,7 @@ let sink = Some(sink);
                 matches!(event, SessionUpdate::Configuration { access_abbreviation, .. }
                     if access_abbreviation == &after.access_abbreviation)
             }));
-            assert_eq!(restart.invocation.load(Ordering::SeqCst), 0);
+            assert_eq!(invocation.load(Ordering::SeqCst), 0);
             assert_eq!(after.exchange.len(), before.exchange.len());
             assert_eq!(after.exchange[0].id, before.exchange[0].id);
             assert_eq!(
@@ -15080,221 +14662,126 @@ let sink = Some(sink);
         }
     }
 
-    struct CleanupRetryProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    struct CleanupSignals {
         started: Notify,
         complete: Notify,
         settled: Notify,
         native_settled: AtomicBool,
         attempt: std::sync::atomic::AtomicUsize,
-        visible_output: bool,
     }
 
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for CleanupRetryProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        async fn fence_session(
-            &self,
-            _: &crate::provider::ExecutionOwner,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move {
-                // This fixture has no external callback registration to revoke.
-                Ok(())
-            }
-            .await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::FenceSession,
-                    source,
-                )
-            })
-        }
-        async fn reset_session(
-            &self,
-            owner: &crate::provider::ExecutionOwner,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move {
-                self.fixture_events.reset_owner(owner).await?;
-                Ok(())
-            }
-            .await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::ResetSession,
-                    source,
-                )
-            })
-        }
-        fn checkpoint_tool_gate(&self) -> bool {
-            true
-        }
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
+    fn cleanup_retry_provider(
+        broker: &HarnessBroker,
+        visible_output: bool,
+        fail_first_cleanup: bool,
+    ) -> (Arc<Provider>, Arc<CleanupSignals>) {
+        let descriptor = forge_provider_api::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("fixture identity is available"),
+            label: "Cleanup lifecycle fixture".into(),
+            capability: Default::default(),
+        };
+        let signals = Arc::new(CleanupSignals {
+            started: Notify::new(),
+            complete: Notify::new(),
+            settled: Notify::new(),
+            native_settled: AtomicBool::new(false),
+            attempt: std::sync::atomic::AtomicUsize::new(usize::from(!fail_first_cleanup)),
+        });
+        let handler_signals = signals.clone();
+        let cleanup_signals = signals.clone();
+        let native = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor,
+            move |request, sink, _cancelled| {
+                let signals = handler_signals.clone();
+                async move {
+                    use forge_provider_api::lifecycle::{
+                        ExecutionObservation, ExecutionResult, ExecutionUpdate,
+                    };
+                    use forge_provider_api::message::{
+                        MessageClassification, MessageId, MessageRole, MessageUpdate,
+                    };
+                    use forge_provider_api::{MessageAddress, ProviderEvent, TurnAddress};
 
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> {
-            Ok(true)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn cleanup_execution(
-            &self,
-            session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move {
-                if self.attempt.fetch_add(1, Ordering::SeqCst) == 0 {
-                    anyhow::bail!("cleanup deadline expired");
+                    let address = TurnAddress {
+                        scope: request.scope.clone(),
+                        thread_id: "cleanup-fixture-session".into(),
+                        turn_id: "cleanup-fixture-turn".into(),
+                    };
+                    let sink = sink.invocation_sink(&request.scope)?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            request.scope.clone(),
+                            ExecutionUpdate::Started {
+                                address: address.clone(),
+                            },
+                        )?,
+                    })
+                    .await?;
+                    if visible_output {
+                        sink.send_wait(ProviderEvent::Message {
+                            address: MessageAddress {
+                                turn: address.clone(),
+                                message_id: MessageId::Native("partial-response".into()),
+                            },
+                            update: MessageUpdate::Started {
+                                classification: MessageClassification::Known(MessageRole::Response),
+                                text: "Partial response".into(),
+                            },
+                        })
+                        .await?;
+                    }
+                    signals.started.notify_one();
+                    signals.complete.notified().await;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            request.scope.clone(),
+                            ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: 100,
+                                result: ExecutionResult::Cancelled {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion::default(
+                                        )
+                                        .into(),
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    signals.native_settled.store(true, Ordering::Release);
+                    signals.settled.notify_waiters();
+                    Ok::<(), forge_provider_api::ProviderError>(())
                 }
-                self.complete.notify_one();
+            },
+        )
+        .with_cleanup_request(move |_binding| {
+            let signals = cleanup_signals.clone();
+            async move {
+                if signals.attempt.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(forge_provider_api::ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::CleanupExecution,
+                            forge_provider_api::ProviderFailureKind::Timeout,
+                        ),
+                    ));
+                }
+                signals.complete.notify_one();
                 loop {
-                    let settled = self.settled.notified();
+                    let settled = signals.settled.notified();
                     tokio::pin!(settled);
                     settled.as_mut().enable();
-                    if self.native_settled.load(Ordering::Acquire) {
+                    if signals.native_settled.load(Ordering::Acquire) {
                         break;
                     }
                     settled.await;
                 }
-                self.fixture_events.cancel_runtime(session_id).await?;
                 Ok(())
             }
-            .await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
+        });
+        (workflow_fixture_bridge(broker, native), signals)
     }
-
-    impl CleanupRetryProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            if let Some(submission) = &request.submission {
-                submission.sending(crate::provider::submission::SubmissionTarget::Untracked)?;
-                submission.accepted("cleanup fixture accepted input".into())?;
-            }
-            let fixture_scope = sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(sink);
-            let sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let sink = Some(sink);
-                    let sink = sink.context("cleanup test requires event delivery")?;
-                    let address = crate::provider::test_support::address(
-                        &fixture_scope,
-                        "cleanup-thread",
-                        "cleanup-turn",
-                    );
-                    sink.send(ProviderEvent::Turn {
-                        address: address.clone(),
-                        update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
-                    })?;
-                    if self.visible_output {
-                        sink.send(completed_message(
-                            &address,
-                            "partial-response",
-                            crate::provider::MessageRole::Response,
-                            "Partial response",
-                        ))?;
-                    }
-                    self.started.notify_one();
-                    self.complete.notified().await;
-                    sink.send(ProviderEvent::Turn {
-                        address,
-                        update: crate::provider::TurnUpdate::Finished {
-                            outcome: crate::turn::TurnOutcome::Interrupted,
-                            completed_at_ms: 100,
-                        },
-                    })?;
-                    self.native_settled.store(true, Ordering::Release);
-                    self.settled.notify_waiters();
-                    Ok(crate::provider::ProviderCompletion {
-                        native: forge_provider_api::completion::ProviderCompletion {
-                            capability: crate::provider::mock_capability(),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    })
-                }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
-    }
-
     #[tokio::test]
     async fn cancelling_paused_restart_persists_goal_and_exchange_stop() {
         let repository = tempfile::tempdir().unwrap();
@@ -15417,20 +14904,12 @@ let sink = Some(sink);
         let repository = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let provider = Arc::new(CleanupRetryProvider {
-            fixture_events: Default::default(),
-            started: Notify::new(),
-            complete: Notify::new(),
-            settled: Notify::new(),
-            native_settled: AtomicBool::new(false),
-            attempt: std::sync::atomic::AtomicUsize::new(0),
-            visible_output: false,
-        });
+        let (provider, signals) = cleanup_retry_provider(&broker, false, true);
         broker.provider = provider.clone();
         let cancellation = broker.turn_cancellation();
         let session_id = broker.session.id.clone();
         let control = async {
-            provider.started.notified().await;
+            signals.started.notified().await;
             cancellation.begin_cleanup(false, false).unwrap();
             let error = provider.cleanup_execution(&session_id).await.unwrap_err();
             cancellation.fail_cleanup(&error);
@@ -15764,268 +15243,175 @@ let sink = Some(sink);
             .unwrap();
     }
 
-    #[derive(Default)]
-    struct FailingProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for FailingProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("synthetic provider failure")
-        }
-    }
-
-    impl FailingProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            _event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let _fixture_scope = _event_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(_event_sink);
-            let _event_sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let _event_sink = Some(_event_sink);
-                    let nested = Path::new(&request.workspace).join("failed/deep/write.txt");
-                    std::fs::create_dir_all(nested.parent().context("failed write parent")?)?;
-                    std::fs::write(&nested, "written before provider failure\n")?;
-                    anyhow::bail!("synthetic provider failure")
-                }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
-    }
-
-    #[derive(Default)]
-    struct InvalidControlOutputProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for InvalidControlOutputProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("fork unavailable")
-        }
-    }
-
-    impl InvalidControlOutputProvider {
-        async fn run_native(
-            &self,
-            _request: ProviderRequest,
-            event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
-            let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let event_sink = Some(event_sink);
-                    if let Some(event_sink) = event_sink {
-                        let _ = event_sink.send(completed_message(
-                            &crate::provider::test_support::address(
-                                &fixture_scope,
-                                "fixture",
-                                "turn",
+    fn failing_provider_fixture(
+        workspace: PathBuf,
+    ) -> Result<crate::provider::test_support::ProviderTestSession> {
+        let descriptor = crate::provider::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            label: "Normalized failure fixture".into(),
+            capability: crate::provider::test_support::fixture_capability(),
+        };
+        let fixture = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor.clone(),
+            move |request, sink, _cancelled| {
+                let workspace = workspace.clone();
+                let descriptor = descriptor.clone();
+                async move {
+                    let nested = workspace.join("failed/deep/write.txt");
+                    std::fs::create_dir_all(nested.parent().expect("nested path has parent"))
+                        .map_err(|_| {
+                            crate::provider::ProviderError::Failure(
+                                forge_provider_api::ProviderFailure::new(
+                                    forge_provider_api::ProviderOperation::NativeTransport,
+                                    forge_provider_api::ProviderFailureKind::Unknown,
+                                ),
+                            )
+                        })?;
+                    std::fs::write(&nested, "written before provider failure\n").map_err(|_| {
+                        crate::provider::ProviderError::Failure(
+                            forge_provider_api::ProviderFailure::new(
+                                forge_provider_api::ProviderOperation::NativeTransport,
+                                forge_provider_api::ProviderFailureKind::Unknown,
                             ),
-                            "corrected-plan",
-                            crate::provider::MessageRole::Response,
-                            "Validated the corrected plan.",
-                        ));
-                    }
-                    Ok(crate::provider::ProviderCompletion {
-                        plan_read: Some("rejected-plan".into()),
-                        ..Default::default()
+                        )
+                    })?;
+                    let scope = request.scope.clone();
+                    let address = crate::provider::TurnAddress {
+                        scope: scope.clone(),
+                        thread_id: "failing-fixture".into(),
+                        turn_id: "turn".into(),
+                    };
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                            scope.clone(),
+                            forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                                address: address.clone(),
+                            },
+                        )?,
                     })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Finished {
+                            outcome: forge_provider_api::turn::TurnOutcome::Failed,
+                            completed_at_ms: 2,
+                        },
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                            scope,
+                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: 2,
+                                result: forge_provider_api::lifecycle::ExecutionResult::Failed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion {
+                                            capability: descriptor.capability.clone(),
+                                            ..Default::default()
+                                        }
+                                        .into(),
+                                    failure:
+                                        forge_provider_api::lifecycle::ExecutionFailure::Terminal {
+                                            kind:
+                                                forge_provider_api::ProviderFailureKind::Transport,
+                                        },
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok(())
                 }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
+            },
+        );
+        crate::provider::test_support::ProviderTestSession::from_native(fixture)
+    }
+
+    fn invalid_control_output_fixture() -> Result<crate::provider::test_support::ProviderTestSession>
+    {
+        let descriptor = crate::provider::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            label: "Normalized failure fixture".into(),
+            capability: crate::provider::test_support::fixture_capability(),
+        };
+        let fixture = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor.clone(),
+            move |request, sink, _cancelled| {
+                let descriptor = descriptor.clone();
+                async move {
+                    let scope = request.scope.clone();
+                    let address = crate::provider::TurnAddress {
+                        scope: scope.clone(),
+                        thread_id: "fixture".into(),
+                        turn_id: "turn".into(),
+                    };
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                            scope.clone(),
+                            forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                                address: address.clone(),
+                            },
+                        )?,
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
+                    })
+                    .await?;
+                    for event in completed_message(
+                        &address,
+                        "failure-message",
+                        crate::provider::MessageRole::Response,
+                        "Provider execution failed after producing output.",
+                    ) {
+                        sink.send_wait(event).await?;
+                    }
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Finished {
+                            outcome: forge_provider_api::turn::TurnOutcome::Failed,
+                            completed_at_ms: 2,
+                        },
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                            scope,
+                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: 2,
+                                result: forge_provider_api::lifecycle::ExecutionResult::Failed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion {
+                                            capability: descriptor.capability.clone(),
+                                            ..Default::default()
+                                        }
+                                        .into(),
+                                    failure:
+                                        forge_provider_api::lifecycle::ExecutionFailure::Terminal {
+                                            kind: forge_provider_api::ProviderFailureKind::Protocol,
+                                        },
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok(())
+                }
+            },
+        );
+        crate::provider::test_support::ProviderTestSession::from_native(fixture)
     }
 
     struct AdvancingClock(std::sync::atomic::AtomicI64);
@@ -16036,1456 +15422,624 @@ let sink = Some(sink);
         }
     }
 
-    #[derive(Default)]
-    struct ParentBoundaryProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for ParentBoundaryProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            anyhow::bail!("parent boundary provider does not fork")
-        }
-    }
-
-    impl ParentBoundaryProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
-            let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let event_sink = Some(event_sink);
-                    let event_list = vec![
-                        completed_message(
-                            &crate::provider::test_support::address(
-                                &fixture_scope,
-                                "fixture",
-                                "turn",
-                            ),
-                            "intermediate-answer",
-                            crate::provider::MessageRole::Response,
-                            "An intermediate answer.",
-                        ),
-                        vec![ProviderEvent::ParentBoundary {
-                            scope: fixture_scope.clone(),
-                            update: crate::provider::ParentBoundaryUpdate::WaitStarted {
-                                agent_count: 1,
+    fn parent_boundary_fixture() -> Result<crate::provider::test_support::ProviderTestSession> {
+        let descriptor = crate::provider::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            label: "Normalized parent boundary fixture".into(),
+            capability: crate::provider::test_support::fixture_capability(),
+        };
+        let fixture = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor.clone(),
+            move |request, sink, _cancelled| {
+                let descriptor = descriptor.clone();
+                async move {
+                    let scope = request.scope.clone();
+                    let address = crate::provider::TurnAddress {
+                        scope: scope.clone(),
+                        thread_id: "fixture".into(),
+                        turn_id: "turn".into(),
+                    };
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                            scope.clone(),
+                            forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                                address: address.clone(),
                             },
-                        }],
-                        vec![ProviderEvent::ParentBoundary {
-                            scope: fixture_scope.clone(),
-                            update: crate::provider::ParentBoundaryUpdate::WaitFinished,
-                        }],
-                        completed_message(
-                            &crate::provider::test_support::address(
-                                &fixture_scope,
-                                "fixture",
-                                "turn",
-                            ),
-                            "final-synthesis",
-                            crate::provider::MessageRole::Response,
-                            "A final synthesis.",
-                        ),
-                    ];
-                    if let Some(event_sink) = event_sink {
-                        for event in event_list {
-                            let _ = event_sink.send(event);
-                        }
-                    }
-                    Ok(crate::provider::ProviderCompletion {
-                        native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some(
-                                "parent-boundary".to_owned().try_into().unwrap(),
-                            ),
-                            runtime: crate::provider::ProviderRuntime {
-                                provider: "Parent boundary test".into(),
-                                model: Some(request.model),
-                            },
-                            ..Default::default()
-                        },
-                        ..Default::default()
+                        )?,
                     })
-                }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
-    }
-
-    struct PlanningQuestionProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-        turn: std::sync::atomic::AtomicUsize,
-        structured: bool,
-    }
-
-    struct RetryPlanProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-        turn: std::sync::atomic::AtomicUsize,
-    }
-
-    #[derive(Default)]
-    struct RepeatedPlanEditProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    }
-
-    #[tokio::test]
-    async fn plan_queries_preserve_the_selected_task_and_pending_review() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker
-            .submit_prompt(json!({"text":"/plan preserve review ownership"}))
-            .await
-            .unwrap();
-        run_plan_to_input_boundary(&mut broker).await.unwrap();
-        let current = broker.snapshot().unwrap().active_plan.unwrap();
-        let mut older = current.clone();
-        older.id = "older-review".into();
-        broker.store.save_plan(&older).unwrap();
-        let selected = serde_json::to_value(broker.task_controller.current().unwrap()).unwrap();
-        for params in [
-            json!({"plan_id":older.id}),
-            json!({"plan_id":older.id,"revision":older.model_revision}),
-        ] {
-            let result = broker
-                .dispatch(Request {
-                    id: 1,
-                    method: "session.plan.get".into(),
-                    params,
-                })
-                .await;
-            assert!(
-                result.response.error().is_none(),
-                "{:?}",
-                result.response.error()
-            );
-            assert_eq!(result.response.result().unwrap()["id"], older.id);
-            assert_eq!(
-                broker.current_plan_id().unwrap().as_deref(),
-                Some(current.id.as_str())
-            );
-            assert_eq!(
-                serde_json::to_value(broker.task_controller.current().unwrap()).unwrap(),
-                selected
-            );
-        }
-        for (method, params) in [
-            ("session.plan.get", json!({"plan_id":"missing"})),
-            ("session.preview", json!({"session_id":"missing"})),
-            (
-                "session.plan.declaration.get",
-                json!({"plan_id":"missing","path":"src/lib.rs","revision":1}),
-            ),
-        ] {
-            let result = broker
-                .dispatch(Request {
-                    id: 2,
-                    method: method.into(),
-                    params,
-                })
-                .await;
-            assert!(result.response.error().is_some(), "{method}");
-            assert_eq!(
-                serde_json::to_value(broker.task_controller.current().unwrap()).unwrap(),
-                selected,
-                "{method}"
-            );
-            assert_eq!(
-                broker.snapshot().unwrap().active_plan.unwrap().state,
-                PlanState::AwaitingReview
-            );
-        }
-        assert!(broker.observer.plan(json!({"plan_id":older.id})).is_ok());
-        assert_eq!(
-            broker.current_plan_id().unwrap().as_deref(),
-            Some(current.id.as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_metadata_requests_preserve_an_unrelated_goal_task() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker
-            .create_task(
-                crate::task::TaskKind::Goal,
-                "Unrelated work".into(),
-                None,
-                None,
-            )
-            .unwrap();
-        let selected = serde_json::to_value(broker.task_controller.current().unwrap()).unwrap();
-        for (method, params) in [
-            ("session.preview", json!({"session_id":"missing"})),
-            ("session.plan.get", json!({"plan_id":"missing"})),
-            ("session.rename", json!({})),
-            ("session.exchange.comment.save", json!({})),
-        ] {
-            let result = broker
-                .dispatch(Request {
-                    id: 1,
-                    method: method.into(),
-                    params,
-                })
-                .await;
-            assert!(result.response.error().is_some(), "{method}");
-            assert_eq!(
-                serde_json::to_value(broker.task_controller.current().unwrap()).unwrap(),
-                selected,
-                "{method}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn review_question_answers_capture_final_responses_without_revising_the_source() {
-        use crate::plan::review_document::ReadOnlyPlanReview;
-        use forge_buffer::identity::{DocumentId, InputSequence, ViewId};
-        use forge_buffer::input::DocumentInput;
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.provider = crate::provider::build(
-            broker.provider_launch.clone(),
-            Arc::clone(&broker.permission_coordinator),
-            Arc::clone(&broker.trace),
-            broker.data_root.clone(),
-        )
-        .unwrap()
-        .into();
-        broker
-            .submit_prompt(json!({"text":"/plan revise the API"}))
-            .await
-            .unwrap();
-        run_plan_to_input_boundary(&mut broker).await.unwrap();
-        let before = broker.snapshot().unwrap().active_plan.unwrap();
-        let thread = broker.session.provider_session_id.clone();
-        let source = broker
-            .plan_file
-            .capture_review_source(
-                &broker.session.id,
-                &before.id,
-                Some(before.model_revision),
-                before.review_digest.as_deref().unwrap(),
-            )
-            .unwrap();
-        let line = source
-            .rendered
-            .navigation
-            .anchor
-            .iter()
-            .find(|anchor| {
-                matches!(
-                    anchor.target,
-                    crate::plan::PlanReviewTarget::Declaration { .. }
-                )
-            })
-            .unwrap()
-            .line;
-        let digest = source.saved_digest.clone();
-        let id = DocumentId("review-question".into());
-        let view = ViewId("view".into());
-        let review = ReadOnlyPlanReview::new(
-            id.clone(),
-            view.clone(),
-            source,
-            forge_buffer::width::WidthProfile::default(),
-            None,
-        )
-        .unwrap();
-        let snapshot = review.snapshot();
-        let target = snapshot.block[0].metadata.target[0].clone();
-        let input = DocumentInput {
-            document: id.clone(),
-            revision: snapshot.revision,
-            view,
-            sequence: InputSequence(1),
-            action: "session.plan.question.answer".into(),
-            block: snapshot.block[0].id.clone(),
-            position: target.range.start,
-            target: Some(target.id),
-        };
-        let admission = broker.plan_review.admit(id.clone()).unwrap();
-        broker.plan_review.insert(review, admission).unwrap();
-        let params = json!({"review":input,"draft_source_digest":digest,"draft_annotation":[{
-            "id":"question","kind":"question","source":{"start_line":line,"end_line":line,"body":"Why this API?"}
-        }]});
-        let mut other = before.clone();
-        other.id = "different-current-plan".into();
-        broker.store.save_plan(&other).unwrap();
-        broker
-            .create_task(
-                crate::task::TaskKind::Plan,
-                "Different task".into(),
-                Some(other.id.clone()),
-                None,
-            )
-            .unwrap();
-        let selected_task =
-            serde_json::to_value(broker.task_controller.current().unwrap()).unwrap();
-        let count = broker.snapshot().unwrap().exchange.len();
-        let (document, mut questions, _) = broker.prepare_review_questions(&params).unwrap();
-        assert_eq!(questions.len(), 1);
-        let mut reordered = params.clone();
-        reordered["review"]["sequence"] = json!(3);
-        assert_eq!(
-            broker.prepare_review_questions(&reordered).unwrap().1.len(),
-            1
-        );
-        reordered["review"]["sequence"] = json!(2);
-        assert_eq!(
-            broker.prepare_review_questions(&reordered).unwrap().1.len(),
-            1
-        );
-        let scope = crate::plan::review_answer::ReviewAnswerScope::new(
-            Arc::clone(&broker.plan_review),
-            document.clone(),
-            questions.remove(0),
-        );
-        let context = crate::tools::ControlTurnContext::inactive(PromptMode::PlanQuestion);
-        let names = crate::tools::ControlToolRegistry
-            .definition_list_for_context(Some(&context), true)
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect::<Vec<_>>();
-        assert!(!names.contains(&"plan_review_answer"));
-        assert!(!names.contains(&"plan_file_edit"));
-        assert!(!names.contains(&"question_ask"));
-        assert!(
-            broker.plan_review.annotations(&document).unwrap()[0]
-                .reply
-                .is_none()
-        );
-        assert!(scope.submit("   ".into()).is_err());
-        scope
-            .submit("The declaration preserves the caller contract.".into())
-            .unwrap();
-        let snapshot = broker.snapshot().unwrap();
-        assert_eq!(snapshot.exchange.len(), count);
-        assert_eq!(snapshot.active_plan.as_ref().unwrap().id, other.id);
-        assert_eq!(
-            serde_json::to_value(broker.task_controller.current().unwrap()).unwrap(),
-            selected_task
-        );
-        assert_eq!(broker.session.provider_session_id, thread);
-        assert_eq!(
-            broker.plan_review.annotations(&document).unwrap()[0]
-                .reply
-                .as_ref()
-                .unwrap()
-                .body,
-            "The declaration preserves the caller contract."
-        );
-        let mut params = params;
-        params["review"]["sequence"] = json!(2);
-        assert!(
-            broker
-                .prepare_review_questions(&params)
-                .unwrap()
-                .1
-                .is_empty()
-        );
-        assert!(
-            broker
-                .configure_ask_model(json!({"model":"missing"}))
-                .await
-                .is_err()
-        );
-        let original_model = broker.session.model.clone();
-        let mut resolved_source = broker.session.clone();
-        resolved_source.model = "default".into();
-        resolved_source.resolved_model = Some("resolved-planning-model".into());
-        assert_eq!(
-            crate::settings::AskModel::default()
-                .resolve(&resolved_source, &[])
-                .unwrap()
-                .model
-                .as_deref(),
-            Some("resolved-planning-model")
-        );
-        broker
-            .configure_ask_model(
-                json!({"model":"mock-model","effort":"high","service_tier":"fast"}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(broker.session.model, original_model);
-        assert_eq!(
-            broker.snapshot().unwrap().ask_model.effort.as_deref(),
-            Some("high")
-        );
-
-        params["review"]["sequence"] = json!(3);
-        params["draft_annotation"][0]["id"] = json!("retry-question");
-        params["draft_annotation"][0]["source"]["body"] = json!("Explain the caller contract.");
-        let (document, mut questions, selection) =
-            broker.prepare_review_questions(&params).unwrap();
-        assert!(scope.check().is_err());
-        let scope = crate::plan::review_answer::ReviewAnswerScope::new(
-            Arc::clone(&broker.plan_review),
-            document.clone(),
-            questions.remove(0),
-        );
-        let count = broker.snapshot().unwrap().exchange.len();
-        let (progress_sink, mut progress_stream) = forge_protocol::outbound::channel();
-        broker
-            .run_review_question(Arc::clone(&scope), &selection, Some((&progress_sink, 53)))
-            .await
-            .unwrap();
-        let progress: Value =
-            serde_json::from_slice(progress_stream.try_recv().unwrap().bytes()).unwrap();
-        assert_eq!(progress["request_id"], 53);
-        assert_eq!(progress["event"], "session.plan.question.answer.progress");
-        assert_eq!(progress["payload"]["question_id"], "retry-question");
-        assert_eq!(progress["payload"]["model"], "mock-model");
-        assert_eq!(progress["payload"]["effort"], "high");
-        assert_eq!(broker.snapshot().unwrap().exchange.len(), count + 1);
-        assert!(
-            broker.plan_review.annotations(&document).unwrap()[0]
-                .reply
-                .is_some()
-        );
-    }
-
-    fn submit_test_plan(
-        request: &ProviderRequest,
-        output: &mut crate::provider::ProviderCompletion,
-        overview: &str,
-    ) {
-        let document = request
-            .control_context
-            .as_ref()
-            .and_then(|context| context.plan_document.as_ref())
-            .expect("planning context retains the design");
-        let design = document.design.as_ref().expect("declaration design");
-        let path = "src/migration.rs";
-        let text = format!(
-            "/// {}\npub fn migrate();\nAlgorithm\n  return\n",
-            overview.replace('\n', " ")
-        );
-        let patch = if design.proposed.contains_key(path) {
-            let document = design.read(Some(path), false).unwrap();
-            let previous = document["text"].as_str().unwrap();
-            format!(
-                "*** Begin Patch\n*** Update File: {path}\n@@\n{}{}*** End Patch",
-                previous
-                    .lines()
-                    .map(|line| format!("-{line}\n"))
-                    .collect::<String>(),
-                text.lines()
-                    .map(|line| format!("+{line}\n"))
-                    .collect::<String>()
-            )
-        } else {
-            format!(
-                "*** Begin Patch\n*** Add File: {path}\n{}*** End Patch",
-                text.lines()
-                    .map(|line| format!("+{line}\n"))
-                    .collect::<String>()
-            )
-        };
-        let previous_metadata = serde_json::to_string_pretty(&design.document)
-            .unwrap()
-            .lines()
-            .map(|line| format!("-{line}\n"))
-            .collect::<String>();
-        let mut metadata = design.document.clone();
-        metadata.objective = "Implement the migration strategy.".into();
-        metadata.background = "The fixture contains the original implementation.".into();
-        metadata.requirements = vec!["Preserve the migration contract.".into()];
-        metadata.design = overview.into();
-        let proposed_metadata = serde_json::to_string_pretty(&metadata)
-            .unwrap()
-            .lines()
-            .map(|line| format!("+{line}\n"))
-            .collect::<String>();
-        let patch = patch.replace("*** End Patch", &format!("*** Update File: plan.json\n@@\n{previous_metadata}{proposed_metadata}*** End Patch"));
-        let change = crate::plan::DesignPatchRequest {
-            plan_id: document.plan_id.clone(),
-            expected_version: document.version,
-            patch,
-            title: Some("Migration plan".into()),
-            source_digests: Default::default(),
-        };
-        let changed = document
-            .patch_design(Path::new(&request.workspace), change.clone())
-            .unwrap();
-        output.design_patch.push(change.into());
-        output.plan_submit = Some(crate::provider::PlanSubmitRequest {
-            plan_id: document.plan_id.clone(),
-            expected_version: changed.version,
-        });
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for RetryPlanProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            Ok(crate::provider::ProviderForkResult::unprofiled(
-                "retry-plan-fork".to_owned().try_into()?,
-            ))
-        }
-    }
-
-    impl RetryPlanProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            _event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let _fixture_scope = _event_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(_event_sink);
-            let _event_sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let _event_sink = Some(_event_sink);
-                    let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let mut output = crate::provider::ProviderCompletion {
-                        native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some("retry-plan".to_owned().try_into().unwrap()),
-                            capability: crate::provider::mock_capability(),
-                            runtime: crate::provider::ProviderRuntime {
-                                provider: "Retry plan test".into(),
-                                model: Some(request.model.clone()),
-                            },
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-                    if turn >= 2 {
-                        submit_test_plan(
-                            &request,
-                            &mut output,
-                            "Submitted after an explicit retry.",
-                        );
-                    }
-                    Ok(output)
-                }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for RepeatedPlanEditProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            Ok(crate::provider::ProviderForkResult::unprofiled(
-                "repeated-plan-document-fork".to_owned().try_into()?,
-            ))
-        }
-    }
-
-    impl RepeatedPlanEditProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            _event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let _fixture_scope = _event_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(_event_sink);
-            let _event_sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let _event_sink = Some(_event_sink);
-                    let mut output = crate::provider::ProviderCompletion {
-                        native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some(
-                                "repeated-plan-document".to_owned().try_into().unwrap(),
-                            ),
-                            capability: ProviderCapability::default(),
-                            runtime: crate::provider::ProviderRuntime {
-                                provider: "Repeated plan document test".into(),
-                                model: Some(request.model.clone()),
-                            },
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-                    submit_test_plan(&request, &mut output, "The same canonical plan.");
-                    output.plan_submit = None;
-                    Ok(output)
-                }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
-    }
-
-    impl PlanningQuestionProvider {
-        fn new(structured: bool) -> Self {
-            Self {
-                fixture_events: Default::default(),
-                turn: std::sync::atomic::AtomicUsize::new(0),
-                structured,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for PlanningQuestionProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            Ok(crate::provider::ProviderForkResult::unprofiled(
-                "planning-question-fork".to_owned().try_into()?,
-            ))
-        }
-    }
-
-    impl PlanningQuestionProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
-            let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let event_sink = Some(event_sink);
-                    let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let text = if turn == 0 {
-                        "Which migration strategy should the plan use?"
-                    } else {
-                        "The plan is ready for review."
-                    };
-                    let event = completed_message(
-                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
-                        "planning-response",
+                    .await?;
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
+                    })
+                    .await?;
+                    for event in completed_message(
+                        &address,
+                        "intermediate-answer",
                         crate::provider::MessageRole::Response,
-                        text,
-                    );
-                    if let Some(event_sink) = event_sink {
-                        let _ = event_sink.send(event.clone());
+                        "An intermediate answer.",
+                    ) {
+                        sink.send_wait(event).await?;
                     }
-                    let plan_question = (turn == 0 && self.structured).then(|| PlanQuestionSet {
-                        id: String::new(),
-                        questions: vec![crate::plan::PlanQuestion {
-                            id: String::new(),
-                            header: "Migration".into(),
-                            question: text.into(),
-                            options: vec![
-                                crate::plan::PlanQuestionOption {
-                                    recommended: false,
-                                    label: "Staged".into(),
-                                    description: "Support both formats temporarily.".into(),
-                                },
-                                crate::plan::PlanQuestionOption {
-                                    recommended: false,
-                                    label: "Immediate".into(),
-                                    description: "Remove the old format now.".into(),
-                                },
-                            ],
-                            allow_freeform: true,
-                        }],
-                    });
-                    let mut output = crate::provider::ProviderCompletion {
-                        native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some(
-                                "planning-question".to_owned().try_into().unwrap(),
-                            ),
-                            capability: ProviderCapability::default(),
-                            runtime: crate::provider::ProviderRuntime {
-                                provider: "Planning question test".into(),
-                                model: Some(request.model.clone()),
-                            },
-                            ..Default::default()
+                    sink.send_wait(ProviderEvent::ParentBoundary {
+                        scope: scope.clone(),
+                        update: crate::provider::ParentBoundaryUpdate::WaitStarted {
+                            agent_count: 1,
                         },
-                        plan_question,
-                        ..Default::default()
-                    };
-                    if turn > 0 && request.mode == PromptMode::Plan {
-                        submit_test_plan(
-                            &request,
-                            &mut output,
-                            "Use the selected migration strategy.",
-                        );
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::ParentBoundary {
+                        scope: scope.clone(),
+                        update: crate::provider::ParentBoundaryUpdate::WaitFinished,
+                    })
+                    .await?;
+                    for event in completed_message(
+                        &address,
+                        "final-synthesis",
+                        crate::provider::MessageRole::Response,
+                        "A final synthesis.",
+                    ) {
+                        sink.send_wait(event).await?;
                     }
-                    Ok(output)
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Finished {
+                            outcome: forge_provider_api::turn::TurnOutcome::Completed,
+                            completed_at_ms: 2,
+                        },
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                            scope,
+                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: 2,
+                                result: forge_provider_api::lifecycle::ExecutionResult::Completed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion {
+                                            provider_session_id: Some(
+                                                "parent-boundary"
+                                                    .to_owned()
+                                                    .try_into()
+                                                    .expect("fixture ID is valid"),
+                                            ),
+                                            capability: descriptor.capability.clone(),
+                                            ..Default::default()
+                                        }
+                                        .into(),
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok(())
                 }
-                .await;
-                output
+            },
+        );
+        crate::provider::test_support::ProviderTestSession::from_native(fixture)
+    }
+
+    #[derive(Clone, Copy)]
+    enum PlanFixtureBehavior {
+        Questions { structured: bool },
+        Retry { submit_from_turn: usize },
+        RepeatEdit,
+    }
+
+    fn plan_document_in_request(request: &forge_provider_api::PromptRequest) -> Option<Value> {
+        let mut text = String::new();
+        text.push_str(&request.instructions);
+        if let forge_provider_api::input::PromptInput::Text(input) = &request.input {
+            text.push('\n');
+            text.push_str(input);
+        }
+        for recovered in &request.recovered_inputs {
+            if let forge_provider_api::input::PromptInput::Text(input) = &recovered.input {
+                text.push('\n');
+                text.push_str(input);
             }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
         }
+        let marker = "Active declaration design:\n```json\n";
+        let start = text.find(marker)? + marker.len();
+        let end = text[start..].find("\n```")? + start;
+        serde_json::from_str(&text[start..end]).ok()
     }
 
-    #[derive(Default)]
-    struct NestedWriteProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for NestedWriteProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
+    async fn plan_fixture_tool(
+        request: &forge_provider_api::PromptRequest,
+        submit: bool,
+    ) -> Result<(), forge_provider_api::ProviderError> {
+        let Some(document) = plan_document_in_request(request) else {
+            return Ok(());
+        };
+        let Some(plan_id) = document.get("plan_id").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        let overview = crate::provider::test_support::call_tool(
+            request,
+            "plan_overview_read",
+            json!({"plan_id":plan_id}),
+        )
+        .await?;
+        let version = overview
+            .get("version")
+            .and_then(Value::as_u64)
+            .or_else(|| document.get("version").and_then(Value::as_u64))
+            .unwrap_or(1);
+        let current = overview.get("overview").cloned().unwrap_or(Value::Null);
+        let required = |name: &str, fallback: &str| {
+            current
+                .get(name)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(fallback)
+                .to_owned()
+        };
+        let objective = required("objective", "Implement the requested migration.");
+        let background = required("background", "Preserve the existing caller contract.");
+        let design = required(
+            "design",
+            "Keep ownership explicit and preserve compatibility.",
+        );
+        if !request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "plan_overview_edit")
+        {
+            return Err(forge_provider_api::ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::AdmitInput,
+                    forge_provider_api::ProviderFailureKind::Authorization,
+                ),
+            ));
+        }
+        request
+            .provider_tools
+            .call(
+                &request.scope,
+                forge_provider_api::control::ToolCall {
+                    name: "plan_overview_edit".into(),
+                    arguments: json!({
+                        "plan_id":plan_id,
+                        "expected_version":version,
+                        "objective":objective,
+                        "background":background,
+                        "design":design
+                    }),
+                },
+            )
+            .await?;
+        if submit {
+            let updated = crate::provider::test_support::call_tool(
+                request,
+                "plan_overview_read",
+                json!({"plan_id":plan_id}),
+            )
+            .await?;
+            let version = updated
+                .get("version")
+                .and_then(Value::as_u64)
+                .unwrap_or(version);
+            if !request.tools.iter().any(|tool| tool.name == "plan_submit") {
+                return Err(forge_provider_api::ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::AdmitInput,
+                        forge_provider_api::ProviderFailureKind::Authorization,
+                    ),
+                ));
             }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
+            request
+                .provider_tools
+                .call(
+                    &request.scope,
+                    forge_provider_api::control::ToolCall {
+                        name: "plan_submit".into(),
+                        arguments: json!({"plan_id":plan_id,"expected_version":version}),
+                    },
                 )
-            })
+                .await?;
         }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            Ok(crate::provider::ProviderForkResult::unprofiled(
-                "nested-write-fork".to_owned().try_into()?,
-            ))
-        }
+        Ok(())
     }
 
-    impl NestedWriteProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
-            let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let event_sink = Some(event_sink);
-                    let commentary = completed_message(
-                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
+    fn plan_fixture_provider(
+        broker: &HarnessBroker,
+        behavior: PlanFixtureBehavior,
+    ) -> Arc<Provider> {
+        let descriptor = forge_provider_api::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("fixture identity is available"),
+            label: "Plan workflow fixture".into(),
+            capability: Default::default(),
+        };
+        let turn = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fixture = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor.clone(),
+            move |request, sink, _cancelled| {
+                let descriptor = descriptor.clone();
+                let turn = turn.clone();
+                async move {
+                    use forge_provider_api::lifecycle::{
+                        ExecutionObservation, ExecutionResult, ExecutionUpdate,
+                    };
+                    use forge_provider_api::{ProviderEvent, TurnAddress};
+
+                    let index = turn.fetch_add(1, Ordering::SeqCst);
+                    match behavior {
+                        PlanFixtureBehavior::Questions { structured: true } if index == 0 => {
+                            crate::provider::test_support::call_tool(&request, "question_ask", json!({
+                                "questions":[{"header":"Migration","question":"Which migration strategy should the plan use?","options":[
+                                    {"label":"Staged","description":"Support both formats temporarily.","recommended":false},
+                                    {"label":"Immediate","description":"Remove the old format now.","recommended":false}
+                                ],"allow_freeform":true}]
+                            })).await?;
+                        }
+                        PlanFixtureBehavior::Retry { submit_from_turn }
+                            if index >= submit_from_turn =>
+                        {
+                            plan_fixture_tool(&request, true).await?;
+                        }
+                        PlanFixtureBehavior::RepeatEdit => {
+                            plan_fixture_tool(&request, false).await?;
+                        }
+                        PlanFixtureBehavior::Questions { .. }
+                            if index > 0 && request.mode == PromptMode::Plan =>
+                        {
+                            plan_fixture_tool(&request, true).await?;
+                        }
+                        _ => {}
+                    }
+                    let scope = request.scope.clone();
+                    let address = TurnAddress {
+                        scope: scope.clone(),
+                        thread_id: "plan-workflow-fixture".into(),
+                        turn_id: format!("turn-{index}").into(),
+                    };
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            scope.clone(),
+                            ExecutionUpdate::Started {
+                                address: address.clone(),
+                            },
+                        )?,
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Started {
+                            started_at_ms: index as i64,
+                        },
+                    })
+                    .await?;
+                    for event in completed_message(
+                        &address,
+                        format!("plan-response-{index}"),
+                        crate::provider::MessageRole::Response,
+                        if index == 0 {
+                            "Which migration strategy should the plan use?"
+                        } else {
+                            "The plan is ready for review."
+                        },
+                    ) {
+                        sink.send_wait(event).await?;
+                    }
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Finished {
+                            outcome: forge_provider_api::turn::TurnOutcome::Completed,
+                            completed_at_ms: index as i64 + 1,
+                        },
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            scope,
+                            ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: index as i64 + 1,
+                                result: ExecutionResult::Completed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion {
+                                            capability: descriptor.capability.clone(),
+                                            ..Default::default()
+                                        }
+                                        .into(),
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok::<(), forge_provider_api::ProviderError>(())
+                }
+            },
+        );
+        workflow_fixture_bridge(broker, fixture)
+    }
+    fn nested_write_provider(broker: &HarnessBroker, workspace: &Path) -> Arc<Provider> {
+        let workspace = workspace.to_owned();
+        let descriptor = forge_provider_api::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("fixture identity is available"),
+            label: "Nested write fixture".into(),
+            capability: Default::default(),
+        };
+        let fixture = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor.clone(),
+            move |request, sink, _cancelled| {
+                let descriptor = descriptor.clone();
+                let workspace = workspace.clone();
+                async move {
+                    use forge_provider_api::lifecycle::{
+                        ExecutionObservation, ExecutionResult, ExecutionUpdate,
+                    };
+                    use forge_provider_api::tool::{ToolInvocation, ToolOutcome, ToolUpdate};
+                    use forge_provider_api::{ProviderEvent, ToolAddress, TurnAddress};
+
+                    let scope = request.scope.clone();
+                    let turn = TurnAddress {
+                        scope: scope.clone(),
+                        thread_id: "nested-write-fixture".into(),
+                        turn_id: "turn-1".into(),
+                    };
+                    let sink = sink.invocation_sink(&scope)?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            scope.clone(),
+                            ExecutionUpdate::Started {
+                                address: turn.clone(),
+                            },
+                        )?,
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: turn.clone(),
+                        update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
+                    })
+                    .await?;
+                    for event in completed_message(
+                        &turn,
                         "nested-commentary",
                         crate::provider::MessageRole::Commentary,
                         "Creating the nested module.",
-                    );
-                    let provider_change = crate::provider::ProviderChangeSet {
-                        file: vec![crate::provider::ProviderFileChange {
+                    ) {
+                        sink.send_wait(event).await?;
+                    }
+
+                    let file_changes = forge_provider_api::ProviderChangeSet {
+                        file: vec![forge_provider_api::ProviderFileChange {
                             path: "seed.txt".into(),
                             move_path: None,
-                            kind: crate::provider::ProviderChangeKind::Update,
+                            kind: forge_provider_api::ProviderChangeKind::Update,
                             diff: "@@ -1 +1 @@\n-seed\n+provider edit".into(),
                         }],
                     };
-                    let file_started = crate::provider::test_support::tool(
-                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
-                        "provider-file-change".into(),
-                        crate::provider::ToolInvocation {
-                            semantics: Default::default(),
-                            kind: crate::provider::ToolActivityKind::FileChange,
-                            name: "fixture".into(),
-                            title: "file changes".into(),
-                            arguments: serde_json::Value::Null,
+                    let file_call = ToolAddress {
+                        turn: turn.clone(),
+                        tool_id: "provider-file-change".into(),
+                    };
+                    let file_invocation = ToolInvocation {
+                        semantics: Default::default(),
+                        kind: forge_provider_api::ToolActivityKind::FileChange,
+                        name: "fixture".into(),
+                        title: "file changes".into(),
+                        arguments: Value::Null,
+                    };
+                    sink.send_wait(ProviderEvent::Tool {
+                        address: file_call.clone(),
+                        update: ToolUpdate::Requested {
+                            invocation: file_invocation,
                         },
-                        crate::turn::test_support::tool_updates(
-                            crate::provider::ToolStatus::Running,
-                            None,
-                            provider_change.clone(),
-                        ),
-                    );
-                    let started = crate::provider::test_support::tool(
-                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
-                        "nested-command".into(),
-                        crate::provider::ToolInvocation {
-                            semantics: Default::default(),
-                            kind: crate::provider::ToolActivityKind::Command,
-                            name: "fixture".into(),
-                            title: "create nested module".into(),
-                            arguments: serde_json::Value::Null,
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Tool {
+                        address: file_call.clone(),
+                        update: ToolUpdate::Started,
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Tool {
+                        address: file_call.clone(),
+                        update: ToolUpdate::Changes {
+                            changes: file_changes.clone(),
                         },
-                        crate::turn::test_support::tool_updates(
-                            crate::provider::ToolStatus::Running,
-                            None,
-                            crate::provider::ProviderChangeSet::default(),
-                        ),
-                    );
-                    if let Some(event_sink) = event_sink.as_ref() {
-                        let _ = event_sink.send(commentary.clone());
-                        let _ = event_sink.send(file_started.clone());
-                    }
-                    std::fs::write(
-                        Path::new(&request.workspace).join("seed.txt"),
-                        "provider edit\n",
-                    )?;
-                    let file_completed = crate::provider::test_support::tool(
-                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
-                        "provider-file-change".into(),
-                        crate::provider::ToolInvocation {
-                            semantics: Default::default(),
-                            kind: crate::provider::ToolActivityKind::FileChange,
-                            name: "fixture".into(),
-                            title: "file changes".into(),
-                            arguments: serde_json::Value::Null,
+                    })
+                    .await?;
+                    std::fs::write(workspace.join("seed.txt"), "provider edit\n")
+                        .map_err(crate::provider::test_support::io_failure)?;
+                    sink.send_wait(ProviderEvent::Tool {
+                        address: file_call,
+                        update: ToolUpdate::Finished {
+                            outcome: ToolOutcome::Succeeded,
                         },
-                        crate::turn::test_support::tool_updates(
-                            crate::provider::ToolStatus::Succeeded,
-                            None,
-                            provider_change,
-                        ),
-                    );
-                    if let Some(event_sink) = event_sink.as_ref() {
-                        let _ = event_sink.send(file_completed.clone());
-                        let _ = event_sink.send(started.clone());
-                    }
-                    let nested = Path::new(&request.workspace).join("apps/new/deep/module");
-                    std::fs::create_dir_all(&nested)?;
-                    std::fs::write(nested.join("lib.rs"), "pub fn nested() {}\n")?;
-                    let ignored = Path::new(&request.workspace).join("target/generated/deep");
-                    std::fs::create_dir_all(&ignored)?;
-                    std::fs::write(ignored.join("artifact.txt"), "ignored\n")?;
-                    let completed = crate::provider::test_support::tool(
-                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
-                        "nested-command".into(),
-                        crate::provider::ToolInvocation {
-                            semantics: Default::default(),
-                            kind: crate::provider::ToolActivityKind::Command,
-                            name: "fixture".into(),
-                            title: "create nested module".into(),
-                            arguments: serde_json::Value::Null,
+                    })
+                    .await?;
+
+                    let command_call = ToolAddress {
+                        turn: turn.clone(),
+                        tool_id: "nested-command".into(),
+                    };
+                    sink.send_wait(ProviderEvent::Tool {
+                        address: command_call.clone(),
+                        update: ToolUpdate::Requested {
+                            invocation: ToolInvocation {
+                                semantics: Default::default(),
+                                kind: forge_provider_api::ToolActivityKind::Command,
+                                name: "fixture".into(),
+                                title: "create nested module".into(),
+                                arguments: Value::Null,
+                            },
                         },
-                        crate::turn::test_support::tool_updates(
-                            crate::provider::ToolStatus::Succeeded,
-                            Some("created nested module".into()),
-                            crate::provider::ProviderChangeSet::default(),
-                        ),
-                    );
-                    let response = completed_message(
-                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Tool {
+                        address: command_call.clone(),
+                        update: ToolUpdate::Started,
+                    })
+                    .await?;
+                    let nested = workspace.join("apps/new/deep/module");
+                    std::fs::create_dir_all(&nested)
+                        .map_err(crate::provider::test_support::io_failure)?;
+                    std::fs::write(nested.join("lib.rs"), "pub fn nested() {}\n")
+                        .map_err(crate::provider::test_support::io_failure)?;
+                    let ignored = workspace.join("target/generated/deep");
+                    std::fs::create_dir_all(&ignored)
+                        .map_err(crate::provider::test_support::io_failure)?;
+                    std::fs::write(ignored.join("artifact.txt"), "ignored\n")
+                        .map_err(crate::provider::test_support::io_failure)?;
+                    sink.send_wait(ProviderEvent::Tool {
+                        address: command_call.clone(),
+                        update: ToolUpdate::Output {
+                            update: forge_provider_api::tool::TextUpdate::Append(
+                                "created nested module".into(),
+                            ),
+                        },
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Tool {
+                        address: command_call,
+                        update: ToolUpdate::Finished {
+                            outcome: ToolOutcome::Succeeded,
+                        },
+                    })
+                    .await?;
+                    for event in completed_message(
+                        &turn,
                         "nested-response",
                         crate::provider::MessageRole::Response,
                         "The nested module is ready.",
-                    );
-                    if let Some(event_sink) = event_sink {
-                        let _ = event_sink.send(completed.clone());
-                        let _ = event_sink.send(response.clone());
+                    ) {
+                        sink.send_wait(event).await?;
                     }
-                    Ok(crate::provider::ProviderCompletion {
-                        native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some(
-                                "nested-write".to_owned().try_into().unwrap(),
-                            ),
-                            capability: ProviderCapability::default(),
-                            runtime: crate::provider::ProviderRuntime {
-                                provider: "Nested test".into(),
-                                model: Some(request.model),
-                            },
-                            ..Default::default()
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: turn.clone(),
+                        update: crate::provider::TurnUpdate::Finished {
+                            outcome: forge_provider_api::turn::TurnOutcome::Completed,
+                            completed_at_ms: 1,
                         },
-                        ..Default::default()
                     })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            scope,
+                            ExecutionUpdate::Finished {
+                                address: turn,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: 1,
+                                result: ExecutionResult::Completed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion {
+                                            capability: descriptor.capability.clone(),
+                                            ..Default::default()
+                                        }
+                                        .into(),
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok::<(), forge_provider_api::ProviderError>(())
                 }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
+            },
+        );
+        workflow_fixture_bridge(broker, fixture)
     }
+    fn task_update_provider(broker: &HarnessBroker) -> Arc<Provider> {
+        let descriptor = forge_provider_api::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("fixture identity is available"),
+            label: "Task update fixture".into(),
+            capability: Default::default(),
+        };
+        let fixture = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor.clone(),
+            move |request, sink, _cancelled| {
+                let descriptor = descriptor.clone();
+                async move {
+                    use forge_provider_api::lifecycle::{
+                        ExecutionObservation, ExecutionResult, ExecutionUpdate,
+                    };
+                    use forge_provider_api::{ProviderEvent, TurnAddress};
 
-    #[derive(Default)]
-    struct TaskUpdateProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for TaskUpdateProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            Ok(crate::provider::ProviderForkResult::unprofiled(
-                "task-update-fork".to_owned().try_into()?,
-            ))
-        }
-    }
-
-    impl TaskUpdateProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let fixture_scope = event_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(event_sink);
-            let event_sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let event_sink = Some(event_sink);
-                    let task_event = ProviderEvent::Checklist {
-                        address: crate::provider::test_support::address(
-                            &fixture_scope,
-                            "fixture",
-                            "turn",
-                        ),
-                        update: crate::provider::ProviderChecklistUpdate {
+                    let scope = request.scope.clone();
+                    let address = TurnAddress {
+                        scope: scope.clone(),
+                        thread_id: "task-update-fixture".into(),
+                        turn_id: "ordinary-turn".into(),
+                    };
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            scope.clone(),
+                            ExecutionUpdate::Started {
+                                address: address.clone(),
+                            },
+                        )?,
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Checklist {
+                        address: address.clone(),
+                        update: forge_provider_api::ProviderChecklistUpdate {
                             scope_id: "ordinary-turn".into(),
                             name: None,
                             complete: false,
                             replace_entries: true,
-                            entry_list: vec![crate::provider::ProviderChecklistEntry {
+                            entry_list: vec![forge_provider_api::ProviderChecklistEntry {
                                 provider_id: None,
                                 content: "Inspect ordinary chat".into(),
                                 priority: None,
-                                status: crate::provider::ChecklistStatus::InProgress,
+                                status: forge_provider_api::ChecklistStatus::InProgress,
                                 provider_ordinal: 0,
                             }],
                         },
-                    };
-                    let response = completed_message(
-                        &crate::provider::test_support::address(&fixture_scope, "fixture", "turn"),
+                    })
+                    .await?;
+                    for event in completed_message(
+                        &address,
                         "ordinary-response",
                         crate::provider::MessageRole::Response,
                         "Ordinary chat completed.",
-                    );
-                    if let Some(event_sink) = event_sink {
-                        let _ = event_sink.send(task_event.clone());
-                        let _ = event_sink.send(response.clone());
+                    ) {
+                        sink.send_wait(event).await?;
                     }
-                    Ok(crate::provider::ProviderCompletion {
-                        native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some("task-update".to_owned().try_into().unwrap()),
-                            capability: ProviderCapability::default(),
-                            runtime: crate::provider::ProviderRuntime {
-                                provider: "Task test".into(),
-                                model: Some(request.model),
-                            },
-                            ..Default::default()
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Finished {
+                            outcome: forge_provider_api::turn::TurnOutcome::Completed,
+                            completed_at_ms: 1,
                         },
-                        ..Default::default()
                     })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            scope,
+                            ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: 1,
+                                result: ExecutionResult::Completed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion {
+                                            capability: descriptor.capability.clone(),
+                                            ..Default::default()
+                                        }
+                                        .into(),
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok::<(), forge_provider_api::ProviderError>(())
                 }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
+            },
+        );
+        workflow_fixture_bridge(broker, fixture)
     }
 
     struct FixedClock(i64);
@@ -17509,7 +16063,8 @@ let sink = Some(sink);
                 workspace: workspace.path().to_string_lossy().into_owned(),
                 client_id: "test-client".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -17567,7 +16122,8 @@ let sink = Some(sink);
                 workspace: workspace.path().to_string_lossy().into_owned(),
                 client_id: "next-client".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -17850,218 +16406,105 @@ let sink = Some(sink);
         }
     }
 
-    struct MutableQuestionProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-        fail_withdrawal_continuation: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for MutableQuestionProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            _request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            Ok(crate::provider::ProviderForkResult::unprofiled(
-                "mutable-question-fork".to_owned().try_into()?,
-            ))
-        }
-    }
-
-    impl MutableQuestionProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            _event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let _fixture_scope = _event_sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(_event_sink);
-            let _event_sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let _event_sink = Some(_event_sink);
-                    let question_set = || PlanQuestionSet {
-                        id: "migration-set".into(),
-                        questions: vec![crate::plan::PlanQuestion {
-                            id: "migration".into(),
-                            header: "Migration".into(),
-                            question: "Which migration should the implementation use?".into(),
-                            options: vec![
-                                crate::plan::PlanQuestionOption {
-                                    recommended: false,
-                                    label: "Staged".into(),
-                                    description: "Preserve compatibility temporarily.".into(),
-                                },
-                                crate::plan::PlanQuestionOption {
-                                    recommended: false,
-                                    label: "Immediate".into(),
-                                    description: "Replace the old format now.".into(),
-                                },
-                            ],
-                            allow_freeform: true,
-                        }],
-                    };
-                    let request_text = request.input.text();
-                    let mut output = crate::provider::ProviderCompletion {
-                        native: forge_provider_api::completion::ProviderCompletion {
-                            provider_session_id: Some(
-                                "mutable-question".to_owned().try_into().unwrap(),
-                            ),
-                            capability: ProviderCapability::default(),
-                            runtime: crate::provider::ProviderRuntime {
-                                provider: "Mutable question test".into(),
-                                model: Some(request.model.clone()),
-                            },
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    };
-                    if request_text.contains("User follow-up:\nreplace the options") {
-                        let mut replacement = question_set();
-                        replacement.questions[0].options = vec![
-                            crate::plan::PlanQuestionOption {
-                                recommended: false,
-                                label: "Safe".into(),
-                                description: "Retain compatibility.".into(),
-                            },
-                            crate::plan::PlanQuestionOption {
-                                recommended: false,
-                                label: "Fast".into(),
-                                description: "Prefer immediate cleanup.".into(),
-                            },
-                        ];
-                        output.plan_question = Some(replacement);
-                    } else if request_text.contains("User follow-up:\nuse staged") {
-                        output.question_answer = Some(PlanQuestionAnswer {
-                            source: crate::session::ResolutionSource::User,
-                            question_id: "migration".into(),
-                            response: PlanQuestionResponse::Selected {
-                                option: "Staged".into(),
-                                feedback: None,
-                            },
-                        });
-                    } else if request_text
-                        .contains("User follow-up:\nthis decision is not material")
-                    {
-                        output.question_withdrawal = Some(PlanQuestionWithdrawal {
-                            reason: "Repository policy determines the migration.".into(),
-                        });
-                    } else if request_text.contains("Pending planning questions withdrawn")
-                        || request_text.contains("Planning feedback:\n- Migration: Staged")
-                        || request_text.contains("Harness resolved the pending questions")
-                    {
-                        if self.fail_withdrawal_continuation
-                            && request_text.contains("Pending planning questions withdrawn")
-                        {
-                            anyhow::bail!("synthetic withdrawal continuation failure");
-                        }
-                        if request.mode == PromptMode::Plan {
-                            submit_test_plan(&request, &mut output, "Follow repository policy.");
-                        }
-                    } else {
-                        output.plan_question = Some(question_set());
+    fn mutable_question_fixture() -> Arc<crate::provider::test_support::EventFixtureProvider> {
+        let descriptor = crate::provider::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            label: "Normalized question fixture".into(),
+            capability: crate::provider::test_support::fixture_capability(),
+        };
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        crate::provider::test_support::EventFixtureProvider::new(
+            descriptor.clone(),
+            move |request, sink, _cancelled| {
+                let turns = turns.clone();
+                let descriptor = descriptor.clone();
+                async move {
+                    let turn = turns.fetch_add(1, Ordering::SeqCst);
+                    let scope = request.scope.clone();
+                    if turn == 0 {
+                        crate::provider::test_support::call_tool(&request, "question_ask", json!({
+                        "questions":[{"header":"Migration","question":"Which migration should the implementation use?","options":[
+                            {"label":"Staged","description":"Preserve compatibility temporarily.","recommended":false},
+                            {"label":"Immediate","description":"Replace the old format now.","recommended":false}
+                        ],"allow_freeform":true}]
+                    })).await?;
                     }
-                    Ok(output)
+                    let address = crate::provider::TurnAddress {
+                        scope: scope.clone(),
+                        thread_id: "question-fixture".into(),
+                        turn_id: turn.to_string().into(),
+                    };
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                            scope.clone(),
+                            forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                                address: address.clone(),
+                            },
+                        )?,
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Started {
+                            started_at_ms: turn as i64,
+                        },
+                    })
+                    .await?;
+                    for event in completed_message(
+                        &address,
+                        "question-response",
+                        crate::provider::MessageRole::Response,
+                        if turn == 0 {
+                            "Which migration strategy should the plan use?"
+                        } else {
+                            "The migration strategy is recorded."
+                        },
+                    ) {
+                        sink.send_wait(event).await?;
+                    }
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Finished {
+                            outcome: forge_provider_api::turn::TurnOutcome::Completed,
+                            completed_at_ms: turn as i64 + 1,
+                        },
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                            scope,
+                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: turn as i64 + 1,
+                                result: forge_provider_api::lifecycle::ExecutionResult::Completed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion {
+                                            capability: descriptor.capability.clone(),
+                                            ..Default::default()
+                                        }
+                                        .into(),
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok(())
                 }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
+            },
+        )
     }
 
     fn mutable_question_broker(repository: &Path, data_root: &Path) -> HarnessBroker {
-        let mut broker = planning_question_broker(repository, data_root, true);
-        broker.provider = Arc::new(MutableQuestionProvider {
-            fixture_events: Default::default(),
-            fail_withdrawal_continuation: false,
-        });
+        let mut broker = planning_question_broker(repository, data_root, false);
+        let native: Arc<dyn forge_provider_api::provider::Provider> = mutable_question_fixture();
+        broker.provider = Arc::new(crate::provider::Provider::new(
+            native,
+            broker.permission_coordinator.clone(),
+            broker.trace.clone(),
+            broker.data_root.clone(),
+        ));
         broker
     }
 
@@ -18081,7 +16524,8 @@ let sink = Some(sink);
                 workspace: repository.to_string_lossy().into_owned(),
                 client_id: "planning-question-client".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -18094,7 +16538,8 @@ let sink = Some(sink);
             Box::new(FixedClock(100)),
         )
         .unwrap();
-        broker.provider = Arc::new(PlanningQuestionProvider::new(structured));
+        broker.provider =
+            plan_fixture_provider(&broker, PlanFixtureBehavior::Questions { structured });
         broker
     }
 
@@ -18127,15 +16572,16 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.provider = Arc::from(crate::provider::build(
+        broker.provider = crate::provider::build(
             ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: vec!["mock".into()],
             },
             broker.permission_coordinator.clone(),
             broker.trace.clone(),
             broker.data_root.clone(),
-        )?);
+        )?;
         broker
             .submit_prompt(json!({"text":"Original request"}))
             .await?;
@@ -18159,6 +16605,22 @@ let sink = Some(sink);
                 question_id: ids[0].clone(),
                 task_id: None,
                 message_kind,
+                reply: crate::provider::test_support::question_reply(
+                    &ids[0],
+                    match message_kind {
+                        crate::question::QuestionMessageKind::Clarification => {
+                            forge_provider_api::QuestionReplyResponse::Clarification {
+                                options: Vec::new(),
+                                text: "Clarify".into(),
+                                reply_to: None,
+                            }
+                        }
+                        _ => forge_provider_api::QuestionReplyResponse::Answer {
+                            answer: "Layout".into(),
+                            required_questions_remain: false,
+                        },
+                    },
+                ),
             };
             broker
                 .submit_prompt(json!({"text":"Internal question delivery context"}))
@@ -18248,15 +16710,14 @@ let sink = Some(sink);
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let mut event = Vec::new();
         let lifecycle = AgentLifecycleEvent {
-            operation: "wait".into(),
-            starts_child: false,
-            parent_thread_id: Some("parent-thread".into()),
-            provider_thread_id: Some("unknown-child".into()),
-            turn_id: None,
+            agent_id: forge_provider_api::agent::AgentId::new("observed-child").unwrap(),
+            parent_agent_id: None,
+            conversation_id: None,
+            kind: forge_provider_api::agent::AgentLifecycleKind::Finished,
             definition: None,
             nickname: None,
             task: None,
-            status: AgentExecutionState::Completed,
+            state: AgentExecutionState::Completed,
         };
 
         broker
@@ -18268,24 +16729,23 @@ let sink = Some(sink);
     }
 
     #[tokio::test]
-    async fn explicit_native_spawn_flags_cannot_create_durable_agent_identity() {
+    async fn observed_agent_start_cannot_create_durable_managed_identity() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let lifecycle = AgentLifecycleEvent {
-            operation: "subagent_spawned".into(),
-            starts_child: true,
-            parent_thread_id: Some("root".into()),
-            provider_thread_id: Some("native-child".into()),
-            turn_id: Some("native-child-turn".into()),
+            agent_id: forge_provider_api::agent::AgentId::new("observed-child").unwrap(),
+            parent_agent_id: None,
+            conversation_id: Some("observed-history".try_into().unwrap()),
+            kind: forge_provider_api::agent::AgentLifecycleKind::Started,
             definition: Some("Reviewer".into()),
             nickname: Some("Review worker".into()),
             task: Some("Inspect the selected change".into()),
-            status: AgentExecutionState::Running,
+            state: AgentExecutionState::Running,
         };
         let mut events = Vec::new();
         let spawned = broker
-            .apply_agent_lifecycle(&lifecycle, Some("parent-exchange"), &mut events)
+            .apply_agent_lifecycle(&lifecycle, None, &mut events)
             .unwrap();
         let saved = broker.store.list_agent_run(&broker.session.id).unwrap();
         let child = saved
@@ -18298,7 +16758,7 @@ let sink = Some(sink);
     }
 
     #[tokio::test]
-    async fn native_subagent_activity_cannot_bind_a_managed_identity() {
+    async fn observed_agent_activity_cannot_bind_a_managed_identity() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -18311,19 +16771,20 @@ let sink = Some(sink);
             .parent_exchange_id = Some("parent-interaction".into());
         let mut event = Vec::new();
         let lifecycle = AgentLifecycleEvent {
-            operation: "subAgentActivity".into(),
-            starts_child: true,
-            parent_thread_id: Some("parent-thread".into()),
-            provider_thread_id: Some("child-thread".into()),
-            turn_id: Some("parent-turn".into()),
+            agent_id: forge_provider_api::agent::AgentId::new("observed-child").unwrap(),
+            parent_agent_id: Some(
+                forge_provider_api::agent::AgentId::new("observed-parent").unwrap(),
+            ),
+            conversation_id: Some("observed-history".try_into().unwrap()),
+            kind: forge_provider_api::agent::AgentLifecycleKind::Updated,
             definition: None,
             nickname: None,
             task: None,
-            status: AgentExecutionState::Running,
+            state: AgentExecutionState::Running,
         };
 
         broker
-            .apply_agent_lifecycle(&lifecycle, Some("parent-interaction"), &mut event)
+            .apply_agent_lifecycle(&lifecycle, None, &mut event)
             .unwrap();
 
         let run_list = broker.agent_registry.list();
@@ -18429,17 +16890,22 @@ let sink = Some(sink);
                 outcome: ToolOutcome::Succeeded,
             }
         ));
-        assert!(!saved.accepts_settled_tool_update(
-            &address,
-            &ToolUpdate::Finished {
-                outcome: ToolOutcome::Failed {
-                    diagnostic: crate::provider::ToolDiagnostic {
-                        code: None,
-                        message: "late contradiction".into(),
-                    }
-                },
-            }
-        ));
+        assert!(
+            !saved.accepts_settled_tool_update(
+                &address,
+                &ToolUpdate::Finished {
+                    outcome: ToolOutcome::Failed {
+                        diagnostic: crate::provider::ToolDiagnostic {
+                            kind: forge_provider_api::ProviderFailureKind::Unknown,
+                            message: forge_provider_api::SanitizedMessage::new(
+                                "late contradiction"
+                            )
+                            .expect("host diagnostic is nonempty"),
+                        }
+                    },
+                }
+            )
+        );
         Ok(())
     }
 
@@ -18567,7 +17033,7 @@ let sink = Some(sink);
                 &mut runtime,
                 &mut exchange,
                 crate::provider::ProviderRuntime {
-                    provider: "Codex CLI".into(),
+                    provider: "Fixture Provider".into(),
                     model: Some("resolved-model".into()),
                 }
                 .resolved_event(fixture_scope),
@@ -19053,7 +17519,6 @@ let sink = Some(sink);
                 scope: fixture_scope.clone(),
                 authorization_sink: sink,
                 editing: Arc::clone(&broker.observer.check_editing),
-                setup: false,
                 can_run: true,
                 agent: Arc::clone(&broker.agent_coordinator),
                 cancelled: Arc::new(AtomicBool::new(false)),
@@ -19146,7 +17611,6 @@ let sink = Some(sink);
                     scope: fixture_scope.clone(),
                     authorization_sink: sink,
                     editing: Arc::clone(&broker.observer.check_editing),
-                    setup: false,
                     can_run: true,
                     agent: Arc::clone(&broker.agent_coordinator),
                     cancelled: Arc::new(AtomicBool::new(false)),
@@ -19502,7 +17966,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "compact-client".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -19847,7 +18312,8 @@ let sink = Some(sink);
             workspace: repository.path().to_string_lossy().into_owned(),
             client_id: client_id.into(),
             provider: ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: vec!["mock".into()],
             },
             model: "mock-model".into(),
@@ -19891,7 +18357,8 @@ let sink = Some(sink);
             workspace: workspace.path().to_string_lossy().into_owned(),
             client_id: "source-client".into(),
             provider: ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: vec!["mock".into()],
             },
             model: "mock-model".into(),
@@ -19935,7 +18402,9 @@ let sink = Some(sink);
             .load_session(&source.session.id)
             .unwrap()
             .unwrap();
-        stored.provider = "copilot".into();
+        stored.provider = forge_providers::registry::alternate_id(&request.provider.kind)
+            .expect("alternate registered provider")
+            .to_string();
         source.store.save_session(&stored).unwrap();
         let failure =
             HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(130)))
@@ -19982,7 +18451,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: client_id.into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -20254,117 +18724,79 @@ let sink = Some(sink);
         );
     }
 
-    #[derive(Default)]
-    struct PreferenceProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for PreferenceProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Codex,
-                label: "Preference fixture".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn model_list(
-            &self,
-            _request: ProviderRequest,
-        ) -> Result<Vec<crate::provider::ProviderModel>> {
-            ["gpt-5.6", "gpt-5.4"].into_iter().map(|id| {
-                Ok(serde_json::from_value(json!({
-                    "id": id, "reasoning": ["low", "medium", "high"],
-                    "default_reasoning": "medium", "is_default": id == "gpt-5.6", "vision": false,
-                        "service_tiers": ["default", "fast", "ultrafast"],
-                    "context_window": [{"id":"default"}, {"id":"long_context"}]
-                }))?)
-            }).collect()
-        }
-    }
-
-    impl PreferenceProvider {
-        async fn run_native(
-            &self,
-            _request: ProviderRequest,
-            _sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let _fixture_scope = _sink.invocation_scope()?.clone();
-            let fixture = crate::provider::test_support::FixtureStream::new(_sink);
-            let _sink = fixture.clone();
-            let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                let output: anyhow::Result<crate::provider::ProviderCompletion> = async {
-                    let _sink = Some(_sink);
-                    anyhow::bail!("preference persistence must not start a model turn")
-                }
-                .await;
-                output
-            }
-            .await;
-            let result = result.map_err(crate::provider::ProviderError::from);
-            fixture.finish(&result).await?;
-            result
-        }
+    fn preference_provider() -> anyhow::Result<crate::provider::test_support::ProviderTestSession> {
+        use forge_provider_api::{ProviderFailure, ProviderFailureKind, ProviderOperation};
+        let descriptor = forge_provider_api::ProviderDescriptor {
+            kind: forge_providers::registry::default_id(),
+            label: "Preference fixture".into(),
+            capability: crate::provider::test_support::fixture_capability(),
+        };
+        let fixture = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor,
+            |_request, _sink, _cancelled| async {
+                Err(crate::provider::ProviderError::Failure(
+                    ProviderFailure::new(
+                        ProviderOperation::AdmitInput,
+                        ProviderFailureKind::Rejected,
+                    ),
+                ))
+            },
+        )
+        .with_models(vec![
+            forge_provider_api::ProviderModel {
+                id: "gpt-5.6".into(),
+                service_tiers: vec![
+                    forge_provider_api::ServiceTier::Standard,
+                    forge_provider_api::ServiceTier::Fast,
+                    forge_provider_api::ServiceTier::Ultrafast,
+                ],
+                reasoning: vec!["low".into(), "medium".into(), "high".into()],
+                default_reasoning: Some("medium".into()),
+                selected_reasoning: None,
+                context_window: vec![
+                    forge_provider_api::ProviderContextWindow {
+                        id: "default".into(),
+                        token_limit: None,
+                    },
+                    forge_provider_api::ProviderContextWindow {
+                        id: "long_context".into(),
+                        token_limit: None,
+                    },
+                ],
+                default_context_window: Some("default".into()),
+                selected_context_window: None,
+                vision: false,
+                description: None,
+                is_default: true,
+            },
+            forge_provider_api::ProviderModel {
+                id: "gpt-5.4".into(),
+                service_tiers: vec![
+                    forge_provider_api::ServiceTier::Standard,
+                    forge_provider_api::ServiceTier::Fast,
+                    forge_provider_api::ServiceTier::Ultrafast,
+                ],
+                reasoning: vec!["low".into(), "medium".into(), "high".into()],
+                default_reasoning: Some("medium".into()),
+                selected_reasoning: None,
+                context_window: vec![
+                    forge_provider_api::ProviderContextWindow {
+                        id: "default".into(),
+                        token_limit: None,
+                    },
+                    forge_provider_api::ProviderContextWindow {
+                        id: "long_context".into(),
+                        token_limit: None,
+                    },
+                ],
+                default_context_window: Some("default".into()),
+                selected_context_window: None,
+                vision: false,
+                description: None,
+                is_default: false,
+            },
+        ]);
+        crate::provider::test_support::ProviderTestSession::from_native(fixture)
     }
 
     #[tokio::test]
@@ -20380,10 +18812,7 @@ let sink = Some(sink);
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "settings-client".into(),
-                provider: ProviderLaunch {
-                    kind: "codex".into(),
-                    command: vec!["codex".into(), "app-server".into()],
-                },
+                provider: crate::provider::test_support::default_launch(),
                 model: "default".into(),
                 effort: "medium".into(),
                 session_id: None,
@@ -20394,7 +18823,8 @@ let sink = Some(sink);
             Box::new(FixedClock(100)),
         )
         .unwrap();
-        broker.provider = Arc::new(PreferenceProvider::default());
+        let preference_provider = self::preference_provider().unwrap();
+        broker.provider = preference_provider.provider_handle();
         let selected = broker
             .dispatch(Request {
                 id: 0,
@@ -20506,10 +18936,7 @@ let sink = Some(sink);
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "settings-client".into(),
-                provider: ProviderLaunch {
-                    kind: "codex".into(),
-                    command: vec!["codex".into(), "app-server".into()],
-                },
+                provider: crate::provider::test_support::default_launch(),
                 model: "default".into(),
                 effort: "medium".into(),
                 session_id: Some(session["id"].as_str().expect("child session id").to_owned()),
@@ -20520,7 +18947,8 @@ let sink = Some(sink);
             Box::new(FixedClock(100)),
         )
         .unwrap();
-        broker.provider = Arc::new(PreferenceProvider::default());
+        let preference_provider = self::preference_provider().unwrap();
+        broker.provider = preference_provider.provider_handle();
         let selected = broker
             .dispatch(Request {
                 id: 21,
@@ -20576,10 +19004,7 @@ let sink = Some(sink);
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "restarted-settings-client".into(),
-                provider: ProviderLaunch {
-                    kind: "codex".into(),
-                    command: vec!["codex".into(), "app-server".into()],
-                },
+                provider: crate::provider::test_support::default_launch(),
                 model: "default".into(),
                 effort: "medium".into(),
                 session_id: Some(resumed_session_id),
@@ -20627,10 +19052,7 @@ let sink = Some(sink);
             permission_file: None,
             workspace: repository.path().to_string_lossy().into_owned(),
             client_id: "provider-default-test".into(),
-            provider: ProviderLaunch {
-                kind: "codex".into(),
-                command: vec!["codex".into(), "app-server".into()],
-            },
+            provider: crate::provider::test_support::default_launch(),
             model: "original-model".into(),
             effort: "medium".into(),
             session_id: None,
@@ -20646,7 +19068,7 @@ let sink = Some(sink);
         initial.save_session().unwrap();
         let original_id = initial.session.id.clone();
         let mut settings = crate::settings::SettingsStore::open(data.path()).unwrap();
-        settings.save_provider(0, "codex", &json!({
+        settings.save_provider(0, forge_providers::registry::default_id().as_str(), &json!({
             "model": "preferred-model", "effort": "high", "context_window": "long_context", "service_tier": "fast"
         })).unwrap();
         drop(initial);
@@ -20711,7 +19133,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "inline-config-client".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -20770,7 +19193,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "preview-client".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -20848,7 +19272,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "first-client".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -20902,7 +19327,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "second-client".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "different-model".into(),
@@ -20955,10 +19381,12 @@ let sink = Some(sink);
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.goal_max_turns = 2;
-        broker.provider = Arc::new(RetryPlanProvider {
-            fixture_events: Default::default(),
-            turn: std::sync::atomic::AtomicUsize::new(0),
-        });
+        broker.provider = plan_fixture_provider(
+            &broker,
+            PlanFixtureBehavior::Retry {
+                submit_from_turn: 2,
+            },
+        );
 
         let failed = broker
             .dispatch(Request {
@@ -21092,10 +19520,12 @@ let sink = Some(sink);
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.goal_max_turns = 2;
-        broker.provider = Arc::new(RetryPlanProvider {
-            fixture_events: Default::default(),
-            turn: std::sync::atomic::AtomicUsize::new(0),
-        });
+        broker.provider = plan_fixture_provider(
+            &broker,
+            PlanFixtureBehavior::Retry {
+                submit_from_turn: 2,
+            },
+        );
         broker
             .dispatch(Request {
                 id: 1,
@@ -21129,7 +19559,7 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.provider = Arc::new(RepeatedPlanEditProvider::default());
+        broker.provider = plan_fixture_provider(&broker, PlanFixtureBehavior::RepeatEdit);
 
         let result = broker
             .dispatch(Request {
@@ -21186,11 +19616,12 @@ let sink = Some(sink);
     }
 
     #[tokio::test]
-    async fn postprocessing_failure_finalizes_the_interaction_timeline() {
+    async fn normalized_provider_failure_finalizes_the_interaction_timeline() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.provider = Arc::new(InvalidControlOutputProvider::default());
+        let provider = invalid_control_output_fixture().unwrap();
+        broker.provider = provider.provider_handle();
         broker.clock = Box::new(AdvancingClock(std::sync::atomic::AtomicI64::new(100)));
 
         let result = broker
@@ -21297,10 +19728,92 @@ let sink = Some(sink);
         assert_eq!(broker.agent_coordinator.active_count(), 0);
         Ok(())
     }
-    struct NativeSettlementProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-        inner: crate::provider::test_support::ProviderTestSession<Provider>,
-        state: GoalState,
+    fn native_settlement_fixture() -> Result<crate::provider::test_support::ProviderTestSession> {
+        let descriptor = crate::provider::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
+            label: "Normalized goal fixture".into(),
+            capability: crate::provider::test_support::fixture_capability(),
+        };
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fixture = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor.clone(),
+            move |request, sink, _cancelled| {
+                let turns = turns.clone();
+                let descriptor = descriptor.clone();
+                async move {
+                    let turn = turns.fetch_add(1, Ordering::SeqCst);
+                    if turn >= 2 {
+                        crate::provider::test_support::call_tool(
+                            &request,
+                            "goal_complete",
+                            json!({"summary":"The continued goal is complete."}),
+                        )
+                        .await?;
+                    }
+                    let scope = request.scope.clone();
+                    let address = crate::provider::TurnAddress {
+                        scope: scope.clone(),
+                        thread_id: "goal-fixture".into(),
+                        turn_id: turn.to_string().into(),
+                    };
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                            scope.clone(),
+                            forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                                address: address.clone(),
+                            },
+                        )?,
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Started {
+                            started_at_ms: turn as i64,
+                        },
+                    })
+                    .await?;
+                    for event in completed_message(
+                        &address,
+                        "goal-response",
+                        crate::provider::MessageRole::Response,
+                        "Continuing the goal.",
+                    ) {
+                        sink.send_wait(event).await?;
+                    }
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Finished {
+                            outcome: forge_provider_api::turn::TurnOutcome::Completed,
+                            completed_at_ms: turn as i64 + 1,
+                        },
+                    })
+                    .await?;
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                            scope,
+                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: turn as i64 + 1,
+                                result: forge_provider_api::lifecycle::ExecutionResult::Completed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion {
+                                            capability: descriptor.capability.clone(),
+                                            ..Default::default()
+                                        }
+                                        .into(),
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok(())
+                }
+            },
+        );
+        let fixture = fixture.with_goal_status(|_owner, _update| async { Ok(()) });
+        crate::provider::test_support::ProviderTestSession::from_native(fixture)
     }
 
     #[tokio::test]
@@ -21308,14 +19821,8 @@ let sink = Some(sink);
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.provider = Arc::new(NativeSettlementProvider {
-            fixture_events: Default::default(),
-            inner: crate::provider::test_support::ProviderTestSession::from_dyn(
-                broker.provider.clone(),
-            )
-            .unwrap(),
-            state: GoalState::Active,
-        });
+        let provider = native_settlement_fixture().unwrap();
+        broker.provider = provider.provider_handle();
         broker
             .dispatch_session_command(
                 "session.goal.set",
@@ -21327,14 +19834,6 @@ let sink = Some(sink);
             .dispatch_session_command("session.command.apply", json!({"action":"continue"}))
             .unwrap();
         dispatch_pending_task_input(&mut broker).await.unwrap();
-        broker.provider = Arc::new(NativeSettlementProvider {
-            fixture_events: Default::default(),
-            inner: crate::provider::test_support::ProviderTestSession::from_dyn(
-                broker.provider.clone(),
-            )
-            .unwrap(),
-            state: GoalState::Complete,
-        });
         broker
             .dispatch_session_command("session.command.apply", json!({"action":"continue"}))
             .unwrap();
@@ -21417,119 +19916,6 @@ let sink = Some(sink);
         );
     }
 
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for NativeSettlementProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Mock CLI".into(),
-                capability: crate::provider::mock_capability(),
-            }
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::test_support::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn fork(
-            &self,
-            request: ProviderForkRequest,
-        ) -> Result<crate::provider::ProviderForkResult> {
-            self.inner.fork(request).await
-        }
-    }
-
-    impl NativeSettlementProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            event_sink: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            let mut output =
-                crate::provider::test_support::ProviderTestExt::session_prompt_and_wait(
-                    &self.inner,
-                    request,
-                    event_sink,
-                )
-                .await?;
-            output.evidence.native_state = Some(self.state);
-            output.evidence.tool_called = true;
-            Ok(output)
-        }
-    }
-
     #[tokio::test]
     async fn pauses_an_active_goal_after_a_provider_failure() {
         let repository = repository();
@@ -21544,7 +19930,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "failure-test".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -21557,7 +19944,8 @@ let sink = Some(sink);
             Box::new(FixedClock(200)),
         )
         .unwrap();
-        broker.provider = Arc::new(FailingProvider::default());
+        let provider = failing_provider_fixture(repository.path().to_owned()).unwrap();
+        broker.provider = provider.provider_handle();
         let result = broker
             .dispatch(Request {
                 id: 1,
@@ -21594,7 +19982,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "task-test".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -21607,7 +19996,7 @@ let sink = Some(sink);
             Box::new(FixedClock(250)),
         )
         .unwrap();
-        broker.provider = Arc::new(TaskUpdateProvider::default());
+        broker.provider = task_update_provider(&broker);
         let result = broker
             .dispatch(Request {
                 id: 1,
@@ -21642,7 +20031,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "parent-boundary-test".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -21655,7 +20045,8 @@ let sink = Some(sink);
             Box::new(FixedClock(500)),
         )
         .unwrap();
-        broker.provider = Arc::new(ParentBoundaryProvider::default());
+        let provider = parent_boundary_fixture().unwrap();
+        broker.provider = provider.provider_handle();
 
         let result = broker
             .dispatch(Request {
@@ -21716,7 +20107,8 @@ let sink = Some(sink);
                 workspace: workspace.path().to_string_lossy().into_owned(),
                 client_id: "reported-edits-test".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -21729,7 +20121,7 @@ let sink = Some(sink);
             Box::new(FixedClock(300)),
         )
         .unwrap();
-        broker.provider = Arc::new(NestedWriteProvider::default());
+        broker.provider = nested_write_provider(&broker, Path::new(&broker.session.workspace));
         let result = broker
             .dispatch(Request {
                 id: 1,
@@ -21777,7 +20169,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "interaction-diff-test".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -21790,7 +20183,7 @@ let sink = Some(sink);
             Box::new(FixedClock(300)),
         )
         .unwrap();
-        broker.provider = Arc::new(NestedWriteProvider::default());
+        broker.provider = nested_write_provider(&broker, Path::new(&broker.session.workspace));
         let result = broker
             .dispatch(Request {
                 id: 1,
@@ -21860,7 +20253,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "matching-interaction-diff-test".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -21873,7 +20267,7 @@ let sink = Some(sink);
             Box::new(FixedClock(300)),
         )
         .unwrap();
-        broker.provider = Arc::new(NestedWriteProvider::default());
+        broker.provider = nested_write_provider(&broker, Path::new(&broker.session.workspace));
 
         let occupied: Vec<_> = (0..4)
             .map(|_| broker.repositories.reads.submit(0, |_| Ok(())).unwrap())
@@ -21944,7 +20338,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "child-attribution-test".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -22073,7 +20468,8 @@ let sink = Some(sink);
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "provider-test".into(),
                 provider: ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec!["mock".into()],
                 },
                 model: "mock-model".into(),
@@ -22088,9 +20484,13 @@ let sink = Some(sink);
         .unwrap();
         let active_id = broker.session.id.clone();
         let mut incompatible = broker.session.clone();
-        incompatible.id = "copilot-session".into();
+        incompatible.id = "different-provider-session".into();
         incompatible.primary_agent_id = HarnessSession::primary_agent_id(&incompatible.id);
-        incompatible.provider = "copilot".into();
+        incompatible.provider = forge_providers::registry::alternate_id(
+            &forge_providers::registry::select(&broker.session.provider).unwrap(),
+        )
+        .expect("alternate registered provider")
+        .to_string();
         incompatible.lease_owner = None;
         broker.store.save_session(&incompatible).unwrap();
         let result = broker

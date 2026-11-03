@@ -73,7 +73,9 @@ impl AgentRuntime {
                             update: crate::provider::ToolUpdate::Finished {
                                 outcome: crate::provider::ToolOutcome::Failed {
                                     diagnostic: crate::provider::ToolDiagnostic {
-                                        code: Some("tool_timeout".into()), message: expired.to_string(),
+                                        kind: forge_provider_api::ProviderFailureKind::Timeout,
+                                        message: forge_provider_api::SanitizedMessage::new("Tool execution timed out")
+                                            .expect("static diagnostic is nonempty"),
                                     },
                                 },
                             },
@@ -142,7 +144,7 @@ impl AgentRuntime {
         let retained = match retained {
             Ok(Ok(retained)) => retained,
             Ok(Err(error)) => {
-                preserve_child_failure(&mut output, error);
+                preserve_child_failure(&mut output, error.into());
                 None
             }
             Err(_) => {
@@ -239,7 +241,8 @@ impl AgentRuntime {
             event
                 .scope()
                 .invocation()
-                .is_none_or(|scope| scope.exchange_id == self.task_id),
+                .is_none_or(|scope| scope.exchange_id
+                    == forge_provider_api::ExchangeId::from(self.task_id.as_str())),
             "provider event crosses child task ownership"
         );
         self.sender
@@ -336,7 +339,7 @@ impl ChildObservation {
                     }
                 }
                 Err(crate::provider::events::EventDeliveryError::Empty) => break,
-                Err(crate::provider::events::EventDeliveryError::Closed { .. }) => {
+                Err(crate::provider::events::EventDeliveryError::Closed) => {
                     self.stream = None;
                     break;
                 }

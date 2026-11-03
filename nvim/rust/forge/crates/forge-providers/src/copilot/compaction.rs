@@ -1,6 +1,8 @@
 use super::turn::CopilotTurnEvent;
 use forge_provider_api::{Compaction, CompactionState};
-use forge_provider_api::{ProviderError, ProviderEvent, ProviderEventSink};
+use forge_provider_api::{
+    ProviderError, ProviderEvent, ProviderEventSink, ProviderFailureKind, SanitizedMessage,
+};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -102,8 +104,8 @@ impl CompactionMonitor {
         thread_id: String,
         subscription_state: CompactionSubscription,
         turn_event: Arc<CopilotTurnEvent>,
-        trace: Arc<dyn forge_provider_api::trace::ProviderTrace>,
-        harness_session_id: String,
+        _trace: Arc<dyn forge_provider_api::trace::ProviderTrace>,
+        _harness_session_id: String,
     ) -> Self {
         let manual = Arc::clone(&subscription_state.manual);
         let correlation = Arc::clone(&manual);
@@ -114,24 +116,19 @@ impl CompactionMonitor {
                 loop {
                     let event = match subscription.recv().await {
                         Ok(event) => event,
-                        Err(error) => {
+                        Err(_) => {
                             let diagnostic = ProviderEvent::Diagnostic {
                                 scope: sink.scope().clone(),
                                 diagnostic: forge_provider_api::ProviderDiagnostic {
-                                    code: Some("copilot_compaction_subscription_failed".into()),
-                                    message: format!(
-                                        "Copilot compaction subscription failed: {error:#}"
-                                    ),
+                                    kind: ProviderFailureKind::Transport,
+                                    message: SanitizedMessage::new(
+                                        "Provider compaction event stream failed",
+                                    )
+                                    .expect("static diagnostic is nonempty"),
                                     fatal: true,
                                 },
                             };
-                            if let Err(delivery) = sink.send_wait(diagnostic).await {
-                                trace.record(
-                                    &harness_session_id,
-                                    "copilot.compaction.delivery_failed",
-                                    serde_json::json!({"error":delivery.to_string()}),
-                                );
-                            }
+                            let _ = sink.send_wait(diagnostic).await;
                             return;
                         }
                     };
@@ -150,22 +147,20 @@ impl CompactionMonitor {
                     );
                     let mut update = match update {
                         Ok(update) => update,
-                        Err(error) => {
+                        Err(_error) => {
                             drop(state);
                             let diagnostic = ProviderEvent::Diagnostic {
                                 scope: sink.scope().clone(),
                                 diagnostic: forge_provider_api::ProviderDiagnostic {
-                                    code: Some("invalid_copilot_compaction".into()),
-                                    message: error.to_string(),
+                                    kind: ProviderFailureKind::Protocol,
+                                    message: SanitizedMessage::new(
+                                        "Provider compaction event could not be normalized",
+                                    )
+                                    .expect("static diagnostic is nonempty"),
                                     fatal: false,
                                 },
                             };
-                            if let Err(delivery) = sink.send_wait(diagnostic).await {
-                                trace.record(
-                                    &harness_session_id,
-                                    "copilot.compaction.delivery_failed",
-                                    serde_json::json!({"error":delivery.to_string()}),
-                                );
+                            if sink.send_wait(diagnostic).await.is_err() {
                                 return;
                             }
                             continue;
@@ -184,11 +179,7 @@ impl CompactionMonitor {
                             })
                             .await
                     {
-                        trace.record(
-                            &harness_session_id,
-                            "copilot.compaction.active_delivery_failed",
-                            serde_json::json!({"error":error.to_string()}),
-                        );
+                        let _ = error;
                     }
                     if let Err(error) = sink
                         .send_wait(ProviderEvent::Compaction {
@@ -197,11 +188,7 @@ impl CompactionMonitor {
                         })
                         .await
                     {
-                        trace.record(
-                            &harness_session_id,
-                            "copilot.compaction.delivery_failed",
-                            serde_json::json!({"error":error.to_string()}),
-                        );
+                        let _ = error;
                         return;
                     }
                 }
@@ -211,7 +198,12 @@ impl CompactionMonitor {
                 _ = closing => {},
                 _ = observe => {},
             }
-            subscription.close().await.map_err(ProviderError::from)
+            subscription.close().await.map_err(|_| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::CollectEventReader,
+                    forge_provider_api::ProviderFailureKind::Runtime,
+                )
+            })
         });
         Self {
             manual,
@@ -228,8 +220,11 @@ impl CompactionMonitor {
         let Some(task) = self.task.as_mut() else {
             return Ok(());
         };
-        let result = task.await.map_err(|error| ProviderError::Protocol {
-            message: format!("Copilot compaction monitor collection failed: {error}"),
+        let result = task.await.map_err(|_| {
+            native_failure(
+                forge_provider_api::ProviderOperation::CollectEventReader,
+                forge_provider_api::ProviderFailureKind::Runtime,
+            )
         });
         self.task.take();
         result?
@@ -242,6 +237,13 @@ impl Drop for CompactionMonitor {
             let _ = shutdown.send(());
         }
     }
+}
+
+fn native_failure(
+    operation: forge_provider_api::ProviderOperation,
+    kind: forge_provider_api::ProviderFailureKind,
+) -> ProviderError {
+    ProviderError::Failure(forge_provider_api::ProviderFailure::new(operation, kind))
 }
 
 #[cfg(test)]
@@ -279,8 +281,12 @@ mod tests {
             Some("Retain the contract.")
         );
         assert_eq!(
-            replayed.result.error.as_deref(),
-            Some("summary request failed")
+            replayed
+                .result
+                .diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.message.as_str()),
+            Some("Provider compaction failed")
         );
         assert_eq!(replayed.result.messages_removed, Some(0));
         assert_eq!(replayed.result.model.as_deref(), Some("summary-model"));
@@ -307,7 +313,7 @@ mod tests {
 
     impl forge_provider_api::trace::ProviderTrace for Trace {
         /// Discard diagnostics while observing the normalized failure and collection boundary.
-        fn record(&self, _: &str, _: &str, _: serde_json::Value) {}
+        fn record(&self, _: forge_provider_api::trace::ProviderTraceRecord) {}
     }
 
     /// A joined subscription failure stays observation evidence rather than becoming cleanup failure.
@@ -324,11 +330,13 @@ mod tests {
         while !reader.is_finished() {
             tokio::task::yield_now().await;
         }
-        let (sink, _events) =
-            forge_provider_api::events::channel(forge_provider_api::EventScope::SessionOperation {
+        let (sink, _events) = forge_provider_api::events::channel(
+            forge_provider_api::BindingId::new("compaction-failure").unwrap(),
+            forge_provider_api::EventScope::SessionOperation {
                 owner: forge_provider_api::ExecutionOwner::root("compaction-failure"),
                 operation_id: "observer".into(),
-            });
+            },
+        );
         let mut monitor = CompactionMonitor::from_stream(
             super::super::event_stream::SessionEventStream::fixture(receive, reader),
             "native-thread".into(),
@@ -344,11 +352,13 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_identity_survives_turn_and_subscription_rebinding() {
-        let (sink, _stream) =
-            forge_provider_api::events::channel(forge_provider_api::EventScope::SessionOperation {
+        let (sink, _stream) = forge_provider_api::events::channel(
+            forge_provider_api::BindingId::new("compaction-observer").unwrap(),
+            forge_provider_api::EventScope::SessionOperation {
                 owner: forge_provider_api::ExecutionOwner::root("session"),
                 operation_id: "compaction-observer".into(),
-            });
+            },
+        );
         let subscription = CompactionSubscription::new(sink);
         let rebound = subscription.clone();
         let start = github_copilot_sdk::SessionEvent {

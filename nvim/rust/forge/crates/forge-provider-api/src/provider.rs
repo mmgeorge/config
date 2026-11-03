@@ -1,274 +1,449 @@
-use crate::capability::{CapabilityManifest, UnsupportedCapability};
-use crate::catalog::{CatalogMutation, McpDefinition, ProviderCatalogRequest, SkillDefinition};
-use crate::*;
-use crate::{events, terminal};
-use anyhow::Result;
+//! Provider-neutral operations implemented by native provider owners.
+
 use async_trait::async_trait;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 
-/// Host-owned request, workflow, and result types used by a provider integration.
-/// Native protocol implementations remain independent of these associated types.
-pub trait ProviderHost: Send + Sync + 'static {
-    type Request: Send + Sync;
-    type Completion: Send;
-    type Output: Send;
-    type ForkRequest: Send;
-    type CompactionRequest: Send;
-    type TextGeneration: Send;
-    type SteeringInput: Send;
-    type Settings: Sync;
-    type Submission: Sync;
-    type MockResponseControl: Sync;
-    fn owner(request: &Self::Request) -> std::result::Result<ExecutionOwner, ProviderError>;
-    fn output(events: Vec<ProviderEvent>, completion: Self::Completion) -> Self::Output;
-    fn has_resources(settings: &Self::Settings) -> bool;
-}
+use crate::{
+    capability::{CapabilityManifest, ProviderFeature, UnsupportedCapability},
+    catalog::{CatalogMutation, McpDefinition, ProviderCatalogRequest, SkillDefinition},
+    events::ProviderEventStream,
+    session::{
+        BindingId, ContinuationOutcome, ContinuationRequest, InputAcceptance, PromptRequest,
+        RecoveryToken, ResourceSelection, SessionBinding, SessionRequest, SessionSettings,
+        SteeringRequest, SubmissionEvidence,
+    },
+    terminal::TerminalSnapshot,
+    *,
+};
 
-/// Requires session lifecycle ownership and provides explicit failures for optional operations.
+/// Own a normalized persistent session and every native lifecycle behind its binding.
 #[async_trait]
 pub trait Provider: Send + Sync + 'static {
-    type Host: ProviderHost;
-    /// Submit input to a retained session; success means acceptance, not execution completion.
-    async fn session_prompt(
-        self: std::sync::Arc<Self>,
-        request: <Self::Host as ProviderHost>::Request,
-        scope: InvocationScope,
-    ) -> std::result::Result<(), ProviderError>;
-
-    /// Observe normalized events through the lifetime of one execution owner's session.
-    async fn session_events(
-        &self,
-        owner: ExecutionOwner,
-    ) -> std::result::Result<events::ProviderEventStream, ProviderError>;
-
-    /// Retire one failed owner's native binding and observation generation before replacement.
-    async fn reset_session(
-        &self,
-        _owner: &ExecutionOwner,
-    ) -> std::result::Result<(), ProviderError> {
-        Err(UnsupportedCapability("session_replacement").into())
-    }
-
-    /// Revoke callback authority before collecting an owner with unreliable observation.
-    async fn fence_session(
-        &self,
-        _owner: &ExecutionOwner,
-    ) -> std::result::Result<(), ProviderError> {
-        Err(UnsupportedCapability("session_fencing").into())
-    }
-
-    /// Submit steering to its original owner without exposing native turn placement.
-    async fn session_steer(
-        self: std::sync::Arc<Self>,
-        owner: &ExecutionOwner,
-        scope: InvocationScope,
-        input: <Self::Host as ProviderHost>::SteeringInput,
-    ) -> std::result::Result<(), ProviderError> {
-        if scope.owner != *owner {
-            return Err(ProviderError::Rejected {
-                message: "steering scope belongs to a different execution owner".into(),
-            });
-        }
-        let _ = input;
-        Err(UnsupportedCapability("native_steer").into())
-    }
-    /// Create or resume provider history and connections without admitting a model turn.
-    /// The returned identity belongs to the requested Harness session in this runtime.
-    /// The broker decides whether to resume or replace it when reopening local history.
+    /// Create or resume a conversation and retain its authoritative event reader.
     async fn initialize_session(
         &self,
-        _request: <Self::Host as ProviderHost>::Request,
-    ) -> std::result::Result<Option<ProviderSessionId>, ProviderError> {
-        Ok(None)
+        request: SessionRequest,
+    ) -> Result<SessionBinding, ProviderError>;
+
+    /// Take the session's one normalized stream before admitting input.
+    async fn take_session_events(
+        &self,
+        binding: &BindingId,
+    ) -> Result<ProviderEventStream, ProviderError>;
+
+    /// Submit input to the retained session; success records acceptance, not completion.
+    async fn session_prompt(
+        &self,
+        binding: &BindingId,
+        request: PromptRequest,
+    ) -> Result<InputAcceptance, ProviderError>;
+
+    /// Continue the same invocation only with provider proof that its prior input was not consumed.
+    async fn continue_session(
+        &self,
+        binding: &BindingId,
+        request: ContinuationRequest,
+    ) -> Result<ContinuationOutcome, ProviderError>;
+
+    /// Submit steering to the original execution owner without exposing native turn placement.
+    async fn session_steer(
+        &self,
+        binding: &BindingId,
+        request: SteeringRequest,
+    ) -> Result<SteeringAcceptance, ProviderError>;
+
+    /// Revoke callback authority and collect a failed binding before replacement.
+    async fn retire_session(&self, binding: &BindingId) -> Result<(), ProviderError>;
+
+    /// Fence a binding whose event observation is no longer reliable.
+    async fn fence_session(&self, binding: &BindingId) -> Result<(), ProviderError>;
+
+    /// Resume a persisted conversation using opaque provider-owned recovery evidence.
+    async fn recover_session(
+        &self,
+        request: SessionRequest,
+        token: Option<RecoveryToken>,
+    ) -> Result<SessionBinding, ProviderError>;
+
+    /// Inspect installed runtime state and normalized authentication choices.
+    async fn setup(&self, request: ProviderCatalogRequest) -> Result<ProviderSetup, ProviderError> {
+        let _ = request;
+        Err(UnsupportedCapability(ProviderFeature::RuntimeSetup).into())
     }
 
-    /// Expose explicit response barriers only for the in-process mock provider.
-    fn mock_response_control(&self) -> Option<&<Self::Host as ProviderHost>::MockResponseControl> {
-        None
+    /// Authenticate with one advertised method without admitting model input.
+    async fn authenticate(
+        &self,
+        request: ProviderCatalogRequest,
+        method: AuthenticationMethodId,
+    ) -> Result<(), ProviderError> {
+        let _ = (request, method);
+        Err(UnsupportedCapability(ProviderFeature::Authentication).into())
     }
 
-    /// Reports whether every local tool waits on the request's checkpoint barrier.
-    fn checkpoint_tool_gate(&self) -> bool {
-        false
-    }
-
-    /// Inspect the installed provider runtime without creating a conversation.
-    async fn setup(&self, _request: ProviderCatalogRequest) -> Result<Value> {
-        Err(UnsupportedCapability("runtime_setup").into())
-    }
-
-    /// Authenticate explicitly without admitting a model prompt or creating provider history.
-    async fn authenticate(&self, _request: ProviderCatalogRequest, _method: String) -> Result<()> {
-        Err(UnsupportedCapability("authentication").into())
-    }
-
-    /// Return support and discovery state for the selected session without launching provider work.
-    async fn capabilities(&self, _request: ProviderCatalogRequest) -> Result<CapabilityManifest> {
+    /// Return normalized support and discovery state for the selected session.
+    async fn capabilities(
+        &self,
+        request: ProviderCatalogRequest,
+    ) -> Result<CapabilityManifest, ProviderError> {
+        let _ = request;
         Ok(CapabilityManifest::from_descriptor(self.descriptor()))
     }
 
-    /// Reconcile portable resource selection before reporting configuration as applied.
+    /// Reconcile normalized model, access, and admitted resource choices.
+    /// Preserve the existing binding and its one event stream while replacing native resources.
+    /// Fence the binding and report observation loss if replacement cannot be completed safely.
     async fn reconcile_settings(
         &self,
-        _request: ProviderCatalogRequest,
-        setting: &<Self::Host as ProviderHost>::Settings,
-    ) -> std::result::Result<(), ProviderError> {
-        if <Self::Host as ProviderHost>::has_resources(setting) {
-            return Err(UnsupportedCapability("resource_selection").into());
-        }
-        Ok(())
+        request: ProviderCatalogRequest,
+        settings: SessionSettings,
+        resources: ResourceSelection,
+    ) -> Result<(), ProviderError> {
+        let _ = (request, settings, resources);
+        Err(UnsupportedCapability(ProviderFeature::ResourceSelection).into())
     }
-    /// Collect provider process ownership after admitted session work has drained.
-    /// Publish final observations for known background tools before closing every
-    /// session event stream. Callers drain those streams before releasing session leases.
-    async fn shutdown(&self) -> std::result::Result<(), ProviderError>;
 
-    /// Return stable provider identity and capability without starting a provider process.
+    /// Collect all provider-owned sessions and runtimes after their readers are drained.
+    async fn shutdown(&self) -> Result<(), ProviderError>;
+
+    /// Expose normalized deterministic controls when this provider is a test backend.
+    fn test_control(&self) -> Option<std::sync::Arc<dyn crate::testing::ProviderTestControl>> {
+        None
+    }
+
+    /// Return stable provider identity and capability without starting provider work.
     fn descriptor(&self) -> ProviderDescriptor;
 
-    /// Plan and execution scopes remain bound to their provider request until its turn ends.
-    fn supports_task_steering(&self, kind: crate::input::TaskKind) -> bool {
-        kind == crate::input::TaskKind::Goal
+    /// Report task steering support through normalized task semantics.
+    fn supports_task_steering(&self, kind: input::TaskKind) -> bool {
+        kind == input::TaskKind::Goal
     }
 
-    /// Returns a native receipt only when history proves this exact submission was accepted.
-    /// Missing history and unsupported reconciliation return None and never authorize replay.
+    /// Reconcile one journal entry using adapter-owned history and opaque recovery evidence.
     async fn reconcile_submission(
         &self,
-        _submission: &<Self::Host as ProviderHost>::Submission,
-        _known_receipts: &std::collections::HashSet<String>,
-    ) -> Result<Option<String>> {
-        Ok(None)
+        submission_id: &SubmissionId,
+        token: Option<&RecoveryToken>,
+        accepted_receipts: &[RecoveryToken],
+    ) -> Result<SubmissionEvidence, ProviderError> {
+        let _ = (submission_id, token, accepted_receipts);
+        Ok(SubmissionEvidence::Unknown)
     }
 
-    /// Fork a provider session only when the provider advertises native support.
+    /// Create durable target history when the capability declares native support.
+    /// The host subsequently initializes its live binding with the returned history identity.
     async fn fork(
         &self,
-        _request: <Self::Host as ProviderHost>::ForkRequest,
-    ) -> Result<ProviderForkResult> {
-        Err(UnsupportedCapability("native_fork").into())
+        request: ConversationForkRequest,
+    ) -> Result<ProviderForkResult, ProviderError> {
+        let _ = request;
+        Err(UnsupportedCapability(ProviderFeature::NativeFork).into())
     }
 
-    /// Query live provider shells independently of prompt execution and exchange completion.
+    /// Query live provider shells independently of prompt execution and completion.
     async fn background_terminals(
         &self,
-        _request: ProviderCatalogRequest,
-    ) -> Result<terminal::TerminalSnapshot> {
-        Err(UnsupportedCapability("background_terminals").into())
+        request: ProviderCatalogRequest,
+    ) -> Result<TerminalSnapshot, ProviderError> {
+        let _ = request;
+        Err(UnsupportedCapability(ProviderFeature::BackgroundTerminals).into())
     }
 
-    /// Terminate one provider-owned background shell without interrupting its exchange.
-    async fn terminate_terminal(&self, _request: ProviderCatalogRequest, _id: &str) -> Result<()> {
-        Err(UnsupportedCapability("background_termination").into())
-    }
-
-    /// Generate text independently of the main provider conversation.
-    async fn generate_text(
+    /// Terminate one provider-owned shell without interrupting its exchange.
+    async fn terminate_terminal(
         &self,
-        _request: ProviderCatalogRequest,
-        _purpose: <Self::Host as ProviderHost>::TextGeneration,
-        _model: &str,
-        _reasoning_effort: Option<&str>,
-        _history: &str,
-    ) -> std::result::Result<String, ProviderError> {
-        Err(UnsupportedCapability("text_generation").into())
+        request: ProviderCatalogRequest,
+        terminal_id: &str,
+    ) -> Result<(), ProviderError> {
+        let _ = (request, terminal_id);
+        Err(UnsupportedCapability(ProviderFeature::BackgroundTermination).into())
     }
 
-    /// List provider models for the Harness model picker.
+    /// Generate text in an isolated temporary operation independent of persistent sessions.
+    async fn generate_text(&self, request: TextGenerationRequest) -> Result<String, ProviderError> {
+        let _ = request;
+        Err(UnsupportedCapability(ProviderFeature::TextGeneration).into())
+    }
+
+    /// List models in normalized preference order for the model picker.
     async fn model_list(
         &self,
-        _request: <Self::Host as ProviderHost>::Request,
-    ) -> Result<Vec<ProviderModel>> {
-        Err(UnsupportedCapability("model_selection").into())
+        request: ProviderCatalogRequest,
+    ) -> Result<Vec<ProviderModel>, ProviderError> {
+        let _ = request;
+        Err(UnsupportedCapability(ProviderFeature::ModelSelection).into())
     }
 
-    /// List user-invocable provider skills with their effective enabled state.
-    async fn skill_list(&self, _request: ProviderCatalogRequest) -> Result<Vec<SkillDefinition>> {
-        Err(UnsupportedCapability("skill_catalog").into())
+    /// List skills using normalized state and stable identity.
+    async fn skill_list(
+        &self,
+        request: ProviderCatalogRequest,
+    ) -> Result<Vec<SkillDefinition>, ProviderError> {
+        let _ = request;
+        Err(UnsupportedCapability(ProviderFeature::SkillCatalog).into())
     }
 
-    /// Persist one provider skill's enabled state for future turns.
+    /// Persist one skill's enabled state for future turns.
     async fn set_skill_enabled(
         &self,
-        _request: ProviderCatalogRequest,
-        _name: &str,
-        _enabled: bool,
-    ) -> Result<CatalogMutation> {
-        Err(UnsupportedCapability("skill_mutation").into())
+        request: ProviderCatalogRequest,
+        name: &str,
+        enabled: bool,
+    ) -> Result<CatalogMutation, ProviderError> {
+        let _ = (request, name, enabled);
+        Err(UnsupportedCapability(ProviderFeature::SkillMutation).into())
     }
 
-    /// List configured servers without waiting for their startup handshakes.
+    /// List configured MCP resources without exposing native launch representation.
     async fn mcp_configuration(
         &self,
-        _request: ProviderCatalogRequest,
-    ) -> Result<Vec<McpDefinition>> {
-        Err(UnsupportedCapability("mcp_catalog").into())
+        request: ProviderCatalogRequest,
+    ) -> Result<Vec<McpDefinition>, ProviderError> {
+        let _ = request;
+        Err(UnsupportedCapability(ProviderFeature::McpCatalog).into())
     }
 
-    /// Query server readiness and tool definitions when the provider exposes them.
-    async fn mcp_list(&self, _request: ProviderCatalogRequest) -> Result<Vec<McpDefinition>> {
-        Err(UnsupportedCapability("mcp_catalog").into())
+    /// Query normalized MCP readiness and available tools.
+    async fn mcp_list(
+        &self,
+        request: ProviderCatalogRequest,
+    ) -> Result<Vec<McpDefinition>, ProviderError> {
+        let _ = request;
+        Err(UnsupportedCapability(ProviderFeature::McpCatalog).into())
     }
 
-    /// Persist one MCP server's enabled state and report whether its turn must resume.
+    /// Persist one MCP resource's enabled state and report whether a turn must resume.
     async fn set_mcp_enabled(
         &self,
-        _request: ProviderCatalogRequest,
-        _name: &str,
-        _enabled: bool,
-    ) -> Result<CatalogMutation> {
-        Err(UnsupportedCapability("mcp_mutation").into())
+        request: ProviderCatalogRequest,
+        name: &str,
+        enabled: bool,
+    ) -> Result<CatalogMutation, ProviderError> {
+        let _ = (request, name, enabled);
+        Err(UnsupportedCapability(ProviderFeature::McpMutation).into())
     }
 
-    /// Return whether one Harness session currently owns an in-flight provider turn.
-    async fn has_active_turn(&self, session_id: &str) -> bool;
+    /// Report whether one execution owner currently has active provider work.
+    async fn has_active_turn(&self, owner: &ExecutionOwner) -> bool;
 
-    /// Clear provisional native turn identity before admitting the next broker invocation.
-    async fn prepare_turn(&self, _session_id: &str) -> Result<()> {
+    /// Clear provisional turn identity before admitting another invocation.
+    async fn prepare_turn(&self, owner: &ExecutionOwner) -> Result<(), ProviderError> {
+        let _ = owner;
         Ok(())
     }
 
-    /// Stop native continuation through the active reader before acquiring the broker lock.
-    /// The caller races reader readiness against broker availability and may cancel this wait.
-    async fn stop_goal_session(&self, _session_id: &str, _clear: bool) -> Result<()> {
-        Ok(())
+    /// Stop native continuation through the active reader before host coordination locks.
+    async fn stop_goal_session(
+        &self,
+        owner: &ExecutionOwner,
+        mode: GoalStopMode,
+    ) -> Result<(), ProviderError> {
+        let _ = (owner, mode);
+        Err(UnsupportedCapability(ProviderFeature::NativeGoal).into())
     }
 
-    /// Update a native provider goal when that provider owns goal persistence.
+    /// Update a provider-owned goal using normalized status.
     async fn goal_status(
         &self,
-        _request: <Self::Host as ProviderHost>::Request,
-        _update: NativeGoalUpdate,
-    ) -> Result<()> {
-        Ok(())
+        owner: &ExecutionOwner,
+        update: NativeGoalUpdate,
+    ) -> Result<(), ProviderError> {
+        let _ = (owner, update);
+        Err(UnsupportedCapability(ProviderFeature::NativeGoal).into())
     }
 
-    /// Compact provider-owned conversation history when the provider advertises support.
+    /// Compact provider-owned history when the normalized capability supports it.
     async fn compact(
         &self,
-        _request: <Self::Host as ProviderHost>::CompactionRequest,
-    ) -> Result<<Self::Host as ProviderHost>::Output> {
-        Err(UnsupportedCapability("native_compact").into())
+        binding: &BindingId,
+        request: CompactionRequest,
+    ) -> Result<Compaction, ProviderError> {
+        let _ = (binding, request);
+        Err(UnsupportedCapability(ProviderFeature::NativeCompact).into())
     }
 
-    /// Interrupt the parent and descendants for one session and await terminal evidence.
-    async fn cleanup_execution(&self, session_id: &str) -> std::result::Result<(), ProviderError>;
+    /// Cancel one binding and wait for its normalized terminal evidence and collection.
+    async fn cancel_session(&self, binding: &BindingId) -> Result<(), ProviderError>;
 
-    /// Stop and collect one session through the same execution cleanup contract.
-    async fn cancel_session(&self, session_id: &str) -> std::result::Result<(), ProviderError> {
-        self.cleanup_execution(session_id).await
-    }
+    /// Resolve one execution's foreground native work while retaining completed background tools.
+    async fn cleanup_execution(&self, binding: &BindingId) -> Result<(), ProviderError>;
 
-    /// Return one Harness session's provider conversation after interruption.
-    async fn active_session_id_for(&self, session_id: &str) -> Result<Option<ProviderSessionId>>;
+    /// Return a conversation identity after interruption for persistence.
+    async fn active_session_id_for(
+        &self,
+        owner: &ExecutionOwner,
+    ) -> Result<Option<ProviderSessionId>, ProviderError>;
 
-    /// Roll back a cancelled turn after the broker proves it produced no visible output or changes.
-    async fn rollback_cancelled_turn(&self) -> Result<bool> {
+    /// Roll back output-free cancellation only after the host confirms it is safe.
+    async fn rollback_cancelled_turn(&self, binding: &BindingId) -> Result<bool, ProviderError> {
+        let _ = binding;
         Ok(false)
     }
+}
 
-    /// Roll back one Harness session's output-free cancelled turn.
-    async fn rollback_cancelled_turn_for(&self, _session_id: &str) -> Result<bool> {
-        self.rollback_cancelled_turn().await
+/// Select an authentication method advertised by normalized setup discovery.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AuthenticationMethodId(String);
+
+impl AuthenticationMethodId {
+    /// Create an opaque nonempty method identity.
+    pub fn new(value: impl Into<String>) -> Result<Self, AuthenticationMethodIdError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(AuthenticationMethodIdError);
+        }
+        Ok(Self(value))
     }
+
+    /// Get the opaque method identity for round-tripping to its owning provider.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for AuthenticationMethodId {
+    type Error = AuthenticationMethodIdError;
+
+    /// Validate deserialized authentication identities through the constructor.
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<AuthenticationMethodId> for String {
+    /// Encode the opaque method identity for host transport.
+    fn from(value: AuthenticationMethodId) -> Self {
+        value.0
+    }
+}
+
+/// Reject an empty authentication method identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AuthenticationMethodIdError;
+
+impl std::fmt::Display for AuthenticationMethodIdError {
+    /// Describe the invalid authentication identity at the boundary.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("authentication method identity is empty")
+    }
+}
+
+impl std::error::Error for AuthenticationMethodIdError {}
+
+/// Describe typed runtime setup and advertised authentication choices.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderSetup {
+    /// Report whether a compatible runtime is installed and available.
+    pub runtime: RuntimeAvailability,
+    /// Identify how the inspected runtime was selected.
+    pub origin: RuntimeOrigin,
+    /// Report executable and adapter versions independently of runtime readiness.
+    pub versions: RuntimeVersions,
+    /// Advertise supported authentication methods.
+    pub authentication: Vec<AuthenticationMethod>,
+}
+
+/// Report whether the selected provider runtime can be used.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimeAvailability {
+    Available,
+    Missing,
+    Incompatible,
+    Unavailable,
+}
+
+/// Distinguish an explicitly configured runtime from a retained managed installation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeOrigin {
+    Configured,
+    Managed,
+}
+
+/// Preserve independently observed runtime components without exposing probe output.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeVersions {
+    /// Installed model-provider executable, when the adapter can inspect it.
+    pub provider: VersionObservation,
+    /// Separately installed protocol adapter, when one is required.
+    pub adapter: VersionObservation,
+}
+
+/// Describe a version probe without carrying native error text or process output.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VersionObservation {
+    Known {
+        version: String,
+    },
+    #[default]
+    NotReported,
+    Failed {
+        failure: crate::ProviderFailureKind,
+    },
+}
+
+/// Describe one opaque authentication method to a setup caller.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AuthenticationMethod {
+    /// Opaque method identity passed back to `authenticate`.
+    pub id: AuthenticationMethodId,
+    /// User-facing method label.
+    pub label: String,
+    /// User-facing explanation of the interaction.
+    pub description: String,
+    /// Identify whether setup opens a terminal or delegates interaction to the provider.
+    pub interaction: AuthenticationInteraction,
+}
+
+/// Identify the normalized authentication interaction surface.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuthenticationInteraction {
+    ProviderManaged,
+    Terminal { launch: TerminalLaunch },
+}
+
+/// Carry an opaque native launch specification for a terminal authentication action.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TerminalLaunch {
+    /// Select the executable already resolved by the owning provider.
+    pub program: std::path::PathBuf,
+    /// Preserve provider-authored arguments without asking the host to parse them.
+    pub arguments: Vec<String>,
+    /// Carry ephemeral environment values needed for the selected interaction.
+    pub environment: std::collections::BTreeMap<String, String>,
+    /// Run the command in the workspace selected for setup.
+    pub working_directory: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Debug for TerminalLaunch {
+    /// Hide ephemeral authentication arguments and environment values from diagnostics.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TerminalLaunch")
+            .field("program", &self.program)
+            .field("arguments", &"[redacted]")
+            .field("environment", &self.environment.keys().collect::<Vec<_>>())
+            .field("working_directory", &self.working_directory)
+            .finish()
+    }
+}
+
+/// Carry a normalized compaction operation identity and scope.
+#[derive(Clone, Debug)]
+pub struct CompactionRequest {
+    /// Identify this session operation independently of prompt invocations.
+    pub operation_id: String,
+    /// Own its event stream observations.
+    pub scope: EventScope,
+}
+
+/// Choose whether stopping a goal retains its provider conversation identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GoalStopMode {
+    RetainConversation,
+    ClearConversation,
 }

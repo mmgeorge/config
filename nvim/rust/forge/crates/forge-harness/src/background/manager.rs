@@ -188,7 +188,7 @@ impl BackgroundManager {
                 store.get(
                     &request.context.workspace,
                     &session_id,
-                    &request.config.provider.kind,
+                    request.config.provider.kind.as_str(),
                 )
             })
             .map(|snapshot| {
@@ -376,8 +376,15 @@ impl BackgroundManager {
                     _ => {
                         if let Some(mut compaction) = pending.take() {
                             compaction.state = crate::provider::CompactionState::Unconfirmed;
-                            compaction.result.error =
-                                Some("Provider compaction completion was not confirmed".into());
+                            compaction.result.diagnostic =
+                                Some(forge_provider_api::ProviderDiagnostic {
+                                    kind: forge_provider_api::ProviderFailureKind::Transport,
+                                    message: forge_provider_api::SanitizedMessage::new(
+                                        "Provider compaction completion was not confirmed",
+                                    )
+                                    .expect("static diagnostic is nonempty"),
+                                    fatal: false,
+                                });
                             let _ = broker.observe_session_event(
                                 crate::provider::ProviderEvent::Compaction {
                                     scope: crate::provider::EventScope::SessionOperation {
@@ -476,9 +483,10 @@ impl BackgroundManager {
             "Background model cannot be empty"
         );
         ensure!(
-            crate::provider::registered_capability(crate::provider::ProviderKind::parse(
-                &request.config.provider.kind
-            )?)
+            forge_providers::registry::resolve(&forge_providers::registry::select(
+                request.config.provider.kind.as_str()
+            )?)?
+            .capability
             .integration
             .background_generation,
             "This provider does not support tool-free persistent Background sessions"
@@ -504,7 +512,7 @@ impl BackgroundManager {
         let reason = match &previous {
             None => "First Background request",
             Some(previous)
-                if previous.provider != request.config.provider.kind
+                if previous.provider != request.config.provider.kind.as_str()
                     || previous.model != request.config.model =>
             {
                 "Background provider or model changed"
@@ -975,7 +983,7 @@ mod tests {
             let diff = DiffEngine::new(Default::default(), 1);
             let manager = BackgroundManager::new(Arc::new(RepositoryStore::default()), diff.clone(), forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool()));
             let config = TextGenerationConfig {
-                provider:crate::provider::ProviderLaunch { kind:"mock".into(), command:Vec::new() },
+                provider:crate::provider::ProviderLaunch { kind:forge_providers::registry::nonselectable_id().expect("registry supplies a nonselectable fixture identity"), command:Vec::new() },
                 model:"mock-model".into(), reasoning_effort:None, service_tier:Default::default(),
                 data_root:fixture.path().join("state"), auto_compaction:Default::default(),
             };
@@ -1059,7 +1067,8 @@ mod tests {
             purpose: crate::provider::TextGeneration::CommitMessage,
             config: TextGenerationConfig {
                 provider: crate::provider::ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: Vec::new(),
                 },
                 model: "mock-model".into(),
@@ -1121,17 +1130,23 @@ mod tests {
         manager.retained.lock().await.remove(&key);
         registry.record_cleanup_failure(crate::provider::session_execution::CleanupError::Work {
             kind: crate::provider::session_execution::CleanupWorkKind::OwnerFence,
-            source: crate::provider::ProviderError::Protocol {
-                message: "first collection failure".into(),
-            }
+            source: crate::provider::ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::ProviderFailureKind::Runtime,
+                ),
+            )
             .into(),
         });
         assert!(manager.retire(retiring.clone()).await.is_err());
         registry.record_cleanup_failure(crate::provider::session_execution::CleanupError::Work {
             kind: crate::provider::session_execution::CleanupWorkKind::OwnerFence,
-            source: crate::provider::ProviderError::Protocol {
-                message: "collection still incomplete".into(),
-            }
+            source: crate::provider::ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::ProviderFailureKind::Runtime,
+                ),
+            )
             .into(),
         });
         let failed = manager.prepare(&request, &key).await;
@@ -1186,7 +1201,8 @@ mod tests {
             purpose: crate::provider::TextGeneration::CommitMessage,
             config: TextGenerationConfig {
                 provider: crate::provider::ProviderLaunch {
-                    kind: "mock".into(),
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity"),
                     command: vec![],
                 },
                 model: "mock-model".into(),

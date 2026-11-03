@@ -124,7 +124,7 @@ impl HarnessService {
         if model == "default"
             && config.data_root.join("harness.sqlite3").is_file()
             && let Some(preference) = SqliteStore::open(&config.data_root)?
-                .load_preference(workspace, &config.provider.kind)?
+                .load_preference(workspace, config.provider.kind.as_str())?
         {
             model = preference.model;
         }
@@ -845,6 +845,15 @@ impl HarnessService {
             sink.send_terminal_response(Response::success(request.id, result)?)?;
             return Ok(());
         }
+        if method == RuntimeMethod::ProviderRegistryList {
+            let result = json!({
+                "default_provider": forge_providers::registry::default_id(),
+                "providers": forge_providers::registry::descriptors(),
+            });
+            sink.send_response(Response::success(request.id, result)?)
+                .await?;
+            return Ok(());
+        }
         let _activity = self.admit().await?;
         let registry = self.registry().await?;
         registry.runtime.lsp.attach(sink.clone());
@@ -1559,7 +1568,15 @@ impl SessionController {
         let startup_session_id = request.harness_session_id.clone();
         let startup_factory = || async move {
             let initialized = async {
-                execution_registry.owner(request.owner()?).await?;
+                let owner = request.owner().map_err(|_| {
+                    forge_provider_api::ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::InitializeSession,
+                            forge_provider_api::ProviderFailureKind::Rejected,
+                        ),
+                    )
+                })?;
+                execution_registry.owner(owner).await?;
                 provider.initialize_session(request.clone()).await
             }
             .await;
@@ -1574,7 +1591,8 @@ impl SessionController {
             }
             let missing_history = matches!(
                 initialized.as_ref(),
-                Err(crate::provider::ProviderError::SessionMissing { .. })
+                Err(crate::provider::ProviderError::Failure(failure))
+                    if failure.kind() == forge_provider_api::ProviderFailureKind::SessionMissing
             );
             let mut initialized = initialized.map_err(anyhow::Error::from);
             if missing_history {
@@ -1676,7 +1694,7 @@ impl SessionController {
         {
             return Ok(pending());
         }
-        result?
+        Ok(result??)
     }
 
     /// Collects the native execution before a replacement prompt can release its owner.
@@ -1878,9 +1896,11 @@ impl SessionController {
         }
         let goal_lane = self.task_controller.native_goal_lane();
         let _goal_guard = if self.task_controller.native_goal_is_uncertain() {
-            Some(tokio::time::timeout(Duration::from_secs(30), goal_lane.lock()).await.map_err(|_| {
-                crate::provider::ProviderError::DeliveryUncertain { message: "native goal generation is still in flight; replacement was not attempted".into() }
-            })?)
+            Some(
+                tokio::time::timeout(Duration::from_secs(30), goal_lane.lock())
+                    .await
+                    .map_err(|_| crate::provider::ProviderError::DeliveryUncertain)?,
+            )
         } else {
             None
         };
@@ -2292,11 +2312,9 @@ async fn generate_isolated_text(
         .await;
     let cleanup = match tokio::time::timeout(Duration::from_secs(8), provider.shutdown()).await {
         Ok(result) => result,
-        Err(source) => Err(crate::provider::ProviderError::Operation(
-            forge_provider_api::error::ProviderOperationFailure::new(
-                forge_provider_api::error::ProviderOperation::Shutdown,
-                Arc::new(source),
-            ),
+        Err(source) => Err(crate::provider::lifecycle_error::classify_source(
+            forge_provider_api::error::ProviderOperation::Shutdown,
+            &source,
         )),
     };
     let result = match (result, cleanup) {
@@ -2742,7 +2760,7 @@ async fn route_request(
             .get(
                 &catalog.workspace,
                 &session_id,
-                &registry.initialize.provider.kind,
+                registry.initialize.provider.kind.as_str(),
             )?
             .desired;
         if !desired.automatic_checks_enabled() {
@@ -2787,7 +2805,7 @@ async fn route_request(
                 .get(
                     &catalog.workspace,
                     &session_id,
-                    &registry.initialize.provider.kind,
+                    registry.initialize.provider.kind.as_str(),
                 )?
                 .desired;
             let enabled = effective.status_thoughts.unwrap_or(true);
@@ -2857,7 +2875,7 @@ async fn route_request(
             .get(
                 &catalog.workspace,
                 &session_id,
-                &registry.initialize.provider.kind,
+                registry.initialize.provider.kind.as_str(),
             )?
             .desired;
         let approval = effective.approval_timeout.unwrap_or_default();
@@ -3034,7 +3052,7 @@ async fn route_request(
         let provider = request.params["provider"]
             .as_str()
             .context("child model catalog requires provider")?;
-        let provider = crate::provider::ProviderKind::parse(provider)?;
+        let provider = forge_providers::registry::select(provider)?;
         let catalog = controller.catalog_request.read().await.clone();
         let models = tokio::time::timeout(
             Duration::from_secs(30),
@@ -3434,9 +3452,10 @@ fn admit_task_intent(
         change.apply(
             &mut access,
             &mut approval,
-            crate::provider::registered_capability(crate::provider::ProviderKind::parse(
+            forge_providers::registry::resolve(&forge_providers::registry::select(
                 &session.provider,
-            )?)
+            )?)?
+            .capability
             .supports_sandbox(),
         );
         Some(crate::task::PermissionSelection {
@@ -4571,7 +4590,7 @@ async fn route_new_session(
     let child = prepare_new_session(
         PathBuf::from(&registry.initialize.data_root).as_path(),
         &registry.initialize.client_id,
-        &registry.initialize.provider.kind,
+        registry.initialize.provider.kind.as_str(),
         registry
             .runtime
             .provider_handle()
@@ -4620,7 +4639,7 @@ async fn start_session_fork(
     let preparation = prepare_provider_fork(
         PathBuf::from(&registry.initialize.data_root).as_path(),
         &registry.initialize.client_id,
-        &registry.initialize.provider.kind,
+        registry.initialize.provider.kind.as_str(),
         &descriptor.capability,
         &session_id,
         &params,
@@ -5938,10 +5957,7 @@ mod tests {
     include!("service/task_state_test.rs");
     include!("service/task_presentation_test.rs");
     use super::*;
-    use crate::provider::{
-        ProviderCatalogRequest, ProviderDescriptor, ProviderEventSink, ProviderKind,
-        ProviderRequest, TextGeneration,
-    };
+    use crate::provider::{ProviderCatalogRequest, TextGeneration};
     use forge_diff::cache::CacheLimits;
 
     #[tokio::test]
@@ -6445,12 +6461,11 @@ mod tests {
 
     #[tokio::test]
     async fn isolated_generation_uses_configured_model_without_a_conversation() -> Result<()> {
-        let provider = GenerationProvider {
-            fixture_events: Default::default(),
-            request: std::sync::Mutex::new(Vec::new()),
-            shutdown: AtomicBool::new(false),
-            fail: false,
-        };
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let native = generation_provider(requests.clone(), shutdown.clone(), false);
+        let provider_fixture =
+            crate::provider::test_support::ProviderTestSession::from_native(native)?;
         let request = ProviderCatalogRequest {
             execution_owner: None,
             harness_session_id: "generation-fixture".into(),
@@ -6460,7 +6475,7 @@ mod tests {
             provider_session_id: None,
         };
         let text = generate_isolated_text(
-            &provider,
+            provider_fixture.as_provider(),
             request.clone(),
             TextGeneration::CommitMessage,
             "selected-model",
@@ -6469,33 +6484,31 @@ mod tests {
         )
         .await?;
         assert_eq!(text, "fix: preserve drafts\n\nKeep existing text.");
-        assert!(provider.shutdown.load(Ordering::Acquire));
+        assert!(shutdown.load(Ordering::Acquire));
         {
-            let requests = provider.request.lock().unwrap();
+            let requests = requests.lock().await;
             assert_eq!(requests.len(), 1);
-            for GenerationCall {
-                request,
-                purpose,
-                model,
-                effort,
-                input,
-            } in requests.iter()
-            {
-                assert_eq!(request.harness_session_id, "generation-fixture");
-                assert_eq!(request.workspace, "commit-workspace");
-                assert!(request.provider_session_id.is_none());
-                assert_eq!(*purpose, TextGeneration::CommitMessage);
-                assert_eq!(model, "selected-model");
-                assert_eq!(effort.as_deref(), Some("low"));
-                assert_eq!(input, "Staged diff:\n+change");
-            }
+            let request = &requests[0];
+            assert_eq!(request.workspace, "commit-workspace");
+            assert_eq!(request.model, "selected-model");
+            assert!(
+                matches!(request.reasoning, forge_provider_api::generation::ReasoningSelection::Level(ref level) if level == "low")
+            );
+            assert!(request.instructions.contains("Conventional Commit"));
+            assert_eq!(request.input, "Staged diff:\n+change");
         }
-        let unsupported = SteeringProvider {
-            fixture_events: Default::default(),
-            request: Mutex::new(Vec::new()),
-        };
+        let descriptor = forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().expect("mock fixture identity"),
+        )
+        .expect("mock fixture descriptor");
+        let unsupported_native =
+            crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
+                Ok(())
+            });
+        let unsupported =
+            crate::provider::test_support::ProviderTestSession::from_native(unsupported_native)?;
         let error = generate_isolated_text(
-            &unsupported,
+            unsupported.as_provider(),
             request,
             TextGeneration::CommitMessage,
             "selected-model",
@@ -6510,12 +6523,11 @@ mod tests {
             "{diagnostic}"
         );
         assert!(diagnostic.contains("text_generation"), "{diagnostic}");
-        let failing = GenerationProvider {
-            fixture_events: Default::default(),
-            request: std::sync::Mutex::new(Vec::new()),
-            shutdown: AtomicBool::new(false),
-            fail: true,
-        };
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let failing_native = generation_provider(requests, shutdown.clone(), true);
+        let failing =
+            crate::provider::test_support::ProviderTestSession::from_native(failing_native)?;
         let request = ProviderCatalogRequest {
             execution_owner: None,
             harness_session_id: "generation-failure".into(),
@@ -6525,7 +6537,7 @@ mod tests {
             provider_session_id: None,
         };
         let failure = generate_isolated_text(
-            &failing,
+            failing.as_provider(),
             request,
             TextGeneration::CommitMessage,
             "selected-model",
@@ -6534,8 +6546,10 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(format!("{failure:#}").contains("fixture generation failure"));
-        assert!(failing.shutdown.load(Ordering::Acquire));
+        let diagnostic = format!("{failure:#}");
+        assert!(diagnostic.contains("GenerateText"));
+        assert!(!diagnostic.contains("fixture generation failure"));
+        assert!(shutdown.load(Ordering::Acquire));
         Ok(())
     }
 
@@ -6561,7 +6575,8 @@ mod tests {
                 TextGenerationConfig {
                     auto_compaction: Default::default(),
                     provider: crate::provider::ProviderLaunch {
-                        kind: "mock".into(),
+                        kind: forge_providers::registry::nonselectable_id()
+                            .expect("registry supplies a nonselectable fixture identity"),
                         command: vec![],
                     },
                     model: "default".into(),
@@ -6587,115 +6602,133 @@ mod tests {
         Ok(())
     }
 
-    #[derive(Default)]
     struct TerminalInventoryProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+        inner: Arc<dyn forge_provider_api::provider::Provider>,
         started: Notify,
         release: Notify,
         calls: AtomicU64,
     }
 
     #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for TerminalInventoryProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        fn descriptor(&self) -> ProviderDescriptor {
-            ProviderDescriptor {
-                kind: ProviderKind::Mock,
-                label: "Terminal fixture".into(),
-                capability: crate::provider::ProviderCapability {
-                    background_terminals: true,
-                    ..Default::default()
-                },
-            }
-        }
-        async fn background_terminals(
+    impl forge_provider_api::provider::Provider for TerminalInventoryProvider {
+        async fn initialize_session(
             &self,
-            _: ProviderCatalogRequest,
-        ) -> Result<crate::provider::terminal::TerminalSnapshot> {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            self.started.notify_one();
-            self.release.notified().await;
-            anyhow::bail!("connection closed")
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
+            request: forge_provider_api::session::SessionRequest,
         ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
+            forge_provider_api::session::SessionBinding,
+            forge_provider_api::ProviderError,
         > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
+            self.inner.initialize_session(request).await
         }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-        async fn cleanup_execution(
+        async fn take_session_events(
             &self,
-            _: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
+            binding: &forge_provider_api::BindingId,
+        ) -> std::result::Result<
+            forge_provider_api::events::ProviderEventStream,
+            forge_provider_api::ProviderError,
+        > {
+            self.inner.take_session_events(binding).await
+        }
+        async fn session_prompt(
+            &self,
+            binding: &forge_provider_api::BindingId,
+            request: forge_provider_api::session::PromptRequest,
+        ) -> std::result::Result<
+            forge_provider_api::session::InputAcceptance,
+            forge_provider_api::ProviderError,
+        > {
+            self.inner.session_prompt(binding, request).await
+        }
+        async fn continue_session(
+            &self,
+            binding: &forge_provider_api::BindingId,
+            request: forge_provider_api::session::ContinuationRequest,
+        ) -> std::result::Result<
+            forge_provider_api::session::ContinuationOutcome,
+            forge_provider_api::ProviderError,
+        > {
+            self.inner.continue_session(binding, request).await
+        }
+        async fn session_steer(
+            &self,
+            binding: &forge_provider_api::BindingId,
+            request: forge_provider_api::session::SteeringRequest,
+        ) -> std::result::Result<
+            forge_provider_api::session::SteeringAcceptance,
+            forge_provider_api::ProviderError,
+        > {
+            self.inner.session_steer(binding, request).await
+        }
+        async fn retire_session(
+            &self,
+            binding: &forge_provider_api::BindingId,
+        ) -> std::result::Result<(), forge_provider_api::ProviderError> {
+            self.inner.retire_session(binding).await
+        }
+        async fn fence_session(
+            &self,
+            binding: &forge_provider_api::BindingId,
+        ) -> std::result::Result<(), forge_provider_api::ProviderError> {
+            self.inner.fence_session(binding).await
+        }
+        async fn recover_session(
+            &self,
+            request: forge_provider_api::session::SessionRequest,
+            token: Option<forge_provider_api::session::RecoveryToken>,
+        ) -> std::result::Result<
+            forge_provider_api::session::SessionBinding,
+            forge_provider_api::ProviderError,
+        > {
+            self.inner.recover_session(request, token).await
+        }
+        async fn shutdown(&self) -> std::result::Result<(), forge_provider_api::ProviderError> {
+            self.inner.shutdown().await
+        }
+        fn descriptor(&self) -> forge_provider_api::ProviderDescriptor {
+            let mut descriptor = self.inner.descriptor();
+            descriptor.capability.background_terminals = true;
+            descriptor
+        }
+        async fn has_active_turn(&self, owner: &forge_provider_api::ExecutionOwner) -> bool {
+            self.inner.has_active_turn(owner).await
         }
         async fn cancel_session(
             &self,
-            _: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
+            binding: &forge_provider_api::BindingId,
+        ) -> std::result::Result<(), forge_provider_api::ProviderError> {
+            self.inner.cancel_session(binding).await
         }
-        async fn has_active_turn(&self, _: &str) -> bool {
-            false
+        async fn cleanup_execution(
+            &self,
+            binding: &forge_provider_api::BindingId,
+        ) -> std::result::Result<(), forge_provider_api::ProviderError> {
+            self.inner.cleanup_execution(binding).await
         }
         async fn active_session_id_for(
             &self,
-            _: &str,
-        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
+            owner: &forge_provider_api::ExecutionOwner,
+        ) -> std::result::Result<
+            Option<forge_provider_api::ProviderSessionId>,
+            forge_provider_api::ProviderError,
+        > {
+            self.inner.active_session_id_for(owner).await
         }
-    }
-
-    impl TerminalInventoryProvider {
-        async fn run_native(
+        async fn background_terminals(
             &self,
-            _: ProviderRequest,
-            _: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            Err(anyhow::anyhow!("terminal fixture cannot prompt").into())
+            _: forge_provider_api::catalog::ProviderCatalogRequest,
+        ) -> std::result::Result<
+            forge_provider_api::terminal::TerminalSnapshot,
+            forge_provider_api::ProviderError,
+        > {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.started.notify_one();
+            self.release.notified().await;
+            Err(forge_provider_api::ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                ),
+            ))
         }
     }
 
@@ -6714,8 +6747,22 @@ mod tests {
             .await
             .remove(registry.initial_session_id())
             .unwrap();
-        let provider = Arc::new(TerminalInventoryProvider::default());
-        *controller.provider.write().unwrap() = provider.clone();
+        let inner = forge_providers::registry::create(
+            crate::provider::ProviderLaunch {
+                kind: forge_providers::registry::nonselectable_id().expect("mock fixture identity"),
+                command: Vec::new(),
+            },
+            controller.data_root.clone(),
+        )?;
+        let provider = Arc::new(TerminalInventoryProvider {
+            inner,
+            started: Notify::new(),
+            release: Notify::new(),
+            calls: AtomicU64::new(0),
+        });
+        let provider_fixture =
+            crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
+        *controller.provider.write().unwrap() = provider_fixture.provider_handle();
         registry
             .controller_by_id
             .write()
@@ -6758,156 +6805,70 @@ mod tests {
         operation.state = "resuming".into();
         store.save_task_operation(&mut operation)?;
         provider.release.notify_one();
-        assert!(
-            controller
-                .background_terminals()
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("connection closed")
-        );
+        let error = controller
+            .background_terminals()
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.to_lowercase().contains("transport"));
+        assert!(!error.contains("connection closed"));
         service.shutdown(Duration::from_secs(2)).await?;
         Ok(())
     }
 
     struct GenerationCall {
-        request: ProviderCatalogRequest,
-        purpose: TextGeneration,
+        workspace: String,
         model: String,
-        effort: Option<String>,
+        reasoning: forge_provider_api::generation::ReasoningSelection,
+        instructions: String,
         input: String,
     }
 
-    struct GenerationProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-        request: std::sync::Mutex<Vec<GenerationCall>>,
-        shutdown: AtomicBool,
+    fn generation_provider(
+        requests: Arc<Mutex<Vec<GenerationCall>>>,
+        shutdown: Arc<AtomicBool>,
         fail: bool,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for GenerationProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        async fn generate_text(
-            &self,
-            request: ProviderCatalogRequest,
-            purpose: TextGeneration,
-            model: &str,
-            reasoning_effort: Option<&str>,
-            input: &str,
-        ) -> std::result::Result<String, crate::provider::ProviderError> {
-            let result: anyhow::Result<String> = async move {
-                self.request.lock().unwrap().push(GenerationCall {
-                    request,
-                    purpose,
-                    model: model.into(),
-                    effort: reasoning_effort.map(str::to_owned),
-                    input: input.into(),
-                });
-                ensure!(!self.fail, "fixture generation failure");
-                Ok("```text\nfix: preserve drafts\n\nKeep existing text.\n```".into())
-            }
-            .await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::GenerateText,
-                    source,
-                )
+    ) -> Arc<crate::provider::test_support::EventFixtureProvider> {
+        let descriptor = forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().expect("mock fixture identity"),
+        )
+        .expect("mock fixture descriptor");
+        let provider =
+            crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
+                Ok(())
             })
-        }
-        fn descriptor(&self) -> ProviderDescriptor {
-            ProviderDescriptor {
-                kind: ProviderKind::Mock,
-                label: "Generation fixture".into(),
-                capability: Default::default(),
-            }
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move {
-                self.shutdown.store(true, Ordering::Release);
+            .with_text_generation(move |request| {
+                let requests = requests.clone();
+                async move {
+                    requests.lock().await.push(GenerationCall {
+                        workspace: request.workspace,
+                        model: request.model,
+                        reasoning: request.reasoning,
+                        instructions: request.instructions,
+                        input: request.input,
+                    });
+                    if fail {
+                        Err(forge_provider_api::ProviderError::Failure(
+                            forge_provider_api::ProviderFailure::new(
+                                forge_provider_api::ProviderOperation::GenerateText,
+                                forge_provider_api::ProviderFailureKind::Runtime,
+                            ),
+                        ))
+                    } else {
+                        Ok("```text\nfix: preserve drafts\n\nKeep existing text.\n```".into())
+                    }
+                }
+            });
+        let shutdown_called = shutdown.clone();
+        provider.with_shutdown(move || {
+            let shutdown_called = shutdown_called.clone();
+            async move {
+                shutdown_called.store(true, Ordering::Release);
                 Ok(())
             }
-            .await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-        async fn cleanup_execution(
-            &self,
-            _: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-        async fn cancel_session(
-            &self,
-            _: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-        async fn has_active_turn(&self, _: &str) -> bool {
-            false
-        }
-        async fn active_session_id_for(
-            &self,
-            _: &str,
-        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
+        });
+        provider
     }
-
-    impl GenerationProvider {
-        async fn run_native(
-            &self,
-            _: ProviderRequest,
-            _: ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            Err(anyhow::anyhow!("isolated generation must not submit a conversational turn").into())
-        }
-    }
-
     #[tokio::test]
     async fn plan_check_edits_retain_review_annotations_and_project_defaults() -> Result<()> {
         let fixture = tempfile::tempdir()?;
@@ -8377,9 +8338,12 @@ mod tests {
         for (method, parameter) in [
             (
                 "provider.model.pin.set",
-                json!({"provider":"copilot", "model":"pinned-model", "pinned":true}),
+                json!({"provider":forge_providers::registry::default_id().as_str(), "model":"pinned-model", "pinned":true}),
             ),
-            ("provider.model.pin.list", json!({"provider":"copilot"})),
+            (
+                "provider.model.pin.list",
+                json!({"provider":forge_providers::registry::default_id().as_str()}),
+            ),
         ] {
             tokio::time::timeout(
                 Duration::from_secs(2),
@@ -8583,11 +8547,14 @@ mod tests {
             &json!({"attachments":[selection]}),
         )
         .await?;
-        let input =
-            crate::provider::codex::attachments::input("Inspect [Image #3]".into(), &selected)
-                .await?;
-        assert_eq!(input[1]["type"], "localImage");
-        assert_eq!(std::fs::read(input[1]["path"].as_str().unwrap())?, bytes);
+        let input = selected
+            .iter()
+            .map(crate::attachment::InputAttachment::prepare)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0].label, "[Image #3]");
+        assert_eq!(input[0].contents.as_ref(), bytes.as_slice());
+        assert_eq!(std::fs::read(&input[0].path)?, bytes);
         assert!(controller.broker.try_lock().is_err());
         drop(broker);
         service.shutdown(Duration::from_secs(1)).await?;
@@ -8895,159 +8862,57 @@ mod tests {
         service.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
-    struct SteeringProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-        request: Mutex<Vec<(String, String)>>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for SteeringProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-
-        async fn cleanup_execution(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> =
-                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-
-        async fn cancel_session(
-            &self,
-            _session_id: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-
-        async fn has_active_turn(&self, _session_id: &str) -> bool {
-            false
-        }
-
-        async fn active_session_id_for(
-            &self,
-            _session_id: &str,
-        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(None)
-        }
-
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Steering test".into(),
-                capability: Default::default(),
+    fn steering_provider(
+        requests: Arc<Mutex<Vec<(String, String)>>>,
+    ) -> Arc<crate::provider::test_support::EventFixtureProvider> {
+        let descriptor = forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().expect("mock fixture identity"),
+        )
+        .expect("mock fixture descriptor");
+        let provider =
+            crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
+                Ok(())
+            });
+        let steering_requests = requests.clone();
+        provider.with_steering(move |request| {
+            let requests = steering_requests.clone();
+            async move {
+                requests
+                    .lock()
+                    .await
+                    .push(("steering".into(), format!("{:?}", request.input)));
+                Ok(())
             }
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-
-        async fn session_steer(
-            self: std::sync::Arc<Self>,
-            owner: &crate::provider::ExecutionOwner,
-            scope: crate::provider::InvocationScope,
-            input: crate::provider::SteeringInput,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            if scope.owner != *owner {
-                return Err(crate::provider::ProviderError::Rejected {
-                    message: "steering crosses owner".into(),
-                });
+        });
+        let goal_requests = requests.clone();
+        provider.with_goal_status(move |owner, update| {
+            let requests = goal_requests.clone();
+            async move {
+                requests
+                    .lock()
+                    .await
+                    .push((owner.session_id.to_string(), format!("{update:?}")));
+                Ok(())
             }
-            let events = self.fixture_events.clone();
-            if !events.running(&scope).await? {
-                let request = events.continuation(&scope, input)?;
-                return self.session_prompt(request, scope).await;
+        });
+        let cleanup_requests = requests.clone();
+        provider.with_cleanup(move |_| {
+            let requests = cleanup_requests.clone();
+            async move {
+                requests
+                    .lock()
+                    .await
+                    .push(("cleanup".into(), String::new()));
+                Err(forge_provider_api::ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::CleanupExecution,
+                        forge_provider_api::ProviderFailureKind::Transport,
+                    ),
+                ))
             }
-            events
-                .steer(&scope, input, |input| async move {
-                    self.steer_native(&owner.runtime_key(), input)
-                        .await
-                        .map_err(crate::provider::ProviderError::from)
-                })
-                .await
-        }
-
-        async fn stop_goal_session(&self, session_id: &str, clear: bool) -> Result<()> {
-            self.request.lock().await.push((
-                session_id.into(),
-                if clear {
-                    "clear".into()
-                } else {
-                    "pause".into()
-                },
-            ));
-            Ok(())
-        }
+        });
+        provider
     }
-
-    impl SteeringProvider {
-        async fn steer_native(
-            &self,
-            session_id: &str,
-            input: crate::provider::SteeringInput,
-        ) -> Result<()> {
-            self.request
-                .lock()
-                .await
-                .push((session_id.into(), input.text().to_owned()));
-            Ok(())
-        }
-    }
-
-    impl SteeringProvider {
-        async fn run_native(
-            &self,
-            _: crate::provider::ProviderRequest,
-            _: crate::provider::ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            Err(anyhow::anyhow!("steering must not start another provider request").into())
-        }
-    }
-
     #[tokio::test]
     async fn child_approval_resolution_uses_the_owned_runtime() -> Result<()> {
         use crate::permissions::matcher::{PermissionRequest, PermissionTarget};
@@ -9095,7 +8960,8 @@ mod tests {
                     crate::session::ApprovalMode::Ask,
                     PermissionRequest {
                         id: "child-request".into(),
-                        provider: "Mock".into(),
+                        provider: forge_provider_api::ProviderId::new("fixture")
+                            .expect("fixture identity is valid"),
                         reason: None,
                         target_list: vec![PermissionTarget::Command {
                             command: "probe".into(),
@@ -9717,108 +9583,30 @@ mod tests {
         service.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
-    struct CheckCleanupProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-        started: tokio::sync::Notify,
-        release: tokio::sync::Notify,
-        completed: AtomicBool,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for CheckCleanupProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-        async fn cleanup_execution(
-            &self,
-            _: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move {
-                self.started.notify_one();
-                self.release.notified().await;
-                self.completed.store(true, Ordering::Release);
+    fn check_cleanup_provider(
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        completed: Arc<AtomicBool>,
+    ) -> Arc<crate::provider::test_support::EventFixtureProvider> {
+        let descriptor = forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().expect("fixture identity"),
+        )
+        .expect("fixture descriptor");
+        let provider =
+            crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
+                Err(forge_provider_api::ProviderError::Cancelled)
+            });
+        provider.with_cleanup(move |_| {
+            let started = started.clone();
+            let release = release.clone();
+            let completed = completed.clone();
+            async move {
+                started.notify_one();
+                release.notified().await;
+                completed.store(true, Ordering::Release);
                 Ok(())
             }
-            .await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-        async fn cancel_session(
-            &self,
-            _: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CancelSession,
-                    source,
-                )
-            })
-        }
-        async fn has_active_turn(&self, _: &str) -> bool {
-            !self.completed.load(Ordering::Acquire)
-        }
-        async fn active_session_id_for(
-            &self,
-            _: &str,
-        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(Some("old-provider-turn".to_owned().try_into()?))
-        }
-        fn descriptor(&self) -> crate::provider::ProviderDescriptor {
-            crate::provider::ProviderDescriptor {
-                kind: crate::provider::ProviderKind::Mock,
-                label: "Cleanup test".into(),
-                capability: Default::default(),
-            }
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-    }
-
-    impl CheckCleanupProvider {
-        async fn run_native(
-            &self,
-            _: crate::provider::ProviderRequest,
-            _: crate::provider::ProviderEventSink,
-        ) -> Result<crate::provider::ProviderCompletion, crate::provider::ProviderError> {
-            Err(anyhow::anyhow!("cleanup must finish before another provider turn").into())
-        }
+        })
     }
 
     #[tokio::test]
@@ -9846,18 +9634,26 @@ mod tests {
                 .await
                 .remove(registry.initial_session_id())
                 .unwrap();
-            let provider = Arc::new(CheckCleanupProvider {
-                fixture_events: Default::default(),
-                started: tokio::sync::Notify::new(),
-                release: tokio::sync::Notify::new(),
-                completed: AtomicBool::new(false),
-            });
-            *controller.provider.write().unwrap() = provider.clone();
+            let started = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(AtomicBool::new(false));
+            let provider =
+                check_cleanup_provider(started.clone(), release.clone(), completed.clone());
+            let provider_fixture =
+                crate::provider::test_support::ProviderTestSession::from_native(provider)?;
+            *controller.provider.write().unwrap() = provider_fixture.provider_handle();
             registry
                 .controller_by_id
                 .write()
                 .await
                 .insert(registry.initial_session_id().to_owned(), controller.clone());
+            let (provider_sink, _provider_output) = forge_protocol::outbound::channel();
+            service
+                .start_provider_session(registry.initial_session_id(), &provider_sink)
+                .await?;
+            while !controller.provider_ready().await {
+                tokio::task::yield_now().await;
+            }
             let (sink, mut output) = forge_protocol::outbound::channel();
             let drain =
                 tokio::spawn(async move { while output.recv().await.ok().flatten().is_some() {} });
@@ -9919,16 +9715,16 @@ mod tests {
             });
             tokio::select! {
                 result = &mut preparation => panic!("prompt admitted before provider cleanup: {result:?}"),
-                _ = provider.started.notified() => {}
+                _ = started.notified() => {}
                 _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("provider cleanup did not start"),
             }
-            assert!(!provider.completed.load(Ordering::Acquire));
+            assert!(!completed.load(Ordering::Acquire));
             assert!(futures_util::poll!(preparation.as_mut()).is_pending());
-            provider.release.notify_one();
+            release.notify_one();
             let admission = tokio::time::timeout(Duration::from_secs(5), preparation)
                 .await
                 .context("checked prompt admission did not finish after provider cleanup")??;
-            assert!(provider.completed.load(Ordering::Acquire));
+            assert!(completed.load(Ordering::Acquire));
             assert!(admission.is_some());
             assert!(controller.checks.active()?.is_none());
             assert_eq!(
@@ -9989,17 +9785,17 @@ mod tests {
         let fixture = tempfile::tempdir()?;
         let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
         let controller = SessionController::new(broker).unwrap();
-        let provider = Arc::new(SteeringProvider {
-            fixture_events: Default::default(),
-            request: Mutex::new(Vec::new()),
-        });
-        *controller.provider.write().unwrap() = provider.clone();
+        let provider_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = steering_provider(provider_requests.clone());
+        let provider_fixture =
+            crate::provider::test_support::ProviderTestSession::from_native(provider)?;
+        *controller.provider.write().unwrap() = provider_fixture.provider_handle();
         for method in [RuntimeMethod::SessionConfigure] {
             let maintenance = controller.broker.lock().await;
             let mut acquisition = Box::pin(acquire_request_broker(&controller, method));
             assert!(futures_util::poll!(acquisition.as_mut()).is_pending());
             assert!(
-                provider.request.lock().await.is_empty(),
+                provider_requests.lock().await.is_empty(),
                 "maintenance cannot trigger provider cleanup"
             );
             assert!(controller.coordinator.execution.try_acquire().is_err());
@@ -10238,11 +10034,11 @@ mod tests {
         let fixture = tempfile::tempdir()?;
         let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
         let controller = SessionController::new(broker)?;
-        let provider = Arc::new(SteeringProvider {
-            fixture_events: Default::default(),
-            request: Mutex::new(Vec::new()),
-        });
-        *controller.provider.write().unwrap() = provider.clone();
+        let provider_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = steering_provider(provider_requests.clone());
+        let provider_fixture =
+            crate::provider::test_support::ProviderTestSession::from_native(provider)?;
+        *controller.provider.write().unwrap() = provider_fixture.provider_handle();
         let session_id = controller.observer.session_id().to_owned();
         let mut store = SqliteStore::open(&controller.data_root)?;
         let (sink, mut output) = forge_protocol::outbound::channel();
@@ -10252,7 +10048,7 @@ mod tests {
         });
         let execution = Arc::clone(&controller.coordinator.execution).try_acquire_owned()?;
         let broker_owner = controller.broker.lock().await;
-        let provider_stop = provider.request.lock().await;
+        let provider_stop = provider_requests.lock().await;
         for (index, action) in ["pause", "clear"].into_iter().enumerate() {
             let previous = controller.task_controller.current()?;
             controller.task_controller.change(
@@ -10497,7 +10293,6 @@ mod tests {
     #[tokio::test]
     async fn steering_burst_reaches_the_active_turn_before_any_acknowledgment() -> Result<()> {
         use crate::input::{InputDelivery, InputIntent, InputOperation};
-        use crate::provider::submission::SubmissionTarget;
         let fixture = tempfile::tempdir()?;
         let service = service();
         service
@@ -10542,7 +10337,7 @@ mod tests {
                 .as_ref()
                 .context("missing input identity")?;
             assert_eq!(submission.record()?.input_message_id.as_deref(), Some(id));
-            submission.sending(SubmissionTarget::Untracked)?;
+            submission.sending(None)?;
             commands.push(command);
         }
         let snapshot = controller.coordinator.submissions.snapshot()?;
@@ -10570,11 +10365,9 @@ mod tests {
                 .record()?
                 .input_message_id
                 .unwrap();
-            command
-                .submission
-                .as_ref()
-                .unwrap()
-                .accepted(format!("accepted {id}"))?;
+            command.submission.as_ref().unwrap().accepted(Some(
+                forge_provider_api::RecoveryToken::new(format!("accepted {id}").into_bytes())?,
+            ))?;
             command.complete(Ok(())).await;
         }
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -10997,6 +10790,13 @@ mod tests {
                     question_id: question_ids[1].clone(),
                     task_id: None,
                     message_kind: crate::question::QuestionMessageKind::Answer,
+                    reply: crate::provider::test_support::question_reply(
+                        &question_ids[1],
+                        forge_provider_api::QuestionReplyResponse::Answer {
+                            answer: "Tabs".into(),
+                            required_questions_remain: false
+                        }
+                    ),
                 })?
             );
             assert_eq!(
@@ -11437,7 +11237,7 @@ mod tests {
     #[tokio::test]
     async fn input_retry_sends_once_and_never_replays_uncertain_delivery() -> Result<()> {
         use crate::input::{InputDelivery, InputOperation};
-        use crate::provider::submission::{SubmissionStore, SubmissionTarget};
+        use crate::provider::submission::SubmissionStore;
         let fixture = tempfile::tempdir()?;
         let service = service();
         service
@@ -11519,10 +11319,11 @@ mod tests {
         let submission = journal.prepare_input(
             &controller.catalog_request.read().await.clone(),
             crate::provider::ProviderInput::from_text("uncertain"),
-            crate::provider::ProviderKind::Mock,
+            forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
             Some("uncertain-message".into()),
         )?;
-        submission.sending(SubmissionTarget::Untracked)?;
+        submission.sending(None)?;
         let uncertain = controller.coordinator.submissions.delivery(
             "uncertain-message",
             Some(InputDelivery::Unknown),

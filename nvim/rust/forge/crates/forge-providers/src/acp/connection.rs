@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -40,6 +41,7 @@ pub enum AcpConnectionError {
     #[error("ACP {method} failed: {source}")]
     Remote {
         method: String,
+        failure: Option<AcpRemoteFailure>,
         #[source]
         source: SourceError,
     },
@@ -54,6 +56,39 @@ pub enum AcpConnectionError {
     /// The host rejected an incoming callback.
     #[error("{0}")]
     Callback(#[source] SourceError),
+}
+
+/// Preserve only recognized, provider-neutral ACP remote error classes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcpRemoteFailure {
+    AuthenticationRequired,
+    RequestCancelled,
+    ResourceNotFound,
+    Rejected,
+    Protocol,
+}
+
+fn remote_failure(source: &(dyn std::error::Error + 'static)) -> Option<AcpRemoteFailure> {
+    let mut cause = Some(source);
+    while let Some(current) = cause {
+        if let Some(error) = current.downcast_ref::<agent_client_protocol::Error>() {
+            use agent_client_protocol::ErrorCode;
+            return match &error.code {
+                ErrorCode::AuthRequired => Some(AcpRemoteFailure::AuthenticationRequired),
+                ErrorCode::RequestCancelled => Some(AcpRemoteFailure::RequestCancelled),
+                ErrorCode::ResourceNotFound => Some(AcpRemoteFailure::ResourceNotFound),
+                ErrorCode::InvalidRequest | ErrorCode::InvalidParams => {
+                    Some(AcpRemoteFailure::Rejected)
+                }
+                ErrorCode::ParseError | ErrorCode::MethodNotFound | ErrorCode::InternalError => {
+                    Some(AcpRemoteFailure::Protocol)
+                }
+                _ => None,
+            };
+        }
+        cause = current.source();
+    }
+    None
 }
 
 /// Handles native callbacks while the connection continues reading responses.
@@ -78,6 +113,7 @@ pub struct AcpConnection {
     connection: ConnectionTo<UntypedRole>,
     process: Mutex<Box<dyn process_wrap::tokio::ChildWrapper>>,
     driver: tokio::task::JoinHandle<Result<(), agent_client_protocol::Error>>,
+    stopped: AtomicBool,
 }
 
 impl AcpConnection {
@@ -183,6 +219,7 @@ impl AcpConnection {
             connection,
             process: Mutex::new(process),
             driver,
+            stopped: AtomicBool::new(false),
         })
     }
 
@@ -211,9 +248,13 @@ impl AcpConnection {
                     source,
                 })?
         };
-        response.map_err(|source| AcpConnectionError::Remote {
-            method: method.into(),
-            source: Box::new(source),
+        response.map_err(|source| {
+            let failure = remote_failure(&source);
+            AcpConnectionError::Remote {
+                method: method.into(),
+                failure,
+                source: Box::new(source),
+            }
         })
     }
 
@@ -229,6 +270,7 @@ impl AcpConnection {
             .send_notification(notification)
             .map_err(|source| AcpConnectionError::Remote {
                 method: method.into(),
+                failure: None,
                 source: Box::new(source),
             })
     }
@@ -236,6 +278,9 @@ impl AcpConnection {
     /// Collect the process tree and stop the native driver.
     pub async fn shutdown(&self) -> Result<(), AcpConnectionError> {
         let mut process = self.process.lock().await;
+        if self.stopped.load(Ordering::Acquire) {
+            return Ok(());
+        }
         Box::into_pin(process.kill())
             .await
             .map_err(|source| AcpConnectionError::Process {
@@ -243,6 +288,7 @@ impl AcpConnection {
                 source,
             })?;
         self.driver.abort();
+        self.stopped.store(true, Ordering::Release);
         Ok(())
     }
 }

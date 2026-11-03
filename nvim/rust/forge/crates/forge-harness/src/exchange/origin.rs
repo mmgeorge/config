@@ -22,6 +22,8 @@ impl ExchangeOrigin {
     }
 }
 
+pub use forge_provider_api::input::TaskStart;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,5 +70,3 @@ mod tests {
         );
     }
 }
-
-pub use forge_provider_api::input::TaskStart;

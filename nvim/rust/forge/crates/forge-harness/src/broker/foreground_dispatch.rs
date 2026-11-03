@@ -271,7 +271,10 @@ impl ForegroundAdmission {
 
 impl QuestionModelCatalogJob {
     pub(crate) async fn run(self) -> Result<Vec<crate::provider::ProviderModel>> {
-        self.provider.model_list(self.request).await
+        self.provider
+            .model_list(self.request)
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -1009,6 +1012,15 @@ impl HarnessBroker {
                     arguments: PlanPrompt::discussion(&arguments),
                     attachments,
                 },
+                ProviderInput::QuestionReply {
+                    reply,
+                    context,
+                    attachments,
+                } => ProviderInput::QuestionReply {
+                    reply,
+                    context: PlanPrompt::discussion(&context),
+                    attachments,
+                },
             };
         }
         if matches!(staged.mode, PromptMode::Plan | PromptMode::PlanDiscussion)
@@ -1035,6 +1047,15 @@ impl HarnessBroker {
                     arguments: format!("{prefix}{arguments}"),
                     attachments,
                 },
+                ProviderInput::QuestionReply {
+                    reply,
+                    context,
+                    attachments,
+                } => ProviderInput::QuestionReply {
+                    reply,
+                    context: format!("{prefix}{context}"),
+                    attachments,
+                },
             };
         }
         if self.session.provider_session_id.is_none() {
@@ -1048,6 +1069,9 @@ impl HarnessBroker {
                 ProviderInput::Text { text, .. } => *text = format!("{feedback}\n\n{text}"),
                 ProviderInput::Skill { arguments, .. } => {
                     *arguments = format!("{feedback}\n\n{arguments}")
+                }
+                ProviderInput::QuestionReply { context, .. } => {
+                    *context = format!("{feedback}\n\n{context}")
                 }
             }
         }
@@ -1205,7 +1229,15 @@ impl HarnessBroker {
         // The explicit recorded answer authorizes continuation; a late native event does not.
         self.store.save_exchange(&exchange)?;
         let text = admission.text.clone();
-        self.stage_foreground_interaction(&text, mode, None, ProviderInput::from_text(text.clone()))
+        let input = match &admission.purpose {
+            crate::input::InputPurpose::Question { reply, .. } => ProviderInput::QuestionReply {
+                reply: reply.clone(),
+                context: String::new(),
+                attachments: Vec::new(),
+            },
+            _ => ProviderInput::from_text(text.clone()),
+        };
+        self.stage_foreground_interaction(&text, mode, None, input)
             .map(Some)
     }
 
@@ -1221,11 +1253,21 @@ impl HarnessBroker {
         if let Some(discussion) = self.prepare_question_discussion(admission)? {
             let visible = discussion.visible_text.clone();
             admission.question_discussion = Some(discussion);
+            let input = match &admission.purpose {
+                crate::input::InputPurpose::Question { reply, .. } => {
+                    ProviderInput::QuestionReply {
+                        reply: reply.clone(),
+                        context: String::new(),
+                        attachments: Vec::new(),
+                    }
+                }
+                _ => ProviderInput::from_text(text),
+            };
             return self.stage_foreground_interaction(
                 &visible,
                 PromptMode::Chat,
                 Some(&ExchangeAdmission::chat(visible.clone())),
-                ProviderInput::from_text(text),
+                input,
             );
         }
         if matches!(
@@ -1514,6 +1556,7 @@ impl HarnessBroker {
                 }
             }
             ProviderInput::Text { .. } => ProviderInput::from_text(prompt),
+            input @ ProviderInput::QuestionReply { .. } => input,
         };
         self.stage_foreground_interaction(
             &text,
@@ -1759,7 +1802,10 @@ pub(crate) struct TaskCompactionJob {
 
 impl TaskCompactionJob {
     pub(crate) async fn run(self) -> Result<crate::provider::ProviderOutput> {
-        self.provider.compact(self.request).await
+        self.provider
+            .compact(self.request)
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -1834,7 +1880,11 @@ impl HarnessBroker {
             Ok(output) => output,
             Err(error) => {
                 state.compaction.state = crate::provider::CompactionState::Failed;
-                state.compaction.result.error = Some(format!("{error:#}"));
+                state.compaction.result.diagnostic =
+                    Some(crate::provider::lifecycle_error::diagnostic(
+                        forge_provider_api::ProviderOperation::HostEffectPublication,
+                        error.as_ref(),
+                    ));
                 state.record.detail = SessionEventKind::Compaction {
                     compaction: state.compaction.into(),
                 };
@@ -1878,12 +1928,14 @@ impl HarnessBroker {
                 .map(|usage| usage.used);
         }
         let failed = state.compaction.state == crate::provider::CompactionState::Failed;
-        let failure = state
-            .compaction
-            .result
-            .error
-            .clone()
-            .unwrap_or_else(|| "Provider compaction failed".into());
+        let failure =
+            forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::CompactSession,
+                state.compaction.result.diagnostic.as_ref().map_or(
+                    forge_provider_api::ProviderFailureKind::Unknown,
+                    |diagnostic| diagnostic.kind,
+                ),
+            ));
         state.record.detail = SessionEventKind::Compaction {
             compaction: state.compaction.into(),
         };
@@ -1923,7 +1975,7 @@ impl HarnessBroker {
         let patch = self.reconcile_timeline()?;
         let mut delivery = self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?;
         if failed {
-            return Ok((delivery, Some(anyhow::anyhow!("{failure}"))));
+            return Ok((delivery, Some(failure.into())));
         }
         delivery
             .events

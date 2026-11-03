@@ -46,6 +46,7 @@ pub enum InputPurpose {
         question_id: crate::question::QuestionId,
         task_id: Option<String>,
         message_kind: crate::question::QuestionMessageKind,
+        reply: forge_provider_api::QuestionReply,
     },
     QuestionContinuation {
         exchange_id: String,

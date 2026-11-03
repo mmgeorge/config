@@ -1,7 +1,7 @@
 #[derive(Clone, Copy)]
 enum ChildCompletionFailure {
     ProviderCancelled,
-    SimilarProviderMessage,
+    ProviderFailed,
     CleanupFailed,
 }
 
@@ -11,10 +11,10 @@ async fn managed_child_provider_cancellation_is_cancelled_without_watch_signal()
     assert_child_completion_failure(ChildCompletionFailure::ProviderCancelled).await
 }
 
-/// Cancellation-like provider text remains a failure in the child completion path.
+/// A normalized provider failure remains distinct from cancellation.
 #[tokio::test]
-async fn managed_child_cancellation_like_provider_error_remains_failed() -> Result<()> {
-    assert_child_completion_failure(ChildCompletionFailure::SimilarProviderMessage).await
+async fn managed_child_normalized_provider_error_remains_failed() -> Result<()> {
+    assert_child_completion_failure(ChildCompletionFailure::ProviderFailed).await
 }
 
 /// Cleanup failure retains its failure state and obligation even after provider cancellation.
@@ -33,7 +33,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
     assert!(
         !*broker
             .agent_coordinator
-            .cancellation(&owner.agent_id, &admission.task.id)?
+            .cancellation(owner.agent_id.as_str(), &admission.task.id)?
             .borrow()
     );
     let mut event = Vec::new();
@@ -59,11 +59,13 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
             None,
             ExchangeState::Cancelled,
         ),
-        ChildCompletionFailure::SimilarProviderMessage => (
-            Err(anyhow::Error::new(crate::provider::ProviderError::Provider {
-                code: None,
-                message: "provider execution cancelled".into(),
-            })),
+        ChildCompletionFailure::ProviderFailed => (
+            Err(anyhow::Error::new(crate::provider::ProviderError::from(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::AdmitInput,
+                    forge_provider_api::ProviderFailureKind::Unknown,
+                ),
+            ))),
             None,
             ExchangeState::Failed,
         ),
@@ -74,7 +76,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         ),
     };
     let turn_outcome = match failure {
-        ChildCompletionFailure::SimilarProviderMessage => crate::turn::TurnOutcome::Failed,
+        ChildCompletionFailure::ProviderFailed => crate::turn::TurnOutcome::Failed,
         ChildCompletionFailure::ProviderCancelled | ChildCompletionFailure::CleanupFailed => {
             crate::turn::TurnOutcome::Cancelled
         }
@@ -120,7 +122,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         crate::turn::ToolState::Denied
     );
     assert_eq!(exchange.finalization_error, cleanup_error);
-    let agent = broker.agent_coordinator.resolve(&owner.agent_id)?;
+    let agent = broker.agent_coordinator.resolve(owner.agent_id.as_str())?;
     match failure {
         ChildCompletionFailure::CleanupFailed => {
             assert_eq!(agent.state, AgentState::Closing);
@@ -128,17 +130,17 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
             assert!(
                 broker
                     .agent_coordinator
-                    .cleanup_task(&owner.agent_id)
+                    .cleanup_task(owner.agent_id.as_str())
                     .is_some()
             );
         }
         ChildCompletionFailure::ProviderCancelled
-        | ChildCompletionFailure::SimilarProviderMessage => {
+        | ChildCompletionFailure::ProviderFailed => {
             assert_eq!(agent.state, AgentState::Ready);
             assert!(
                 broker
                     .agent_coordinator
-                    .cleanup_task(&owner.agent_id)
+                    .cleanup_task(owner.agent_id.as_str())
                     .is_none()
             );
         }

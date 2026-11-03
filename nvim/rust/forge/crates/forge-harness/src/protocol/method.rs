@@ -73,6 +73,8 @@ pub enum RuntimeMethod {
     ProviderModelPinList,
     #[serde(rename = "provider.model.pin.set")]
     ProviderModelPinSet,
+    #[serde(rename = "provider.registry.list")]
+    ProviderRegistryList,
     #[serde(rename = "session.agent.start")]
     SessionAgentStart,
     #[serde(rename = "session.agent.message.send")]

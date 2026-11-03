@@ -169,10 +169,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .disconnect()
                 .await
                 .map_err(|cleanup| ProviderError::PreparationCleanup {
-                    cause: Arc::new(ProviderError::Protocol {
-                        message: "previous Copilot startup was abandoned".into(),
-                    }),
-                    cleanup: Arc::new(cleanup),
+                    cause: Box::new(super::error::native_failure(
+                        forge_provider_api::ProviderOperation::InitializeSession,
+                        forge_provider_api::ProviderFailureKind::Runtime,
+                    )),
+                    cleanup: Box::new(cleanup),
                 })?;
             self.provisional
                 .lock()
@@ -262,8 +263,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             );
             provisional
                 .lock()
-                .map_err(|_| ProviderError::Protocol {
-                    message: "Copilot provisional session registry poisoned".into(),
+                .map_err(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
                 })?
                 .insert(startup_key, session.clone());
             Ok(session)
@@ -306,11 +310,16 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         let (repair, mcp_failure) = match configuration {
             Ok(configured) => configured,
             Err(error) => {
-                let cause = ProviderError::from(error);
+                let cause = error.downcast::<ProviderError>().unwrap_or_else(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::InitializeSession,
+                        forge_provider_api::ProviderFailureKind::Runtime,
+                    )
+                });
                 if let Err(cleanup) = session.disconnect().await {
                     return Err(ProviderError::PreparationCleanup {
-                        cause: Arc::new(cause),
-                        cleanup: Arc::new(cleanup),
+                        cause: Box::new(cause),
+                        cleanup: Box::new(cleanup),
                     }
                     .into());
                 }
@@ -370,8 +379,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         let binding = active
             .as_mut()
             .filter(|binding| Arc::ptr_eq(&binding.session, session))
-            .ok_or_else(|| ProviderError::Protocol {
-                message: "Copilot submission changed or lost its session".into(),
+            .ok_or_else(|| {
+                super::error::native_failure(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                )
             })?;
         binding.history = SessionHistory::Submitted;
         Ok(())
@@ -432,11 +444,6 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                     error,
                 ));
         }
-    }
-
-    /// Report whether the session has a separate compaction observer.
-    pub async fn observes_compaction(&self, key: &str) -> bool {
-        self.subscriptions.lock().await.contains_key(key)
     }
 
     /// Fail every source observer sharing this client before callbacks or readers are retired.
@@ -502,10 +509,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                         ),
                     ))
                 })?;
-            entry.state = SessionCollectionState::Complete(joined.unwrap_or_else(|error| {
-                Err(Arc::new(ProviderError::Protocol {
-                    message: format!("Copilot session collection worker failed: {error}"),
-                }))
+            entry.state = SessionCollectionState::Complete(joined.unwrap_or_else(|_error| {
+                Err(Arc::new(super::error::native_failure(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                )))
             }));
         }
         match &entry.state {
@@ -515,10 +523,10 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             }
             SessionCollectionState::Complete(Err(cleanup)) => {
                 Err(ProviderError::PreparationCleanup {
-                    cause: Arc::new(ProviderError::Observation(
+                    cause: Box::new(ProviderError::Observation(
                         client.failed_generation().failure(),
                     )),
-                    cleanup: cleanup.clone(),
+                    cleanup: Box::new(cleanup.as_ref().clone()),
                 })
             }
             SessionCollectionState::Running(_) => {
@@ -535,9 +543,10 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         owner: forge_provider_api::ExecutionOwner,
     ) -> Result<(), ProviderError> {
         if owner.runtime_key() != key {
-            return Err(ProviderError::Rejected {
-                message: "Copilot generation binding crosses execution ownership".into(),
-            });
+            return Err(super::error::native_failure(
+                forge_provider_api::ProviderOperation::NativeTransport,
+                forge_provider_api::ProviderFailureKind::Rejected,
+            ));
         }
         let sink = self
             .subscriptions
@@ -556,9 +565,10 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         generation.ensure_healthy()?;
         if let Some(previous) = generations.get(key) {
             if !previous.generation.same(&generation) {
-                return Err(ProviderError::Rejected {
-                    message: "old Copilot generation has not been collected".into(),
-                });
+                return Err(super::error::native_failure(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Rejected,
+                ));
             }
             if previous.observer.is_some() {
                 return Ok(());
@@ -606,8 +616,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             let startup = self
                 .startups
                 .lock()
-                .map_err(|_| ProviderError::Protocol {
-                    message: "Copilot startup registry poisoned".into(),
+                .map_err(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
                 })?
                 .get(&key)
                 .cloned();
@@ -620,20 +633,22 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                             return Err(ProviderError::PreparationCleanup { cause, cleanup });
                         }
                         Ok(Err(_)) => {}
-                        Err(error) => {
-                            return Err(ProviderError::Protocol {
-                                message: format!(
-                                    "Copilot startup worker failed during recovery: {error}"
-                                ),
-                            });
+                        Err(_error) => {
+                            return Err(super::error::native_failure(
+                                forge_provider_api::ProviderOperation::NativeTransport,
+                                forge_provider_api::ProviderFailureKind::Protocol,
+                            ));
                         }
                     }
                     retained.take();
                 }
                 self.startups
                     .lock()
-                    .map_err(|_| ProviderError::Protocol {
-                        message: "Copilot startup registry poisoned".into(),
+                    .map_err(|_| {
+                        super::error::native_failure(
+                            forge_provider_api::ProviderOperation::NativeTransport,
+                            forge_provider_api::ProviderFailureKind::Protocol,
+                        )
                     })?
                     .remove(&key);
             }
@@ -645,9 +660,10 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 let mut active = slot.lock().await;
                 if let Some(binding) = active.as_mut() {
                     if !binding.session.belongs_to(proof.failed_generation()) {
-                        return Err(ProviderError::Rejected {
-                            message: "Copilot recovery encountered a successor session".into(),
-                        });
+                        return Err(super::error::native_failure(
+                            forge_provider_api::ProviderOperation::NativeTransport,
+                            forge_provider_api::ProviderFailureKind::Rejected,
+                        ));
                     }
                     if let Some(monitor) = binding.compaction.as_mut() {
                         monitor.shutdown().await?;
@@ -662,8 +678,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             let provisional = self
                 .provisional
                 .lock()
-                .map_err(|_| ProviderError::Protocol {
-                    message: "Copilot provisional session registry poisoned".into(),
+                .map_err(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
                 })?
                 .get(&key)
                 .cloned();
@@ -672,20 +691,29 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             }
             self.provisional
                 .lock()
-                .map_err(|_| ProviderError::Protocol {
-                    message: "Copilot provisional session registry poisoned".into(),
+                .map_err(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
                 })?
                 .remove(&key);
             self.leases
                 .lock()
-                .map_err(|_| ProviderError::Protocol {
-                    message: "Copilot resource lease registry poisoned".into(),
+                .map_err(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
                 })?
                 .remove(&key);
             self.failed_startups
                 .lock()
-                .map_err(|_| ProviderError::Protocol {
-                    message: "Copilot startup failure registry poisoned".into(),
+                .map_err(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
                 })?
                 .remove(&key);
             let observer = self
@@ -696,8 +724,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .and_then(|binding| binding.observer.take());
             if let Some(observer) = observer {
                 // Sticky failure is already published; this owned worker joins its failure relay.
-                observer.await.map_err(|error| ProviderError::Protocol {
-                    message: format!("Copilot generation observer failed: {error}"),
+                observer.await.map_err(|_error| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
                 })?;
             }
             self.generations.lock().await.remove(&key);
@@ -712,8 +743,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         let slot = self.slot(key).await;
         let (session, manual) = {
             let active = slot.lock().await;
-            let binding = active.as_ref().ok_or_else(|| ProviderError::Protocol {
-                message: "Copilot compaction lost its session".into(),
+            let binding = active.as_ref().ok_or_else(|| {
+                super::error::native_failure(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                )
             })?;
             (
                 binding.session.clone(),
@@ -791,6 +825,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Drop observation readers before shutting down the SDK client.
+    #[cfg(test)]
     pub async fn close_observers(&self) -> Result<(), ProviderError> {
         let mut terminals = self.terminals.lock().await;
         for monitor in terminals.values_mut() {
@@ -812,8 +847,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         sessions.extend(
             self.provisional
                 .lock()
-                .map_err(|_| ProviderError::Protocol {
-                    message: "Copilot provisional session registry poisoned".into(),
+                .map_err(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
                 })?
                 .values()
                 .cloned(),
@@ -870,10 +908,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             match observer.await {
                 Ok(()) => {}
                 Err(error) if error.is_cancelled() => {}
-                Err(error) => {
-                    return Err(ProviderError::Protocol {
-                        message: format!("Copilot generation observer failed: {error}"),
-                    });
+                Err(_error) => {
+                    return Err(super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    ));
                 }
             }
         }
@@ -886,42 +925,56 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         let keys: Vec<_> = self
             .startups
             .lock()
-            .map_err(|_| ProviderError::Protocol {
-                message: "Copilot startup registry poisoned".into(),
+            .map_err(|_| {
+                super::error::native_failure(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                )
             })?
             .keys()
             .cloned()
             .collect();
-        let mut startup_failure = None;
-        let failed_key = self
+        let mut failed_startups: Vec<_> = self
             .failed_startups
             .lock()
-            .map_err(|_| ProviderError::Protocol {
-                message: "Copilot startup failure registry poisoned".into(),
+            .map_err(|_| {
+                super::error::native_failure(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                )
             })?
-            .keys()
-            .next()
-            .cloned();
-        if let Some(key) = failed_key {
-            startup_failure = Some(ProviderError::from(
-                self.ensure_startup_collected(&key)
-                    .expect_err("failed startup must remain fenced"),
-            ));
-        }
+            .iter()
+            .map(|(key, error)| (key.clone(), error.as_ref().clone()))
+            .collect();
+        failed_startups.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut failures: Vec<_> = failed_startups
+            .into_iter()
+            .map(|(_, error)| error)
+            .collect();
         for key in keys {
             if let Err(error) = self.collect_startup(&key).await {
-                startup_failure.get_or_insert(ProviderError::from(error));
+                failures.push(error.downcast::<ProviderError>().unwrap_or_else(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::InitializeSession,
+                        forge_provider_api::ProviderFailureKind::Runtime,
+                    )
+                }));
             }
         }
-        let slots = std::mem::take(&mut *self.slots.lock().await);
-        let mut failure = startup_failure;
+        let slots: Vec<_> = self
+            .slots
+            .lock()
+            .await
+            .iter()
+            .map(|(key, slot)| (key.clone(), slot.clone()))
+            .collect();
         let provisional: Vec<_> = {
-            let pending = self
-                .provisional
-                .lock()
-                .map_err(|_| ProviderError::Protocol {
-                    message: "Copilot provisional session registry poisoned".into(),
-                })?;
+            let pending = self.provisional.lock().map_err(|_| {
+                super::error::native_failure(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                )
+            })?;
             pending
                 .iter()
                 .map(|(key, session)| (key.clone(), session.clone()))
@@ -930,31 +983,40 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         for (key, session) in provisional {
             match session.disconnect().await {
                 Err(error) => {
-                    failure.get_or_insert(error);
+                    failures.push(error);
                 }
                 Ok(()) => {
                     self.provisional
                         .lock()
-                        .map_err(|_| ProviderError::Protocol {
-                            message: "Copilot provisional session registry poisoned".into(),
+                        .map_err(|_| {
+                            super::error::native_failure(
+                                forge_provider_api::ProviderOperation::NativeTransport,
+                                forge_provider_api::ProviderFailureKind::Protocol,
+                            )
                         })?
                         .remove(&key);
                     self.leases
                         .lock()
-                        .map_err(|_| ProviderError::Protocol {
-                            message: "Copilot resource lease registry poisoned".into(),
+                        .map_err(|_| {
+                            super::error::native_failure(
+                                forge_provider_api::ProviderOperation::NativeTransport,
+                                forge_provider_api::ProviderFailureKind::Protocol,
+                            )
                         })?
                         .remove(&key);
                 }
             }
         }
-        for (_, slot) in slots {
-            let binding = slot.lock().await.take();
-            if let Some(binding) = binding
+        for (key, slot) in slots {
+            let mut retained = slot.lock().await;
+            if let Some(binding) = retained.as_ref()
                 && let Err(error) = binding.session.events.close().await
             {
-                failure.get_or_insert(error);
+                failures.push(error);
+                continue;
             }
+            retained.take();
+            self.slots.lock().await.remove(&key);
         }
         let keys = self
             .generations
@@ -965,7 +1027,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             .collect::<Vec<_>>();
         for key in keys {
             if let Err(error) = self.retire_generation_observer(&key).await {
-                failure.get_or_insert(error);
+                failures.push(error);
             }
         }
         self.turns.lock().await.clear();
@@ -973,34 +1035,55 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             && self
                 .startups
                 .lock()
-                .map_err(|_| ProviderError::Protocol {
-                    message: "Copilot startup registry poisoned".into(),
+                .map_err(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
                 })?
                 .is_empty()
             && self
                 .provisional
                 .lock()
-                .map_err(|_| ProviderError::Protocol {
-                    message: "Copilot provisional session registry poisoned".into(),
+                .map_err(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
                 })?
                 .is_empty()
         {
             self.failed_startups
                 .lock()
-                .map_err(|_| ProviderError::Protocol {
-                    message: "Copilot startup failure registry poisoned".into(),
+                .map_err(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
                 })?
                 .clear();
             self.leases
                 .lock()
-                .map_err(|_| ProviderError::Protocol {
-                    message: "Copilot resource lease registry poisoned".into(),
+                .map_err(|_| {
+                    super::error::native_failure(
+                        forge_provider_api::ProviderOperation::NativeTransport,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    )
                 })?
                 .clear();
         }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
+        let mut failures = failures.into_iter();
+        let Some(primary) = failures.next() else {
+            return Ok(());
+        };
+        let secondary: Vec<_> = failures.collect();
+        if secondary.is_empty() {
+            Err(primary)
+        } else {
+            Err(ProviderError::Combined {
+                primary: Box::new(primary),
+                secondary,
+            })
         }
     }
 
@@ -1033,14 +1116,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             Ok(result) => result,
             Err(_) => {
                 return Err(ProviderError::PreparationCleanup {
-                    cause: Arc::new(ProviderError::Protocol {
-                        message: "Copilot startup has not settled".into(),
-                    }),
-                    cleanup: Arc::new(ProviderError::DeliveryUncertain {
-                        message:
-                            "Copilot startup collection exceeded its deadline; worker retained"
-                                .into(),
-                    }),
+                    cause: Box::new(super::error::native_failure(
+                        forge_provider_api::ProviderOperation::InitializeSession,
+                        forge_provider_api::ProviderFailureKind::Runtime,
+                    )),
+                    cleanup: Box::new(ProviderError::DeliveryUncertain),
                 }
                 .into());
             }
@@ -1067,10 +1147,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                     .remove(key);
                 Err(error.into())
             }
-            Err(error) => {
-                let error = Arc::new(ProviderError::Protocol {
-                    message: format!("Copilot startup worker failed: {error}"),
-                });
+            Err(_error) => {
+                let error = Arc::new(super::error::native_failure(
+                    forge_provider_api::ProviderOperation::InitializeSession,
+                    forge_provider_api::ProviderFailureKind::Runtime,
+                ));
                 self.failed_startups
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Copilot startup failure registry poisoned"))?
@@ -1090,10 +1171,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             .get(key)
         {
             return Err(ProviderError::PreparationCleanup {
-                cause: error.clone(),
-                cleanup: Arc::new(ProviderError::Protocol {
-                    message: "Copilot startup cleanup remains uncollected".into(),
-                }),
+                cause: Box::new(error.as_ref().clone()),
+                cleanup: Box::new(super::error::native_failure(
+                    forge_provider_api::ProviderOperation::CleanupExecution,
+                    forge_provider_api::ProviderFailureKind::Runtime,
+                )),
             }
             .into());
         }
@@ -1147,12 +1229,13 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     include!("sessions_recovery_test.rs");
+    include!("completion_ancestry_test.rs");
     include!("startup_loss_test.rs");
 
     struct Trace;
     impl ProviderTrace for Trace {
         /// Discard fixture diagnostics independently of the native transport assertions.
-        fn record(&self, _: &str, _: &str, _: Value) {}
+        fn record(&self, _: forge_provider_api::trace::ProviderTraceRecord) {}
     }
 
     struct Host;
@@ -1161,13 +1244,16 @@ mod tests {
         /// Reject unexpected native permission callbacks in the startup fixture.
         async fn authorize(
             &self,
-            _: &str,
+            _: &forge_provider_api::InvocationScope,
             _: forge_provider_api::permissions::PermissionRequest,
         ) -> forge_provider_api::permissions::PermissionResponse {
             forge_provider_api::permissions::PermissionResponse::Cancelled
         }
         /// Keep the fixture's host barrier open without authorizing tool calls.
-        async fn before_tool(&self) -> Result<(), ProviderError> {
+        async fn before_tool(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
             Ok(())
         }
     }
@@ -1176,11 +1262,13 @@ mod tests {
         /// Reject unexpected native tool execution before prompt dispatch.
         async fn call(
             &self,
+            _: &forge_provider_api::InvocationScope,
             _: forge_provider_api::control::ToolCall,
         ) -> Result<String, ProviderError> {
-            Err(ProviderError::Rejected {
-                message: "unexpected tool call".into(),
-            })
+            Err(crate::copilot::error::native_failure(
+                forge_provider_api::ProviderOperation::NativeTransport,
+                forge_provider_api::ProviderFailureKind::Rejected,
+            ))
         }
     }
 
@@ -1325,6 +1413,7 @@ mod tests {
                             },
                             excluded_tools: Vec::new(),
                             tools: Vec::new(),
+                            native_callbacks: None,
                         },
                         Arc::new(Host),
                         Arc::new(Host),
@@ -1420,7 +1509,7 @@ mod tests {
                         "owner".into(),
                         Arc::new(Mutex::new(Some(SessionBinding {
                             session: session.clone(),
-                            history: SessionHistory::Submitted,
+                            history: SessionHistory::Prepared,
                             repair: None,
                             tool_schema: Vec::new(),
                             compaction: None,
@@ -1429,12 +1518,23 @@ mod tests {
                         }))),
                     );
                 }
+                if !provisional {
+                    sessions.mark_submitted("owner", &session).await.unwrap();
+                    let slot = sessions.slot("owner").await;
+                    assert!(matches!(
+                        slot.lock().await.as_ref().unwrap().history,
+                        SessionHistory::Submitted
+                    ));
+                }
                 sessions.close_observers().await.unwrap();
                 let scope = forge_provider_api::InvocationScope::new(
                     forge_provider_api::ExecutionOwner::root("owner"),
                     "exchange",
                 );
-                let (sink, _events) = forge_provider_api::events::channel(scope.clone());
+                let (sink, _events) = forge_provider_api::events::channel(
+                    forge_provider_api::BindingId::new("sessions-fixture").unwrap(),
+                    scope.clone(),
+                );
                 let context = Arc::new(Mutex::new(super::super::intake::TurnContext {
                     decoder: super::super::event_decoder::CopilotEventDecoder::new(
                         scope,
@@ -1513,6 +1613,7 @@ mod tests {
                                 },
                                 excluded_tools: Vec::new(),
                                 tools: Vec::new(),
+                                native_callbacks: None,
                             },
                             skills: None,
                             mcp: None,
@@ -1678,6 +1779,7 @@ mod tests {
                                 },
                                 excluded_tools: Vec::new(),
                                 tools: Vec::new(),
+                                native_callbacks: None,
                             },
                             skills: None,
                             mcp: None,
@@ -1737,9 +1839,10 @@ mod tests {
         let task = tokio::spawn(async move {
             let _profile = worker_profile;
             let _ = wait.await;
-            Err(ProviderError::Rejected {
-                message: "startup failed".into(),
-            })
+            Err(crate::copilot::error::native_failure(
+                forge_provider_api::ProviderOperation::NativeTransport,
+                forge_provider_api::ProviderFailureKind::Rejected,
+            ))
         });
         let startup = Arc::new(Mutex::new(Some(task)));
         sessions
@@ -1768,14 +1871,45 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("startup failure was lost"),
         };
-        assert!(
-            matches!(error.downcast_ref::<ProviderError>(), Some(ProviderError::Rejected { message }) if message == "startup failed")
-        );
+        assert!(matches!(
+            error.downcast_ref::<ProviderError>(),
+            Some(ProviderError::Failure(failure))
+                if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected
+        ));
         assert!(!sessions.startups.lock().unwrap().contains_key("owner"));
         assert!(
             !profile_path.exists(),
             "resource lease was not released after collection"
         );
+    }
+
+    /// Preserve each independently failed startup when shutdown reports its outcome.
+    #[tokio::test]
+    async fn shutdown_preserves_all_failed_startup_causes() {
+        use forge_provider_api::{ProviderFailureKind, ProviderOperation};
+        let sessions = CopilotSessions::<()>::new(Arc::new(Trace));
+        for (key, kind) in [
+            ("first", ProviderFailureKind::Protocol),
+            ("second", ProviderFailureKind::Transport),
+        ] {
+            sessions.failed_startups.lock().unwrap().insert(
+                key.into(),
+                Arc::new(super::super::error::native_failure(
+                    ProviderOperation::InitializeSession,
+                    kind,
+                )),
+            );
+        }
+        let error = sessions.clear(ClientShutdown::Collected).await.unwrap_err();
+        let ProviderError::Combined { primary, secondary } = error else {
+            panic!("shutdown discarded an independent startup failure");
+        };
+        assert!(matches!(*primary, ProviderError::Failure(failure)
+            if failure.kind() == ProviderFailureKind::Protocol));
+        assert!(matches!(&secondary[..], [ProviderError::Failure(failure)]
+            if failure.kind() == ProviderFailureKind::Transport));
+        assert!(sessions.failed_startups.lock().unwrap().is_empty());
+        sessions.clear(ClientShutdown::Collected).await.unwrap();
     }
 
     /// Keep failed cleanup fenced and retain its profile until collection can be proven.
@@ -1791,12 +1925,14 @@ mod tests {
             .insert("owner".into(), profile);
         let task = tokio::spawn(async {
             Err(ProviderError::PreparationCleanup {
-                cause: Arc::new(ProviderError::Rejected {
-                    message: "startup failed".into(),
-                }),
-                cleanup: Arc::new(ProviderError::Transport {
-                    message: "disconnect failed".into(),
-                }),
+                cause: Box::new(crate::copilot::error::native_failure(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Rejected,
+                )),
+                cleanup: Box::new(crate::copilot::error::native_failure(
+                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                )),
             })
         });
         sessions

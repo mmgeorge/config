@@ -403,6 +403,15 @@ fn git(workspace: &Path, args: &[&str]) {
     );
 }
 
+/// Select the failing-runtime fixture through the same registry available to every client.
+fn registered_provider(broker: &mut BrokerProcess) -> String {
+    broker.request(json!({"id": 900, "method": "provider.registry.list", "params": {}}));
+    broker.read_response(900).last().unwrap()["result"]["default_provider"]
+        .as_str()
+        .expect("registry supplies a default provider")
+        .to_owned()
+}
+
 fn serial_test() -> MutexGuard<'static, ()> {
     BROKER_TEST_LOCK
         .lock()
@@ -415,11 +424,12 @@ fn chat_reports_provider_start_failure_without_stopping_host() {
     let repository = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let mut broker = BrokerProcess::start();
+    let provider = registered_provider(&mut broker);
     broker.request(json!({
         "id": 1, "method": "session.initialize", "params": {
             "data_root": data.path(), "workspace": repository.path(),
             "client_id": "chat-provider-stack-test",
-            "provider": { "kind": "codex", "command": ["forge-unavailable-provider-fixture"] },
+            "provider": { "kind": provider, "command": ["forge-unavailable-provider-fixture"] },
             "model": "fixture", "effort": "medium"
         }
     }));
@@ -472,6 +482,7 @@ fn planning_task_reports_provider_start_failure_without_stopping_host() {
     std::fs::write(repository.path().join(".forge.json"), r#"{"checks":{}}"#).unwrap();
     let data = tempfile::tempdir().unwrap();
     let mut broker = BrokerProcess::start();
+    let provider = registered_provider(&mut broker);
     broker.request(json!({
         "id": 1,
         "method": "session.initialize",
@@ -479,7 +490,7 @@ fn planning_task_reports_provider_start_failure_without_stopping_host() {
             "data_root": data.path(),
             "workspace": repository.path(),
             "client_id": "planning-stack-test",
-            "provider": { "kind": "codex", "command": ["forge-unavailable-provider-fixture"] },
+            "provider": { "kind": provider, "command": ["forge-unavailable-provider-fixture"] },
             "model": "fixture",
             "effort": "medium"
         }

@@ -8,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 
 /// Identify one question without confusing it with an exchange or task.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -231,6 +231,7 @@ pub(crate) struct QuestionOutbox {
     pub(crate) task_id: Option<String>,
     pub(crate) kind: QuestionMessageKind,
     pub(crate) text: String,
+    pub(crate) reply: forge_provider_api::QuestionReply,
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -597,7 +598,10 @@ impl QuestionController {
         let encoded = serde_json::to_string(&command)?;
         self.update(|state| {
             if let Some(previous) = state.operations.get(&command.operation_id) {
-                ensure!(previous == &encoded, "question operation identity was reused");
+                ensure!(
+                    previous == &encoded,
+                    "question operation identity was reused"
+                );
                 return Ok(state.snapshot.clone());
             }
             let other_required_pending = state.snapshot.questions.iter().any(|question| {
@@ -605,17 +609,34 @@ impl QuestionController {
                     && question.requirement == QuestionRequirement::Required
                     && question.pending()
             });
-            let question = state.snapshot.questions.iter_mut().find(|question| question.id == command.question_id).context("question does not belong to this session")?;
+            let question = state
+                .snapshot
+                .questions
+                .iter_mut()
+                .find(|question| question.id == command.question_id)
+                .context("question does not belong to this session")?;
             let cancelled = state.cancelled_exchanges.contains(&question.exchange_id);
-            ensure!(question.content.revision == command.revision, "question changed; review its current choices before submitting");
-            ensure!(!matches!(question.resolution, QuestionResolution::Retired { .. }), "question owner is no longer active");
+            ensure!(
+                question.content.revision == command.revision,
+                "question changed; review its current choices before submitting"
+            );
+            ensure!(
+                !matches!(question.resolution, QuestionResolution::Retired { .. }),
+                "question owner is no longer active"
+            );
             let message_id = command.operation_id.clone();
             let mut outbound = None;
             match command.action {
                 QuestionAction::Answer { answer } => {
-                    ensure!(question.pending(), "question already resolved; send a correction instead");
+                    ensure!(
+                        question.pending(),
+                        "question already resolved; send a correction instead"
+                    );
                     let text = answer_text(&question.content, &answer)?;
-                    question.resolution = QuestionResolution::Answered { answer, message_id: message_id.clone() };
+                    question.resolution = QuestionResolution::Answered {
+                        answer,
+                        message_id: message_id.clone(),
+                    };
                     outbound = Some((QuestionMessageKind::Answer, text));
                 }
                 QuestionAction::Clarify { text } => {
@@ -625,25 +646,58 @@ impl QuestionController {
                     outbound = Some((QuestionMessageKind::Clarification, text));
                 }
                 QuestionAction::Correct { text } => {
-                    ensure!(matches!(question.resolution, QuestionResolution::Answered { .. }), "only an answered question accepts a correction");
+                    ensure!(
+                        matches!(question.resolution, QuestionResolution::Answered { .. }),
+                        "only an answered question accepts a correction"
+                    );
                     ensure!(!text.trim().is_empty(), "correction is empty");
                     outbound = Some((QuestionMessageKind::Correction, text));
                 }
                 QuestionAction::Dismiss => {
                     ensure!(question.pending(), "question is no longer pending");
-                    ensure!(question.requirement == QuestionRequirement::Optional, "required questions cannot be dismissed");
+                    ensure!(
+                        question.requirement == QuestionRequirement::Optional,
+                        "required questions cannot be dismissed"
+                    );
                     question.resolution = QuestionResolution::Dismissed;
                 }
-                QuestionAction::Reply { message_id: parent, text } => {
+                QuestionAction::Reply {
+                    message_id: parent,
+                    text,
+                } => {
                     ensure!(!text.trim().is_empty(), "clarification reply is empty");
-                    ensure!(question.discussion.iter().any(|message| message.id == parent && message.kind == QuestionMessageKind::Clarification), "clarification message not found");
-                    question.discussion.push(QuestionMessage { id: message_id.clone(), kind: QuestionMessageKind::Reply, text, reply_to: Some(parent) });
+                    ensure!(
+                        question
+                            .discussion
+                            .iter()
+                            .any(|message| message.id == parent
+                                && message.kind == QuestionMessageKind::Clarification),
+                        "clarification message not found"
+                    );
+                    question.discussion.push(QuestionMessage {
+                        id: message_id.clone(),
+                        kind: QuestionMessageKind::Reply,
+                        text,
+                        reply_to: Some(parent),
+                    });
                 }
                 QuestionAction::Revise { draft } => {
                     ensure!(question.pending(), "resolved questions cannot be revised");
-                    ensure!(draft.requirement == question.requirement, "question requirement cannot change during revision");
-                    let next = content(draft, question.content.revision.checked_add(1).context("question revision exhausted")?)?;
-                    question.previous.push(std::mem::replace(&mut question.content, next));
+                    ensure!(
+                        draft.requirement == question.requirement,
+                        "question requirement cannot change during revision"
+                    );
+                    let next = content(
+                        draft,
+                        question
+                            .content
+                            .revision
+                            .checked_add(1)
+                            .context("question revision exhausted")?,
+                    )?;
+                    question
+                        .previous
+                        .push(std::mem::replace(&mut question.content, next));
                 }
                 QuestionAction::Withdraw { reason } => {
                     ensure!(question.pending(), "question is no longer pending");
@@ -652,38 +706,81 @@ impl QuestionController {
                 }
             }
             if let Some((kind, text)) = outbound {
-                question.discussion.push(QuestionMessage { id: message_id.clone(), kind, text: text.clone(), reply_to: None });
+                question.discussion.push(QuestionMessage {
+                    id: message_id.clone(),
+                    kind,
+                    text: text.clone(),
+                    reply_to: None,
+                });
                 // Optional answers remain durable history without authorizing another native turn.
                 if cancelled {
                     state.operations.insert(command.operation_id, encoded);
                     return Ok(state.snapshot.clone());
                 }
                 let waiting = question.delivery == QuestionDelivery::ToolResult
-                    && self.waiting.lock().map_err(|_| anyhow::anyhow!("question wait registry poisoned"))?.contains(&question.id);
-                if waiting && matches!(kind, QuestionMessageKind::Answer | QuestionMessageKind::Correction) {
+                    && self
+                        .waiting
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("question wait registry poisoned"))?
+                        .contains(&question.id);
+                if waiting
+                    && matches!(
+                        kind,
+                        QuestionMessageKind::Answer | QuestionMessageKind::Correction
+                    )
+                {
                     state.operations.insert(command.operation_id, encoded);
                     return Ok(state.snapshot.clone());
                 }
-                let rendered = if kind == QuestionMessageKind::Clarification {
-                    let target = serde_json::json!({
-                        "question_id": question.id.as_str(),
-                        "revision": question.content.revision,
-                        "message_id": message_id,
-                    });
-                    format!("Harness question clarification\n{}\nChoices: {}\nUser clarification: {}\nReply target: {}\nThis is a read-only question discussion. Explain the choices and provide illustrative examples when requested, without selecting or recording an answer. Call question_reply with these exact target fields and your explanation in text. Copy the complete opaque question_id, including its colon and index suffix. Leave the question unanswered. Honor any explicit constraint in the user's text. Do not implement or resume the original task; Harness owns its continuation.", question.content.question, serde_json::to_string(&question.content.options)?, text, target)
-                } else {
-                    let end = question.content.question.floor_char_boundary(question.content.question.len().min(512));
-                    let replies = serde_json::json!([{
-                        "answer": text,
-                        "question": question.content.question[..end].replace(['\n', '\r'], " "),
-                        "questionItemId": question.id.as_str(),
-                    }]);
-                    let remaining = if other_required_pending {
-                        "\nOther required questions remain unanswered. Record this answer without resuming the original request. Wait for the remaining answers."
-                    } else { "" };
-                    format!("<send_user_message_question_reply>\n{replies}\n</send_user_message_question_reply>{remaining}")
+                let response = match kind {
+                    QuestionMessageKind::Clarification => {
+                        forge_provider_api::QuestionReplyResponse::Clarification {
+                            options: question
+                                .content
+                                .options
+                                .iter()
+                                .map(|option| forge_provider_api::QuestionReplyOption {
+                                    id: option.id.clone(),
+                                    label: option.label.clone(),
+                                    description: option.description.clone(),
+                                    recommended: option.recommended,
+                                })
+                                .collect(),
+                            text: text.clone(),
+                            reply_to: None,
+                        }
+                    }
+                    QuestionMessageKind::Answer => {
+                        forge_provider_api::QuestionReplyResponse::Answer {
+                            answer: text.clone(),
+                            required_questions_remain: other_required_pending,
+                        }
+                    }
+                    QuestionMessageKind::Correction => {
+                        forge_provider_api::QuestionReplyResponse::Correction {
+                            answer: text.clone(),
+                            required_questions_remain: other_required_pending,
+                        }
+                    }
+                    QuestionMessageKind::Reply => anyhow::bail!(
+                        "a discussion reply cannot be submitted as a question response"
+                    ),
                 };
-                state.outbox.push(QuestionOutbox { id: message_id, question_id: question.id.clone(), task_id: question.task_id.clone(), kind, text: rendered });
+                let reply = forge_provider_api::QuestionReply {
+                    question_id: question.id.as_str().to_owned(),
+                    revision: question.content.revision,
+                    message_id: message_id.clone(),
+                    question: question.content.question.clone(),
+                    response,
+                };
+                state.outbox.push(QuestionOutbox {
+                    id: message_id,
+                    question_id: question.id.clone(),
+                    task_id: question.task_id.clone(),
+                    kind,
+                    text,
+                    reply,
+                });
             }
             state.operations.insert(command.operation_id, encoded);
             Ok(state.snapshot.clone())
@@ -692,9 +789,15 @@ impl QuestionController {
     }
 
     fn load(&self, connection: &Connection) -> Result<QuestionState> {
-        let encoded: Option<String> = connection.query_row("SELECT payload FROM session_question_state WHERE session_id=?1 AND format_version=?2", params![self.session_id, FORMAT_VERSION], |row| row.get(0)).optional()?;
+        let encoded: Option<(u32, String)> = connection
+            .query_row(
+                "SELECT format_version,payload FROM session_question_state WHERE session_id=?1",
+                params![self.session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
         let state: QuestionState = encoded
-            .map(|encoded| serde_json::from_str(&encoded).map_err(anyhow::Error::from))
+            .map(|(version, encoded)| decode_question_state(version, &encoded))
             .transpose()?
             .unwrap_or_default();
         let mut identities = std::collections::BTreeSet::new();
@@ -772,6 +875,155 @@ impl QuestionController {
         self.changed.send_replace(state.snapshot.revision);
         Ok(result)
     }
+}
+
+/// Restore a legacy input reply from canonical question history using a read-only connection.
+pub(crate) fn restore_input_reply(
+    root: &Path,
+    session_id: &str,
+    question_id: &QuestionId,
+    message_id: &str,
+    kind: QuestionMessageKind,
+) -> Result<forge_provider_api::QuestionReply> {
+    let connection = Connection::open_with_flags(
+        root.join("harness.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let (version, encoded): (u32, String) = connection.query_row(
+        "SELECT format_version,payload FROM session_question_state WHERE session_id=?1",
+        [session_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let state = decode_question_state(version, &encoded)?;
+    saved_reply(&state, question_id, message_id, kind)
+}
+
+/// Reconstruct one admitted reply without interpreting its old provider-rendered text.
+fn saved_reply(
+    state: &QuestionState,
+    question_id: &QuestionId,
+    message_id: &str,
+    kind: QuestionMessageKind,
+) -> Result<forge_provider_api::QuestionReply> {
+    let question = state
+        .snapshot
+        .questions
+        .iter()
+        .find(|question| question.id == *question_id)
+        .context("saved question response has no question")?;
+    let message = question
+        .discussion
+        .iter()
+        .find(|message| message.id == message_id && message.kind == kind)
+        .context("saved question response has no canonical discussion entry")?;
+    let revision = state
+        .operations
+        .get(message_id)
+        .map(|command| serde_json::from_str::<QuestionCommand>(command))
+        .transpose()?
+        .map_or(question.content.revision, |command| command.revision);
+    let content = std::iter::once(&question.content)
+        .chain(question.previous.iter())
+        .find(|content| content.revision == revision)
+        .context("saved question revision is unavailable")?;
+    let required_questions_remain = state.snapshot.questions.iter().any(|other| {
+        other.id != *question_id
+            && other.requirement == QuestionRequirement::Required
+            && other.pending()
+    });
+    let response = match kind {
+        QuestionMessageKind::Answer => forge_provider_api::QuestionReplyResponse::Answer {
+            answer: message.text.clone(),
+            required_questions_remain,
+        },
+        QuestionMessageKind::Correction => forge_provider_api::QuestionReplyResponse::Correction {
+            answer: message.text.clone(),
+            required_questions_remain,
+        },
+        QuestionMessageKind::Clarification => {
+            forge_provider_api::QuestionReplyResponse::Clarification {
+                options: content
+                    .options
+                    .iter()
+                    .map(|option| forge_provider_api::QuestionReplyOption {
+                        id: option.id.clone(),
+                        label: option.label.clone(),
+                        description: option.description.clone(),
+                        recommended: option.recommended,
+                    })
+                    .collect(),
+                text: message.text.clone(),
+                reply_to: message.reply_to.clone(),
+            }
+        }
+        QuestionMessageKind::Reply => {
+            anyhow::bail!("saved discussion reply cannot authorize provider input")
+        }
+    };
+    let reply = forge_provider_api::QuestionReply {
+        question_id: question_id.as_str().to_owned(),
+        revision,
+        message_id: message_id.to_owned(),
+        question: content.question.clone(),
+        response,
+    };
+    Ok(reply)
+}
+
+/// Rebuild older outbox entries from canonical discussion, never from their native text envelope.
+fn decode_question_state(version: u32, encoded: &str) -> Result<QuestionState> {
+    if version == FORMAT_VERSION {
+        return Ok(serde_json::from_str(encoded)?);
+    }
+    ensure!(version == 3, "unsupported question state format");
+    #[derive(Deserialize)]
+    struct LegacyOutbox {
+        id: String,
+        question_id: QuestionId,
+        task_id: Option<String>,
+        kind: QuestionMessageKind,
+    }
+    #[derive(Deserialize)]
+    struct LegacyState {
+        snapshot: QuestionSnapshot,
+        outbox: Vec<LegacyOutbox>,
+        operations: BTreeMap<String, String>,
+        chat_continuation: BTreeMap<String, ChatContinuation>,
+        cancelled_exchanges: BTreeSet<String>,
+    }
+    let legacy: LegacyState = serde_json::from_str(encoded)?;
+    let state = QuestionState {
+        snapshot: legacy.snapshot,
+        operations: legacy.operations,
+        chat_continuation: legacy.chat_continuation,
+        cancelled_exchanges: legacy.cancelled_exchanges,
+        ..QuestionState::default()
+    };
+    let outbox = legacy
+        .outbox
+        .into_iter()
+        .map(|entry| {
+            let reply = saved_reply(&state, &entry.question_id, &entry.id, entry.kind)?;
+            let text = match &reply.response {
+                forge_provider_api::QuestionReplyResponse::Answer { answer, .. }
+                | forge_provider_api::QuestionReplyResponse::Correction { answer, .. } => {
+                    answer.clone()
+                }
+                forge_provider_api::QuestionReplyResponse::Clarification { text, .. } => {
+                    text.clone()
+                }
+            };
+            Ok(QuestionOutbox {
+                id: entry.id,
+                question_id: entry.question_id,
+                task_id: entry.task_id,
+                kind: entry.kind,
+                text,
+                reply,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(QuestionState { outbox, ..state })
 }
 
 /// Release live answer destinations when a waiting tool completes or is cancelled.
@@ -897,17 +1149,17 @@ pub(crate) fn retire_task(
     if !exists {
         return Ok(());
     }
-    let payload: Option<String> = transaction
+    let payload: Option<(u32, String)> = transaction
         .query_row(
-            "SELECT payload FROM session_question_state WHERE session_id=?1 AND format_version=?2",
-            params![session_id, FORMAT_VERSION],
-            |row| row.get(0),
+            "SELECT format_version,payload FROM session_question_state WHERE session_id=?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    let Some(payload) = payload else {
+    let Some((version, payload)) = payload else {
         return Ok(());
     };
-    let mut state: QuestionState = serde_json::from_str(&payload)?;
+    let mut state = decode_question_state(version, &payload)?;
     for question in &mut state.snapshot.questions {
         if question.task_id.as_deref() == Some(task_id) && question.pending() {
             question.resolution = QuestionResolution::Retired {
@@ -924,8 +1176,8 @@ pub(crate) fn retire_task(
         .checked_add(1)
         .context("question snapshot revision exhausted")?;
     transaction.execute(
-        "UPDATE session_question_state SET payload=?2 WHERE session_id=?1",
-        params![session_id, serde_json::to_string(&state)?],
+        "UPDATE session_question_state SET payload=?2,format_version=?3 WHERE session_id=?1",
+        params![session_id, serde_json::to_string(&state)?, FORMAT_VERSION],
     )?;
     Ok(())
 }
@@ -1002,6 +1254,127 @@ pub(crate) fn project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Recover pending answers from canonical discussion without interpreting old wire envelopes.
+    #[test]
+    fn legacy_outbox_preserves_question_state_and_rebuilds_structured_reply() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let ids = controller.ask(
+            "question",
+            "exchange",
+            QuestionOrigin::Chat,
+            vec![draft(QuestionRequirement::Required)],
+        )?;
+        controller.apply(command(
+            &ids[0],
+            "clarify",
+            QuestionAction::Clarify {
+                text: "Explain the alternatives".into(),
+            },
+        ))?;
+        let original = controller.outbox()?.remove(0);
+        {
+            let connection = controller.connection.lock().unwrap();
+            let payload: String = connection.query_row(
+                "SELECT payload FROM session_question_state WHERE session_id='session'",
+                [],
+                |row| row.get(0),
+            )?;
+            let mut legacy: serde_json::Value = serde_json::from_str(&payload)?;
+            legacy["outbox"][0].as_object_mut().unwrap().remove("reply");
+            legacy["outbox"][0]["text"] = serde_json::json!("private-native-envelope-canary");
+            connection.execute("UPDATE session_question_state SET format_version=3,payload=?1 WHERE session_id='session'",
+                [serde_json::to_string(&legacy)?])?;
+        }
+        assert_eq!(controller.snapshot()?.questions.len(), 1);
+        let migrated = controller.outbox()?.remove(0);
+        assert_eq!(migrated.reply, original.reply);
+        assert_eq!(migrated.text, "Explain the alternatives");
+        let submissions = crate::provider::submission::SubmissionStore::open(
+            root.path(),
+            std::sync::Arc::new(crate::trace::TraceStore::open(root.path())?),
+        )?;
+        let queue = crate::input::SessionInputQueue::open(root.path(), "session", &submissions)?;
+        let operation: crate::input::InputOperation = serde_json::from_value(serde_json::json!({
+            "id":"question-admission", "control_revision":0, "after_control":null,
+            "action":{"kind":"submit", "message":{
+                "id":original.id, "revision":0, "text":original.text,
+                "purpose":{"kind":"question", "question_id":original.question_id,
+                    "task_id":null, "message_kind":original.kind, "reply":original.reply},
+                "attachments":[], "config":null, "intent":"queue", "delivery":"queued",
+                "route":null, "reservation":null, "submission_id":null, "error":null
+            }}
+        }))?;
+        assert!(queue.apply(operation)?.error.is_none());
+        drop(queue);
+        {
+            let connection = rusqlite::Connection::open(root.path().join("input-queue.sqlite3"))?;
+            let snapshot: String = connection.query_row(
+                "SELECT payload FROM input_session WHERE session_id='session'",
+                [],
+                |row| row.get(0),
+            )?;
+            let mut snapshot: serde_json::Value = serde_json::from_str(&snapshot)?;
+            snapshot["messages"][0]["purpose"]
+                .as_object_mut()
+                .unwrap()
+                .remove("reply");
+            snapshot["messages"][0]["text"] = serde_json::json!("private-native-envelope-canary");
+            connection.execute(
+                "UPDATE input_session SET payload=?1 WHERE session_id='session'",
+                [serde_json::to_string(&snapshot)?],
+            )?;
+            let (request, receipt): (String, String) = connection.query_row(
+                "SELECT request,payload FROM input_operation WHERE id='question-admission'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let mut request: serde_json::Value = serde_json::from_str(&request)?;
+            request["action"]["message"]["purpose"]
+                .as_object_mut()
+                .unwrap()
+                .remove("reply");
+            request["action"]["message"]["text"] =
+                serde_json::json!("private-native-envelope-canary");
+            let mut receipt: serde_json::Value = serde_json::from_str(&receipt)?;
+            receipt["upsert"][0]["purpose"]
+                .as_object_mut()
+                .unwrap()
+                .remove("reply");
+            receipt["upsert"][0]["text"] = serde_json::json!("private-native-envelope-canary");
+            connection.execute(
+                "UPDATE input_operation SET request=?1,payload=?2 WHERE id='question-admission'",
+                params![
+                    serde_json::to_string(&request)?,
+                    serde_json::to_string(&receipt)?
+                ],
+            )?;
+        }
+        // Admission has already removed the outbox in production; history must be sufficient.
+        controller.admitted(&original.id)?;
+        let queue = crate::input::SessionInputQueue::open(root.path(), "session", &submissions)?;
+        let snapshot = queue.snapshot()?;
+        assert_eq!(snapshot.messages[0].text, "Explain the alternatives");
+        let crate::input::InputPurpose::Question { reply, .. } = &snapshot.messages[0].purpose
+        else {
+            panic!("restored question purpose changed");
+        };
+        assert_eq!(reply, &original.reply);
+        let receipt = queue
+            .operation("question-admission")?
+            .expect("admission receipt remains available");
+        assert_eq!(receipt.upsert[0].text, "Explain the alternatives");
+        controller.connection.lock().unwrap().execute(
+            "UPDATE session_question_state SET format_version=99 WHERE session_id='session'",
+            [],
+        )?;
+        assert!(
+            controller.snapshot().is_err(),
+            "unknown format must not silently erase questions"
+        );
+        Ok(())
+    }
 
     /// Keep partial answers inside a waiting call and fall back to messages after cancellation.
     #[tokio::test]
@@ -1499,19 +1872,12 @@ mod tests {
         first.apply(answer.clone())?;
         second.apply(answer)?;
         assert_eq!(second.outbox()?.len(), 1);
-        let delivered = &second.outbox()?[0].text;
-        let payload = delivered
-            .strip_prefix("<send_user_message_question_reply>\n")
-            .and_then(|text| text.strip_suffix("\n</send_user_message_question_reply>"))
-            .context("answer must use the native Codex envelope without extra instructions")?;
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(payload)?,
-            serde_json::json!([{
-                "answer": "Tabs \"wide\"\nwith details",
-                "question": "Which layout?",
-                "questionItemId": id.as_str(),
-            }])
-        );
+        let delivered = &second.outbox()?[0].reply;
+        assert_eq!(delivered.question_id, id.as_str());
+        assert_eq!(delivered.question, "Which layout?");
+        assert!(matches!(&delivered.response,
+            forge_provider_api::QuestionReplyResponse::Answer { answer, required_questions_remain: false }
+                if answer == "Tabs \"wide\"\nwith details"));
         first.admitted("answer")?;
         assert!(second.outbox()?.is_empty());
         assert!(matches!(
@@ -1526,19 +1892,12 @@ mod tests {
             },
         ))?;
         assert_eq!(second.snapshot()?.questions[0].discussion.len(), 2);
-        let delivered = &second.outbox()?[0].text;
-        let payload = delivered
-            .strip_prefix("<send_user_message_question_reply>\n")
-            .and_then(|text| text.strip_suffix("\n</send_user_message_question_reply>"))
-            .context("correction must use the native Codex envelope without extra instructions")?;
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(payload)?,
-            serde_json::json!([{
-                "answer": "Use a sidebar instead",
-                "question": "Which layout?",
-                "questionItemId": id.as_str(),
-            }])
-        );
+        let delivered = &second.outbox()?[0].reply;
+        assert_eq!(delivered.question_id, id.as_str());
+        assert_eq!(delivered.question, "Which layout?");
+        assert!(matches!(&delivered.response,
+            forge_provider_api::QuestionReplyResponse::Correction { answer, required_questions_remain: false }
+                if answer == "Use a sidebar instead"));
         assert!(matches!(
             second.snapshot()?.questions[0].resolution,
             QuestionResolution::Answered { .. }

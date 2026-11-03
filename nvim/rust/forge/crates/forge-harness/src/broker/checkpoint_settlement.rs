@@ -144,7 +144,8 @@ impl HarnessBroker {
                 anyhow::ensure!(
                     scope.owner.session_id.as_str() == self.session.id
                         && scope.owner.agent_id.as_str() == interaction.agent_id
-                        && scope.exchange_id == interaction.id,
+                        && scope.exchange_id
+                            == forge_provider_api::ExchangeId::from(interaction.id.as_str()),
                     "checkpoint capture crosses invocation ownership"
                 );
                 anyhow::ensure!(

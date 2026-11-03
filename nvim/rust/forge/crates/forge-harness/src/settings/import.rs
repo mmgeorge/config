@@ -401,8 +401,10 @@ fn sanitize_server(name: &str, source: &Value, file: &Path, pointer: &str) -> Re
     );
     if let Some(tools) = source.get("tools") {
         ensure!(
-            tools == &json!(["*"]),
-            "MCP tool selection cannot transfer through ACP"
+            tools.as_array().is_some_and(|tools| tools
+                .iter()
+                .all(|tool| { tool.as_str().is_some_and(|name| !name.trim().is_empty()) })),
+            "MCP tools must be a list of nonempty names"
         );
     }
     if let Some(targets) = source.get("targets") {
@@ -430,6 +432,9 @@ fn sanitize_server(name: &str, source: &Value, file: &Path, pointer: &str) -> Re
     );
     let mut definition =
         json!({"type":transport,"native_definition":{"source":file,"pointer":pointer}});
+    if let Some(tools) = source.get("tools") {
+        definition["tools"] = tools.clone();
+    }
     if transport == "stdio" {
         let command = source["command"]
             .as_str()
@@ -604,10 +609,9 @@ mod test {
             .unwrap();
         let selected = preview.select(&preview.fingerprint, std::slice::from_ref(&secret.id))?;
         assert!(!serde_json::to_string(&selected)?.contains("private-value"));
-        assert_eq!(
-            selected[0].server()?.unwrap().native()?["env"]["TOKEN"],
-            "private-value"
-        );
+        assert!(matches!(selected[0].server()?.unwrap().launch()?.transport,
+            forge_provider_api::session::McpTransport::Stdio { environment, .. }
+                if environment.get("TOKEN").map(String::as_str) == Some("private-value")));
         let invalid = preview
             .candidate
             .iter()
@@ -647,7 +651,7 @@ mod test {
             SettingScope::Workspace,
             &workspace,
             "session",
-            "claude",
+            "fixture-gamma",
         )?;
         let id = preview.candidate[0].id.clone();
         let selected = preview.select(&preview.fingerprint, std::slice::from_ref(&id))?;
@@ -697,11 +701,16 @@ mod test {
         );
         assert!(
             store
-                .catalog("another-workspace", "session", "claude")?
+                .catalog("another-workspace", "session", "fixture-gamma")?
                 .server
                 .is_empty()
         );
-        for provider in ["codex", "copilot", "claude", "antigravity"] {
+        for provider in [
+            "fixture-alpha",
+            "fixture-beta",
+            "fixture-gamma",
+            "fixture-delta",
+        ] {
             let snapshot = store.catalog(&workspace, "session", provider)?;
             assert_eq!(snapshot.server.len(), 1);
             assert_eq!(
@@ -723,7 +732,7 @@ mod test {
                     .is_empty()
             );
         }
-        let mut desired = store.get(&workspace, "session", "claude")?.desired;
+        let mut desired = store.get(&workspace, "session", "fixture-gamma")?.desired;
         desired.mcp.insert(id, true);
         store.update(1, SettingScope::Workspace, &workspace, "session", &desired)?;
         let request = crate::provider::ProviderCatalogRequest {
@@ -734,8 +743,10 @@ mod test {
             approval_mode: crate::session::ApprovalMode::Ask,
             provider_session_id: None,
         };
-        let launched = SessionResources::load(root.path(), &request, "antigravity", "test")?;
-        assert_eq!(launched.launch[0].1["env"]["TOKEN"], "native-token-fixture");
+        let launched = SessionResources::load(root.path(), &request, "fixture-delta", "test")?;
+        assert!(matches!(&launched.launch[0].transport,
+            forge_provider_api::session::McpTransport::Stdio { environment, .. }
+                if environment.get("TOKEN").map(String::as_str) == Some("native-token-fixture")));
         assert_eq!(
             launched.mcp[0].scope,
             Some(crate::provider::ResourceScope::Workspace)
@@ -773,7 +784,8 @@ mod test {
         assert_eq!(preview.candidate.len(), 2049);
         assert!(serde_json::to_vec(&preview)?.len() > 256 * 1024);
         let selected = preview.select(&preview.fingerprint, &[preview.candidate[0].id.clone()])?;
-        assert_eq!(selected[0].server()?.unwrap().native()?["command"], "node");
+        assert!(matches!(selected[0].server()?.unwrap().launch()?.transport,
+            forge_provider_api::session::McpTransport::Stdio { command, .. } if command == "node"));
         Ok(())
     }
 
@@ -797,7 +809,7 @@ mod test {
             SettingScope::Global,
             "workspace",
             "session",
-            "claude",
+            "fixture-gamma",
         )?;
         let selected = preview.select(&preview.fingerprint, &[preview.candidate[0].id.clone()])?;
         store.import_operation(
@@ -811,7 +823,7 @@ mod test {
             "skill-import",
             &json!({"fingerprint":preview.fingerprint}),
         )?;
-        let snapshot = store.catalog("another-workspace", "another-session", "antigravity")?;
+        let snapshot = store.catalog("another-workspace", "another-session", "fixture-delta")?;
         assert_eq!(snapshot.skill[0].name, "imported-skill");
         assert_eq!(
             snapshot.skill[0].scope,
@@ -829,7 +841,7 @@ mod test {
             SettingScope::Workspace,
             "workspace",
             "session",
-            "claude",
+            "fixture-gamma",
         )?;
         let selected = preview.select(&preview.fingerprint, &[preview.candidate[0].id.clone()])?;
         store.import_operation(
@@ -875,11 +887,15 @@ mod test {
         let preview = NativeImport::read(ImportKind::Mcp, &source, "global", root.path())?;
         let selected = preview.select(&preview.fingerprint, &[preview.candidate[0].id.clone()])?;
         let server = selected[0].server()?.unwrap();
-        assert_eq!(server.native()?["env"]["TOKEN"], "literal$token");
+        assert!(matches!(server.launch()?.transport,
+            forge_provider_api::session::McpTransport::Stdio { environment, .. }
+                if environment.get("TOKEN").map(String::as_str) == Some("literal$token")));
         write(
             json!({"command":"node","args":["fixture.js"],"env":{"TOKEN":"rotated$token"},"tools":["*"]}),
         )?;
-        assert_eq!(server.native()?["env"]["TOKEN"], "rotated$token");
+        assert!(matches!(server.launch()?.transport,
+            forge_provider_api::session::McpTransport::Stdio { environment, .. }
+                if environment.get("TOKEN").map(String::as_str) == Some("rotated$token")));
         for key in [
             "enabled_tools",
             "disabled_tools",
@@ -894,18 +910,25 @@ mod test {
             let blocked = NativeImport::read(ImportKind::Mcp, &source, "global", root.path())?;
             let reason = blocked.candidate[0].blocked.as_ref().unwrap();
             assert!(reason.contains(key) && !reason.contains("PRIVATE_POLICY_VALUE"));
-            assert!(server.native().is_err());
+            assert!(server.launch().is_err());
         }
         write(json!({"command":"node","tools":["only-this-tool"]}))?;
-        assert!(
-            NativeImport::read(ImportKind::Mcp, &source, "global", root.path())?.candidate[0]
-                .blocked
-                .is_some()
+        let restricted = NativeImport::read(ImportKind::Mcp, &source, "global", root.path())?;
+        assert!(restricted.candidate[0].blocked.is_none());
+        let selection = restricted.select(
+            &restricted.fingerprint,
+            &[restricted.candidate[0].id.clone()],
+        )?;
+        assert_eq!(
+            selection[0].server()?.unwrap().launch()?.tools,
+            Some(forge_provider_api::session::McpToolSelection::from_names(
+                vec!["only-this-tool".into()]
+            )?)
         );
         write(
             json!({"command":"another-program","args":["fixture.js"],"env":{"TOKEN":"rotated$token"}}),
         )?;
-        assert!(server.native().is_err());
+        assert!(server.launch().is_err());
         let workspace = root.path().to_string_lossy().into_owned();
         let project_path = if cfg!(windows) {
             workspace.to_uppercase().replace('\\', "/")
@@ -914,13 +937,13 @@ mod test {
         };
         std::fs::write(&source, json!({"projects":{project_path:{"mcpServers":{"fixture":{"command":"project-command"}}}}}).to_string())?;
         let project = NativeImport::read(ImportKind::Mcp, &source, "global", root.path())?;
-        assert_eq!(
+        assert!(matches!(
             project.select(&project.fingerprint, &[project.candidate[0].id.clone()])?[0]
                 .server()?
                 .unwrap()
-                .native()?["command"],
-            "project-command"
-        );
+                .launch()?.transport,
+            forge_provider_api::session::McpTransport::Stdio { command, .. } if command == "project-command"
+        ));
         Ok(())
     }
 }

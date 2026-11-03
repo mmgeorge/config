@@ -1090,8 +1090,11 @@ mod test {
                 update: ToolUpdate::Finished {
                     outcome: ToolOutcome::Failed {
                         diagnostic: ToolDiagnostic {
-                            code: None,
-                            message: "Patch context did not match".into(),
+                            kind: forge_provider_api::ProviderFailureKind::Unknown,
+                            message: forge_provider_api::SanitizedMessage::new(
+                                "Patch context did not match",
+                            )
+                            .expect("host diagnostic is nonempty"),
                         },
                     },
                 },

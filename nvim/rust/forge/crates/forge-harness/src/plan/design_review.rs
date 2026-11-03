@@ -3318,7 +3318,7 @@ mod tests {
                 .iter()
                 .position(|block| block.id == endpoint.block)
                 .unwrap();
-            assert!(end_index + usize::from(endpoint.position.row > 0) <= tests_start - 1);
+            assert!(end_index + usize::from(endpoint.position.row > 0) < tests_start);
             for expected in ["new_case", "changed_case", "old_case", "existing_case"] {
                 assert!(rows.contains(&expected));
             }

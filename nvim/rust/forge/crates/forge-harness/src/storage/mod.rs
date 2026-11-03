@@ -1432,45 +1432,51 @@ mod test {
         let temporary = tempfile::tempdir()?;
         let mut store = SqliteStore::open(temporary.path())?;
         assert_eq!(
-            store.latest_resolved_default_model("D:/work", "copilot")?,
+            store.latest_resolved_default_model("D:/work", "fixture-beta")?,
             None
         );
         for (ordinal, (id, workspace, provider, model, resolved)) in [
             (
                 "older",
                 "D:/work",
-                "copilot",
+                "fixture-beta",
                 "default",
                 Some("older-default"),
             ),
             (
                 "latest",
                 "D:/work",
-                "copilot",
+                "fixture-beta",
                 "default",
                 Some("latest-default"),
             ),
-            ("explicit", "D:/work", "copilot", "chosen", Some("chosen")),
-            ("empty", "D:/work", "copilot", "default", Some("")),
-            ("unresolved", "D:/work", "copilot", "default", None),
+            (
+                "explicit",
+                "D:/work",
+                "fixture-beta",
+                "chosen",
+                Some("chosen"),
+            ),
+            ("empty", "D:/work", "fixture-beta", "default", Some("")),
+            ("unresolved", "D:/work", "fixture-beta", "default", None),
             (
                 "workspace",
                 "D:/elsewhere",
-                "copilot",
+                "fixture-beta",
                 "default",
                 Some("workspace-default"),
             ),
             (
                 "provider",
                 "D:/work",
-                "codex",
+                "fixture-alpha",
                 "default",
-                Some("codex-default"),
+                Some("fixture-alpha-default"),
             ),
             (
                 "incompatible",
                 "D:/work",
-                "copilot",
+                "fixture-beta",
                 "default",
                 Some("obsolete"),
             ),
@@ -1493,24 +1499,24 @@ mod test {
         let store = SqliteStore::open(temporary.path())?;
         assert_eq!(
             store
-                .latest_resolved_default_model("D:/work", "copilot")?
+                .latest_resolved_default_model("D:/work", "fixture-beta")?
                 .as_deref(),
             Some("latest-default")
         );
         assert_eq!(
             store
-                .latest_resolved_default_model("D:/work", "codex")?
+                .latest_resolved_default_model("D:/work", "fixture-alpha")?
                 .as_deref(),
-            Some("codex-default")
+            Some("fixture-alpha-default")
         );
         assert_eq!(
             store
-                .latest_resolved_default_model("D:/elsewhere", "copilot")?
+                .latest_resolved_default_model("D:/elsewhere", "fixture-beta")?
                 .as_deref(),
             Some("workspace-default")
         );
         assert_eq!(
-            store.latest_resolved_default_model("D:/missing", "copilot")?,
+            store.latest_resolved_default_model("D:/missing", "fixture-beta")?,
             None
         );
         Ok(())
@@ -1872,12 +1878,12 @@ mod test {
             primary_agent_id: HarnessSession::primary_agent_id(id),
             name: id.into(),
             workspace: workspace.into(),
-            provider: "copilot".into(),
+            provider: "fixture-beta".into(),
             provider_session_id: None,
             provider_checkpoint_id: None,
             provider_fork_state: crate::session::ProviderForkState::Ready,
             model: "default".into(),
-            provider_label: "Copilot CLI".into(),
+            provider_label: "Fixture Beta".into(),
             resolved_model: None,
             effort: "medium".into(),
             plan_executor: Default::default(),
@@ -2228,7 +2234,7 @@ mod test {
             tool_timeout: Default::default(),
         };
         store
-            .save_preference("D:/work", "codex", &preference)
+            .save_preference("D:/work", "fixture-alpha", &preference)
             .unwrap();
         store
             .connection
@@ -2293,7 +2299,7 @@ mod test {
         );
         assert_eq!(
             store
-                .load_preference("D:/work", "codex")
+                .load_preference("D:/work", "fixture-alpha")
                 .unwrap()
                 .unwrap()
                 .model,
@@ -2330,14 +2336,19 @@ mod test {
         ] {
             let encoded = encode(&payload).unwrap();
             store.connection.execute(
-                "INSERT INTO preference_record(workspace,backend,payload) VALUES(?1,'codex',?2)",
+                "INSERT INTO preference_record(workspace,backend,payload) VALUES(?1,'fixture-alpha',?2)",
                 params![workspace, encoded],
             ).unwrap();
-            assert!(store.load_preference(workspace, "codex").unwrap().is_none());
+            assert!(
+                store
+                    .load_preference(workspace, "fixture-alpha")
+                    .unwrap()
+                    .is_none()
+            );
             let retained: String = store
                 .connection
                 .query_row(
-                    "SELECT payload FROM preference_record WHERE workspace=?1 AND backend='codex'",
+                    "SELECT payload FROM preference_record WHERE workspace=?1 AND backend='fixture-alpha'",
                     [workspace],
                     |row| row.get(0),
                 )
@@ -2345,13 +2356,13 @@ mod test {
             assert_eq!(retained, encoded);
         }
         store.connection.execute(
-            "INSERT INTO preference_record(workspace,backend,payload) VALUES('current','codex',?1)",
+            "INSERT INTO preference_record(workspace,backend,payload) VALUES('current','fixture-alpha',?1)",
             [encode(&serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION,
                 "preference": {"model":"current-model", "effort":"high"}})).unwrap()],
         ).unwrap();
         assert_eq!(
             store
-                .load_preference("current", "codex")
+                .load_preference("current", "fixture-alpha")
                 .unwrap()
                 .unwrap()
                 .model,
@@ -2383,13 +2394,13 @@ mod test {
             },
         }))?;
         store.connection.execute(
-            "INSERT INTO preference_record(workspace, backend, payload) VALUES('D:/work', 'codex', ?1)",
+            "INSERT INTO preference_record(workspace, backend, payload) VALUES('D:/work', 'fixture-alpha', ?1)",
             [&obsolete_preference],
         )?;
         store.save_session(&session("current-access", "D:/work"))?;
 
         assert!(store.load_session("obsolete-access")?.is_none());
-        assert!(store.load_preference("D:/work", "codex")?.is_none());
+        assert!(store.load_preference("D:/work", "fixture-alpha")?.is_none());
         assert_eq!(store.list_session(Some("D:/work"))?.len(), 1);
         assert!(store.load_session("current-access")?.is_some());
         let retained: String = store.connection.query_row(
@@ -2399,7 +2410,7 @@ mod test {
         )?;
         assert_eq!(retained, encoded);
         let retained_preference: String = store.connection.query_row(
-            "SELECT payload FROM preference_record WHERE workspace='D:/work' AND backend='codex'",
+            "SELECT payload FROM preference_record WHERE workspace='D:/work' AND backend='fixture-alpha'",
             [],
             |row| row.get(0),
         )?;

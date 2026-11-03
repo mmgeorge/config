@@ -61,6 +61,7 @@ impl SessionController {
                             question_id: message.question_id,
                             task_id: message.task_id,
                             message_kind: message.kind,
+                            reply: message.reply,
                         },
                         attachments: Vec::new(),
                         config: None,
@@ -462,10 +463,7 @@ impl SessionController {
             Ok(guard) => guard,
             Err(_) => {
                 self.task_controller.mark_native_goal_uncertain();
-                let error = anyhow::Error::new(crate::provider::ProviderError::DeliveryUncertain {
-                    message: "native goal transport lane timed out; provider outcome is uncertain"
-                        .into(),
-                });
+                let error = anyhow::Error::new(crate::provider::ProviderError::DeliveryUncertain);
                 return Err(match registry.fence(&owner).await {
                     Ok(()) => error,
                     Err(cleanup) => error.context(cleanup),
@@ -522,16 +520,12 @@ impl SessionController {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(error)) => {
                     self.task_controller.mark_native_goal_uncertain();
-                    Err(error.context(crate::provider::ProviderError::DeliveryUncertain { message: "native goal synchronization failed after dispatch; provider outcome is uncertain".into() }))
+                    Err(anyhow::Error::new(error)
+                        .context(crate::provider::ProviderError::DeliveryUncertain))
                 }
                 Err(_) => {
                     self.task_controller.mark_native_goal_uncertain();
-                    Err(crate::provider::ProviderError::DeliveryUncertain {
-                        message:
-                            "native goal synchronization timed out; provider outcome is uncertain"
-                                .into(),
-                    }
-                    .into())
+                    Err(crate::provider::ProviderError::DeliveryUncertain.into())
                 }
             };
             let epoch = match self.task_controller.native_goal_written() {
@@ -554,9 +548,7 @@ impl SessionController {
             if !Arc::ptr_eq(&provider, &self.provider_handle()) {
                 self.task_controller.mark_native_goal_uncertain();
                 drop(_lane);
-                let error = anyhow::Error::new(crate::provider::ProviderError::DeliveryUncertain {
-                    message: "provider changed during native goal transport".into(),
-                });
+                let error = anyhow::Error::new(crate::provider::ProviderError::DeliveryUncertain);
                 return Err(match registry.fence(&owner).await {
                     Ok(()) => error,
                     Err(cleanup) => error.context(cleanup),
@@ -1485,8 +1477,17 @@ impl SessionController {
             .await?;
             return Ok(());
         }
-        let input = crate::provider::ProviderInput::from_text(message.text.clone())
-            .with_attachments(attachments.clone());
+        let input = match &message.purpose {
+            crate::input::InputPurpose::Question { reply, .. } => {
+                crate::provider::ProviderInput::QuestionReply {
+                    context: String::new(),
+                    reply: reply.clone(),
+                    attachments: attachments.clone(),
+                }
+            }
+            _ => crate::provider::ProviderInput::from_text(message.text.clone())
+                .with_attachments(attachments.clone()),
+        };
         let provider = self.provider_handle().descriptor().kind;
         let message_id = message.id.clone();
         let task_input_id = match &message.purpose {
@@ -1589,6 +1590,16 @@ impl SessionController {
                 if let crate::input::InputPurpose::TaskEntry { start, .. } = &message.purpose {
                     crate::provider::SteeringInput::TaskEntry {
                         start: start.clone(),
+                        goal: self.task_controller.current()?.and_then(|task| {
+                            match &task.workflow {
+                                crate::task::WorkflowSnapshot::Goal { goal } if goal.native => {
+                                    Some(forge_provider_api::NativeGoalCommand::Set {
+                                        objective: goal.objective.clone(),
+                                    })
+                                }
+                                _ => None,
+                            }
+                        }),
                         text: message.text.clone(),
                         submission: submission.clone(),
                     }

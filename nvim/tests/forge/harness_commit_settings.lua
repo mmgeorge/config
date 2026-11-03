@@ -2,13 +2,15 @@ vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
 vim.o.columns, vim.o.lines = 130, 50
 require("forge").setup({ harness = { provider = "mock" } })
 local client = require("forge.client")
+dofile("nvim/tests/forge/support/provider_catalog.lua").install()
+client.generation_config = function(callback, selection) callback(client.generation_get_config(selection)) end
 local store = require("forge.integrations.background_settings")
 local settings = require("forge.views.harness.settings")
 local picker = require("forge.views.picker")
 local fail_save = false
 local revision = 0
 local preferences = { auto_compaction = { enabled = true, threshold_tokens = 128000 }, models = {
-  codex = { model = "gpt-6-luna", thinking = "low" },
+  fixture_alpha = { model = "gpt-6-luna", thinking = "low" },
 } }
 local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
@@ -30,7 +32,7 @@ client.request = function(request_specification, callback)
   })
   else error("Commit settings used a conversation mutation: " .. method) end
 end
-local state = { session = { id = "background-config", provider = "codex", model = "chat-model", effort = "high", service_tier = "default" },
+local state = { session = { id = "background-config", provider = "fixture_alpha", model = "chat-model", effort = "high", service_tier = "default" },
   capability = { os_sandbox = true, fast_mode = true, ultrafast_mode = true } }
 local host = { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() }
 local function open()
@@ -51,13 +53,13 @@ open()
 assert(option("background-model").value:find("gpt-6-luna", 1, true))
 assert(not pcall(option, "background-provider"), "provider selector should be removed")
 change("background-thinking")
-assert(preferences.models.codex.thinking == "medium")
+assert(preferences.models.fixture_alpha.thinking == "medium")
 change("background-speed")
-assert(preferences.models.codex.service_tier == "fast")
+assert(preferences.models.fixture_alpha.service_tier == "fast")
 change("background-speed")
-assert(preferences.models.codex.service_tier == "default", "Luna must not offer ultrafast")
+assert(preferences.models.fixture_alpha.service_tier == "default", "Luna must not offer ultrafast")
 change("background-speed")
-assert(preferences.models.codex.service_tier == "fast")
+assert(preferences.models.fixture_alpha.service_tier == "fast")
 change("background-compact")
 assert(not preferences.auto_compaction.enabled)
 for index, expected in ipairs({ 64000, 128000, 256000, 512000 }) do
@@ -78,17 +80,17 @@ end
 picker._state_for_test().spec.on_field_action({ field = option("background-model") }, "activate", 1)
 local model_picker = picker._state_for_test()
 model_picker.spec.on_confirm({ option = { value = { id = "second-model", picker_reasoning = "high" } } })
-assert(preferences.models.codex.model == "second-model" and preferences.models.codex.thinking == "high")
-assert(preferences.models.codex.service_tier == "fast", "model change lost valid Background speed")
+assert(preferences.models.fixture_alpha.model == "second-model" and preferences.models.fixture_alpha.thinking == "high")
+assert(preferences.models.fixture_alpha.service_tier == "fast", "model change lost valid Background speed")
 change("background-speed")
-assert(preferences.models.codex.service_tier == "ultrafast")
+assert(preferences.models.fixture_alpha.service_tier == "ultrafast")
 assert(picker.is_open("harness-config"), "model selection did not return to config")
 fail_save = true
 change("background-thinking")
 assert(errors[#errors] == "database denied", "save failure was silent")
-assert(preferences.models.codex.thinking == "high", "failed save replaced prior settings")
+assert(preferences.models.fixture_alpha.thinking == "high", "failed save replaced prior settings")
 change("background-speed")
-assert(preferences.models.codex.service_tier == "ultrafast", "failed save replaced Background speed")
+assert(preferences.models.fixture_alpha.service_tier == "ultrafast", "failed save replaced Background speed")
 assert(state.session.model == "chat-model" and state.session.effort == "high", "commit config changed the active chat")
 assert(state.session.service_tier == "default", "Background speed changed the active chat")
 picker.close()

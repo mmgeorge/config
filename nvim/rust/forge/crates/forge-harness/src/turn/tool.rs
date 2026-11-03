@@ -31,6 +31,8 @@ pub struct ToolCall {
     /// Retain the adapter-selected shell for command rendering across platforms.
     pub command_shell: Option<String>,
     pub output: super::ToolOutputText,
+    /// Canonical display status; legacy spellings are accepted only while loading saved history.
+    #[serde(deserialize_with = "read_legacy_status")]
     pub status: String,
     pub failed: bool,
     #[serde(default)]
@@ -47,13 +49,13 @@ impl ToolCall {
         Some(end.saturating_sub(start).max(0) as u64)
     }
 
-    /// Resolve the provider status into a stable execution state.
+    /// Read the canonical projection produced from normalized tool outcomes.
     pub fn state(&self) -> ToolState {
-        match self.status.to_ascii_lowercase().as_str() {
-            "completed" | "complete" | "success" | "succeeded" => ToolState::Completed,
-            "failed" | "error" => ToolState::Failed,
-            "denied" | "declined" | "rejected" => ToolState::Denied,
-            "cancelled" | "canceled" => ToolState::Cancelled,
+        match self.status.as_str() {
+            "completed" => ToolState::Completed,
+            "failed" => ToolState::Failed,
+            "denied" => ToolState::Denied,
+            "cancelled" => ToolState::Cancelled,
             "interrupted" => ToolState::Interrupted,
             _ => ToolState::Running,
         }
@@ -126,8 +128,11 @@ impl ToolStore {
                     execution.outcome = Some(match outcome {
                         super::TurnOutcome::Failed => ToolOutcome::Failed {
                             diagnostic: crate::provider::ToolDiagnostic {
-                                code: None,
-                                message: "provider execution failed before tool completion".into(),
+                                kind: forge_provider_api::ProviderFailureKind::Unknown,
+                                message: forge_provider_api::SanitizedMessage::new(
+                                    "Provider execution failed before tool completion",
+                                )
+                                .expect("static diagnostic is nonempty"),
                             },
                         },
                         super::TurnOutcome::Cancelled => ToolOutcome::Cancelled,
@@ -188,8 +193,11 @@ impl ToolStore {
         now_ms: i64,
     ) -> Result<(), crate::provider::ProviderError> {
         let id = address.tool_id.as_str();
-        let protocol = |message: &str| crate::provider::ProviderError::Protocol {
-            message: message.into(),
+        let protocol = |_message: &str| {
+            crate::provider::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::CollectEventReader,
+                forge_provider_api::ProviderFailureKind::Protocol,
+            ))
         };
         if !self.execution.contains_key(id) {
             let ToolUpdate::Requested { invocation } = update else {
@@ -324,12 +332,59 @@ fn tool_kind(kind: crate::provider::ToolActivityKind) -> String {
 }
 
 fn tool_failed(status: &str) -> bool {
-    matches!(status.to_ascii_lowercase().as_str(), "failed" | "error")
+    status == "failed"
+}
+
+/// Migrate historical projection values once at the storage boundary.
+fn read_legacy_status<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let status = String::deserialize(deserializer)?;
+    let canonical = match status.to_ascii_lowercase().as_str() {
+        "running" | "pending" | "in_progress" => "running",
+        "completed" | "complete" | "success" | "succeeded" => "completed",
+        "failed" | "error" => "failed",
+        "denied" | "declined" | "rejected" => "denied",
+        "cancelled" | "canceled" => "cancelled",
+        "interrupted" => "interrupted",
+        _ => return Err(serde::de::Error::custom("unknown saved tool status")),
+    };
+    Ok(canonical.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Old status aliases are normalized while loading, before the live reducer sees them.
+    #[test]
+    fn saved_tool_status_aliases_migrate_to_canonical_projection() {
+        let tool = ToolCall {
+            started_at_ms: None,
+            completed_at_ms: None,
+            checklist_item_id: None,
+            id: "fixture-tool".into(),
+            kind: "tool_call".into(),
+            title: "Fixture".into(),
+            command_shell: None,
+            output: Default::default(),
+            status: "running".into(),
+            failed: false,
+            change: Default::default(),
+        };
+        for (old, canonical) in [
+            ("success", "completed"),
+            ("error", "failed"),
+            ("declined", "denied"),
+            ("canceled", "cancelled"),
+        ] {
+            let mut saved = serde_json::to_value(&tool).unwrap();
+            saved["status"] = serde_json::json!(old);
+            let restored: ToolCall = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored.status, canonical);
+            assert_eq!(serde_json::to_value(restored).unwrap()["status"], canonical);
+        }
+    }
 
     /// Preserve proven background work only across normal foreground completion.
     #[test]
@@ -556,7 +611,10 @@ mod tests {
             &address,
             &ToolUpdate::Finished {
                 outcome: ToolOutcome::Denied {
-                    reason: "workspace policy".into(),
+                    reason: forge_provider_api::diagnostic::SanitizedMessage::new(
+                        "workspace policy",
+                    )
+                    .expect("static denial is nonempty"),
                 },
             },
             13,
@@ -607,7 +665,7 @@ mod tests {
         assert_eq!(execution.input, "complete");
         assert_eq!(execution.invocation.arguments["path"], "source.rs");
         assert!(matches!(&execution.outcome,
-            Some(ToolOutcome::Denied { reason }) if reason == "workspace policy"));
+            Some(ToolOutcome::Denied { reason }) if reason.as_str() == "workspace policy"));
         Ok(())
     }
 
@@ -625,7 +683,10 @@ mod tests {
         ] {
             assert!(!tool_failed(status), "{status}");
         }
-        assert!(tool_failed("error"));
+        assert!(
+            !tool_failed("error"),
+            "live projections accept only normalized status"
+        );
         assert!(tool_failed("failed"));
         let mut store = ToolStore::default();
         let address = ToolAddress {

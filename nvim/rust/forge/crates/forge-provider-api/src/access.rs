@@ -1,6 +1,49 @@
-use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+
+/// Identify the configured directory list that failed validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AccessDirectoryKind {
+    Readable,
+    Writable,
+}
+
+impl std::fmt::Display for AccessDirectoryKind {
+    /// Render the directory-list role in a configuration diagnostic.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Readable => "readable",
+            Self::Writable => "writable",
+        })
+    }
+}
+
+/// Preserve the directory and validation category without erasing filesystem causes.
+#[derive(Debug, thiserror::Error)]
+pub enum AccessPolicyError {
+    #[error("{kind} directory must be absolute: {path}")]
+    NotAbsolute {
+        kind: AccessDirectoryKind,
+        path: String,
+    },
+    #[error("{kind} directory does not exist: {path}")]
+    NotDirectory {
+        kind: AccessDirectoryKind,
+        path: String,
+    },
+    #[error("resolve {kind} directory: {path}")]
+    Canonicalize {
+        kind: AccessDirectoryKind,
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("duplicate {kind} directory: {path}")]
+    Duplicate {
+        kind: AccessDirectoryKind,
+        path: String,
+    },
+}
 
 /// Controls file authorization and provider isolation independently of approval mode.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -53,25 +96,33 @@ pub enum WriteScope {
 
 impl AccessPolicy {
     /// Resolve existing directories before admitting a configuration change.
-    pub fn validate(mut self) -> Result<Self> {
-        for (label, directories) in [
-            ("readable", &mut self.readable_directory),
-            ("writable", &mut self.writable_directory),
+    pub fn validate(mut self) -> Result<Self, AccessPolicyError> {
+        for (kind, directories) in [
+            (AccessDirectoryKind::Readable, &mut self.readable_directory),
+            (AccessDirectoryKind::Writable, &mut self.writable_directory),
         ] {
             let mut normalized = Vec::new();
             for directory in directories.iter() {
                 let path = Path::new(directory.trim());
-                ensure!(
-                    path.is_absolute(),
-                    "{label} directory must be absolute: {directory}"
-                );
-                ensure!(
-                    path.is_dir(),
-                    "{label} directory does not exist: {directory}"
-                );
-                let canonical = path
-                    .canonicalize()
-                    .with_context(|| format!("resolve {label} directory: {directory}"))?;
+                if !path.is_absolute() {
+                    return Err(AccessPolicyError::NotAbsolute {
+                        kind,
+                        path: directory.clone(),
+                    });
+                }
+                if !path.is_dir() {
+                    return Err(AccessPolicyError::NotDirectory {
+                        kind,
+                        path: directory.clone(),
+                    });
+                }
+                let canonical =
+                    path.canonicalize()
+                        .map_err(|source| AccessPolicyError::Canonicalize {
+                            kind,
+                            path: directory.clone(),
+                            source,
+                        })?;
                 let canonical = canonical.to_string_lossy().replace('\\', "/");
                 let canonical = canonical
                     .strip_prefix("//?/UNC/")
@@ -82,14 +133,18 @@ impl AccessPolicy {
                             .unwrap_or(&canonical)
                             .to_owned()
                     });
-                ensure!(
-                    !normalized.iter().any(|existing: &String| if cfg!(windows) {
+                if normalized.iter().any(|existing: &String| {
+                    if cfg!(windows) {
                         existing.eq_ignore_ascii_case(&canonical)
                     } else {
                         existing == &canonical
-                    }),
-                    "duplicate {label} directory: {directory}"
-                );
+                    }
+                }) {
+                    return Err(AccessPolicyError::Duplicate {
+                        kind,
+                        path: directory.clone(),
+                    });
+                }
                 normalized.push(canonical);
             }
             *directories = normalized;
@@ -148,30 +203,6 @@ impl AccessPolicy {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn validates_and_deduplicates_directory_identity() -> Result<()> {
-        let directory = tempfile::tempdir()?;
-        let path = directory.path().to_string_lossy().into_owned();
-        let policy = AccessPolicy {
-            writable_directory: vec![path.clone()],
-            ..Default::default()
-        };
-        let policy = policy.validate()?;
-        assert_eq!(policy.writable_roots("/workspace").len(), 2);
-        let mut duplicate = policy.clone();
-        duplicate.writable_directory.push(path);
-        assert!(duplicate.validate().is_err());
-        let mut relative = policy;
-        relative.writable_directory = vec!["relative".into()];
-        assert!(relative.validate().is_err());
-        Ok(())
-    }
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DirectoryOperation {
@@ -183,4 +214,40 @@ pub enum DirectoryOperation {
 pub struct DirectoryGrant {
     pub operation: DirectoryOperation,
     pub path: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_and_deduplicates_directory_identity() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().to_string_lossy().into_owned();
+        let policy = AccessPolicy {
+            writable_directory: vec![path.clone()],
+            ..Default::default()
+        };
+        let policy = policy.validate()?;
+        assert_eq!(policy.writable_roots("/workspace").len(), 2);
+        let mut duplicate = policy.clone();
+        duplicate.writable_directory.push(path);
+        assert!(matches!(
+            duplicate.validate(),
+            Err(AccessPolicyError::Duplicate {
+                kind: AccessDirectoryKind::Writable,
+                ..
+            })
+        ));
+        let mut relative = policy;
+        relative.writable_directory = vec!["relative".into()];
+        assert!(matches!(
+            relative.validate(),
+            Err(AccessPolicyError::NotAbsolute {
+                kind: AccessDirectoryKind::Writable,
+                ..
+            })
+        ));
+        Ok(())
+    }
 }

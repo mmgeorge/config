@@ -2,7 +2,6 @@ use super::runtime::ControlToolRuntime;
 use super::{ControlToolInvocation, ControlToolResult, ControlTurnContext};
 use crate::plan::PlanDocument;
 use crate::tools::ToolResult as Result;
-use std::collections::BTreeMap;
 use std::sync::Mutex;
 use tokio::sync::{Notify, watch};
 
@@ -114,7 +113,6 @@ impl ControlToolExecutor {
                 _execution: execution,
                 result,
                 plan_document,
-                source_digests: None,
                 execution_finished,
             });
         }
@@ -123,18 +121,10 @@ impl ControlToolExecutor {
             result = runtime.invoke(invocation) => result,
             _ = cancelled.wait_for(|closed| *closed) => return Err(crate::broker::TurnCancelled.into()),
         };
-        let source_digests = result
-            .as_ref()
-            .ok()
-            .and_then(|result| result.invocation.as_ref())
-            .and_then(|invocation| invocation.arguments["expected_version"].as_u64())
-            .and_then(|version| runtime.patch_source_digests(version))
-            .cloned();
         Ok(ControlToolOutcome {
             _execution: execution,
             result,
             plan_document: runtime.plan_document().cloned(),
-            source_digests,
             execution_finished: runtime.execution_finished(),
         })
     }
@@ -151,8 +141,19 @@ impl ControlToolExecutor {
     /// Cancels and collects all admitted calls before the provider releases its turn.
     pub(crate) async fn close(&self) {
         self.cancel();
+        self.finish().await;
+    }
+
+    /// Close admission and collect published effects without cancelling admitted tool work.
+    pub(crate) async fn finish(&self) {
+        self.admission
+            .lock()
+            .expect("control admission lock poisoned")
+            .closed = true;
         loop {
             let settled = self.settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
             if self
                 .admission
                 .lock()
@@ -191,8 +192,6 @@ pub(crate) struct ControlToolOutcome<'owner> {
     pub(crate) result: Result<ControlToolResult>,
     /// Captures the canonical plan after execution, including error context.
     pub(crate) plan_document: Option<PlanDocument>,
-    /// Binds a replayed patch to the source revision validated by the runtime.
-    pub(crate) source_digests: Option<BTreeMap<String, String>>,
     /// Identifies a phase transition that requires ending the native turn.
     pub(crate) execution_finished: bool,
 }
@@ -274,7 +273,7 @@ mod test {
         let (_root, mut store, controller) = crate::task::SessionTaskController::test_goal();
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         context.bind_test_task_controller(controller.clone());
-        let checkpoint = crate::checkpoint::ToolGate::new()?;
+        let checkpoint = crate::checkpoint::ToolGate::new();
         context.checkpoint = Some(checkpoint.clone());
         let executor = ControlToolExecutor::new(context);
         let invocation = || ControlToolInvocation {
@@ -300,7 +299,7 @@ mod test {
                 2,
             )?
             .unwrap();
-        checkpoint.complete(Ok(()))?;
+        checkpoint.complete(Ok(()));
         let running = running.await?.result.unwrap_err();
         let queued = queued.await.unwrap_err();
         assert!(running.is::<crate::task::StaleTask>());
@@ -339,7 +338,7 @@ mod test {
         let (_task_root, _task_store, task_controller) =
             crate::task::SessionTaskController::test_goal();
         context.bind_test_task_controller(task_controller);
-        context.checkpoint = Some(crate::checkpoint::ToolGate::new()?);
+        context.checkpoint = Some(crate::checkpoint::ToolGate::new());
         let executor = ControlToolExecutor::new(context);
         let invocation = || ControlToolInvocation {
             task_permit: None,

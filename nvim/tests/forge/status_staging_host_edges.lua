@@ -46,9 +46,7 @@ local ok, failure = xpcall(function()
     assert(git({ "diff", "--cached", "--name-only" }) == "")
     select_file(case.path, case.section)
   end
-  for _, notice in ipairs(forge_manual.notices) do
-    assert(notice.message:find("no Copilot OAuth token found", 1, true), notice.message)
-  end
+  assert(#forge_manual.notices == 0, vim.inspect(forge_manual.notices))
   local baseline = #forge_manual.notices
   local lock = forge_manual.fixture .. "/.git/index.lock"
   vim.fn.writefile({ "fixture-owned lock" }, lock)

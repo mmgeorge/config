@@ -1,7 +1,17 @@
-use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::time::Instant;
+
+/// Distinguish invalid timeout configuration from runtime provider failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum InputTimeoutError {
+    #[error("tool and shell timeout must be greater than zero")]
+    ExpiryRequired,
+    #[error("input timeout exceeds the timer range")]
+    TimerRange,
+    #[error("input timeout exceeds the timestamp range")]
+    TimestampRange,
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,22 +48,20 @@ pub struct InputTimeout {
 
 impl InputTimeout {
     /// Reject disabled expiry for tool and shell execution.
-    pub fn require_expiry(self) -> Result<Self> {
+    pub fn require_expiry(self) -> Result<Self, InputTimeoutError> {
         self.validate()?;
-        ensure!(
-            self.amount > 0,
-            "tool and shell timeout must be greater than zero"
-        );
+        if self.amount == 0 {
+            return Err(InputTimeoutError::ExpiryRequired);
+        }
         Ok(self)
     }
 
     /// Validate the duration before saving it or creating a runtime timer.
-    pub fn validate(self) -> Result<Self> {
+    pub fn validate(self) -> Result<Self, InputTimeoutError> {
         let duration = self.duration();
-        ensure!(
-            Instant::now().checked_add(duration).is_some(),
-            "input timeout exceeds the timer range"
-        );
+        if Instant::now().checked_add(duration).is_none() {
+            return Err(InputTimeoutError::TimerRange);
+        }
         Ok(self)
     }
 
@@ -68,15 +76,18 @@ impl InputTimeout {
     }
 
     /// Capture one deadline without retaining mutable configuration.
-    pub fn deadline(self, now_ms: i64) -> Result<Option<InputDeadline>> {
+    pub fn deadline(self, now_ms: i64) -> Result<Option<InputDeadline>, InputTimeoutError> {
         self.validate()?;
         if self.amount == 0 {
             return Ok(None);
         }
         let duration = self.duration();
         let expires_at_ms = now_ms
-            .checked_add(i64::try_from(duration.as_millis())?)
-            .context("input timeout exceeds the timestamp range")?;
+            .checked_add(
+                i64::try_from(duration.as_millis())
+                    .map_err(|_| InputTimeoutError::TimestampRange)?,
+            )
+            .ok_or(InputTimeoutError::TimestampRange)?;
         Ok(Some(InputDeadline {
             expires_at_ms,
             instant: Instant::now().checked_add(duration),
@@ -132,3 +143,31 @@ impl PartialEq for InputDeadline {
     }
 }
 impl Eq for InputDeadline {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Keep disabled input waits distinct from invalid execution deadlines and overflow.
+    #[test]
+    fn timeout_validation_reports_typed_configuration_failures() {
+        let disabled = InputTimeout {
+            amount: 0,
+            unit: TimeoutUnit::S,
+        };
+        assert_eq!(
+            disabled.require_expiry(),
+            Err(InputTimeoutError::ExpiryRequired)
+        );
+        assert!(disabled.deadline(i64::MAX).unwrap().is_none());
+        let enabled = InputTimeout {
+            amount: 1,
+            unit: TimeoutUnit::S,
+        };
+        assert!(matches!(
+            enabled.deadline(i64::MAX),
+            Err(InputTimeoutError::TimestampRange)
+        ));
+        assert!(enabled.deadline(0).unwrap().is_some());
+    }
+}

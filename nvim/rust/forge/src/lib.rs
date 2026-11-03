@@ -17,9 +17,6 @@ pub enum Command {
     Nvim,
     /// Run the plan and goal control-tool MCP server.
     Mcp,
-    #[command(hide = true)]
-    /// Wait for an exchange baseline before a native provider tool runs.
-    CheckpointWait { path: std::path::PathBuf },
 }
 
 #[inline(never)]
@@ -30,13 +27,6 @@ pub enum Command {
 pub fn run(command: Command, diagnostic_skip_line_stats: bool) -> Result<()> {
     shutdown::run(async {
         match command {
-            Command::CheckpointWait { path } => {
-                println!(
-                    "{}",
-                    forge_harness::checkpoint::wait_hook(&path, &mut std::io::stdin().lock()).await
-                );
-                Ok(())
-            }
             Command::Mcp => forge_harness::tools::run_stdio().await,
             Command::Nvim => {
                 let host = Arc::new(runtime::ForgeRuntime::new()?);

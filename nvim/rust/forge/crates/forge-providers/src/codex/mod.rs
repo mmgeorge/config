@@ -1,4 +1,11 @@
+mod attachments;
 mod connection;
+mod descendants;
+pub mod provider;
+mod question;
+mod resources;
+mod rpc;
+mod text_generation;
 
 pub use connection::{CodexConnection, CodexConnectionError, ReceivedMessage};
 pub mod decode;

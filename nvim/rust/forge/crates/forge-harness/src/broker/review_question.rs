@@ -55,19 +55,6 @@ impl HarnessBroker {
         Ok((document, questions, settings))
     }
 
-    /// Validate and persist provider-local Ask settings without changing the planning model.
-    #[cfg(test)]
-    pub(crate) async fn configure_ask_model(&mut self, value: Value) -> Result<Value> {
-        let prepared = self.prepare_ask_model_configuration(value)?;
-        let catalog = if prepared.needs_catalog() {
-            let result = self.prepare_configuration_catalog()?.run().await?;
-            self.commit_configuration_catalog(result)?
-        } else {
-            Vec::new()
-        };
-        self.commit_ask_model_configuration(prepared, &catalog)
-    }
-
     pub(crate) fn prepare_ask_model_configuration(
         &self,
         value: Value,
@@ -128,37 +115,6 @@ impl HarnessBroker {
             )?;
             Ok(json!({"ask_model":selection}))
         })
-    }
-
-    /// Save the completed fork's final response on its unchanged source question.
-    #[cfg(test)]
-    pub(crate) async fn run_review_question(
-        &mut self,
-        scope: Arc<ReviewAnswerScope>,
-        selection: &AskModel,
-        progress: Option<(&forge_protocol::outbound::MessageSender, u64)>,
-    ) -> Result<()> {
-        let catalog = if selection.model.is_some() {
-            let result = self
-                .prepare_configuration_catalog_for_mode(PromptMode::PlanQuestion)?
-                .run()
-                .await?;
-            self.commit_configuration_catalog(result)?
-        } else {
-            Vec::new()
-        };
-        let prompt = self.prepare_review_question(&scope, selection, &catalog, progress)?;
-        let (sink, updates) = publication::channel();
-        let dispatch =
-            self.begin_review_question_dispatch(prompt, scope.question.body.clone(), sink)?;
-        let result = self.drive_local_foreground(dispatch, updates).await?;
-        let value = result.response.result().ok_or_else(|| {
-            anyhow::anyhow!(
-                "review question dispatch failed: {:?}",
-                result.response.error()
-            )
-        })?;
-        self.finish_review_question(scope, value)
     }
 
     /// Resolve the review model and capture its question before owned dispatch.

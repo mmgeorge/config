@@ -165,9 +165,7 @@ impl HarnessBroker {
                     .tool_gate
                     .as_ref()
                     .expect("blocked tool gate")
-                    .complete(Err(
-                        "turn cancelled before checkpoint admission completed".into()
-                    ))?;
+                    .complete(Err(crate::checkpoint::CheckpointGateError::OwnerEnded));
                 runtime.checkpoint.take();
                 state.exchange.finalization_error = None;
                 state.exchange.finish(outcome, self.clock.now_ms())?;

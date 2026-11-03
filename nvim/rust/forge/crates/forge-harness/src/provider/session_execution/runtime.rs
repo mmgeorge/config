@@ -49,7 +49,7 @@ impl From<ProviderError> for RegistryError {
 /// Retain one engine for each independent execution owner in a shared provider runtime.
 pub(crate) struct SessionExecutionRegistry {
     provider: Arc<Provider>,
-    trace: Arc<dyn forge_provider_api::trace::ProviderTrace>,
+    trace: Arc<crate::trace::TraceStore>,
     owners: Mutex<HashMap<ExecutionOwner, Arc<OwnerExecution>>>,
     gate: tokio::sync::RwLock<()>,
     closed: AtomicBool,
@@ -63,10 +63,7 @@ struct OwnerExecution {
 }
 
 impl SessionExecutionRegistry {
-    pub(crate) fn new(
-        provider: Arc<Provider>,
-        trace: Arc<dyn forge_provider_api::trace::ProviderTrace>,
-    ) -> Self {
+    pub(crate) fn new(provider: Arc<Provider>, trace: Arc<crate::trace::TraceStore>) -> Self {
         Self {
             provider,
             trace,
@@ -86,7 +83,7 @@ impl SessionExecutionRegistry {
         provider: Arc<Provider>,
         owner: ExecutionOwner,
         observer: Arc<super::SessionObservationInbox>,
-        trace: Arc<dyn forge_provider_api::trace::ProviderTrace>,
+        trace: Arc<crate::trace::TraceStore>,
     ) -> Self {
         let mut owners = HashMap::new();
         owners.insert(
@@ -937,7 +934,7 @@ enum Command {
     Execute {
         request: Box<ProviderRequest>,
         scope: InvocationScope,
-        submission: SubmissionId,
+        submission: Option<SubmissionId>,
         sink: ProviderEventSink,
         completion: Box<crate::tools::ControlTurnContext>,
         continuation: Option<(u64, u64, u64)>,
@@ -966,12 +963,12 @@ enum Delivery {
     },
     Event {
         sink: ProviderEventSink,
-        event: ProviderEvent,
+        event: Box<ProviderEvent>,
         fallback: Option<SessionObserver>,
     },
     Complete {
         reply: oneshot::Sender<Result<NativeReady, ProviderError>>,
-        result: Result<NativeReady, ProviderError>,
+        result: Box<Result<NativeReady, ProviderError>>,
     },
 }
 
@@ -981,6 +978,7 @@ struct Invocation {
     reply: Option<oneshot::Sender<Result<NativeReady, ProviderError>>>,
     completion: crate::tools::ControlTurnContext,
     terminal: Option<Result<forge_provider_api::lifecycle::ExecutionResult, ProviderError>>,
+    publication_failure: Option<ProviderError>,
     pending_controls: usize,
     revision: u64,
     ticket_outstanding: bool,
@@ -999,7 +997,7 @@ struct SubmissionOutcome {
 #[derive(Clone)]
 enum SessionObserver {
     Inbox(Arc<super::SessionObservationInbox>),
-    Stream(ProviderEventSink),
+    Stream(Box<ProviderEventSink>),
 }
 
 impl SessionObserver {
@@ -1040,14 +1038,7 @@ impl SessionObserver {
 
 enum FailureOrigin {
     Observation,
-    Operation(forge_provider_api::error::ProviderOperationFailure),
-    DeliveryUncertain {
-        message: String,
-    },
-    PreparationCleanup {
-        cause: Arc<ProviderError>,
-        cleanup: Arc<ProviderError>,
-    },
+    Error(ProviderError),
 }
 
 struct FailedWaiter {
@@ -1058,7 +1049,7 @@ struct FailedWaiter {
 struct Driver {
     owner: ExecutionOwner,
     provider: Arc<Provider>,
-    trace: Arc<dyn forge_provider_api::trace::ProviderTrace>,
+    trace: Arc<crate::trace::TraceStore>,
     queue_loss_reported: AtomicBool,
     state: ExecutionState,
     invocations: HashMap<InvocationId, Invocation>,
@@ -1115,7 +1106,7 @@ impl SessionExecution {
         provider: Arc<Provider>,
         owner: ExecutionOwner,
         observer: Arc<super::SessionObservationInbox>,
-        trace: Arc<dyn forge_provider_api::trace::ProviderTrace>,
+        trace: Arc<crate::trace::TraceStore>,
     ) -> Result<Self, ProviderError> {
         let mut events = provider.session_events(owner.clone()).await?;
         let (commands, mut receive) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
@@ -1161,7 +1152,7 @@ impl SessionExecution {
                                         tokio::task::yield_now().await;
                                     },
                                     Err(crate::provider::events::EventDeliveryError::Empty) => break,
-                                    Err(crate::provider::events::EventDeliveryError::Closed { .. }) => {
+                                    Err(crate::provider::events::EventDeliveryError::Closed) => {
                                         if !driver_shutdown.load(Ordering::Acquire) { driver.fail_observation(ObservationFailure::Disconnected); }
                                         break;
                                     },
@@ -1189,7 +1180,7 @@ impl SessionExecution {
                             }
                             break;
                         },
-                        Err(crate::provider::events::EventDeliveryError::Closed { .. }) if driver_shutdown.load(Ordering::Acquire) => break,
+                        Err(crate::provider::events::EventDeliveryError::Closed) if driver_shutdown.load(Ordering::Acquire) => break,
                         Err(crate::provider::events::EventDeliveryError::Observation(failure)) => {
                             driver.fail_observation(failure); break;
                         },
@@ -1221,7 +1212,7 @@ impl SessionExecution {
                             Ok(event) => driver.event(event),
                             Err(
                                 crate::provider::events::EventDeliveryError::Empty
-                                | crate::provider::events::EventDeliveryError::Closed { .. },
+                                | crate::provider::events::EventDeliveryError::Closed,
                             ) => break,
                             Err(crate::provider::events::EventDeliveryError::Observation(
                                 failure,
@@ -1382,11 +1373,9 @@ impl SessionExecution {
         let result = handle.await;
         let result = match result {
             Ok(result) => result,
-            Err(error) => Err(ProviderError::Operation(
-                forge_provider_api::error::ProviderOperationFailure::new(
-                    forge_provider_api::error::ProviderOperation::CollectEventReader,
-                    Arc::new(error),
-                ),
+            Err(error) => Err(crate::provider::lifecycle_error::classify_source(
+                forge_provider_api::error::ProviderOperation::CollectEventReader,
+                &error,
             )),
         };
         match result {
@@ -1595,16 +1584,29 @@ impl SessionExecution {
         if request.owner()? != self.owner || scope.owner != self.owner {
             return Err(protocol("execution request belongs to another owner"));
         }
-        let submission = match request.submission.take() {
-            Some(submission) => submission,
-            None => store.prepare(&request, self.provider.descriptor().kind)?,
+        let resuming = request
+            .control_context
+            .as_ref()
+            .is_some_and(|context| context.provider_continuation.is_some());
+        let id = if resuming {
+            request.submission = None;
+            None
+        } else {
+            let submission = match request.submission.take() {
+                Some(submission) => submission,
+                None => store
+                    .prepare(&request, self.provider.descriptor().kind)
+                    .map_err(|_| protocol("submission preparation failed"))?,
+            };
+            submission
+                .recover(self.provider.as_ref(), &mut request)
+                .await
+                .map_err(|_| protocol("submission recovery failed"))?;
+            let id = SubmissionId::try_from(submission.id().to_owned())
+                .map_err(|error| protocol(&error.to_string()))?;
+            request.submission = Some(submission);
+            Some(id)
         };
-        submission
-            .recover(self.provider.as_ref(), &mut request)
-            .await?;
-        let id = SubmissionId::try_from(submission.id().to_owned())
-            .map_err(|error| protocol(&error.to_string()))?;
-        request.submission = Some(submission);
         let context = request
             .control_context
             .get_or_insert_with(|| crate::tools::ControlTurnContext::inactive(request.mode));
@@ -1673,30 +1675,22 @@ impl Driver {
         operation: forge_provider_api::error::ProviderOperation,
         source: Arc<dyn std::error::Error + Send + Sync>,
     ) {
-        let next = ProviderError::Operation(
-            forge_provider_api::error::ProviderOperationFailure::new(operation, source),
-        );
+        let next = crate::provider::lifecycle_error::classify_source(operation, source.as_ref());
         let failure = self
             .first_failure
             .get_or_insert(ObservationFailure::LifecycleUnavailable)
             .clone();
-        let cause = match self.cleanup_failure.take() {
-            Some(previous) => ProviderError::Combined {
-                primary: Box::new(ProviderError::Cleanup(previous)),
-                secondary: vec![next],
-            },
-            None => next,
-        };
-        self.cleanup_failure = Some(Arc::new(
-            forge_provider_api::error::ObservationCleanup::new(
+        let report = self.cleanup_failure.get_or_insert_with(|| {
+            Arc::new(forge_provider_api::error::ObservationCleanup::new(
                 failure.clone(),
                 None,
                 None,
-                Some(forge_provider_api::error::CleanupFailure::Failed(Box::new(
-                    cause,
-                ))),
-            ),
-        ));
+                None,
+            ))
+        });
+        Arc::make_mut(report).record_collection_failure(
+            forge_provider_api::error::CleanupFailure::Failed(Box::new(next)),
+        );
         self.failed = true;
         match &self.idle {
             SessionObserver::Inbox(inbox) => inbox.fail(failure),
@@ -1714,8 +1708,9 @@ impl Driver {
     ) {
         self.fail_observation_with_origin(
             failure,
-            FailureOrigin::Operation(forge_provider_api::error::ProviderOperationFailure::new(
-                operation, source,
+            FailureOrigin::Error(crate::provider::lifecycle_error::classify_source(
+                operation,
+                source.as_ref(),
             )),
         );
     }
@@ -1782,9 +1777,7 @@ impl Driver {
                 reply,
             } => {
                 let Some(scope) = self.state.latest_scope().cloned() else {
-                    let _ = reply.send(Err(ProviderError::Rejected {
-                        message: "owner has no admitted invocation for steering".into(),
-                    }));
+                    let _ = reply.send(Err(not_admitted()));
                     return;
                 };
                 self.command(Command::Steer {
@@ -1803,9 +1796,7 @@ impl Driver {
                 reply,
             } => {
                 if self.failed || !self.state.contains(&scope) {
-                    let _ = reply.send(Err(ProviderError::Rejected {
-                        message: "steering has no retained execution owner".into(),
-                    }));
+                    let _ = reply.send(Err(not_admitted()));
                     return;
                 }
                 if self
@@ -1813,9 +1804,7 @@ impl Driver {
                     .active_scope()
                     .is_some_and(|active| active != &scope)
                 {
-                    let _ = reply.send(Err(ProviderError::Rejected {
-                        message: "another invocation owns this session".into(),
-                    }));
+                    let _ = reply.send(Err(not_admitted()));
                     return;
                 }
                 let mut reply = Some(reply);
@@ -1844,18 +1833,38 @@ impl Driver {
                         .take()
                         .expect("control reply is present before dispatch");
                     self.submissions.spawn(async move {
-                        let result = match dispatch_authority.as_ref().map(|authority| authority.validate_scope()).transpose() {
-                            Err(error) => Err(ProviderError::NotConsumed { message: format!("callback authority was revoked before native dispatch: {error:#}"), cause: Some(Arc::new(crate::provider::lifecycle_error::classify(forge_provider_api::error::ProviderOperation::AdmitInput,error))) }),
+                        let result = match dispatch_authority
+                            .as_ref()
+                            .map(|authority| authority.validate_scope())
+                            .transpose()
+                        {
+                            Err(error) => Err(ProviderError::PreparationFailed(Box::new(
+                                crate::provider::lifecycle_error::classify(
+                                    forge_provider_api::ProviderOperation::AdmitInput,
+                                    error,
+                                ),
+                            ))),
                             Ok(_) => {
-                                let result = provider.session_steer(&scope.owner, scope.clone(), input).await;
-                                if dispatch_authority.as_ref().is_some_and(|authority| authority.validate_scope().is_err())
+                                let result = provider
+                                    .session_steer(&scope.owner, scope.clone(), input)
+                                    .await;
+                                if dispatch_authority
+                                    .as_ref()
+                                    .is_some_and(|authority| authority.validate_scope().is_err())
                                     && !matches!(&result, Err(ProviderError::NotConsumed { .. }))
                                 {
-                                    Err(ProviderError::DeliveryUncertain { message: "callback authority changed while native steering was in flight".into() })
-                                } else { result }
+                                    Err(ProviderError::DeliveryUncertain)
+                                } else {
+                                    result
+                                }
                             }
                         };
-                        SubmissionOutcome { scope, submission, control_reply: Some(reply), result }
+                        SubmissionOutcome {
+                            scope,
+                            submission,
+                            control_reply: Some(reply),
+                            result,
+                        }
                     });
                     Ok(())
                 };
@@ -1866,10 +1875,7 @@ impl Driver {
                 if let Err(error) = admitted
                     && let Some(reply) = reply
                 {
-                    let _ = reply.send(Err(ProviderError::NotConsumed {
-                        message: format!("control was not admitted: {error:#}"),
-                        cause: Some(Arc::new(error)),
-                    }));
+                    let _ = reply.send(Err(ProviderError::PreparationFailed(Box::new(error))));
                 }
             }
             Command::ObserveSession { sink, reply } => {
@@ -1889,7 +1895,7 @@ impl Driver {
                     },
                     SessionObserver::Stream(_) => unreachable!("stream observer rejected above"),
                 };
-                self.idle = SessionObserver::Stream(sink);
+                self.idle = SessionObserver::Stream(Box::new(sink));
                 for event in pending {
                     self.idle_event(event);
                 }
@@ -1954,7 +1960,9 @@ impl Driver {
                             reply.send(Err(protocol("continuation settlement ticket is stale")));
                         return;
                     }
-                    if let Err(error) = self.state.admit(scope.clone(), submission.clone()) {
+                    if let Some(submission) = &submission
+                        && let Err(error) = self.state.admit(scope.clone(), submission.clone())
+                    {
                         let _ = reply.send(Err(protocol(&error.to_string())));
                         return;
                     }
@@ -1977,6 +1985,7 @@ impl Driver {
                     invocation.revision = next_revision;
                     invocation.ticket_outstanding = false;
                     invocation.terminal = None;
+                    invocation.publication_failure = None;
                     invocation.output = sink;
                     invocation.idle_observation = false;
                     invocation.completion = context.clone();
@@ -1989,7 +1998,9 @@ impl Driver {
                         )));
                         return;
                     }
-                    if let Err(error) = self.state.admit(scope.clone(), submission.clone()) {
+                    if let Some(submission) = &submission
+                        && let Err(error) = self.state.admit(scope.clone(), submission.clone())
+                    {
                         let _ = reply.send(Err(protocol(&error.to_string())));
                         return;
                     }
@@ -2001,6 +2012,7 @@ impl Driver {
                             reply: Some(reply),
                             completion,
                             terminal: None,
+                            publication_failure: None,
                             pending_controls: 0,
                             revision: 0,
                             ticket_outstanding: false,
@@ -2015,7 +2027,7 @@ impl Driver {
                     let result = provider.session_prompt(request, scope.clone()).await;
                     SubmissionOutcome {
                         scope,
-                        submission: Some(submission),
+                        submission,
                         control_reply: None,
                         result,
                     }
@@ -2135,7 +2147,9 @@ impl Driver {
             }
             let delivery = match &result {
                 Ok(()) => DeliveryState::Accepted,
-                Err(ProviderError::NotConsumed { .. }) => DeliveryState::NotConsumed,
+                Err(ProviderError::NotConsumed { .. } | ProviderError::PreparationFailed(_)) => {
+                    DeliveryState::NotConsumed
+                }
                 Err(_) => DeliveryState::Uncertain,
             };
             if let Some(submission) = submission
@@ -2157,8 +2171,9 @@ impl Driver {
         }
         let delivery = match &result {
             Ok(()) => DeliveryState::Accepted,
-            Err(ProviderError::NotConsumed { .. }) => DeliveryState::NotConsumed,
-            Err(ProviderError::PreparationFailed(_)) if !is_control => DeliveryState::NotConsumed,
+            Err(ProviderError::NotConsumed { .. } | ProviderError::PreparationFailed(_)) => {
+                DeliveryState::NotConsumed
+            }
             Err(_) => DeliveryState::Uncertain,
         };
         if let Some(submission) = submission
@@ -2168,9 +2183,7 @@ impl Driver {
         }
         if let Some(reply) = control_reply {
             if result.is_err() && delivery != DeliveryState::NotConsumed {
-                invocation.terminal = Some(Err(ProviderError::DeliveryUncertain {
-                    message: "steering delivery failed; native completion is unknown".into(),
-                }));
+                invocation.terminal = Some(Err(ProviderError::DeliveryUncertain));
             }
             let _ = reply.send(result);
         } else if let Err(error) = result {
@@ -2215,6 +2228,7 @@ impl Driver {
                 return;
             }
             invocation.terminal = None;
+            invocation.publication_failure = None;
             invocation.reply = None;
             invocation.ticket_outstanding = false;
             invocation.idle_observation = true;
@@ -2270,6 +2284,29 @@ impl Driver {
                     | ExecutionUpdate::ResolvedWithoutExecution { result, .. } => {
                         Some(Ok(result.clone()))
                     }
+                    ExecutionUpdate::PublicationFailed {
+                        failure, result, ..
+                    }
+                    | ExecutionUpdate::ResolutionPublicationFailed {
+                        failure, result, ..
+                    } => {
+                        let kind = match failure {
+                            forge_provider_api::HostEffectFailure::Rejected
+                            | forge_provider_api::HostEffectFailure::Retired => {
+                                forge_provider_api::ProviderFailureKind::Rejected
+                            }
+                            forge_provider_api::HostEffectFailure::Uncertain => {
+                                forge_provider_api::ProviderFailureKind::Persistence
+                            }
+                        };
+                        invocation.publication_failure = Some(ProviderError::Failure(
+                            forge_provider_api::ProviderFailure::new(
+                                forge_provider_api::ProviderOperation::HostEffectPublication,
+                                kind,
+                            ),
+                        ));
+                        Some(Ok(result.clone()))
+                    }
                     ExecutionUpdate::ObservationLost { failure, .. } => {
                         Some(Err(ProviderError::Observation(failure.clone())))
                     }
@@ -2284,7 +2321,7 @@ impl Driver {
         let output = invocation.output.clone();
         if !self.enqueue(Delivery::Event {
             sink: output,
-            event,
+            event: Box::new(event),
             fallback: Some(self.idle.clone()),
         }) {
             self.fail_observation(ObservationFailure::Disconnected);
@@ -2311,7 +2348,7 @@ impl Driver {
                 };
                 if !self.enqueue(Delivery::Event {
                     sink,
-                    event,
+                    event: Box::new(event),
                     fallback: None,
                 }) {
                     self.fail_observation(ObservationFailure::Disconnected);
@@ -2342,13 +2379,13 @@ impl Driver {
                         ),
                         Delivery::Complete { result, .. } => (
                             "engine_completion",
-                            result.as_ref().ok().map(|ready| {
+                            result.as_ref().as_ref().ok().map(|ready| {
                                 crate::provider::EventScope::from(ready.ticket.scope.clone())
                             }),
                             None,
                         ),
                     };
-                    self.trace.record(&self.owner.session_id, "provider.observation_queue_lost", serde_json::json!({
+                    self.trace.record(self.owner.session_id.as_str(), "provider.observation_queue_lost", serde_json::json!({
                         "provider":self.provider.descriptor().kind, "stage":stage,
                         "queued":sender.max_capacity(), "capacity":sender.max_capacity(),
                         "queued_bytes":null, "event_bytes":event_bytes, "source_scope":source_scope, "owner":self.owner,
@@ -2377,38 +2414,27 @@ impl Driver {
         }
         let origin = match &ready {
             Ok(ExecutionReadiness::DeliveryUncertain) => {
-                if let Some(Err(ProviderError::PreparationCleanup { cause, cleanup })) =
+                if let Some(Err(error @ ProviderError::PreparationCleanup { .. })) =
                     &invocation.terminal
                 {
-                    FailureOrigin::PreparationCleanup {
-                        cause: cause.clone(),
-                        cleanup: cleanup.clone(),
-                    }
+                    FailureOrigin::Error(error.clone())
                 } else {
-                    let message = match &invocation.terminal {
-                        Some(Err(ProviderError::DeliveryUncertain { message })) => message.clone(),
-                        _ => "provider delivery is uncertain; native completion is unknown".into(),
-                    };
-                    FailureOrigin::DeliveryUncertain { message }
+                    FailureOrigin::Error(ProviderError::DeliveryUncertain)
                 }
             }
-            Ok(ExecutionReadiness::ObservationLost(ObservationFailure::DeliveryUncertain {
-                message,
-            })) => FailureOrigin::DeliveryUncertain {
-                message: message.clone(),
-            },
+            Ok(ExecutionReadiness::ObservationLost(ObservationFailure::DeliveryUncertain)) => {
+                FailureOrigin::Error(ProviderError::DeliveryUncertain)
+            }
             _ => FailureOrigin::Observation,
         };
         let failure = match ready {
             Ok(ExecutionReadiness::Waiting) => return,
             Ok(ExecutionReadiness::Complete) => None,
             Ok(ExecutionReadiness::ObservationLost(failure)) => Some(failure),
-            Ok(ExecutionReadiness::DeliveryUncertain) => Some(ObservationFailure::Protocol {
-                message: "provider delivery is uncertain; native completion is unknown".into(),
-            }),
-            Err(error) => Some(ObservationFailure::Protocol {
-                message: error.to_string(),
-            }),
+            Ok(ExecutionReadiness::DeliveryUncertain) => {
+                Some(ObservationFailure::DeliveryUncertain)
+            }
+            Err(_) => Some(ObservationFailure::Protocol),
         };
         if let Some(failure) = failure {
             self.fail_observation_with_origin(failure, origin);
@@ -2417,7 +2443,9 @@ impl Driver {
         if self.invocations.get(id).is_some_and(|invocation| {
             matches!(
                 &invocation.terminal,
-                Some(Err(ProviderError::PreparationFailed(_)))
+                Some(Err(
+                    ProviderError::PreparationFailed(_) | ProviderError::NotConsumed { .. }
+                ))
             )
         }) {
             let mut invocation = self
@@ -2428,7 +2456,7 @@ impl Driver {
                 (invocation.reply.take(), invocation.terminal.take())
                 && !self.enqueue(Delivery::Complete {
                     reply,
-                    result: Err(error),
+                    result: Box::new(Err(error)),
                 })
             {
                 self.fail_all("execution result delivery closed");
@@ -2449,7 +2477,7 @@ impl Driver {
         };
         let crate::tools::ProviderExecutionPreview {
             revision: effects_revision,
-            outcome,
+            mut outcome,
             batches,
         } = match invocation.completion.preview_provider_execution(terminal) {
             Ok(preview) => preview,
@@ -2460,6 +2488,9 @@ impl Driver {
                 return;
             }
         };
+        if let Some(failure) = &invocation.publication_failure {
+            outcome = Err(failure.clone());
+        }
         let Some(nonce) = self.next_ticket_nonce.checked_add(1) else {
             let _ = reply.send(Err(protocol("settlement ticket identity exhausted")));
             self.fail_all("settlement ticket identity exhausted");
@@ -2480,7 +2511,10 @@ impl Driver {
             },
         });
         invocation.ticket_outstanding = true;
-        if !self.enqueue(Delivery::Complete { reply, result }) {
+        if !self.enqueue(Delivery::Complete {
+            reply,
+            result: Box::new(result),
+        }) {
             self.fail_all("execution result delivery closed");
         }
     }
@@ -2505,34 +2539,16 @@ impl Driver {
                     None,
                     None,
                     Some(forge_provider_api::error::CleanupFailure::Failed(Box::new(
-                        ProviderError::Operation(
-                            forge_provider_api::error::ProviderOperationFailure::new(
-                                forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
-                                Arc::new(error),
-                            ),
+                        crate::provider::lifecycle_error::classify_source(
+                            forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                            &error,
                         ),
                     ))),
                 );
                 let origin = self
                     .failed_waiters
                     .iter()
-                    .find_map(|waiter| match &waiter.original {
-                        Some(ProviderError::DeliveryUncertain { message }) => {
-                            Some(ProviderError::DeliveryUncertain {
-                                message: message.clone(),
-                            })
-                        }
-                        Some(ProviderError::PreparationCleanup { cause, cleanup }) => {
-                            Some(ProviderError::PreparationCleanup {
-                                cause: cause.clone(),
-                                cleanup: cleanup.clone(),
-                            })
-                        }
-                        Some(ProviderError::Operation(failure)) => {
-                            Some(ProviderError::Operation(failure.clone()))
-                        }
-                        _ => None,
-                    });
+                    .find_map(|waiter| waiter.original.clone());
                 Arc::new(match origin {
                     Some(origin) => report.with_origin(origin),
                     None => report,
@@ -2567,8 +2583,11 @@ impl Driver {
                     operation_id: uuid::Uuid::new_v4().to_string(),
                 },
                 diagnostic: crate::provider::ProviderDiagnostic {
-                    code: Some("observation_cleanup_failed".into()),
-                    message: report.to_string(),
+                    kind: forge_provider_api::ProviderFailureKind::Runtime,
+                    message: forge_provider_api::SanitizedMessage::new(
+                        "Provider observation cleanup failed",
+                    )
+                    .expect("static diagnostic is nonempty"),
                     fatal: true,
                 },
             });
@@ -2583,17 +2602,15 @@ impl Driver {
         }
     }
 
-    fn fail_all(&mut self, message: &str) {
-        self.fail_observation(ObservationFailure::Protocol {
-            message: message.to_owned(),
-        });
+    fn fail_all(&mut self, _message: &str) {
+        self.fail_observation(ObservationFailure::Protocol);
     }
 
     fn fail_observation(&mut self, failure: ObservationFailure) {
         let origin = match &failure {
-            ObservationFailure::DeliveryUncertain { message } => FailureOrigin::DeliveryUncertain {
-                message: message.clone(),
-            },
+            ObservationFailure::DeliveryUncertain => {
+                FailureOrigin::Error(ProviderError::DeliveryUncertain)
+            }
             _ => FailureOrigin::Observation,
         };
         self.fail_observation_with_origin(failure, origin);
@@ -2608,21 +2625,8 @@ impl Driver {
             let owner = self.owner.clone();
             let observation = failure.clone();
             let cleanup_origin = match &origin {
-                FailureOrigin::DeliveryUncertain { message } => {
-                    Some(ProviderError::DeliveryUncertain {
-                        message: message.clone(),
-                    })
-                }
                 FailureOrigin::Observation => None,
-                FailureOrigin::Operation(failure) => {
-                    Some(ProviderError::Operation(failure.clone()))
-                }
-                FailureOrigin::PreparationCleanup { cause, cleanup } => {
-                    Some(ProviderError::PreparationCleanup {
-                        cause: cause.clone(),
-                        cleanup: cleanup.clone(),
-                    })
-                }
+                FailureOrigin::Error(error) => Some(error.clone()),
             };
             self.cleanup.spawn(async move {
                 let report = collect_failed_execution(provider.as_ref(), &owner, observation).await;
@@ -2649,30 +2653,14 @@ impl Driver {
             ) {
                 self.enqueue(Delivery::Event {
                     sink: invocation.output,
-                    event: ProviderEvent::Execution { observation },
+                    event: Box::new(ProviderEvent::Execution { observation }),
                     fallback: Some(self.idle.clone()),
                 });
             }
             if let Some(reply) = invocation.reply {
                 let original = match &origin {
-                    FailureOrigin::DeliveryUncertain { message } => {
-                        Some(match invocation.terminal {
-                            Some(Err(error @ ProviderError::DeliveryUncertain { .. })) => error,
-                            _ => ProviderError::DeliveryUncertain {
-                                message: message.clone(),
-                            },
-                        })
-                    }
                     FailureOrigin::Observation => None,
-                    FailureOrigin::Operation(failure) => {
-                        Some(ProviderError::Operation(failure.clone()))
-                    }
-                    FailureOrigin::PreparationCleanup { cause, cleanup } => {
-                        Some(ProviderError::PreparationCleanup {
-                            cause: cause.clone(),
-                            cleanup: cleanup.clone(),
-                        })
-                    }
+                    FailureOrigin::Error(error) => Some(error.clone()),
                 };
                 self.failed_waiters.push(FailedWaiter { reply, original });
             }
@@ -2738,18 +2726,21 @@ async fn deliver(mut pending: mpsc::Receiver<Delivery>) -> Result<(), ProviderEr
                 sink,
                 event,
                 fallback,
-            } => match fallback {
-                Some(observer) => match sink.send_wait(event.clone()).await {
-                    Ok(()) => Ok(()),
-                    Err(crate::provider::events::EventDeliveryError::Closed { .. }) => {
-                        observer.retain(event).await
-                    }
-                    Err(error) => Err(error.into()),
-                },
-                None => sink.send_wait(event).await.map_err(ProviderError::from),
-            },
+            } => {
+                let event = *event;
+                match fallback {
+                    Some(observer) => match sink.send_wait(event.clone()).await {
+                        Ok(()) => Ok(()),
+                        Err(crate::provider::events::EventDeliveryError::Closed) => {
+                            observer.retain(event).await
+                        }
+                        Err(error) => Err(error.into()),
+                    },
+                    None => sink.send_wait(event).await.map_err(ProviderError::from),
+                }
+            }
             Delivery::Complete { reply, result } => {
-                let _ = reply.send(result);
+                let _ = reply.send(*result);
                 Ok(())
             }
         };
@@ -2768,10 +2759,20 @@ async fn deliver(mut pending: mpsc::Receiver<Delivery>) -> Result<(), ProviderEr
     Ok(())
 }
 
-fn protocol(message: &str) -> ProviderError {
-    ProviderError::Protocol {
-        message: message.to_owned(),
-    }
+fn protocol(_message: &str) -> ProviderError {
+    ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+        forge_provider_api::ProviderOperation::CollectEventReader,
+        forge_provider_api::ProviderFailureKind::Protocol,
+    ))
+}
+
+fn not_admitted() -> ProviderError {
+    ProviderError::PreparationFailed(Box::new(ProviderError::Failure(
+        forge_provider_api::ProviderFailure::new(
+            forge_provider_api::ProviderOperation::AdmitInput,
+            forge_provider_api::ProviderFailureKind::Rejected,
+        ),
+    )))
 }
 
 #[cfg(test)]
@@ -2967,15 +2968,16 @@ mod tests {
     async fn close_retries_incomplete_cleanup_before_releasing_owner() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
-        let provider: Arc<Provider> = Arc::from(crate::provider::build(
+        let provider: Arc<Provider> = crate::provider::build(
             ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: Vec::new(),
             },
             crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
             trace.clone(),
             directory.path().into(),
-        )?);
+        )?;
         let report = Arc::new(forge_provider_api::error::ObservationCleanup::new(
             ObservationFailure::Disconnected,
             None,
@@ -3009,15 +3011,16 @@ mod tests {
     async fn host_ticket_blocks_admission_and_reopens_on_steering() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
-        let provider: Arc<Provider> = Arc::from(crate::provider::build(
+        let provider: Arc<Provider> = crate::provider::build(
             ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: Vec::new(),
             },
             crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
             trace.clone(),
             directory.path().into(),
-        )?);
+        )?;
         let store =
             crate::provider::submission::SubmissionStore::open(directory.path(), trace.clone())?;
         let owner = ExecutionOwner::root("host-ticket");
@@ -3029,7 +3032,7 @@ mod tests {
             workspace: directory.path().to_string_lossy().into_owned(),
             input: ProviderInput::from_text("hello"),
             mode: PromptMode::Chat,
-            model: "mock".into(),
+            model: "default".into(),
             effort: "default".into(),
             context_window: None,
             service_tier: Default::default(),
@@ -3045,7 +3048,8 @@ mod tests {
         drop(events);
         let ready = engine
             .run_until_ready(request.clone(), sink, &store)
-            .await?;
+            .await
+            .context("first execution readiness")?;
         assert!(ready.outcome.is_ok());
         assert!(engine.is_healthy().await);
         assert!(!registry.observer(owner.clone())?.drain()?.is_empty());
@@ -3095,7 +3099,8 @@ mod tests {
         let receipt = store.prepare_steering(
             &catalog,
             ProviderInput::from_text("continue"),
-            crate::provider::ProviderKind::Mock,
+            forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
         )?;
         engine
             .steer(
@@ -3106,7 +3111,8 @@ mod tests {
                     submission: Some(receipt),
                 },
             )
-            .await?;
+            .await
+            .context("steer retained ticket")?;
         assert!(matches!(
             ready.ticket.commit().await,
             Err(SettlementError::Stale)
@@ -3114,7 +3120,8 @@ mod tests {
         let (continuation_sink, _events) = crate::provider::events::channel(scope.clone());
         let stale = engine
             .continue_attempt(&ready.ticket, request.clone(), continuation_sink, &store)
-            .await?;
+            .await
+            .context("reject stale continuation")?;
         let ContinuationAttempt::Stale(prepared) = stale else {
             panic!("stale continuation must not be admitted");
         };
@@ -3134,7 +3141,9 @@ mod tests {
             std::time::Duration::from_secs(2),
             engine.continue_attempt(&current.ticket, request, continuation_sink, &store),
         )
-        .await??;
+        .await
+        .context("continue current ticket deadline")?
+        .context("continue current ticket")?;
         let ContinuationAttempt::Ready(next) = next else {
             panic!("current continuation must be admitted");
         };
@@ -3155,15 +3164,16 @@ mod tests {
     async fn idle_reopen_retains_host_effect_until_new_commit() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
-        let provider: Arc<Provider> = Arc::from(crate::provider::build(
+        let provider: Arc<Provider> = crate::provider::build(
             ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: Vec::new(),
             },
             crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
             trace.clone(),
             directory.path().into(),
-        )?);
+        )?;
         let owner = ExecutionOwner::root("idle-host-effects");
         let scope = InvocationScope::new(owner.clone(), "exchange");
         let submission = SubmissionId::try_from("original".to_owned())?;
@@ -3210,6 +3220,7 @@ mod tests {
                 reply: None,
                 completion: context,
                 terminal: Some(Ok(completed.clone())),
+                publication_failure: None,
                 pending_controls: 0,
                 revision: 1,
                 ticket_outstanding: false,
@@ -3277,7 +3288,7 @@ mod tests {
         });
         while let Some(delivery) = deliveries.recv().await {
             if let Delivery::Complete { reply, result } = delivery {
-                reply.send(result).ok();
+                reply.send(*result).ok();
                 break;
             }
         }
@@ -3343,15 +3354,16 @@ mod tests {
     async fn preparation_failure_preserves_cause_without_delivery_or_fallback() -> anyhow::Result<()>
     {
         let directory = tempfile::tempdir()?;
-        let provider: Arc<Provider> = Arc::from(crate::provider::build(
+        let provider: Arc<Provider> = crate::provider::build(
             ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: Vec::new(),
             },
             crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
             Arc::new(crate::trace::TraceStore::open(directory.path())?),
             directory.path().into(),
-        )?);
+        )?;
         let owner = ExecutionOwner::root("preparation-failure");
         let scope = InvocationScope::new(owner.clone(), "exchange");
         let submission = SubmissionId::try_from("input".to_owned())?;
@@ -3368,6 +3380,7 @@ mod tests {
                 reply: Some(reply),
                 completion: crate::tools::ControlTurnContext::inactive(PromptMode::Chat),
                 terminal: None,
+                publication_failure: None,
                 pending_controls: 0,
                 revision: 0,
                 ticket_outstanding: false,
@@ -3405,20 +3418,21 @@ mod tests {
             scope: scope.clone(),
             submission: Some(submission),
             control_reply: None,
-            result: Err(ProviderError::PreparationFailed(Arc::new(
-                ProviderError::Rejected {
-                    message: "catalog unavailable".into(),
-                },
+            result: Err(ProviderError::PreparationFailed(Box::new(
+                ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::InitializeSession,
+                    forge_provider_api::ProviderFailureKind::Initialization,
+                )),
             ))),
         });
         if let Some(Delivery::Complete { reply, result }) = pending.recv().await {
-            reply.send(result).ok();
+            reply.send(*result).ok();
         }
         let Err(ProviderError::PreparationFailed(cause)) = response.await? else {
             panic!("expected typed preparation failure")
         };
         assert!(
-            matches!(cause.as_ref(), ProviderError::Rejected { message } if message == "catalog unavailable")
+            matches!(cause.as_ref(), ProviderError::Failure(failure) if failure.kind() == forge_provider_api::ProviderFailureKind::Initialization)
         );
         assert!(!driver.failed);
         assert!(driver.cleanup.is_empty());
@@ -3436,15 +3450,16 @@ mod tests {
     async fn uncertain_terminal_waits_for_cleanup_and_preserves_failure() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
-        let provider: Arc<Provider> = Arc::from(crate::provider::build(
+        let provider: Arc<Provider> = crate::provider::build(
             ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: Vec::new(),
             },
             crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
             trace.clone(),
             directory.path().into(),
-        )?);
+        )?;
         let owner = ExecutionOwner::root("uncertain-cleanup");
         let scope = InvocationScope::new(owner.clone(), "exchange");
         let submission = SubmissionId::try_from("input".to_owned())?;
@@ -3467,6 +3482,7 @@ mod tests {
                             .into(),
                     },
                 )),
+                publication_failure: None,
                 pending_controls: 0,
                 revision: 0,
                 ticket_outstanding: false,
@@ -3512,11 +3528,11 @@ mod tests {
         let Err(ProviderError::Cleanup(report)) = response.await? else {
             panic!("cleanup failure must reach the execution waiter");
         };
-        assert!(
-            matches!(report.observation(), ObservationFailure::Protocol { message }
-            if message.contains("delivery is uncertain"))
-        );
-        assert!(report.collection().is_some());
+        assert!(matches!(
+            report.observation(),
+            ObservationFailure::DeliveryUncertain
+        ));
+        assert!(!report.collection().is_empty());
         Ok(())
     }
 
@@ -3525,15 +3541,16 @@ mod tests {
     async fn uncertain_observation_before_acceptance_preserves_typed_error() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
-        let provider: Arc<Provider> = Arc::from(crate::provider::build(
+        let provider: Arc<Provider> = crate::provider::build(
             ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: Vec::new(),
             },
             crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
             trace.clone(),
             directory.path().into(),
-        )?);
+        )?;
         let owner = ExecutionOwner::root("uncertain-cleanup");
         let scope = InvocationScope::new(owner.clone(), "exchange");
         let submission = SubmissionId::try_from("input".to_owned())?;
@@ -3551,6 +3568,7 @@ mod tests {
                 completion: crate::tools::ControlTurnContext::inactive(PromptMode::Chat),
                 terminal: None,
                 pending_controls: 0,
+                publication_failure: None,
                 revision: 0,
                 ticket_outstanding: false,
                 ticket_nonce: 0,
@@ -3586,9 +3604,7 @@ mod tests {
         let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
             scope.clone(),
             ExecutionUpdate::ObservationLost {
-                failure: ObservationFailure::DeliveryUncertain {
-                    message: "initial acknowledgment expired".into(),
-                },
+                failure: ObservationFailure::DeliveryUncertain,
                 completion: None,
             },
         )?;
@@ -3599,9 +3615,10 @@ mod tests {
         ));
         let cleanup = driver.cleanup.join_next().await;
         driver.cleanup_finished(cleanup);
-        assert!(
-            matches!(response.await?, Err(ProviderError::DeliveryUncertain { message }) if message == "initial acknowledgment expired")
-        );
+        assert!(matches!(
+            response.await?,
+            Err(ProviderError::DeliveryUncertain)
+        ));
         Ok(())
     }
 
@@ -3611,7 +3628,7 @@ mod tests {
         let (reply, response) = oneshot::channel();
         Delivery::Complete {
             reply,
-            result: Err(protocol("original")),
+            result: Box::new(Err(protocol("original"))),
         }
         .fail(ObservationFailure::Disconnected);
         assert!(matches!(
@@ -3625,15 +3642,16 @@ mod tests {
     async fn host_waits_for_execution_completion_and_reuses_session_intake() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
-        let provider: Arc<Provider> = Arc::from(crate::provider::build(
+        let provider: Arc<Provider> = crate::provider::build(
             ProviderLaunch {
-                kind: "mock".into(),
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
                 command: Vec::new(),
             },
             crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
             trace.clone(),
             directory.path().into(),
-        )?);
+        )?;
         let store =
             crate::provider::submission::SubmissionStore::open(directory.path(), trace.clone())?;
         let owner = ExecutionOwner::root("engine-fixture");
@@ -3643,13 +3661,13 @@ mod tests {
         let mut idle = engine.session_events().await?;
         let mut retained_scope = None;
         for exchange in ["one", "two"] {
-            let request = ProviderRequest {
+            let mut request = ProviderRequest {
                 execution_owner: Some(owner.clone()),
                 harness_session_id: "engine-fixture".into(),
                 workspace: directory.path().to_string_lossy().into_owned(),
                 input: ProviderInput::from_text("hello"),
                 mode: PromptMode::Chat,
-                model: "mock".into(),
+                model: "default".into(),
                 effort: "default".into(),
                 context_window: None,
                 service_tier: Default::default(),
@@ -3660,6 +3678,13 @@ mod tests {
                 recovered_input: Vec::new(),
                 control_context: None,
             };
+            request.model = provider
+                .model_list(request.clone())
+                .await?
+                .into_iter()
+                .next()
+                .context("fixture provider advertises a model")?
+                .id;
             let control = provider.mock_response_control().unwrap();
             let hold = control
                 .dispatch(
@@ -3669,7 +3694,8 @@ mod tests {
                         any_session: false,
                     },
                 )
-                .await?;
+                .await
+                .context("arm prompt hold")?;
             let hold_id = hold["id"].as_str().unwrap().to_owned();
             let scope = InvocationScope::new(owner.clone(), exchange);
             retained_scope = Some(scope.clone());
@@ -3678,14 +3704,21 @@ mod tests {
             let store = store.clone();
             let mut result =
                 tokio::spawn(async move { running.run_once(request, sink, &store).await });
-            control
+            let hold_wait = control
                 .dispatch(
                     "engine-fixture",
                     MockResponseCommand::Wait {
                         id: hold_id.clone(),
                     },
                 )
-                .await?;
+                .await;
+            if let Err(error) = hold_wait {
+                let outcome =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), &mut result).await;
+                anyhow::bail!(
+                    "wait for exchange {exchange} hold: {error}; prompt outcome: {outcome:?}"
+                );
+            }
             assert!(
                 !result.is_finished(),
                 "acceptance was mistaken for execution completion"
@@ -3695,16 +3728,17 @@ mod tests {
                     "engine-fixture",
                     MockResponseCommand::Release { id: hold_id },
                 )
-                .await?;
+                .await
+                .with_context(|| format!("release exchange {exchange} hold"))?;
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
                     tokio::select! {
-                        value = &mut result => { value??; return Ok::<_, anyhow::Error>(()); }
-                        event = events.recv() => { event?; }
+                        value = &mut result => { value?.with_context(|| format!("complete exchange {exchange}"))?; return Ok::<_, anyhow::Error>(()); }
+                        event = events.recv() => { event.with_context(|| format!("observe exchange {exchange}"))?; }
                     }
                 }
             })
-            .await??;
+            .await.with_context(|| format!("complete exchange {exchange} before deadline"))??;
         }
         let scope = retained_scope.unwrap();
         let catalog = crate::provider::ProviderCatalogRequest {
@@ -3718,7 +3752,8 @@ mod tests {
         let receipt = store.prepare_steering(
             &catalog,
             ProviderInput::from_text("continue original work"),
-            crate::provider::ProviderKind::Mock,
+            forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a nonselectable fixture identity"),
         )?;
         let input = SubmissionId::try_from(receipt.id().to_owned())?;
         engine
@@ -3730,11 +3765,14 @@ mod tests {
                     submission: Some(receipt),
                 },
             )
-            .await?;
+            .await
+            .context("steer retained invocation")?;
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             let mut started = false;
             loop {
-                if let Some(ProviderEvent::Execution { observation }) = idle.recv().await? {
+                if let Some(ProviderEvent::Execution { observation }) =
+                    idle.recv().await.context("observe retained invocation")?
+                {
                     assert_eq!(observation.scope(), &scope);
                     match observation.update() {
                         ExecutionUpdate::Started { .. } => started = true,
@@ -3752,21 +3790,34 @@ mod tests {
                         ExecutionUpdate::ResolvedWithoutExecution { .. } => {
                             anyhow::bail!("mock continuation unexpectedly had no native execution")
                         }
+                        ExecutionUpdate::PublicationFailed { .. }
+                        | ExecutionUpdate::ResolutionPublicationFailed { .. } => {
+                            anyhow::bail!("mock continuation failed host publication")
+                        }
                     }
                 }
             }
         })
-        .await??;
+        .await
+        .context("complete retained steering before deadline")??;
 
-        registry.close().await?;
-        registry.close().await?;
+        let ready = engine
+            .wait_ready(scope)
+            .await
+            .context("settle observed idle execution")?;
+        ready.ticket.commit().await?;
+        registry.close().await.context("close fixture registry")?;
+        registry.close().await.context("close fixture registry")?;
         assert!(
             registry
                 .owner(ExecutionOwner::root("closed"))
                 .await
                 .is_err()
         );
-        provider.shutdown().await?;
+        provider
+            .shutdown()
+            .await
+            .context("shutdown fixture provider")?;
         Ok(())
     }
 }

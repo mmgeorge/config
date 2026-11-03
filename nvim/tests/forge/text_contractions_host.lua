@@ -1,7 +1,7 @@
 local fixture=dofile('nvim/tests/forge/support/text_fixture.lua').native()
 local ok,failure=xpcall(function()
-  assert(fixture.exec([[return vim.tbl_contains(text_initialize_wire.request.params.terminology,'codex')]]),
-    'codex was not loaded from the shared vocabulary')
+  assert(fixture.exec([[return vim.tbl_contains(text_initialize_wire.request.params.terminology,'Neovim')]]),
+    'Neovim was not loaded from the shared vocabulary')
   fixture.exec([[
     contraction_requests={}
     local service=require('forge.text.service')
@@ -37,8 +37,8 @@ local ok,failure=xpcall(function()
     {prefix='I shouldnt',suffix=' ',expected="I shouldn't "},
     {prefix='dont',suffix=' ',expected="Don't "},
     {prefix='I WONT',suffix=' ',expected="I WON'T "},
-    {prefix='Use codex',suffix=' ',expected='Use codex '},
-    {prefix='Use Codex',suffix=' ',expected='Use Codex '},
+    {prefix='Use tokio',suffix=' ',expected='Use tokio '},
+    {prefix='Use Tokio',suffix=' ',expected='Use Tokio '},
   }) do
     fixture.type('<Esc>')
     fixture.exec([[

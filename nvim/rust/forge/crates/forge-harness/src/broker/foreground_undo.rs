@@ -28,9 +28,7 @@ impl UndoTeardown {
                 .await
                 .map_err(|_| {
                     self.goal_controller.mark_native_goal_uncertain();
-                    ProviderError::DeliveryUncertain {
-                        message: "native goal generation remained active during undo".into(),
-                    }
+                    ProviderError::DeliveryUncertain
                 })?,
         );
         self.goal_controller.ensure_native_goal_certain()?;
@@ -157,12 +155,12 @@ impl HarnessBroker {
         } else {
             None
         };
-        let replacement = Arc::from(crate::provider::build(
+        let replacement = crate::provider::build(
             self.provider_launch.clone(),
             self.permission_coordinator.clone(),
             self.trace.clone(),
             self.data_root.clone(),
-        )?);
+        )?;
         Ok(UndoTeardown {
             session_id: self.session.id.clone(),
             expected_latest,

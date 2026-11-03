@@ -38,6 +38,10 @@ fn diagnostic_field(key: &str) -> bool {
             | "operation_id"
             | "message_id"
             | "submission_id"
+            | "binding_id"
+            | "failure"
+            | "kind"
+            | "event"
             | "busy_ms"
             | "poll_count"
             | "from_state"
@@ -49,11 +53,9 @@ fn diagnostic_field(key: &str) -> bool {
             | "thread_id"
             | "turn_id"
             | "tool_id"
-            | "tool_call_id"
             | "type"
             | "success"
             | "provider"
-            | "event_type"
             | "status"
             | "code"
             | "enabled"
@@ -87,12 +89,7 @@ fn diagnostic_field(key: &str) -> bool {
 /// Filter a retained record to public diagnostic metadata.
 pub(crate) fn inspection_record(record: &Value) -> Value {
     let mut payload = inspection_metadata(&record["payload"]);
-    for (name, pointer) in [
-        ("data", "/payload/data"),
-        ("params", "/payload/params"),
-        ("provider_event", "/payload/params/event"),
-        ("provider_event_data", "/payload/params/event/data"),
-    ] {
+    for (name, pointer) in [("data", "/payload/data"), ("params", "/payload/params")] {
         if let Some(value) = record.pointer(pointer) {
             let metadata = inspection_metadata(value);
             if !metadata.is_empty() {

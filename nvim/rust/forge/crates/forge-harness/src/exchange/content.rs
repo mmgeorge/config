@@ -543,13 +543,16 @@ impl Exchange {
             self.turn.iter().any(|turn| turn.id() == turn_id
                 && turn.provider() == &address.turn
                 && (turn.state() == crate::turn::TurnState::Running || late))
-                && !address.tool_id.is_empty(),
+                && !address.tool_id.as_str().is_empty(),
             "completed turn rejects tool events"
         );
         if !existing && !matches!(update, crate::provider::ToolUpdate::Requested { .. }) {
-            return Err(crate::provider::ProviderError::Protocol {
-                message: "provider tool update arrived before its request".into(),
-            }
+            return Err(crate::provider::ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::CollectEventReader,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                ),
+            )
             .into());
         }
         let tool_id = address.tool_id.as_str();
@@ -697,7 +700,7 @@ mod tests {
         let error = exchange.observe_turn(&event, 4).unwrap_err();
         assert!(matches!(
             error.downcast_ref::<crate::provider::ProviderError>(),
-            Some(crate::provider::ProviderError::Protocol { .. })
+            Some(crate::provider::ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Protocol
         ));
         assert_eq!(serde_json::to_value(&exchange)?, before_conflict);
         if let ProviderEvent::Message { update, .. } = &mut event {
@@ -951,8 +954,9 @@ mod tests {
             *update = ToolUpdate::Finished {
                 outcome: ToolOutcome::Failed {
                     diagnostic: crate::provider::ToolDiagnostic {
-                        code: None,
-                        message: "failed".into(),
+                        kind: forge_provider_api::ProviderFailureKind::Unknown,
+                        message: forge_provider_api::SanitizedMessage::new("failed")
+                            .expect("fixture diagnostic is nonempty"),
                     },
                 },
             };

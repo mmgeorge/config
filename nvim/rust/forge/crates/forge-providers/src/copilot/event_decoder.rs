@@ -8,8 +8,8 @@ use forge_provider_api::turn::TurnOutcome;
 use forge_provider_api::{
     AgentUpdate, InvocationScope, MessageAddress, MessageClassification, MessageId, MessageRole,
     MessageUpdate, ProviderDiagnostic, ProviderError, ProviderEvent, ProviderEventSink,
-    RuntimeUpdate, TextUpdate, ToolActivityKind, ToolAddress, ToolDiagnostic, ToolInvocation,
-    ToolOutcome, ToolUpdate, TurnAddress, TurnUpdate,
+    ProviderFailureKind, RuntimeUpdate, SanitizedMessage, TextUpdate, ToolActivityKind,
+    ToolAddress, ToolDiagnostic, ToolInvocation, ToolOutcome, ToolUpdate, TurnAddress, TurnUpdate,
 };
 
 use super::message_state::{CopilotMessageStore, CopilotPhase, CopilotPhaseMetadata};
@@ -105,10 +105,11 @@ impl CopilotEventDecoder {
             .map(|turn| turn.address.clone())
     }
 
-    fn protocol(message: impl Into<String>) -> ProviderError {
-        ProviderError::Protocol {
-            message: message.into(),
-        }
+    fn protocol(_message: impl Into<String>) -> ProviderError {
+        ProviderError::Failure(forge_provider_api::error::ProviderFailure::new(
+            forge_provider_api::error::ProviderOperation::NativeTransport,
+            forge_provider_api::error::ProviderFailureKind::Protocol,
+        ))
     }
 
     fn thread(
@@ -137,14 +138,14 @@ impl CopilotEventDecoder {
     async fn diagnostic(
         &self,
         sink: &ProviderEventSink,
-        code: &str,
-        message: String,
+        kind: ProviderFailureKind,
     ) -> Result<(), ProviderError> {
         sink.send_wait(ProviderEvent::Diagnostic {
             scope: self.scope.clone().into(),
             diagnostic: ProviderDiagnostic {
-                code: Some(code.into()),
-                message,
+                kind,
+                message: SanitizedMessage::new("Provider reported a failure")
+                    .expect("static diagnostic is nonempty"),
                 fatal: false,
             },
         })
@@ -404,24 +405,20 @@ impl CopilotEventDecoder {
                 .await?;
             }
             "subagent.started" | "subagent.completed" | "subagent.failed" => {
-                sink.send_wait(ProviderEvent::Agent {
-                    scope: self.scope.clone(),
-                    update: AgentUpdate::Lifecycle {
-                        event: super::decode::agent_lifecycle(event),
-                    },
-                })
-                .await?;
+                if let Some(event) = super::decode::agent_lifecycle(event) {
+                    sink.send_wait(ProviderEvent::Agent {
+                        scope: self.scope.clone(),
+                        update: AgentUpdate::Lifecycle { event },
+                    })
+                    .await?;
+                }
             }
             "session.compaction_start" | "session.compaction_complete" => {
                 self.compaction(event, &thread, output, sink).await?;
             }
             "session.error" if !event.is_transient_error() => {
-                self.diagnostic(
-                    sink,
-                    "copilot_session_error",
-                    super::decode::session_error(event, output.session_id().map(|id| id.as_str())),
-                )
-                .await?;
+                self.diagnostic(sink, super::error::session_failure_kind(&event.data))
+                    .await?;
             }
             _ => {}
         }
@@ -440,13 +437,8 @@ impl CopilotEventDecoder {
             .and_then(Value::as_str)
             .ok_or_else(|| Self::protocol("Copilot message omitted messageId"))?;
         let phase = CopilotPhaseMetadata::parse(event.data.get("phase").and_then(Value::as_str));
-        if let CopilotPhaseMetadata::Unknown(value) = &phase {
-            self.diagnostic(
-                sink,
-                "unknown_copilot_phase",
-                format!("Unknown Copilot phase: {value}"),
-            )
-            .await?;
+        if let CopilotPhaseMetadata::Unknown(_) = &phase {
+            self.diagnostic(sink, ProviderFailureKind::Protocol).await?;
         }
         let key = (thread.into(), id.into());
         let address = if let Some(address) = self.message_address.get(&key) {
@@ -631,14 +623,15 @@ impl CopilotEventDecoder {
                     arguments.get("command").and_then(Value::as_str),
                     Some("str_replace" | "create" | "insert" | "undo_edit")
                 );
-        let invocation = crate::copilot::normalize_invocation(ToolInvocation {
+        let invocation = crate::copilot::tool_semantics::normalize_invocation(ToolInvocation {
             semantics: Default::default(),
             kind: if file_tool {
                 ToolActivityKind::FileChange
             } else {
                 ToolActivityKind::ToolCall
             },
-            title: ToolInvocation::call_title(&name, &arguments).unwrap_or_else(|| name.clone()),
+            title: crate::tool_display::call_title(&name, &arguments)
+                .unwrap_or_else(|| name.clone()),
             name,
             arguments,
         });
@@ -710,11 +703,11 @@ impl CopilotEventDecoder {
                 sink.send_wait(ProviderEvent::Diagnostic {
                     scope: self.scope.clone().into(),
                     diagnostic: ProviderDiagnostic {
-                        code: Some("copilot_shell_output_gap".into()),
-                        message: format!(
-                            "Copilot shell output sequence changed from {:?} to {sequence}",
-                            tool.output_sequence
-                        ),
+                        kind: ProviderFailureKind::Protocol,
+                        message: SanitizedMessage::new(
+                            "Provider tool output sequence was incomplete",
+                        )
+                        .expect("static diagnostic is nonempty"),
                         fatal: false,
                     },
                 })
@@ -758,7 +751,6 @@ impl CopilotEventDecoder {
                 .data
                 .pointer("/result/detailedContent")
                 .or_else(|| event.data.pointer("/result/content"))
-                .or_else(|| event.data.pointer("/error/message"))
                 .and_then(Value::as_str)
                 .map(strip_ansi_escapes::strip_str)
         } else {
@@ -785,12 +777,15 @@ impl CopilotEventDecoder {
                 &self.workspace,
             ) {
                 Ok(reported) => changes = reported,
-                Err(error) => {
+                Err(_) => {
                     sink.send_wait(ProviderEvent::Diagnostic {
                         scope: self.scope.clone().into(),
                         diagnostic: ProviderDiagnostic {
-                            code: Some("invalid_copilot_file_changes".into()),
-                            message: format!("Invalid Copilot file changes: {error:#}"),
+                            kind: ProviderFailureKind::Protocol,
+                            message: SanitizedMessage::new(
+                                "Provider file changes could not be normalized",
+                            )
+                            .expect("static diagnostic is nonempty"),
                             fatal: false,
                         },
                     })
@@ -827,27 +822,17 @@ impl CopilotEventDecoder {
                 ToolOutcome::Succeeded
             } else if super::decode::is_denied(&event.data) {
                 ToolOutcome::Denied {
-                    reason: event
-                        .data
-                        .pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Copilot denied this operation")
-                        .into(),
+                    reason: forge_provider_api::diagnostic::SanitizedMessage::new(
+                        "Provider denied this operation",
+                    )
+                    .expect("static denial is nonempty"),
                 }
             } else {
                 ToolOutcome::Failed {
                     diagnostic: ToolDiagnostic {
-                        code: event
-                            .data
-                            .pointer("/error/code")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        message: event
-                            .data
-                            .pointer("/error/message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Copilot tool failed without diagnostic details")
-                            .into(),
+                        kind: super::error::tool_failure_kind(&event.data),
+                        message: SanitizedMessage::new("Provider tool execution failed")
+                            .expect("static diagnostic is nonempty"),
                     },
                 }
             };
@@ -1003,5 +988,84 @@ impl CopilotEventDecoder {
             self.finish_turn(&thread, outcome, sink).await?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_provider_api::{BindingId, ExecutionOwner, InvocationScope};
+
+    /// Keep provider error envelopes private while retaining genuine failed-tool output.
+    #[tokio::test]
+    async fn failed_tool_output_never_publishes_native_error_payload() {
+        let scope = InvocationScope::new(ExecutionOwner::root("copilot-decoder-test"), "exchange");
+        let (sink, mut stream) = forge_provider_api::events::channel(
+            BindingId::new("copilot-decoder-binding").expect("binding id is valid"),
+            scope.clone(),
+        );
+        let mut output = forge_provider_api::completion::ProviderCompletion {
+            provider_session_id: Some(
+                "copilot-native-session"
+                    .to_owned()
+                    .try_into()
+                    .expect("fixture session id is valid"),
+            ),
+            ..Default::default()
+        };
+        let mut decoder = CopilotEventDecoder::new(scope, ".".into());
+        let event = |id: &str, kind: &str, data: Value| -> SessionEvent {
+            serde_json::from_value(serde_json::json!({
+                "id":id,
+                "type":kind,
+                "timestamp":"2026-11-02T00:00:00Z",
+                "data":data,
+            }))
+            .expect("fixture event has a valid SDK envelope")
+        };
+
+        decoder
+            .decode(
+                &event(
+                    "turn-start",
+                    "assistant.turn_start",
+                    serde_json::json!({"turnId":"0"}),
+                ),
+                &mut output,
+                &sink,
+            )
+            .await
+            .unwrap();
+        decoder
+            .decode(
+                &event(
+                    "tool-result",
+                    "tool.execution_complete",
+                    serde_json::json!({
+                        "toolCallId":"call-1",
+                        "toolName":"shell",
+                        "arguments":{"command":"safe fixture"},
+                        "success":false,
+                        "result":{"content":"visible failed-tool output"},
+                        "error":{"code":"native-code-sentinel","message":"native-message-sentinel"}
+                    }),
+                ),
+                &mut output,
+                &sink,
+            )
+            .await
+            .unwrap();
+
+        let mut visible_output = false;
+        while let Ok(event) = stream.try_recv() {
+            let encoded = serde_json::to_string(&event.event).unwrap();
+            assert!(!encoded.contains("native-code-sentinel"));
+            assert!(!encoded.contains("native-message-sentinel"));
+            visible_output |= encoded.contains("visible failed-tool output");
+        }
+        assert!(
+            visible_output,
+            "the normalized stream retains actual tool output"
+        );
     }
 }

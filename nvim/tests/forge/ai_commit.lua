@@ -5,7 +5,7 @@ local original_provider = ai_commit._provider
 local original_client = package.loaded["forge.client"]
 local original_notify = vim.notify
 local original_settings = package.loaded["forge.integrations.background_settings"]
-local function generation_get_config() return { provider = { kind = "codex" } } end
+local function generation_get_config() return { provider = { kind = "fixture_alpha" } } end
 package.loaded["forge.integrations.background_settings"] = {
   request = function(_, _, callback)
     callback({ settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
@@ -236,15 +236,15 @@ local function run()
     generation_get_config = generation_get_config,
     generation_request = function(params, callback, on_model)
       assert_equal(params.model, nil, "fallback hardcoded a provider or model")
-      on_model("selected-model (codex)")
+      on_model("selected-model (fixture_alpha)")
       callback({ state = "ready", message = "fix: use recent Harness\n\nPreserve the body." })
     end,
   }
   ai_commit.ensure("D:/harness-fallback", { ref = "HEAD" })
   assert_equal(ai_commit.state("D:/harness-fallback", "HEAD").message, "fix: use recent Harness\n\nPreserve the body.")
-  assert_equal(ai_commit.state("D:/harness-fallback", "HEAD").model, "selected-model (codex) · fast")
+  assert_equal(ai_commit.state("D:/harness-fallback", "HEAD").model, "selected-model (fixture_alpha) · fast")
   package.loaded["forge.client"].generation_request = function(_, callback)
-    callback(nil, "claude commit_message generation failed: Unsupported provider capability: text_generation")
+    callback(nil, "fixture_gamma commit_message generation failed: Unsupported provider capability: text_generation")
   end
   ai_commit.ensure("D:/unsupported-harness", { ref = "HEAD" })
   assert(ai_commit.state("D:/unsupported-harness", "HEAD").error:find("text_generation", 1, true))

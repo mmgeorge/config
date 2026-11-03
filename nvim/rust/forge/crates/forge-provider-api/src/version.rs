@@ -6,19 +6,19 @@ use std::{
     time::Duration,
 };
 
-use crate::ProviderKind;
+use crate::ProviderId;
 
 /// An adapter-owned minimum version and the runtime selected for this initialization.
 #[derive(Clone, Debug)]
 pub struct RuntimeRequirement {
-    provider: ProviderKind,
+    provider: ProviderId,
     runtime: PathBuf,
     minimum: semver::Version,
 }
 
 impl RuntimeRequirement {
     /// Create a requirement after resolving the actual executable or native connection.
-    pub fn new(provider: ProviderKind, runtime: PathBuf, minimum: semver::Version) -> Self {
+    pub fn new(provider: ProviderId, runtime: PathBuf, minimum: semver::Version) -> Self {
         Self {
             provider,
             runtime,
@@ -27,8 +27,8 @@ impl RuntimeRequirement {
     }
 
     /// Get the provider whose native runtime is being validated.
-    pub fn provider(&self) -> ProviderKind {
-        self.provider
+    pub fn provider(&self) -> &ProviderId {
+        &self.provider
     }
 
     /// Get the selected executable or native connection identity.
@@ -42,30 +42,18 @@ impl RuntimeRequirement {
     }
 
     /// Preserve a failed native probe and its selected runtime requirement.
-    pub fn probe_failed(
-        &self,
-        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-    ) -> RuntimeVersionError {
+    pub fn probe_failed(&self, failure: RuntimeProbeFailure) -> RuntimeVersionError {
         RuntimeVersionError::Probe {
-            requirement: self.clone(),
-            failure: RuntimeProbeFailure::Request {
-                source: source.into(),
-            },
+            requirement: Box::new(self.clone()),
+            failure,
         }
     }
 
     /// Preserve a probe deadline and its original timer failure.
-    pub fn probe_timed_out(
-        &self,
-        deadline: Duration,
-        source: impl std::error::Error + Send + Sync + 'static,
-    ) -> RuntimeVersionError {
+    pub fn probe_timed_out(&self, deadline: Duration) -> RuntimeVersionError {
         RuntimeVersionError::Probe {
-            requirement: self.clone(),
-            failure: RuntimeProbeFailure::TimedOut {
-                deadline,
-                source: Box::new(source),
-            },
+            requirement: Box::new(self.clone()),
+            failure: RuntimeProbeFailure::TimedOut { deadline },
         }
     }
 
@@ -77,17 +65,15 @@ impl RuntimeRequirement {
         let reported = reported
             .filter(|version| !version.trim().is_empty())
             .ok_or_else(|| RuntimeVersionError::Missing {
-                requirement: self.clone(),
+                requirement: Box::new(self.clone()),
             })?;
         let version =
-            semver::Version::parse(reported).map_err(|source| RuntimeVersionError::Malformed {
-                requirement: self.clone(),
-                reported: reported.to_owned(),
-                source,
+            semver::Version::parse(reported).map_err(|_| RuntimeVersionError::Malformed {
+                requirement: Box::new(self.clone()),
             })?;
         if version < self.minimum {
             return Err(RuntimeVersionError::Unsupported {
-                requirement: self.clone(),
+                requirement: Box::new(self.clone()),
                 detected: version,
             });
         }
@@ -131,64 +117,48 @@ impl ValidatedRuntime {
 }
 
 /// Distinguish failed requests from expired version-probe deadlines.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum RuntimeProbeFailure {
-    /// The native transport or remote runtime failed the probe.
-    Request {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-    /// The native runtime did not answer before the probe deadline.
-    TimedOut {
-        deadline: Duration,
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
+    /// The selected runtime denied access to its version endpoint.
+    PermissionDenied,
+    /// The selected runtime could not provide a version response.
+    Unavailable,
+    /// The selected runtime did not answer before the probe deadline.
+    TimedOut { deadline: Duration },
 }
 
 impl fmt::Display for RuntimeProbeFailure {
     /// Render the probe classification while retaining its underlying source.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Request { source } => write!(f, "version probe failed: {source}"),
-            Self::TimedOut {
-                deadline,
-                source: _,
-            } => write!(f, "version probe exceeded {deadline:?}"),
+            Self::PermissionDenied => f.write_str("version probe permission was denied"),
+            Self::Unavailable => f.write_str("runtime version probe was unavailable"),
+            Self::TimedOut { deadline } => write!(f, "version probe exceeded {deadline:?}"),
         }
     }
 }
 
-impl std::error::Error for RuntimeProbeFailure {
-    /// Preserve the concrete external transport or timer error at the adapter boundary.
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Request { source }
-            | Self::TimedOut {
-                source,
-                deadline: _,
-            } => Some(source.as_ref()),
-        }
-    }
-}
+impl std::error::Error for RuntimeProbeFailure {}
 
 /// Distinguish failed, missing, malformed, and unsupported runtime versions for initialization.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum RuntimeVersionError {
     /// The runtime could not provide a version because the native probe failed.
     Probe {
-        requirement: RuntimeRequirement,
+        requirement: Box<RuntimeRequirement>,
         failure: RuntimeProbeFailure,
     },
     /// The native runtime supplied no usable version.
-    Missing { requirement: RuntimeRequirement },
+    Missing {
+        requirement: Box<RuntimeRequirement>,
+    },
     /// The reported value was not a semantic version.
     Malformed {
-        requirement: RuntimeRequirement,
-        reported: String,
-        source: semver::Error,
+        requirement: Box<RuntimeRequirement>,
     },
     /// The selected runtime predates the adapter's required native API.
     Unsupported {
-        requirement: RuntimeRequirement,
+        requirement: Box<RuntimeRequirement>,
         detected: semver::Version,
     },
 }
@@ -208,13 +178,9 @@ impl fmt::Display for RuntimeVersionError {
                 f,
                 "{requirement}; no version was reported. Install a supported runtime."
             ),
-            Self::Malformed {
-                requirement,
-                reported,
-                ..
-            } => write!(
+            Self::Malformed { requirement } => write!(
                 f,
-                "{requirement}; reported version {reported:?} is invalid. Install a supported runtime."
+                "{requirement}; reported version is malformed. Install a supported runtime."
             ),
             Self::Unsupported {
                 requirement,
@@ -227,93 +193,64 @@ impl fmt::Display for RuntimeVersionError {
     }
 }
 
-impl std::error::Error for RuntimeVersionError {
-    /// Preserve the native probe or parser cause without formatting it into a string.
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Probe { failure, .. } => Some(failure),
-            Self::Malformed { source, .. } => Some(source),
-            Self::Missing { .. } | Self::Unsupported { .. } => None,
-        }
-    }
-}
+impl std::error::Error for RuntimeVersionError {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::error::Error;
 
-    /// Retain the concrete failed-probe cause together with the adapter's selected requirement.
-    #[test]
-    fn failed_probe_preserves_source_and_runtime_requirement() {
-        let requirement = RuntimeRequirement::new(
-            ProviderKind::Copilot,
-            "selected-copilot".into(),
+    fn requirement() -> RuntimeRequirement {
+        RuntimeRequirement::new(
+            crate::ProviderId::new("test-provider").unwrap(),
+            "selected-runtime".into(),
             semver::Version::new(1, 0, 103),
-        );
-        let error = requirement.probe_failed(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "fixture native status failure",
-        ));
+        )
+    }
+
+    /// Retain a sanitized failure category and the selected runtime requirement.
+    #[test]
+    fn failed_probe_preserves_category_and_runtime_requirement() {
+        let requirement = requirement();
+        let error = requirement.probe_failed(RuntimeProbeFailure::PermissionDenied);
         let RuntimeVersionError::Probe {
-            requirement,
+            requirement: actual,
             failure,
         } = &error
         else {
-            panic!("request failure lost probe classification");
+            panic!("probe failure lost its classification");
         };
-        assert_eq!(requirement.provider(), ProviderKind::Copilot);
-        assert_eq!(requirement.runtime(), Path::new("selected-copilot"));
-        assert_eq!(requirement.minimum(), &semver::Version::new(1, 0, 103));
-        assert!(matches!(failure, RuntimeProbeFailure::Request { .. }));
-        let source = error
-            .source()
-            .unwrap()
-            .source()
-            .unwrap()
-            .downcast_ref::<std::io::Error>()
-            .expect("probe failure erased the native source");
-        assert_eq!(source.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(actual.provider().as_str(), "test-provider");
+        assert_eq!(actual.runtime(), Path::new("selected-runtime"));
+        assert_eq!(actual.minimum(), &semver::Version::new(1, 0, 103));
+        assert!(matches!(failure, RuntimeProbeFailure::PermissionDenied));
+        assert!(std::error::Error::source(&error).is_none());
         let diagnostic = error.to_string();
-        assert!(
-            diagnostic.contains("selected-copilot")
-                && diagnostic.contains("1.0.103")
-                && diagnostic.contains("fixture native status failure")
-        );
+        assert!(diagnostic.contains("selected-runtime"));
+        assert!(diagnostic.contains("permission was denied"));
     }
 
-    /// Keep an expired probe distinct from a native request failure and preserve the timer source.
-    #[tokio::test]
-    async fn timed_out_probe_preserves_deadline_and_runtime_requirement() {
-        let requirement = RuntimeRequirement::new(
-            ProviderKind::Copilot,
-            "selected-copilot".into(),
-            semver::Version::new(1, 0, 103),
-        );
-        let deadline = Duration::from_millis(1);
-        let elapsed = tokio::time::timeout(deadline, std::future::pending::<()>())
-            .await
-            .unwrap_err();
-        let error = requirement.probe_timed_out(deadline, elapsed);
-        assert!(
-            matches!(&error, RuntimeVersionError::Probe { requirement: actual, failure: RuntimeProbeFailure::TimedOut { deadline: actual_deadline, .. }} if actual.runtime() == requirement.runtime() && *actual_deadline == deadline)
-        );
-        assert!(
-            error
-                .source()
-                .unwrap()
-                .source()
-                .unwrap()
-                .is::<tokio::time::error::Elapsed>()
-        );
+    /// Keep a probe timeout distinct without retaining a raw timer source.
+    #[test]
+    fn timed_out_probe_preserves_deadline_and_runtime_requirement() {
+        let requirement = requirement();
+        let deadline = Duration::from_millis(50);
+        let error = requirement.probe_timed_out(deadline);
+        assert!(matches!(
+            &error,
+            RuntimeVersionError::Probe {
+                requirement: actual,
+                failure: RuntimeProbeFailure::TimedOut { deadline: actual_deadline }
+            } if actual.runtime() == requirement.runtime() && *actual_deadline == deadline
+        ));
+        assert!(std::error::Error::source(&error).is_none());
     }
 
     /// Compare versions numerically and reject prereleases below a stable minimum.
     #[test]
-    fn initialization_requires_supported_native_version() {
+    fn initialization_requires_supported_runtime_version() {
         let requirement = RuntimeRequirement::new(
-            ProviderKind::Copilot,
-            "copilot".into(),
+            crate::ProviderId::new("test-provider").unwrap(),
+            "runtime".into(),
             semver::Version::new(1, 0, 10),
         );
         assert!(requirement.validate(Some("1.0.10")).is_ok());

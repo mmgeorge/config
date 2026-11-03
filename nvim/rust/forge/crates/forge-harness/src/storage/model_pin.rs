@@ -73,31 +73,31 @@ mod test {
     fn model_pins_persist_independently_and_isolate_providers() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = ModelPinStore::open(directory.path())?;
-        assert!(store.load("copilot")?.is_empty());
+        assert!(store.load("fixture-beta")?.is_empty());
         assert_eq!(
-            store.set("copilot", "temporarily-unavailable", true)?,
+            store.set("fixture-beta", "temporarily-unavailable", true)?,
             ["temporarily-unavailable"]
         );
-        store.set("copilot", "temporarily-unavailable", true)?;
-        store.set("codex", "another-model", true)?;
-        assert!(store.set("copilot", " ", true).is_err());
+        store.set("fixture-beta", "temporarily-unavailable", true)?;
+        store.set("fixture-alpha", "another-model", true)?;
+        assert!(store.set("fixture-beta", " ", true).is_err());
         drop(store);
         let session_store = super::super::SqliteStore::open(directory.path())?;
         drop(session_store);
         let mut reopened = ModelPinStore::open(directory.path())?;
-        assert_eq!(reopened.load("copilot")?, ["temporarily-unavailable"]);
-        assert_eq!(reopened.load("codex")?, ["another-model"]);
+        assert_eq!(reopened.load("fixture-beta")?, ["temporarily-unavailable"]);
+        assert_eq!(reopened.load("fixture-alpha")?, ["another-model"]);
         assert!(
             reopened
-                .set("copilot", "temporarily-unavailable", false)?
+                .set("fixture-beta", "temporarily-unavailable", false)?
                 .is_empty()
         );
         assert!(
             reopened
-                .set("copilot", "temporarily-unavailable", false)?
+                .set("fixture-beta", "temporarily-unavailable", false)?
                 .is_empty()
         );
-        assert_eq!(reopened.load("codex")?, ["another-model"]);
+        assert_eq!(reopened.load("fixture-alpha")?, ["another-model"]);
         Ok(())
     }
 
@@ -112,7 +112,7 @@ mod test {
             std::thread::spawn(move || -> anyhow::Result<()> {
                 let mut store = ModelPinStore::open(&data_root)?;
                 barrier.wait();
-                store.set("copilot", model, true)?;
+                store.set("fixture-beta", model, true)?;
                 Ok(())
             })
         });
@@ -120,7 +120,7 @@ mod test {
             handle.join().unwrap()?;
         }
         assert_eq!(
-            ModelPinStore::open(directory.path())?.load("copilot")?,
+            ModelPinStore::open(directory.path())?.load("fixture-beta")?,
             ["first", "second"]
         );
         Ok(())
@@ -139,7 +139,7 @@ mod test {
         let writer = std::thread::spawn(move || {
             started.send(()).unwrap();
             completed
-                .send(contender.set("copilot", "waiting-model", true))
+                .send(contender.set("fixture-beta", "waiting-model", true))
                 .unwrap();
         });
         waiting.recv()?;
@@ -153,7 +153,7 @@ mod test {
             ["waiting-model"]
         );
         writer.join().unwrap();
-        assert_eq!(holder.load("copilot")?, ["waiting-model"]);
+        assert_eq!(holder.load("fixture-beta")?, ["waiting-model"]);
         Ok(())
     }
 }

@@ -1,11 +1,11 @@
 use super::coordinator::*;
 use super::{AgentSelection, AgentSource};
 use crate::{
-    provider::{ProviderKind, ServiceTier},
+    provider::{ProviderId, ServiceTier},
     session::ApprovalMode,
 };
 
-fn selection(provider: ProviderKind) -> AgentSelection {
+fn selection(provider: ProviderId) -> AgentSelection {
     AgentSelection {
         profile: "worker".into(),
         instructions: String::new(),
@@ -37,7 +37,16 @@ fn request(operation_id: &str, task_name: &str) -> (AgentRequest, SpawnAgentRequ
 fn admit(coordinator: &AgentCoordinator, operation_id: &str, task_name: &str) -> AgentWork {
     let (request, spawn) = request(operation_id, task_name);
     let admission = coordinator
-        .reserve_spawn(&request, &spawn, selection(ProviderKind::Mock), "parent", 1)
+        .reserve_spawn(
+            &request,
+            &spawn,
+            selection(
+                forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+            ),
+            "parent",
+            1,
+        )
         .unwrap();
     match admission.commit().unwrap() {
         AgentCommit::Admitted(work) => work,
@@ -53,14 +62,32 @@ fn capacity_counts_uncommitted_and_cleanup_ownership_without_orphaning_ninth() {
             let (request, spawn) =
                 request(&format!("operation-{ordinal}"), &format!("child-{ordinal}"));
             coordinator
-                .reserve_spawn(&request, &spawn, selection(ProviderKind::Mock), "parent", 1)
+                .reserve_spawn(
+                    &request,
+                    &spawn,
+                    selection(
+                        forge_providers::registry::nonselectable_id()
+                            .expect("registry supplies a nonselectable fixture identity"),
+                    ),
+                    "parent",
+                    1,
+                )
                 .unwrap()
         })
         .collect();
     let (ninth, spawn) = request("ninth", "ninth");
     assert!(
         coordinator
-            .reserve_spawn(&ninth, &spawn, selection(ProviderKind::Mock), "parent", 1)
+            .reserve_spawn(
+                &ninth,
+                &spawn,
+                selection(
+                    forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity")
+                ),
+                "parent",
+                1
+            )
             .is_err()
     );
     assert!(coordinator.snapshot(None).is_empty());
@@ -79,7 +106,16 @@ fn capacity_counts_uncommitted_and_cleanup_ownership_without_orphaning_ninth() {
     assert_eq!(coordinator.active_count(), 8);
     assert!(
         coordinator
-            .reserve_spawn(&ninth, &spawn, selection(ProviderKind::Mock), "parent", 1)
+            .reserve_spawn(
+                &ninth,
+                &spawn,
+                selection(
+                    forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity")
+                ),
+                "parent",
+                1
+            )
             .is_err()
     );
     coordinator
@@ -87,7 +123,16 @@ fn capacity_counts_uncommitted_and_cleanup_ownership_without_orphaning_ninth() {
         .unwrap();
     assert!(
         coordinator
-            .reserve_spawn(&ninth, &spawn, selection(ProviderKind::Mock), "parent", 1)
+            .reserve_spawn(
+                &ninth,
+                &spawn,
+                selection(
+                    forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity")
+                ),
+                "parent",
+                1
+            )
             .is_ok()
     );
 }
@@ -100,7 +145,10 @@ fn retries_resolve_one_identity_and_rejected_persistence_releases_reservation() 
         .reserve_spawn(
             &request,
             &spawn,
-            selection(ProviderKind::Claude),
+            selection(
+                forge_providers::registry::alternate_id(&forge_providers::registry::default_id())
+                    .expect("registry supplies an alternate identity"),
+            ),
             "parent",
             1,
         )
@@ -109,7 +157,10 @@ fn retries_resolve_one_identity_and_rejected_persistence_releases_reservation() 
         .reserve_spawn(
             &request,
             &spawn,
-            selection(ProviderKind::Claude),
+            selection(
+                forge_providers::registry::alternate_id(&forge_providers::registry::default_id())
+                    .expect("registry supplies an alternate identity"),
+            ),
             "parent",
             2,
         )
@@ -125,7 +176,12 @@ fn retries_resolve_one_identity_and_rejected_persistence_releases_reservation() 
             .reserve_spawn(
                 &request,
                 &conflict,
-                selection(ProviderKind::Claude),
+                selection(
+                    forge_providers::registry::alternate_id(
+                        &forge_providers::registry::default_id()
+                    )
+                    .expect("registry supplies an alternate identity")
+                ),
                 "parent",
                 3
             )
@@ -137,7 +193,12 @@ fn retries_resolve_one_identity_and_rejected_persistence_releases_reservation() 
             .reserve_spawn(
                 &duplicate,
                 &spawn,
-                selection(ProviderKind::Claude),
+                selection(
+                    forge_providers::registry::alternate_id(
+                        &forge_providers::registry::default_id()
+                    )
+                    .expect("registry supplies an alternate identity")
+                ),
                 "parent",
                 3
             )
@@ -149,7 +210,12 @@ fn retries_resolve_one_identity_and_rejected_persistence_releases_reservation() 
             .reserve_spawn(
                 &failed,
                 &spawn,
-                selection(ProviderKind::Claude),
+                selection(
+                    forge_providers::registry::alternate_id(
+                        &forge_providers::registry::default_id(),
+                    )
+                    .expect("registry supplies an alternate identity"),
+                ),
                 "parent",
                 3,
             )
@@ -159,7 +225,10 @@ fn retries_resolve_one_identity_and_rejected_persistence_releases_reservation() 
         .reserve_spawn(
             &failed,
             &spawn,
-            selection(ProviderKind::Claude),
+            selection(
+                forge_providers::registry::alternate_id(&forge_providers::registry::default_id())
+                    .expect("registry supplies an alternate identity"),
+            ),
             "parent",
             4,
         )
@@ -281,7 +350,11 @@ fn settled_task_selects_only_the_next_queued_task_and_retains_selection() {
         .unwrap()
         .unwrap();
     assert_eq!(next.task.id, second.task.id);
-    assert_eq!(next.agent.selection.unwrap().provider, ProviderKind::Mock);
+    assert_eq!(
+        next.agent.selection.unwrap().provider,
+        forge_providers::registry::nonselectable_id()
+            .expect("registry supplies a nonselectable fixture identity")
+    );
     assert_eq!(coordinator.active_count(), 1);
     assert!(
         coordinator
@@ -296,10 +369,28 @@ fn reservation_drop_releases_capacity_and_cancel_revokes_replay() {
     let coordinator = AgentCoordinator::new("root".into());
     let (request, spawn) = request("operation", "worker");
     let original = coordinator
-        .reserve_spawn(&request, &spawn, selection(ProviderKind::Mock), "parent", 1)
+        .reserve_spawn(
+            &request,
+            &spawn,
+            selection(
+                forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+            ),
+            "parent",
+            1,
+        )
         .unwrap();
     let replay = coordinator
-        .reserve_spawn(&request, &spawn, selection(ProviderKind::Mock), "parent", 2)
+        .reserve_spawn(
+            &request,
+            &spawn,
+            selection(
+                forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+            ),
+            "parent",
+            2,
+        )
         .unwrap();
     let original_id = original.task.id.clone();
     drop(original);
@@ -308,20 +399,56 @@ fn reservation_drop_releases_capacity_and_cancel_revokes_replay() {
 
     let (request, spawn) = super::coordinator_test::request("cancelled", "worker");
     let original = coordinator
-        .reserve_spawn(&request, &spawn, selection(ProviderKind::Mock), "parent", 3)
+        .reserve_spawn(
+            &request,
+            &spawn,
+            selection(
+                forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+            ),
+            "parent",
+            3,
+        )
         .unwrap();
     let replay = coordinator
-        .reserve_spawn(&request, &spawn, selection(ProviderKind::Mock), "parent", 4)
+        .reserve_spawn(
+            &request,
+            &spawn,
+            selection(
+                forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+            ),
+            "parent",
+            4,
+        )
         .unwrap();
     original.cancel().unwrap();
     assert!(replay.commit().is_err());
     let retried = coordinator
-        .reserve_spawn(&request, &spawn, selection(ProviderKind::Mock), "parent", 5)
+        .reserve_spawn(
+            &request,
+            &spawn,
+            selection(
+                forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+            ),
+            "parent",
+            5,
+        )
         .unwrap();
     let retried_id = retried.task.id.clone();
     drop(retried);
     let fresh = coordinator
-        .reserve_spawn(&request, &spawn, selection(ProviderKind::Mock), "parent", 6)
+        .reserve_spawn(
+            &request,
+            &spawn,
+            selection(
+                forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+            ),
+            "parent",
+            6,
+        )
         .unwrap();
     assert_ne!(fresh.task.id, retried_id);
 }
@@ -356,7 +483,16 @@ fn overlapping_policy_transitions_close_new_admission_and_preserve_durable_repla
     let (next, spawn) = request("second", "second");
     assert!(
         coordinator
-            .reserve_spawn(&next, &spawn, selection(ProviderKind::Mock), "parent", 2)
+            .reserve_spawn(
+                &next,
+                &spawn,
+                selection(
+                    forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity")
+                ),
+                "parent",
+                2
+            )
             .is_err()
     );
     assert!(
@@ -367,7 +503,16 @@ fn overlapping_policy_transitions_close_new_admission_and_preserve_durable_repla
     let (replay, spawn) = request("first", "review");
     assert_eq!(
         coordinator
-            .reserve_spawn(&replay, &spawn, selection(ProviderKind::Mock), "parent", 2)
+            .reserve_spawn(
+                &replay,
+                &spawn,
+                selection(
+                    forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies a nonselectable fixture identity")
+                ),
+                "parent",
+                2
+            )
             .unwrap()
             .task
             .id,

@@ -1,9 +1,6 @@
 use super::*;
-use crate::provider::submission::{SubmissionState, SubmissionStore, SubmissionTarget};
-use crate::provider::{
-    PromptMode, ProviderDescriptor, ProviderError, ProviderEventSink, ProviderInput, ProviderKind,
-    ServiceTier,
-};
+use crate::provider::submission::{SubmissionState, SubmissionStore};
+use crate::provider::{PromptMode, ProviderError, ProviderInput, ServiceTier};
 use crate::session::ApprovalMode;
 
 #[derive(Clone, Copy)]
@@ -15,241 +12,208 @@ enum BackgroundFinish {
     NoisyTimeout,
 }
 
-/// Retain the actual session delivery lane until the simulated native command settles.
-struct BackgroundProvider {
-    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+#[derive(Clone)]
+struct BackgroundObservation {
+    scope: crate::provider::InvocationScope,
+    address: crate::provider::ToolAddress,
+}
+
+fn background_provider(
     finish: BackgroundFinish,
     output_count: usize,
-    session_sink: tokio::sync::Mutex<Option<ProviderEventSink>>,
-    background: tokio::sync::Mutex<Option<(ProviderEventSink, crate::provider::ToolAddress)>>,
-    shutdown_called: std::sync::atomic::AtomicBool,
-}
-
-impl BackgroundProvider {
-    async fn finish_background(&self) -> Result<()> {
-        let pending = self.background.lock().await.take();
-        if let Some((sink, address)) = pending {
-            for sequence in 0..self.output_count {
-                sink.send_wait(ProviderEvent::Tool {
-                    address: address.clone(),
-                    update: crate::provider::ToolUpdate::Output {
-                        update: crate::provider::TextUpdate::Append(format!("END-{sequence}\n")),
+    shutdown_called: Arc<std::sync::atomic::AtomicBool>,
+) -> Arc<crate::provider::test_support::EventFixtureProvider> {
+    let pending = Arc::new(std::sync::Mutex::new(None::<BackgroundObservation>));
+    let prompt_pending = pending.clone();
+    let descriptor = forge_providers::registry::descriptor(
+        &forge_providers::registry::nonselectable_id().expect("mock fixture identity"),
+    )
+    .expect("mock fixture descriptor");
+    let provider = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        move |request, sink, mut cancelled| {
+            let pending = prompt_pending.clone();
+            async move {
+                let scope = request.scope.clone();
+                let turn = crate::provider::TurnAddress {
+                    scope: scope.clone(),
+                    thread_id: "fixture-thread".into(),
+                    turn_id: "fixture-turn".into(),
+                };
+                let address = crate::provider::ToolAddress {
+                    turn: turn.clone(),
+                    tool_id: "background-tool".into(),
+                };
+                let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
+                    scope.clone(),
+                    forge_provider_api::lifecycle::ExecutionUpdate::Started { address: turn },
+                )?;
+                sink.send_wait(ProviderEvent::Execution { observation })
+                    .await?;
+                for update in [
+                    crate::provider::ToolUpdate::Requested {
+                        invocation: crate::provider::ToolInvocation {
+                            semantics: Default::default(),
+                            kind: crate::provider::ToolActivityKind::Command,
+                            name: "exec".into(),
+                            title: "Background command".into(),
+                            arguments: serde_json::json!({}),
+                        },
                     },
-                })
+                    crate::provider::ToolUpdate::Started,
+                    crate::provider::ToolUpdate::Output {
+                        update: crate::provider::TextUpdate::Append("BEGIN\n".into()),
+                    },
+                    crate::provider::ToolUpdate::Backgrounded,
+                ] {
+                    sink.send_wait(ProviderEvent::Tool {
+                        address: address.clone(),
+                        update,
+                    })
+                    .await?;
+                }
+                *pending.lock().unwrap() = Some(BackgroundObservation {
+                    scope,
+                    address: address.clone(),
+                });
+                if matches!(finish, BackgroundFinish::NoisyTimeout) {
+                    loop {
+                        tokio::select! {
+                            changed = cancelled.changed() => {
+                                if changed.is_err() || *cancelled.borrow() { return Ok(()); }
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
+                                sink.send_wait(ProviderEvent::Tool {
+                                    address: address.clone(),
+                                    update: crate::provider::ToolUpdate::Output {
+                                        update: crate::provider::TextUpdate::Append("still running\n".into()),
+                                    },
+                                }).await?;
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+        },
+    );
+    let active_provider = Arc::downgrade(&provider);
+    let active_pending = pending.clone();
+    provider.with_active_session_id(move |owner| {
+        let provider = active_provider
+            .upgrade()
+            .expect("fixture remains alive during session lookup");
+        let pending = active_pending.clone();
+        async move {
+            if matches!(finish, BackgroundFinish::IdentityLookup) {
+                publish_background_terminal(
+                    &provider,
+                    &pending,
+                    finish,
+                    output_count,
+                    crate::provider::ToolOutcome::Succeeded,
+                )
                 .await?;
             }
-            sink.send_wait(ProviderEvent::Tool {
-                address,
-                update: crate::provider::ToolUpdate::Finished {
-                    outcome: match self.finish {
-                        BackgroundFinish::Shutdown
-                        | BackgroundFinish::ForeignOwner
-                        | BackgroundFinish::PriorTask
-                        | BackgroundFinish::NoisyTimeout => {
-                            crate::provider::ToolOutcome::Interrupted
-                        }
-                        BackgroundFinish::IdentityLookup => crate::provider::ToolOutcome::Succeeded,
-                    },
-                },
-            })
-            .await?;
+            if owner.session_id.as_str().is_empty() {
+                return Err(fixture_provider_error(
+                    forge_provider_api::ProviderFailureKind::Rejected,
+                ));
+            }
+            Ok(Some(
+                "fixture-session"
+                    .to_owned()
+                    .try_into()
+                    .expect("fixture session ID is nonempty"),
+            ))
         }
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::provider::ProviderAdapter for BackgroundProvider {
-    type Host = crate::provider::HarnessProviderHost;
-    fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            kind: ProviderKind::Mock,
-            label: "background child fixture".into(),
-            capability: Default::default(),
-        }
-    }
-
-    async fn session_events(
-        &self,
-        owner: crate::provider::ExecutionOwner,
-    ) -> std::result::Result<
-        crate::provider::events::ProviderEventStream,
-        crate::provider::ProviderError,
-    > {
-        let stream = self.fixture_events.subscribe(owner.clone())?;
-        *self.session_sink.lock().await = Some(self.fixture_events.session_sink(&owner)?);
-        Ok(stream)
-    }
-
-    async fn session_prompt(
-        self: std::sync::Arc<Self>,
-        request: crate::provider::ProviderRequest,
-        scope: crate::provider::InvocationScope,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let events = self.fixture_events.clone();
-        events
-            .submit(
-                request,
-                scope,
-                crate::provider::TerminalBoundary::LocalFixture,
-                move |request, sink| async move { self.run_native(request, sink).await },
-            )
-            .await
-    }
-
-    async fn active_session_id_for(
-        &self,
-        _: &str,
-    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
-        if matches!(self.finish, BackgroundFinish::IdentityLookup) {
-            self.finish_background()
-                .await
-                .expect("fixture session lane must remain open during identity lookup");
-        }
-        Ok(Some("child-thread".to_owned().try_into()?))
-    }
-
-    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move {
-            self.shutdown_called
-                .store(true, std::sync::atomic::Ordering::Release);
-            self.finish_background().await?;
-            self.session_sink.lock().await.take();
+    });
+    let shutdown_provider = Arc::downgrade(&provider);
+    let shutdown_pending = pending.clone();
+    provider.with_shutdown(move || {
+        let provider = shutdown_provider
+            .upgrade()
+            .expect("fixture remains alive during shutdown");
+        let pending = shutdown_pending.clone();
+        let shutdown_called = shutdown_called.clone();
+        async move {
+            shutdown_called.store(true, std::sync::atomic::Ordering::Release);
+            if matches!(
+                finish,
+                BackgroundFinish::Shutdown | BackgroundFinish::PriorTask
+            ) {
+                publish_background_terminal(
+                    &provider,
+                    &pending,
+                    finish,
+                    output_count,
+                    crate::provider::ToolOutcome::Interrupted,
+                )
+                .await?;
+            }
+            if matches!(finish, BackgroundFinish::ForeignOwner) {
+                reject_foreign_background_scope(&provider, &pending).await?;
+            }
             Ok(())
         }
-        .await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::Shutdown,
-                source,
-            )
-        })
-    }
-    async fn cleanup_execution(
-        &self,
-        _: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
-                source,
-            )
-        })
-    }
-    async fn fence_session(
-        &self,
-        owner: &ExecutionOwner,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> =
-            async move { self.fixture_events.cancel(owner).await.map_err(Into::into) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::FenceSession,
-                source,
-            )
-        })
-    }
-    async fn cancel_session(
-        &self,
-        _: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CancelSession,
-                source,
-            )
-        })
-    }
-    async fn has_active_turn(&self, _: &str) -> bool {
-        false
-    }
+    });
+    provider
 }
 
-impl BackgroundProvider {
-    async fn run_native(
-        &self,
-        _: ProviderRequest,
-        sink: ProviderEventSink,
-    ) -> Result<ProviderCompletion, ProviderError> {
-        let scope = sink.invocation_scope()?.clone();
-        let address = crate::provider::ToolAddress {
-            turn: crate::provider::TurnAddress {
-                scope: scope.clone(),
-                thread_id: "child-thread".into(),
-                turn_id: "child-turn".into(),
+async fn publish_background_terminal(
+    provider: &crate::provider::test_support::EventFixtureProvider,
+    pending: &std::sync::Mutex<Option<BackgroundObservation>>,
+    finish: BackgroundFinish,
+    output_count: usize,
+    outcome: crate::provider::ToolOutcome,
+) -> std::result::Result<(), ProviderError> {
+    let Some(mut observed) = pending.lock().unwrap().take() else {
+        return Ok(());
+    };
+    if matches!(finish, BackgroundFinish::PriorTask) {
+        observed.scope.exchange_id = "prior-child-task".into();
+        observed.address.turn.scope = observed.scope.clone();
+    }
+    let sink = provider.invocation_sink(&observed.scope).await?;
+    for sequence in 0..output_count {
+        sink.send_wait(ProviderEvent::Tool {
+            address: observed.address.clone(),
+            update: crate::provider::ToolUpdate::Output {
+                update: crate::provider::TextUpdate::Append(format!("END-{sequence}\n")),
             },
-            tool_id: "background-tool".into(),
-        };
-        sink.send_wait(ProviderEvent::Execution {
-            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                scope.clone(),
-                forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                    address: address.turn.clone(),
-                },
-            )
-            .expect("execution scope is derived from its native address"),
         })
         .await?;
-        for update in [
-            crate::provider::ToolUpdate::Requested {
-                invocation: crate::provider::ToolInvocation {
-                    semantics: Default::default(),
-                    kind: crate::provider::ToolActivityKind::Command,
-                    name: "exec".into(),
-                    title: "Background command".into(),
-                    arguments: serde_json::json!({}),
-                },
-            },
-            crate::provider::ToolUpdate::Started,
-            crate::provider::ToolUpdate::Output {
-                update: crate::provider::TextUpdate::Append("BEGIN\n".into()),
-            },
-            crate::provider::ToolUpdate::Backgrounded,
-        ] {
-            sink.send_wait(ProviderEvent::Tool {
-                address: address.clone(),
-                update,
-            })
-            .await?;
-        }
-        let mut observed_scope = scope;
-        if matches!(self.finish, BackgroundFinish::NoisyTimeout) {
-            loop {
-                sink.send_wait(ProviderEvent::Tool {
-                    address: address.clone(),
-                    update: crate::provider::ToolUpdate::Output {
-                        update: crate::provider::TextUpdate::Append("still running\n".into()),
-                    },
-                })
-                .await?;
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        }
-        match self.finish {
-            BackgroundFinish::ForeignOwner => {
-                observed_scope.owner.agent_id = "foreign-child".into()
-            }
-            BackgroundFinish::PriorTask => observed_scope.exchange_id = "prior-child-task".into(),
-            BackgroundFinish::Shutdown
-            | BackgroundFinish::IdentityLookup
-            | BackgroundFinish::NoisyTimeout => {}
-        }
-        let mut observed_address = address;
-        observed_address.turn.scope = observed_scope.clone();
-        let observer = self
-            .session_sink
-            .lock()
-            .await
-            .as_ref()
-            .context("runtime did not subscribe to child session events")?
-            .invocation_sink(&observed_scope)?;
-        *self.background.lock().await = Some((observer, observed_address));
-        Ok(ProviderCompletion::default())
     }
+    sink.send_wait(ProviderEvent::Tool {
+        address: observed.address,
+        update: crate::provider::ToolUpdate::Finished { outcome },
+    })
+    .await?;
+    Ok(())
 }
 
+async fn reject_foreign_background_scope(
+    provider: &crate::provider::test_support::EventFixtureProvider,
+    pending: &std::sync::Mutex<Option<BackgroundObservation>>,
+) -> std::result::Result<(), ProviderError> {
+    let Some(observed) = pending.lock().unwrap().take() else {
+        return Ok(());
+    };
+    let session_sink = provider.event_sink(&observed.scope.owner).await?;
+    let mut foreign = observed.scope;
+    foreign.owner.agent_id = "foreign-child".into();
+    session_sink.bind_scope(forge_provider_api::EventScope::from(foreign))?;
+    Err(fixture_provider_error(
+        forge_provider_api::ProviderFailureKind::Protocol,
+    ))
+}
+
+fn fixture_provider_error(kind: forge_provider_api::ProviderFailureKind) -> ProviderError {
+    ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+        forge_provider_api::ProviderOperation::NativeTransport,
+        kind,
+    ))
+}
 async fn collect_background_child(
     finish: BackgroundFinish,
     output_count: usize,
@@ -263,14 +227,10 @@ async fn collect_background_child(
         session_id: "session".into(),
         agent_id: "child".into(),
     };
-    let provider = Arc::new(BackgroundProvider {
-        fixture_events: Default::default(),
-        finish,
-        output_count,
-        session_sink: Default::default(),
-        background: Default::default(),
-        shutdown_called: Default::default(),
-    });
+    let shutdown_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let native = background_provider(finish, output_count, shutdown_called.clone());
+    let test_provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    let provider = test_provider.provider_handle();
     let runtime = AgentRuntime {
         execution_registry: Arc::new(
             crate::provider::session_execution::SessionExecutionRegistry::new(
@@ -372,9 +332,7 @@ async fn collect_background_child(
     .context("child cleanup blocked while observation queues filled")??;
     running.await??;
     assert!(
-        provider
-            .shutdown_called
-            .load(std::sync::atomic::Ordering::Acquire),
+        shutdown_called.load(std::sync::atomic::Ordering::Acquire),
         "scope failure skipped provider cleanup"
     );
     assert!(
@@ -446,7 +404,7 @@ async fn noisy_child_tool_timeout_stops_execution_and_cleans_up() -> Result<()> 
         update: crate::provider::ToolUpdate::Finished {
             outcome: crate::provider::ToolOutcome::Failed { diagnostic },
         }, ..
-    } if diagnostic.code.as_deref() == Some("tool_timeout")))
+    } if diagnostic.kind == forge_provider_api::ProviderFailureKind::Timeout))
     );
     Ok(())
 }
@@ -480,10 +438,10 @@ async fn background_shutdown_drains_full_provider_queue_before_child_completion(
     Ok(())
 }
 
-/// Reject a well-formed foreign-owner stream at the runtime boundary while still cleaning up.
+/// Reject a foreign-owner normalized event scope before child forwarding, then collect cleanup.
 #[tokio::test]
-async fn foreign_owner_session_event_fails_child_without_forwarding_or_skipping_cleanup()
--> Result<()> {
+async fn foreign_owner_event_scope_fails_child_without_forwarding_or_skipping_cleanup() -> Result<()>
+{
     let events = collect_background_child(BackgroundFinish::ForeignOwner, 1).await?;
     assert!(
         !events.iter().any(|event| matches!(
@@ -523,149 +481,6 @@ enum SubmissionBoundary {
     Accepted,
 }
 
-struct ProviderCancelledProvider {
-    fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
-    boundary: SubmissionBoundary,
-}
-
-#[async_trait::async_trait]
-impl crate::provider::ProviderAdapter for ProviderCancelledProvider {
-    type Host = crate::provider::HarnessProviderHost;
-    /// Use a tracked provider kind without launching an external provider.
-    fn descriptor(&self) -> ProviderDescriptor {
-        ProviderDescriptor {
-            kind: ProviderKind::Codex,
-            label: "cancelled child".into(),
-            capability: {
-                let mut capability = crate::provider::mock_capability();
-                capability.integration.tracked_submission = true;
-                capability.integration.local_acceptance = false;
-                capability
-            },
-        }
-    }
-    /// Complete fixture cleanup without resources.
-    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::Shutdown,
-                source,
-            )
-        })
-    }
-    /// Leave cancellation cleanup successful.
-    async fn cleanup_execution(
-        &self,
-        _: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
-                source,
-            )
-        })
-    }
-    /// Leave cancellation cleanup successful.
-    async fn fence_session(
-        &self,
-        owner: &ExecutionOwner,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> =
-            async move { self.fixture_events.cancel(owner).await.map_err(Into::into) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::FenceSession,
-                source,
-            )
-        })
-    }
-    async fn cancel_session(
-        &self,
-        _: &str,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let result: anyhow::Result<()> = async move { Ok(()) }.await;
-        result.map_err(|source| {
-            crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CancelSession,
-                source,
-            )
-        })
-    }
-    /// No native turn remains after the fixture response.
-    async fn has_active_turn(&self, _: &str) -> bool {
-        false
-    }
-    /// Do not invent a native conversation after cancellation.
-    async fn active_session_id_for(
-        &self,
-        _: &str,
-    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
-        Ok(None)
-    }
-    /// Transfer the fixture's owned observation stream to its execution engine.
-    async fn session_events(
-        &self,
-        owner: crate::provider::ExecutionOwner,
-    ) -> std::result::Result<
-        crate::provider::events::ProviderEventStream,
-        crate::provider::ProviderError,
-    > {
-        let stream = self.fixture_events.subscribe(owner.clone())?;
-        Ok(stream)
-    }
-
-    async fn session_prompt(
-        self: std::sync::Arc<Self>,
-        request: crate::provider::ProviderRequest,
-        scope: crate::provider::InvocationScope,
-    ) -> std::result::Result<(), crate::provider::ProviderError> {
-        let events = self.fixture_events.clone();
-        events
-            .submit(
-                request,
-                scope,
-                crate::provider::TerminalBoundary::LocalFixture,
-                move |request, sink| async move { self.run_native(request, sink).await },
-            )
-            .await
-    }
-}
-
-impl ProviderCancelledProvider {
-    async fn run_native(
-        &self,
-        request: ProviderRequest,
-        _: ProviderEventSink,
-    ) -> Result<ProviderCompletion, ProviderError> {
-        let submission = request.submission.as_ref().unwrap();
-        match self.boundary {
-            SubmissionBoundary::Prepared => {}
-            SubmissionBoundary::Sending => submission
-                .sending(SubmissionTarget::native(
-                    "codex",
-                    "thread",
-                    serde_json::json!({}),
-                ))
-                .map_err(ProviderError::from)?,
-            SubmissionBoundary::Accepted => {
-                submission
-                    .sending(SubmissionTarget::native(
-                        "codex",
-                        "thread",
-                        serde_json::json!({}),
-                    ))
-                    .map_err(ProviderError::from)?;
-                submission
-                    .accepted("accepted".into())
-                    .map_err(ProviderError::from)?;
-            }
-        }
-        Err(ProviderError::Cancelled)
-    }
-}
-
 /// Provider cancellation excludes only unsent child input while preserving uncertain or accepted delivery.
 #[tokio::test]
 async fn independent_provider_cancellation_preserves_child_submission_boundaries() -> Result<()> {
@@ -699,12 +514,27 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
             recovered_input: Vec::new(),
             control_context: None,
         };
-        let submission = store.prepare(&request, ProviderKind::Codex)?;
+        let mut descriptor = forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().expect("mock fixture identity"),
+        )
+        .expect("mock fixture descriptor");
+        descriptor.capability.integration.tracked_submission = true;
+        descriptor.capability.integration.local_acceptance = false;
+        let native =
+            crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
+                Err(ProviderError::Cancelled)
+            });
+        if matches!(boundary, SubmissionBoundary::Prepared) {
+            native.with_pre_dispatch(|_| async { Err(ProviderError::Cancelled) });
+        }
+        if matches!(boundary, SubmissionBoundary::Sending) {
+            native.with_admission(|_| Err(ProviderError::DeliveryUncertain));
+        }
+        let test_provider =
+            crate::provider::test_support::ProviderTestSession::from_native(native)?;
+        let provider = test_provider.provider_handle();
+        let submission = store.prepare(&request, provider.descriptor().kind)?;
         request.submission = Some(submission.clone());
-        let provider: Arc<Provider> = Arc::new(ProviderCancelledProvider {
-            fixture_events: Default::default(),
-            boundary,
-        });
         AgentRuntime {
             execution_registry: Arc::new(
                 crate::provider::session_execution::SessionExecutionRegistry::new(
@@ -752,7 +582,11 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
         assert!(
             error.chain().any(|cause| matches!(
                 cause.downcast_ref::<ProviderError>(),
-                Some(ProviderError::Observation(_) | ProviderError::DeliveryUncertain { .. })
+                Some(
+                    ProviderError::Observation(_)
+                        | ProviderError::DeliveryUncertain
+                        | ProviderError::Cancelled
+                )
             )),
             "an uncertified native cancellation must remain uncertain: {error:#}"
         );

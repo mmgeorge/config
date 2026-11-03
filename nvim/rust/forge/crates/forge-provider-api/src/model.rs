@@ -2,40 +2,72 @@ use crate::{
     ServiceTier, access::AccessPolicy, agent::AgentCapability, approval::ApprovalMode,
     catalog::CatalogCapability, compaction::CompactionCapability,
 };
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use thiserror::Error;
 
-/// Identifies one supported provider implementation without leaking launch strings across consumers.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
-    Codex,
-    Copilot,
-    /// Uses the published Claude Code ACP adapter.
-    Claude,
-    /// Uses Google's standalone Antigravity ACP server.
-    Antigravity,
-    Mock,
+/// Identifies a provider without exposing its native launch or protocol details.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct ProviderId(String);
+
+/// Reject invalid serialized or constructed provider identities.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ProviderIdError {
+    /// Provider identities cannot be empty or whitespace-only.
+    #[error("provider identity cannot be empty")]
+    Empty,
+    /// Provider identities cannot contain surrounding whitespace.
+    #[error("provider identity cannot have surrounding whitespace")]
+    SurroundingWhitespace,
 }
 
-impl ProviderKind {
-    /// Parse one persisted provider name into the supported provider set.
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "codex" => Ok(Self::Codex),
-            "copilot" => Ok(Self::Copilot),
-            "claude" => Ok(Self::Claude),
-            "antigravity" | "agy" => Ok(Self::Antigravity),
-            "mock" => Ok(Self::Mock),
-            _ => anyhow::bail!("unsupported Harness provider: {value}"),
+impl ProviderId {
+    /// Create an opaque provider identity from a nonempty canonical identifier.
+    pub fn new(value: impl Into<String>) -> std::result::Result<Self, ProviderIdError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(ProviderIdError::Empty);
         }
+        if value != value.trim() {
+            return Err(ProviderIdError::SurroundingWhitespace);
+        }
+        Ok(Self(value))
+    }
+
+    /// Get the serialized identity used by persistence and host protocols.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for ProviderId {
+    type Error = ProviderIdError;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderId {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for ProviderId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
     }
 }
 
 /// Describes provider identity and capability for broker and editor consumers.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderDescriptor {
-    pub kind: ProviderKind,
+    pub kind: ProviderId,
     pub label: String,
     pub capability: ProviderCapability,
 }
@@ -74,10 +106,18 @@ pub struct ProviderCapability {
     pub catalog: CatalogCapability,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum AccessCapabilityError {
+    #[error("This provider cannot enforce Forge's OS sandbox")]
+    SandboxUnsupported,
+    #[error("Unsupported isolation mode")]
+    IsolationModeUnsupported,
+}
+
 /// Represents one executable provider launch descriptor.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderLaunch {
-    pub kind: String,
+    pub kind: ProviderId,
     pub command: Vec<String>,
 }
 
@@ -164,21 +204,19 @@ impl ProviderCapability {
     }
 
     /// Reject OS isolation requests that this provider cannot enforce.
-    pub fn validate_access(&self, access: &AccessPolicy) -> Result<()> {
-        anyhow::ensure!(
-            !access.sandbox || self.supports_sandbox(),
-            "This provider cannot enforce Forge's OS sandbox"
-        );
+    pub fn validate_access(&self, access: &AccessPolicy) -> Result<(), AccessCapabilityError> {
+        if access.sandbox && !self.supports_sandbox() {
+            return Err(AccessCapabilityError::SandboxUnsupported);
+        }
         if access.sandbox
             && let Some(mode) = &access.isolation_mode
+            && !self
+                .integration
+                .isolation_modes
+                .iter()
+                .any(|choice| &choice.id == mode)
         {
-            anyhow::ensure!(
-                self.integration
-                    .isolation_modes
-                    .iter()
-                    .any(|choice| &choice.id == mode),
-                "Unsupported isolation mode: {mode}"
-            );
+            return Err(AccessCapabilityError::IsolationModeUnsupported);
         }
         Ok(())
     }

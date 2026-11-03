@@ -1,13 +1,10 @@
-pub use forge_provider_api::retry::{ProviderRetry, RetryableFailure};
+pub use forge_provider_api::retry::ProviderRetry;
 use std::time::Duration;
 
 use anyhow::Result;
 use serde_json::{Value, json};
 
-use super::{
-    ProviderCompletion, ProviderEvent, ProviderEventSink, ProviderInput, ProviderRequest,
-    TurnAddress,
-};
+use super::{ProviderCompletion, ProviderEvent, ProviderEventSink, ProviderRequest, TurnAddress};
 use crate::trace::TraceStore;
 
 const RETRY_DELAY_SECONDS: [u64; 5] = [1, 5, 10, 30, 60];
@@ -132,25 +129,18 @@ pub(crate) async fn execute_until_ready(
                 return Ok(RetryAttempt::Ready(Box::new(outcome)));
             }
         };
-        progress.record(
-            "failed",
-            json!({"code":failure.code,"error":failure.detail,"message":failure.message,
-            "thread_id":failure.address.thread_id,"turn_id":failure.address.turn_id}),
-        );
+        progress.record("failed", json!({"category":failure.category}));
         let Some(delay_seconds) = RETRY_DELAY_SECONDS.get(progress.attempt).copied() else {
-            progress.record(
-                "exhausted",
-                json!({"code":failure.code,"error":failure.detail,"message":failure.message}),
-            );
+            progress.record("exhausted", json!({"category":failure.category}));
             publish(&event_sink, address, None).await?;
             progress.pending = false;
             return Ok(RetryAttempt::Ready(Box::new(outcome)));
         };
         address = Some(failure.address.clone());
-        request.provider_session_id = Some(failure.address.thread_id.clone().try_into()?);
-        request.input = ProviderInput::from_text(
-            "Continue the previous request after the temporary provider failure. Preserve the original instructions and complete only unfinished work.",
-        );
+        request
+            .control_context
+            .get_or_insert_with(|| crate::tools::ControlTurnContext::inactive(request.mode))
+            .provider_continuation = Some(failure.continuation.clone());
         request.submission = None;
         request.recovered_input.clear();
         progress.attempt += 1;
@@ -228,26 +218,18 @@ where
             }
             return Err(error.into());
         };
-        progress.record(
-            "failed",
-            json!({"code":failure.code,"error":failure.detail,"message":failure.message,
-            "thread_id":failure.address.thread_id,"turn_id":failure.address.turn_id}),
-        );
+        progress.record("failed", json!({"category":failure.category}));
         let Some(delay_seconds) = RETRY_DELAY_SECONDS.get(progress.attempt).copied() else {
-            progress.record(
-                "exhausted",
-                json!({"code":failure.code,"error":failure.detail,"message":failure.message}),
-            );
+            progress.record("exhausted", json!({"category":failure.category}));
             publish(&event_sink, address.clone(), None).await?;
             progress.pending = false;
             return Err(error.into());
         };
         address = Some(failure.address.clone());
-        request.provider_session_id = Some(failure.address.thread_id.clone().try_into()?);
-        // The native thread already contains the request. Do not append it a second time.
-        request.input = ProviderInput::from_text(
-            "Continue the previous request after the temporary provider failure. Preserve the original instructions and complete only unfinished work.",
-        );
+        request
+            .control_context
+            .get_or_insert_with(|| crate::tools::ControlTurnContext::inactive(request.mode))
+            .provider_continuation = Some(failure.continuation.clone());
         request.submission = None;
         request.recovered_input.clear();
         progress.attempt += 1;
@@ -330,141 +312,157 @@ pub(crate) fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::provider::test_support::retry_prompt as prompt;
-    use crate::provider::{
-        ExecutionOwner, InvocationScope, PromptMode, ProviderDescriptor, ProviderError,
-        ProviderKind,
+    use crate::provider::{ExecutionOwner, InvocationScope, PromptMode, ProviderInput};
+    use forge_provider_api::{
+        ProviderError, ProviderEvent, TurnAddress,
+        completion::ProviderCompletion as ApiCompletion,
+        events::ProviderEventSink as ApiEventSink,
+        lifecycle::{ExecutionFailure, ExecutionObservation, ExecutionResult, ExecutionUpdate},
+        retry::RetryCategory,
     };
-    use std::sync::Mutex;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    struct FailureProvider {
-        fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
+    #[derive(Clone, Copy)]
+    enum Ending {
+        Completed,
+        Cancelled,
+        Rejected,
+    }
+
+    struct ScriptLog {
+        prompt_count: AtomicUsize,
+        continuation_count: AtomicUsize,
+        attempts: Mutex<Vec<(usize, tokio::time::Instant)>>,
+        selected_model: Mutex<Option<String>>,
+    }
+
+    fn descriptor() -> forge_provider_api::ProviderDescriptor {
+        forge_provider_api::ProviderDescriptor {
+            kind: forge_providers::registry::nonselectable_id()
+                .expect("registry supplies a fixture identity"),
+            label: "Generic fixture".into(),
+            capability: Default::default(),
+        }
+    }
+
+    async fn emit_attempt(
+        scope: InvocationScope,
+        sink: ApiEventSink,
+        attempt: usize,
         failure_count: usize,
-        terminal_error: Option<fn() -> ProviderError>,
-        request: Mutex<Vec<(ProviderRequest, tokio::time::Instant)>>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::provider::ProviderAdapter for FailureProvider {
-        type Host = crate::provider::HarnessProviderHost;
-        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::Shutdown,
-                    source,
-                )
-            })
-        }
-        fn descriptor(&self) -> ProviderDescriptor {
-            ProviderDescriptor {
-                kind: ProviderKind::Mock,
-                label: "Retry fixture".into(),
-                capability: Default::default(),
-            }
-        }
-        async fn has_active_turn(&self, _: &str) -> bool {
-            false
-        }
-        async fn cleanup_execution(
-            &self,
-            _: &str,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let result: anyhow::Result<()> = async move { Ok(()) }.await;
-            result.map_err(|source| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CleanupExecution,
-                    source,
-                )
-            })
-        }
-        async fn active_session_id_for(
-            &self,
-            _: &str,
-        ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
-            Ok(Some("retained-thread".to_owned().try_into()?))
-        }
-
-        async fn session_events(
-            &self,
-            owner: crate::provider::ExecutionOwner,
-        ) -> std::result::Result<
-            crate::provider::events::ProviderEventStream,
-            crate::provider::ProviderError,
-        > {
-            let stream = self.fixture_events.subscribe(owner.clone())?;
-            Ok(stream)
-        }
-
-        async fn session_prompt(
-            self: std::sync::Arc<Self>,
-            request: crate::provider::ProviderRequest,
-            scope: crate::provider::InvocationScope,
-        ) -> std::result::Result<(), crate::provider::ProviderError> {
-            let events = self.fixture_events.clone();
-            events
-                .submit(
-                    request,
-                    scope,
-                    crate::provider::TerminalBoundary::LocalFixture,
-                    move |request, sink| async move { self.run_native(request, sink).await },
-                )
-                .await
-        }
-    }
-
-    impl FailureProvider {
-        async fn run_native(
-            &self,
-            request: ProviderRequest,
-            sink: ProviderEventSink,
-        ) -> Result<ProviderCompletion, ProviderError> {
-            let output: anyhow::Result<ProviderCompletion> = async {
-                let count = {
-                    let mut requests = self.request.lock().unwrap();
-                    requests.push((request, tokio::time::Instant::now()));
-                    requests.len()
-                };
-                let address = TurnAddress {
-                    scope: sink.invocation_scope()?.clone(),
-                    thread_id: "retained-thread".into(),
-                    turn_id: format!("turn-{count}").into(),
-                };
-                sink.send_wait(ProviderEvent::Execution {
-                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                        address.scope.clone(),
-                        forge_provider_api::lifecycle::ExecutionUpdate::Started {
-                            address: address.clone(),
-                        },
-                    )
-                    .expect("execution scope is derived from its native address"),
-                })
-                .await?;
-                sink.send_wait(ProviderEvent::Turn {
+        ending: Ending,
+        covered: Vec<forge_provider_api::SubmissionId>,
+    ) -> Result<(), ProviderError> {
+        let address = TurnAddress {
+            scope: scope.clone(),
+            thread_id: "fixture-session".into(),
+            turn_id: format!("turn-{attempt}").into(),
+        };
+        sink.send_wait(ProviderEvent::Execution {
+            observation: ExecutionObservation::new(
+                scope.clone(),
+                ExecutionUpdate::Started {
                     address: address.clone(),
-                    update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
-                })
-                .await?;
-                if count <= self.failure_count {
-                    return Err(RetryableFailure {
-                        address: TurnAddress {
-                            scope: sink.invocation_scope()?.clone(),
-                            thread_id: "retained-thread".into(),
-                            turn_id: format!("turn-{}", count).into(),
-                        },
-                        code: "serverOverloaded".into(),
-                        detail: json!({"message":format!("capacity failure {}", count)}),
-                        message: format!("capacity failure {}", count),
-                    }
-                    .into());
-                }
-                if let Some(error) = self.terminal_error {
-                    return Err(error().into());
-                }
-                Ok(ProviderCompletion::default())
+                },
+            )?,
+        })
+        .await?;
+        let completion = ApiCompletion::default();
+        let result = if attempt <= failure_count {
+            ExecutionResult::Failed {
+                completion: completion.into(),
+                failure: ExecutionFailure::Retryable {
+                    address: address.clone(),
+                    category: RetryCategory::TemporaryCapacity,
+                    continuation: forge_provider_api::ContinuationToken::new(
+                        format!("retry-{attempt}").into_bytes(),
+                    )?,
+                },
             }
-            .await;
-            output.map_err(ProviderError::from)
-        }
+        } else {
+            match ending {
+                Ending::Completed => ExecutionResult::Completed {
+                    completion: completion.into(),
+                },
+                Ending::Cancelled => ExecutionResult::Cancelled {
+                    completion: completion.into(),
+                },
+                Ending::Rejected => ExecutionResult::Failed {
+                    completion: completion.into(),
+                    failure: ExecutionFailure::Terminal {
+                        kind: forge_provider_api::ProviderFailureKind::Rejected,
+                    },
+                },
+            }
+        };
+        sink.send_wait(ProviderEvent::Execution {
+            observation: ExecutionObservation::new(
+                scope,
+                ExecutionUpdate::Finished {
+                    address,
+                    covered_submissions: covered,
+                    completed_at_ms: now_ms(),
+                    result,
+                },
+            )?,
+        })
+        .await?;
+        Ok(())
+    }
+
+    fn provider(
+        failure_count: usize,
+        ending: Ending,
+    ) -> (
+        Arc<crate::provider::test_support::EventFixtureProvider>,
+        Arc<ScriptLog>,
+    ) {
+        let log = Arc::new(ScriptLog {
+            prompt_count: AtomicUsize::new(0),
+            continuation_count: AtomicUsize::new(0),
+            attempts: Mutex::new(Vec::new()),
+            selected_model: Mutex::new(None),
+        });
+        let initial_log = log.clone();
+        let provider = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor(),
+            move |request, sink, _cancelled| {
+                let log = initial_log.clone();
+                async move {
+                    let attempt = log.prompt_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    *log.selected_model.lock().unwrap() = request.configuration.model.model.clone();
+                    log.attempts
+                        .lock()
+                        .unwrap()
+                        .push((attempt, tokio::time::Instant::now()));
+                    emit_attempt(
+                        request.scope,
+                        sink,
+                        attempt,
+                        failure_count,
+                        ending,
+                        vec![request.submission_id],
+                    )
+                    .await
+                }
+            },
+        );
+        let continuation_log = log.clone();
+        provider.with_continuation(move |scope, _callbacks, sink, _cancelled| {
+            let log = continuation_log.clone();
+            async move {
+                let attempt = log.continuation_count.fetch_add(1, Ordering::SeqCst) + 2;
+                log.attempts
+                    .lock()
+                    .unwrap()
+                    .push((attempt, tokio::time::Instant::now()));
+                emit_attempt(scope, sink, attempt, failure_count, ending, Vec::new()).await
+            }
+        });
+        (provider, log)
     }
 
     fn scope() -> InvocationScope {
@@ -495,15 +493,6 @@ mod tests {
         }
     }
 
-    fn provider(failure_count: usize) -> FailureProvider {
-        FailureProvider {
-            fixture_events: Default::default(),
-            failure_count,
-            terminal_error: None,
-            request: Mutex::new(Vec::new()),
-        }
-    }
-
     #[test]
     fn replay_rejects_tools_and_control_mutations() {
         let mut output = ProviderCompletion::default();
@@ -528,33 +517,33 @@ mod tests {
         let submission_store =
             super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
         trace.configure(true)?;
-        let provider = provider(6);
-        let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
+        let (native, log) = provider(6, Ending::Completed);
+        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
         let error = prompt(&provider, request(), None, &trace, &submission_store)
             .await
             .unwrap_err();
-        assert_eq!(error.to_string(), "capacity failure 6");
-        let requests = provider.request.lock().unwrap();
-        assert_eq!(requests.len(), 6);
+        assert!(
+            matches!(error.downcast_ref::<ProviderError>(), Some(ProviderError::Retryable(failure))
+            if failure.category == RetryCategory::TemporaryCapacity)
+        );
+        let attempts = log.attempts.lock().unwrap();
+        assert_eq!(log.prompt_count.load(Ordering::SeqCst), 1);
+        assert_eq!(log.continuation_count.load(Ordering::SeqCst), 5);
+        assert_eq!(attempts.len(), 6);
         for (index, delay) in RETRY_DELAY_SECONDS.iter().enumerate() {
             assert_eq!(
-                requests[index + 1].1.duration_since(requests[index].1),
+                attempts[index + 1].1.duration_since(attempts[index].1),
                 Duration::from_secs(*delay)
             );
-            assert_eq!(requests[index + 1].0.model, "selected-model");
-            assert_eq!(
-                requests[index + 1]
-                    .0
-                    .provider_session_id
-                    .as_ref()
-                    .map(|id| id.as_str()),
-                Some("retained-thread")
-            );
-            assert_ne!(requests[index + 1].0.input.text(), "original request");
         }
+        assert_eq!(
+            log.selected_model.lock().unwrap().as_deref(),
+            Some("selected-model")
+        );
         trace.flush()?;
         let records = std::fs::read_to_string(trace.session_status("retry-fixture").path)?;
-        assert!(records.contains("capacity failure 6"));
+        assert!(!records.contains("serverOverloaded"));
+        assert!(!records.contains("capacity failure"));
         assert!(records.contains("\"status\":\"exhausted\""));
         assert_eq!(
             records
@@ -572,9 +561,9 @@ mod tests {
         let trace = std::sync::Arc::new(TraceStore::open(directory.path())?);
         let submission_store =
             super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
-        let recovered_provider = provider(1);
+        let (recovered_native, recovered_log) = provider(1, Ending::Completed);
         let recovered_provider =
-            crate::provider::test_support::ProviderTestSession::new(recovered_provider)?;
+            crate::provider::test_support::ProviderTestSession::from_native(recovered_native)?;
         let (sink, mut stream) = crate::provider::events::channel(scope());
         prompt(
             &recovered_provider,
@@ -600,23 +589,18 @@ mod tests {
                 .is_some_and(|retry| retry.retry_at_ms.is_none())
         );
         assert!(retries[2].is_none());
-        let provider = FailureProvider {
-            fixture_events: Default::default(),
-            terminal_error: Some(|| ProviderError::Provider {
-                code: None,
-                message: "unauthorized".into(),
-            }),
-            ..provider(0)
-        };
-        let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
-        assert_eq!(
-            prompt(&provider, request(), None, &trace, &submission_store)
-                .await
-                .unwrap_err()
-                .to_string(),
-            "unauthorized"
+        assert_eq!(recovered_log.continuation_count.load(Ordering::SeqCst), 1);
+        let (native, log) = provider(0, Ending::Rejected);
+        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+        let error = prompt(&provider, request(), None, &trace, &submission_store)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<ProviderError>(), Some(ProviderError::Failure(failure))
+            if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)
         );
-        assert_eq!(provider.request.lock().unwrap().len(), 1);
+        assert_eq!(log.prompt_count.load(Ordering::SeqCst), 1);
+        assert_eq!(log.continuation_count.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
@@ -628,18 +612,15 @@ mod tests {
             let trace = std::sync::Arc::new(TraceStore::open(directory.path())?);
             let submission_store =
                 super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
-            let provider = FailureProvider {
-                fixture_events: Default::default(),
-                terminal_error: Some(|| ProviderError::Cancelled),
-                ..provider(failure_count)
-            };
-            let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
+            let (native, log) = provider(failure_count, Ending::Cancelled);
+            let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
             let (sink, mut stream) = crate::provider::events::channel(scope());
             let error = prompt(&provider, request(), Some(sink), &trace, &submission_store)
                 .await
                 .unwrap_err();
             assert!(error.is::<crate::broker::TurnCancelled>(), "{error:#}");
-            assert_eq!(provider.request.lock().unwrap().len(), failure_count + 1);
+            assert_eq!(log.prompt_count.load(Ordering::SeqCst), 1);
+            assert_eq!(log.continuation_count.load(Ordering::SeqCst), failure_count);
             let mut retry_updates = Vec::new();
             while let Some(event) = stream.try_next()? {
                 if let ProviderEvent::Retry { update, .. } = event {
@@ -665,23 +646,17 @@ mod tests {
         let trace = std::sync::Arc::new(TraceStore::open(directory.path())?);
         let submission_store =
             super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
-        let provider = FailureProvider {
-            fixture_events: Default::default(),
-            terminal_error: Some(|| ProviderError::Provider {
-                code: Some("provider_failure".into()),
-                message: "provider execution cancelled".into(),
-            }),
-            ..provider(0)
-        };
-        let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
+        let (native, log) = provider(0, Ending::Rejected);
+        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
         let error = prompt(&provider, request(), None, &trace, &submission_store)
             .await
             .unwrap_err();
         assert!(!error.is::<crate::broker::TurnCancelled>());
-        assert!(matches!(error.downcast_ref::<ProviderError>(),
-            Some(ProviderError::Provider { code: Some(code), message })
-                if code == "provider_failure" && message == "provider execution cancelled"));
-        assert_eq!(provider.request.lock().unwrap().len(), 1);
+        assert!(
+            matches!(error.downcast_ref::<ProviderError>(), Some(ProviderError::Failure(failure))
+            if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)
+        );
+        assert_eq!(log.prompt_count.load(Ordering::SeqCst), 1);
         Ok(())
     }
 
@@ -692,8 +667,8 @@ mod tests {
         let submission_store =
             super::super::submission::SubmissionStore::open(directory.path(), trace.clone())?;
         trace.configure(true)?;
-        let provider = provider(6);
-        let provider = crate::provider::test_support::ProviderTestSession::new(provider)?;
+        let (native, log) = provider(6, Ending::Completed);
+        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
         let (sink, mut stream) = crate::provider::events::channel(scope());
         {
             let pending = prompt(&provider, request(), Some(sink), &trace, &submission_store);
@@ -708,7 +683,8 @@ mod tests {
             }
         }
         tokio::time::advance(Duration::from_secs(120)).await;
-        assert_eq!(provider.request.lock().unwrap().len(), 1);
+        assert_eq!(log.prompt_count.load(Ordering::SeqCst), 1);
+        assert_eq!(log.continuation_count.load(Ordering::SeqCst), 0);
         trace.flush()?;
         let records = std::fs::read_to_string(trace.session_status("retry-fixture").path)?;
         assert!(records.contains("\"status\":\"cancelled\""));

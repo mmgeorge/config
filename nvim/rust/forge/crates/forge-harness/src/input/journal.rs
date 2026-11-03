@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 pub(super) struct InputJournal {
     connection: Connection,
     session_id: String,
+    root: std::path::PathBuf,
 }
 
 impl InputJournal {
@@ -43,6 +44,7 @@ impl InputJournal {
         Ok(Self {
             connection,
             session_id: session_id.into(),
+            root: root.to_owned(),
         })
     }
 
@@ -59,7 +61,7 @@ impl InputJournal {
         let restored = snapshot.is_some();
         let mut state = InputState {
             snapshot: snapshot
-                .map(|payload| serde_json::from_str::<InputSnapshot>(&payload))
+                .map(|payload| self.decode::<InputSnapshot>(&payload))
                 .transpose()?
                 .unwrap_or_default(),
             ..Default::default()
@@ -75,8 +77,8 @@ impl InputJournal {
             ))
         })? {
             let (id, request, payload) = row?;
-            let operation: super::InputOperation = serde_json::from_str(&request)?;
-            let receipt: InputUpdate = serde_json::from_str(&payload)?;
+            let operation: super::InputOperation = self.decode(&request)?;
+            let receipt: InputUpdate = self.decode(&payload)?;
             ensure!(
                 !id.is_empty()
                     && operation.id == id
@@ -132,7 +134,7 @@ impl InputJournal {
             );
         }
         for (request, receipt) in state.operation.values() {
-            let operation: super::InputOperation = serde_json::from_str(request)?;
+            let operation: super::InputOperation = self.decode(request)?;
             if receipt.error.is_none()
                 && let super::InputAction::Submit { message } = operation.action
             {
@@ -143,6 +145,85 @@ impl InputJournal {
             }
         }
         Ok((state, restored))
+    }
+
+    /// Upgrade saved question messages before decoding the current typed queue schema.
+    fn decode<T: serde::de::DeserializeOwned>(&self, payload: &str) -> Result<T> {
+        let mut value: serde_json::Value = serde_json::from_str(payload)?;
+        if let Some(messages) = value
+            .get_mut("messages")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for message in messages {
+                self.restore_question_message(message)?;
+            }
+        }
+        if let Some(messages) = value
+            .get_mut("upsert")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for message in messages {
+                self.restore_question_message(message)?;
+            }
+        }
+        if let Some(messages) = value
+            .pointer_mut("/snapshot/messages")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for message in messages {
+                self.restore_question_message(message)?;
+            }
+        }
+        if value
+            .pointer("/action/kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("submit")
+            && let Some(message) = value.pointer_mut("/action/message")
+        {
+            self.restore_question_message(message)?;
+        }
+        Ok(serde_json::from_value(value)?)
+    }
+
+    /// Rebuild legacy replies from durable question history, never their native text envelope.
+    fn restore_question_message(&self, message: &mut serde_json::Value) -> Result<()> {
+        let Some(purpose) = message.get("purpose") else {
+            return Ok(());
+        };
+        if purpose.get("kind").and_then(serde_json::Value::as_str) != Some("question")
+            || purpose.get("reply").is_some()
+        {
+            return Ok(());
+        }
+        let question_id =
+            serde_json::from_value(purpose.get("question_id").cloned().ok_or_else(|| {
+                anyhow::anyhow!("saved question input has no question identity")
+            })?)?;
+        let kind = serde_json::from_value(
+            purpose
+                .get("message_kind")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("saved question input has no action"))?,
+        )?;
+        let message_id = message
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("saved question input has no message identity"))?;
+        let reply = crate::question::restore_input_reply(
+            &self.root,
+            &self.session_id,
+            &question_id,
+            message_id,
+            kind,
+        )?;
+        let text = match &reply.response {
+            forge_provider_api::QuestionReplyResponse::Answer { answer, .. }
+            | forge_provider_api::QuestionReplyResponse::Correction { answer, .. } => answer,
+            forge_provider_api::QuestionReplyResponse::Clarification { text, .. } => text,
+        };
+        message["text"] = serde_json::Value::String(text.clone());
+        message["purpose"]["reply"] = serde_json::to_value(reply)?;
+        Ok(())
     }
 
     /// Commit only active state and newly admitted receipts, never rewrite historical receipts.

@@ -29,7 +29,7 @@ local source = {
 }
 local function open(current, is_current)
   return model_picker.open({ host = { win = vim.api.nvim_get_current_win() }, model_list = source,
-    provider = "codex", current_model = current, is_current = is_current,
+    provider = "fixture_alpha", current_model = current, is_current = is_current,
     on_confirm = function(config) confirmed = config end })
 end
 local function first()
@@ -38,7 +38,7 @@ end
 
 local success, failure = xpcall(function()
   require("forge").setup({ harness = { provider = "mock" } })
-  pins.refresh("codex", function(_, pin_error) assert(not pin_error) end)
+  pins.refresh("fixture_alpha", function(_, pin_error) assert(not pin_error) end)
   request_list[#request_list].callback({})
   open("newer")
   assert(selected().id == "newer" and first().id == "older")
@@ -59,7 +59,7 @@ local success, failure = xpcall(function()
   write = request_list[#request_list]
   write.callback(nil, "database failure")
   assert(#errors == 1 and errors[1]:find("database failure", 1, true))
-  assert(first().id == "newer" and pins.get("codex").newer)
+  assert(first().id == "newer" and pins.get("fixture_alpha").newer)
   invoke("p")
   write = request_list[#request_list]
   write.callback({})
@@ -78,24 +78,24 @@ local success, failure = xpcall(function()
   current = false
   write.callback({ "newer", "third" })
   assert(first().id == "newer", "provider-stale response changed the picker")
-  assert(pins.get("codex").third, "successful stale write was not retained")
+  assert(pins.get("fixture_alpha").third, "successful stale write was not retained")
   picker.close()
 
-  pins.refresh("codex", function(_, pin_error) assert(not pin_error) end)
+  pins.refresh("fixture_alpha", function(_, pin_error) assert(not pin_error) end)
   local read = request_list[#request_list]
-  pins.set("codex", "older", true, function(_, pin_error) assert(not pin_error) end)
+  pins.set("fixture_alpha", "older", true, function(_, pin_error) assert(not pin_error) end)
   request_list[#request_list].callback({ "older" })
   read.callback({ "third" })
-  assert(pins.get("codex").older and not pins.get("codex").third, "late read replaced a newer write")
+  assert(pins.get("fixture_alpha").older and not pins.get("fixture_alpha").third, "late read replaced a newer write")
 
   local state = require("forge.session").harness
-  state.session = { id = "pin-completion", provider = "codex" }
-  state.model_provider, state.model_list = "codex", source
+  state.session = { id = "pin-completion", provider = "fixture_alpha" }
+  state.model_provider, state.model_list = "fixture_alpha", source
   local completion = require("forge.views.harness.completion.command_source").new()
   local result
   completion:request_model_list(function(model_list) result = model_list end)
   assert(result[1].id == "older")
-  pins.set("codex", "third", true, function(_, pin_error) assert(not pin_error) end)
+  pins.set("fixture_alpha", "third", true, function(_, pin_error) assert(not pin_error) end)
   request_list[#request_list].callback({ "third" })
   completion:request_model_list(function(model_list) result = model_list end)
   assert(result[1].id == "third" and state.model_list[1].id == "older", "completion changed the raw catalog")
