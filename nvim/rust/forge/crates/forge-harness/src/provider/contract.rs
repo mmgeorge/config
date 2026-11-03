@@ -465,13 +465,25 @@ impl crate::provider::ProviderAdapter for MockProvider {
         Some(&self.response_control)
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        self.response_control.cancel_session(None);
-        self.session_events.shutdown().await?;
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.response_control.cancel_session(None);
+            self.session_events.shutdown().await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
 
-    async fn cancel_session(&self, session_id: &str) -> Result<()> {
+    async fn cancel_session(
+        &self,
+        session_id: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
         self.cleanup_execution(session_id).await
     }
 
@@ -498,17 +510,51 @@ impl crate::provider::ProviderAdapter for MockProvider {
         Ok(terminal::TerminalSnapshot::default())
     }
 
-    async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
-        self.response_control.cancel_session(Some(session_id));
-        self.session_events.cancel_runtime(session_id).await?;
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        session_id: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.response_control.cancel_session(Some(session_id));
+            self.session_events.cancel_runtime(session_id).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
-    async fn reset_session(&self, owner: &ExecutionOwner) -> Result<()> {
-        self.session_events.reset_owner(owner).await?;
-        Ok(())
+    async fn reset_session(
+        &self,
+        owner: &ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.session_events.reset_owner(owner).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::ResetSession,
+                source,
+            )
+        })
     }
-    async fn fence_session(&self, owner: &ExecutionOwner) -> Result<()> {
-        self.cleanup_execution(&owner.runtime_key()).await
+    async fn fence_session(
+        &self,
+        owner: &ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> =
+            async move { Ok(self.cleanup_execution(&owner.runtime_key()).await?) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::FenceSession,
+                source,
+            )
+        })
     }
     async fn generate_text(
         &self,
@@ -517,19 +563,28 @@ impl crate::provider::ProviderAdapter for MockProvider {
         _model: &str,
         _reasoning_effort: Option<&str>,
         _history: &str,
-    ) -> Result<String> {
-        if let Some(delay) = self.delay {
-            tokio::time::sleep(delay).await;
+    ) -> std::result::Result<String, crate::provider::ProviderError> {
+        let result: anyhow::Result<String> = async move {
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
+            }
+            purpose.validate(match purpose {
+                TextGeneration::Recap => {
+                    "The current request is recorded. Review the next proposed change."
+                }
+                TextGeneration::SessionName => "Review proposed changes",
+                TextGeneration::CommitMessage => "feat: describe repository changes",
+                TextGeneration::PullRequestDescription => {
+                    "Describes the repository changes for reviewers."
+                }
+            })
         }
-        purpose.validate(match purpose {
-            TextGeneration::Recap => {
-                "The current request is recorded. Review the next proposed change."
-            }
-            TextGeneration::SessionName => "Review proposed changes",
-            TextGeneration::CommitMessage => "feat: describe repository changes",
-            TextGeneration::PullRequestDescription => {
-                "Describes the repository changes for reviewers."
-            }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::GenerateText,
+                source,
+            )
         })
     }
     fn descriptor(&self) -> ProviderDescriptor {

@@ -119,6 +119,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.to_string(), "original failure");
         drop(trace.stage("interrupted"));
+        store.flush().unwrap();
         let content = std::fs::read_to_string(store.session_status("session").path).unwrap();
         assert!(!content.contains("must not be logged"));
         let records: Vec<Value> = content

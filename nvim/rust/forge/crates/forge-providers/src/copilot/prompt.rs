@@ -41,6 +41,7 @@ pub async fn run(
     control: &dyn TurnControl,
     trace: Arc<dyn ProviderTrace>,
 ) -> Result<TurnResult, ProviderError> {
+    session.ensure_healthy()?;
     let owned_session = session;
     let session = &session.inner;
     let output = ProviderCompletion {
@@ -106,11 +107,13 @@ pub async fn run(
         .tail()
         .await
         .context("capture Copilot pre-submit history boundary")?;
+    let ancestry_cursor = history.cursor.clone();
     let mut message_input = options.attachments;
     message_input.prompt.push_str(&prompt);
     let message = super::input::message(message_input);
     turn_event_guard
         .send(history.cursor.clone(), options.receipt.as_ref().map(|receipt| forge_provider_api::lifecycle::SubmissionId::try_from(receipt.id().to_owned())).transpose().map_err(|error| ProviderError::Protocol { message: error.to_string() })?, async {
+            owned_session.ensure_healthy()?;
             trace.record(
                 &options.correlation_id,
                 "copilot.session.send",
@@ -123,6 +126,7 @@ pub async fn run(
                     .await?;
             }
             control.before_send().await?;
+            owned_session.ensure_healthy()?;
             let receipt = session.send(message).await.context("send Copilot prompt")?;
             if let Some(submission) = &options.receipt {
                 submission.clone().record_accepted(receipt.clone()).await?;
@@ -281,6 +285,17 @@ pub async fn run(
         decoder.finish_failure(outcome, sink).await?;
         return Err(error);
     }
+    if turn_event.needs_ancestry()? {
+        restore_durable_ancestry(
+            session,
+            turn_event,
+            ancestry_cursor,
+            trace.as_ref(),
+            &options.correlation_id,
+        )
+        .await?;
+    }
+    subscription.ensure_healthy()?;
     if let Some(failure) = retry_failure {
         decoder
             .finish_failure(forge_provider_api::turn::TurnOutcome::Failed, sink)
@@ -328,6 +343,100 @@ pub async fn run(
         completion: output.clone(),
         answered_rejection: rejection.answered,
     })
+}
+
+/// Fill filtered durable links while retaining the live idle as the terminal authority.
+async fn restore_durable_ancestry(
+    session: &Session,
+    turn: &CopilotTurnEvent,
+    mut cursor: String,
+    trace: &dyn ProviderTrace,
+    correlation: &str,
+) -> Result<(), ProviderError> {
+    use github_copilot_sdk::rpc::{
+        EventLogReadRequest, EventsAgentScope, EventsCursorStatus, EventsReadDirection,
+    };
+    let read = async {
+        let mut cursors = std::collections::HashSet::new();
+        let mut count = 0usize;
+        loop {
+            anyhow::ensure!(
+                cursors.insert(cursor.clone()),
+                "Copilot ancestry cursor did not advance"
+            );
+            trace.record(
+                correlation,
+                "copilot.ancestry.lookup",
+                json!({
+                    "phase":"page_requested", "cursor":cursor, "page":cursors.len(),
+                    "native_session_id":session.id(),
+                }),
+            );
+            let page = session
+                .rpc()
+                .event_log()
+                .read(EventLogReadRequest {
+                    agent_ids: None,
+                    agent_scope: Some(EventsAgentScope::All),
+                    cursor: Some(cursor.clone()),
+                    direction: Some(EventsReadDirection::Forward),
+                    include_ephemeral: Some(false),
+                    max: Some(1000),
+                    types: Some(json!("*")),
+                    wait_ms: Some(0),
+                })
+                .await
+                .context("read Copilot durable terminal ancestry")?;
+            anyhow::ensure!(
+                page.cursor_status == EventsCursorStatus::Ok,
+                "Copilot terminal ancestry cursor expired"
+            );
+            count = count
+                .checked_add(page.events.len())
+                .context("Copilot ancestry event count overflow")?;
+            anyhow::ensure!(
+                count <= 16_384 && cursors.len() <= 64,
+                "Copilot terminal ancestry exceeds its read bound"
+            );
+            trace.record(correlation, "copilot.ancestry.lookup", json!({
+                "phase":"page_received", "cursor":cursor, "next_cursor":page.cursor,
+                "cursor_status":page.cursor_status, "has_more":page.has_more,
+                "event_count":page.events.len(), "total_event_count":count,
+                "event_types":page.events.iter().map(|event| event.event_type.as_str()).collect::<std::collections::BTreeSet<_>>(),
+            }));
+            turn.restore_ancestry(&page.events)?;
+            if !page.has_more {
+                trace.record(
+                    correlation,
+                    "copilot.ancestry.lookup",
+                    json!({
+                        "phase":"finished", "start_ancestry_missing":turn.needs_ancestry()?,
+                        "total_event_count":count,
+                    }),
+                );
+                return Ok::<_, anyhow::Error>(());
+            }
+            cursor = page.cursor;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(30), read)
+        .await
+        .context("Copilot terminal ancestry lookup timed out")
+        .and_then(|result| result)
+        .map_err(|error| {
+            trace.record(
+                correlation,
+                "copilot.ancestry.lookup",
+                json!({
+                    "phase":"failed", "error":format!("{error:#}"),
+                }),
+            );
+            ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Protocol {
+                    message: format!("cannot certify Copilot terminal ancestry: {error:#}"),
+                },
+            )
+        })
 }
 
 fn native_replay_safe(output: &ProviderCompletion) -> bool {

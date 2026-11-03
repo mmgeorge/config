@@ -1,12 +1,18 @@
 use super::*;
 use crate::provider::test_support::ProviderTestExt as _;
 use crate::provider::{
-    ApprovalUpdate, ExecutionOwner, InvocationScope, ToolOutcome, ToolUpdate, TurnUpdate,
+    ApprovalUpdate, ExecutionOwner, InvocationScope, MessageUpdate, ToolOutcome, ToolUpdate,
+    TurnUpdate,
 };
 use forge_provider_api::permissions::{PermissionResponse, ProviderPermissions as _};
 use forge_providers::copilot::permission::permission_from_copilot;
 use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+enum EngineRecoveryOutcome {
+    ObservationLost(tokio::sync::oneshot::Receiver<()>),
+    Completed,
+}
 
 /// Observe the denial before exercising cancellation of the response that follows it.
 struct DeniedToolObserved(Arc<tokio::sync::Notify>);
@@ -1084,7 +1090,8 @@ async fn copilot_cleanup_sends_abort_before_a_pending_send_response() -> Result<
     };
     let stopping = async {
         submission.await?;
-        provider.cleanup_execution(&session_id).await
+        provider.cleanup_execution(&session_id).await?;
+        Ok::<(), anyhow::Error>(())
     };
     let server = async {
         let send = read_request(&mut server_read, &mut server_write).await?;
@@ -1377,7 +1384,8 @@ async fn native_rewind(first_failure: Option<Value>) -> Result<()> {
                 }
             })
             .await??;
-            provider.cleanup_execution(&session_id).await
+            provider.cleanup_execution(&session_id).await?;
+            Ok::<(), anyhow::Error>(())
         };
         let (result, cleanup) = tokio::join!(prompt, cleanup);
         cleanup?;
@@ -2412,6 +2420,526 @@ async fn copilot_submission_reconciliation_excludes_known_messages_and_ambiguous
         );
     }
     Ok(())
+}
+
+/// A shared native loss retires every owner and never advances a known failed input to Sending.
+#[tokio::test]
+async fn copilot_failed_shared_client_reset_retires_all_owners_without_input_replay() -> Result<()>
+{
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (directory, provider, request) = fixture()?;
+        let first_owner = request.owner()?;
+        let mut second_request = request.clone();
+        second_request.harness_session_id = "copilot-second-owner".into();
+        second_request.execution_owner = Some(ExecutionOwner::root("copilot-second-owner"));
+        let second_owner = second_request.owner()?;
+        let first_events = provider.session_events(first_owner.clone()).await?;
+        let second_events = provider.session_events(second_owner.clone()).await?;
+        let (client_read, mut server_write) = tokio::io::duplex(65536);
+        let (client_write, mut server_read) = tokio::io::duplex(65536);
+        provider.runtime.attach_streams(client_read, client_write, PathBuf::from(&request.workspace)).await?;
+        let (disconnect, disconnected) = tokio::sync::oneshot::channel();
+        let original_peer = tokio::spawn(async move {
+            for _ in 0..2 {
+                let create = read_request(&mut server_read, &mut server_write).await?;
+                assert_eq!(create["method"], "session.create");
+                respond(&mut server_write, &create, json!({"result":{"sessionId":create["params"]["sessionId"],"workspacePath":"."}})).await?;
+            }
+            disconnected.await?;
+            drop(server_write);
+            assert!(read_frame(&mut server_read).await.is_err(), "failed client dispatched native work during recovery");
+            Ok::<_, anyhow::Error>(())
+        });
+        let first = provider.session(&request, CopilotSessionReuse::Compatible).await?;
+        let second = provider.session(&second_request, CopilotSessionReuse::Compatible).await?;
+        let first_permission = provider.permission_context(&request.runtime_key()?).await;
+        let second_permission = provider.permission_context(&second_request.runtime_key()?).await;
+        let journal = crate::provider::submission::SubmissionStore::open(directory.path(), provider.trace.clone())?;
+        let submission = journal.prepare(&request, ProviderKind::Copilot)?;
+        disconnect.send(()).map_err(|_| anyhow::anyhow!("native peer closed before loss injection"))?;
+        while provider.runtime.failed_generation().await.is_none() { tokio::task::yield_now().await; }
+        let failed_input = forge_provider_api::input::MessageInput { prompt: "must remain undispatched".into(), attachments: Vec::new() };
+        assert!(matches!(first.steer(failed_input.clone(), Some(submission.clone())).await, Err(ProviderError::Observation(_))));
+        assert!(matches!(first.send(failed_input).await, Err(ProviderError::Observation(_))));
+        assert!(matches!(submission.record()?.delivery, crate::provider::submission::SubmissionState::Prepared));
+
+        // Queue both resets against the old token before either may collect the shared client.
+        let gate = provider.recovery.lock().await;
+        let mut reset_first = Box::pin(provider.reset_session(&first_owner));
+        let mut reset_second = Box::pin(provider.reset_session(&second_owner));
+        assert!(futures_util::poll!(reset_first.as_mut()).is_pending());
+        assert!(futures_util::poll!(reset_second.as_mut()).is_pending());
+        drop(gate);
+        tokio::try_join!(reset_first, reset_second)?;
+        original_peer.await??;
+        assert!(provider.sessions.active(&request.runtime_key()?).await.is_none());
+        assert!(provider.sessions.active(&second_request.runtime_key()?).await.is_none());
+        assert!(provider.permission_context_by_harness.lock().await.is_empty());
+        assert!(provider.control_router_by_harness.lock().await.is_empty());
+        assert!(first_events.check().is_err() && second_events.check().is_err());
+        assert!(forge_provider_api::permissions::ProviderPermissions::before_tool(first_permission.as_ref()).await.is_err());
+        assert!(forge_provider_api::permissions::ProviderPermissions::before_tool(second_permission.as_ref()).await.is_err());
+        assert!(second.ensure_healthy().is_err());
+
+        let (client_read, mut server_write) = tokio::io::duplex(65536);
+        let (client_write, mut server_read) = tokio::io::duplex(65536);
+        provider.runtime.attach_streams(client_read, client_write, PathBuf::from(&request.workspace)).await?;
+        let replacement_peer = tokio::spawn(async move {
+            let probe = read_frame(&mut server_read).await?;
+            assert_eq!(probe["method"], "status.get", "replacement skipped its own version check");
+            respond(&mut server_write, &probe, json!({"result":{"version":"1.0.104","protocolVersion":1}})).await?;
+            let create = read_frame(&mut server_read).await?;
+            assert_eq!(create["method"], "session.create");
+            respond(&mut server_write, &create, json!({"result":{"sessionId":create["params"]["sessionId"],"workspacePath":"."}})).await?;
+            let detach = read_frame(&mut server_read).await?;
+            assert_eq!(detach["method"], "session.detach", "recovery replayed an old input");
+            respond(&mut server_write, &detach, json!({"result":{"success":true}})).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let replacement = provider.session(&request, CopilotSessionReuse::Compatible).await?;
+        replacement.ensure_healthy()?;
+        let replacement_permission = provider.permission_context(&request.runtime_key()?).await;
+        assert!(!Arc::ptr_eq(&first_permission, &replacement_permission));
+        forge_provider_api::permissions::ProviderPermissions::before_tool(replacement_permission.as_ref()).await?;
+        crate::provider::ProviderAdapter::shutdown(&*provider).await?;
+        replacement_peer.await??;
+        assert!(matches!(submission.record()?.delivery, crate::provider::submission::SubmissionState::Prepared));
+        Ok::<_, anyhow::Error>(())
+    }).await.context("shared-client reset fixture exceeded ten seconds")?
+}
+
+/// Accepted observation loss remains unknown while collected cleanup permits real engine replacement.
+#[tokio::test]
+async fn copilot_accepted_observation_loss_collects_engine_and_replaces_without_replay()
+-> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (directory, _unused, mut request) = fixture()?;
+        let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
+        let provider = Arc::new(CopilotProvider::new_with_permission_coordinator(
+            Vec::new(), PermissionCoordinator::transient(directory.path())?, trace.clone(), None,
+        )?);
+        let erased: Arc<crate::provider::Provider> = provider.clone();
+        let registry = crate::provider::session_execution::SessionExecutionRegistry::new(erased, trace.clone());
+        let owner = request.owner()?;
+        let engine = registry.owner(owner.clone()).await?;
+        let inbox = registry.observer(owner.clone())?;
+        let journal = crate::provider::submission::SubmissionStore::open(directory.path(), trace)?;
+        request.input = crate::provider::ProviderInput::from_text("old accepted request must never replay");
+        let receipt = journal.prepare(&request, ProviderKind::Copilot)?;
+        request.submission = Some(receipt.clone());
+        let (client_read, server_write) = tokio::io::duplex(65536);
+        let (client_write, server_read) = tokio::io::duplex(65536);
+        provider.runtime.attach_streams(client_read, client_write, PathBuf::from(&request.workspace)).await?;
+        let (disconnect, disconnected) = tokio::sync::oneshot::channel();
+        let original_peer = tokio::spawn(engine_recovery_peer(
+            server_read, server_write, "1.0.103", "old accepted request must never replay", "old-accepted-receipt",
+            EngineRecoveryOutcome::ObservationLost(disconnected),
+        ));
+        let scope = InvocationScope::new(owner.clone(), "accepted-loss");
+        let (sink, mut events) = crate::provider::events::channel(scope);
+        let running_engine = engine.clone();
+        let running_store = journal.clone();
+        let running_request = request.clone();
+        let running = tokio::spawn(async move { running_engine.run_until_ready(running_request, sink, &running_store).await });
+        loop {
+            let event = events.recv().await?.context("engine closed before live native start")?;
+            if matches!(event, ProviderEvent::Execution { observation } if matches!(observation.update(), forge_provider_api::lifecycle::ExecutionUpdate::Started { .. })) { break; }
+        }
+        assert!(matches!(receipt.record()?.delivery, crate::provider::submission::SubmissionState::Accepted { receipt, .. } if receipt == "old-accepted-receipt"));
+        disconnect.send(()).map_err(|_| anyhow::anyhow!("native loss waiter disappeared"))?;
+        let error = match running.await? {
+            Err(error) => error,
+            Ok(_) => anyhow::bail!("observation loss fabricated native completion"),
+        };
+        assert!(matches!(error, ProviderError::Observation(_)), "local collection failed instead of retaining native uncertainty: {error}");
+        engine.close().await.context("collected observation loss prevented engine close")?;
+        assert!(!engine.is_healthy().await);
+        loop {
+            match inbox.drain() {
+                Ok(_) => tokio::task::yield_now().await,
+                Err(error) => {
+                    assert!(matches!(error, ProviderError::Observation(_)));
+                    break;
+                }
+            }
+        }
+        assert!(inbox.ready_for_replacement()?);
+        registry.replace(owner.clone()).await.context("accepted-loss owner could not replace")?;
+        original_peer.await??;
+
+        let (client_read, server_write) = tokio::io::duplex(65536);
+        let (client_write, server_read) = tokio::io::duplex(65536);
+        provider.runtime.attach_streams(client_read, client_write, PathBuf::from(&request.workspace)).await?;
+        let replacement_peer = tokio::spawn(engine_recovery_peer(
+            server_read, server_write, "1.0.104", "explicit new request", "new-accepted-receipt", EngineRecoveryOutcome::Completed,
+        ));
+        let replacement = registry.owner(owner.clone()).await?;
+        assert!(!Arc::ptr_eq(&engine, &replacement));
+        request.input = crate::provider::ProviderInput::from_text("explicit new request");
+        request.submission = None;
+        let (sink, _events) = crate::provider::events::channel(InvocationScope::new(owner, "replacement-request"));
+        let ready = replacement.run_until_ready(request, sink, &journal).await?;
+        ready.ticket.commit().await?;
+        ready.outcome?;
+        assert!(matches!(receipt.record()?.delivery, crate::provider::submission::SubmissionState::Accepted { receipt, .. } if receipt == "old-accepted-receipt"));
+        registry.close().await?;
+        crate::provider::ProviderAdapter::shutdown(provider.as_ref()).await?;
+        replacement_peer.await??;
+        Ok::<_, anyhow::Error>(())
+    }).await.context("accepted engine observation-loss recovery fixture exceeded ten seconds")?
+}
+
+/// Drive real SDK framing through an acknowledged prompt, then loss or certified completion.
+async fn engine_recovery_peer(
+    mut reader: DuplexStream,
+    mut writer: DuplexStream,
+    version: &'static str,
+    expected_prompt: &'static str,
+    receipt: &'static str,
+    outcome: EngineRecoveryOutcome,
+) -> Result<()> {
+    let probe = read_frame(&mut reader).await?;
+    assert_eq!(probe["method"], "status.get");
+    respond(
+        &mut writer,
+        &probe,
+        json!({"result":{"version":version,"protocolVersion":1}}),
+    )
+    .await?;
+    let create = read_frame(&mut reader).await?;
+    assert_eq!(create["method"], "session.create");
+    let native_id = create["params"]["sessionId"]
+        .as_str()
+        .context("created native session identity missing")?
+        .to_owned();
+    respond(
+        &mut writer,
+        &create,
+        json!({"result":{"sessionId":native_id,"workspacePath":"."}}),
+    )
+    .await?;
+    let tasks = read_frame(&mut reader).await?;
+    assert_eq!(tasks["method"], "session.plan.readSqlTodosWithDependencies");
+    respond(
+        &mut writer,
+        &tasks,
+        json!({"result":{"rows":[],"dependencies":[]}}),
+    )
+    .await?;
+    let tail = read_frame(&mut reader).await?;
+    assert_eq!(tail["method"], "session.eventLog.tail");
+    respond(
+        &mut writer,
+        &tail,
+        json!({"result":{"cursor":format!("before-{receipt}")}}),
+    )
+    .await?;
+    let send = read_frame(&mut reader).await?;
+    assert_eq!(send["method"], "session.send");
+    let prompt = send["params"]["prompt"]
+        .as_str()
+        .context("native input missing")?;
+    assert!(prompt.ends_with(expected_prompt));
+    if matches!(&outcome, EngineRecoveryOutcome::Completed) {
+        assert!(!prompt.contains("old accepted request must never replay"));
+    }
+    respond(&mut writer, &send, json!({"result":{"messageId":receipt}})).await?;
+    let mut native_events = vec![
+        (
+            "user.message",
+            json!({"messageId":receipt,"turnId":"0","content":expected_prompt}),
+        ),
+        ("assistant.turn_start", json!({"turnId":"0"})),
+        (
+            "assistant.message",
+            json!({"messageId":"answer","phase":"final_answer","content":"accepted native output"}),
+        ),
+    ];
+    if matches!(&outcome, EngineRecoveryOutcome::Completed) {
+        native_events.extend([
+            ("assistant.turn_end", json!({"turnId":"0"})),
+            ("session.idle", json!({})),
+        ]);
+    }
+    for (index, (kind, data)) in native_events.into_iter().enumerate() {
+        let mut event = json!({"id":format!("{receipt}-{index}"),"type":kind,"timestamp":"2026-11-02T00:00:00Z","data":data});
+        if index > 0 {
+            event["parentId"] = json!(format!("{receipt}-{}", index - 1));
+        }
+        write_frame(&mut writer, json!({"jsonrpc":"2.0","method":"session.event","params":{"sessionId":native_id,"event":event}})).await?;
+    }
+    match outcome {
+        EngineRecoveryOutcome::ObservationLost(disconnected) => {
+            disconnected.await?;
+            drop(writer);
+            assert!(
+                read_frame(&mut reader).await.is_err(),
+                "failed engine cleanup sent an abort or replay to the dead peer"
+            );
+        }
+        EngineRecoveryOutcome::Completed => {
+            let detach = read_frame(&mut reader).await?;
+            assert_eq!(
+                detach["method"], "session.detach",
+                "replacement replayed old work or issued unexpected lifecycle RPC"
+            );
+            respond(&mut writer, &detach, json!({"result":{"success":true}})).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Blocking the real diagnostic writer cannot block native observation or an accepted active steer.
+#[tokio::test]
+async fn copilot_native_burst_and_steering_progress_while_trace_writer_is_blocked() -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let directory = tempfile::tempdir()?;
+        std::fs::write(directory.path().join("harness-trace-config.json"), r#"{"enabled":true}"#)?;
+        let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
+        let provider = Arc::new(CopilotProvider::new_with_permission_coordinator(
+            Vec::new(), PermissionCoordinator::transient(directory.path())?, trace.clone(), None,
+        )?);
+        let owner = ExecutionOwner::root("blocked-trace-burst");
+        let mut request = CopilotProvider::catalog_provider_request(&ProviderCatalogRequest {
+            execution_owner: Some(owner.clone()), harness_session_id: owner.session_id.to_string(),
+            workspace:directory.path().to_string_lossy().into_owned(),
+            access:crate::provider::registered_capability(ProviderKind::Copilot).resolve_access(Default::default()),
+            approval_mode:ApprovalMode::Ask, provider_session_id:None,
+        });
+        request.input = crate::provider::ProviderInput::from_text("inspect three files and explain the edge cases");
+        let journal = crate::provider::submission::SubmissionStore::open(directory.path(), trace.clone())?;
+        let initial_receipt = journal.prepare(&request, ProviderKind::Copilot)?;
+        request.submission = Some(initial_receipt.clone());
+        let erased: Arc<crate::provider::Provider> = provider.clone();
+        let registry = crate::provider::session_execution::SessionExecutionRegistry::new(erased, trace.clone());
+        let engine = registry.owner(owner.clone()).await?;
+        let (client_read, server_write) = tokio::io::duplex(65536);
+        let (client_write, server_read) = tokio::io::duplex(65536);
+        provider.runtime.attach_streams(client_read, client_write, PathBuf::from(&request.workspace)).await?;
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let (observed, mut observed_bytes) = tokio::sync::watch::channel(0usize);
+        let peer = tokio::spawn(trace_burst_peer(server_read, server_write, finishing, observed_bytes.clone()));
+        let (sink, mut stream) = crate::provider::events::channel(InvocationScope::new(owner.clone(), "burst"));
+        let tools_started = Arc::new(tokio::sync::Notify::new());
+        let tool_signal = tools_started.clone();
+        let collector = tokio::spawn(async move {
+            let mut started = 0;
+            let mut bytes = 0;
+            while let Some(event) = stream.recv().await? {
+                match event {
+                    ProviderEvent::Tool { update:ToolUpdate::Started, .. } => {
+                        started += 1;
+                        if started == 3 { tool_signal.notify_one(); }
+                    }
+                    ProviderEvent::Message { update:MessageUpdate::Started { text, .. } | MessageUpdate::Delta { text }, .. } => {
+                        bytes += text.len();
+                        observed.send_replace(bytes);
+                    }
+                    _ => {}
+                }
+            }
+            Ok::<_, ProviderError>(bytes)
+        });
+        let held_trace = trace.clone();
+        let hold = tokio::task::spawn_blocking(move || held_trace.hold_writer()).await??;
+        let running_engine = engine.clone();
+        let running_request = request.clone();
+        let running_journal = journal.clone();
+        let running = tokio::spawn(async move { running_engine.run_until_ready(running_request, sink, &running_journal).await });
+        tokio::time::timeout(std::time::Duration::from_secs(3), tools_started.notified())
+            .await.context("native burst fixture did not observe all three tool starts")?;
+        let mut steering_request = request;
+        steering_request.submission = None;
+        steering_request.input = crate::provider::ProviderInput::from_text("include zero and keep examples concise");
+        let steering_receipt = journal.prepare(&steering_request, ProviderKind::Copilot)?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), engine.steer_current(crate::provider::SteeringInput::User {
+            text:"include zero and keep examples concise".into(), attachments:Vec::new(), submission:Some(steering_receipt.clone()),
+        })).await.context("native steering acknowledgment stalled while diagnostic writer was held")??;
+        assert!(matches!(steering_receipt.record()?.delivery, crate::provider::submission::SubmissionState::Accepted { receipt, .. } if receipt == "burst-steering"));
+        tokio::time::timeout(std::time::Duration::from_secs(3), observed_bytes.wait_for(|bytes| *bytes == 192))
+            .await.context("native burst prefix did not reach 192 bytes while diagnostic writer was held")??;
+        assert!(engine.is_healthy().await && provider.runtime.failed_generation().await.is_none());
+        assert!(!running.is_finished(), "a diagnostic backlog fabricated completion before the native end and idle");
+        assert!(matches!(initial_receipt.record()?.delivery, crate::provider::submission::SubmissionState::Accepted { receipt, .. } if receipt == "burst-initial"));
+        drop(hold);
+        let flushing = trace.clone();
+        tokio::task::spawn_blocking(move || flushing.flush()).await??;
+        let diagnostics = std::fs::read_to_string(trace.session_status("global").path)?;
+        assert!(diagnostics.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok()).any(|entry| entry["event"] == "trace.loss" && entry["payload"]["queue_full_count"].as_u64().is_some_and(|count| count > 0)), "fixture did not saturate the held diagnostic writer");
+        finish.send(()).map_err(|_| anyhow::anyhow!("native terminal gate disappeared"))?;
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(3), running)
+            .await.context("native burst did not settle after explicit end and fresh idle")???;
+        ready.ticket.commit().await?;
+        ready.outcome?;
+        registry.close().await?;
+        crate::provider::ProviderAdapter::shutdown(provider.as_ref()).await?;
+        peer.await??;
+        assert_eq!(collector.await??, 192);
+        Ok::<_, anyhow::Error>(())
+    }).await.context("native burst stalled behind diagnostic filesystem ownership")?
+}
+
+/// Preserve live SDK order through three parallel tools, steering, and a sustained delta burst.
+async fn trace_burst_peer(
+    mut reader: DuplexStream,
+    mut writer: DuplexStream,
+    finishing: tokio::sync::oneshot::Receiver<()>,
+    mut observed: tokio::sync::watch::Receiver<usize>,
+) -> Result<()> {
+    let create = read_request(&mut reader, &mut writer).await?;
+    assert_eq!(create["method"], "session.create");
+    let native = create["params"]["sessionId"]
+        .as_str()
+        .context("native session identity missing")?
+        .to_owned();
+    respond(
+        &mut writer,
+        &create,
+        json!({"result":{"sessionId":native,"workspacePath":"."}}),
+    )
+    .await?;
+    let tasks = read_frame(&mut reader).await?;
+    assert_eq!(tasks["method"], "session.plan.readSqlTodosWithDependencies");
+    respond(
+        &mut writer,
+        &tasks,
+        json!({"result":{"rows":[],"dependencies":[]}}),
+    )
+    .await?;
+    let tail = read_frame(&mut reader).await?;
+    assert_eq!(tail["method"], "session.eventLog.tail");
+    respond(
+        &mut writer,
+        &tail,
+        json!({"result":{"cursor":"before-burst"}}),
+    )
+    .await?;
+    let send = read_frame(&mut reader).await?;
+    assert_eq!(send["method"], "session.send");
+    respond(
+        &mut writer,
+        &send,
+        json!({"result":{"messageId":"burst-initial"}}),
+    )
+    .await?;
+    let mut sequence = 0;
+    burst_native_event(&mut writer, &native, &mut sequence, "user.message", json!({"messageId":"burst-initial","turnId":"0","content":"inspect three files and explain the edge cases"})).await?;
+    burst_native_event(
+        &mut writer,
+        &native,
+        &mut sequence,
+        "assistant.turn_start",
+        json!({"turnId":"0"}),
+    )
+    .await?;
+    for index in 0..3 {
+        burst_native_event(&mut writer, &native, &mut sequence, "tool.execution_start", json!({"toolCallId":format!("read-{index}"),"toolName":"view","arguments":{"path":format!("fixture-{index}.txt")}})).await?;
+    }
+    let tail = read_frame(&mut reader).await?;
+    assert_eq!(tail["method"], "session.eventLog.tail");
+    respond(
+        &mut writer,
+        &tail,
+        json!({"result":{"cursor":"active-burst"}}),
+    )
+    .await?;
+    let steering = read_frame(&mut reader).await?;
+    assert_eq!(steering["method"], "session.send");
+    assert_eq!(steering["params"]["mode"], "immediate");
+    respond(
+        &mut writer,
+        &steering,
+        json!({"result":{"messageId":"burst-steering"}}),
+    )
+    .await?;
+    burst_native_event(&mut writer, &native, &mut sequence, "user.message", json!({"messageId":"burst-steering","turnId":"0","content":"include zero and keep examples concise"})).await?;
+    for index in 0..3 {
+        burst_native_event(&mut writer, &native, &mut sequence, "tool.execution_complete", json!({"toolCallId":format!("read-{index}"),"toolName":"view","success":true,"result":{"content":"fixture contents"}})).await?;
+    }
+    burst_native_event(
+        &mut writer,
+        &native,
+        &mut sequence,
+        "assistant.message_start",
+        json!({"messageId":"burst-answer","phase":"final_answer"}),
+    )
+    .await?;
+    for index in 0..192 {
+        burst_native_event(
+            &mut writer,
+            &native,
+            &mut sequence,
+            "assistant.streaming_delta",
+            json!({"totalResponseSizeBytes":index + 1}),
+        )
+        .await?;
+        burst_native_event(
+            &mut writer,
+            &native,
+            &mut sequence,
+            "assistant.message_delta",
+            json!({"messageId":"burst-answer","deltaContent":"x"}),
+        )
+        .await?;
+        if index % 8 == 7 {
+            // Bound each native burst while diagnostics accumulate beyond their queue capacity.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                observed.wait_for(|bytes| *bytes >= index + 1),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "native burst peer did not observe prefix byte {}",
+                    index + 1
+                )
+            })??;
+        }
+    }
+    finishing.await?;
+    burst_native_event(
+        &mut writer,
+        &native,
+        &mut sequence,
+        "assistant.message",
+        json!({"messageId":"burst-answer","phase":"final_answer","content":"x".repeat(192)}),
+    )
+    .await?;
+    burst_native_event(
+        &mut writer,
+        &native,
+        &mut sequence,
+        "assistant.turn_end",
+        json!({"turnId":"0"}),
+    )
+    .await?;
+    burst_native_event(
+        &mut writer,
+        &native,
+        &mut sequence,
+        "session.idle",
+        json!({}),
+    )
+    .await?;
+    let detach = read_frame(&mut reader).await?;
+    assert_eq!(detach["method"], "session.detach");
+    respond(&mut writer, &detach, json!({"result":{"success":true}})).await
+}
+
+/// Emit public SDK notification framing with concrete live event ancestry.
+async fn burst_native_event(
+    writer: &mut DuplexStream,
+    native: &str,
+    sequence: &mut usize,
+    kind: &str,
+    data: Value,
+) -> Result<()> {
+    let mut event = json!({"id":format!("burst-event-{sequence}"),"type":kind,"timestamp":"2026-11-02T00:00:00Z","data":data});
+    if *sequence > 0 {
+        event["parentId"] = json!(format!("burst-event-{}", *sequence - 1));
+    }
+    *sequence += 1;
+    write_frame(writer, json!({"jsonrpc":"2.0","method":"session.event","params":{"sessionId":native,"event":event}})).await
 }
 
 /// Serve runtime initialization before returning the next operation under test.

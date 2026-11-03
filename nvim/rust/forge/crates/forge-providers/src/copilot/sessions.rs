@@ -1,3 +1,6 @@
+use super::client_generation::{
+    ClientGeneration, CollectedClient, CollectedSessions, FailedGeneration,
+};
 use super::compaction::{CompactionMonitor, CompactionSubscription};
 use super::handle::{CopilotClient, CopilotSession, SkillSelection};
 use super::history_repair::{self, HistoryRepair};
@@ -33,6 +36,8 @@ pub enum ClientShutdown {
 
 /// Select native history and model settings independently of host workflow state.
 pub struct SessionSelection {
+    /// Retain callback authority even when this preparation has no event subscriber yet.
+    pub execution_owner: forge_provider_api::ExecutionOwner,
     /// Identify the host execution owner whose native binding may be reused.
     pub runtime_key: String,
     /// Correlate diagnostics with the host session.
@@ -76,6 +81,24 @@ pub struct CopilotSessions<P> {
     subscriptions: Mutex<HashMap<String, CompactionSubscription>>,
     turns: Mutex<HashMap<String, Arc<CopilotTurnEvent>>>,
     trace: Arc<dyn ProviderTrace>,
+    generations: Mutex<HashMap<String, GenerationBinding>>,
+    collections: Mutex<Vec<SessionCollection>>,
+}
+
+struct GenerationBinding {
+    owner: forge_provider_api::ExecutionOwner,
+    generation: ClientGeneration,
+    observer: Option<tokio::task::JoinHandle<()>>,
+}
+
+struct SessionCollection {
+    failed: FailedGeneration,
+    state: SessionCollectionState,
+}
+
+enum SessionCollectionState {
+    Running(tokio::task::JoinHandle<Result<(), Arc<ProviderError>>>),
+    Complete(Result<(), Arc<ProviderError>>),
 }
 
 enum SessionHistory {
@@ -106,6 +129,8 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             subscriptions: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
             trace,
+            generations: Mutex::new(HashMap::new()),
+            collections: Mutex::new(Vec::new()),
         }
     }
 
@@ -124,6 +149,10 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         Fut: Future<Output = Result<PreparedSession<P>>> + Send,
         V: FnOnce(&CopilotSession) -> Result<()> + Send,
     {
+        anyhow::ensure!(
+            selection.execution_owner.runtime_key() == selection.runtime_key,
+            "Copilot session selection crosses execution ownership"
+        );
         let slot = self.slot(&selection.runtime_key).await;
         let turn = self.turn(&selection.runtime_key).await;
         let mut active = slot.lock().await;
@@ -165,6 +194,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                         == binding.tool_schema
                 })
         }) {
+            binding.session.ensure_healthy()?;
             if binding.compaction.is_none() {
                 binding.compaction = self.monitor(&selection, &binding.session, turn).await;
             }
@@ -189,6 +219,13 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             None => selection.session_id.clone(),
         };
         let (client, reasoning_effort) = client.await?;
+        client.ensure_healthy()?;
+        self.bind_generation(
+            &selection.runtime_key,
+            client.generation.clone(),
+            selection.execution_owner.clone(),
+        )
+        .await?;
         let mut prepared = prepare().await?;
         prepared.options.reasoning_effort = reasoning_effort;
         prepared.options.session_id = retained_id.clone();
@@ -376,12 +413,298 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         self.subscriptions
             .lock()
             .await
-            .insert(key, CompactionSubscription::new(sink));
+            .insert(key.clone(), CompactionSubscription::new(sink));
+        let generation = self
+            .generations
+            .lock()
+            .await
+            .get(&key)
+            .map(|binding| (binding.generation.clone(), binding.owner.clone()));
+        // Existing bindings normally subscribe before acquisition. A later
+        // observer must still receive a previously established client loss.
+        if let Some((generation, owner)) = generation
+            && let Err(error) = self.bind_generation(&key, generation, owner).await
+            && let Some(subscription) = self.subscriptions.lock().await.get(&key)
+        {
+            subscription
+                .sink
+                .fail(forge_provider_api::events::EventDeliveryError::transport(
+                    error,
+                ));
+        }
     }
 
     /// Report whether the session has a separate compaction observer.
     pub async fn observes_compaction(&self, key: &str) -> bool {
         self.subscriptions.lock().await.contains_key(key)
+    }
+
+    /// Fail every source observer sharing this client before callbacks or readers are retired.
+    pub async fn fail_generation(
+        &self,
+        failed: &FailedGeneration,
+    ) -> Result<Vec<forge_provider_api::ExecutionOwner>, ProviderError> {
+        let keys = self
+            .generations
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, binding)| failed.matches(&binding.generation))
+            .map(|(key, binding)| (key.clone(), binding.owner.clone()))
+            .collect::<Vec<_>>();
+        let subscriptions = self.subscriptions.lock().await;
+        let mut owners = Vec::new();
+        for (key, owner) in keys {
+            if let Some(subscription) = subscriptions.get(&key) {
+                subscription.sink.fail(
+                    forge_provider_api::events::EventDeliveryError::Observation(failed.failure()),
+                );
+            }
+            owners.push(owner);
+        }
+        Ok(owners)
+    }
+
+    /// Join failed-session cleanup without transferring its worker to a cancellable waiter.
+    pub async fn collect_failed_generation(
+        self: &Arc<Self>,
+        client: &CollectedClient,
+    ) -> Result<CollectedSessions, ProviderError> {
+        let mut collections = self.collections.lock().await;
+        let index = match collections
+            .iter()
+            .position(|entry| entry.failed.same(client.failed_generation()))
+        {
+            Some(index) => index,
+            None => {
+                let owner = self.clone();
+                let proof = client.clone();
+                collections.push(SessionCollection {
+                    failed: client.failed_generation().clone(),
+                    state: SessionCollectionState::Running(tokio::spawn(async move {
+                        owner.collect_failed_work(&proof).await.map_err(Arc::new)
+                    })),
+                });
+                collections.len() - 1
+            }
+        };
+        let entry = &mut collections[index];
+        if let SessionCollectionState::Running(task) = &mut entry.state {
+            let joined = tokio::time::timeout(std::time::Duration::from_secs(30), task)
+                .await
+                .map_err(|_| {
+                    ProviderError::Cleanup(Arc::new(
+                        forge_provider_api::error::ObservationCleanup::new(
+                            client.failed_generation().failure(),
+                            None,
+                            None,
+                            Some(forge_provider_api::error::CleanupFailure::TimedOut),
+                        ),
+                    ))
+                })?;
+            entry.state = SessionCollectionState::Complete(joined.unwrap_or_else(|error| {
+                Err(Arc::new(ProviderError::Protocol {
+                    message: format!("Copilot session collection worker failed: {error}"),
+                }))
+            }));
+        }
+        match &entry.state {
+            SessionCollectionState::Complete(Ok(())) => {
+                collections.remove(index);
+                Ok(CollectedSessions::new(client))
+            }
+            SessionCollectionState::Complete(Err(cleanup)) => {
+                Err(ProviderError::PreparationCleanup {
+                    cause: Arc::new(ProviderError::Observation(
+                        client.failed_generation().failure(),
+                    )),
+                    cleanup: cleanup.clone(),
+                })
+            }
+            SessionCollectionState::Running(_) => {
+                unreachable!("joined session collection has a retained result")
+            }
+        }
+    }
+
+    /// Preserve idle failure delivery independently of active invocation contexts or queue capacity.
+    async fn bind_generation(
+        &self,
+        key: &str,
+        generation: ClientGeneration,
+        owner: forge_provider_api::ExecutionOwner,
+    ) -> Result<(), ProviderError> {
+        if owner.runtime_key() != key {
+            return Err(ProviderError::Rejected {
+                message: "Copilot generation binding crosses execution ownership".into(),
+            });
+        }
+        let sink = self
+            .subscriptions
+            .lock()
+            .await
+            .get(key)
+            .map(|subscription| subscription.sink.clone());
+        if let (Some(sink), Some(failure)) = (&sink, generation.failure()) {
+            sink.fail(forge_provider_api::events::EventDeliveryError::Observation(
+                failure,
+            ));
+        }
+        let mut generations = self.generations.lock().await;
+        // Serialize admission with the collector's key snapshot. A stopped
+        // generation must never acquire a late binding after its collection proof.
+        generation.ensure_healthy()?;
+        if let Some(previous) = generations.get(key) {
+            if !previous.generation.same(&generation) {
+                return Err(ProviderError::Rejected {
+                    message: "old Copilot generation has not been collected".into(),
+                });
+            }
+            if previous.observer.is_some() {
+                return Ok(());
+            }
+        }
+        let observer = sink.map(|sink| {
+            let mut failure = generation.failures();
+            tokio::spawn(async move {
+                loop {
+                    if let Some(reason) = failure.borrow().clone() {
+                        sink.fail(forge_provider_api::events::EventDeliveryError::Observation(
+                            reason,
+                        ));
+                        break;
+                    }
+                    if failure.changed().await.is_err() {
+                        break;
+                    }
+                }
+            })
+        });
+        generations.insert(
+            key.to_owned(),
+            GenerationBinding {
+                owner,
+                generation,
+                observer,
+            },
+        );
+        Ok(())
+    }
+
+    /// Collect only this failed client's local work; never issue detach over its stopped transport.
+    async fn collect_failed_work(&self, proof: &CollectedClient) -> Result<(), ProviderError> {
+        self.fail_generation(proof.failed_generation()).await?;
+        let keys = self
+            .generations
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, binding)| proof.failed_generation().matches(&binding.generation))
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            let startup = self
+                .startups
+                .lock()
+                .map_err(|_| ProviderError::Protocol {
+                    message: "Copilot startup registry poisoned".into(),
+                })?
+                .get(&key)
+                .cloned();
+            if let Some(startup) = startup {
+                let mut retained = startup.lock().await;
+                if let Some(task) = retained.as_mut() {
+                    match task.await {
+                        Ok(Ok(session)) => session.local_collect_after_client_stop(proof).await?,
+                        Ok(Err(ProviderError::PreparationCleanup { cause, cleanup })) => {
+                            return Err(ProviderError::PreparationCleanup { cause, cleanup });
+                        }
+                        Ok(Err(_)) => {}
+                        Err(error) => {
+                            return Err(ProviderError::Protocol {
+                                message: format!(
+                                    "Copilot startup worker failed during recovery: {error}"
+                                ),
+                            });
+                        }
+                    }
+                    retained.take();
+                }
+                self.startups
+                    .lock()
+                    .map_err(|_| ProviderError::Protocol {
+                        message: "Copilot startup registry poisoned".into(),
+                    })?
+                    .remove(&key);
+            }
+            if let Some(mut monitor) = self.terminals.lock().await.remove(&key) {
+                monitor.shutdown().await?;
+            }
+            let slot = self.slots.lock().await.get(&key).cloned();
+            if let Some(slot) = slot {
+                let mut active = slot.lock().await;
+                if let Some(binding) = active.as_mut() {
+                    if !binding.session.belongs_to(proof.failed_generation()) {
+                        return Err(ProviderError::Rejected {
+                            message: "Copilot recovery encountered a successor session".into(),
+                        });
+                    }
+                    if let Some(monitor) = binding.compaction.as_mut() {
+                        monitor.shutdown().await?;
+                    }
+                    binding
+                        .session
+                        .local_collect_after_client_stop(proof)
+                        .await?;
+                }
+                active.take();
+            }
+            let provisional = self
+                .provisional
+                .lock()
+                .map_err(|_| ProviderError::Protocol {
+                    message: "Copilot provisional session registry poisoned".into(),
+                })?
+                .get(&key)
+                .cloned();
+            if let Some(session) = provisional {
+                session.local_collect_after_client_stop(proof).await?;
+            }
+            self.provisional
+                .lock()
+                .map_err(|_| ProviderError::Protocol {
+                    message: "Copilot provisional session registry poisoned".into(),
+                })?
+                .remove(&key);
+            self.leases
+                .lock()
+                .map_err(|_| ProviderError::Protocol {
+                    message: "Copilot resource lease registry poisoned".into(),
+                })?
+                .remove(&key);
+            self.failed_startups
+                .lock()
+                .map_err(|_| ProviderError::Protocol {
+                    message: "Copilot startup failure registry poisoned".into(),
+                })?
+                .remove(&key);
+            let observer = self
+                .generations
+                .lock()
+                .await
+                .get_mut(&key)
+                .and_then(|binding| binding.observer.take());
+            if let Some(observer) = observer {
+                // Sticky failure is already published; this owned worker joins its failure relay.
+                observer.await.map_err(|error| ProviderError::Protocol {
+                    message: format!("Copilot generation observer failed: {error}"),
+                })?;
+            }
+            self.generations.lock().await.remove(&key);
+            self.subscriptions.lock().await.remove(&key);
+            self.turns.lock().await.remove(&key);
+        }
+        Ok(())
     }
 
     /// Correlate one manual compaction with native notifications around its RPC.
@@ -439,6 +762,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             )
         });
         if !monitor.observes(&binding.session) {
+            monitor.shutdown().await?;
             *monitor = CopilotTerminalMonitor::new(
                 &binding.session,
                 self.trace.clone(),
@@ -466,14 +790,21 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         Ok(())
     }
 
-    /// Collect every session intake before SDK detach closes its subscription.
+    /// Drop observation readers before shutting down the SDK client.
     pub async fn close_observers(&self) -> Result<(), ProviderError> {
-        self.terminals.lock().await.clear();
+        let mut terminals = self.terminals.lock().await;
+        for monitor in terminals.values_mut() {
+            monitor.shutdown().await?;
+        }
+        terminals.clear();
+        drop(terminals);
         let slots: Vec<_> = self.slots.lock().await.values().cloned().collect();
         let mut sessions = Vec::new();
         for slot in slots {
-            let mut slot = slot.lock().await;
-            if let Some(binding) = slot.as_mut() {
+            if let Some(binding) = slot.lock().await.as_mut() {
+                if let Some(monitor) = binding.compaction.as_mut() {
+                    monitor.shutdown().await?;
+                }
                 binding.compaction.take();
                 sessions.push(binding.session.clone());
             }
@@ -487,17 +818,14 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 .values()
                 .cloned(),
         );
-        self.subscriptions.lock().await.clear();
         let mut failure = None;
         for session in sessions {
             if let Err(error) = session.events.close().await {
                 failure.get_or_insert(error);
             }
         }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        self.subscriptions.lock().await.clear();
+        failure.map_or(Ok(()), Err)
     }
 
     /// Disconnect one collected owner before allowing its history to be resumed.
@@ -528,6 +856,28 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             .remove(key);
         self.subscriptions.lock().await.remove(key);
         self.turns.lock().await.remove(key);
+        self.retire_generation_observer(key).await?;
+        Ok(())
+    }
+
+    /// Join a healthy owner's failure relay before removing its generation registration.
+    async fn retire_generation_observer(&self, key: &str) -> Result<(), ProviderError> {
+        let mut generations = self.generations.lock().await;
+        if let Some(binding) = generations.get_mut(key)
+            && let Some(observer) = binding.observer.as_mut()
+        {
+            observer.abort();
+            match observer.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => {
+                    return Err(ProviderError::Protocol {
+                        message: format!("Copilot generation observer failed: {error}"),
+                    });
+                }
+            }
+        }
+        generations.remove(key);
         Ok(())
     }
 
@@ -603,6 +953,18 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             if let Some(binding) = binding
                 && let Err(error) = binding.session.events.close().await
             {
+                failure.get_or_insert(error);
+            }
+        }
+        let keys = self
+            .generations
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Err(error) = self.retire_generation_observer(&key).await {
                 failure.get_or_insert(error);
             }
         }
@@ -766,8 +1128,8 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         let Some(mut binding) = active.take() else {
             return Ok(());
         };
-        if let Some(monitor) = self.terminals.lock().await.remove(key) {
-            monitor.shutdown().await;
+        if let Some(mut monitor) = self.terminals.lock().await.remove(key) {
+            monitor.shutdown().await?;
         }
         binding.compaction.take();
         if let Err(error) = binding.session.disconnect().await {
@@ -783,6 +1145,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    include!("sessions_recovery_test.rs");
+    include!("startup_loss_test.rs");
 
     struct Trace;
     impl ProviderTrace for Trace {
@@ -970,7 +1335,9 @@ mod tests {
                     .unwrap();
                     session.disconnect().await.unwrap();
                     peer.await.unwrap();
-                    client.inner.force_stop();
+                    client.fail_generation(
+                        forge_provider_api::lifecycle::ObservationFailure::Disconnected,
+                    );
                 }
             }
         })
@@ -1022,15 +1389,24 @@ mod tests {
                         .await
                         .unwrap(),
                 );
-                let stream = super::super::event_stream::SessionEventStream::new(
-                    &native,
+                let stream = super::super::event_stream::SessionEventStream::from_subscription(
+                    native.subscribe(),
+                    native.id().to_string(),
                     |_| true,
                     Arc::new(Trace),
                     "shutdown".into(),
+                    super::super::event_stream::StartupState::Finished(
+                        super::super::event_stream::StartupOutcome::Started,
+                    ),
+                    client.generation.clone(),
                 );
                 let session = Arc::new(CopilotSession {
                     inner: native,
-                    events: super::super::intake::SessionIntake::new(stream, client.clone()),
+                    events: super::super::intake::SessionIntake::new(
+                        stream,
+                        client.generation.clone(),
+                    ),
+                    generation: client.generation.clone(),
                 });
                 let sessions = CopilotSessions::<()>::new(Arc::new(Trace));
                 if provisional {
@@ -1071,11 +1447,17 @@ mod tests {
                     session.events.attach(context).await.is_err(),
                     "shutdown left intake alive"
                 );
-                client.inner.stop().await.unwrap();
-                peer.await.unwrap();
+                session.disconnect().await.unwrap();
                 assert!(
-                    !client.is_stopped(),
-                    "orderly shutdown was treated as observation loss"
+                    client.generation.failure().is_none(),
+                    "orderly observer collection was treated as observation loss"
+                );
+                client.stop().await.unwrap();
+                peer.await.unwrap();
+                assert!(client.is_stopped());
+                assert!(
+                    client.generation.failure().is_none(),
+                    "orderly shutdown invented observation loss"
                 );
             }
         })
@@ -1104,6 +1486,7 @@ mod tests {
                 .acquire(
                     async move { Ok((client, None)) },
                     SessionSelection {
+                        execution_owner: forge_provider_api::ExecutionOwner::root("owner"),
                         runtime_key: "owner".into(),
                         correlation_id: "owner".into(),
                         session_id: None,
@@ -1268,6 +1651,7 @@ mod tests {
                 .acquire(
                     async move { Ok((client, None)) },
                     SessionSelection {
+                        execution_owner: forge_provider_api::ExecutionOwner::root("owner"),
                         runtime_key: "owner".into(),
                         correlation_id: "owner".into(),
                         session_id: None,

@@ -13,17 +13,17 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone)]
 pub struct CopilotClient {
     pub(crate) inner: github_copilot_sdk::Client,
-    stopped: Arc<AtomicBool>,
+    pub(crate) generation: super::client_generation::ClientGeneration,
 }
 
 pub struct CopilotSession {
     pub(crate) inner: Arc<github_copilot_sdk::session::Session>,
     pub(crate) events: super::intake::SessionIntake,
+    pub(crate) generation: super::client_generation::ClientGeneration,
 }
 
 pub struct SkillSelection {
@@ -32,30 +32,44 @@ pub struct SkillSelection {
 }
 
 impl CopilotClient {
-    /// Create a shared runtime handle whose stop state follows every session.
+    /// Bind a native transport to its single shared health generation.
     pub(crate) fn new(inner: github_copilot_sdk::Client) -> Self {
         Self {
+            generation: super::client_generation::ClientGeneration::new(inner.clone()),
             inner,
-            stopped: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Report whether collection or observation failure stopped this runtime generation.
+    /// Get whether this shared transport is unavailable to retained session handles.
+    #[cfg(test)]
     pub(crate) fn is_stopped(&self) -> bool {
-        self.stopped.load(Ordering::Acquire)
+        self.generation.is_stopped()
     }
 
-    /// Stop the native transport before marking its shared generation unavailable.
+    /// Fence an unexposed transport rejected during runtime initialization.
     pub(crate) fn force_stop(&self) {
         self.inner.force_stop();
-        self.stopped.store(true, Ordering::Release);
     }
 
-    /// Collect the SDK runtime before marking its shared handles unavailable.
+    /// Collect the SDK runtime before marking its shared generation unavailable.
     pub(crate) async fn stop(&self) -> Result<(), github_copilot_sdk::StopErrors> {
         self.inner.stop().await?;
-        self.stopped.store(true, Ordering::Release);
+        self.generation.mark_stopped();
         Ok(())
+    }
+
+    /// Inject fixture transport loss into every session using this client.
+    #[cfg(test)]
+    pub(crate) fn fail_generation(
+        &self,
+        failure: forge_provider_api::lifecycle::ObservationFailure,
+    ) {
+        self.generation.fail(failure);
+    }
+
+    /// Reject session reuse after any reader has lost this shared transport.
+    pub(crate) fn ensure_healthy(&self) -> Result<(), ProviderError> {
+        self.generation.ensure_healthy()
     }
 
     pub async fn models(&self) -> Result<Vec<ProviderModel>, ProviderError> {
@@ -221,7 +235,34 @@ impl CopilotClient {
 }
 
 impl CopilotSession {
+    /// Check whether a failure applies to this session's exact native client.
+    pub fn belongs_to(&self, failed: &super::client_generation::FailedGeneration) -> bool {
+        failed.matches(&self.generation)
+    }
+
+    /// Reject reuse of a cached binding whose shared client has failed.
+    pub fn ensure_healthy(&self) -> Result<(), ProviderError> {
+        self.generation.ensure_healthy()
+    }
+
+    /// Join local readers after client collection, without a dead transport detach RPC.
+    pub async fn local_collect_after_client_stop(
+        &self,
+        proof: &super::client_generation::CollectedClient,
+    ) -> Result<(), ProviderError> {
+        if !self.belongs_to(proof.failed_generation()) {
+            return Err(ProviderError::Rejected {
+                message: "Copilot session collection proof belongs to another client generation"
+                    .into(),
+            });
+        }
+        self.events.close().await?;
+        self.inner.stop_event_loop().await;
+        Ok(())
+    }
+
     pub async fn send(&self, input: MessageInput) -> Result<String, ProviderError> {
+        self.ensure_healthy()?;
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
             self.inner.send(super::input::message(input)),
@@ -710,6 +751,7 @@ impl CopilotSession {
         input: MessageInput,
         receipt: Option<Arc<dyn InputReceipt>>,
     ) -> Result<String, ProviderError> {
+        self.ensure_healthy()?;
         let result: Result<String> = async {
             let message = super::input::message(input).with_mode(DeliveryMode::Immediate);
             if let Some(receipt) = &receipt {
@@ -720,11 +762,13 @@ impl CopilotSession {
                     .tail()
                     .await
                     .context("capture Copilot steering history boundary")?;
+                self.ensure_healthy()?;
                 receipt
                     .clone()
                     .record_sending(SubmissionTarget::native("copilot", self.id(), serde_json::json!({"cursor":history.cursor,"prompt":message.prompt.clone()})))
                     .await?;
             }
+            self.ensure_healthy()?;
             let accepted = self
                 .inner
                 .send(message)

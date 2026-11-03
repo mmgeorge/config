@@ -1,5 +1,5 @@
 use super::session::AcpSessionState;
-use super::{AcpConnection, AcpLaunch};
+use super::{AcpConnection, AcpConnectionError, AcpLaunch};
 use anyhow::{Context, Result, ensure};
 use forge_provider_api::catalog::{McpDefinition, McpStatus};
 use forge_provider_api::{
@@ -38,25 +38,15 @@ impl AcpConversation {
         options: ConversationOptions,
     ) -> Result<Self, ProviderError> {
         let runtime = PathBuf::from(launch.command.first().map(String::as_str).unwrap_or("ACP"));
-        let transport = AcpConnection::launch(launch, state.clone()).await?;
+        let requirement = runtime_requirement(options.kind, runtime)?;
+        let transport = AcpConnection::launch(launch, state.clone())
+            .await
+            .map_err(|source| initialization_failure(&requirement, source))?;
         let result: Result<Self> = async {
         let initialized = transport.request("initialize", json!({"protocolVersion":1,
             "clientInfo":{"name":"forge-harness","title":"Forge Harness","version":"0.1.0"},
-            "clientCapabilities":{"session":{"compaction":{},"configOptions":{"boolean":{}}},"subagents":{}}})).await?;
-        let minimum = match options.kind {
-            ProviderKind::Claude => semver::Version::new(0, 99, 1),
-            ProviderKind::Antigravity => semver::Version::new(1, 4, 5),
-            ProviderKind::Codex | ProviderKind::Copilot | ProviderKind::Mock => {
-                return Err(ProviderError::Protocol { message: "non-ACP provider selected for ACP initialization".into() }.into());
-            }
-        };
-        forge_provider_api::version::RuntimeRequirement::new(options.kind, runtime, minimum)
-            .validate(initialized.pointer("/agentInfo/version").and_then(Value::as_str))
-            .map_err(ProviderError::from)?;
-        ensure!(
-            initialized["protocolVersion"] == 1,
-            "ACP agent did not negotiate protocol v1"
-        );
+            "clientCapabilities":{"session":{"compaction":{},"configOptions":{"boolean":{}}},"subagents":{}}})).await.map_err(|source| initialization_failure(&requirement, source))?;
+        validate_initialization(&requirement, &initialized)?;
         ensure!(
             initialized
                 .pointer("/agentCapabilities/loadSession")
@@ -346,6 +336,61 @@ impl AcpConversation {
         }
         Ok(result)
     }
+}
+
+/// Create the adapter-owned requirement shared by setup and native session initialization.
+pub fn runtime_requirement(
+    kind: ProviderKind,
+    runtime: PathBuf,
+) -> Result<forge_provider_api::version::RuntimeRequirement, ProviderError> {
+    let minimum = match kind {
+        ProviderKind::Claude => semver::Version::new(0, 99, 1),
+        ProviderKind::Antigravity => semver::Version::new(1, 4, 5),
+        ProviderKind::Codex | ProviderKind::Copilot | ProviderKind::Mock => {
+            return Err(ProviderError::Protocol {
+                message: "non-ACP provider selected for ACP initialization".into(),
+            });
+        }
+    };
+    Ok(forge_provider_api::version::RuntimeRequirement::new(
+        kind, runtime, minimum,
+    ))
+}
+
+/// Preserve the native initialize failure with its version-probe classification and requirement.
+pub fn initialization_failure(
+    requirement: &forge_provider_api::version::RuntimeRequirement,
+    source: AcpConnectionError,
+) -> ProviderError {
+    match source {
+        source @ AcpConnectionError::Timeout { seconds, .. } => requirement
+            .probe_timed_out(std::time::Duration::from_secs(seconds), source)
+            .into(),
+        source @ (AcpConnectionError::Configuration(_)
+        | AcpConnectionError::Process { .. }
+        | AcpConnectionError::Startup { .. }
+        | AcpConnectionError::Protocol { .. }
+        | AcpConnectionError::Remote { .. }
+        | AcpConnectionError::Callback(_)) => requirement.probe_failed(source).into(),
+    }
+}
+
+/// Validate the reported runtime and selected ACP protocol before session or authentication use.
+pub fn validate_initialization(
+    requirement: &forge_provider_api::version::RuntimeRequirement,
+    initialized: &Value,
+) -> Result<forge_provider_api::version::ValidatedRuntime, ProviderError> {
+    let validated = requirement.validate(
+        initialized
+            .pointer("/agentInfo/version")
+            .and_then(Value::as_str),
+    )?;
+    if initialized["protocolVersion"] != 1 {
+        return Err(ProviderError::Protocol {
+            message: "ACP agent did not negotiate protocol v1".into(),
+        });
+    }
+    Ok(validated)
 }
 
 fn find_option<'catalog>(catalog: &'catalog Value, category: &str) -> Option<&'catalog Value> {

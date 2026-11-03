@@ -346,8 +346,14 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for FailureProvider {
         type Host = crate::provider::HarnessProviderHost;
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
         fn descriptor(&self) -> ProviderDescriptor {
             ProviderDescriptor {
@@ -359,8 +365,17 @@ mod tests {
         async fn has_active_turn(&self, _: &str) -> bool {
             false
         }
-        async fn cleanup_execution(&self, _: &str) -> Result<()> {
-            Ok(())
+        async fn cleanup_execution(
+            &self,
+            _: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
         async fn active_session_id_for(
             &self,
@@ -537,6 +552,7 @@ mod tests {
             );
             assert_ne!(requests[index + 1].0.input.text(), "original request");
         }
+        trace.flush()?;
         let records = std::fs::read_to_string(trace.session_status("retry-fixture").path)?;
         assert!(records.contains("capacity failure 6"));
         assert!(records.contains("\"status\":\"exhausted\""));
@@ -693,6 +709,7 @@ mod tests {
         }
         tokio::time::advance(Duration::from_secs(120)).await;
         assert_eq!(provider.request.lock().unwrap().len(), 1);
+        trace.flush()?;
         let records = std::fs::read_to_string(trace.session_status("retry-fixture").path)?;
         assert!(records.contains("\"status\":\"cancelled\""));
         Ok(())

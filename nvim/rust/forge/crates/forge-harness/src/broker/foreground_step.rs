@@ -28,8 +28,8 @@ impl HarnessBroker {
             ForegroundSignal::FailureCheckpointCompleted(result) => {
                 return self.complete_foreground_failure_checkpoint(dispatch, result);
             }
-            ForegroundSignal::CancelledTurnRollbackCompleted(result) => {
-                return self.complete_cancelled_turn_rollback(dispatch, result);
+            ForegroundSignal::FailureBaselineCompleted(result) => {
+                return self.complete_failure_baseline(dispatch, result);
             }
             signal => signal,
         };
@@ -135,6 +135,7 @@ impl HarnessBroker {
                 }
                 if transaction.question_stop_pending
                     || transaction.native_goal.is_some()
+                    || transaction.observation_publication_in_flight
                     || !transaction.pending_session_observations.is_empty()
                 {
                     transaction.pending_native_ready = Some(*ready);
@@ -159,18 +160,6 @@ impl HarnessBroker {
                     Ok(completion) => completion,
                     Err(error) => return self.fail_foreground(transaction, error),
                 };
-                if transaction.native_goal.is_none()
-                    && transaction.pending_session_observations.is_empty()
-                    && let Some(ready) = transaction.pending_native_ready.take()
-                {
-                    return self.complete_foreground_native(
-                        dispatch,
-                        ForegroundOutcome::RequiredQuestion {
-                            ready,
-                            completion: Box::new(completion),
-                        },
-                    );
-                }
                 transaction.question_override = Some(completion);
                 return Ok(ForegroundAction::Wait);
             }
@@ -179,17 +168,6 @@ impl HarnessBroker {
             }
             signal => signal,
         };
-        let reconsider_native = matches!(
-            &signal,
-            ForegroundSignal::AgentChanged
-                | ForegroundSignal::AgentDelivery(_)
-                | ForegroundSignal::AgentResultDelivered { .. }
-                | ForegroundSignal::AgentApprovalsCancelled { .. }
-                | ForegroundSignal::UserInput(_)
-                | ForegroundSignal::UserDelivery(_)
-                | ForegroundSignal::UserDeliverySettled(_)
-                | ForegroundSignal::PublicationDelivered(_)
-        );
         let (transaction, admission) = match dispatch {
             ForegroundDispatch::Running {
                 transaction,
@@ -407,7 +385,7 @@ impl HarnessBroker {
             | ForegroundSignal::FailureAdmissionEventsForwarded(_)
             | ForegroundSignal::FailurePublicationCompleted(_)
             | ForegroundSignal::FailureCheckpointCompleted(_)
-            | ForegroundSignal::CancelledTurnRollbackCompleted(_)
+            | ForegroundSignal::FailureBaselineCompleted(_)
             | ForegroundSignal::AdmissionCleanupCompleted(_)
             | ForegroundSignal::AdmissionFailureCheckpointCompleted(_)
             | ForegroundSignal::RetractionGoalRestored(_)
@@ -433,22 +411,6 @@ impl HarnessBroker {
                 anyhow::bail!("foreground signal arrived in the wrong phase")
             }
         }?;
-        if reconsider_native
-            && matches!(&action, ForegroundAction::Wait)
-            && transaction.native_goal.is_none()
-            && !transaction.question_stop_pending
-            && transaction.pending_session_observations.is_empty()
-            && let Some(ready) = transaction.pending_native_ready.take()
-        {
-            let outcome = match transaction.question_override.take() {
-                Some(completion) => ForegroundOutcome::RequiredQuestion {
-                    ready,
-                    completion: Box::new(completion),
-                },
-                None => ForegroundOutcome::NativeReady(ready),
-            };
-            return self.complete_foreground_native(dispatch, outcome);
-        }
         let failure_drained = transaction.failure.is_some()
             && transaction.pending_session_observations.is_empty()
             && matches!(&action, ForegroundAction::Wait);
@@ -548,12 +510,42 @@ impl HarnessBroker {
         &self,
         transaction: &mut ForegroundTransaction,
     ) -> Result<()> {
-        while let Some(event) = transaction.native.events.try_next()? {
-            transaction.pending_session_observations.push_back(event);
+        let mut failure = None;
+        while transaction.native.stream_open
+            && transaction.pending_session_observations.len() < forge_protocol::MAX_PENDING_FRAMES
+        {
+            match transaction.native.events.try_next() {
+                Ok(Some(event)) => transaction.pending_session_observations.push_back(event),
+                Ok(None) => break,
+                Err(error) => {
+                    transaction.native.stream_open = false;
+                    failure = Some(anyhow::Error::new(error));
+                    break;
+                }
+            }
         }
-        for event in transaction.session_events.drain()? {
-            transaction.pending_session_observations.push_back(event);
+        let remaining = forge_protocol::MAX_PENDING_FRAMES
+            .saturating_sub(transaction.pending_session_observations.len());
+        if remaining != 0 && (!transaction.failure_cleanup_active || transaction.failure_inbox_open)
+        {
+            match transaction.session_events.drain_up_to(remaining) {
+                Ok(events) => {
+                    if events.is_empty() && transaction.session_events.is_closed() {
+                        transaction.failure_inbox_open = false;
+                    }
+                    transaction.pending_session_observations.extend(events);
+                }
+                Err(error) => {
+                    transaction.failure_inbox_open = false;
+                    failure = Some(match failure {
+                        Some(native) => {
+                            native.context(format!("session observation drain failed: {error}"))
+                        }
+                        None => anyhow::Error::new(error),
+                    });
+                }
+            }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 }

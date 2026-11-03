@@ -10,6 +10,8 @@ startup_log.path = function() return startup_log_path end
 local original_context = package.loaded["forge.views.status.status_context"]
 local client = require("forge.client")
 local original_start = client.host_start
+local original_set_buffer = vim.api.nvim_win_set_buf
+local original_notify = vim.notify
 client.host_start = function() end
 local context_attachment = {}
 local refocus_checks = 0
@@ -135,10 +137,70 @@ local succeeded, failure = xpcall(function()
   status.close(pending_command)
   pending_open[pending_command.document]()
   await(function() return closed_document[pending_command.document] end, "pending command close did not settle")
+
+  -- Exercise the public entry from a real pinned window, preserving its draft and ownership.
+  local forge = require("forge")
+  vim.api.nvim_set_current_win(unrelated_window)
+  local pinned = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_name(pinned, "ForgeHarnessInput://status-entry-fixture")
+  vim.api.nvim_buf_set_lines(pinned, 0, -1, false, { "Retain this Harness draft café 東京" })
+  vim.api.nvim_win_set_buf(unrelated_window, pinned)
+  vim.api.nvim_win_set_cursor(unrelated_window, { 1, 5 })
+  vim.wo[unrelated_window].winfixbuf = true
+  local pinned_cursor = vim.api.nvim_win_get_cursor(unrelated_window)
+  local public = forge.open()
+  assert(vim.api.nvim_get_current_win() == unrelated_window and vim.api.nvim_get_current_buf() == pinned,
+    "pending public Status entry changed the pinned window")
+  pending_open[public.document]()
+  await(function() return public.ready and #vim.fn.win_findbuf(public.replica.buffer) == 1 end,
+    "public Status entry did not mount beside the pinned feature")
+  local status_window = vim.fn.win_findbuf(public.replica.buffer)[1]
+  assert(status_window ~= unrelated_window and vim.api.nvim_get_current_win() == status_window)
+  assert(vim.api.nvim_win_get_buf(unrelated_window) == pinned and vim.wo[unrelated_window].winfixbuf,
+    "Status stole the pinned Harness input buffer or removed its pin")
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(unrelated_window), pinned_cursor)
+    and vim.api.nvim_buf_get_lines(pinned, 0, -1, false)[1] == "Retain this Harness draft café 東京")
+  vim.api.nvim_set_current_win(unrelated_window)
+  local tabs = #vim.api.nvim_list_tabpages()
+  assert(forge.open() == public and vim.api.nvim_get_current_win() == status_window,
+    "cached Status entry could not focus its existing mount from a pinned input")
+  assert(#vim.api.nvim_list_tabpages() == tabs, "cached Status entry created another tab")
+  status.close(public)
+  await(function() return closed_document[public.document] end, "public pinned Status close did not settle")
+  if vim.api.nvim_win_is_valid(status_window) then vim.api.nvim_win_close(status_window, true) end
+  vim.api.nvim_set_current_win(unrelated_window)
+
+  -- A failed asynchronous bind must release the cached owner and its newly created window.
+  local failed = forge.open()
+  local notices = {}
+  vim.notify = function(message) notices[#notices + 1] = tostring(message) end
+  vim.api.nvim_win_set_buf = function(window, buf)
+    if buf == failed.replica.buffer then error("fixture Status bind failure") end
+    return original_set_buffer(window, buf)
+  end
+  local before_failure_tabs = #vim.api.nvim_list_tabpages()
+  pending_open[failed.document]()
+  await(function() return not failed.active and closed_document[failed.document] end,
+    "failed Status binding retained a partial active document")
+  vim.api.nvim_win_set_buf = original_set_buffer
+  vim.notify = original_notify
+  assert(not vim.api.nvim_buf_is_valid(failed.replica.buffer) and not failed.ready)
+  assert(#vim.api.nvim_list_tabpages() == before_failure_tabs, "failed binding leaked its new Status tab")
+  assert(#notices == 1 and notices[1]:find("fixture Status bind failure", 1, true))
+  assert(vim.api.nvim_win_get_buf(unrelated_window) == pinned and vim.wo[unrelated_window].winfixbuf)
+  local recovered = forge.open()
+  assert(recovered ~= failed, "public entry reused a failed partial Status owner")
+  pending_open[recovered.document]()
+  await(function() return recovered.ready end, "public Status entry did not recover after a failed bind")
+  status.close(recovered)
+  await(function() return closed_document[recovered.document] end, "recovered Status close did not settle")
+  vim.wo[unrelated_window].winfixbuf = false
 end, debug.traceback)
 
 status._set_runner_for_test(nil)
 client.host_start = original_start
+vim.api.nvim_win_set_buf = original_set_buffer
+vim.notify = original_notify
 startup_log.path = original_startup_log_path
 vim.fn.delete(startup_log_path)
 package.loaded["forge.views.status.status_context"] = original_context

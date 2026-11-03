@@ -120,7 +120,9 @@ pub async fn wait_hook(path: &Path, input: &mut impl std::io::Read) -> Value {
 
 /// Retains and cancels asynchronous baseline acquisition with its exchange.
 pub(crate) struct CheckpointTask(
-    pub(crate) tokio::task::JoinHandle<Result<super::CheckpointRecord>>,
+    pub(crate)  tokio::task::JoinHandle<
+        std::result::Result<super::CheckpointRecord, super::CheckpointFailure>,
+    >,
 );
 
 impl Drop for CheckpointTask {

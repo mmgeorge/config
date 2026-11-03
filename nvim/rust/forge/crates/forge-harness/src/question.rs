@@ -175,6 +175,15 @@ pub(crate) struct QuestionSnapshot {
 }
 
 impl QuestionSnapshot {
+    /// Keep unfinished required tool questions attached to their originating exchange.
+    pub(crate) fn required_pending_in_exchange(&self, exchange_id: &str) -> bool {
+        self.questions.iter().any(|question| {
+            question.exchange_id == exchange_id
+                && question.requirement == QuestionRequirement::Required
+                && question.pending()
+        })
+    }
+
     /// Preserve the turn's required-input stop even after a fast answer resolves the gate.
     pub(crate) fn required_in_exchange(&self, exchange_id: &str) -> bool {
         self.questions.iter().any(|question| {
@@ -591,6 +600,11 @@ impl QuestionController {
                 ensure!(previous == &encoded, "question operation identity was reused");
                 return Ok(state.snapshot.clone());
             }
+            let other_required_pending = state.snapshot.questions.iter().any(|question| {
+                question.id != command.question_id
+                    && question.requirement == QuestionRequirement::Required
+                    && question.pending()
+            });
             let question = state.snapshot.questions.iter_mut().find(|question| question.id == command.question_id).context("question does not belong to this session")?;
             let cancelled = state.cancelled_exchanges.contains(&question.exchange_id);
             ensure!(question.content.revision == command.revision, "question changed; review its current choices before submitting");
@@ -656,7 +670,7 @@ impl QuestionController {
                         "revision": question.content.revision,
                         "message_id": message_id,
                     });
-                    format!("Harness question clarification\n{}\nChoices: {}\nUser clarification: {}\nReply target: {}\nThis is a read-only question discussion. Call question_reply with these exact target fields and your explanation in text. Copy the complete opaque question_id, including its colon and index suffix. Leave the question unanswered. Honor any explicit constraint in the user's text. Do not perform the original work; Harness owns its continuation.", question.content.question, serde_json::to_string(&question.content.options)?, text, target)
+                    format!("Harness question clarification\n{}\nChoices: {}\nUser clarification: {}\nReply target: {}\nThis is a read-only question discussion. Explain the choices and provide illustrative examples when requested, without selecting or recording an answer. Call question_reply with these exact target fields and your explanation in text. Copy the complete opaque question_id, including its colon and index suffix. Leave the question unanswered. Honor any explicit constraint in the user's text. Do not implement or resume the original task; Harness owns its continuation.", question.content.question, serde_json::to_string(&question.content.options)?, text, target)
                 } else {
                     let end = question.content.question.floor_char_boundary(question.content.question.len().min(512));
                     let replies = serde_json::json!([{
@@ -664,7 +678,10 @@ impl QuestionController {
                         "question": question.content.question[..end].replace(['\n', '\r'], " "),
                         "questionItemId": question.id.as_str(),
                     }]);
-                    format!("<send_user_message_question_reply>\n{replies}\n</send_user_message_question_reply>")
+                    let remaining = if other_required_pending {
+                        "\nOther required questions remain unanswered. Record this answer without resuming the original request. Wait for the remaining answers."
+                    } else { "" };
+                    format!("<send_user_message_question_reply>\n{replies}\n</send_user_message_question_reply>{remaining}")
                 };
                 state.outbox.push(QuestionOutbox { id: message_id, question_id: question.id.clone(), task_id: question.task_id.clone(), kind, text: rendered });
             }
@@ -1369,6 +1386,16 @@ mod tests {
             },
         ))?;
         assert!(controller.snapshot()?.required_pending());
+        assert!(
+            controller
+                .snapshot()?
+                .required_pending_in_exchange("exchange")
+        );
+        assert!(controller.outbox()?.iter().any(|message| {
+            message
+                .text
+                .contains("Other required questions remain unanswered")
+        }));
         controller.apply(command(
             &ids[1],
             "withdraw",
@@ -1377,6 +1404,11 @@ mod tests {
             },
         ))?;
         assert!(!controller.snapshot()?.required_pending());
+        assert!(
+            !controller
+                .snapshot()?
+                .required_pending_in_exchange("exchange")
+        );
         assert!(controller.snapshot()?.required_in_exchange("exchange"));
         assert!(
             !controller

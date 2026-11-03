@@ -69,9 +69,13 @@ impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized>
     fn attach(provider: Arc<P>, native: Arc<harness::provider::Provider>) -> anyhow::Result<Self> {
         let directory = Arc::new(tempfile::tempdir()?);
         let trace = Arc::new(harness::trace::TraceStore::open(directory.path())?);
-        let store = harness::provider::submission::SubmissionStore::open(directory.path(), trace)?;
+        let store =
+            harness::provider::submission::SubmissionStore::open(directory.path(), trace.clone())?;
         let registry = Arc::new(
-            harness::provider::session_execution::SessionExecutionRegistry::new(native.clone()),
+            harness::provider::session_execution::SessionExecutionRegistry::new(
+                native.clone(),
+                trace.clone(),
+            ),
         );
         Ok(Self {
             provider,
@@ -94,7 +98,7 @@ impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized>
         request: ProviderRequest,
     ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
         self.owner(request.owner()?).await?;
-        self.provider.initialize_session(request).await
+        Ok(self.provider.initialize_session(request).await?)
     }
 
     /// Steer through the same owner and reducer used for complete-result collection.
@@ -116,15 +120,10 @@ impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized>
             match inbox.drain() {
                 Ok(events) if events.is_empty() => break,
                 Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.downcast_ref::<ProviderError>(),
-                        Some(ProviderError::Observation(_))
-                    ) =>
-                {
+                Err(error) if matches!(error, ProviderError::Observation(_)) => {
                     break;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
         }
         self.registry.replace(owner.clone()).await?;

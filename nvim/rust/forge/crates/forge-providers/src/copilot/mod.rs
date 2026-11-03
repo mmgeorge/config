@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod client_generation;
 pub mod compaction;
 pub mod control;
 pub mod decode;

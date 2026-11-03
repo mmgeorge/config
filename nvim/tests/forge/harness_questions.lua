@@ -230,5 +230,66 @@ other_answer.callback(saved_other)
 assert(not vim.api.nvim_win_is_valid(editing_window), "resolved question retained its obsolete editor")
 assert(picker._state_for_test().spec.page_list[1].id == "arrived")
 picker.close(false)
+-- Choosing a structured answer must not resubmit the retained clarification draft.
+state.questions = { revision = 16, questions = { question("clarify-then-answer", "required") } }
+state.question_picker_resume = nil
+questions.open(state, host)
+press("a")
+press("<CR>")
+instance = picker._state_for_test()
+local clarification = "Show one example before I choose."
+vim.api.nvim_buf_set_lines(instance.input_buf, 0, -1, false, { clarification })
+local function press_question_input(key)
+  local current = picker._state_for_test()
+  local mapping = vim.api.nvim_buf_call(current.input_buf, function()
+    return vim.fn.maparg(key, "n", false, true)
+  end)
+  assert(mapping.callback, "missing question input key: " .. key)
+  mapping.callback()
+end
+press_question_input("<C-s>")
+local clarification_request = sent[#sent]
+assert(clarification_request.request.params.command.action.kind == "clarify")
+local explanation = vim.deepcopy(state.questions)
+explanation.revision = 17
+explanation.questions[1].discussion = { { kind = "reply", text = "Tabs are compact; a sidebar is wide." } }
+clarification_request.callback(explanation)
+instance = picker._state_for_test()
+assert(instance.input_kind == "ask" and instance.input_buf,
+  "clarification response discarded the retained Ask editor")
+assert(vim.api.nvim_buf_get_lines(instance.input_buf, 0, -1, false)[1] == clarification)
+local before_answer = #sent
+press_question_input("<C-f>")
+press(require("forge.infra.config").options.picker.choice_keys[1])
+press("<CR>")
+local selected_answer = sent[#sent]
+local selected_action = selected_answer.request.params.command.action
+assert(#sent == before_answer + 1 and selected_action.kind == "answer",
+  "confirming a selected answer resubmitted the Ask draft")
+assert(selected_action.answer.kind == "selected" and selected_action.answer.option_id == "tabs")
+assert(selected_action.answer.feedback == nil, "Ask text leaked into answer feedback")
+assert(state.question_drafts["clarify-then-answer"].ask == clarification,
+  "selecting an answer lost the independent clarification draft")
+local resolved = vim.deepcopy(state.questions)
+resolved.revision = 18
+resolved.questions[1].resolution = { kind = "answered" }
+selected_answer.callback(resolved)
+assert(not picker.is_open("questions"), "selected answer did not resolve the question")
+
+-- Explicit answer feedback still follows the selected option from the options pane.
+state.questions = { revision = 19, questions = { question("answer-with-feedback", "required") } }
+state.question_picker_resume = nil
+questions.open(state, host)
+press("<C-f>")
+instance = picker._state_for_test()
+assert(instance.input_kind == "feedback", "answer feedback used a clarification editor")
+vim.api.nvim_buf_set_lines(instance.input_buf, 0, -1, false, { "Keep the compact layout." })
+press_question_input("<C-f>")
+press("<CR>")
+local feedback_answer = sent[#sent].request.params.command.action
+assert(feedback_answer.kind == "answer" and feedback_answer.answer.option_id == "tabs")
+assert(feedback_answer.answer.feedback == "Keep the compact layout.",
+  "confirming a structured answer discarded its explicit feedback")
+picker.close(false)
 client.request = original_request
 print("harness questions tests passed")

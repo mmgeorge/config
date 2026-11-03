@@ -56,7 +56,7 @@ impl AdmissionWorkspaceJob {
                 let checkpoint = (&mut task.0)
                     .await
                     .context("initial checkpoint worker failed")
-                    .and_then(|result| result);
+                    .and_then(|result| result.map_err(anyhow::Error::new));
                 (WorkspaceOwner::Initial, checkpoint)
             }
             WorkspaceWork::Task {

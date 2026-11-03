@@ -484,6 +484,7 @@ impl HarnessInspectionScope {
         page: &mut InspectionPage,
         limit: Option<NonZeroUsize>,
     ) -> Result<()> {
+        self.trace.flush()?;
         let current = PathBuf::from(self.trace.session_status(&session.id).path);
         if let Some(snapshot) = LogSnapshot::open(&current)? {
             page.attach_log(

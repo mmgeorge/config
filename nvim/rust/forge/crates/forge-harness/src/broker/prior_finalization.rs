@@ -26,7 +26,7 @@ impl PriorObservationJob {
             biased;
             () = self.cancellation.cancelled() => Err(TurnCancelled.into()),
             () = self.settlement.notified() => Ok(()),
-            result = self.inbox.notified() => result,
+            result = self.inbox.notified() => result.map_err(anyhow::Error::new),
         }
     }
 }
@@ -55,6 +55,7 @@ impl PriorInitialJob {
         (&mut self.task.0)
             .await
             .context("prior checkpoint worker failed")?
+            .map_err(anyhow::Error::new)
     }
 }
 

@@ -629,7 +629,9 @@ local function confirm(instance, with_feedback)
   elseif with_feedback then
     open_input(instance, "feedback")
   else
-    local feedback = valid_window(instance.input_win) and input.text(instance.input_buf) or ""
+    -- Ask and Other drafts keep their own submit action when a regular option is chosen.
+    local feedback = instance.input_kind == "feedback" and valid_window(instance.input_win)
+      and input.text(instance.input_buf) or ""
     finish(instance, {
       page = page,
       option = option,

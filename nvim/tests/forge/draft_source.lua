@@ -46,6 +46,14 @@ assert(replica.physical_column(43, 5) == 11, "source-to-display mapping lost its
 assert(replica.locate(displayed, 11).target == "director" and replica.locate(displayed, 24).target == "weapon",
   "display padding shifted symbol navigation away from canonical source columns")
 assert(replica.locate(displayed, 0).position.column == 0, "presentation padding produced a negative source column")
+source[1].text = "Choice · JSON"
+comments.update(buffer, {})
+local annotation_location = replica.locate(2, 8)
+assert(annotation_location.block == "first-block" and annotation_location.position.column == 0,
+  "an annotation cursor column must not become a byte offset inside its source's multibyte character")
+local first_row = replica.physical_row(0)
+assert(replica.locate(first_row, 8).position.column == 7,
+  "source coordinate clamping must retain a valid UTF-8 boundary")
 comments.detach(buffer)
 vim.api.nvim_buf_delete(buffer, { force = true })
 print("draft_source: exact symbol navigation and sparse source boundaries survive local comments")

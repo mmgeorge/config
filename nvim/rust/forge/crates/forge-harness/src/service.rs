@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -147,7 +148,7 @@ impl HarnessService {
         ));
         let trace = Arc::new(crate::trace::TraceStore::open(&config.data_root)?);
         let provider =
-            crate::provider::build(config.provider, permission, trace, config.data_root)?;
+            crate::provider::build(config.provider, permission, trace.clone(), config.data_root)?;
         let request = crate::provider::ProviderCatalogRequest {
             execution_owner: None,
             harness_session_id: format!("generation-{}", uuid::Uuid::new_v4()),
@@ -162,7 +163,7 @@ impl HarnessService {
             approval_mode: crate::session::ApprovalMode::Ask,
             provider_session_id: None,
         };
-        generate_isolated_text(
+        let generation = generate_isolated_text(
             provider.as_ref(),
             request,
             purpose,
@@ -170,7 +171,26 @@ impl HarnessService {
             config.reasoning_effort.as_deref(),
             input,
         )
-        .await
+        .await;
+        drop(provider);
+        let collected = tokio::task::spawn_blocking(move || trace.close()).await;
+        // Diagnostic collection cannot change an already established model result.
+        match collected {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Forge Harness isolated trace collection failed: {error}"
+                );
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Forge Harness isolated trace collector failed: {error}"
+                );
+            }
+        }
+        generation
     }
 
     pub async fn saved_diff(
@@ -1118,6 +1138,12 @@ impl HarnessService {
                         .close_all()?;
                     controller.broker.lock().await.release_lease()?;
                 }
+                // Controllers borrow this runtime's trace lease. Collect it only
+                // after their final observations and lease-release diagnostics.
+                let trace = registry.runtime.trace();
+                tokio::task::spawn_blocking(move || trace.close())
+                    .await
+                    .context("collect Harness trace writer")??;
             }
             owner.take();
             Ok(())
@@ -1532,7 +1558,7 @@ impl SessionController {
         let sink = sink.clone();
         let startup_session_id = request.harness_session_id.clone();
         let startup_factory = || async move {
-            let mut initialized = async {
+            let initialized = async {
                 execution_registry.owner(request.owner()?).await?;
                 provider.initialize_session(request.clone()).await
             }
@@ -1546,12 +1572,12 @@ impl SessionController {
             {
                 return;
             }
-            if initialized.as_ref().is_err_and(|error| {
-                matches!(
-                    error.downcast_ref::<crate::provider::ProviderError>(),
-                    Some(crate::provider::ProviderError::SessionMissing { .. })
-                )
-            }) {
+            let missing_history = matches!(
+                initialized.as_ref(),
+                Err(crate::provider::ProviderError::SessionMissing { .. })
+            );
+            let mut initialized = initialized.map_err(anyhow::Error::from);
+            if missing_history {
                 initialized = initialized.map_err(|error| {
                     error.context(
                     "Saved provider history is unavailable; retained conversation was preserved"
@@ -1670,14 +1696,17 @@ impl SessionController {
             }
             let owner = crate::provider::ExecutionOwner::root(session_id);
             self.permission.cancel_owner(&owner, None).await?;
-            self.provider_handle().cleanup_execution(session_id).await
+            Ok(self.provider_handle().cleanup_execution(session_id).await?)
         }
         .await;
         if let Err(error) = cleanup {
-            self.cancellation.fail_cleanup(&error);
-            return Err(
-                error.context("collect provider execution before replacing a checked prompt")
+            let error = crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                error,
             );
+            self.cancellation.fail_cleanup(&error);
+            return Err(anyhow::Error::new(error)
+                .context("collect provider execution before replacing a checked prompt"));
         }
         self.cancellation.request(false);
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -2260,19 +2289,25 @@ async fn generate_isolated_text(
     let provider_label = provider.descriptor().label;
     let result = provider
         .generate_text(request, purpose, model, reasoning_effort, input)
-        .await
-        .with_context(|| format!("{provider_label} {} generation failed", purpose.name()));
-    let cleanup = tokio::time::timeout(Duration::from_secs(8), provider.shutdown())
-        .await
-        .context("Isolated provider shutdown timed out")
-        .and_then(|result| result);
-    match (result, cleanup) {
-        (Err(failure), Err(cleanup)) => {
-            Err(failure.context(format!("Isolated provider cleanup failed: {cleanup:#}")))
-        }
-        (Err(failure), _) | (_, Err(failure)) => Err(failure),
-        (Ok(text), Ok(())) => purpose.validate(&text),
-    }
+        .await;
+    let cleanup = match tokio::time::timeout(Duration::from_secs(8), provider.shutdown()).await {
+        Ok(result) => result,
+        Err(source) => Err(crate::provider::ProviderError::Operation(
+            forge_provider_api::error::ProviderOperationFailure::new(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                Arc::new(source),
+            ),
+        )),
+    };
+    let result = match (result, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(crate::provider::ProviderError::Combined {
+            primary: Box::new(primary),
+            secondary: vec![cleanup],
+        }),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Ok(text), Ok(())) => Ok(text),
+    };
+    result.with_context(|| format!("{provider_label} {} generation failed", purpose.name()))
 }
 
 async fn analyze_plan_source(
@@ -3756,7 +3791,9 @@ async fn execute_task_transition_inner(
                 .await
             {
                 controller.cancellation.fail_cleanup(&error);
-                return Err(error.context("collect current task before transition"));
+                return Err(
+                    anyhow::Error::new(error).context("collect current task before transition")
+                );
             }
             controller.cancellation.request(restore_prompt);
             // Execution ownership includes finalization and response delivery, independently of read-only broker locks.
@@ -5419,11 +5456,11 @@ async fn request_foreground_native_cancel(
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
             controller.cancellation.request(restore_prompt);
-            Err(error.context("native cancellation failed"))
+            Err(anyhow::Error::new(error).context("native cancellation failed"))
         }
-        Err(_) => {
+        Err(source) => {
             controller.cancellation.request(restore_prompt);
-            anyhow::bail!("native cancellation exceeded 15 seconds")
+            Err(anyhow::Error::new(source).context("native cancellation exceeded 15 seconds"))
         }
     }
 }
@@ -5749,7 +5786,7 @@ async fn route_control_request(
                 .await
             {
                 controller.cancellation.fail_cleanup(&error);
-                return Err(error);
+                return Err(error.into());
             }
             controller.cancellation.request_restart();
             let approval_owner = crate::provider::ExecutionOwner::root(
@@ -6608,14 +6645,38 @@ mod tests {
                 .await
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
-        async fn cleanup_execution(&self, _: &str) -> Result<()> {
-            Ok(())
+        async fn cleanup_execution(
+            &self,
+            _: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
-        async fn cancel_session(&self, _: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
         async fn has_active_turn(&self, _: &str) -> bool {
             false
@@ -6734,16 +6795,25 @@ mod tests {
             model: &str,
             reasoning_effort: Option<&str>,
             input: &str,
-        ) -> Result<String> {
-            self.request.lock().unwrap().push(GenerationCall {
-                request,
-                purpose,
-                model: model.into(),
-                effort: reasoning_effort.map(str::to_owned),
-                input: input.into(),
-            });
-            ensure!(!self.fail, "fixture generation failure");
-            Ok("```text\nfix: preserve drafts\n\nKeep existing text.\n```".into())
+        ) -> std::result::Result<String, crate::provider::ProviderError> {
+            let result: anyhow::Result<String> = async move {
+                self.request.lock().unwrap().push(GenerationCall {
+                    request,
+                    purpose,
+                    model: model.into(),
+                    effort: reasoning_effort.map(str::to_owned),
+                    input: input.into(),
+                });
+                ensure!(!self.fail, "fixture generation failure");
+                Ok("```text\nfix: preserve drafts\n\nKeep existing text.\n```".into())
+            }
+            .await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::GenerateText,
+                    source,
+                )
+            })
         }
         fn descriptor(&self) -> ProviderDescriptor {
             ProviderDescriptor {
@@ -6780,15 +6850,42 @@ mod tests {
                 .await
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            self.shutdown.store(true, Ordering::Release);
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move {
+                self.shutdown.store(true, Ordering::Release);
+                Ok(())
+            }
+            .await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
-        async fn cleanup_execution(&self, _: &str) -> Result<()> {
-            Ok(())
+        async fn cleanup_execution(
+            &self,
+            _: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
-        async fn cancel_session(&self, _: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
         async fn has_active_turn(&self, _: &str) -> bool {
             false
@@ -8806,16 +8903,41 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for SteeringProvider {
         type Host = crate::provider::HarnessProviderHost;
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -9605,17 +9727,44 @@ mod tests {
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for CheckCleanupProvider {
         type Host = crate::provider::HarnessProviderHost;
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
-        async fn cleanup_execution(&self, _: &str) -> Result<()> {
-            self.started.notify_one();
-            self.release.notified().await;
-            self.completed.store(true, Ordering::Release);
-            Ok(())
+        async fn cleanup_execution(
+            &self,
+            _: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move {
+                self.started.notify_one();
+                self.release.notified().await;
+                self.completed.store(true, Ordering::Release);
+                Ok(())
+            }
+            .await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
-        async fn cancel_session(&self, _: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
         async fn has_active_turn(&self, _: &str) -> bool {
             !self.completed.load(Ordering::Acquire)
@@ -10439,6 +10588,118 @@ mod tests {
             Ok::<(), anyhow::Error>(())
         })
         .await??;
+        controller.coordinator.submissions.suspend(true, None)?;
+        drop(active);
+        drop(execution);
+        service.shutdown(Duration::from_secs(5)).await?;
+        drop(sink);
+        reader.await??;
+        Ok(())
+    }
+
+    /// Preserve cancelled, undispatched followups for explicit recovery instead of replaying them.
+    #[tokio::test]
+    async fn cancelled_deferred_input_retains_text_and_attachment_without_replay() -> Result<()> {
+        use crate::input::{InputDelivery, InputOperation};
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let registry = service.registry().await?;
+        let session_id = registry.initial_session_id().to_owned();
+        let controller = registry.resolve(&session_id).await?;
+        let execution = controller
+            .coordinator
+            .execution
+            .clone()
+            .acquire_owned()
+            .await?;
+        let mut active = controller.parent_input.activate(None)?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let source = fixture.path().join("retained.png");
+        std::fs::write(&source, b"\x89PNG\r\n\x1a\nretained image")?;
+        service
+            .dispatch(
+                Some(session_id.clone()),
+                Request {
+                    id: 2,
+                    method: "session.attachment.import".into(),
+                    params: json!({"path":source,"number":1}),
+                },
+                &sink,
+            )
+            .await?;
+        let imported: Value = serde_json::from_slice(
+            output
+                .recv()
+                .await?
+                .context("missing imported attachment")?
+                .bytes(),
+        )?;
+        let attachment = imported["result"].clone();
+        let reader = tokio::spawn(async move {
+            while output.recv().await?.is_some() {}
+            Ok::<(), anyhow::Error>(())
+        });
+        let operation: InputOperation = serde_json::from_value(json!({
+            "id":"deferred-op","action":{"kind":"submit","message":{
+                "id":"deferred-input","text":"[Image #1] café 東京","intent":"auto","attachments":[attachment]
+            }}
+        }))?;
+        controller.coordinator.submissions.apply(operation)?;
+        controller.attach_input(&sink).await?;
+        let command = tokio::time::timeout(Duration::from_secs(5), active.receive())
+            .await?
+            .context("missing deferred input")?;
+        let submission = command
+            .submission
+            .as_ref()
+            .context("missing deferred receipt")?
+            .clone();
+        assert_eq!(
+            submission.record()?.delivery,
+            crate::provider::submission::SubmissionState::Prepared
+        );
+        let before = controller.coordinator.submissions.snapshot()?.messages[0].clone();
+        controller.coordinator.submissions.suspend(true, None)?;
+        active.retire();
+        command.cancel_undispatched().await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = controller.coordinator.submissions.snapshot()?;
+                if snapshot.messages[0].delivery == InputDelivery::Failed {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        let after = controller.coordinator.submissions.snapshot()?.messages[0].clone();
+        assert_eq!(after.text, before.text);
+        assert_eq!(after.attachments, before.attachments);
+        assert_eq!(after.submission_id.as_deref(), Some(submission.id()));
+        assert_eq!(
+            submission.record()?.delivery,
+            crate::provider::submission::SubmissionState::Cancelled
+        );
+        let fresh: InputOperation = serde_json::from_value(json!({
+            "id":"fresh-op","control_revision":controller.coordinator.submissions.snapshot()?.control_revision,
+            "action":{"kind":"submit","message":{"id":"fresh-input","text":"A distinct request","intent":"auto"}}
+        }))?;
+        controller.coordinator.submissions.apply(fresh)?;
+        assert_eq!(
+            controller
+                .coordinator
+                .submissions
+                .snapshot()?
+                .messages
+                .iter()
+                .find(|message| message.id == "deferred-input")
+                .unwrap()
+                .delivery,
+            InputDelivery::Failed
+        );
         controller.coordinator.submissions.suspend(true, None)?;
         drop(active);
         drop(execution);

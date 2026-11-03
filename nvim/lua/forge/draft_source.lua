@@ -52,7 +52,13 @@ function M.attach(replica, comments, source)
     local selected = preceding(row)
     if not selected then return nil end
     local original = selected.source
-    local position = { row = original.position.row, column = math.min(math.max(0, column - (original.display_indent or 0)), #original.text) }
+    -- Annotation columns belong to the draft text, not to its preceding source line.
+    local source_column = selected.row == row and math.max(0, column - (original.display_indent or 0))
+      or original.position.column
+    source_column = math.min(source_column, #original.text)
+    while source_column > 0 and (original.text:byte(source_column + 1) or 0) >= 0x80
+      and (original.text:byte(source_column + 1) or 0) < 0xC0 do source_column = source_column - 1 end
+    local position = { row = original.position.row, column = source_column }
     local targets = original.metadata and original.metadata.target
     local target
     if type(targets) == "table" then target = require("forge.buffer").target_at(targets, position)

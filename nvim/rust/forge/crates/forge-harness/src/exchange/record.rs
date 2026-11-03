@@ -786,6 +786,37 @@ impl Exchange {
         Ok(())
     }
 
+    /// Resume a recorded required tool answer, rejecting foreign, unresolved, or interrupted work.
+    pub(crate) fn continue_required_question(
+        &mut self,
+        question: &crate::question::QuestionRecord,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            question.exchange_id == self.id
+                && question.requirement == crate::question::QuestionRequirement::Required
+                && question.delivery == crate::question::QuestionDelivery::ToolResult
+                && matches!(
+                    question.resolution,
+                    crate::question::QuestionResolution::Answered { .. }
+                ),
+            "required answer does not authorize this exchange"
+        );
+        anyhow::ensure!(
+            matches!(
+                self.state(),
+                ExchangeState::Running | ExchangeState::Complete
+            ) && self
+                .turn
+                .iter()
+                .all(|turn| turn.state() != crate::turn::TurnState::Running),
+            "required answer cannot resume interrupted or active native work"
+        );
+        self.phase = super::ExchangePhase::Running;
+        self.finalization_error = None;
+        self.resume(now_ms)
+    }
+
     /// Continue explicit review feedback under the original exchange and checkpoint.
     pub(crate) fn revise_plan(&mut self, now_ms: i64) -> anyhow::Result<()> {
         anyhow::ensure!(

@@ -286,6 +286,7 @@ fn log_metadata_excludes_private_content_and_reports_absence() -> Result<()> {
         .scope
         .trace
         .record("current", "long.metadata", json!({"method":method}));
+    fixture.scope.trace.flush()?;
     let path = PathBuf::from(fixture.scope.trace.session_status("current").path);
     std::fs::copy(&path, path.with_extension("jsonl.1"))?;
     std::fs::write(&path, "")?;
@@ -320,6 +321,7 @@ async fn log_snapshot_completes_and_preserves_every_record() -> Result<()> {
         definition.input_schema["properties"]["limit"]["default"],
         1000
     );
+    fixture.scope.trace.flush()?;
     let path = PathBuf::from(fixture.scope.trace.session_status("current").path);
     std::fs::create_dir_all(path.parent().unwrap())?;
     let mut file = BufWriter::new(std::fs::File::create(&path)?);
@@ -367,6 +369,7 @@ async fn log_snapshot_completes_and_preserves_every_record() -> Result<()> {
 #[test]
 fn log_pages_read_lazily_and_invalidate_failed_cursors() -> Result<()> {
     let fixture = Fixture::new()?;
+    fixture.scope.trace.flush()?;
     let path = PathBuf::from(fixture.scope.trace.session_status("current").path);
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(
@@ -417,6 +420,7 @@ fn log_pages_read_lazily_and_invalidate_failed_cursors() -> Result<()> {
 #[test]
 fn log_pages_survive_rotation_and_exclude_new_appends() -> Result<()> {
     let fixture = Fixture::new()?;
+    fixture.scope.trace.flush()?;
     let path = PathBuf::from(fixture.scope.trace.session_status("current").path);
     std::fs::create_dir_all(path.parent().unwrap())?;
     std::fs::write(&path, "{\"event\":\"first\"}\n{\"event\":\"second\"}\n")?;
@@ -438,6 +442,7 @@ fn log_pages_survive_rotation_and_exclude_new_appends() -> Result<()> {
 fn log_pages_preserve_large_entries_and_replayed_cursors() -> Result<()> {
     use std::io::Write;
     let fixture = Fixture::new()?;
+    fixture.scope.trace.flush()?;
     let path = PathBuf::from(fixture.scope.trace.session_status("current").path);
     std::fs::create_dir_all(path.parent().unwrap())?;
     let method = "雪".repeat(20_000);

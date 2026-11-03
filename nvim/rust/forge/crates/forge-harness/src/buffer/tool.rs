@@ -637,6 +637,7 @@ mod tests {
             std::fs::create_dir(&path)?;
             assert!(export.close().is_err());
             drop(export);
+            trace.flush()?;
             let log = PathBuf::from(trace.session_status(session_id).path);
             assert_eq!(log.exists(), enabled);
             if enabled {

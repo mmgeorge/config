@@ -44,6 +44,7 @@ async fn ordinary_input_does_not_activate_a_pending_plan_entry() -> Result<()> {
 }
 
 struct BoundarySteeringProvider {
+    capability: crate::provider::ProviderCapability,
     fixture_events: std::sync::Arc<crate::provider::test_support::SessionEvents>,
     initial_started: tokio::sync::Semaphore,
     initial_release: tokio::sync::Semaphore,
@@ -70,19 +71,49 @@ impl crate::provider::ProviderAdapter for TaskStartEventProvider {
             capability: crate::provider::mock_capability(),
         }
     }
-    async fn shutdown(&self) -> Result<()> {
-        self.fixture_events.shutdown().await?;
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.shutdown().await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
-    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-        self.fixture_events.cancel(owner).await?;
-        Ok(())
+    async fn fence_session(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.cancel(owner).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::FenceSession,
+                source,
+            )
+        })
     }
     async fn has_active_turn(&self, _: &str) -> bool {
         false
     }
-    async fn cleanup_execution(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
     async fn active_session_id_for(
         &self,
@@ -410,6 +441,7 @@ async fn task_start_replay_rejects_reused_identity_with_different_content() -> R
 impl BoundarySteeringProvider {
     fn new() -> Self {
         Self {
+            capability: crate::provider::mock_capability(),
             fixture_events: Default::default(),
             initial_started: tokio::sync::Semaphore::new(0),
             initial_release: tokio::sync::Semaphore::new(0),
@@ -439,7 +471,7 @@ impl crate::provider::ProviderAdapter for BoundarySteeringProvider {
             kind: crate::provider::ProviderKind::Codex,
             label: "Boundary steering fixture".into(),
             capability: {
-                let mut capability = crate::provider::mock_capability();
+                let mut capability = self.capability.clone();
                 capability.integration.tracked_submission = true;
                 capability.integration.local_acceptance = false;
                 capability
@@ -447,20 +479,50 @@ impl crate::provider::ProviderAdapter for BoundarySteeringProvider {
         }
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        self.fixture_events.shutdown().await?;
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.shutdown().await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
     /// Fence and collect the fixture's admitted execution before owner teardown.
-    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-        self.fixture_events.cancel(owner).await?;
-        Ok(())
+    async fn fence_session(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.cancel(owner).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::FenceSession,
+                source,
+            )
+        })
     }
     async fn has_active_turn(&self, _: &str) -> bool {
         true
     }
-    async fn cleanup_execution(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
     async fn active_session_id_for(
         &self,
@@ -538,6 +600,7 @@ impl BoundarySteeringProvider {
     async fn steer_native(&self, _: &str, _: crate::provider::SteeringInput) -> Result<()> {
         self.steering_deferred.add_permits(1);
         Err(crate::provider::ProviderError::NotConsumed {
+            cause: None,
             message: "provider turn ended before steering dispatch".into(),
         }
         .into())
@@ -600,6 +663,9 @@ impl BoundarySteeringProvider {
                 } else {
                     self.initial_started.add_permits(1);
                     self.initial_release.acquire().await?.forget();
+                    if !self.capability.native_steer && self.fail_response.load(Ordering::Acquire) {
+                        return Err(crate::provider::ProviderError::Cancelled.into());
+                    }
                 }
                 if let Some(sink) = sink {
                     sink.send_wait(completed_message(
@@ -632,6 +698,70 @@ impl BoundarySteeringProvider {
 #[tokio::test]
 async fn deferred_steering_acknowledges_only_after_provider_acceptance() -> Result<()> {
     assert_deferred_steering_delivery(false).await
+}
+
+/// Retaining a cancelled foreground must release unsent commands and their durable attempts.
+#[tokio::test]
+async fn cancelled_terminal_releases_undispatched_steering_before_retention() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let mut fixture = BoundarySteeringProvider::new();
+    fixture.capability.native_steer = false;
+    fixture.fail_response.store(true, Ordering::Release);
+    let provider = Arc::new(fixture);
+    broker.provider = provider.clone();
+    let lane = broker.parent_input.clone();
+    let catalog = broker.provider_catalog_request()?;
+    broker.turn_cancellation().arm(true);
+    let submission = broker.submission_store.prepare_input(
+        &catalog,
+        ProviderInput::from_text("Retain café 東京"),
+        crate::provider::ProviderKind::Codex,
+        Some("cancelled-followup".into()),
+    )?;
+    let running = tokio::spawn(async move {
+        let result = broker
+            .run_interaction(
+                "initial request".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("initial request".into())),
+            )
+            .await;
+        (broker, result)
+    });
+    await_boundary_barrier(&provider.initial_started, "initial native start").await?;
+    let pending = lane.steer(crate::provider::SteeringInput::User {
+        text: "Retain café 東京".into(),
+        attachments: Vec::new(),
+        submission: Some(submission.clone()),
+    });
+    tokio::pin!(pending);
+    assert!(futures_util::poll!(pending.as_mut()).is_pending());
+    provider.initial_release.add_permits(1);
+    let (broker, result) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), running).await??;
+    assert!(result.is_err());
+    assert!(
+        !broker.retained_foregrounds.is_empty(),
+        "the regression requires retained foreground ownership"
+    );
+    let rejected = tokio::time::timeout(std::time::Duration::from_secs(1), pending)
+        .await?
+        .unwrap_err();
+    assert!(matches!(
+        rejected.downcast_ref::<crate::provider::ProviderError>(),
+        Some(crate::provider::ProviderError::Cancelled)
+    ));
+    assert_eq!(
+        submission.record()?.delivery,
+        crate::provider::submission::SubmissionState::Cancelled
+    );
+    assert_eq!(
+        provider.input.lock().unwrap().as_slice(),
+        ["initial request"]
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -789,18 +919,48 @@ impl crate::provider::ProviderAdapter for SlowSteeringProvider {
         self.inner.descriptor()
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        self.fixture_events.shutdown().await?;
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.shutdown().await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
     /// Fence and collect the fixture's admitted execution before owner teardown.
-    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-        self.fixture_events.cancel(owner).await?;
-        Ok(())
+    async fn fence_session(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.cancel(owner).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::FenceSession,
+                source,
+            )
+        })
     }
 
-    async fn cleanup_execution(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
 
     async fn has_active_turn(&self, _: &str) -> bool {

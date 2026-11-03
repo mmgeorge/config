@@ -399,6 +399,7 @@ mod tests {
             failure.response.error().is_some(),
             "missing prompt should fail admission"
         );
+        broker.trace.flush()?;
         let lines = std::fs::read_to_string(broker.trace.session_status(&broker.session.id).path)?;
         let entries = lines
             .lines()

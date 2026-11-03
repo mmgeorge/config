@@ -73,6 +73,21 @@ impl TaskAuthority {
         self.commit(|| Ok(()))
     }
 
+    /// Commit typed provider control under the same atomic task and permission authority.
+    pub(crate) fn commit_control<T>(
+        &self,
+        commit: impl FnOnce() -> std::result::Result<T, crate::provider::ProviderError>,
+    ) -> std::result::Result<T, crate::provider::ProviderError> {
+        // Keep callback errors as values inside the existing gate. Only the
+        // authority layer's own legacy validation failures cross its adapter.
+        self.commit(|| Ok(commit())).map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::AdmitInput,
+                source,
+            )
+        })?
+    }
+
     /// Validate under the shared task gate and perform only a short synchronous commit.
     pub(crate) fn commit<T>(&self, commit: impl FnOnce() -> Result<T>) -> Result<T> {
         let controller = self
@@ -112,6 +127,55 @@ impl TaskAuthority {
 mod test {
     use super::*;
     use crate::task::{Task, TaskChange};
+
+    /// Keep typed callback failures intact and reject revoked authority before invoking control.
+    #[test]
+    fn typed_control_commit_preserves_error_and_revocation_atomicity() -> Result<()> {
+        let (_root, mut store, controller) = SessionTaskController::test_goal();
+        let task = controller.current()?.unwrap();
+        let mut context =
+            super::super::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        context.task_controller = Some(controller.clone());
+        context.task_permit = Some(task.permit());
+        context.task_generation = Some(controller.callback_snapshot()?.0);
+        let authority = TaskAuthority::capture(&context).unwrap();
+        let invoked = std::cell::Cell::new(false);
+        let error = authority
+            .commit_control(|| {
+                invoked.set(true);
+                Err::<(), _>(crate::provider::ProviderError::Contract(
+                    forge_provider_api::lifecycle::LifecycleError::UnknownExecution,
+                ))
+            })
+            .unwrap_err();
+        assert!(invoked.get());
+        assert!(matches!(
+            error,
+            crate::provider::ProviderError::Contract(
+                forge_provider_api::lifecycle::LifecycleError::UnknownExecution
+            )
+        ));
+        controller.change(&mut store, Some(&task.revision), TaskChange::Clear, 2)?;
+        invoked.set(false);
+        let error = authority
+            .commit_control(|| {
+                invoked.set(true);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            !invoked.get(),
+            "revoked authority invoked the native control callback"
+        );
+        let crate::provider::ProviderError::Operation(failure) = error else {
+            panic!("authority failure lost its typed boundary");
+        };
+        assert_eq!(
+            failure.operation(),
+            forge_provider_api::error::ProviderOperation::AdmitInput
+        );
+        Ok(())
+    }
 
     #[test]
     fn approval_authority_rejects_replacement_and_unacknowledged_entry() -> Result<()> {

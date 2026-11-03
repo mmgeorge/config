@@ -13,6 +13,7 @@ pub mod codex;
 pub mod copilot;
 pub mod events;
 mod execution;
+pub(crate) mod lifecycle_error;
 pub(crate) mod mcp;
 pub mod mock_response;
 mod prompt;

@@ -58,6 +58,12 @@ struct BackgroundLease {
     retained: Arc<RetainedBackground>,
 }
 
+enum ObservationContinuity {
+    Reliable,
+    Collected,
+    Lost,
+}
+
 impl BackgroundLease {
     fn acquire(retained: Arc<RetainedBackground>) -> Result<Self> {
         ensure!(
@@ -269,7 +275,7 @@ impl BackgroundManager {
             session_id: session_id.clone(),
         }));
         let mut native_compaction_observed = false;
-        let mut observation_reliable = true;
+        let mut observation = ObservationContinuity::Reliable;
         {
             let inbox = &runtime.retained.observer;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
@@ -288,8 +294,40 @@ impl BackgroundManager {
                     inbox.drain().map(Some)
                 };
                 let observed = tokio::time::timeout_at(until, observations).await;
+                // Drain every accepted observation before interpreting the typed
+                // owner end. Intentional collection is not a native terminal.
+                let observed = match observed {
+                    Ok(Ok(None)) => {
+                        match inbox.end() {
+                            Some(
+                                crate::provider::session_execution::ObservationEnd::Collected(
+                                    reason,
+                                ),
+                            ) => {
+                                let reason = match reason {
+                                crate::provider::session_execution::OwnerCloseReason::Cancelled => "cancelled",
+                                crate::provider::session_execution::OwnerCloseReason::Shutdown => "shutdown",
+                            };
+                                broker.trace.record(
+                                    &session_id,
+                                    "background.observation_collected",
+                                    json!({"reason":reason}),
+                                );
+                                if matches!(observation, ObservationContinuity::Reliable) {
+                                    observation = ObservationContinuity::Collected;
+                                }
+                                Ok(Ok(None))
+                            }
+                            Some(crate::provider::session_execution::ObservationEnd::Lost(
+                                failure,
+                            )) => Ok(Err(crate::provider::ProviderError::Observation(failure))),
+                            None => Ok(Ok(None)),
+                        }
+                    }
+                    observed => observed,
+                };
                 if let Ok(Err(error)) = &observed {
-                    observation_reliable = false;
+                    observation = ObservationContinuity::Lost;
                     let failure = format!("Background session observation failed: {error:#}");
                     if let Err(storage) =
                         broker.background_failure("observation_loss", failure.clone())
@@ -321,7 +359,7 @@ impl BackgroundManager {
                                 };
                             }
                             if let Err(error) = broker.observe_session_event(event) {
-                                observation_reliable = false;
+                                observation = ObservationContinuity::Lost;
                                 let _ = broker.background_failure(
                                     "observation_application",
                                     format!("{error:#}"),
@@ -361,7 +399,9 @@ impl BackgroundManager {
                 }
             }
         }
-        if observation_reliable && let Err(error) = broker.finalize_observed_execution().await {
+        if matches!(observation, ObservationContinuity::Reliable)
+            && let Err(error) = broker.finalize_observed_execution().await
+        {
             let _ = broker.background_failure("continuation_settlement", format!("{error:#}"));
             report(
                 &request.delivery,
@@ -371,7 +411,7 @@ impl BackgroundManager {
             .await;
         }
         if succeeded
-            && observation_reliable
+            && matches!(observation, ObservationContinuity::Reliable)
             && !native_compaction_observed
             && let Err(error) = broker.auto_compact().await
         {
@@ -383,7 +423,7 @@ impl BackgroundManager {
             )
             .await;
         }
-        if !succeeded || !observation_reliable {
+        if !succeeded || !matches!(observation, ObservationContinuity::Reliable) {
             let removed = self.retained.lock().await.remove(&key);
             if let Some(removed) = removed
                 && let Err(error) = self.retire(removed).await
@@ -606,7 +646,7 @@ impl BackgroundManager {
             .extend(evicted.iter().cloned());
         let mut cleanup_failure = None;
         for previous in evicted {
-            match previous.runtime.shutdown().await {
+            match collect_retained_runtime(&previous).await {
                 Ok(()) => {
                     self.cleanup_pending
                         .lock()
@@ -652,7 +692,7 @@ impl BackgroundManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(runtime.clone());
-        runtime.runtime.shutdown().await?;
+        collect_retained_runtime(&runtime).await?;
         self.cleanup_pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -681,7 +721,7 @@ impl BackgroundManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         for runtime in pending {
-            match runtime.runtime.shutdown().await {
+            match collect_retained_runtime(&runtime).await {
                 Ok(()) => {
                     self.cleanup_pending
                         .lock()
@@ -832,6 +872,18 @@ impl BackgroundManager {
     }
 }
 
+/// Collect a retired Background owner's trace only after native execution cleanup succeeds.
+async fn collect_retained_runtime(retained: &RetainedBackground) -> Result<()> {
+    retained.runtime.shutdown().await?;
+    // Background runtimes own separate trace leases even when they share a data
+    // root with Main. Releasing this lease leaves other live owners usable.
+    let trace = retained.runtime.trace();
+    tokio::task::spawn_blocking(move || trace.close())
+        .await
+        .context("collect Background trace writer")??;
+    Ok(())
+}
+
 /// Forward ordered Background progress and surface errors before a flush can acknowledge it.
 async fn forward_progress(
     mut events: crate::broker::publication::SessionUpdateStream,
@@ -908,6 +960,80 @@ mod tests {
             std::io::ErrorKind::BrokenPipe
         );
         Ok(())
+    }
+
+    /// Supersession collects the old owner intentionally while preserving its prefix and subsequent reuse.
+    #[tokio::test]
+    async fn background_supersession_preserves_prefix_and_reuses_completed_successor_without_loss_report()
+    -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let fixture = tempfile::tempdir()?;
+            let workspace = fixture.path().join("workspace");
+            fs::create_dir(&workspace)?;
+            let initialized = std::process::Command::new("git").arg("-C").arg(&workspace).args(["init", "-q"]).output()?;
+            ensure!(initialized.status.success(), "fixture Git initialization failed");
+            let diff = DiffEngine::new(Default::default(), 1);
+            let manager = BackgroundManager::new(Arc::new(RepositoryStore::default()), diff.clone(), forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool()));
+            let config = TextGenerationConfig {
+                provider:crate::provider::ProviderLaunch { kind:"mock".into(), command:Vec::new() },
+                model:"mock-model".into(), reasoning_effort:None, service_tier:Default::default(),
+                data_root:fixture.path().join("state"), auto_compaction:Default::default(),
+            };
+            let context = BackgroundContext::read(&manager.repositories, workspace.to_str().context("fixture path is not Unicode")?).await?;
+            let (delivery, mut delivered) = forge_protocol::outbound::channel();
+            let request = |input:&str, cancellation| BackgroundRequest {
+                cancellation, purpose:crate::provider::TextGeneration::CommitMessage, config:config.clone(),
+                context:context.clone(), input:input.into(), delivery:Some((delivery.clone(), 71)),
+            };
+            let cancellation = super::super::CancellationToken::new();
+            let initial = request("cancelled-old-generation", cancellation.clone());
+            let key = format!("{}:{}", config.data_root.display(), context.workspace);
+            let (mut broker, retained, ownership) = manager.prepare(&initial, &key).await?;
+            let session_id = retained.retained.session_id.clone();
+            let provider = retained.retained.runtime.provider_handle();
+            let control = provider.mock_response_control().context("mock response barrier is unavailable")?;
+            let hold = control.dispatch(&session_id, crate::provider::mock_response::MockResponseCommand::Hold {
+                mode:Some(crate::provider::PromptMode::Background), any_session:false,
+            }).await?;
+            let hold = hold["id"].as_str().context("mock hold identity missing")?.to_owned();
+            drop(retained);
+            broker.release_lease()?;
+            drop(broker);
+            drop(ownership);
+            let first = tokio::spawn({ let manager = manager.clone(); async move { manager.generate(initial).await } });
+            control.dispatch(&session_id, crate::provider::mock_response::MockResponseCommand::Wait { id:hold }).await?;
+            let store = SqliteStore::read_only(&config.data_root)?;
+            loop {
+                if store.list_exchange(&session_id)?.first().is_some_and(|exchange| !exchange.turn.is_empty()) { break; }
+                tokio::task::yield_now().await;
+            }
+            cancellation.cancel();
+            let error = first.await?.err().context("superseded generation returned a result")?;
+            assert!(error.to_string().contains("Background generation cancelled"));
+            let second = manager.generate(request("new-completed-generation", super::super::CancellationToken::new())).await?;
+            assert_eq!(second.session_id, session_id);
+            assert!(second.text.contains("new-completed-generation") && !second.text.contains("cancelled-old-generation"));
+            let successor = manager.retained.lock().await.get(&key).context("successful successor was not retained")?.runtime.clone();
+            let third = manager.generate(request("later-same-session-generation", super::super::CancellationToken::new())).await?;
+            assert_eq!(third.session_id, session_id);
+            assert!(third.text.contains("later-same-session-generation") && !third.text.contains("cancelled-old-generation"));
+            assert!(Arc::ptr_eq(&successor, &manager.retained.lock().await.get(&key).context("reused owner missing")?.runtime));
+            manager.shutdown().await?;
+            let exchanges = store.list_exchange(&session_id)?;
+            assert_eq!(exchanges.len(), 3);
+            assert_eq!(exchanges[0].state(), crate::exchange::ExchangeState::Cancelled);
+            assert!(!exchanges[0].turn.is_empty(), "intentional teardown discarded the accepted native prefix");
+            assert!(exchanges[1..].iter().all(|exchange| exchange.state() == crate::exchange::ExchangeState::Complete));
+            let records = store.list_session_event(&session_id)?;
+            assert!(!records.iter().any(|record| matches!(&record.detail,
+                crate::timeline::SessionEventKind::Configuration { field, .. } if field.iter().any(|field| field == "observation_loss")
+            )), "intentional supersession was retained as unreliable observation");
+            while let Ok(frame) = delivered.try_recv() {
+                let event:Value = serde_json::from_slice(frame.bytes())?;
+                assert_ne!(event["event"], "background_error", "{event}");
+            }
+            Ok::<_, anyhow::Error>(())
+        }).await.context("Background supersession did not collect and reuse its owner")?
     }
 
     /// Recover a lost retained listener only when a new Background request arrives.
@@ -993,9 +1119,21 @@ mod tests {
         broker.release_lease()?;
         drop(ownership);
         manager.retained.lock().await.remove(&key);
-        registry.record_cleanup_failure(anyhow::anyhow!("first collection failure"));
+        registry.record_cleanup_failure(crate::provider::session_execution::CleanupError::Work {
+            kind: crate::provider::session_execution::CleanupWorkKind::OwnerFence,
+            source: crate::provider::ProviderError::Protocol {
+                message: "first collection failure".into(),
+            }
+            .into(),
+        });
         assert!(manager.retire(retiring.clone()).await.is_err());
-        registry.record_cleanup_failure(anyhow::anyhow!("collection still incomplete"));
+        registry.record_cleanup_failure(crate::provider::session_execution::CleanupError::Work {
+            kind: crate::provider::session_execution::CleanupWorkKind::OwnerFence,
+            source: crate::provider::ProviderError::Protocol {
+                message: "collection still incomplete".into(),
+            }
+            .into(),
+        });
         let failed = manager.prepare(&request, &key).await;
         assert!(failed.is_err(), "pending cleanup admitted a replacement");
         assert!(manager.retained.lock().await.get(&key).is_none());

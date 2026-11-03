@@ -594,7 +594,7 @@ pub(crate) enum ForegroundSignal {
     AdmissionCleanupCompleted(foreground_failure::AdmissionCleanupResult),
     AdmissionFailureCheckpointCompleted(Result<checkpoint_settlement::FinalCheckpointResult>),
     FailureCheckpointCompleted(Result<checkpoint_settlement::FinalCheckpointResult>),
-    CancelledTurnRollbackCompleted(foreground_failure::CancelledTurnRollbackResult),
+    FailureBaselineCompleted(foreground_failure::FailureBaselineResult),
     RetractionGoalRestored(Result<()>),
     PlanSubmissionCompleted(Result<foreground_plan_effect::PlanSubmissionResult>),
     PlanQuestionCompleted(Result<foreground_plan_effect::PlanQuestionResult>),
@@ -736,7 +736,7 @@ pub(crate) enum ForegroundJob {
     AutoCompactionPublication(PendingProviderDelivery),
     ObservationPublication(PendingProviderDelivery),
     FailureCheckpoint(Box<checkpoint_settlement::FinalCheckpointJob>),
-    CancelledTurnRollback(foreground_failure::CancelledTurnRollbackJob),
+    FailureBaseline(foreground_failure::FailureBaselineJob),
     RetractionGoal(Box<foreground_failure::RetractionGoalJob>),
     PlanSubmission(Box<foreground_plan_effect::PlanSubmissionJob>),
     PlanQuestion(Box<foreground_plan_effect::PlanQuestionJob>),
@@ -748,6 +748,8 @@ pub(crate) enum ForegroundJob {
         engine: Arc<crate::provider::session_execution::SessionExecution>,
         native: tokio::task::JoinSet<Result<ProviderAttempt>>,
         original: anyhow::Error,
+        trace: Arc<TraceStore>,
+        scope: crate::provider::InvocationScope,
     },
     QuestionStop {
         provider: Arc<Provider>,
@@ -815,7 +817,10 @@ pub(crate) enum ForegroundJob {
         scope: crate::provider::InvocationScope,
         checkout: crate::provider::session_execution::SettlementCheckout,
     },
-    SettlementCommit(Arc<crate::provider::session_execution::SettlementCell>),
+    SettlementCommit {
+        cell: Arc<crate::provider::session_execution::SettlementCell>,
+        undispatched: Vec<crate::provider::SteerCommand>,
+    },
     UserSteering {
         engine: Arc<crate::provider::session_execution::SessionExecution>,
         scope: crate::provider::InvocationScope,
@@ -879,8 +884,24 @@ impl ForegroundJob {
                 engine,
                 mut native,
                 original,
+                trace,
+                scope,
             } => {
-                let mut cleanup = engine.close().await;
+                trace.record(&scope.owner.session_id, "foreground.cleanup", json!({
+                    "exchange_id":scope.exchange_id, "phase":"engine_close_started", "cause":format!("{original:#}"),
+                }));
+                let mut cleanup = if original.is::<TurnCancelled>() {
+                    engine
+                        .close_with_reason(
+                            crate::provider::session_execution::OwnerCloseReason::Cancelled,
+                        )
+                        .await
+                } else {
+                    engine.close().await
+                };
+                trace.record(&scope.owner.session_id, "foreground.cleanup", json!({
+                    "exchange_id":scope.exchange_id, "phase":"engine_closed", "failure":cleanup.as_ref().err().map(ToString::to_string),
+                }));
                 while let Some(result) = native.join_next().await {
                     if let Err(error) = result
                         && cleanup.is_ok()
@@ -890,11 +911,14 @@ impl ForegroundJob {
                         });
                     }
                 }
+                trace.record(&scope.owner.session_id, "foreground.cleanup", json!({
+                    "exchange_id":scope.exchange_id, "phase":"native_joined", "failure":cleanup.as_ref().err().map(ToString::to_string),
+                }));
                 Ok(ForegroundSignal::CleanupCompleted { original, cleanup })
             }
-            Self::CancelledTurnRollback(job) => Ok(
-                ForegroundSignal::CancelledTurnRollbackCompleted(job.run().await),
-            ),
+            Self::FailureBaseline(job) => {
+                Ok(ForegroundSignal::FailureBaselineCompleted(job.run().await))
+            }
             Self::FailurePublication(delivery) => match delivery.deliver_and_flush().await {
                 Ok(events) if !events.is_empty() => {
                     Ok(ForegroundSignal::FailurePublicationNeedsForward { events })
@@ -1170,8 +1194,15 @@ impl ForegroundJob {
                 checkout,
                 ready: Box::new(engine.wait_ready(scope).await),
             }),
-            Self::SettlementCommit(cell) => {
+            Self::SettlementCommit { cell, undispatched } => {
                 use crate::provider::session_execution::SettlementError;
+                for input in undispatched {
+                    if let Err(error) = input.cancel_undispatched().await {
+                        return Ok(ForegroundSignal::SettlementCommitted(Err(
+                            SettlementError::Provider(ProviderError::from(error)),
+                        )));
+                    }
+                }
                 if let Err(error) = cell.validate_effects_settled() {
                     return Ok(ForegroundSignal::SettlementCommitted(Err(
                         SettlementError::Provider(error),
@@ -1223,36 +1254,56 @@ impl ForegroundTransaction {
     pub(crate) async fn next(&mut self) -> Result<ForegroundSignal> {
         loop {
             if self.failure_cleanup_active {
-                if !self.pending_session_observations.is_empty() {
+                // Retained events wait for their preceding publication's acknowledgment.
+                // Re-selecting a ready failed inbox would starve that publication's job.
+                if !self.observation_publication_in_flight
+                    && !self.pending_session_observations.is_empty()
+                {
                     return Ok(ForegroundSignal::SessionObservationsReady);
                 }
                 tokio::select! {
                     checkpoint = async {
                         match self.state.runtime.as_mut().and_then(|runtime| runtime.checkpoint.as_mut()) {
-                            Some(task) => (&mut task.0).await.context("checkpoint worker failed").and_then(|result| result),
+                            Some(task) => (&mut task.0).await.context("checkpoint worker failed").and_then(|result| result.map_err(anyhow::Error::new)),
                             None => std::future::pending().await,
                         }
                     } => return Ok(ForegroundSignal::Checkpoint(checkpoint)),
-                    event = self.native.events.recv(), if self.native.stream_open => match event {
+                    event = self.native.events.recv(), if self.native.stream_open && !self.observation_publication_in_flight && self.pending_session_observations.len() < forge_protocol::MAX_PENDING_FRAMES => match event {
                         Ok(Some(event)) => return Ok(ForegroundSignal::Native(NativeForegroundSignal::ProviderEvent(event))),
                         Ok(None) => { self.native.stream_open = false; continue; }
                         Err(error) => { self.native.stream_open = false; return Ok(ForegroundSignal::EffectFailed(error.into())); }
                     },
-                    ready = self.session_events.notified(), if self.failure_inbox_open => match ready {
-                        Ok(()) => { if self.session_events.is_closed() { self.failure_inbox_open = false; } return Ok(ForegroundSignal::SessionObservationsReady); },
+                    ready = self.session_events.notified(), if self.failure_inbox_open && !self.observation_publication_in_flight && self.pending_session_observations.len() < forge_protocol::MAX_PENDING_FRAMES => match ready {
+                        Ok(()) => return Ok(ForegroundSignal::SessionObservationsReady),
                         Err(_) => { self.failure_inbox_open = false; continue; }
                     },
                     else => std::future::pending::<()>().await,
                 }
                 continue;
             }
-            if self.native_goal.is_none() && !self.pending_session_observations.is_empty() {
+            if self.native_goal.is_none()
+                && !self.observation_publication_in_flight
+                && !self.pending_session_observations.is_empty()
+            {
                 return Ok(ForegroundSignal::SessionObservationsReady);
             }
             if self.native_goal.is_none()
+                && !self.observation_publication_in_flight
                 && !self.question_stop_pending
-                && let Some(ready) = self.pending_native_ready.take()
+                && self.pending_native_ready.is_some()
             {
+                // A bounded staging window is not the entire accepted observation prefix.
+                // Recheck both upstream owners before exposing a deferred native result.
+                if let Some(event) = self.native.events.try_next()? {
+                    self.pending_session_observations.push_back(event);
+                    return Ok(ForegroundSignal::SessionObservationsReady);
+                }
+                if self.session_events.has_pending()? {
+                    return Ok(ForegroundSignal::SessionObservationsReady);
+                }
+                let ready = self.pending_native_ready.take().expect(
+                    "deferred native result was checked before draining its observation prefix",
+                );
                 return Ok(ForegroundSignal::Native(
                     NativeForegroundSignal::NativeReady(ProviderAttempt::Ready(Box::new(ready))),
                 ));
@@ -1274,7 +1325,7 @@ impl ForegroundTransaction {
                 }
                 checkpoint = async {
                     match self.state.runtime.as_mut().and_then(|runtime| runtime.checkpoint.as_mut()) {
-                        Some(task) => (&mut task.0).await.context("checkpoint worker failed").and_then(|result| result),
+                        Some(task) => (&mut task.0).await.context("checkpoint worker failed").and_then(|result| result.map_err(anyhow::Error::new)),
                         None => std::future::pending().await,
                     }
                 } => return Ok(ForegroundSignal::Checkpoint(checkpoint)),
@@ -1304,12 +1355,12 @@ impl ForegroundTransaction {
                     let state = self.cleanup.borrow_and_update().clone();
                     if !matches!(state, ExecutionCleanup::Idle) { return Ok(ForegroundSignal::Cleanup(state)); }
                 }
-                native = self.native.next(), if self.native_open => {
+                native = self.native.next(), if self.native_open && !self.observation_publication_in_flight && self.pending_session_observations.len() < forge_protocol::MAX_PENDING_FRAMES => {
                     let native = native?;
                     if matches!(&native, NativeForegroundSignal::NativeReady(_)) { self.native_open = false; }
                     return Ok(ForegroundSignal::Native(native));
                 },
-                ready = self.session_events.notified() => { ready?; return Ok(ForegroundSignal::SessionObservationsReady); }
+                ready = self.session_events.notified(), if !self.observation_publication_in_flight && self.pending_session_observations.len() < forge_protocol::MAX_PENDING_FRAMES => { ready?; return Ok(ForegroundSignal::SessionObservationsReady); }
                 error = publication::failed(self.delivery_sink.as_ref()) => return Ok(ForegroundSignal::PublicationFailed(error)),
             }
         }
@@ -1428,7 +1479,7 @@ pub struct BrokerRuntime {
 #[derive(Debug)]
 struct RuntimeShutdownFailure {
     fence: Option<ProviderError>,
-    native: Option<anyhow::Error>,
+    native: Option<ProviderError>,
     execution: Option<crate::provider::session_execution::RegistryError>,
 }
 
@@ -1456,7 +1507,7 @@ impl std::error::Error for RuntimeShutdownFailure {
             .or_else(|| {
                 self.native
                     .as_ref()
-                    .map(|error| error.as_ref() as &(dyn std::error::Error + 'static))
+                    .map(|error| error as &(dyn std::error::Error + 'static))
             })
             .or_else(|| {
                 self.execution
@@ -1511,7 +1562,10 @@ impl BrokerRuntime {
             diff,
             workspace_kind,
             execution_registry: Arc::new(
-                crate::provider::session_execution::SessionExecutionRegistry::new(provider.clone()),
+                crate::provider::session_execution::SessionExecutionRegistry::new(
+                    provider.clone(),
+                    trace.clone(),
+                ),
             ),
             provider,
             permission_store,
@@ -1680,7 +1734,7 @@ impl TurnCancellation {
     }
 
     /// Publish a retryable cleanup failure without dropping the provider consumer.
-    pub(crate) fn fail_cleanup(&self, error: &anyhow::Error) {
+    pub(crate) fn fail_cleanup(&self, error: &ProviderError) {
         self.cleanup
             .send_replace(ExecutionCleanup::Failed(format!("{error:#}")));
     }
@@ -1843,6 +1897,7 @@ impl HarnessBroker {
                     self.provider.clone(),
                     crate::provider::ExecutionOwner::root(&self.session.id),
                     self.observer.session_events(),
+                    self.trace.clone(),
                 ),
             );
         }
@@ -3987,7 +4042,10 @@ impl HarnessBroker {
             self.child_provider_by_agent
                 .insert(admission.agent.id.clone(), provider.clone());
             let execution_registry = Arc::new(
-                crate::provider::session_execution::SessionExecutionRegistry::new(provider.clone()),
+                crate::provider::session_execution::SessionExecutionRegistry::new(
+                    provider.clone(),
+                    self.trace.clone(),
+                ),
             );
             self.child_execution_by_agent
                 .insert(admission.agent.id.clone(), execution_registry.clone());
@@ -5718,6 +5776,11 @@ impl HarnessBroker {
                         checkpoint.capture(&objects, &repositories, &session_id, now_ms),
                     )
                     .await
+                    .map_err(
+                        |source| crate::checkpoint::CheckpointFailure::SnapshotCapture {
+                            source: source.into_boxed_dyn_error(),
+                        },
+                    )
             }))
         });
         self.active_wait_projection = None;
@@ -5811,7 +5874,7 @@ impl HarnessBroker {
         let result = (&mut task.0)
             .await
             .context("checkpoint worker failed")
-            .and_then(|result| result);
+            .and_then(|result| result.map_err(anyhow::Error::new));
         self.finish_initial_checkpoint(runtime, interaction, result)
     }
 
@@ -10540,17 +10603,41 @@ mod test {
                 capability: crate::provider::mock_capability(),
             }
         }
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
         async fn has_active_turn(&self, _: &str) -> bool {
             false
         }
-        async fn cleanup_execution(&self, _: &str) -> Result<()> {
-            Ok(())
+        async fn cleanup_execution(
+            &self,
+            _: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
-        async fn cancel_session(&self, _: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
         async fn active_session_id_for(
             &self,
@@ -10871,6 +10958,8 @@ mod test {
         started: Arc<tokio::sync::Notify>,
         tool_ran: Arc<std::sync::atomic::AtomicBool>,
         active: Arc<std::sync::atomic::AtomicUsize>,
+        native_rejection: Option<Arc<PreparationProbe>>,
+        cleanup_error: Option<fn() -> crate::provider::ProviderError>,
     }
 
     struct ActiveProviderProbe(Arc<std::sync::atomic::AtomicUsize>);
@@ -10884,13 +10973,37 @@ mod test {
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for CheckpointProvider {
         type Host = crate::provider::HarnessProviderHost;
-        async fn fence_session(&self, _: &crate::provider::ExecutionOwner) -> Result<()> {
-            // This fixture has no external callback registration to revoke.
-            Ok(())
+        async fn fence_session(
+            &self,
+            _: &crate::provider::ExecutionOwner,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move {
+                // This fixture has no external callback registration to revoke.
+                Ok(())
+            }
+            .await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::FenceSession,
+                    source,
+                )
+            })
         }
-        async fn reset_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-            self.fixture_events.reset_owner(owner).await?;
-            Ok(())
+        async fn reset_session(
+            &self,
+            owner: &crate::provider::ExecutionOwner,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move {
+                self.fixture_events.reset_owner(owner).await?;
+                Ok(())
+            }
+            .await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::ResetSession,
+                    source,
+                )
+            })
         }
         async fn prepare_turn(&self, _: &str) -> Result<()> {
             if let Some(preparation) = &self.preparation {
@@ -10910,19 +11023,37 @@ mod test {
                 capability: crate::provider::mock_capability(),
             }
         }
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
         async fn has_active_turn(&self, _: &str) -> bool {
             false
         }
-        async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
+        async fn cleanup_execution(
+            &self,
+            session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
             self.fixture_events.cancel_runtime(session_id).await?;
-            Ok(())
+            match self.cleanup_error {
+                Some(error) => Err(error()),
+                None => Ok(()),
+            }
         }
-        async fn cancel_session(&self, session_id: &str) -> Result<()> {
+        async fn cancel_session(
+            &self,
+            session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
             self.fixture_events.cancel_runtime(session_id).await?;
-            Ok(())
+            match self.cleanup_error {
+                Some(error) => Err(error()),
+                None => Ok(()),
+            }
         }
         async fn active_session_id_for(
             &self,
@@ -10950,6 +11081,15 @@ mod test {
             request: crate::provider::ProviderRequest,
             scope: crate::provider::InvocationScope,
         ) -> std::result::Result<(), crate::provider::ProviderError> {
+            if let Some(rejection) = &self.native_rejection {
+                rejection.started.notify_one();
+                rejection.release.notified().await;
+                return Err(crate::provider::ProviderError::PreparationFailed(Arc::new(
+                    crate::provider::ProviderError::Rejected {
+                        message: "fixture native preparation rejected".into(),
+                    },
+                )));
+            }
             let events = self.fixture_events.clone();
             events
                 .submit(
@@ -10972,7 +11112,7 @@ mod test {
                 submission.sending(crate::provider::submission::SubmissionTarget::Untracked)?;
                 submission.accepted("checkpoint fixture accepted input".into())?;
             }
-            let _fixture_scope = _sink.invocation_scope()?.clone();
+            let fixture_scope = _sink.invocation_scope()?.clone();
             let fixture = crate::provider::test_support::FixtureStream::new(_sink);
             let _sink = fixture.clone();
             let result: anyhow::Result<crate::provider::ProviderCompletion> = async {
@@ -10980,6 +11120,17 @@ mod test {
                     let _sink = Some(_sink);
                     self.active.fetch_add(1, Ordering::SeqCst);
                     let _active = ActiveProviderProbe(Arc::clone(&self.active));
+                    _sink
+                        .as_ref()
+                        .context("checkpoint fixture requires events")?
+                        .send(ProviderEvent::Turn {
+                            address: crate::provider::TurnAddress {
+                                scope: fixture_scope.clone(),
+                                thread_id: "checkpoint-thread".into(),
+                                turn_id: "checkpoint-turn".into(),
+                            },
+                            update: crate::provider::TurnUpdate::Started { started_at_ms: 0 },
+                        })?;
                     self.started.notify_one();
                     request
                         .control_context
@@ -10993,7 +11144,13 @@ mod test {
                         Path::new(&request.workspace).join("seed.txt"),
                         "tool changed workspace\n",
                     )?;
-                    Ok(crate::provider::ProviderCompletion::default())
+                    Ok(crate::provider::ProviderCompletion {
+                        native: forge_provider_api::completion::ProviderCompletion {
+                            capability: crate::provider::mock_capability(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
                 }
                 .await;
                 output
@@ -11003,6 +11160,260 @@ mod test {
             fixture.finish(&result).await?;
             result
         }
+    }
+
+    /// A failed pre-baseline owner releases its own capture while an unrelated Git editor stays admitted.
+    #[tokio::test]
+    async fn prebaseline_failure_settles_while_shared_git_admission_remains_held() -> Result<()> {
+        for native_rejection in [false, true] {
+            let repository = repository();
+            let data = tempfile::tempdir()?;
+            let mut broker = planning_question_broker(repository.path(), data.path(), false);
+            let rejection = Arc::new(PreparationProbe {
+                started: Notify::new(),
+                release: Notify::new(),
+                fail: true,
+            });
+            let tool_ran = Arc::new(AtomicBool::new(false));
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            broker.provider = Arc::new(CheckpointProvider {
+                fixture_events: Default::default(),
+                preparation: (!native_rejection).then(|| rejection.clone()),
+                native_rejection: native_rejection.then(|| rejection.clone()),
+                cleanup_error: None,
+                started: Arc::new(Notify::new()),
+                tool_ran: tool_ran.clone(),
+                active: active.clone(),
+            });
+            let repositories = broker.repositories.clone();
+            let handle = repositories
+                .open(repository.path().to_owned())
+                .await?
+                .context("fixture repository missing")?;
+            let operation = repositories.writes.admit(
+                vec![forge_git::mutation::MutationScope::WorktreeFiles(
+                    handle
+                        .identity
+                        .worktree
+                        .clone()
+                        .context("fixture worktree missing")?,
+                )],
+                0,
+            )?;
+            let held = repositories
+                .writes
+                .start(operation)?
+                .context("external Git mutation was not admitted")?;
+            let reject = async {
+                rejection.started.notified().await;
+                while repositories.writes.usage().operations < 2 {
+                    tokio::task::yield_now().await;
+                }
+                rejection.release.notify_one();
+            };
+            let prompt = "Fail before the baseline while Git commit owns the workspace";
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                tokio::join!(
+                    broker.run_interaction(
+                        prompt.into(),
+                        PromptMode::Chat,
+                        Some(ExchangeAdmission::chat(prompt.into()))
+                    ),
+                    reject
+                )
+            })
+            .await
+            .context("failed execution waited for unrelated Git admission")?;
+            let error = result.expect_err("pre-baseline failure became successful execution");
+            let expected = if native_rejection {
+                "fixture native preparation rejected"
+            } else {
+                "fixture preparation failed"
+            };
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert!(!error.is::<TurnCancelled>() && !error.is::<TurnRetracted>());
+            assert!(!tool_ran.load(Ordering::Acquire) && active.load(Ordering::Acquire) == 0);
+            assert!(broker.host_settlement().is_none() && broker.exchange_runtime.is_none());
+            assert_eq!(
+                repositories.writes.state(operation),
+                Some(forge_git::coordinator::OperationState::Running {
+                    cancellation_requested: false
+                })
+            );
+            assert_eq!(
+                repositories.writes.usage().operations,
+                1,
+                "aborted baseline retained mutation admission"
+            );
+            let exchanges = broker.store.list_exchange(&broker.session.id)?;
+            assert_eq!(exchanges.len(), 1);
+            assert_eq!(exchanges[0].state(), ExchangeState::Failed);
+            assert!(
+                exchanges[0].checkpoint_before.is_none() && exchanges[0].checkpoint_after.is_none()
+            );
+            assert!(
+                exchanges[0]
+                    .finalization_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(expected))
+            );
+            let query =
+                broker.provider_request(ProviderInput::from_text(prompt), PromptMode::Chat)?;
+            let pending = broker.submission_store.pending(
+                &query,
+                crate::provider::ProviderKind::Mock,
+                None,
+            )?;
+            assert_eq!(pending.len(), 1);
+            assert!(matches!(
+                pending[0].delivery,
+                crate::provider::submission::SubmissionState::Prepared
+            ));
+            assert_eq!(
+                std::fs::read_to_string(repository.path().join("seed.txt"))?,
+                "seed\n"
+            );
+            held.finish(forge_git::mutation::OperationCompletion::Completed)?;
+            repositories.writes.take_receipt(operation);
+        }
+        Ok(())
+    }
+
+    /// Collect a denied baseline despite native cleanup failure, without claiming rollback proof.
+    #[tokio::test]
+    async fn cancellation_cleanup_failure_collects_denied_baseline_without_native_rollback()
+    -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let started = Arc::new(Notify::new());
+        let tool_ran = Arc::new(AtomicBool::new(false));
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        broker.provider = Arc::new(CheckpointProvider {
+            fixture_events: Default::default(),
+            preparation: None,
+            native_rejection: None,
+            cleanup_error: Some(|| crate::provider::ProviderError::Protocol {
+                message: "fixture native cleanup failed".into(),
+            }),
+            started: started.clone(),
+            tool_ran: tool_ran.clone(),
+            active: active.clone(),
+        });
+        broker.capability.native_turn_rollback = true;
+        let repositories = broker.repositories.clone();
+        let handle = repositories
+            .open(repository.path().to_owned())
+            .await?
+            .context("fixture repository")?;
+        let operation = repositories.writes.admit(
+            vec![forge_git::mutation::MutationScope::WorktreeFiles(
+                handle
+                    .identity
+                    .worktree
+                    .clone()
+                    .context("fixture worktree")?,
+            )],
+            0,
+        )?;
+        let held = repositories
+            .writes
+            .start(operation)?
+            .context("external Git admission")?;
+        let cancellation = broker.turn_cancellation();
+        cancellation.arm(true);
+        let cancel = async {
+            started.notified().await;
+            cancellation.request(true);
+        };
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(
+                broker.run_interaction(
+                    "Cancel with failed native cleanup".into(),
+                    PromptMode::Chat,
+                    Some(ExchangeAdmission::chat(
+                        "Cancel with failed native cleanup".into()
+                    )),
+                ),
+                cancel,
+            )
+            .0
+        })
+        .await;
+        // Inspect while admission stays held, then release it even if verification failed.
+        // An abandoned Git operation intentionally remains a safety fence for later workers.
+        let verified: Result<()> = (|| {
+            let result = result.context(
+                "native cleanup failure left the denied baseline waiting for external Git",
+            )?;
+            let error = result
+                .err()
+                .context("failed native cleanup became success")?;
+            anyhow::ensure!(
+                error.is::<TurnCancelled>() && !error.is::<TurnRetracted>(),
+                "{error:#}"
+            );
+            let cleanup = error
+                .downcast_ref::<foreground_failure::ForegroundFailureContext>()
+                .and_then(|context| context.cleanup.as_ref());
+            let Some(crate::provider::ProviderError::Cleanup(report)) = cleanup else {
+                anyhow::bail!("native cleanup lost its typed report: {error:#}");
+            };
+            anyhow::ensure!(
+                matches!(report.cancellation(), Some(
+            forge_provider_api::error::CleanupFailure::Failed(error)
+        ) if matches!(error.as_ref(), crate::provider::ProviderError::Protocol { message }
+            if message == "fixture native cleanup failed")),
+                "{error:#}"
+            );
+            anyhow::ensure!(
+                broker.host_settlement().is_none() && broker.exchange_runtime.is_none(),
+                "foreground retained its failed owner"
+            );
+            anyhow::ensure!(
+                !tool_ran.load(Ordering::Acquire) && active.load(Ordering::Acquire) == 0,
+                "native producer or tool remained active"
+            );
+            anyhow::ensure!(
+                repositories.writes.usage().operations == 1,
+                "baseline retained Git admission"
+            );
+            anyhow::ensure!(
+                repositories.writes.state(operation)
+                    == Some(forge_git::coordinator::OperationState::Running {
+                        cancellation_requested: false
+                    }),
+                "failed baseline altered external Git admission"
+            );
+            let exchanges = broker.store.list_exchange(&broker.session.id)?;
+            anyhow::ensure!(
+                exchanges.len() == 1,
+                "cleanup failure must retain the accepted input"
+            );
+            anyhow::ensure!(
+                exchanges[0].state() == ExchangeState::Cancelled,
+                "cancelled exchange changed outcome"
+            );
+            anyhow::ensure!(
+                exchanges[0].checkpoint_before.is_none() && exchanges[0].checkpoint_after.is_none(),
+                "denied baseline published checkpoint evidence"
+            );
+            anyhow::ensure!(
+                exchanges[0]
+                    .finalization_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("fixture native cleanup failed")),
+                "durable exchange lost native cleanup error"
+            );
+            anyhow::ensure!(
+                std::fs::read_to_string(repository.path().join("seed.txt"))? == "seed\n",
+                "failed native cleanup changed workspace"
+            );
+            Ok(())
+        })();
+        let released = held.finish(forge_git::mutation::OperationCompletion::Completed);
+        repositories.writes.take_receipt(operation);
+        verified.and(released)
     }
 
     #[tokio::test]
@@ -11017,11 +11428,14 @@ mod test {
         broker.provider = Arc::new(CheckpointProvider {
             fixture_events: Default::default(),
             preparation: None,
+            native_rejection: None,
+            cleanup_error: None,
             started: Arc::clone(&started),
             tool_ran: Arc::clone(&tool_ran),
             active: Arc::clone(&active),
         });
         broker.capability.native_turn_rollback = true;
+        broker.trace.configure(true)?;
         let repositories = Arc::clone(&broker.repositories);
         let handle = repositories
             .open(repository.path().to_owned())
@@ -11065,9 +11479,14 @@ mod test {
                     broker.store.list_exchange(&broker.session.id)
                         .and_then(|exchanges| Ok(serde_json::to_string(&exchanges)?))
                         .unwrap_or_else(|error| format!("read failed: {error:#}")),
-                ))?
+                ) + &format!("; trace={}", std::fs::read_to_string(broker.trace.session_status(&broker.session.id).path)
+                    .unwrap_or_else(|error| format!("read failed: {error}"))))?
                 .unwrap_err();
             assert!(error.is::<TurnRetracted>(), "{error:#}");
+            assert!(
+                broker.host_settlement().is_none(),
+                "cancelled owner retained its host settlement fence"
+            );
             assert!(!tool_ran.load(Ordering::SeqCst));
             assert!(broker.store.list_exchange(&broker.session.id)?.is_empty());
             assert!(broker.exchange_runtime.is_none());
@@ -11181,7 +11600,12 @@ mod test {
             let error = result.unwrap_err();
             let exchange = broker.store.list_exchange(&broker.session.id)?;
             if restore_prompt && !visible_output {
-                assert!(error.is::<TurnRetracted>(), "{error:#}");
+                assert!(
+                    error.is::<TurnRetracted>(),
+                    "cleanup_before_completion={cleanup_before_completion}, visible_output={visible_output}, restore_prompt={restore_prompt}; {error:#}; trace={}",
+                    std::fs::read_to_string(broker.trace.session_status(&broker.session.id).path)
+                        .unwrap_or_else(|error| format!("read failed: {error}"))
+                );
                 assert!(exchange.is_empty());
             } else {
                 assert!(error.is::<TurnCancelled>(), "{error:#}");
@@ -11234,6 +11658,8 @@ mod test {
         broker.provider = Arc::new(CheckpointProvider {
             fixture_events: Default::default(),
             preparation: None,
+            native_rejection: None,
+            cleanup_error: None,
             started: started.clone(),
             tool_ran: tool_ran.clone(),
             active: Default::default(),
@@ -11555,17 +11981,41 @@ mod test {
                 capability: crate::provider::mock_capability(),
             }
         }
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
         async fn has_active_turn(&self, _session_id: &str) -> bool {
             true
         }
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
         async fn active_session_id_for(
             &self,
@@ -12946,16 +13396,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -13188,16 +13663,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -13418,16 +13918,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -13763,12 +14288,28 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -13809,9 +14350,21 @@ let sink = Some(sink);
                 .await
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            self.cancelled.store(true, Ordering::Release);
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move {
+                self.cancelled.store(true, Ordering::Release);
+                Ok(())
+            }
+            .await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn fork(
@@ -14076,16 +14629,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -14515,13 +15093,37 @@ let sink = Some(sink);
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for CleanupRetryProvider {
         type Host = crate::provider::HarnessProviderHost;
-        async fn fence_session(&self, _: &crate::provider::ExecutionOwner) -> Result<()> {
-            // This fixture has no external callback registration to revoke.
-            Ok(())
+        async fn fence_session(
+            &self,
+            _: &crate::provider::ExecutionOwner,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move {
+                // This fixture has no external callback registration to revoke.
+                Ok(())
+            }
+            .await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::FenceSession,
+                    source,
+                )
+            })
         }
-        async fn reset_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-            self.fixture_events.reset_owner(owner).await?;
-            Ok(())
+        async fn reset_session(
+            &self,
+            owner: &crate::provider::ExecutionOwner,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move {
+                self.fixture_events.reset_owner(owner).await?;
+                Ok(())
+            }
+            .await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::ResetSession,
+                    source,
+                )
+            })
         }
         fn checkpoint_tool_gate(&self) -> bool {
             true
@@ -14534,12 +15136,27 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -14584,22 +15201,34 @@ let sink = Some(sink);
                 .await
         }
 
-        async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
-            if self.attempt.fetch_add(1, Ordering::SeqCst) == 0 {
-                anyhow::bail!("cleanup deadline expired");
-            }
-            self.complete.notify_one();
-            loop {
-                let settled = self.settled.notified();
-                tokio::pin!(settled);
-                settled.as_mut().enable();
-                if self.native_settled.load(Ordering::Acquire) {
-                    break;
+        async fn cleanup_execution(
+            &self,
+            session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move {
+                if self.attempt.fetch_add(1, Ordering::SeqCst) == 0 {
+                    anyhow::bail!("cleanup deadline expired");
                 }
-                settled.await;
+                self.complete.notify_one();
+                loop {
+                    let settled = self.settled.notified();
+                    tokio::pin!(settled);
+                    settled.as_mut().enable();
+                    if self.native_settled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    settled.await;
+                }
+                self.fixture_events.cancel_runtime(session_id).await?;
+                Ok(())
             }
-            self.fixture_events.cancel_runtime(session_id).await?;
-            Ok(())
+            .await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
     }
 
@@ -14648,7 +15277,13 @@ let sink = Some(sink);
                     })?;
                     self.native_settled.store(true, Ordering::Release);
                     self.settled.notify_waiters();
-                    Ok(crate::provider::ProviderCompletion::default())
+                    Ok(crate::provider::ProviderCompletion {
+                        native: forge_provider_api::completion::ProviderCompletion {
+                            capability: crate::provider::mock_capability(),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
                 }
                 .await;
                 output
@@ -15145,16 +15780,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -15246,16 +15906,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -15367,16 +16052,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -15915,16 +16625,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -16030,16 +16765,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -16151,16 +16911,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -16309,16 +17094,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -16528,16 +17338,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -17031,16 +17866,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -19410,14 +20270,29 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
         async fn has_active_turn(&self, _session_id: &str) -> bool {
             false
         }
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
         async fn active_session_id_for(
             &self,
@@ -20553,16 +21428,41 @@ let sink = Some(sink);
             }
         }
 
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {
@@ -20986,7 +21886,11 @@ let sink = Some(sink);
         let mut runtime = broker.exchange_runtime.take().unwrap();
         let captured = (&mut runtime.checkpoint.as_mut().unwrap().0).await.unwrap();
         let error = broker
-            .finish_initial_checkpoint(&mut runtime, &mut rejected, captured)
+            .finish_initial_checkpoint(
+                &mut runtime,
+                &mut rejected,
+                captured.map_err(anyhow::Error::new),
+            )
             .unwrap_err();
         assert!(error.to_string().contains("capacity is full"));
         assert!(runtime.tool_gate.as_ref().unwrap().wait().await.is_err());

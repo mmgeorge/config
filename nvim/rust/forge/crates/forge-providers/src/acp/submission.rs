@@ -123,6 +123,7 @@ impl AcpConnection {
                             submission.clone().record_rejected(error.into()).await?;
                         }
                         return Err(ProviderError::NotConsumed {
+                            cause: None,
                             message: error.into(),
                         });
                     }

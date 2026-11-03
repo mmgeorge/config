@@ -2,10 +2,18 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use anyhow::{Result, anyhow};
+use crate::provider::ProviderError;
+type Result<T> = std::result::Result<T, ProviderError>;
 use tokio::sync::Notify;
 
 use crate::provider::ProviderEvent;
+
+/// Distinguish explicitly collected owners from a native observation failure.
+#[derive(Clone, Debug)]
+pub(crate) enum ObservationEnd {
+    Collected(super::OwnerCloseReason),
+    Lost(forge_provider_api::lifecycle::ObservationFailure),
+}
 
 /// Retain provider session events while the foreground request owns the broker.
 #[derive(Default)]
@@ -17,6 +25,7 @@ pub(crate) struct SessionObservationInbox {
     failure_reported: AtomicBool,
     idle_settlement_requested: AtomicBool,
     failure: Mutex<Option<forge_provider_api::lifecycle::ObservationFailure>>,
+    collected: Mutex<Option<super::OwnerCloseReason>>,
     watchdogs: Mutex<
         HashMap<
             crate::provider::InvocationId,
@@ -31,6 +40,33 @@ pub(crate) struct SessionObservationInbox {
 }
 
 impl SessionObservationInbox {
+    /// Get terminal ownership evidence after the accepted event prefix has drained.
+    pub(crate) fn end(&self) -> Option<ObservationEnd> {
+        if !self.is_closed() {
+            return None;
+        }
+        if let Some(failure) = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            return Some(ObservationEnd::Lost(failure));
+        }
+        self.collected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map(ObservationEnd::Collected)
+    }
+
+    /// Publish collected resource ownership without inventing native execution completion.
+    pub(crate) fn close_collected(&self, reason: super::OwnerCloseReason) {
+        *self
+            .collected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+        self.close();
+    }
     /// Wake the session owner when a foreground admission finds idle host work.
     pub(crate) fn request_idle_settlement(&self) {
         self.idle_settlement_requested
@@ -78,11 +114,17 @@ impl SessionObservationInbox {
         let mut pending = self
             .pending
             .lock()
-            .map_err(|_| anyhow!("session event inbox poisoned"))?;
-        anyhow::ensure!(
-            !self.is_closed(),
-            "session observation generation is closed"
-        );
+            .map_err(|_| inbox_poisoned("session event inbox poisoned"))?;
+        if self.is_closed() {
+            return Err(ProviderError::Protocol {
+                message: "session observation generation is closed".into(),
+            });
+        }
+        if pending.len() == forge_protocol::MAX_PENDING_FRAMES {
+            return Err(crate::provider::ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Overflow,
+            ));
+        }
         pending.push_back(event);
         drop(pending);
         self.ready.notify_one();
@@ -95,14 +137,19 @@ impl SessionObservationInbox {
             let watchdogs: Vec<_> = self
                 .watchdogs
                 .lock()
-                .map_err(|_| anyhow!("tool watchdog registry poisoned"))?
+                .map_err(|_| inbox_poisoned("tool watchdog registry poisoned"))?
                 .get(&scope.invocation_id)
                 .into_iter()
                 .flatten()
                 .filter_map(Weak::upgrade)
                 .collect();
             for watchdog in watchdogs {
-                watchdog.observe(event)?;
+                watchdog.observe(event).map_err(|error| {
+                    crate::provider::lifecycle_error::classify(
+                        forge_provider_api::error::ProviderOperation::CollectEventReader,
+                        error,
+                    )
+                })?;
             }
         }
         Ok(())
@@ -117,11 +164,11 @@ impl SessionObservationInbox {
         let mut current = self
             .retained_watchdogs
             .lock()
-            .map_err(|_| anyhow!("retained watchdog lock poisoned"))?;
+            .map_err(|_| inbox_poisoned("retained watchdog lock poisoned"))?;
         let mut watchdogs = self
             .watchdogs
             .lock()
-            .map_err(|_| anyhow!("tool watchdog registry poisoned"))?;
+            .map_err(|_| inbox_poisoned("tool watchdog registry poisoned"))?;
         for retained in watchdogs.values_mut() {
             retained.retain(|watchdog| watchdog.strong_count() > 0);
         }
@@ -136,7 +183,12 @@ impl SessionObservationInbox {
         if let Some(previous) = current.get(&scope.invocation_id)
             && !Arc::ptr_eq(previous, watchdog)
         {
-            previous.retire_idle()?;
+            previous.retire_idle().map_err(|error| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CollectEventReader,
+                    error,
+                )
+            })?;
         }
         current.insert(scope.invocation_id.clone(), watchdog.clone());
         Ok(())
@@ -149,7 +201,12 @@ impl SessionObservationInbox {
         watchdog: Arc<crate::provider::tool_timeout::ToolWatchdog>,
         provider: Arc<crate::provider::Provider>,
     ) -> Result<()> {
-        watchdog.finish_foreground()?;
+        watchdog.finish_foreground().map_err(|error| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CollectEventReader,
+                error,
+            )
+        })?;
         self.start_tool_monitor(scope, watchdog, provider)
     }
 
@@ -163,20 +220,23 @@ impl SessionObservationInbox {
         let mut tasks = self
             .background_tasks
             .lock()
-            .map_err(|_| anyhow!("background watchdog task registry poisoned"))?;
-        anyhow::ensure!(
-            !self.is_closed(),
-            "session observation generation is closed"
-        );
+            .map_err(|_| inbox_poisoned("background watchdog task registry poisoned"))?;
+        if self.is_closed() {
+            return Err(ProviderError::Protocol {
+                message: "session observation generation is closed".into(),
+            });
+        }
         while let Some(result) = tasks.try_join_next() {
             if let Err(error) = result
                 && !error.is_cancelled()
             {
-                let failure =
-                    self.retain_watchdog_failure(crate::provider::ProviderError::Protocol {
-                        message: format!("background watchdog task failed: {error}"),
-                    });
-                return Err(crate::provider::ProviderError::Cleanup(failure).into());
+                let failure = self.retain_watchdog_failure(ProviderError::Operation(
+                    forge_provider_api::error::ProviderOperationFailure::new(
+                        forge_provider_api::error::ProviderOperation::CollectEventReader,
+                        Arc::new(error),
+                    ),
+                ));
+                return Err(crate::provider::ProviderError::Cleanup(failure));
             }
         }
         if watchdog.is_monitored() {
@@ -194,13 +254,13 @@ impl SessionObservationInbox {
                     let timeout = tokio::select! {
                         biased;
                         () = wait_for_close(&closed, &monitor_closed) => return Ok(()),
-                        timeout = watchdog.expired() => timeout?,
+                        timeout = watchdog.expired() => timeout.map_err(|error| crate::provider::lifecycle_error::classify(forge_provider_api::error::ProviderOperation::CollectEventReader, error))?,
                     };
                     let Some(timeout) = timeout else {
                         if !tokio::select! {
                             biased;
                             () = wait_for_close(&closed, &monitor_closed) => Ok(false),
-                            resumed = watchdog.resumed() => resumed,
+                            resumed = watchdog.resumed() => resumed.map_err(|error| crate::provider::lifecycle_error::classify(forge_provider_api::error::ProviderOperation::CollectEventReader, error)),
                         }? {
                             return Ok(());
                         }
@@ -233,11 +293,16 @@ impl SessionObservationInbox {
                             },
                         })
                     })();
+                    if let Err(ProviderError::Observation(failure)) = &publication
+                        && let Some(inbox) = inbox.upgrade()
+                    {
+                        inbox.fail(failure.clone());
+                    }
                     // Stop native work even when timeout publication fails.
                     let cancellation = provider.cancel_session(&scope.owner.runtime_key()).await;
                     match (publication, cancellation) {
                         (Err(publication), Err(cancellation)) => {
-                            return Err(publication.context(cancellation));
+                            return Err(ProviderError::Combined { primary: Box::new(publication), secondary: vec![cancellation] });
                         }
                         (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
                         (Ok(()), Ok(())) => {}
@@ -257,7 +322,7 @@ impl SessionObservationInbox {
                         fatal: true,
                     },
                 });
-                inbox.retain_watchdog_failure(crate::provider::ProviderError::from(error));
+                inbox.retain_watchdog_failure(error);
                 inbox.fail(forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable);
                 inbox.close();
             }
@@ -270,13 +335,13 @@ impl SessionObservationInbox {
         let mut failure = self
             .watchdog_failure
             .lock()
-            .map_err(|_| anyhow!("background watchdog failure lock poisoned"))?
+            .map_err(|_| inbox_poisoned("background watchdog failure lock poisoned"))?
             .clone();
         let mut tasks = std::mem::take(
             &mut *self
                 .background_tasks
                 .lock()
-                .map_err(|_| anyhow!("background watchdog task registry poisoned"))?,
+                .map_err(|_| inbox_poisoned("background watchdog task registry poisoned"))?,
         );
         tasks.abort_all();
         while let Some(result) = tasks.join_next().await {
@@ -284,9 +349,12 @@ impl SessionObservationInbox {
                 && !error.is_cancelled()
             {
                 failure.get_or_insert_with(|| {
-                    self.retain_watchdog_failure(crate::provider::ProviderError::Protocol {
-                        message: format!("background watchdog task failed: {error}"),
-                    })
+                    self.retain_watchdog_failure(ProviderError::Operation(
+                        forge_provider_api::error::ProviderOperationFailure::new(
+                            forge_provider_api::error::ProviderOperation::CollectEventReader,
+                            Arc::new(error),
+                        ),
+                    ))
                 });
             }
         }
@@ -294,16 +362,16 @@ impl SessionObservationInbox {
             failure = self
                 .watchdog_failure
                 .lock()
-                .map_err(|_| anyhow!("background watchdog failure lock poisoned"))?
+                .map_err(|_| inbox_poisoned("background watchdog failure lock poisoned"))?
                 .clone();
         }
         if let Some(failure) = failure {
             *self
                 .watchdog_failure
                 .lock()
-                .map_err(|_| anyhow!("background watchdog failure lock poisoned"))? =
+                .map_err(|_| inbox_poisoned("background watchdog failure lock poisoned"))? =
                 Some(failure.clone());
-            return Err(crate::provider::ProviderError::Cleanup(failure).into());
+            return Err(crate::provider::ProviderError::Cleanup(failure));
         }
         Ok(())
     }
@@ -313,6 +381,12 @@ impl SessionObservationInbox {
         &self,
         error: crate::provider::ProviderError,
     ) -> Arc<forge_provider_api::error::ObservationCleanup> {
+        let observation = self
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or(forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable);
         let mut failure = self
             .watchdog_failure
             .lock()
@@ -320,7 +394,7 @@ impl SessionObservationInbox {
         failure
             .get_or_insert_with(|| {
                 Arc::new(forge_provider_api::error::ObservationCleanup::new(
-                    forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
+                    observation,
                     None,
                     None,
                     Some(forge_provider_api::error::CleanupFailure::Failed(Box::new(
@@ -333,29 +407,34 @@ impl SessionObservationInbox {
 
     /// Take queued events in provider order without holding the lock during delivery.
     pub(crate) fn drain(&self) -> Result<Vec<ProviderEvent>> {
-        let events = self.take_pending()?;
+        self.drain_up_to(usize::MAX)
+    }
+
+    /// Take only the prefix that fits its next owner, preserving sticky failure until a nonzero drain.
+    pub(crate) fn drain_up_to(&self, limit: usize) -> Result<Vec<ProviderEvent>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let events: Vec<_> = {
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| inbox_poisoned("session event inbox poisoned"))?;
+            let count = limit.min(pending.len());
+            pending.drain(..count).collect()
+        };
         if events.is_empty()
             && self.is_closed()
             && let Some(failure) = self
                 .failure
                 .lock()
-                .map_err(|_| anyhow!("session observation failure poisoned"))?
+                .map_err(|_| inbox_poisoned("session observation failure poisoned"))?
                 .clone()
         {
             self.failure_reported.store(true, Ordering::Release);
-            return Err(crate::provider::ProviderError::Observation(failure).into());
+            return Err(crate::provider::ProviderError::Observation(failure));
         }
         Ok(events)
-    }
-
-    /// Take accepted session observations without acknowledging a terminal failure.
-    fn take_pending(&self) -> Result<Vec<ProviderEvent>> {
-        Ok(self
-            .pending
-            .lock()
-            .map_err(|_| anyhow!("session event inbox poisoned"))?
-            .drain(..)
-            .collect())
     }
 
     /// Require old observations and their failure to be consumed before replacing the owner.
@@ -363,12 +442,12 @@ impl SessionObservationInbox {
         let empty = self
             .pending
             .lock()
-            .map_err(|_| anyhow!("session event inbox poisoned"))?
+            .map_err(|_| inbox_poisoned("session event inbox poisoned"))?
             .is_empty();
         let failed = self
             .failure
             .lock()
-            .map_err(|_| anyhow!("session observation failure poisoned"))?
+            .map_err(|_| inbox_poisoned("session observation failure poisoned"))?
             .is_some();
         Ok(self.is_closed() && empty && (!failed || self.failure_reported.load(Ordering::Acquire)))
     }
@@ -378,7 +457,7 @@ impl SessionObservationInbox {
         let pending = !self
             .pending
             .lock()
-            .map_err(|_| anyhow!("session event inbox poisoned"))?
+            .map_err(|_| inbox_poisoned("session event inbox poisoned"))?
             .is_empty();
         Ok(pending
             || self.idle_settlement_requested.load(Ordering::Acquire)
@@ -386,7 +465,7 @@ impl SessionObservationInbox {
                 && self
                     .failure
                     .lock()
-                    .map_err(|_| anyhow!("session observation failure poisoned"))?
+                    .map_err(|_| inbox_poisoned("session observation failure poisoned"))?
                     .is_some()))
     }
 
@@ -401,7 +480,7 @@ impl SessionObservationInbox {
         if !self
             .pending
             .lock()
-            .map_err(|_| anyhow!("session event inbox poisoned"))?
+            .map_err(|_| inbox_poisoned("session event inbox poisoned"))?
             .is_empty()
         {
             return Ok(());
@@ -444,13 +523,144 @@ impl forge_provider_api::events::EventObserver for SessionObservationInbox {
     }
 }
 
+/// Identify poisoned synchronization without erasing its engine phase.
+#[derive(Debug)]
+struct InboxPoisoned(&'static str);
+impl std::fmt::Display for InboxPoisoned {
+    /// Describe the poisoned owned state.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for InboxPoisoned {}
+/// Preserve typed inbox synchronization failures at the engine boundary.
+fn inbox_poisoned(component: &'static str) -> ProviderError {
+    ProviderError::Operation(forge_provider_api::error::ProviderOperationFailure::new(
+        forge_provider_api::error::ProviderOperation::CollectEventReader,
+        Arc::new(InboxPoisoned(component)),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
 
-    /// Cancel native work without losing timeout evidence behind a publication backlog.
+    /// Accept sustained traffic above one inbox capacity when the owner drains each bounded window.
+    #[test]
+    fn bounded_draining_preserves_large_observation_stream() -> Result<()> {
+        let inbox = SessionObservationInbox::default();
+        let scope = crate::provider::EventScope::SessionOperation {
+            owner: crate::provider::ExecutionOwner::root("session"),
+            operation_id: "large-observation-stream".into(),
+        };
+        let mut observed = Vec::new();
+        let count = forge_protocol::MAX_PENDING_FRAMES * 4;
+        for index in 0..count {
+            inbox.push(ProviderEvent::Diagnostic {
+                scope: scope.clone(),
+                diagnostic: crate::provider::ProviderDiagnostic {
+                    code: None,
+                    message: format!("frame-{index}: α🦀"),
+                    fatal: false,
+                },
+            })?;
+            if (index + 1) % forge_protocol::MAX_PENDING_FRAMES == 0 {
+                loop {
+                    let prefix = inbox.drain_up_to(17)?;
+                    if prefix.is_empty() {
+                        break;
+                    }
+                    assert!(prefix.len() <= 17);
+                    for frame in prefix {
+                        let ProviderEvent::Diagnostic { diagnostic, .. } = frame else {
+                            anyhow::bail!("bounded transfer changed an observation");
+                        };
+                        observed.push(diagnostic.message);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            observed,
+            (0..count)
+                .map(|index| format!("frame-{index}: α🦀"))
+                .collect::<Vec<_>>()
+        );
+        assert!(!inbox.is_closed());
+        assert!(inbox.end().is_none());
+        assert!(inbox.drain()?.is_empty());
+        Ok(())
+    }
+
+    /// Keep a full accepted prefix ordered across partial drains and report real loss only afterward.
+    #[test]
+    fn bounded_drain_preserves_full_prefix_and_does_not_acknowledge_loss_without_capacity()
+    -> Result<()> {
+        let inbox = SessionObservationInbox::default();
+        let event = |index| ProviderEvent::Diagnostic {
+            scope: crate::provider::EventScope::SessionOperation {
+                owner: crate::provider::ExecutionOwner::root("session"),
+                operation_id: format!("operation-{index}"),
+            },
+            diagnostic: crate::provider::ProviderDiagnostic {
+                code: None,
+                message: format!("frame-{index:03}: α🦀"),
+                fatal: false,
+            },
+        };
+        for index in 0..forge_protocol::MAX_PENDING_FRAMES {
+            inbox.push(event(index))?;
+        }
+        assert!(matches!(
+            inbox.push(event(forge_protocol::MAX_PENDING_FRAMES)),
+            Err(crate::provider::ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Overflow
+            ))
+        ));
+        inbox.fail(forge_provider_api::lifecycle::ObservationFailure::Overflow);
+        inbox.close();
+        assert!(inbox.drain_up_to(0)?.is_empty());
+        assert!(!inbox.ready_for_replacement()?);
+        let mut observed = Vec::new();
+        while observed.len() < forge_protocol::MAX_PENDING_FRAMES {
+            let prefix = inbox.drain_up_to(17)?;
+            assert!(!prefix.is_empty() && prefix.len() <= 17);
+            for frame in prefix {
+                let ProviderEvent::Diagnostic { diagnostic, .. } = frame else {
+                    anyhow::bail!("partial drain changed a frame");
+                };
+                observed.push(diagnostic.message);
+            }
+            assert!(
+                !inbox.ready_for_replacement()?,
+                "accepted prefix acknowledged real loss"
+            );
+        }
+        assert_eq!(
+            observed,
+            (0..forge_protocol::MAX_PENDING_FRAMES)
+                .map(|index| format!("frame-{index:03}: α🦀"))
+                .collect::<Vec<_>>()
+        );
+        assert!(inbox.drain_up_to(0)?.is_empty());
+        assert!(
+            !inbox.ready_for_replacement()?,
+            "zero capacity acknowledged sticky loss"
+        );
+        assert!(matches!(
+            inbox.drain_up_to(1),
+            Err(crate::provider::ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Overflow
+            ))
+        ));
+        assert!(inbox.ready_for_replacement()?);
+        Ok(())
+    }
+
+    /// Preserve typed loss and still cancel native work when timeout publication meets a full inbox.
     #[tokio::test(start_paused = true)]
-    async fn timeout_cancels_native_work_behind_large_publication_backlog() -> Result<()> {
+    async fn timeout_cancels_native_work_even_when_publication_is_full() -> Result<()> {
         let data = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(data.path())?);
         let provider: Arc<crate::provider::Provider> = Arc::from(crate::provider::build(
@@ -505,7 +715,7 @@ mod tests {
             },
             update: crate::provider::ToolUpdate::Started,
         })?;
-        let event_count = forge_protocol::MAX_PENDING_FRAMES * 4;
+        let event_count = forge_protocol::MAX_PENDING_FRAMES;
         for _ in 1..event_count {
             inbox.push(ProviderEvent::Diagnostic {
                 scope: scope.clone().into(),
@@ -521,21 +731,31 @@ mod tests {
             .await?
             .unwrap_err();
         assert!(cancellation.to_string().contains("cancelled"));
-        assert!(!inbox.is_closed());
-        let events = inbox.drain()?;
-        assert_eq!(events.len(), event_count + 2);
-        assert!(matches!(&events[event_count], ProviderEvent::Tool {
-            update: crate::provider::ToolUpdate::Finished {
-                outcome: crate::provider::ToolOutcome::Failed { diagnostic },
-            }, ..
-        } if diagnostic.code.as_deref() == Some("tool_timeout")));
+        assert!(inbox.is_closed());
+        assert_eq!(inbox.drain()?.len(), forge_protocol::MAX_PENDING_FRAMES);
+        let failure = inbox.drain().unwrap_err();
         assert!(
-            matches!(&events[event_count + 1], ProviderEvent::Diagnostic {
-            diagnostic, ..
-        } if diagnostic.code.as_deref() == Some("tool_timeout"))
+            matches!(
+                failure,
+                crate::provider::ProviderError::Observation(
+                    forge_provider_api::lifecycle::ObservationFailure::Overflow
+                )
+            ),
+            "{failure:#}"
         );
-        assert!(inbox.drain()?.is_empty());
-        inbox.retire_background().await?;
+        let error = inbox.retire_background().await.unwrap_err();
+        let crate::provider::ProviderError::Cleanup(cleanup) = error else {
+            panic!("expected typed watchdog cleanup failure: {error:#}");
+        };
+        assert!(matches!(
+            cleanup.observation(),
+            forge_provider_api::lifecycle::ObservationFailure::Overflow
+        ));
+        assert!(
+            matches!(cleanup.collection(), Some(forge_provider_api::error::CleanupFailure::Failed(error))
+            if matches!(error.as_ref(), crate::provider::ProviderError::Observation(forge_provider_api::lifecycle::ObservationFailure::Overflow)))
+        );
+        assert!(inbox.retire_background().await.is_err());
         Ok(())
     }
 
@@ -765,12 +985,12 @@ mod tests {
         assert_eq!(inbox.drain()?.len(), 1);
         assert!(inbox.has_pending()?);
         assert!(!inbox.ready_for_replacement()?);
-        assert!(
-            inbox
-                .drain()
-                .unwrap_err()
-                .is::<crate::provider::ProviderError>()
-        );
+        assert!(matches!(
+            inbox.drain().unwrap_err(),
+            crate::provider::ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Overflow
+            )
+        ));
         assert!(inbox.ready_for_replacement()?);
         inbox.notified().await?;
         Ok(())

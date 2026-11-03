@@ -206,6 +206,16 @@ impl ForegroundFinalization {
         if outcome == crate::exchange::ExchangeOutcome::Cancelled {
             broker.questions.cancel_chat(Some(&exchange.id))?;
             exchange.set_awaiting_input(false);
+        } else if outcome == crate::exchange::ExchangeOutcome::Complete
+            && broker
+                .questions
+                .snapshot()?
+                .required_pending_in_exchange(&exchange.id)
+        {
+            // Steering can end a native question tool without resolving its durable decision.
+            exchange.set_awaiting_input(true);
+            exchange.pause(broker.clock.now_ms());
+            broker.store.save_exchange(exchange)?;
         }
         if exchange.awaiting_input() {
             self.phase = FinalizationPhase::Checks;
@@ -328,9 +338,10 @@ impl ForegroundFinalization {
             "foreground response was not prepared before settlement"
         );
         self.phase = FinalizationPhase::Commit;
-        Ok(ForegroundAction::Effect(ForegroundJob::SettlementCommit(
-            self.settlement.clone(),
-        )))
+        Ok(ForegroundAction::Effect(ForegroundJob::SettlementCommit {
+            cell: self.settlement.clone(),
+            undispatched: Vec::new(),
+        }))
     }
 
     pub(crate) fn settlement_committed(
@@ -1388,7 +1399,25 @@ impl HarnessBroker {
             .context("finalization envelope is missing")?;
         // Commit the final publication barrier or admit an owned continuation.
         if finalization.phase == FinalizationPhase::FinalDrain {
-            return finalization.checks_delivered();
+            let action = finalization.checks_delivered()?;
+            if let ForegroundAction::Effect(ForegroundJob::SettlementCommit {
+                cell,
+                mut undispatched,
+            }) = action
+            {
+                // Retention preserves event ownership, never a pending input reply.
+                // End admission before draining so no command can enter the retired lane.
+                transaction.steering.active.retire();
+                undispatched.extend(transaction.steering.deferred.drain(..));
+                while let Some(input) = transaction.steering.active.try_receive() {
+                    undispatched.push(input);
+                }
+                return Ok(ForegroundAction::Effect(ForegroundJob::SettlementCommit {
+                    cell,
+                    undispatched,
+                }));
+            }
+            return Ok(action);
         }
         if let Some((request, events)) = self.prepare_owned_clarification(
             &mut transaction.state.interaction,

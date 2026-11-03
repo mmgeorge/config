@@ -792,6 +792,45 @@ function M.apply_update(state, update)
   M.demand(state)
 end
 
+---Mount Status without replacing a buffer pinned by another feature.
+---@param state ForgeNativeStatus
+---@param window integer
+---@return integer? window
+---@return string? failure
+function M.show(state, window)
+  if not state.active or not vim.api.nvim_buf_is_valid(state.replica.buffer) then
+    return nil, "Status document is closed"
+  end
+  if not vim.api.nvim_win_is_valid(window) then return nil, "Status opening window is closed" end
+  local origin = vim.api.nvim_get_current_win()
+  local focused = origin == window
+  local created
+  local target = window
+  local ok, failure = xpcall(function()
+    if vim.wo[window].winfixbuf and vim.api.nvim_win_get_buf(window) ~= state.replica.buffer then
+      local displayed = vim.fn.win_findbuf(state.replica.buffer)
+      if #displayed > 0 then
+        target = displayed[1]
+      else
+        vim.api.nvim_win_call(window, function()
+          vim.cmd("tabnew")
+          target = vim.api.nvim_get_current_win()
+          created = target
+          vim.wo[target].winfixbuf = false
+        end)
+      end
+    end
+    vim.api.nvim_win_set_buf(target, state.replica.buffer)
+    if focused then vim.api.nvim_set_current_win(target) end
+  end, debug.traceback)
+  if not ok then
+    if created and vim.api.nvim_win_is_valid(created) then pcall(vim.api.nvim_win_close, created, true) end
+    if vim.api.nvim_win_is_valid(origin) then pcall(vim.api.nvim_set_current_win, origin) end
+    return nil, tostring(failure)
+  end
+  return target
+end
+
 ---@param options? ForgeNativeStatusOptions
 ---@return ForgeNativeStatus
 function M.open(options)
@@ -979,18 +1018,21 @@ function M.open(options)
   local function start_open()
   require("forge.startup_log").write("status.open.dispatch", { document = document })
   if not state.active then return end
+  local function fail_open(failure)
+    state.finish_open(failure)
+    state.opening_failed = true
+    if options.bind ~= false and vim.api.nvim_win_is_valid(opening_window)
+      and vim.api.nvim_win_get_buf(opening_window) == state.replica.buffer
+      and vim.api.nvim_buf_is_valid(opening_buffer) then
+      pcall(vim.api.nvim_win_set_buf, opening_window, opening_buffer)
+      vim.api.nvim_win_call(opening_window, function() vim.fn.winrestview(opening_view) end)
+    end
+    M.close(state)
+    notice(failure)
+  end
   request(state, opening, function(result, failure)
     if failure or not result then
-      state.finish_open(failure or "Missing status document")
-      state.opening_failed = true
-      if options.bind ~= false and vim.api.nvim_win_is_valid(opening_window)
-        and vim.api.nvim_win_get_buf(opening_window) == state.replica.buffer
-        and vim.api.nvim_buf_is_valid(opening_buffer) then
-        vim.api.nvim_win_set_buf(opening_window, opening_buffer)
-        vim.api.nvim_win_call(opening_window, function() vim.fn.winrestview(opening_view) end)
-      end
-      M.close(state)
-      notice(failure or "Missing status document")
+      fail_open(failure or "Missing status document")
       return
     end
     local snapshot_apply_started = vim.uv.hrtime()
@@ -1005,7 +1047,8 @@ function M.open(options)
     local post_apply_started = vim.uv.hrtime()
     if options.bind ~= false and vim.api.nvim_win_is_valid(opening_window)
       and vim.api.nvim_win_get_buf(opening_window) == opening_buffer then
-      vim.api.nvim_win_set_buf(opening_window, state.replica.buffer)
+      local mounted, bind_failure = M.show(state, opening_window)
+      if not mounted then fail_open(bind_failure or "Status window could not be opened") return end
     end
     require("forge.startup_log").write("status.window.bound", { document = document, elapsed_us = math.floor((vim.uv.hrtime() - post_apply_started) / 1000) })
     if result.context and result.context ~= vim.NIL then

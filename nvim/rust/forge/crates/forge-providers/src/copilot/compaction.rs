@@ -1,6 +1,6 @@
 use super::turn::CopilotTurnEvent;
 use forge_provider_api::{Compaction, CompactionState};
-use forge_provider_api::{ProviderEvent, ProviderEventSink};
+use forge_provider_api::{ProviderError, ProviderEvent, ProviderEventSink};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -62,7 +62,8 @@ impl CompactionSubscription {
 pub struct CompactionMonitor {
     /// Maps manual RPC results and native notifications onto their owning row.
     pub manual: Arc<Mutex<ManualCompactionMap>>,
-    task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<Result<(), ProviderError>>>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl CompactionMonitor {
@@ -74,8 +75,7 @@ impl CompactionMonitor {
         trace: Arc<dyn forge_provider_api::trace::ProviderTrace>,
         harness_session_id: String,
     ) -> Self {
-        let session = &session.inner;
-        let mut subscription = super::event_stream::SessionEventStream::new(
+        let subscription = super::event_stream::SessionEventStream::new(
             session,
             |event| {
                 matches!(
@@ -86,110 +86,161 @@ impl CompactionMonitor {
             trace.clone(),
             harness_session_id.clone(),
         );
+        Self::from_stream(
+            subscription,
+            session.inner.id().to_string(),
+            subscription_state,
+            turn_event,
+            trace,
+            harness_session_id,
+        )
+    }
+
+    /// Own subscription delivery and collection independently of the native session handle.
+    fn from_stream(
+        mut subscription: super::event_stream::SessionEventStream,
+        thread_id: String,
+        subscription_state: CompactionSubscription,
+        turn_event: Arc<CopilotTurnEvent>,
+        trace: Arc<dyn forge_provider_api::trace::ProviderTrace>,
+        harness_session_id: String,
+    ) -> Self {
         let manual = Arc::clone(&subscription_state.manual);
         let correlation = Arc::clone(&manual);
-        let thread_id = session.id().to_string();
+        let (shutdown, closing) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let sink = subscription_state.sink;
-            loop {
-                let event = match subscription.recv().await {
-                    Ok(event) => event,
-                    Err(error) => {
-                        let diagnostic = ProviderEvent::Diagnostic {
-                            scope: sink.scope().clone(),
-                            diagnostic: forge_provider_api::ProviderDiagnostic {
-                                code: Some("copilot_compaction_subscription_failed".into()),
-                                message: format!(
-                                    "Copilot compaction subscription failed: {error:#}"
-                                ),
-                                fatal: true,
-                            },
-                        };
-                        if let Err(delivery) = sink.send_wait(diagnostic).await {
-                            trace.record(
-                                &harness_session_id,
-                                "copilot.compaction.delivery_failed",
-                                serde_json::json!({"error":delivery.to_string()}),
-                            );
-                        }
-                        return;
-                    }
-                };
-                if !matches!(
-                    event.event_type.as_str(),
-                    "session.compaction_start" | "session.compaction_complete"
-                ) {
-                    continue;
-                }
-                let event_thread = event.agent_id.as_deref().unwrap_or(&thread_id);
-                let mut state = subscription_state.state.lock().await;
-                let update =
-                    super::decode::decode_compaction(&event, event_thread, state.get(event_thread));
-                let mut update = match update {
-                    Ok(update) => update,
-                    Err(error) => {
-                        drop(state);
-                        let diagnostic = ProviderEvent::Diagnostic {
-                            scope: sink.scope().clone(),
-                            diagnostic: forge_provider_api::ProviderDiagnostic {
-                                code: Some("invalid_copilot_compaction".into()),
-                                message: error.to_string(),
-                                fatal: false,
-                            },
-                        };
-                        if let Err(delivery) = sink.send_wait(diagnostic).await {
-                            trace.record(
-                                &harness_session_id,
-                                "copilot.compaction.delivery_failed",
-                                serde_json::json!({"error":delivery.to_string()}),
-                            );
+            let observe = async {
+                let sink = subscription_state.sink;
+                loop {
+                    let event = match subscription.recv().await {
+                        Ok(event) => event,
+                        Err(error) => {
+                            let diagnostic = ProviderEvent::Diagnostic {
+                                scope: sink.scope().clone(),
+                                diagnostic: forge_provider_api::ProviderDiagnostic {
+                                    code: Some("copilot_compaction_subscription_failed".into()),
+                                    message: format!(
+                                        "Copilot compaction subscription failed: {error:#}"
+                                    ),
+                                    fatal: true,
+                                },
+                            };
+                            if let Err(delivery) = sink.send_wait(diagnostic).await {
+                                trace.record(
+                                    &harness_session_id,
+                                    "copilot.compaction.delivery_failed",
+                                    serde_json::json!({"error":delivery.to_string()}),
+                                );
+                            }
                             return;
                         }
+                    };
+                    if !matches!(
+                        event.event_type.as_str(),
+                        "session.compaction_start" | "session.compaction_complete"
+                    ) {
                         continue;
                     }
-                };
-                state.insert(event_thread.into(), update.clone());
-                drop(state);
-                if event.agent_id.is_none() {
-                    correlation.lock().await.correlate(&mut update);
-                }
-                if let Some(active_sink) = turn_event.event_sink()
-                    && let Err(error) = active_sink
+                    let event_thread = event.agent_id.as_deref().unwrap_or(&thread_id);
+                    let mut state = subscription_state.state.lock().await;
+                    let update = super::decode::decode_compaction(
+                        &event,
+                        event_thread,
+                        state.get(event_thread),
+                    );
+                    let mut update = match update {
+                        Ok(update) => update,
+                        Err(error) => {
+                            drop(state);
+                            let diagnostic = ProviderEvent::Diagnostic {
+                                scope: sink.scope().clone(),
+                                diagnostic: forge_provider_api::ProviderDiagnostic {
+                                    code: Some("invalid_copilot_compaction".into()),
+                                    message: error.to_string(),
+                                    fatal: false,
+                                },
+                            };
+                            if let Err(delivery) = sink.send_wait(diagnostic).await {
+                                trace.record(
+                                    &harness_session_id,
+                                    "copilot.compaction.delivery_failed",
+                                    serde_json::json!({"error":delivery.to_string()}),
+                                );
+                                return;
+                            }
+                            continue;
+                        }
+                    };
+                    state.insert(event_thread.into(), update.clone());
+                    drop(state);
+                    if event.agent_id.is_none() {
+                        correlation.lock().await.correlate(&mut update);
+                    }
+                    if let Some(active_sink) = turn_event.event_sink()
+                        && let Err(error) = active_sink
+                            .send_wait(ProviderEvent::Compaction {
+                                scope: active_sink.scope().clone(),
+                                update: update.clone().into(),
+                            })
+                            .await
+                    {
+                        trace.record(
+                            &harness_session_id,
+                            "copilot.compaction.active_delivery_failed",
+                            serde_json::json!({"error":error.to_string()}),
+                        );
+                    }
+                    if let Err(error) = sink
                         .send_wait(ProviderEvent::Compaction {
-                            scope: active_sink.scope().clone(),
-                            update: update.clone().into(),
+                            scope: sink.scope().clone(),
+                            update: update.into(),
                         })
                         .await
-                {
-                    trace.record(
-                        &harness_session_id,
-                        "copilot.compaction.active_delivery_failed",
-                        serde_json::json!({"error":error.to_string()}),
-                    );
+                    {
+                        trace.record(
+                            &harness_session_id,
+                            "copilot.compaction.delivery_failed",
+                            serde_json::json!({"error":error.to_string()}),
+                        );
+                        return;
+                    }
                 }
-                if let Err(error) = sink
-                    .send_wait(ProviderEvent::Compaction {
-                        scope: sink.scope().clone(),
-                        update: update.into(),
-                    })
-                    .await
-                {
-                    trace.record(
-                        &harness_session_id,
-                        "copilot.compaction.delivery_failed",
-                        serde_json::json!({"error":error.to_string()}),
-                    );
-                    return;
-                }
+            };
+            tokio::select! {
+                biased;
+                _ = closing => {},
+                _ = observe => {},
             }
+            subscription.close().await.map_err(ProviderError::from)
         });
-        Self { manual, task }
+        Self {
+            manual,
+            task: Some(task),
+            shutdown: Some(shutdown),
+        }
+    }
+
+    /// Stop delivery and join both the monitor and its owned SDK subscription reader.
+    pub async fn shutdown(&mut self) -> Result<(), ProviderError> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        let Some(task) = self.task.as_mut() else {
+            return Ok(());
+        };
+        let result = task.await.map_err(|error| ProviderError::Protocol {
+            message: format!("Copilot compaction monitor collection failed: {error}"),
+        });
+        self.task.take();
+        result?
     }
 }
 
 impl Drop for CompactionMonitor {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
     }
 }
 
@@ -250,6 +301,45 @@ mod tests {
         )?;
         assert_eq!(orphan.result.pre_compaction_tokens, None);
         Ok(())
+    }
+
+    struct Trace;
+
+    impl forge_provider_api::trace::ProviderTrace for Trace {
+        /// Discard diagnostics while observing the normalized failure and collection boundary.
+        fn record(&self, _: &str, _: &str, _: serde_json::Value) {}
+    }
+
+    /// A joined subscription failure stays observation evidence rather than becoming cleanup failure.
+    #[tokio::test]
+    async fn failed_compaction_subscription_still_collects_its_reader() {
+        let (send, receive) = tokio::sync::mpsc::channel(1);
+        let reader = tokio::spawn(async move {
+            drop(send);
+            Err(forge_provider_api::ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Disconnected,
+            )
+            .into())
+        });
+        while !reader.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let (sink, _events) =
+            forge_provider_api::events::channel(forge_provider_api::EventScope::SessionOperation {
+                owner: forge_provider_api::ExecutionOwner::root("compaction-failure"),
+                operation_id: "observer".into(),
+            });
+        let mut monitor = CompactionMonitor::from_stream(
+            super::super::event_stream::SessionEventStream::fixture(receive, reader),
+            "native-thread".into(),
+            CompactionSubscription::new(sink),
+            Arc::new(CopilotTurnEvent::default()),
+            Arc::new(Trace),
+            "compaction-failure".into(),
+        );
+        monitor.shutdown().await.unwrap();
+        assert!(monitor.task.is_none());
+        monitor.shutdown().await.unwrap();
     }
 
     #[tokio::test]

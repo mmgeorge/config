@@ -66,16 +66,26 @@ fn native_agent_exclusions() -> Vec<String> {
 }
 
 type SharedCopilotSession = Arc<forge_providers::copilot::handle::CopilotSession>;
+
+enum FailedClientRecovery {
+    Idle,
+    Running {
+        failed: forge_providers::copilot::client_generation::FailedGeneration,
+        task: tokio::task::JoinHandle<std::result::Result<(), Arc<ProviderError>>>,
+    },
+}
+
 /// Owns the native Copilot SDK client, session, event decoder, and Harness callbacks.
 pub struct CopilotProvider {
     session_events: Arc<crate::provider::session_events::SessionEvents>,
-    runtime: CopilotRuntime,
+    runtime: Arc<CopilotRuntime>,
     settings_root: Option<PathBuf>,
     trace: Arc<crate::trace::TraceStore>,
     sessions: Arc<CopilotSessions<crate::settings::ResourceProfile>>,
-    control_router_by_harness: Mutex<HashMap<String, Arc<ControlToolRouter>>>,
-    permission_context_by_harness: Mutex<HashMap<String, Arc<ProviderPermissionContext>>>,
+    control_router_by_harness: Arc<Mutex<HashMap<String, Arc<ControlToolRouter>>>>,
+    permission_context_by_harness: Arc<Mutex<HashMap<String, Arc<ProviderPermissionContext>>>>,
     permission_coordinator: Arc<PermissionCoordinator>,
+    recovery: Mutex<FailedClientRecovery>,
 }
 
 impl CopilotProvider {
@@ -102,11 +112,12 @@ impl CopilotProvider {
             settings_root,
             sessions: Arc::new(CopilotSessions::new(trace.clone())),
             trace,
-            runtime: CopilotRuntime::new(command),
+            runtime: Arc::new(CopilotRuntime::new(command)),
 
-            control_router_by_harness: Mutex::new(HashMap::new()),
-            permission_context_by_harness: Mutex::new(HashMap::new()),
+            control_router_by_harness: Default::default(),
+            permission_context_by_harness: Default::default(),
             permission_coordinator,
+            recovery: Mutex::new(FailedClientRecovery::Idle),
         })
     }
 
@@ -117,6 +128,98 @@ impl CopilotProvider {
 
     async fn client(&self, workspace: &str) -> Result<Client> {
         Ok(self.runtime.client(workspace).await?)
+    }
+
+    /// Retain shared-client retirement independently of the reset caller's lifetime.
+    async fn recover_failed_client(
+        &self,
+        recovery: &mut FailedClientRecovery,
+        failed: forge_providers::copilot::client_generation::FailedGeneration,
+    ) -> Result<()> {
+        let runtime = self.runtime.clone();
+        let sessions = self.sessions.clone();
+        let events = self.session_events.clone();
+        let permissions = self.permission_context_by_harness.clone();
+        let routers = self.control_router_by_harness.clone();
+        let coordinator = self.permission_coordinator.clone();
+        let collecting = failed.clone();
+        *recovery = FailedClientRecovery::Running {
+            failed,
+            task: tokio::spawn(async move {
+                let collect = async {
+                    let owners = sessions.fail_generation(&collecting).await?;
+                    let mut controls = Vec::new();
+                    let mut fencing = None;
+                    for owner in &owners {
+                        let key = owner.runtime_key();
+                        let permission = permissions.lock().await.get(&key).cloned();
+                        if let Some(permission) = permission
+                            && let Err(error) = permission.retire()
+                        {
+                            fencing.get_or_insert_with(|| ProviderError::from(error));
+                        }
+                        if let Err(error) = coordinator.cancel_owner(owner, None).await {
+                            fencing.get_or_insert_with(|| ProviderError::from(error));
+                        }
+                        let router = routers.lock().await.get(&key).cloned();
+                        if let Some(router) = router {
+                            if let Err(error) = router.cancel() {
+                                fencing.get_or_insert_with(|| ProviderError::from(error));
+                            }
+                            controls.push(router);
+                        }
+                    }
+                    if let Some(error) = fencing {
+                        return Err(error);
+                    }
+                    let client = runtime.collect_failed_client(&collecting).await?;
+                    // Foreground decoders release their locks before native intake collection.
+                    for owner in &owners {
+                        events.cancel(owner).await?;
+                    }
+                    for router in controls {
+                        router.close().await.map_err(ProviderError::from)?;
+                    }
+                    let collected = sessions.collect_failed_generation(&client).await?;
+                    for owner in &owners {
+                        let key = owner.runtime_key();
+                        events.reset_owner(owner).await?;
+                        routers.lock().await.remove(&key);
+                        permissions.lock().await.remove(&key);
+                    }
+                    runtime.finish_recovery(collected).await
+                };
+                collect.await.map_err(Arc::new)
+            }),
+        };
+        Self::join_failed_client_recovery(recovery).await
+    }
+
+    /// Join the retained recovery worker without detaching it on timeout or waiter cancellation.
+    async fn join_failed_client_recovery(recovery: &mut FailedClientRecovery) -> Result<()> {
+        let (failed, result) = match recovery {
+            FailedClientRecovery::Idle => return Ok(()),
+            FailedClientRecovery::Running { failed, task } => {
+                let result = tokio::time::timeout(std::time::Duration::from_secs(60), task)
+                    .await
+                    .context("Copilot shared-client recovery exceeded 60 seconds")?;
+                (failed.clone(), result)
+            }
+        };
+        *recovery = FailedClientRecovery::Idle;
+        let result = result.map_err(|error| {
+            ProviderError::Operation(forge_provider_api::error::ProviderOperationFailure::new(
+                forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                Arc::new(error),
+            ))
+        })?;
+        result.map_err(|cleanup| {
+            ProviderError::PreparationCleanup {
+                cause: Arc::new(ProviderError::Observation(failed.failure())),
+                cleanup,
+            }
+            .into()
+        })
     }
 
     async fn session(
@@ -135,6 +238,7 @@ impl CopilotProvider {
         let tool_list = self.control_tool_list(request);
         let selected_tools = request.control_context.as_ref().map(|_| tool_list.clone());
         let selection = SessionSelection {
+            execution_owner: request.owner()?,
             runtime_key: key.clone(),
             correlation_id: request.harness_session_id.clone(),
             session_id: request.provider_session_id.clone().map(Into::into),
@@ -394,21 +498,30 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
         &self,
         request: ProviderCatalogRequest,
         setting: &crate::settings::PortableSettings,
-    ) -> Result<()> {
-        if self.settings_root.is_none() {
-            anyhow::ensure!(
-                setting.skill.is_empty() && setting.mcp.is_empty(),
-                "shared resource selection requires the Forge settings store"
-            );
-            return Ok(());
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            if self.settings_root.is_none() {
+                anyhow::ensure!(
+                    setting.skill.is_empty() && setting.mcp.is_empty(),
+                    "shared resource selection requires the Forge settings store"
+                );
+                return Ok(());
+            }
+            self.cleanup_execution(&request.runtime_key()?).await?;
+            self.session(
+                &Self::catalog_provider_request(&request),
+                CopilotSessionReuse::Refresh,
+            )
+            .await?;
+            Ok(())
         }
-        self.cleanup_execution(&request.runtime_key()?).await?;
-        self.session(
-            &Self::catalog_provider_request(&request),
-            CopilotSessionReuse::Refresh,
-        )
-        .await?;
-        Ok(())
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::ReconcileSettings,
+                source,
+            )
+        })
     }
 
     async fn generate_text(
@@ -418,7 +531,8 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
         model: &str,
         reasoning_effort: Option<&str>,
         history: &str,
-    ) -> Result<String> {
+    ) -> std::result::Result<String, crate::provider::ProviderError> {
+        let result: anyhow::Result<String> = async move {
         self.trace.record(&request.harness_session_id, "copilot.generation.request", json!({
             "purpose": purpose.name(),
             "model":model,"reasoning_effort":reasoning_effort,"instructions":purpose.instructions(),"history":history}));
@@ -455,6 +569,14 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
             },
         );
         result
+
+        }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::GenerateText,
+                source,
+            )
+        })
     }
     async fn terminate_terminal(&self, request: ProviderCatalogRequest, id: &str) -> Result<()> {
         self.sessions.terminate(&request.runtime_key()?, id).await
@@ -469,33 +591,42 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
             .await
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        let mut failure = self
-            .session_events
-            .shutdown()
-            .await
-            .err()
-            .map(anyhow::Error::from);
-        self.runtime.close_admission();
-        if let Err(error) = self.sessions.close_observers().await {
-            failure.get_or_insert(error.into());
-        }
-        let client_stopped = match self.runtime.shutdown().await {
-            Ok(()) => forge_providers::copilot::sessions::ClientShutdown::Collected,
-            Err(error) => {
-                failure.get_or_insert(error.into());
-                forge_providers::copilot::sessions::ClientShutdown::Uncertain
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.runtime.close_admission();
+            let mut recovery = self.recovery.lock().await;
+            Self::join_failed_client_recovery(&mut recovery).await?;
+            if let Some(failed) = self.runtime.failed_generation().await {
+                self.recover_failed_client(&mut recovery, failed).await?;
             }
-        };
-        if let Err(error) = self.sessions.clear(client_stopped).await {
-            failure.get_or_insert(error.into());
+            let mut failures = Vec::new();
+            if let Err(error) = self.session_events.shutdown().await {
+                failures.push(error);
+            }
+            if let Err(error) = self.sessions.close_observers().await {
+                failures.push(error);
+            }
+            let client_stopped = match self.runtime.shutdown().await {
+                Ok(()) => forge_providers::copilot::sessions::ClientShutdown::Collected,
+                Err(error) => {
+                    failures.push(error);
+                    forge_providers::copilot::sessions::ClientShutdown::Uncertain
+                }
+            };
+            if let Err(error) = self.sessions.clear(client_stopped).await {
+                failures.push(error);
+            }
+            self.control_router_by_harness.lock().await.clear();
+            self.permission_context_by_harness.lock().await.clear();
+            crate::provider::lifecycle_error::combine(failures).map_err(anyhow::Error::from)
         }
-        self.control_router_by_harness.lock().await.clear();
-        self.permission_context_by_harness.lock().await.clear();
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -719,7 +850,11 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
     async fn initialize_session(
         &self,
         request: ProviderRequest,
-    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+    ) -> std::result::Result<
+        Option<forge_provider_api::ProviderSessionId>,
+        crate::provider::ProviderError,
+    > {
+        let result: anyhow::Result<Option<forge_provider_api::ProviderSessionId>> = async move {
         let start = || self.session(&request, CopilotSessionReuse::Compatible);
         self.trace.record(&request.harness_session_id, "future.stack_probe", json!({"phase":"copilot.initialize.session","bytes":crate::trace::future_bytes(&start)}));
         self.trace.record(&request.harness_session_id, "future.stack_probe", json!({"phase":"copilot.sdk.start","bytes":forge_providers::copilot::runtime::CopilotRuntime::sdk_start_future_bytes()}));
@@ -730,6 +865,14 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
             json!({"phase":"copilot.initialize.ready","bytes":0}),
         );
         Ok(Some(session.id().to_string().try_into()?))
+
+        }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::InitializeSession,
+                source,
+            )
+        })
     }
 
     async fn mcp_configuration(
@@ -789,73 +932,137 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
         self.turn_event(session_id).await.reset()
     }
 
-    async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
-        let controls = self.control_router(session_id).await.cancel()?;
-        let turn_event = self.turn_event(session_id).await;
-        let stop = turn_event.request_stop()?;
-        let stopped = (stop.submitted || stop.sending)
-            && self
-                .active_session(session_id)
-                .await
-                .is_some_and(|session| session.client_stopped());
-        if stopped || (!stop.submitted && !stop.sending) {
-            self.session_events.cancel_runtime(session_id).await?;
-        }
-        let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
-            if stop.submitted {
-                let session = self
+    async fn cleanup_execution(
+        &self,
+        session_id: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            // Observation loss already fenced this native client. Collect its local
+            // ownership without requiring an abort response from the dead transport.
+            // The engine retains the original unknown execution outcome separately.
+            if let Some(requested) = self.runtime.failed_generation().await {
+                let mut recovery = self.recovery.lock().await;
+                Self::join_failed_client_recovery(&mut recovery).await?;
+                if let Some(current) = self.runtime.failed_generation().await
+                    && requested.same(&current)
+                {
+                    return self.recover_failed_client(&mut recovery, current).await;
+                }
+                return Ok(());
+            }
+            let controls = self.control_router(session_id).await.cancel()?;
+            let turn_event = self.turn_event(session_id).await;
+            let stop = turn_event.request_stop()?;
+            let stopped = (stop.submitted || stop.sending)
+                && self
                     .active_session(session_id)
                     .await
-                    .context("Submitted Copilot session is missing")?;
-                session.abort().await.context("abort active Copilot turn")?;
+                    .is_some_and(|session| session.client_stopped());
+            if stopped || (!stop.submitted && !stop.sending) {
+                self.session_events.cancel_runtime(session_id).await?;
             }
-            if turn_event.stop().await? {
-                if stop.sending || !stop.submitted {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                if stop.submitted {
                     let session = self
                         .active_session(session_id)
                         .await
                         .context("Submitted Copilot session is missing")?;
-                    session
-                        .abort()
-                        .await
-                        .context("abort committed Copilot send after collection")?;
+                    session.abort().await.context("abort active Copilot turn")?;
                 }
-                turn_event.wait_finished().await;
+                if turn_event.stop().await? {
+                    if stop.sending || !stop.submitted {
+                        let session = self
+                            .active_session(session_id)
+                            .await
+                            .context("Submitted Copilot session is missing")?;
+                        session
+                            .abort()
+                            .await
+                            .context("abort committed Copilot send after collection")?;
+                    }
+                    turn_event.wait_finished().await;
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("Copilot execution did not stop within 8 seconds")
+            .and_then(|result| result);
+            if let Some(controls) = controls {
+                controls.close().await;
             }
-            Ok::<_, anyhow::Error>(())
+            result
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
         })
-        .await
-        .context("Copilot execution did not stop within 8 seconds")
-        .and_then(|result| result);
-        if let Some(controls) = controls {
-            controls.close().await;
-        }
-        result
     }
 
-    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-        let key = owner.runtime_key();
-        if let Some(permission) = self.permission_context_by_harness.lock().await.get(&key) {
-            permission.retire()?;
+    async fn fence_session(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            let key = owner.runtime_key();
+            if let Some(permission) = self.permission_context_by_harness.lock().await.get(&key) {
+                permission.retire()?;
+            }
+            self.permission_coordinator
+                .cancel_owner(owner, None)
+                .await?;
+            if let Some(router) = self.control_router_by_harness.lock().await.get(&key) {
+                router.cancel()?;
+            }
+            Ok(())
         }
-        self.permission_coordinator
-            .cancel_owner(owner, None)
-            .await?;
-        if let Some(router) = self.control_router_by_harness.lock().await.get(&key) {
-            router.cancel()?;
-        }
-        Ok(())
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::FenceSession,
+                source,
+            )
+        })
     }
 
-    async fn reset_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-        let key = owner.runtime_key();
-        self.fence_session(owner).await?;
-        self.sessions.retire(&key).await?;
-        self.runtime.recover().await?;
-        self.control_router_by_harness.lock().await.remove(&key);
-        self.permission_context_by_harness.lock().await.remove(&key);
-        self.session_events.reset_owner(owner).await?;
-        Ok(())
+    async fn reset_session(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            // Capture failure before waiting: an old queued reset cannot retire a successor.
+            let requested = self.runtime.failed_generation().await;
+            let mut recovery = self.recovery.lock().await;
+            Self::join_failed_client_recovery(&mut recovery).await?;
+            let current = self.runtime.failed_generation().await;
+            if let Some(requested) = requested {
+                match current {
+                    Some(current) if requested.same(&current) => {
+                        return self.recover_failed_client(&mut recovery, current).await;
+                    }
+                    Some(_) | None => return Ok(()),
+                }
+            }
+            if let Some(current) = current {
+                return self.recover_failed_client(&mut recovery, current).await;
+            }
+            let key = owner.runtime_key();
+            self.fence_session(owner).await?;
+            self.sessions.retire(&key).await?;
+            self.control_router_by_harness.lock().await.remove(&key);
+            self.permission_context_by_harness.lock().await.remove(&key);
+            self.session_events.reset_owner(owner).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::ResetSession,
+                source,
+            )
+        })
     }
 
     async fn rollback_cancelled_turn_for(&self, session_id: &str) -> Result<bool> {
@@ -1028,12 +1235,30 @@ impl CopilotProvider {
                 self.trace.clone(),
             )
             .await;
-            if let (Some(context), Some(sink), Ok(Some((_, event_id))), Ok(executions)) = (
-                request.control_context.as_ref(),
-                event_sink.as_ref(),
-                turn_event.foreground_anchor(),
-                turn_event.certified_executions(),
-            ) {
+            if let (Some(context), Some(sink)) =
+                (request.control_context.as_ref(), event_sink.as_ref())
+            {
+                let certification = (|| -> anyhow::Result<_> {
+                    let (_, event_id) = turn_event
+                        .foreground_anchor()?
+                        .context("Copilot terminal lacks an admitted foreground anchor")?;
+                    Ok((event_id, turn_event.certified_executions()?))
+                })();
+                let (event_id, executions) = match certification {
+                    Ok(certification) => certification,
+                    Err(error) => {
+                        // Preserve an established native failure; successful execution
+                        // requires explicit terminal coverage rather than a skipped certificate.
+                        completed?;
+                        return Err(ProviderError::Observation(
+                            forge_provider_api::lifecycle::ObservationFailure::Protocol {
+                                message: format!(
+                                    "cannot certify Copilot execution completion: {error:#}"
+                                ),
+                            },
+                        ));
+                    }
+                };
                 let scope = sink.invocation_scope()?.clone();
                 let thread_id = session.id().to_string();
                 let initial_is_first = executions
@@ -1071,6 +1296,15 @@ impl CopilotProvider {
                             continuations,
                         },
                     )?;
+                } else {
+                    completed?;
+                    return Err(ProviderError::Observation(
+                        forge_provider_api::lifecycle::ObservationFailure::Protocol {
+                            message:
+                                "Copilot terminal coverage lacks its initial foreground execution"
+                                    .into(),
+                        },
+                    ));
                 }
             }
             let completed = completed?;

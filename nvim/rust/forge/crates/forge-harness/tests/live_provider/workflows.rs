@@ -586,7 +586,7 @@ async fn tool_workflow(provider: &str) -> Result<()> {
     };
     result.with_context(|| format!("{provider} tool workflow; evidence: {}", fixture.display()))?;
     initial_cleanup?;
-    resumed_cleanup
+    Ok(resumed_cleanup?)
 }
 
 /// Exercise plan question admission, explicit user feedback, and review-ready submission.

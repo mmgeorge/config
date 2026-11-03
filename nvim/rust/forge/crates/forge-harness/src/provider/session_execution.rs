@@ -2,13 +2,16 @@
 
 mod cleanup;
 mod inbox;
-pub(crate) use cleanup::RetainedCleanupFailure;
+pub(crate) use cleanup::{
+    CleanupError, CleanupWorkFailure, CleanupWorkKind, RetainedCleanupFailure,
+};
 mod runtime;
-pub(crate) use inbox::SessionObservationInbox;
+pub(crate) use inbox::{ObservationEnd, SessionObservationInbox};
 pub(crate) use runtime::{
     ContinuationAttempt, HostEffectAdmission, HostEffectGuard, HostEffectId, HostEffectKind,
-    HostEffectOutput, NativeReady, RegistryError, ResultEffectAdmission, SessionExecution,
-    SessionExecutionRegistry, SettlementCell, SettlementCheckout, SettlementError,
+    HostEffectOutput, NativeReady, OwnerCloseReason, RegistryError, ResultEffectAdmission,
+    SessionExecution, SessionExecutionRegistry, SettlementCell, SettlementCheckout,
+    SettlementError,
 };
 
 use std::collections::{HashMap, HashSet};

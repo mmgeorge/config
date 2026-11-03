@@ -8,15 +8,15 @@ use super::handle::CopilotClient;
 
 enum Shutdown {
     Idle,
-    Running(tokio::task::JoinHandle<Result<(), String>>),
-    Complete(Result<(), String>),
+    Running(tokio::task::JoinHandle<Result<(), std::sync::Arc<ProviderError>>>),
+    Complete(Result<(), std::sync::Arc<ProviderError>>),
 }
 
 #[derive(Clone)]
 enum RuntimeClient {
     Unvalidated(CopilotClient),
     Ready {
-        client: CopilotClient,
+        client: super::handle::CopilotClient,
         _validation: forge_provider_api::version::ValidatedRuntime,
     },
 }
@@ -25,7 +25,8 @@ impl RuntimeClient {
     /// Get the transport for resource collection regardless of validation state.
     fn client(&self) -> &CopilotClient {
         match self {
-            Self::Unvalidated(client) | Self::Ready { client, .. } => client,
+            Self::Unvalidated(client) => client,
+            Self::Ready { client, .. } => client,
         }
     }
 }
@@ -38,7 +39,6 @@ pub struct CopilotRuntime {
     starts: AtomicU64,
     closed: AtomicBool,
     shutdown: Mutex<Shutdown>,
-    recovery: Mutex<Shutdown>,
 }
 
 impl CopilotRuntime {
@@ -62,7 +62,6 @@ impl CopilotRuntime {
             starts: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             shutdown: Mutex::new(Shutdown::Idle),
-            recovery: Mutex::new(Shutdown::Idle),
         }
     }
 
@@ -117,10 +116,10 @@ impl CopilotRuntime {
                 message: "Copilot runtime is shut down".into(),
             });
         }
-        self.collect_stopped().await?;
         let current = self.client.lock().await.clone();
         let transport = match current {
             Some(RuntimeClient::Ready { client, .. }) => {
+                client.ensure_healthy()?;
                 return Ok(client);
             }
             Some(RuntimeClient::Unvalidated(client)) => client,
@@ -149,7 +148,7 @@ impl CopilotRuntime {
                 started
             }
         };
-        let validation = match self.validate_version(&transport.inner).await {
+        let validation = match validate_version(&transport.inner, &self.command).await {
             Ok(validation) => validation,
             Err(error) => {
                 transport.force_stop();
@@ -165,108 +164,343 @@ impl CopilotRuntime {
                 message: "Copilot runtime closed during validation".into(),
             });
         }
+        let client = transport;
         *state = Some(RuntimeClient::Ready {
-            client: transport.clone(),
+            client: client.clone(),
             _validation: validation,
         });
-        Ok(transport)
+        Ok(client)
     }
 
-    /// Collect a stopped generation before an explicit recovery attaches another transport.
-    pub async fn recover(&self) -> Result<(), ProviderError> {
-        let _initializing = self.initializing.lock().await;
-        self.collect_stopped().await
-    }
-
-    /// Release only a force-stopped client after its SDK workers have been collected.
-    async fn collect_stopped(&self) -> Result<(), ProviderError> {
-        let current = self.client.lock().await.clone();
-        if let Some(current) = current
-            && current.client().is_stopped()
-        {
-            let mut recovery = self.recovery.lock().await;
-            if matches!(*recovery, Shutdown::Idle | Shutdown::Complete(Err(_))) {
-                *recovery = Shutdown::Running(tokio::spawn(async move {
-                    current
-                        .client()
-                        .stop()
-                        .await
-                        .map_err(|error| error.to_string())
-                }));
+    /// Identify the failed cached client without starting or replacing any native work.
+    pub async fn failed_generation(&self) -> Option<super::client_generation::FailedGeneration> {
+        let client = self.client.lock().await.clone();
+        match client {
+            Some(RuntimeClient::Ready { client, .. }) => {
+                client.generation.failed_after_fencing().await
             }
-            if let Shutdown::Running(task) = &mut *recovery {
-                let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
-                *recovery = Shutdown::Complete(result);
-            }
-            if let Shutdown::Complete(Err(error)) = &*recovery {
-                return Err(ProviderError::Transport {
-                    message: format!("collect stopped Copilot runtime: {error}"),
-                });
-            }
-            self.client.lock().await.take();
-            *recovery = Shutdown::Idle;
+            Some(RuntimeClient::Unvalidated(_)) | None => None,
         }
-        Ok(())
     }
 
-    /// Validate the actual process before decoding optional status metadata.
-    async fn validate_version(
+    /// Collect only the failed cached client after its affected callback owners are fenced.
+    pub async fn collect_failed_client(
         &self,
-        client: &Client,
-    ) -> Result<forge_provider_api::version::ValidatedRuntime, ProviderError> {
-        let status =
-            client
-                .call("status.get", None)
-                .await
-                .map_err(|error| ProviderError::Transport {
-                    message: format!("query Copilot runtime version: {error}"),
-                })?;
-        let requirement = forge_provider_api::version::RuntimeRequirement::new(
-            forge_provider_api::ProviderKind::Copilot,
-            self.command
-                .first()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| "SDK-managed Copilot".into()),
-            semver::Version::new(1, 0, 103),
-        );
-        Ok(requirement.validate(status.get("version").and_then(serde_json::Value::as_str))?)
+        failed: &super::client_generation::FailedGeneration,
+    ) -> Result<super::client_generation::CollectedClient, ProviderError> {
+        let current = {
+            let _initializing = self.initializing.lock().await;
+            self.client.lock().await.clone()
+        };
+        match current {
+            Some(RuntimeClient::Ready { client, .. }) if failed.matches(&client.generation) => {
+                client.generation.collect(failed).await
+            }
+            Some(RuntimeClient::Ready { .. }) | Some(RuntimeClient::Unvalidated(_)) | None => {
+                Err(ProviderError::Rejected {
+                    message: "Copilot recovery token no longer owns the cached client".into(),
+                })
+            }
+        }
+    }
+
+    /// Retire the stopped cache entry only after all of its registered session work is joined.
+    pub async fn finish_recovery(
+        &self,
+        sessions: super::client_generation::CollectedSessions,
+    ) -> Result<(), ProviderError> {
+        let _initializing = self.initializing.lock().await;
+        let mut current = self.client.lock().await;
+        match current.as_ref() {
+            Some(RuntimeClient::Ready { client, .. })
+                if sessions.failed_generation().matches(&client.generation) =>
+            {
+                current.take();
+                Ok(())
+            }
+            Some(RuntimeClient::Ready { .. }) | Some(RuntimeClient::Unvalidated(_)) | None => {
+                Err(ProviderError::Rejected {
+                    message: "Copilot session collection proof no longer owns the cached client"
+                        .into(),
+                })
+            }
+        }
     }
 
     pub async fn shutdown(&self) -> Result<(), ProviderError> {
         self.close_admission();
         let _initializing = self.initializing.lock().await;
-        self.collect_stopped().await?;
         let mut shutdown = self.shutdown.lock().await;
         if matches!(*shutdown, Shutdown::Idle | Shutdown::Complete(Err(_))) {
             let client = self.client.lock().await.clone();
             *shutdown = Shutdown::Running(tokio::spawn(async move {
                 match client {
-                    Some(client) => client
-                        .client()
-                        .stop()
-                        .await
-                        .map_err(|error| error.to_string()),
+                    Some(client) => client.client().stop().await.map_err(|error| {
+                        std::sync::Arc::new(ProviderError::Operation(
+                            forge_provider_api::error::ProviderOperationFailure::native(
+                                forge_provider_api::error::ProviderOperation::Shutdown,
+                                forge_provider_api::error::ProviderFailureKind::Transport,
+                                std::sync::Arc::new(error),
+                            ),
+                        ))
+                    }),
                     None => Ok(()),
                 }
             }));
         }
         if let Shutdown::Running(task) = &mut *shutdown {
-            let result = task.await.unwrap_or_else(|error| Err(error.to_string()));
+            let result = task.await.unwrap_or_else(|error| {
+                Err(std::sync::Arc::new(ProviderError::Operation(
+                    forge_provider_api::error::ProviderOperationFailure::new(
+                        forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                        std::sync::Arc::new(error),
+                    ),
+                )))
+            });
             *shutdown = Shutdown::Complete(result);
         }
         if let Shutdown::Complete(Err(error)) = &*shutdown {
-            return Err(ProviderError::Transport {
-                message: format!("Copilot runtime collection failed: {error}"),
-            });
+            return Err(ProviderError::Operation(
+                forge_provider_api::error::ProviderOperationFailure::new(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    error.clone(),
+                ),
+            ));
         }
         self.client.lock().await.take();
         Ok(())
     }
 }
 
+/// Validate the actual native client before retained or isolated session creation.
+pub(crate) async fn validate_version(
+    client: &Client,
+    command: &[String],
+) -> Result<forge_provider_api::version::ValidatedRuntime, ProviderError> {
+    let requirement = forge_provider_api::version::RuntimeRequirement::new(
+        forge_provider_api::ProviderKind::Copilot,
+        command
+            .first()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| "SDK-managed Copilot".into()),
+        semver::Version::new(1, 0, 103),
+    );
+    let deadline = std::time::Duration::from_secs(30);
+    let status = tokio::time::timeout(deadline, client.call("status.get", None))
+        .await
+        .map_err(|source| requirement.probe_timed_out(deadline, source))?
+        .map_err(|source| requirement.probe_failed(source))?;
+    Ok(requirement.validate(status.get("version").and_then(serde_json::Value::as_str))?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_provider_api::version::RuntimeVersionError;
+    use serde_json::{Value, json};
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    enum StatusReply {
+        Version(&'static str),
+        Missing,
+        Failed,
+    }
+
+    enum VersionOutcome {
+        Supported,
+        Unsupported,
+        Missing,
+        Malformed,
+        Failed,
+    }
+
+    /// Retain every actual SDK request so rejection cannot hide a session dispatch.
+    struct RuntimePeer {
+        methods: Arc<StdMutex<Vec<String>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl RuntimePeer {
+        /// Bind the public stream attachment to a protocol peer without launching a CLI.
+        async fn attach(runtime: &CopilotRuntime, reply: StatusReply) -> Self {
+            let (client_write, mut peer_read) = tokio::io::duplex(64 * 1024);
+            let (mut peer_write, client_read) = tokio::io::duplex(64 * 1024);
+            runtime
+                .attach_streams(client_read, client_write, std::env::temp_dir())
+                .await
+                .unwrap();
+            let methods = Arc::new(StdMutex::new(Vec::new()));
+            let observed = methods.clone();
+            let task = tokio::spawn(async move {
+                while let Some(request) = read_frame(&mut peer_read).await {
+                    let method = request["method"].as_str().unwrap();
+                    observed.lock().unwrap().push(method.to_owned());
+                    let response = match method {
+                        "status.get" => match &reply {
+                            StatusReply::Version(version) => json!({"result":{"version":version}}),
+                            StatusReply::Missing => json!({"result":{}}),
+                            StatusReply::Failed => {
+                                json!({"error":{"code":-32000,"message":"status probe failed"}})
+                            }
+                        },
+                        "session.create" => {
+                            assert!(
+                                matches!(reply, StatusReply::Version("1.0.103" | "1.0.104")),
+                                "unsupported runtime reached session creation"
+                            );
+                            json!({"result":{"sessionId":"version-probe","workspacePath":std::env::temp_dir()}})
+                        }
+                        "session.options.update" => json!({"result":{"success":true}}),
+                        "session.detach" => json!({"result":{"success":true}}),
+                        method => panic!("unexpected SDK request during version gate: {method}"),
+                    };
+                    reply_frame(&mut peer_write, &request, response).await;
+                }
+            });
+            Self { methods, task }
+        }
+
+        /// Join transport collection before inspecting the complete native request sequence.
+        async fn collected(self) -> Vec<String> {
+            self.task.await.unwrap();
+            self.methods.lock().unwrap().clone()
+        }
+    }
+
+    /// Read one actual SDK frame while treating a clean closed transport as completion.
+    async fn read_frame(reader: &mut DuplexStream) -> Option<Value> {
+        let mut header = Vec::new();
+        loop {
+            match reader.read_u8().await {
+                Ok(byte) => header.push(byte),
+                Err(error)
+                    if header.is_empty() && error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return None;
+                }
+                Err(error) => panic!("version fixture frame header failed: {error}"),
+            }
+            if header.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            assert!(header.len() < 1024, "unbounded version fixture header");
+        }
+        let size: usize = std::str::from_utf8(&header)
+            .unwrap()
+            .trim()
+            .strip_prefix("Content-Length: ")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(size < 64 * 1024);
+        let mut body = vec![0; size];
+        reader.read_exact(&mut body).await.unwrap();
+        Some(serde_json::from_slice(&body).unwrap())
+    }
+
+    /// Preserve the original RPC identity for a status or session response.
+    async fn reply_frame(writer: &mut DuplexStream, request: &Value, mut response: Value) {
+        response["jsonrpc"] = json!("2.0");
+        response["id"] = request["id"].clone();
+        let body = serde_json::to_vec(&response).unwrap();
+        writer
+            .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&body).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    /// Validate the adapter's real SDK gate before any create, resume, or send is possible.
+    #[tokio::test]
+    async fn attached_runtime_enforces_minimum_before_session_dispatch() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for (reply, outcome) in [
+                (StatusReply::Version("1.0.102"), VersionOutcome::Unsupported),
+                (StatusReply::Version("1.0.103"), VersionOutcome::Supported),
+                (StatusReply::Version("1.0.104"), VersionOutcome::Supported),
+                (StatusReply::Missing, VersionOutcome::Missing),
+                (StatusReply::Version("not-a-version"), VersionOutcome::Malformed),
+                (StatusReply::Failed, VersionOutcome::Failed),
+            ] {
+                let runtime = CopilotRuntime::new(vec!["fixture-selected-copilot".into()]);
+                let peer = RuntimePeer::attach(&runtime, reply).await;
+                let result = runtime.client(".").await;
+                match outcome {
+                    VersionOutcome::Supported => {
+                        let client = result.unwrap();
+                        runtime.client(".").await.unwrap();
+                        let prepared = client.inner.prepare_session(github_copilot_sdk::SessionConfig::default().with_session_id(github_copilot_sdk::SessionId::new("version-probe"))).unwrap();
+                        let session = prepared.start().await.unwrap();
+                        session.disconnect().await.unwrap();
+                    }
+                    VersionOutcome::Unsupported => {
+                        let error = result.err().expect("unsupported runtime passed validation");
+                        assert!(matches!(&error, ProviderError::RuntimeVersion(RuntimeVersionError::Unsupported { detected, .. }) if *detected == semver::Version::new(1, 0, 102)));
+                        let diagnostic = error.to_string();
+                        assert!(diagnostic.contains("fixture-selected-copilot") && diagnostic.contains("1.0.103"));
+                    }
+                    VersionOutcome::Missing => assert!(matches!(result, Err(ProviderError::RuntimeVersion(RuntimeVersionError::Missing { .. })))),
+                    VersionOutcome::Malformed => assert!(matches!(result, Err(ProviderError::RuntimeVersion(RuntimeVersionError::Malformed { reported, .. })) if reported == "not-a-version")),
+                    VersionOutcome::Failed => {
+                        let Err(ProviderError::RuntimeVersion(RuntimeVersionError::Probe { requirement, failure })) = result else {
+                            panic!("failed probe lost its typed runtime context");
+                        };
+                        assert_eq!(requirement.provider(), forge_provider_api::ProviderKind::Copilot);
+                        assert_eq!(requirement.runtime(), std::path::Path::new("fixture-selected-copilot"));
+                        assert_eq!(requirement.minimum(), &semver::Version::new(1, 0, 103));
+                        let forge_provider_api::version::RuntimeProbeFailure::Request { source } = failure else {
+                            panic!("remote rejection was classified as a timeout");
+                        };
+                        let native = source.downcast_ref::<github_copilot_sdk::Error>().expect("original SDK probe error was erased");
+                        assert!(native.to_string().contains("status probe failed"));
+                    },
+                }
+                runtime.shutdown().await.unwrap();
+                let methods = peer.collected().await;
+                assert_eq!(methods.iter().filter(|method| method.as_str() == "status.get").count(), 1, "a ready transport repeated version validation");
+                if matches!(outcome, VersionOutcome::Supported) {
+                    assert_eq!(methods.first().map(String::as_str), Some("status.get"));
+                    assert_eq!(methods.iter().filter(|method| method.as_str() == "session.create").count(), 1);
+                } else {
+                    assert_eq!(methods, ["status.get"], "rejected runtime dispatched native session work");
+                }
+                assert_eq!(runtime.start_count(), 0, "stream fixture launched an executable");
+            }
+        }).await.expect("runtime version gate fixture timed out");
+    }
+
+    /// Bind cached validation to one process rather than a later replacement transport.
+    #[tokio::test]
+    async fn replacement_runtime_reprobes_actual_transport_version() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let original = CopilotRuntime::new(vec!["same-configured-command".into()]);
+            let peer = RuntimePeer::attach(&original, StatusReply::Version("1.0.103")).await;
+            original.client(".").await.unwrap();
+            original.client(".").await.unwrap();
+            original.shutdown().await.unwrap();
+            assert_eq!(peer.collected().await, ["status.get"]);
+
+            let replacement = CopilotRuntime::new(vec!["same-configured-command".into()]);
+            let peer = RuntimePeer::attach(&replacement, StatusReply::Version("1.0.102")).await;
+            assert!(matches!(
+                replacement.client(".").await,
+                Err(ProviderError::RuntimeVersion(
+                    RuntimeVersionError::Unsupported { .. }
+                ))
+            ));
+            replacement.shutdown().await.unwrap();
+            assert_eq!(
+                peer.collected().await,
+                ["status.get"],
+                "replacement inherited a previous process's validation"
+            );
+            assert_eq!(replacement.start_count(), 0);
+        })
+        .await
+        .expect("replacement version fixture timed out");
+    }
 
     /// Prevent retained session handles from issuing detach RPCs after successful shutdown.
     #[tokio::test]
@@ -291,9 +525,9 @@ mod tests {
         assert!(runtime.client.lock().await.is_none());
     }
 
-    /// Keep stopped-generation collection alive when its first recovery waiter disappears.
+    /// Keep collection owned when a stopped transport's shutdown waiter disappears.
     #[tokio::test]
-    async fn cancelled_recovery_retains_collection_until_shutdown() {
+    async fn cancelled_stopped_generation_collection_retains_shutdown_task() {
         let runtime = CopilotRuntime::new(Vec::new());
         let (reader, _writer) = tokio::io::duplex(64);
         let (_reader, writer) = tokio::io::duplex(64);
@@ -301,30 +535,52 @@ mod tests {
             .attach_streams(reader, writer, PathBuf::from("."))
             .await
             .unwrap();
-        runtime
+        let client = runtime
             .client
             .lock()
             .await
             .as_ref()
             .unwrap()
             .client()
-            .force_stop();
+            .clone();
+        client.force_stop();
         let (release, released) = tokio::sync::oneshot::channel();
-        *runtime.recovery.lock().await = Shutdown::Running(tokio::spawn(async move {
-            released.await.map_err(|error| error.to_string())
+        let collecting = client.clone();
+        *runtime.shutdown.lock().await = Shutdown::Running(tokio::spawn(async move {
+            released.await.map_err(|source| {
+                std::sync::Arc::new(ProviderError::Operation(
+                    forge_provider_api::error::ProviderOperationFailure::new(
+                        forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                        std::sync::Arc::new(source),
+                    ),
+                ))
+            })?;
+            collecting.stop().await.map_err(|source| {
+                std::sync::Arc::new(ProviderError::Operation(
+                    forge_provider_api::error::ProviderOperationFailure::new(
+                        forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                        std::sync::Arc::new(source),
+                    ),
+                ))
+            })
         }));
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(1), runtime.recover())
+            tokio::time::timeout(std::time::Duration::from_millis(1), runtime.shutdown())
                 .await
                 .is_err()
         );
         assert!(matches!(
-            *runtime.recovery.lock().await,
+            *runtime.shutdown.lock().await,
             Shutdown::Running(_)
         ));
         assert!(runtime.client.lock().await.is_some());
+        assert!(
+            !client.is_stopped(),
+            "collection is not proven while the worker is pending"
+        );
         release.send(()).unwrap();
         runtime.shutdown().await.unwrap();
+        assert!(client.is_stopped());
         assert!(runtime.client.lock().await.is_none());
     }
 
@@ -332,7 +588,10 @@ mod tests {
     #[tokio::test]
     async fn failed_collection_can_be_retried_without_starting_a_client() {
         let runtime = CopilotRuntime::new(Vec::new());
-        *runtime.shutdown.lock().await = Shutdown::Complete(Err("prior stop failed".into()));
+        *runtime.shutdown.lock().await =
+            Shutdown::Complete(Err(std::sync::Arc::new(ProviderError::Transport {
+                message: "prior stop failed".into(),
+            })));
         runtime.shutdown().await.unwrap();
         assert!(matches!(
             *runtime.shutdown.lock().await,
@@ -346,7 +605,14 @@ mod tests {
         let runtime = CopilotRuntime::new(Vec::new());
         let (release, released) = tokio::sync::oneshot::channel();
         *runtime.shutdown.lock().await = Shutdown::Running(tokio::spawn(async move {
-            released.await.map_err(|error| error.to_string())
+            released.await.map_err(|source| {
+                std::sync::Arc::new(ProviderError::Operation(
+                    forge_provider_api::error::ProviderOperationFailure::new(
+                        forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                        std::sync::Arc::new(source),
+                    ),
+                ))
+            })
         }));
         assert!(
             tokio::time::timeout(std::time::Duration::ZERO, runtime.shutdown())
@@ -362,5 +628,71 @@ mod tests {
         runtime.shutdown().await.unwrap();
         assert_eq!(runtime.start_count(), 0);
         assert!(runtime.client(".").await.is_err());
+    }
+
+    /// Reopen the same runtime only after both collection proofs and revalidate its new peer.
+    #[tokio::test]
+    async fn failed_generation_recovery_revalidates_same_runtime_and_fences_old_callbacks() {
+        use super::super::client_generation::CollectedSessions;
+        use forge_provider_api::lifecycle::ObservationFailure;
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for next_version in ["1.0.104", "1.0.102"] {
+                let runtime = CopilotRuntime::new(vec!["fixture-selected-copilot".into()]);
+                let original_peer =
+                    RuntimePeer::attach(&runtime, StatusReply::Version("1.0.103")).await;
+                let original = runtime.client(".").await.unwrap();
+                runtime.client(".").await.unwrap();
+                original.fail_generation(ObservationFailure::Disconnected);
+                let failed = runtime
+                    .failed_generation()
+                    .await
+                    .expect("first native loss must fence cached client");
+                assert!(matches!(
+                    runtime.client(".").await,
+                    Err(ProviderError::Observation(ObservationFailure::Disconnected))
+                ));
+                let client = runtime.collect_failed_client(&failed).await.unwrap();
+                assert!(
+                    runtime.client(".").await.is_err(),
+                    "SDK stop alone reopened the cache before session collection"
+                );
+                // This fixture has no session work: its empty registry can immediately seal collection.
+                let stale_proof = CollectedSessions::new(&client);
+                runtime
+                    .finish_recovery(CollectedSessions::new(&client))
+                    .await
+                    .unwrap();
+                assert_eq!(original_peer.collected().await, ["status.get"]);
+
+                let replacement_peer =
+                    RuntimePeer::attach(&runtime, StatusReply::Version(next_version)).await;
+                let replacement = runtime.client(".").await;
+                assert!(
+                    runtime.finish_recovery(stale_proof).await.is_err(),
+                    "an old proof retired the replacement cache"
+                );
+                original.fail_generation(ObservationFailure::Overflow);
+                if next_version == "1.0.104" {
+                    let replacement = replacement.unwrap();
+                    replacement.ensure_healthy().unwrap();
+                    runtime.client(".").await.unwrap().ensure_healthy().unwrap();
+                } else {
+                    assert!(matches!(
+                        replacement,
+                        Err(ProviderError::RuntimeVersion(
+                            RuntimeVersionError::Unsupported { .. }
+                        ))
+                    ));
+                }
+                runtime.shutdown().await.unwrap();
+                assert_eq!(
+                    replacement_peer.collected().await,
+                    ["status.get"],
+                    "recovery dispatched or replayed native input"
+                );
+            }
+        })
+        .await
+        .expect("same-runtime recovery fixture timed out");
     }
 }

@@ -1455,9 +1455,18 @@ impl crate::provider::ProviderAdapter for RoutingProvider {
             capability: crate::provider::mock_capability(),
         }
     }
-    async fn shutdown(&self) -> Result<()> {
-        self.fixture_events.shutdown().await?;
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.shutdown().await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
     async fn has_active_turn(&self, _session_id: &str) -> bool {
         self.reject_steering
@@ -1486,17 +1495,53 @@ impl crate::provider::ProviderAdapter for RoutingProvider {
             })
             .await
     }
-    async fn cancel_session(&self, runtime_key: &str) -> Result<()> {
-        self.fixture_events.cancel_runtime(runtime_key).await?;
-        Ok(())
+    async fn cancel_session(
+        &self,
+        runtime_key: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.cancel_runtime(runtime_key).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CancelSession,
+                source,
+            )
+        })
     }
-    async fn cleanup_execution(&self, runtime_key: &str) -> Result<()> {
-        self.fixture_events.cancel_runtime(runtime_key).await?;
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        runtime_key: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.cancel_runtime(runtime_key).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
-    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-        self.fixture_events.cancel(owner).await?;
-        Ok(())
+    async fn fence_session(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.cancel(owner).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::FenceSession,
+                source,
+            )
+        })
     }
     async fn active_session_id_for(
         &self,
@@ -1839,17 +1884,41 @@ impl crate::provider::ProviderAdapter for ResultReceivingProvider {
             capability: crate::provider::mock_capability(),
         }
     }
-    async fn shutdown(&self) -> Result<()> {
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
     async fn has_active_turn(&self, _session_id: &str) -> bool {
         self.active.load(Ordering::Acquire)
     }
-    async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-        Ok(())
+    async fn cancel_session(
+        &self,
+        _session_id: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CancelSession,
+                source,
+            )
+        })
     }
-    async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        _session_id: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
     async fn active_session_id_for(
         &self,
@@ -2180,17 +2249,41 @@ impl crate::provider::ProviderAdapter for SuspendedParentProvider {
             capability,
         }
     }
-    async fn shutdown(&self) -> Result<()> {
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
     async fn has_active_turn(&self, _session_id: &str) -> bool {
         false
     }
-    async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-        Ok(())
+    async fn cancel_session(
+        &self,
+        _session_id: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CancelSession,
+                source,
+            )
+        })
     }
-    async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        _session_id: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
     async fn active_session_id_for(
         &self,

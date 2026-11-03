@@ -328,6 +328,7 @@ mod test {
             .request("thread/start", json!({"config":config}), &mut output)
             .await?;
         server.await?;
+        trace.flush()?;
         let trace = std::fs::read_to_string(trace.session_status("session").path)?;
         assert!(
             !trace.contains("selected-secret-fixture") && !trace.contains("native-secret-fixture")

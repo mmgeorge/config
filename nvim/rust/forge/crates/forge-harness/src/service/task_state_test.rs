@@ -2388,8 +2388,14 @@ struct ControlledGoalTransport {
 impl crate::provider::ProviderAdapter for ControlledGoalTransport {
     type Host = crate::provider::HarnessProviderHost;
     /// Release this in-process transport without starting provider processes.
-    async fn shutdown(&self) -> Result<()> {
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
     /// Advertise native goal persistence through the normal service boundary.
     fn descriptor(&self) -> crate::provider::ProviderDescriptor {
@@ -2434,8 +2440,17 @@ impl crate::provider::ProviderAdapter for ControlledGoalTransport {
         false
     }
     /// Collect the fixture's empty execution tree.
-    async fn cleanup_execution(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
     /// Identify the native conversation retained by the fixture.
     async fn active_session_id_for(

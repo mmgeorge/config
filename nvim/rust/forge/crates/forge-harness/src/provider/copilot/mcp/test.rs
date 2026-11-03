@@ -372,6 +372,7 @@ async fn mcp_failures_keep_prompt_and_catalog_available() {
                 .status,
             McpStatus::Connected
         );
+        fixture.provider.trace.flush().unwrap();
         let trace =
             std::fs::read_to_string(fixture.provider.trace.session_status("mcp-failure").path)
                 .unwrap();
@@ -499,6 +500,7 @@ async fn mcp_timeout_preserves_healthy_servers_and_session() {
                     update: crate::provider::MessageUpdate::Completed { text }, ..
                 } if text == "Repository answer")
         ));
+        fixture.provider.trace.flush().unwrap();
         let trace =
             std::fs::read_to_string(fixture.provider.trace.session_status("mcp-timeout").path)
                 .unwrap();

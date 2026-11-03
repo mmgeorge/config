@@ -212,6 +212,7 @@ impl SteeringLane {
                 return Ok(());
             }
             return Err(ProviderError::NotConsumed {
+                cause: None,
                 message: "provider has no active turn to steer".into(),
             }
             .into());
@@ -255,6 +256,7 @@ impl SteeringLane {
                 task_start,
             })
             .map_err(|_| ProviderError::NotConsumed {
+                cause: None,
                 message: "active turn completed before steering input was sent".into(),
             })?;
         if let Some(submission) = submission {
@@ -270,6 +272,7 @@ impl SteeringLane {
 impl ActiveSteering {
     /// Release this completed lane while retaining its receiver until its owner is dropped.
     pub(crate) fn retire(&mut self) {
+        self.receiver.close();
         let mut state = self.lane.state.lock().expect("steering lane lock poisoned");
         if state.generation == self.generation {
             state.sender = None;
@@ -284,6 +287,11 @@ impl ActiveSteering {
 
     /// Receive the next steering input in submission order.
     pub async fn receive(&mut self) -> Option<SteerCommand> {
+        // Retirement fences new admission while settlement still polls the owner.
+        // Its already-admitted commands are drained explicitly through try_receive.
+        if self.receiver.is_closed() {
+            return std::future::pending().await;
+        }
         let mut command = self.receiver.recv().await?;
         command.event_sink.clone_from(&self.event_sink);
         Some(command)
@@ -300,6 +308,15 @@ impl Drop for ActiveSteering {
 }
 
 impl SteerCommand {
+    /// Release a terminal owner's undispatched input without authorizing automatic replay.
+    pub(crate) async fn cancel_undispatched(self) -> Result<()> {
+        if let Some(submission) = &self.submission {
+            submission.persist(|submission| submission.cancel()).await?;
+        }
+        self.complete(Err(ProviderError::Cancelled.into())).await;
+        Ok(())
+    }
+
     pub(crate) fn input(&self) -> SteeringInput {
         if !self.publish_input {
             return SteeringInput::AgentResult(self.text.clone());
@@ -467,6 +484,7 @@ impl Drop for SteerCommand {
                     )
                 }) {
                 ProviderError::NotConsumed {
+                    cause: None,
                     message: "active turn ended before steering input was sent".into(),
                 }
             } else {

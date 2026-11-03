@@ -123,16 +123,41 @@ mod test {
     #[async_trait::async_trait]
     impl crate::provider::ProviderAdapter for DiscoveryProvider {
         type Host = crate::provider::HarnessProviderHost;
-        async fn shutdown(&self) -> Result<()> {
-            Ok(())
+        async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::Shutdown,
+                    source,
+                )
+            })
         }
 
-        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-            anyhow::bail!("provider cannot confirm execution cleanup")
+        async fn cleanup_execution(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> =
+                async move { anyhow::bail!("provider cannot confirm execution cleanup") }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CleanupExecution,
+                    source,
+                )
+            })
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
-            Ok(())
+        async fn cancel_session(
+            &self,
+            _session_id: &str,
+        ) -> std::result::Result<(), crate::provider::ProviderError> {
+            let result: anyhow::Result<()> = async move { Ok(()) }.await;
+            result.map_err(|source| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::error::ProviderOperation::CancelSession,
+                    source,
+                )
+            })
         }
 
         async fn has_active_turn(&self, _session_id: &str) -> bool {

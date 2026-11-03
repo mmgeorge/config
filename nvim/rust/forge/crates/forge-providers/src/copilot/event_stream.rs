@@ -1,8 +1,82 @@
 use anyhow::{Context, Result};
+use forge_provider_api::lifecycle::ObservationFailure;
 use forge_provider_api::trace::ProviderTrace;
 use github_copilot_sdk::SessionEvent;
 use github_copilot_sdk::subscription::RecvErrorKind;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Identify the bounded native handoff that first could not retain an observation.
+pub(crate) enum IntakeQueueStage {
+    Subscription,
+    Unbound,
+    Attachment,
+    Foreground,
+    Release,
+}
+
+/// Retain diagnostic ownership independently of foreground decoder locks.
+#[derive(Clone)]
+pub(crate) struct QueueDiagnostics {
+    trace: Option<Arc<dyn ProviderTrace>>,
+    correlation: String,
+    native_session: String,
+    reported: Arc<AtomicBool>,
+}
+
+impl QueueDiagnostics {
+    /// Record one bounded first-loss witness without entering an ordinary observation queue.
+    pub(crate) fn lost(
+        &self,
+        stage: IntakeQueueStage,
+        queued: usize,
+        capacity: usize,
+        scope: Option<&forge_provider_api::InvocationScope>,
+        event: Option<&SessionEvent>,
+    ) {
+        let Some(trace) = &self.trace else {
+            return;
+        };
+        if self.reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let stage = match stage {
+            IntakeQueueStage::Subscription => "native_subscription",
+            IntakeQueueStage::Unbound => "native_unbound",
+            IntakeQueueStage::Attachment => "native_attachment",
+            IntakeQueueStage::Foreground => "native_foreground",
+            IntakeQueueStage::Release => "native_release",
+        };
+        trace.record(&self.correlation, "provider.observation_queue_lost", serde_json::json!({
+            "provider":"copilot", "stage":stage, "queued":queued, "capacity":capacity,
+            "queued_bytes":null, "event_bytes":event.and_then(|event| serde_json::to_vec(event).ok()).map(|encoded| encoded.len()),
+            "source_scope":scope.map(|scope| forge_provider_api::EventScope::from(scope.clone())),
+            "owner":scope.map(|scope| &scope.owner), "native_session_id":self.native_session,
+            "native_event_id":event.map(|event| event.id.as_str()),
+            "native_event_type":event.map(|event| event.event_type.as_str()),
+        }));
+    }
+
+    /// Retain the SDK's public skipped-event count without inventing its private ring capacity.
+    fn subscription_lagged(&self, skipped: u64) {
+        let Some(trace) = &self.trace else {
+            return;
+        };
+        if self.reported.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        trace.record(
+            &self.correlation,
+            "provider.observation_queue_lost",
+            serde_json::json!({
+                "provider":"copilot", "stage":"sdk_subscription", "queued":null, "capacity":null,
+                "queued_bytes":null, "event_bytes":null, "skipped":skipped,
+                "source_scope":null, "native_session_id":self.native_session,
+                "native_event_id":null, "native_event_type":null,
+            }),
+        );
+    }
+}
 
 /// Distinguish pending initialization from its established native outcome.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -24,27 +98,29 @@ pub(crate) enum StartupOutcome {
 
 /// Drains SDK notifications without owning the session or blocking on presentation.
 pub struct SessionEventStream {
-    receiver: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+    receiver: tokio::sync::mpsc::Receiver<SessionEvent>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     session_id: String,
     startup: Option<tokio::sync::watch::Sender<StartupState>>,
+    diagnostics: QueueDiagnostics,
 }
 
 impl SessionEventStream {
     /// Subscribe before starting work and retain only events needed by this consumer.
     pub fn new(
-        session: &Arc<github_copilot_sdk::session::Session>,
+        session: &Arc<super::handle::CopilotSession>,
         accepts: fn(&SessionEvent) -> bool,
         trace: Arc<dyn ProviderTrace>,
         harness_session_id: String,
     ) -> Self {
         Self::from_subscription(
-            session.subscribe(),
+            session.inner.subscribe(),
             session.id().to_string(),
             accepts,
             trace,
             harness_session_id,
             StartupState::Finished(StartupOutcome::Started),
+            session.generation.clone(),
         )
     }
 
@@ -56,12 +132,20 @@ impl SessionEventStream {
         trace: Arc<dyn ProviderTrace>,
         harness_session_id: String,
         initial: StartupState,
+        generation: super::client_generation::ClientGeneration,
     ) -> Self {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
         let (startup, mut startup_state) = tokio::sync::watch::channel(initial);
         let stream_session_id = session_id.clone();
+        let diagnostics = QueueDiagnostics {
+            trace: Some(trace.clone()),
+            correlation: harness_session_id.clone(),
+            native_session: session_id.clone(),
+            reported: Arc::new(AtomicBool::new(false)),
+        };
+        let queue_diagnostics = diagnostics.clone();
         let task = tokio::spawn(async move {
-            let result: Result<()> = async {
+            let result: std::result::Result<(), ObservationFailure> = async {
                 loop {
                     let event = match subscription.recv().await {
                         Ok(event) => event,
@@ -79,7 +163,8 @@ impl SessionEventStream {
                                 }
                             }
                             let failure = match error.kind() {
-                                RecvErrorKind::Lagged(_) => {
+                                RecvErrorKind::Lagged(lagged) => {
+                                    queue_diagnostics.subscription_lagged(lagged.skipped());
                                     forge_provider_api::lifecycle::ObservationFailure::Overflow
                                 }
                                 RecvErrorKind::Closed => {
@@ -89,37 +174,51 @@ impl SessionEventStream {
                                     message: error.to_string(),
                                 },
                             };
-                            return Err(
-                                forge_provider_api::ProviderError::Observation(failure).into()
-                            );
+                            return Err(failure);
                         }
                     };
-                    if accepts(&event) && sender.send(event).is_err() {
-                        return Ok(());
+                    if accepts(&event) {
+                        match sender.try_send(event) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                                queue_diagnostics.lost(
+                                    IntakeQueueStage::Subscription,
+                                    sender.max_capacity(),
+                                    sender.max_capacity(),
+                                    None,
+                                    Some(&event),
+                                );
+                                return Err(ObservationFailure::Overflow);
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                        }
                     }
                 }
             }
             .await;
-            if let Err(error) = &result {
+            result.map_err(|failure| {
+                generation.fail(failure.clone());
+                let error = forge_provider_api::ProviderError::Observation(failure);
                 trace.record(
                     &harness_session_id,
                     "copilot.subscription.failed",
                     serde_json::json!({"session_id": session_id, "error": format!("{error:#}")}),
                 );
-            }
-            result
+                error.into()
+            })
         });
         Self {
             receiver,
             task: Some(task),
             session_id: stream_session_id,
             startup: (initial == StartupState::Pending).then_some(startup),
+            diagnostics,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn fixture(
-        receiver: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+        receiver: tokio::sync::mpsc::Receiver<SessionEvent>,
         task: tokio::task::JoinHandle<Result<()>>,
     ) -> Self {
         Self {
@@ -127,7 +226,18 @@ impl SessionEventStream {
             task: Some(task),
             session_id: "fixture".into(),
             startup: None,
+            diagnostics: QueueDiagnostics {
+                trace: None,
+                correlation: "fixture".into(),
+                native_session: "fixture".into(),
+                reported: Arc::new(AtomicBool::new(false)),
+            },
         }
+    }
+
+    /// Share first-loss diagnostics with handoffs below this subscription reader.
+    pub(crate) fn queue_diagnostics(&self) -> QueueDiagnostics {
+        self.diagnostics.clone()
     }
 
     /// Resolve whether closure during session initialization was expected.
@@ -146,6 +256,16 @@ impl SessionEventStream {
         let result = task.await;
         self.task.take();
         match result {
+            // The producer has already published typed observation loss to the generation.
+            // Joining that failed producer proves collection; it is not a second cleanup error.
+            Ok(Err(error))
+                if matches!(
+                    error.downcast_ref::<forge_provider_api::ProviderError>(),
+                    Some(forge_provider_api::ProviderError::Observation(_))
+                ) =>
+            {
+                Ok(())
+            }
             Ok(result) => result,
             Err(error) if error.is_cancelled() => Ok(()),
             Err(error) => Err(error).context("Copilot event intake failed during collection"),
@@ -193,7 +313,7 @@ mod tests {
     /// Keep a producer's handle when another select branch interrupts error collection.
     #[tokio::test]
     async fn cancelled_receive_retains_producer_for_collection() {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
         drop(sender);
         let (release, released) = tokio::sync::oneshot::channel::<()>();
         let task = tokio::spawn(async move {
@@ -224,7 +344,7 @@ mod tests {
     /// Explicit close waits for the producer to drop its queue and can be repeated safely.
     #[tokio::test]
     async fn explicit_close_collects_the_subscription_task() {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
         let probe = sender.clone();
         let (ready, started) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
@@ -239,9 +359,38 @@ mod tests {
         stream.close().await.unwrap();
     }
 
+    /// Treat a joined observation failure as collected while retaining real worker failure.
+    #[tokio::test]
+    async fn close_separates_reported_observation_loss_from_worker_failure() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            drop(sender);
+            Err(forge_provider_api::ProviderError::Observation(ObservationFailure::Overflow).into())
+        });
+        let mut stream = SessionEventStream::fixture(receiver, task);
+        while !stream.task.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        stream.close().await.unwrap();
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            drop(sender);
+            panic!("failed subscription worker");
+        });
+        let mut stream = SessionEventStream::fixture(receiver, task);
+        while !stream.task.as_ref().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            format!("{:#}", stream.close().await.unwrap_err())
+                .contains("failed subscription worker")
+        );
+    }
+
     #[tokio::test]
     async fn intake_preserves_large_events_before_reporting_the_producer_error() {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
         let content = "patch".repeat(forge_protocol::MAX_FRAME_BYTES);
         let expected = content.clone();
         let task = tokio::spawn(async move {
@@ -257,15 +406,12 @@ mod tests {
                     event_type: "tool.execution_start".into(),
                     data: serde_json::json!({"patch": content}),
                 })
+                .await
                 .unwrap();
             Err(anyhow::anyhow!("socket reset").context("SDK subscription disconnected"))
         });
-        let mut stream = SessionEventStream {
-            receiver,
-            task: Some(task),
-            session_id: "native-session".into(),
-            startup: None,
-        };
+        let mut stream = SessionEventStream::fixture(receiver, task);
+        stream.session_id = "native-session".into();
         let event = stream.recv().await.unwrap();
         assert_eq!(event.data["patch"].as_str(), Some(expected.as_str()));
         let error = format!("{:#}", stream.recv().await.unwrap_err());
@@ -278,17 +424,13 @@ mod tests {
 
     #[tokio::test]
     async fn intake_reports_task_panics_instead_of_clean_eof() {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
         let task = tokio::spawn(async move {
             let _sender = sender;
             panic!("intake fixture panic");
         });
-        let mut stream = SessionEventStream {
-            receiver,
-            task: Some(task),
-            session_id: "native-session".into(),
-            startup: None,
-        };
+        let mut stream = SessionEventStream::fixture(receiver, task);
+        stream.session_id = "native-session".into();
         let error = format!("{:#}", stream.recv().await.unwrap_err());
         assert!(error.contains("native-session"), "{error}");
         assert!(error.contains("intake fixture panic"), "{error}");
@@ -296,17 +438,13 @@ mod tests {
 
     #[tokio::test]
     async fn intake_reports_unexpected_successful_task_exit() {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
         let task = tokio::spawn(async move {
             drop(sender);
             Ok(())
         });
-        let mut stream = SessionEventStream {
-            receiver,
-            task: Some(task),
-            session_id: "native-session".into(),
-            startup: None,
-        };
+        let mut stream = SessionEventStream::fixture(receiver, task);
+        stream.session_id = "native-session".into();
         let error = stream.recv().await.unwrap_err().to_string();
         assert!(error.contains("native-session"), "{error}");
         assert!(
@@ -317,18 +455,14 @@ mod tests {
 
     #[tokio::test]
     async fn intake_reports_task_cancellation() {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
         let task = tokio::spawn(async move {
             let _sender = sender;
             std::future::pending::<Result<()>>().await
         });
         task.abort();
-        let mut stream = SessionEventStream {
-            receiver,
-            task: Some(task),
-            session_id: "native-session".into(),
-            startup: None,
-        };
+        let mut stream = SessionEventStream::fixture(receiver, task);
+        stream.session_id = "native-session".into();
         let error = format!("{:#}", stream.recv().await.unwrap_err());
         assert!(error.contains("native-session"), "{error}");
         assert!(error.contains("cancelled"), "{error}");

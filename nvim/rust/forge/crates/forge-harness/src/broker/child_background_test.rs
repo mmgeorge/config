@@ -46,29 +46,74 @@ impl crate::provider::ProviderAdapter for ChildBackgroundProvider {
     }
 
     /// Finish the background tool before closing the observer consumed by child shutdown.
-    async fn shutdown(&self) -> Result<()> {
-        self.publish_final().await?;
-        self.observer.lock().unwrap().take();
-        self.fixture_events.shutdown().await?;
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.publish_final().await?;
+            self.observer.lock().unwrap().take();
+            self.fixture_events.shutdown().await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
 
     /// Keep provider cancellation independent of the test's natural prompt completion.
-    async fn cancel_session(&self, runtime_key: &str) -> Result<()> {
-        self.fixture_events.cancel_runtime(runtime_key).await?;
-        Ok(())
+    async fn cancel_session(
+        &self,
+        runtime_key: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.cancel_runtime(runtime_key).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CancelSession,
+                source,
+            )
+        })
     }
 
     /// Leave cleanup to the observer-producing shutdown implementation.
-    async fn cleanup_execution(&self, runtime_key: &str) -> Result<()> {
-        self.fixture_events.cancel_runtime(runtime_key).await?;
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        runtime_key: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.cancel_runtime(runtime_key).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
 
     /// Collect this owner's invocation tasks while preserving final session observations.
-    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-        self.fixture_events.cancel(owner).await?;
-        Ok(())
+    async fn fence_session(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.cancel(owner).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::FenceSession,
+                source,
+            )
+        })
     }
 
     /// Report no foreground execution after prompt completion.
@@ -153,9 +198,12 @@ impl ChildBackgroundProvider {
             sink.send_wait(ProviderEvent::Execution {
                 observation: forge_provider_api::lifecycle::ExecutionObservation::new(
                     scope.clone(),
-                    forge_provider_api::lifecycle::ExecutionUpdate::Started { address: turn.clone() },
+                    forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                        address: turn.clone(),
+                    },
                 )?,
-            }).await?;
+            })
+            .await?;
             sink.send_wait(ProviderEvent::Turn {
                 address: turn.clone(),
                 update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },

@@ -237,30 +237,36 @@ impl CodexProvider {
         process.set_execution_owner(request.owner()?).await;
         let process_duration_ms = process_started.elapsed().as_secs_f64() * 1000.0;
         let initialize_started = Instant::now();
-        let initialized = process.request("initialize", json!({
-            "clientInfo": { "name": "forge-harness", "title": "Forge Harness", "version": env!("CARGO_PKG_VERSION") },
-            "capabilities": { "experimentalApi": true }
-        }), output).await?;
-        let reported = initialized
-            .get("userAgent")
-            .and_then(Value::as_str)
-            .and_then(|agent| {
-                agent
-                    .split(|character: char| {
-                        character.is_whitespace() || matches!(character, '/' | '(' | ')')
-                    })
-                    .find(|part| semver::Version::parse(part).is_ok())
-            });
-        forge_provider_api::version::RuntimeRequirement::new(
+        let requirement = forge_provider_api::version::RuntimeRequirement::new(
             ProviderKind::Codex,
             self.command
                 .first()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| "Codex app-server".into()),
             semver::Version::new(0, 164, 0),
-        )
-        .validate(reported)
-        .map_err(super::ProviderError::from)?;
+        );
+        let deadline = std::time::Duration::from_secs(30);
+        let initialized = tokio::time::timeout(deadline, process.request("initialize", json!({
+            "clientInfo": { "name": "forge-harness", "title": "Forge Harness", "version": env!("CARGO_PKG_VERSION") },
+            "capabilities": { "experimentalApi": true }
+        }), output)).await
+            .map_err(|source| requirement.probe_timed_out(deadline, source))?
+            .map_err(|source| requirement.probe_failed(source.into_boxed_dyn_error()))?;
+        let reported = initialized
+            .get("userAgent")
+            .and_then(Value::as_str)
+            .and_then(|agent| {
+                let product = agent.split_whitespace().next()?;
+                // Platform and terminal versions in the remaining user agent cannot certify Codex.
+                Some(
+                    product
+                        .split_once('/')
+                        .map_or(product, |(_, version)| version),
+                )
+            });
+        requirement
+            .validate(reported)
+            .map_err(super::ProviderError::from)?;
         process.notify("initialized", Value::Null).await?;
         Ok(CodexConnection {
             process,
@@ -1017,7 +1023,11 @@ impl crate::provider::ProviderAdapter for CodexProvider {
     async fn initialize_session(
         &self,
         mut request: ProviderRequest,
-    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
+    ) -> std::result::Result<
+        Option<forge_provider_api::ProviderSessionId>,
+        crate::provider::ProviderError,
+    > {
+        let result: anyhow::Result<Option<forge_provider_api::ProviderSessionId>> = async move {
         capability().validate_access(&request.access)?;
         let runtime_key = request.runtime_key()?;
         let _startup = self.startup_guard(runtime_key.clone()).await;
@@ -1055,6 +1065,14 @@ impl crate::provider::ProviderAdapter for CodexProvider {
         }.await;
         self.background.start(runtime_key, connection).await?;
         result
+
+        }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::InitializeSession,
+                source,
+            )
+        })
     }
 
     fn supports_task_steering(&self, _kind: crate::task::TaskKind) -> bool {
@@ -1115,57 +1133,66 @@ impl crate::provider::ProviderAdapter for CodexProvider {
         &self,
         request: ProviderCatalogRequest,
         setting: &crate::settings::PortableSettings,
-    ) -> Result<()> {
-        if self.settings_root.is_none() {
-            anyhow::ensure!(
-                setting.skill.is_empty() && setting.mcp.is_empty(),
-                "Codex resource configuration requires the Forge settings store"
-            );
-            return Ok(());
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            if self.settings_root.is_none() {
+                anyhow::ensure!(
+                    setting.skill.is_empty() && setting.mcp.is_empty(),
+                    "Codex resource configuration requires the Forge settings store"
+                );
+                return Ok(());
+            }
+            let next = Arc::new(CodexResources::new(
+                self.settings_root.as_ref().expect("settings root checked"),
+                &request,
+                self.command.clone(),
+            )?);
+            self.cleanup_execution(&request.runtime_key()?).await?;
+            let terminal_slot = self
+                .terminal_connection_by_session
+                .lock()
+                .await
+                .entry(request.runtime_key()?)
+                .or_insert_with(|| Arc::new(Mutex::new(None)))
+                .clone();
+            let mut terminal = terminal_slot.lock().await;
+            *terminal = None;
+            self.background.stop(&request.runtime_key()?).await?;
+            self.connection_by_session
+                .lock()
+                .await
+                .remove(&request.runtime_key()?);
+            if let Some(resources) = self
+                .resource_by_session
+                .lock()
+                .await
+                .remove(&request.runtime_key()?)
+            {
+                resources.runtime.shutdown().await?;
+            }
+            self.resource_by_session
+                .lock()
+                .await
+                .insert(request.runtime_key()?, next);
+            let provider_request = Self::catalog_provider_request(&request);
+            let (mut process, mut output) = self.catalog_process(&request).await?;
+            self.load_thread(
+                &mut process,
+                &mut output,
+                &provider_request,
+                true,
+                Vec::new(),
+            )
+            .await?;
+            Ok(())
         }
-        let next = Arc::new(CodexResources::new(
-            self.settings_root.as_ref().expect("settings root checked"),
-            &request,
-            self.command.clone(),
-        )?);
-        self.cleanup_execution(&request.runtime_key()?).await?;
-        let terminal_slot = self
-            .terminal_connection_by_session
-            .lock()
-            .await
-            .entry(request.runtime_key()?)
-            .or_insert_with(|| Arc::new(Mutex::new(None)))
-            .clone();
-        let mut terminal = terminal_slot.lock().await;
-        *terminal = None;
-        self.background.stop(&request.runtime_key()?).await?;
-        self.connection_by_session
-            .lock()
-            .await
-            .remove(&request.runtime_key()?);
-        if let Some(resources) = self
-            .resource_by_session
-            .lock()
-            .await
-            .remove(&request.runtime_key()?)
-        {
-            resources.runtime.shutdown().await?;
-        }
-        self.resource_by_session
-            .lock()
-            .await
-            .insert(request.runtime_key()?, next);
-        let provider_request = Self::catalog_provider_request(&request);
-        let (mut process, mut output) = self.catalog_process(&request).await?;
-        self.load_thread(
-            &mut process,
-            &mut output,
-            &provider_request,
-            true,
-            Vec::new(),
-        )
-        .await?;
-        Ok(())
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::ReconcileSettings,
+                source,
+            )
+        })
     }
 
     async fn generate_text(
@@ -1175,27 +1202,36 @@ impl crate::provider::ProviderAdapter for CodexProvider {
         model: &str,
         reasoning_effort: Option<&str>,
         history: &str,
-    ) -> Result<String> {
-        self.trace.record(
-            &request.harness_session_id,
-            "codex.generation.request",
-            json!({
-                "purpose": purpose.name(),
-                "model":model,
-                "reasoning_effort":reasoning_effort,
-            }),
-        );
-        let (mut process, mut output) = self.catalog_process(&request).await?;
-        text_generation::generate(
-            &mut process,
-            &mut output,
-            &request.workspace,
-            purpose,
-            model,
-            reasoning_effort,
-            history,
-        )
-        .await
+    ) -> std::result::Result<String, crate::provider::ProviderError> {
+        let result: anyhow::Result<String> = async move {
+            self.trace.record(
+                &request.harness_session_id,
+                "codex.generation.request",
+                json!({
+                    "purpose": purpose.name(),
+                    "model":model,
+                    "reasoning_effort":reasoning_effort,
+                }),
+            );
+            let (mut process, mut output) = self.catalog_process(&request).await?;
+            text_generation::generate(
+                &mut process,
+                &mut output,
+                &request.workspace,
+                purpose,
+                model,
+                reasoning_effort,
+                history,
+            )
+            .await
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::GenerateText,
+                source,
+            )
+        })
     }
     async fn terminate_terminal(&self, request: ProviderCatalogRequest, id: &str) -> Result<()> {
         let (mut process, mut output, thread_id) = self
@@ -1300,51 +1336,60 @@ impl crate::provider::ProviderAdapter for CodexProvider {
         result
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        let mut failure = self
-            .session_events
-            .shutdown()
-            .await
-            .err()
-            .map(anyhow::Error::from);
-        if let Err(error) = self.background.stop_readers().await {
-            failure.get_or_insert(error);
-        }
-        let connections: Vec<_> = self
-            .connection_by_session
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect();
-        for connection in connections {
-            let mut connection = connection.lock().await;
-            if let Err(error) = connection.process.shutdown_background().await {
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            let mut failure = self
+                .session_events
+                .shutdown()
+                .await
+                .err()
+                .map(anyhow::Error::from);
+            if let Err(error) = self.background.stop_readers().await {
                 failure.get_or_insert(error);
             }
-            if let Err(error) = connection.process.close().await {
+            let connections: Vec<_> = self
+                .connection_by_session
+                .lock()
+                .await
+                .values()
+                .cloned()
+                .collect();
+            for connection in connections {
+                let mut connection = connection.lock().await;
+                if let Err(error) = connection.process.shutdown_background().await {
+                    failure.get_or_insert(error);
+                }
+                if let Err(error) = connection.process.close().await {
+                    failure.get_or_insert(error);
+                }
+            }
+            for (_, resources) in self.resource_by_session.lock().await.drain() {
+                if let Err(error) = resources.runtime.shutdown().await {
+                    failure.get_or_insert(error);
+                }
+            }
+            if let Err(error) = self.runtime.shutdown().await {
                 failure.get_or_insert(error);
             }
-        }
-        for (_, resources) in self.resource_by_session.lock().await.drain() {
-            if let Err(error) = resources.runtime.shutdown().await {
-                failure.get_or_insert(error);
+            self.connection_by_session.lock().await.clear();
+            self.startup_by_session.lock().await.clear();
+            self.terminal_connection_by_session.lock().await.clear();
+            self.steering_by_session.lock().await.clear();
+            self.active_turn_by_session.lock().await.clear();
+            self.completed_turn_by_session.lock().await.clear();
+            self.background.close().await;
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(()),
             }
         }
-        if let Err(error) = self.runtime.shutdown().await {
-            failure.get_or_insert(error);
-        }
-        self.connection_by_session.lock().await.clear();
-        self.startup_by_session.lock().await.clear();
-        self.terminal_connection_by_session.lock().await.clear();
-        self.steering_by_session.lock().await.clear();
-        self.active_turn_by_session.lock().await.clear();
-        self.completed_turn_by_session.lock().await.clear();
-        self.background.close().await;
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
 
     fn descriptor(&self) -> ProviderDescriptor {
@@ -1490,68 +1535,103 @@ impl crate::provider::ProviderAdapter for CodexProvider {
         })
     }
 
-    async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
-        self.background.stop(session_id).await?;
-        self.steering_lane(session_id)
-            .await
-            .cleanup_execution()
-            .await
-    }
-
-    async fn cancel_session(&self, session_id: &str) -> Result<()> {
-        self.cleanup_execution(session_id).await
-    }
-
-    async fn reset_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-        let key = owner.runtime_key();
-        self.background.stop(&key).await?;
-        let connection = self.connection_by_session.lock().await.get(&key).cloned();
-        if let Some(connection) = connection {
-            connection.lock().await.process.close().await?;
-            self.connection_by_session.lock().await.remove(&key);
+    async fn cleanup_execution(
+        &self,
+        session_id: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.background.stop(session_id).await?;
+            self.steering_lane(session_id)
+                .await
+                .cleanup_execution()
+                .await
         }
-        self.active_turn_by_session.lock().await.remove(&key);
-        self.session_events.reset_owner(owner).await?;
-        Ok(())
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
 
-    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-        let key = owner.runtime_key();
-        let interrupt = self.cleanup_execution(&key).await;
-        let collection = self.session_events.cancel(owner).await;
-        let connection = self.connection_by_session.lock().await.get(&key).cloned();
-        let close = if let Some(connection) = connection {
-            let result = connection.lock().await.process.close().await;
-            if result.is_ok() {
+    async fn cancel_session(
+        &self,
+        session_id: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> =
+            async move { Ok(self.cleanup_execution(session_id).await?) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CancelSession,
+                source,
+            )
+        })
+    }
+
+    async fn reset_session(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            let key = owner.runtime_key();
+            self.background.stop(&key).await?;
+            let connection = self.connection_by_session.lock().await.get(&key).cloned();
+            if let Some(connection) = connection {
+                connection.lock().await.process.close().await?;
                 self.connection_by_session.lock().await.remove(&key);
             }
-            result
-        } else {
+            self.active_turn_by_session.lock().await.remove(&key);
+            self.session_events.reset_owner(owner).await?;
             Ok(())
-        };
-        match (interrupt, collection, close) {
-            (Err(error), collection, close) => {
-                let error = if let Err(next) = collection {
-                    error.context(format!("collect Codex execution: {next:#}"))
-                } else {
-                    error
-                };
-                Err(if let Err(next) = close {
-                    error.context(format!("close Codex connection: {next:#}"))
-                } else {
-                    error
-                })
-            }
-            (Ok(()), Err(error), close) => {
-                let error = anyhow::Error::new(error);
-                Err(if let Err(next) = close {
-                    error.context(format!("close Codex connection: {next:#}"))
-                } else {
-                    error
-                })
-            }
-            (Ok(()), Ok(()), close) => close,
         }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::ResetSession,
+                source,
+            )
+        })
+    }
+
+    async fn fence_session(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            let key = owner.runtime_key();
+            let interrupt = self.cleanup_execution(&key).await;
+            let collection = self.session_events.cancel(owner).await;
+            let connection = self.connection_by_session.lock().await.get(&key).cloned();
+            let close = if let Some(connection) = connection {
+                let result = connection.lock().await.process.close().await;
+                if result.is_ok() {
+                    self.connection_by_session.lock().await.remove(&key);
+                }
+                result
+            } else {
+                Ok(())
+            };
+            let failures = [
+                interrupt.err(),
+                collection.err(),
+                close.err().map(|source| {
+                    crate::provider::lifecycle_error::classify(
+                        forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                        source,
+                    )
+                }),
+            ];
+            crate::provider::lifecycle_error::combine(failures.into_iter().flatten())
+                .map_err(anyhow::Error::from)
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::FenceSession,
+                source,
+            )
+        })
     }
 
     async fn active_session_id_for(
@@ -2304,6 +2384,9 @@ impl CodexProvider {
             .map_err(super::ProviderError::from)
     }
 }
+
+#[cfg(test)]
+mod version_gate;
 
 #[cfg(test)]
 mod test {

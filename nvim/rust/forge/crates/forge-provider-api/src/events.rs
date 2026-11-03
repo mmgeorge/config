@@ -237,14 +237,31 @@ impl ProviderEventSink {
         Ok(())
     }
 
+    /// Deliver a native event and its host observations without waiting for channel capacity.
     pub fn send(&self, event: ProviderEvent) -> Result<(), EventDeliveryError> {
         self.validate(&event)?;
+        let _delivery = self.delivery.try_lock().map_err(|_| {
+            let error =
+                EventDeliveryError::Observation(crate::lifecycle::ObservationFailure::Overflow);
+            self.fail(error.clone());
+            error
+        })?;
         for observer in &self.observer {
             observer
                 .before_delivery(&event)
                 .inspect_err(|error| self.fail(error.clone()))?;
         }
-        self.sender.send(event).map_err(EventDeliveryError::queue)
+        let mut additional = Vec::new();
+        for observer in &self.observer {
+            additional.extend(observer.additional_events(&event).inspect_err(|error| {
+                self.fail(error.clone());
+            })?);
+        }
+        self.sender.send(event).map_err(EventDeliveryError::queue)?;
+        for event in additional {
+            self.sender.send(event).map_err(EventDeliveryError::queue)?;
+        }
+        Ok(())
     }
 
     /// Record irreversible observation loss independently of ordinary queue capacity.
@@ -621,45 +638,94 @@ mod tests {
     /// Preserve host observations immediately after their native event on the same channel.
     #[tokio::test]
     async fn host_observer_preserves_native_event_order() -> anyhow::Result<()> {
-        let (sink, mut stream) = channel(scope());
-        let sink = sink.with_observer(std::sync::Arc::new(Observer { fail: false }));
-        sink.send_wait(message(
-            "observed",
-            MessageUpdate::Delta {
-                text: "text".into(),
-            },
-        ))
-        .await?;
-        assert!(matches!(
-            stream.try_next()?,
-            Some(ProviderEvent::Message { .. })
-        ));
-        assert!(matches!(
-            stream.try_next()?,
-            Some(ProviderEvent::Runtime {
-                update: crate::RuntimeUpdate::Progress { received_bytes: 42 },
-                ..
-            })
-        ));
+        for synchronous in [false, true] {
+            let (sink, mut stream) = channel(scope());
+            let sink = sink.with_observer(std::sync::Arc::new(Observer { fail: false }));
+            let event = message(
+                "observed",
+                MessageUpdate::Delta {
+                    text: "text".into(),
+                },
+            );
+            if synchronous {
+                sink.send(event)?;
+            } else {
+                sink.send_wait(event).await?;
+            }
+            assert!(matches!(
+                stream.try_next()?,
+                Some(ProviderEvent::Message { .. })
+            ));
+            assert!(matches!(
+                stream.try_next()?,
+                Some(ProviderEvent::Runtime {
+                    update: crate::RuntimeUpdate::Progress { received_bytes: 42 },
+                    ..
+                })
+            ));
+        }
         Ok(())
     }
 
     /// Fail the delivery channel when a host observer cannot produce required observations.
     #[tokio::test]
     async fn host_observer_failure_reaches_event_consumers() {
-        let (sink, stream) = channel(scope());
-        let sink = sink.with_observer(std::sync::Arc::new(Observer { fail: true }));
-        assert!(
-            sink.send_wait(message(
+        for synchronous in [false, true] {
+            let (sink, stream) = channel(scope());
+            let sink = sink.with_observer(std::sync::Arc::new(Observer { fail: true }));
+            let event = message(
                 "observed",
                 MessageUpdate::Delta {
-                    text: "text".into()
+                    text: "text".into(),
+                },
+            );
+            let result = if synchronous {
+                sink.send(event)
+            } else {
+                sink.send_wait(event).await
+            };
+            assert!(result.is_err());
+            assert!(stream.check().is_err());
+        }
+    }
+
+    /// Preserve the accepted prefix and wake consumers when synchronous delivery cannot remain ordered.
+    #[tokio::test]
+    async fn synchronous_send_contention_reports_typed_observation_loss() -> anyhow::Result<()> {
+        let (sink, mut stream) = channel(scope());
+        sink.send(message(
+            "accepted",
+            MessageUpdate::Delta {
+                text: "prefix".into(),
+            },
+        ))?;
+        let delivery = sink.delivery.lock().await;
+        assert!(matches!(
+            sink.send(message(
+                "lost",
+                MessageUpdate::Delta {
+                    text: "lost".into()
                 }
+            )),
+            Err(EventDeliveryError::Observation(
+                crate::lifecycle::ObservationFailure::Overflow
             ))
-            .await
-            .is_err()
-        );
-        assert!(stream.check().is_err());
+        ));
+        drop(delivery);
+        assert!(matches!(stream.recv().await?, Some(ProviderEvent::Message {
+            update: MessageUpdate::Delta { text }, ..
+        }) if text == "prefix"));
+        assert!(matches!(
+            stream.recv().await,
+            Err(EventDeliveryError::Observation(
+                crate::lifecycle::ObservationFailure::Overflow
+            ))
+        ));
+        assert!(matches!(
+            sink.failed().await,
+            EventDeliveryError::Observation(crate::lifecycle::ObservationFailure::Overflow)
+        ));
+        Ok(())
     }
 
     fn scope() -> InvocationScope {

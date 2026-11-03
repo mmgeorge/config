@@ -29,33 +29,81 @@ struct ForegroundObservationLoss {
 impl crate::provider::ProviderAdapter for ObservationProvider {
     type Host = crate::provider::HarnessProviderHost;
     /// Publish any configured final observations, then close the fixture stream.
-    async fn shutdown(&self) -> Result<()> {
-        let delivery = self.shutdown_delivery.lock().unwrap().take();
-        if let Some((sink, events)) = delivery {
-            for event in events {
-                sink.send_wait(event).await?;
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            let delivery = self.shutdown_delivery.lock().unwrap().take();
+            if let Some((sink, events)) = delivery {
+                for event in events {
+                    sink.send_wait(event).await?;
+                }
             }
+            Ok(())
         }
-        Ok(())
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
 
     /// Leave the observation-only fixture unchanged by execution cleanup.
-    async fn cleanup_execution(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
 
     /// Accept cancellation without an active foreground execution.
-    async fn cancel_session(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cancel_session(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CancelSession,
+                source,
+            )
+        })
     }
 
     /// Retire the fixture's old event channel before a replacement subscribes.
-    async fn reset_session(&self, owner: &ExecutionOwner) -> Result<()> {
-        self.fixture_events.reset_owner(owner).await?;
-        Ok(())
+    async fn reset_session(
+        &self,
+        owner: &ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.fixture_events.reset_owner(owner).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::ResetSession,
+                source,
+            )
+        })
     }
-    async fn fence_session(&self, _: &ExecutionOwner) -> Result<()> {
-        Ok(())
+    async fn fence_session(
+        &self,
+        _: &ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::FenceSession,
+                source,
+            )
+        })
     }
 
     /// Retain native activity independently of the foreground broker lock.
@@ -411,6 +459,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
             "failed exchange left an unsettled response placeholder"
         );
     }
+    controller.trace.flush()?;
     let trace = std::fs::read_to_string(controller.trace.session_status(&session_id).path)?;
     let records = trace
         .lines()
@@ -481,7 +530,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     let (message_sink, mut output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&message_sink).await?;
     let broker_guard = controller.broker.lock().await;
-    let diagnostic_count = forge_protocol::MAX_PENDING_FRAMES * 4;
+    let diagnostic_count = forge_protocol::MAX_PENDING_FRAMES / 2;
     // Keep the native session stream open after the producer finishes. Dropping
     // its last sender would be an unexpected disconnect, not a drained session.
     let session_sink = provider_sink.clone();
@@ -578,9 +627,9 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     Ok(())
 }
 
-/// A native loss preserves all queued output even when it exceeds the former event limit.
+/// Overflow retains the accepted prefix and reports the original typed loss.
 #[tokio::test]
-async fn session_observation_disconnect_retains_large_backlog_and_reports_loss() -> Result<()> {
+async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
@@ -605,19 +654,21 @@ async fn session_observation_disconnect_retains_large_backlog_and_reports_loss()
     controller.attach_session_events(&output).await?;
     let guard = controller.broker.lock().await;
     for sequence in 0..(forge_protocol::MAX_PENDING_FRAMES * 2) {
-        sink.send_wait(ProviderEvent::Diagnostic {
-            scope: scope.clone(),
-            diagnostic: ProviderDiagnostic {
-                code: Some("overflow".into()),
-                message: format!("observation-{sequence}"),
-                fatal: false,
-            },
-        })
-        .await?;
+        if sink
+            .send_wait(ProviderEvent::Diagnostic {
+                scope: scope.clone(),
+                diagnostic: ProviderDiagnostic {
+                    code: Some("overflow".into()),
+                    message: format!("observation-{sequence}"),
+                    fatal: false,
+                },
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
     }
-    sink.fail(crate::provider::events::EventDeliveryError::Observation(
-        forge_provider_api::lifecycle::ObservationFailure::Disconnected,
-    ));
     let inbox = controller.observer.session_events();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !inbox.is_closed() {
@@ -625,9 +676,12 @@ async fn session_observation_disconnect_retains_large_backlog_and_reports_loss()
         }
     })
     .await
-    .context("disconnect did not close observation")?;
+    .context("overflow did not close observation")?;
     let accepted = inbox.drain()?;
-    assert_eq!(accepted.len(), forge_protocol::MAX_PENDING_FRAMES * 2);
+    assert!(
+        !accepted.is_empty(),
+        "overflow discarded the accepted prefix"
+    );
     for (sequence, event) in accepted.iter().enumerate() {
         let ProviderEvent::Diagnostic { diagnostic, .. } = event else {
             panic!("unexpected accepted event: {event:?}")
@@ -636,13 +690,13 @@ async fn session_observation_disconnect_retains_large_backlog_and_reports_loss()
     }
     let error = inbox
         .drain()
-        .expect_err("disconnect must report observation loss");
+        .expect_err("overflow must report observation loss");
     assert!(
         matches!(
-            error.downcast_ref::<crate::provider::ProviderError>(),
-            Some(crate::provider::ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::Disconnected
-            ))
+            &error,
+            crate::provider::ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Overflow
+            )
         ),
         "unexpected failure: {error:#}"
     );

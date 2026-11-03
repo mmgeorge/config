@@ -5,6 +5,60 @@ use github_copilot_sdk::{
 };
 use std::{sync::Arc, time::Duration};
 
+/// Keep temporary runtime collection alive when its generation caller is cancelled.
+struct IsolatedClient {
+    client: Option<Client>,
+    collection: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+
+impl IsolatedClient {
+    /// Get the live transport before ownership transfers into its collection task.
+    fn client(&self) -> &Client {
+        self.client
+            .as_ref()
+            .expect("isolated client has not begun collection")
+    }
+
+    /// Transfer native ownership into one bounded task before awaiting its result.
+    fn begin_collection(&mut self) {
+        if self.collection.is_none() {
+            let client = self
+                .client
+                .take()
+                .expect("isolated client collection starts once");
+            self.collection = Some(tokio::spawn(async move {
+                let result = tokio::time::timeout(Duration::from_secs(8), client.stop())
+                    .await
+                    .context("isolated Copilot SDK shutdown exceeded 8 seconds")
+                    .and_then(|result| result.context("stop isolated Copilot SDK client"));
+                if result.is_err() {
+                    client.force_stop();
+                }
+                result
+            }));
+        }
+    }
+
+    /// Join native collection without aborting it when this waiter disappears.
+    async fn collect(mut self) -> Result<()> {
+        self.begin_collection();
+        self.collection
+            .as_mut()
+            .expect("isolated collection task was installed")
+            .await
+            .context("isolated Copilot collection task failed")?
+    }
+}
+
+impl Drop for IsolatedClient {
+    /// Retain collection on cancellation rather than abandoning a live temporary runtime.
+    fn drop(&mut self) {
+        if self.client.is_some() {
+            self.begin_collection();
+        }
+    }
+}
+
 /// Summarize captured history without attaching to or sending input to the main session.
 pub async fn generate(
     command: &[String],
@@ -22,15 +76,33 @@ pub async fn generate(
         .await
         .context("isolated Copilot SDK startup exceeded 20 seconds")?
         .context("start isolated Copilot SDK client")?;
-    let result = summarize(&client, workspace, request, validator).await;
-    let shutdown = tokio::time::timeout(Duration::from_secs(8), client.stop())
-        .await
-        .context("isolated Copilot SDK shutdown exceeded 8 seconds")
-        .and_then(|result| result.context("stop isolated Copilot SDK client"));
+    complete_generation(client, command, workspace, request, validator).await
+}
+
+/// Apply the same native version gate to isolated generation before any session work.
+async fn complete_generation(
+    client: Client,
+    command: &[String],
+    workspace: &str,
+    request: &TextGenerationRequest,
+    validator: &dyn TextValidator,
+) -> Result<String> {
+    let client = IsolatedClient {
+        client: Some(client),
+        collection: None,
+    };
+    let result = async {
+        super::runtime::validate_version(client.client(), command).await?;
+        summarize(client.client(), workspace, request, validator).await
+    }
+    .await;
+    let shutdown = client.collect().await;
     match (result, shutdown) {
-        (Err(error), Err(shutdown)) => {
-            Err(error.context(format!("Copilot SDK shutdown also failed: {shutdown:#}")))
+        (Err(error), Err(shutdown)) => Err(forge_provider_api::ProviderError::Combined {
+            primary: Box::new(forge_provider_api::ProviderError::from(error)),
+            secondary: vec![forge_provider_api::ProviderError::from(shutdown)],
         }
+        .into()),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Ok(text), Ok(())) => Ok(text),
     }
@@ -161,5 +233,234 @@ async fn summarize(
         }
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Ok(text), Ok(())) => Ok(text),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_provider_api::{ProviderError, version::RuntimeVersionError};
+    use serde_json::{Value, json};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+    #[derive(Clone, Copy)]
+    enum Completion {
+        Success,
+        Failure,
+        Cancel,
+    }
+
+    struct Validator;
+
+    impl TextValidator for Validator {
+        /// Keep text validation separate from SDK acknowledgment and completion.
+        fn validate(&self, text: &str) -> Result<String, ProviderError> {
+            Ok(text.to_owned())
+        }
+    }
+
+    /// Connect the production isolated operation to a real SDK stream and private RPC recorder.
+    fn fixture(
+        version: &'static str,
+        completion: Completion,
+    ) -> (
+        Client,
+        Arc<Mutex<Vec<String>>>,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client_write, mut peer_read) = tokio::io::duplex(64 * 1024);
+        let (mut peer_write, client_read) = tokio::io::duplex(64 * 1024);
+        let client = Client::from_streams(client_read, client_write, std::env::temp_dir()).unwrap();
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let observed = methods.clone();
+        let (sent, sending) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut sent = Some(sent);
+            let mut session = String::new();
+            let mut held_request = None;
+            while let Some(request) = read_frame(&mut peer_read).await {
+                let method = request["method"].as_str().unwrap();
+                observed.lock().unwrap().push(method.to_owned());
+                let result = match method {
+                    "status.get" => json!({"version":version}),
+                    "session.create" => {
+                        assert_eq!(version, "1.0.103", "isolated session bypassed version gate");
+                        session = request["params"]["sessionId"].as_str().unwrap().to_owned();
+                        json!({"sessionId":session,"workspacePath":std::env::temp_dir()})
+                    }
+                    "session.options.update" => json!({"success":true}),
+                    "session.sendAndWait" if matches!(completion, Completion::Cancel) => {
+                        held_request = Some(request["id"].clone());
+                        if let Some(sent) = sent.take() {
+                            let _ = sent.send(());
+                        }
+                        continue;
+                    }
+                    "$/cancelRequest" => {
+                        assert!(matches!(completion, Completion::Cancel));
+                        assert_eq!(Some(&request["params"]["id"]), held_request.as_ref());
+                        assert!(
+                            request.get("id").is_none(),
+                            "RPC cancellation must be a notification"
+                        );
+                        continue;
+                    }
+                    "session.sendAndWait" if matches!(completion, Completion::Failure) => {
+                        write_frame(&mut peer_write, json!({"jsonrpc":"2.0","id":request["id"],"error":{"code":-32000,"message":"isolated send failed"}})).await;
+                        continue;
+                    }
+                    "session.sendAndWait" => {
+                        json!({"aborted":false,"messageId":"isolated-input","completionEventId":"isolated-idle","response":{
+                            "id":"isolated-answer","type":"assistant.message","timestamp":"2026-11-02T00:00:00Z",
+                            "data":{"messageId":"answer","originatingMessageId":"isolated-input","content":"Complete isolated text"}
+                        }})
+                    }
+                    "session.abort" | "session.detach" => json!({"success":true}),
+                    "session.delete" => json!({}),
+                    other => panic!("unexpected isolated SDK request: {other}"),
+                };
+                write_frame(
+                    &mut peer_write,
+                    json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                )
+                .await;
+                if method == "session.sendAndWait" {
+                    if let Some(sent) = sent.take() {
+                        let _ = sent.send(());
+                    }
+                    if matches!(completion, Completion::Success) {
+                        write_frame(&mut peer_write, json!({"jsonrpc":"2.0","method":"session.event","params":{"sessionId":session,"event":{
+                            "id":"isolated-idle","type":"session.idle","timestamp":"2026-11-02T00:00:00Z","ephemeral":true,"data":{}
+                        }}})).await;
+                    }
+                }
+            }
+        });
+        (client, methods, sending, peer)
+    }
+
+    /// Read a bounded SDK protocol frame while preserving clean client collection as EOF.
+    async fn read_frame(reader: &mut DuplexStream) -> Option<Value> {
+        let mut header = Vec::new();
+        loop {
+            match reader.read_u8().await {
+                Ok(byte) => header.push(byte),
+                Err(error)
+                    if header.is_empty() && error.kind() == std::io::ErrorKind::UnexpectedEof =>
+                {
+                    return None;
+                }
+                Err(error) => panic!("isolated peer header failed: {error}"),
+            }
+            if header.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            assert!(header.len() < 1024);
+        }
+        let size: usize = std::str::from_utf8(&header)
+            .unwrap()
+            .trim()
+            .strip_prefix("Content-Length: ")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(size < 64 * 1024);
+        let mut body = vec![0; size];
+        reader.read_exact(&mut body).await.unwrap();
+        Some(serde_json::from_slice(&body).unwrap())
+    }
+
+    /// Write native responses and notifications on the same ordered SDK connection.
+    async fn write_frame(writer: &mut DuplexStream, frame: Value) {
+        let body = serde_json::to_vec(&frame).unwrap();
+        writer
+            .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+            .await
+            .unwrap();
+        writer.write_all(&body).await.unwrap();
+        writer.flush().await.unwrap();
+    }
+
+    /// Exercise generation with explicit model selection without unrelated catalog RPCs.
+    fn request() -> TextGenerationRequest {
+        TextGenerationRequest {
+            model: "fixture-model".into(),
+            reasoning: ReasoningSelection::Level("low".into()),
+            instructions: "summarize".into(),
+            input: "inspect".into(),
+        }
+    }
+
+    /// Reject an actual isolated SDK client before create or send and still collect it.
+    #[tokio::test]
+    async fn isolated_generation_rejects_old_runtime_before_session_creation() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (client, methods, _, peer) = fixture("1.0.102", Completion::Success);
+            let error = complete_generation(client, &[], ".", &request(), &Validator)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<ProviderError>(),
+                Some(ProviderError::RuntimeVersion(
+                    RuntimeVersionError::Unsupported { .. }
+                ))
+            ));
+            peer.await.unwrap();
+            assert_eq!(*methods.lock().unwrap(), ["status.get"]);
+        })
+        .await
+        .expect("isolated rejection failed to collect its SDK transport");
+    }
+
+    /// Collect the temporary SDK client on completed, failed, and cancelled caller paths.
+    #[tokio::test]
+    async fn isolated_generation_collects_success_failure_and_cancelled_callers() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for completion in [Completion::Success, Completion::Failure, Completion::Cancel] {
+                let (client, methods, sending, peer) = fixture("1.0.103", completion);
+                let generation = tokio::spawn(async move {
+                    complete_generation(client, &[], ".", &request(), &Validator).await
+                });
+                match completion {
+                    Completion::Success => {
+                        assert_eq!(generation.await.unwrap().unwrap(), "Complete isolated text")
+                    }
+                    Completion::Failure => assert!(
+                        format!("{:#}", generation.await.unwrap().unwrap_err())
+                            .contains("isolated send failed")
+                    ),
+                    Completion::Cancel => {
+                        sending.await.unwrap();
+                        generation.abort();
+                        assert!(generation.await.unwrap_err().is_cancelled());
+                    }
+                }
+                peer.await.unwrap();
+                let methods = methods.lock().unwrap();
+                assert_eq!(methods.first().map(String::as_str), Some("status.get"));
+                assert_eq!(
+                    methods
+                        .iter()
+                        .filter(|method| method.as_str() == "session.create")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    methods
+                        .iter()
+                        .filter(|method| method.as_str() == "session.sendAndWait")
+                        .count(),
+                    1
+                );
+                if !matches!(completion, Completion::Cancel) {
+                    assert!(methods.iter().any(|method| method == "session.detach"));
+                    assert!(methods.iter().any(|method| method == "session.delete"));
+                }
+            }
+        })
+        .await
+        .expect("isolated outcome failed to collect its SDK transport");
     }
 }

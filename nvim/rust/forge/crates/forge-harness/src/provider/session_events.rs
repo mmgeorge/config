@@ -271,6 +271,7 @@ impl DeliverySet {
             .map_err(|_| protocol("submission coverage lock poisoned"))?;
         if !state.accepting {
             return Err(ProviderError::NotConsumed {
+                cause: None,
                 message: "native execution closed before steering dispatch".into(),
             });
         }
@@ -510,6 +511,7 @@ impl SessionEvents {
             .filter(|task| task.owner == scope.owner)
             .map(|task| task.delivery.clone())
             .ok_or_else(|| ProviderError::NotConsumed {
+                cause: None,
                 message: "steering has no retained native execution".into(),
             })?;
         let submission = input
@@ -1343,6 +1345,77 @@ mod tests {
         Ok(())
     }
 
+    /// Require an observed local execution anchor even after its cancelled producer joins.
+    #[tokio::test]
+    async fn joined_local_cancellation_requires_a_published_execution_anchor() -> anyhow::Result<()>
+    {
+        for publish_anchor in [false, true] {
+            let events = Arc::new(SessionEvents::default());
+            let owner = ExecutionOwner::root("cancelled-local-fixture");
+            let scope = InvocationScope::new(owner.clone(), "exchange");
+            let mut stream = events.subscribe(owner.clone())?;
+            let address = TurnAddress {
+                scope: scope.clone(),
+                thread_id: "fixture".into(),
+                turn_id: "active".into(),
+            };
+            let covered = input("accepted");
+            let (started, entered) = tokio::sync::oneshot::channel();
+            let native_scope = scope.clone();
+            let native_address = address.clone();
+            events
+                .start(
+                    scope.clone(),
+                    vec![covered.clone()],
+                    Acknowledgement::Local(None),
+                    None,
+                    TerminalBoundary::LocalFixture,
+                    move |sink| async move {
+                        if publish_anchor {
+                            sink.send_wait(ProviderEvent::Execution {
+                                observation: ExecutionObservation::new(
+                                    native_scope,
+                                    ExecutionUpdate::Started {
+                                        address: native_address,
+                                    },
+                                )?,
+                            })
+                            .await?;
+                        }
+                        let _ = started.send(());
+                        std::future::pending::<Result<ProviderCompletion, ProviderError>>().await
+                    },
+                )
+                .await?;
+            entered.await?;
+            events.cancel_runtime(&owner.runtime_key()).await?;
+            let first = stream
+                .recv()
+                .await?
+                .expect("joined local producer must publish its actual evidence");
+            if publish_anchor {
+                assert!(matches!(first,ProviderEvent::Execution {observation}
+                    if matches!(observation.update(),ExecutionUpdate::Started {address:observed} if observed==&address)));
+                let terminal = stream
+                    .recv()
+                    .await?
+                    .expect("published anchor must receive cancellation coverage");
+                assert!(matches!(terminal,ProviderEvent::Execution {observation}
+                    if matches!(observation.update(),ExecutionUpdate::Finished {address:observed,covered_submissions,result:ExecutionResult::Cancelled {..},..}
+                        if observed==&address && covered_submissions==&vec![covered])));
+            } else {
+                assert!(matches!(first,ProviderEvent::Execution {observation}
+                    if matches!(observation.update(),ExecutionUpdate::ObservationLost {failure:ObservationFailure::Protocol {..},..})));
+            }
+            assert!(
+                stream.try_next()?.is_none(),
+                "local cancellation fabricated additional lifecycle evidence"
+            );
+            events.shutdown().await?;
+        }
+        Ok(())
+    }
+
     /// Keep two separately certified native continuations open before settling the root.
     #[test]
     fn certified_continuations_publish_distinct_turn_boundaries() -> anyhow::Result<()> {
@@ -1700,6 +1773,7 @@ mod tests {
             .register(Some(input("steer")))
             .unwrap()
             .complete(&Err(ProviderError::NotConsumed {
+                cause: None,
                 message: "native idle rejection".into(),
             }))
             .unwrap();

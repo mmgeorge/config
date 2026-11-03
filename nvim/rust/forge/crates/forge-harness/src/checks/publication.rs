@@ -165,6 +165,7 @@ mod tests {
 
         trace.configure(true).unwrap();
         notification.signal();
+        trace.flush().unwrap();
         let logged = std::fs::read_to_string(&path).unwrap();
         assert!(logged.contains("checks.notification_worker_closed"));
 

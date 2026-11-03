@@ -1130,12 +1130,94 @@ impl HarnessBroker {
 }
 
 impl HarnessBroker {
+    /// Continue a detached required tool answer under its original exchange and task authority.
+    fn prepare_required_question_continuation(
+        &mut self,
+        admission: &mut ForegroundAdmission,
+    ) -> Result<Option<StagedInteraction>> {
+        let crate::input::InputPurpose::Question {
+            question_id,
+            message_kind: crate::question::QuestionMessageKind::Answer,
+            ..
+        } = &admission.purpose
+        else {
+            return Ok(None);
+        };
+        let snapshot = self.questions.snapshot()?;
+        let question = snapshot
+            .questions
+            .iter()
+            .find(|question| &question.id == question_id)
+            .context("required answer source is missing")?;
+        if question.requirement != crate::question::QuestionRequirement::Required
+            || question.delivery != crate::question::QuestionDelivery::ToolResult
+        {
+            return Ok(None);
+        }
+        // Validate the original owner before changing exchange or model state.
+        let mut exchange = self
+            .store
+            .latest_exchange(&self.session.id)?
+            .context("required answer lost its originating exchange")?;
+        anyhow::ensure!(
+            exchange.id == question.exchange_id,
+            "required answer cannot replace a newer exchange"
+        );
+        let task = self.task_controller.current()?;
+        anyhow::ensure!(
+            task.as_ref().map(|task| task.id.as_str()) == question.task_id.as_deref(),
+            "required answer task authority changed"
+        );
+        anyhow::ensure!(
+            task.as_ref().is_none_or(|task| task.entry_accepted()
+                && matches!(
+                    task.status(),
+                    crate::task::TaskStatus::Running | crate::task::TaskStatus::Waiting
+                )),
+            "required answer task is no longer active"
+        );
+        exchange.continue_required_question(question, self.clock.now_ms())?;
+        let mode = match task.as_ref().map(|task| &task.workflow) {
+            Some(crate::task::WorkflowSnapshot::Plan { plan })
+                if plan.artifact.state == PlanState::ConfiguringChecks =>
+            {
+                self.observer.set_check_editing(true)?;
+                self.check_setup = true;
+                admission.reset_check_setup = true;
+                PromptMode::Chat
+            }
+            Some(crate::task::WorkflowSnapshot::Plan { plan })
+                if plan.artifact.state == PlanState::AwaitingReview =>
+            {
+                PromptMode::PlanDiscussion
+            }
+            Some(crate::task::WorkflowSnapshot::Plan { .. }) => PromptMode::Plan,
+            Some(crate::task::WorkflowSnapshot::Execute { .. }) => PromptMode::ExecutePlan,
+            Some(crate::task::WorkflowSnapshot::Goal { .. }) => PromptMode::GoalContinuation,
+            None => PromptMode::Chat,
+        };
+        if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
+            admission.planning = Some(self.capture_planning_context(
+                task.as_ref().context("question plan owner is missing")?,
+            )?);
+        }
+
+        // The explicit recorded answer authorizes continuation; a late native event does not.
+        self.store.save_exchange(&exchange)?;
+        let text = admission.text.clone();
+        self.stage_foreground_interaction(&text, mode, None, ProviderInput::from_text(text.clone()))
+            .map(Some)
+    }
+
     /// Normalize a prompt into the same exchange mode and origin as legacy admission.
     fn normalize_foreground_interaction(
         &mut self,
         admission: &mut ForegroundAdmission,
     ) -> Result<StagedInteraction> {
         let text = admission.text.clone();
+        if let Some(staged) = self.prepare_required_question_continuation(admission)? {
+            return Ok(staged);
+        }
         if let Some(discussion) = self.prepare_question_discussion(admission)? {
             let visible = discussion.visible_text.clone();
             admission.question_discussion = Some(discussion);

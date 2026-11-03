@@ -150,7 +150,8 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     async fn close(&self) -> Result<()> {
         self.provider
             .cleanup_execution(&self.request.runtime_key()?)
-            .await
+            .await?;
+        Ok(())
     }
 
     /// Get the peer's native request and notification evidence without interpreting transcript text.

@@ -72,6 +72,8 @@ end
 local function render(state)
   local input = state.input
   local entries = vim.deepcopy(input.confirmed)
+  local confirmed = {}
+  for _, entry in ipairs(input.confirmed) do confirmed[entry.id] = true end
   for _, operation in ipairs(input.pending) do apply(entries, operation.action) end
   for _, message in ipairs(input.rejected) do
     if not index_of(entries, message.id) then entries[#entries + 1] = vim.deepcopy(message) end
@@ -81,8 +83,6 @@ local function render(state)
   local present = {}
   for _, entry in ipairs(entries) do
     present[entry.id] = true
-    local immediate = entry.intent == "auto" and (entry.config == nil or entry.config == vim.NIL)
-      and entry.delivery ~= "failed" and entry.delivery ~= "unknown"
     if entry.delivery == "accepted" then input.accepted[entry.id] = true end
     if entry.delivery ~= "accepted" and not input.accepted[entry.id] then
       local target = input.entry_by_id[entry.id] or {}
@@ -90,6 +90,11 @@ local function render(state)
       for key in pairs(target) do target[key] = nil end
       for key, value in pairs(entry) do if value ~= vim.NIL then target[key] = value end end
       local direct = entry.route == "turn" or (entry.route == nil or entry.route == vim.NIL) and input.direct_submission[entry.id]
+      -- A host-confirmed queue entry has not started steering. Preserve the
+      -- direct submission indicator while its initial admission is acknowledged.
+      local immediate = entry.intent == "auto" and (entry.config == nil or entry.config == vim.NIL)
+        and entry.delivery ~= "failed" and entry.delivery ~= "unknown"
+        and (not confirmed[entry.id] or entry.delivery == "delivering" or direct and input.direct_submission[entry.id])
       local destination = immediate and (direct and submitting or steering) or queue
       destination[#destination + 1] = target
       retained[entry.id] = true

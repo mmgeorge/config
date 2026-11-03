@@ -109,21 +109,58 @@ impl crate::provider::ProviderAdapter for BackgroundProvider {
         Ok(Some("child-thread".to_owned().try_into()?))
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        self.shutdown_called
-            .store(true, std::sync::atomic::Ordering::Release);
-        self.finish_background().await?;
-        self.session_sink.lock().await.take();
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.shutdown_called
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.finish_background().await?;
+            self.session_sink.lock().await.take();
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
-    async fn cleanup_execution(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
-    async fn fence_session(&self, owner: &ExecutionOwner) -> Result<()> {
-        self.fixture_events.cancel(owner).await.map_err(Into::into)
+    async fn fence_session(
+        &self,
+        owner: &ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> =
+            async move { self.fixture_events.cancel(owner).await.map_err(Into::into) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::FenceSession,
+                source,
+            )
+        })
     }
-    async fn cancel_session(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cancel_session(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CancelSession,
+                source,
+            )
+        })
     }
     async fn has_active_turn(&self, _: &str) -> bool {
         false
@@ -236,7 +273,10 @@ async fn collect_background_child(
     });
     let runtime = AgentRuntime {
         execution_registry: Arc::new(
-            crate::provider::session_execution::SessionExecutionRegistry::new(provider.clone()),
+            crate::provider::session_execution::SessionExecutionRegistry::new(
+                provider.clone(),
+                trace.clone(),
+            ),
         ),
         provider: provider.clone(),
         tool_timeout: if matches!(finish, BackgroundFinish::NoisyTimeout) {
@@ -505,19 +545,53 @@ impl crate::provider::ProviderAdapter for ProviderCancelledProvider {
         }
     }
     /// Complete fixture cleanup without resources.
-    async fn shutdown(&self) -> Result<()> {
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
     /// Leave cancellation cleanup successful.
-    async fn cleanup_execution(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
     /// Leave cancellation cleanup successful.
-    async fn fence_session(&self, owner: &ExecutionOwner) -> Result<()> {
-        self.fixture_events.cancel(owner).await.map_err(Into::into)
+    async fn fence_session(
+        &self,
+        owner: &ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> =
+            async move { self.fixture_events.cancel(owner).await.map_err(Into::into) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::FenceSession,
+                source,
+            )
+        })
     }
-    async fn cancel_session(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cancel_session(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CancelSession,
+                source,
+            )
+        })
     }
     /// No native turn remains after the fixture response.
     async fn has_active_turn(&self, _: &str) -> bool {
@@ -633,7 +707,10 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
         });
         AgentRuntime {
             execution_registry: Arc::new(
-                crate::provider::session_execution::SessionExecutionRegistry::new(provider.clone()),
+                crate::provider::session_execution::SessionExecutionRegistry::new(
+                    provider.clone(),
+                    trace.clone(),
+                ),
             ),
             provider,
             tool_timeout: Default::default(),

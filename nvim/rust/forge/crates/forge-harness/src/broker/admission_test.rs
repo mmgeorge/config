@@ -4,6 +4,192 @@ struct PreparationProbe {
     fail: bool,
 }
 
+/// Preserve a required tool question's exchange when clarification has released its native waiter.
+#[tokio::test]
+async fn detached_required_answer_continues_original_exchange_before_or_after_completion()
+-> Result<()> {
+    use crate::question::{
+        QuestionAction, QuestionAnswer, QuestionCommand, QuestionDraft, QuestionMessageKind,
+        QuestionOrigin, QuestionRequirement,
+    };
+    for answer_before_completion in [false, true] {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let (mut original, _, _) = broker
+            .test_stage_interaction_for_turn("Choose a format then produce a sample", true, 1)
+            .await?;
+        broker.begin_exchange_runtime(&mut original, 1)?;
+        broker.store.save_exchange(&original)?;
+        let question_id = broker
+            .questions
+            .ask(
+                "required-tool",
+                &original.id,
+                QuestionOrigin::Tool(None),
+                vec![QuestionDraft {
+                    header: "Format".into(),
+                    question: "Which format?".into(),
+                    requirement: QuestionRequirement::Required,
+                    options: Vec::new(),
+                }],
+            )?
+            .remove(0);
+        let answer = QuestionCommand {
+            operation_id: "answer".into(),
+            question_id: question_id.clone(),
+            revision: 1,
+            action: QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "JSON".into(),
+                },
+            },
+        };
+        if answer_before_completion {
+            broker.questions.apply(answer.clone())?;
+        }
+        broker
+            .run_interaction(
+                "Explain the two formats without selecting one".into(),
+                PromptMode::Chat,
+                None,
+            )
+            .await?;
+        let waiting = broker.store.latest_exchange(&broker.session.id)?.unwrap();
+        assert_eq!(waiting.id, original.id);
+        assert_eq!(waiting.awaiting_input(), !answer_before_completion);
+        if !answer_before_completion {
+            assert!(
+                waiting.execution_started_at_ms().is_none(),
+                "question wait kept the execution clock active"
+            );
+        }
+        assert_eq!(
+            waiting.state(),
+            if answer_before_completion {
+                ExchangeState::Complete
+            } else {
+                ExchangeState::Running
+            }
+        );
+        if !answer_before_completion {
+            broker.questions.apply(answer)?;
+        }
+        let packet = broker
+            .questions
+            .outbox()?
+            .into_iter()
+            .find(|message| message.kind == QuestionMessageKind::Answer)
+            .unwrap();
+        broker.input_purpose = crate::input::InputPurpose::Question {
+            question_id,
+            task_id: None,
+            message_kind: QuestionMessageKind::Answer,
+        };
+        let result = broker
+            .dispatch(Request {
+                id: 2,
+                method: "session.prompt.submit".into(),
+                params: json!({"text":packet.text}),
+            })
+            .await;
+        assert!(
+            result.response.error().is_none(),
+            "answer_before_completion={answer_before_completion}: {:?}",
+            result.response.error()
+        );
+        let exchanges = broker.store.list_exchange(&broker.session.id)?;
+        assert_eq!(exchanges.len(), 1, "answer created another exchange");
+        assert_eq!(exchanges[0].id, original.id);
+        assert_eq!(exchanges[0].state(), ExchangeState::Complete);
+        assert_eq!(exchanges[0].turn.len(), 2);
+        assert!(
+            !broker.question_discussion,
+            "required continuation used the temporary Ask model"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse stale required answers instead of attaching them to newer source work.
+#[tokio::test]
+async fn detached_required_answer_rejects_cancelled_or_newer_exchange() -> Result<()> {
+    use crate::question::{
+        QuestionAction, QuestionAnswer, QuestionCommand, QuestionDraft, QuestionMessageKind,
+        QuestionOrigin, QuestionRequirement,
+    };
+    for newer_exchange in [false, true] {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let (mut original, _, _) = broker
+            .test_stage_interaction_for_turn("Original", true, 1)
+            .await?;
+        let question_id = broker
+            .questions
+            .ask(
+                "required-tool",
+                &original.id,
+                QuestionOrigin::Tool(None),
+                vec![QuestionDraft {
+                    header: "Format".into(),
+                    question: "Which format?".into(),
+                    requirement: QuestionRequirement::Required,
+                    options: Vec::new(),
+                }],
+            )?
+            .remove(0);
+        broker.questions.apply(QuestionCommand {
+            operation_id: "answer".into(),
+            question_id: question_id.clone(),
+            revision: 1,
+            action: QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "JSON".into(),
+                },
+            },
+        })?;
+        original.finish(
+            if newer_exchange {
+                crate::exchange::ExchangeOutcome::Complete
+            } else {
+                crate::exchange::ExchangeOutcome::Cancelled
+            },
+            2,
+        )?;
+        broker.store.save_exchange(&original)?;
+        if newer_exchange {
+            let (newer, _, _) = broker
+                .test_stage_interaction_for_turn("Newer", true, 3)
+                .await?;
+            broker.store.save_exchange(&newer)?;
+        }
+        let count = broker.store.list_exchange(&broker.session.id)?.len();
+        broker.input_purpose = crate::input::InputPurpose::Question {
+            question_id,
+            task_id: None,
+            message_kind: QuestionMessageKind::Answer,
+        };
+        let result = broker
+            .dispatch(Request {
+                id: 2,
+                method: "session.prompt.submit".into(),
+                params: json!({"text":"JSON"}),
+            })
+            .await;
+        assert!(
+            result.response.error().is_some(),
+            "stale answer was dispatched"
+        );
+        assert_eq!(broker.store.list_exchange(&broker.session.id)?.len(), count);
+        assert_eq!(
+            broker.store.load_exchange(&original.id)?.unwrap().state(),
+            original.state()
+        );
+    }
+    Ok(())
+}
+
 /// Reject host completion when its presentation receiver has disappeared.
 #[tokio::test]
 async fn closed_publication_cannot_complete_an_exchange() -> Result<()> {
@@ -91,6 +277,8 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
         broker.provider = Arc::new(CheckpointProvider {
             fixture_events: Default::default(),
             preparation: Some(preparation.clone()),
+            native_rejection: None,
+            cleanup_error: None,
             started: Arc::new(Notify::new()),
             tool_ran: tool_ran.clone(),
             active: Default::default(),

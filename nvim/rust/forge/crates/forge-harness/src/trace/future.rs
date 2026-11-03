@@ -37,12 +37,7 @@ impl TraceStore {
         phase: &str,
         future: impl Future<Output = Result<Output>>,
     ) -> Result<Output> {
-        if !self
-            .config
-            .lock()
-            .map(|config| config.enabled)
-            .unwrap_or(false)
-        {
+        if !self.is_enabled() {
             return future.await;
         }
         self.record(
@@ -142,6 +137,7 @@ mod tests {
             tokio::pin!(future);
             assert!(futures_util::poll!(&mut future).is_pending());
         }
+        trace.flush()?;
         let text = std::fs::read_to_string(root.path().join("logs/session.jsonl"))?;
         let records: Vec<serde_json::Value> = text
             .lines()

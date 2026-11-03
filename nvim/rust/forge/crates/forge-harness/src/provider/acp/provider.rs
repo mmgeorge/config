@@ -286,19 +286,31 @@ impl crate::provider::ProviderAdapter for AcpProvider {
         )
         .await?;
         let initialized = transport
-            .request(
-                "initialize",
+            .initialize(
+                self.kind,
+                status
+                    .command
+                    .first()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| "ACP".into()),
                 json!({"protocolVersion":1,
             "clientInfo":{"name":"forge-harness","version":env!("CARGO_PKG_VERSION")},
             "clientCapabilities":{"auth":{"terminal":true}}}),
             )
             .await;
-        transport.shutdown().await?;
-        let initialized = initialized?;
-        ensure!(
-            initialized["protocolVersion"] == 1,
-            "ACP agent did not negotiate protocol v1"
-        );
+        let collected = transport.shutdown().await;
+        let initialized = match (initialized, collected) {
+            (Ok(initialized), Ok(())) => initialized,
+            (Err(cause), Err(cleanup)) => {
+                return Err(ProviderError::PreparationCleanup {
+                    cause: Arc::new(cause),
+                    cleanup: Arc::new(cleanup),
+                }
+                .into());
+            }
+            (Err(error), Ok(())) => return Err(error.into()),
+            (Ok(_), Err(error)) => return Err(error.into()),
+        };
         result["adapter_version"] = initialized
             .pointer("/agentInfo/version")
             .cloned()
@@ -320,10 +332,19 @@ impl crate::provider::ProviderAdapter for AcpProvider {
         &self,
         request: ProviderCatalogRequest,
         _setting: &crate::settings::PortableSettings,
-    ) -> Result<()> {
-        self.cleanup_execution(&request.runtime_key()?).await?;
-        self.session(request, None, None).await?;
-        Ok(())
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.cleanup_execution(&request.runtime_key()?).await?;
+            self.session(request, None, None).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::ReconcileSettings,
+                source,
+            )
+        })
     }
 
     async fn authenticate(&self, request: ProviderCatalogRequest, method: String) -> Result<()> {
@@ -460,29 +481,33 @@ impl crate::provider::ProviderAdapter for AcpProvider {
         }
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        let mut failure = self
-            .session_events
-            .shutdown()
-            .await
-            .err()
-            .map(anyhow::Error::from);
-        let sessions: Vec<_> = self
-            .session
-            .lock()
-            .await
-            .drain()
-            .map(|(_, session)| session)
-            .collect();
-        for session in sessions {
-            if let Err(error) = session.native.shutdown().await {
-                failure.get_or_insert(error.into());
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            let mut failures = Vec::new();
+            if let Err(error) = self.session_events.shutdown().await {
+                failures.push(error);
             }
+            let sessions: Vec<_> = self
+                .session
+                .lock()
+                .await
+                .drain()
+                .map(|(_, session)| session)
+                .collect();
+            for session in sessions {
+                if let Err(source) = session.native.shutdown().await {
+                    failures.push(source);
+                }
+            }
+            crate::provider::lifecycle_error::combine(failures).map_err(anyhow::Error::from)
         }
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
 
     async fn skill_list(&self, request: ProviderCatalogRequest) -> Result<Vec<SkillDefinition>> {
@@ -794,77 +819,126 @@ impl crate::provider::ProviderAdapter for AcpProvider {
     }
 
     /// Interrupt native work and collect its validated terminal response without retiring the reader.
-    async fn cancel_session(&self, id: &str) -> Result<()> {
-        if let Some(cancelled) = self.cancellation.lock().await.get(id) {
-            cancelled.store(true, Ordering::Release);
-        }
-        let session = self.session.lock().await.get(id).cloned();
-        if let Some(session) = session {
-            session.control.cancel().await;
-            session.permission.close().await;
-            if session.native.state().has_active_work().await {
-                let terminal = async {
-                    session.native.cancel()?;
-                    let turn = tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        session.turn.lock(),
-                    )
-                    .await
-                    .map_err(|_| {
-                        ProviderError::Observation(
+    async fn cancel_session(
+        &self,
+        id: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            if let Some(cancelled) = self.cancellation.lock().await.get(id) {
+                cancelled.store(true, Ordering::Release);
+            }
+            let session = self.session.lock().await.get(id).cloned();
+            if let Some(session) = session {
+                session.control.cancel().await;
+                session.permission.close().await;
+                if session.native.state().has_active_work().await {
+                    let terminal = async {
+                        session.native.cancel()?;
+                        let turn = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            session.turn.lock(),
+                        )
+                        .await
+                        .map_err(|_| {
+                            ProviderError::Observation(
                             forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
                         )
-                    })?;
-                    match &*turn {
+                        })?;
+                        match &*turn {
                         PromptEvidence::Validated => Ok(()),
                         PromptEvidence::Unavailable => Err(ProviderError::Observation(
                             forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
                         )),
                     }
-                }
-                .await;
-                if let Err(failure) = terminal {
-                    return match self.cleanup_execution(id).await {
-                        Ok(()) => Err(failure.into()),
-                        Err(cleanup) => Err(anyhow::Error::new(failure)
-                            .context(format!("ACP cancellation cleanup also failed: {cleanup:#}"))),
-                    };
+                    }
+                    .await;
+                    if let Err(failure) = terminal {
+                        return match self.cleanup_execution(id).await {
+                            Ok(()) => Err(failure.into()),
+                            Err(cleanup) => Err(ProviderError::Combined {
+                                primary: Box::new(failure),
+                                secondary: vec![cleanup],
+                            }
+                            .into()),
+                        };
+                    }
                 }
             }
+            Ok(())
         }
-        Ok(())
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CancelSession,
+                source,
+            )
+        })
     }
 
-    async fn cleanup_execution(&self, id: &str) -> Result<()> {
-        if let Some(cancelled) = self.cancellation.lock().await.get(id) {
-            cancelled.store(true, Ordering::Release);
+    async fn cleanup_execution(
+        &self,
+        id: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            if let Some(cancelled) = self.cancellation.lock().await.get(id) {
+                cancelled.store(true, Ordering::Release);
+            }
+            let session = self.session.lock().await.get(id).cloned();
+            if let Some(session) = session {
+                session.control.cancel().await;
+                session.permission.close().await;
+                let result = session.native.shutdown().await;
+                session.control.close().await;
+                let finalized = session
+                    .native
+                    .state()
+                    .finish(crate::turn::TurnOutcome::Cancelled)
+                    .await;
+                finalized?;
+                result?;
+                self.session.lock().await.remove(id);
+            }
+            Ok(())
         }
-        let session = self.session.lock().await.get(id).cloned();
-        if let Some(session) = session {
-            session.control.cancel().await;
-            session.permission.close().await;
-            let result = session.native.shutdown().await;
-            session.control.close().await;
-            let finalized = session
-                .native
-                .state()
-                .finish(crate::turn::TurnOutcome::Cancelled)
-                .await;
-            finalized?;
-            result?;
-            self.session.lock().await.remove(id);
-        }
-        Ok(())
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
 
-    async fn reset_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-        self.cleanup_execution(&owner.runtime_key()).await?;
-        self.session_events.reset_owner(owner).await?;
-        Ok(())
+    async fn reset_session(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.cleanup_execution(&owner.runtime_key()).await?;
+            self.session_events.reset_owner(owner).await?;
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::ResetSession,
+                source,
+            )
+        })
     }
 
-    async fn fence_session(&self, owner: &crate::provider::ExecutionOwner) -> Result<()> {
-        self.cleanup_execution(&owner.runtime_key()).await
+    async fn fence_session(
+        &self,
+        owner: &crate::provider::ExecutionOwner,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> =
+            async move { Ok(self.cleanup_execution(&owner.runtime_key()).await?) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::FenceSession,
+                source,
+            )
+        })
     }
 
     async fn active_session_id_for(

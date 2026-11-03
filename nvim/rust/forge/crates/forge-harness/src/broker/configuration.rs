@@ -74,9 +74,15 @@ impl Drop for ConfigurationWriteGuard {
         self.controller.mark_native_goal_uncertain();
         let registry = Arc::clone(&self.registry);
         let owner = self.owner.clone();
-        if let Err(error) = self.registry.retain_cleanup(async move {
-            registry.fence(&owner).await.map_err(anyhow::Error::from)
-        }) {
+        if let Err(error) = self.registry.retain_cleanup(
+            crate::provider::session_execution::CleanupWorkKind::OwnerFence,
+            async move {
+                registry
+                    .fence(&owner)
+                    .await
+                    .map_err(crate::provider::session_execution::CleanupWorkFailure::Provider)
+            },
+        ) {
             self.registry.record_cleanup_failure(error);
         }
     }
@@ -166,12 +172,16 @@ impl ConfigurationReconcileJob {
         };
         // The spawned worker retains the transport lane even if its caller is
         // cancelled, so generation recovery cannot race a late provider write.
-        let worker = guard.registry.retain_cleanup(async move {
-            let _lane = lane;
-            self.provider
-                .reconcile_settings(self.request, &self.selection)
-                .await
-        })?;
+        let worker = guard.registry.retain_cleanup(
+            crate::provider::session_execution::CleanupWorkKind::ConfigurationWrite,
+            async move {
+                let _lane = lane;
+                self.provider
+                    .reconcile_settings(self.request, &self.selection)
+                    .await
+                    .map_err(crate::provider::session_execution::CleanupWorkFailure::Provider)
+            },
+        )?;
         worker
             .await
             .map_err(|error| {
@@ -190,7 +200,7 @@ impl ConfigurationReconcileJob {
                 )
             })?;
         guard.registry.collect_cleanup().await.map_err(|error| {
-            error.context(crate::provider::ProviderError::DeliveryUncertain {
+            anyhow::Error::new(error).context(crate::provider::ProviderError::DeliveryUncertain {
                 message: "provider settings worker could not be collected".into(),
             })
         })?;
@@ -877,9 +887,14 @@ impl HarnessBroker {
                     self.task_controller.mark_native_goal_uncertain();
                     let registry = self.execution_registry.clone();
                     let owner = crate::provider::ExecutionOwner::root(&session_id);
-                    if let Err(cleanup) = self.execution_registry.retain_cleanup(async move {
-                        registry.fence(&owner).await.map_err(anyhow::Error::from)
-                    }) {
+                    if let Err(cleanup) = self.execution_registry.retain_cleanup(
+                        crate::provider::session_execution::CleanupWorkKind::OwnerFence,
+                        async move {
+                            registry.fence(&owner).await.map_err(
+                                crate::provider::session_execution::CleanupWorkFailure::Provider,
+                            )
+                        },
+                    ) {
                         self.execution_registry.record_cleanup_failure(cleanup);
                     }
                     return Err(
@@ -895,9 +910,15 @@ impl HarnessBroker {
             self.task_controller.mark_native_goal_uncertain();
             let registry = self.execution_registry.clone();
             let owner = crate::provider::ExecutionOwner::root(&session_id);
-            if let Err(cleanup) = self.execution_registry.retain_cleanup(async move {
-                registry.fence(&owner).await.map_err(anyhow::Error::from)
-            }) {
+            if let Err(cleanup) = self.execution_registry.retain_cleanup(
+                crate::provider::session_execution::CleanupWorkKind::OwnerFence,
+                async move {
+                    registry
+                        .fence(&owner)
+                        .await
+                        .map_err(crate::provider::session_execution::CleanupWorkFailure::Provider)
+                },
+            ) {
                 self.execution_registry.record_cleanup_failure(cleanup);
             }
             return Err(

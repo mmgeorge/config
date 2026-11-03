@@ -175,5 +175,33 @@ assert(#requests == previous_requests, "input refresh submitted while switching 
 state.switching_provider = false
 input.refresh(state)
 requests[#requests].callback({ revision = 13, suspended = false, execution_busy = false, messages = {} })
+
+-- A cancelled followup blocks FIFO without making a later idle draft an active steer.
+local failed_followup = { id = "cancelled-followup", revision = 4, text = "Retain café 東京",
+  intent = "auto", delivery = "failed", route = "steering", attachments = {}, error = "Turn cancelled" }
+input.receive(state, { revision = 14, suspended = false, execution_busy = false,
+  upsert = { failed_followup }, removed = {} })
+assert(#state.queue == 1 and #state.pending_steer == 0 and #state.pending_submit == 0)
+compose("new idle draft Δ")
+submission.start(state, { text = "new idle draft Δ", context = context }, function() end)
+local queued_submission = requests[#requests]
+local queued_message = vim.deepcopy(queued_submission.parameters.action.message)
+local queued_identity = state.pending_steer[1]
+assert(queued_identity and queued_identity.id == queued_message.id,
+  "local optimistic submission lost its identity before acknowledgment")
+queued_message.revision = 1
+queued_submission.callback({ operation_id = queued_submission.parameters.id, revision = 15,
+  suspended = false, execution_busy = false, upsert = { queued_message }, removed = {} })
+assert(not state.busy and not state.execution_busy and #state.pending_steer == 0 and #state.pending_submit == 0,
+  "confirmed queued draft was labelled as steering while the provider was idle")
+assert(#state.queue == 2 and state.queue[1].id == failed_followup.id and state.queue[2] == queued_identity,
+  "host queue acknowledgment changed FIFO or entry identity")
+assert(state.queue[2].text == "new idle draft Δ" and text() == "",
+  "queue presentation lost the submitted draft or restored it over the composer")
+queued_message.delivery, queued_message.route, queued_message.revision = "delivering", "steering", 2
+input.receive(state, { revision = 16, suspended = false, execution_busy = true,
+  upsert = { queued_message }, removed = {} })
+assert(#state.pending_steer == 1 and state.pending_steer[1] == queued_identity and #state.queue == 1,
+  "authoritative steering dispatch did not move the existing entry into steering")
 print("harness_input_state: passed")
 vim.cmd("qa!")

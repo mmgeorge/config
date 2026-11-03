@@ -262,7 +262,8 @@ function M.open(started_at)
     and vim.api.nvim_buf_is_valid(native_main_status.state.replica.buffer)
   then
     if not native_main_status.state.ready then return native_main_status.state end
-    vim.api.nvim_win_set_buf(window, native_main_status.state.replica.buffer)
+    local mounted, failure = native.show(native_main_status.state, window)
+    if not mounted then notify_error(failure or "Status window could not be opened", "Forge") return end
     require("forge.startup_log").write("status.buffer.reused", {
       elapsed_ms = math.floor((vim.uv.hrtime() - command_started) / 1e6),
     })

@@ -4,7 +4,192 @@ use crate::provider::{
     ToolInvocation, ToolOutcome, ToolUpdate, TurnUpdate,
 };
 use crate::turn::{ToolState, TurnOutcome, TurnState};
+use futures_util::FutureExt;
 use std::sync::atomic::AtomicUsize;
+
+/// Preserve multiple bounded observation windows and await their final publication before readiness.
+#[tokio::test]
+async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publication() -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let workspace = super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.checkpoint = None;
+        broker.turn_cancellation.arm(true);
+        let (publication, _updates) = publication::channel();
+        let ForegroundDispatch::Admitting(admission) = broker.begin_foreground_dispatch(
+            Request {
+                id: 1,
+                method: "session.prompt.submit".into(),
+                params: json!({"text":"Observe every frame"}),
+            },
+            publication,
+        )?
+        else {
+            anyhow::bail!("fixture did not create foreground admission");
+        };
+        let mut staged = broker.stage_foreground_interaction(
+            "Observe every frame",
+            PromptMode::Chat,
+            Some(&ExchangeAdmission::chat("Observe every frame".into())),
+            ProviderInput::from_text("Observe every frame"),
+        )?;
+        broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
+        let engine = broker
+            .execution_registry()
+            .owner(crate::provider::ExecutionOwner::root(&broker.session.id))
+            .await?;
+        let mut transaction = broker.construct_foreground_transaction(&staged, engine.clone())?;
+        // Replace the never-polled submission with accepted observation fixtures, retaining its real host owner.
+        transaction.native.task.abort_all();
+        while let Some(result) = transaction.native.task.join_next().await {
+            match result {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(_) => anyhow::bail!("replacement observation fixture dispatched its submission"),
+            }
+        }
+        let scope = transaction.state.scope.clone();
+        let (native, stream) = crate::provider::events::channel(scope.clone());
+        transaction.native.events = stream;
+        transaction.native_open = false;
+        transaction.session_events =
+            Arc::new(crate::provider::session_execution::SessionObservationInbox::default());
+        transaction.question_enabled = false;
+        transaction.cleanup_open = false;
+        transaction.execution_open = false;
+        transaction.agent_revision.borrow_and_update();
+        let turn = crate::provider::TurnAddress {
+            scope,
+            thread_id: "prefix-thread".into(),
+            turn_id: "prefix-turn".into(),
+        };
+        let mut frames = vec![ProviderEvent::Turn {
+            address: turn.clone(),
+            update: TurnUpdate::Started { started_at_ms: 1 },
+        }];
+        let mut expected = String::new();
+        for index in 0..128 {
+            let text = format!("frame-{index:03}: α🦀\n");
+            expected.push_str(&text);
+            frames.extend(crate::provider::test_support::message(
+                &turn,
+                format!("message-{index}"),
+                Some(crate::provider::MessageRole::Response),
+                text,
+            ));
+        }
+        frames.push(ProviderEvent::Turn {
+            address: turn.clone(),
+            update: TurnUpdate::Finished {
+                outcome: TurnOutcome::Completed,
+                completed_at_ms: 2,
+            },
+        });
+        transaction
+            .pending_session_observations
+            .extend(frames[..64].iter().cloned());
+        for event in &frames[64..160] {
+            native.send(event.clone())?;
+        }
+        for event in &frames[160..] {
+            transaction.session_events.push(event.clone())?;
+        }
+        transaction.pending_native_ready = Some(Ok(ProviderCompletion::default()));
+        transaction.native_goal = Some(NativeGoalTransition::ContinuationInitial {
+            observation: frames[0].clone(),
+        });
+        broker.collect_foreground_observations(&mut transaction)?;
+        assert_eq!(
+            transaction.pending_session_observations.len(),
+            forge_protocol::MAX_PENDING_FRAMES
+        );
+        assert!(
+            transaction.next().now_or_never().is_none(),
+            "full held staging consumed another source frame"
+        );
+        transaction.native_goal = None;
+        let mut dispatch = ForegroundDispatch::Running {
+            transaction: Box::new(transaction),
+            admission,
+        };
+        let mut action = ForegroundAction::Wait;
+        let mut publications = 0;
+        loop {
+            action = match action {
+                ForegroundAction::Wait => {
+                    let ForegroundDispatch::Running { transaction, .. } = &mut dispatch else {
+                        anyhow::bail!("prefix application changed foreground ownership");
+                    };
+                    let signal = transaction.next().await?;
+                    if matches!(
+                        &signal,
+                        ForegroundSignal::Native(NativeForegroundSignal::NativeReady(_))
+                    ) {
+                        assert_eq!(
+                            publications,
+                            frames.len(),
+                            "native readiness bypassed its accepted prefix"
+                        );
+                        assert!(!transaction.observation_publication_in_flight);
+                        let messages: String = transaction
+                            .state
+                            .interaction
+                            .turn
+                            .iter()
+                            .flat_map(|turn| turn.messages())
+                            .map(|message| message.text())
+                            .collect();
+                        assert_eq!(
+                            messages, expected,
+                            "bounded transfer changed native bytes/order"
+                        );
+                        assert_eq!(
+                            transaction
+                                .state
+                                .interaction
+                                .turn
+                                .last()
+                                .context("missing native turn")?
+                                .state(),
+                            TurnState::Finished {
+                                outcome: TurnOutcome::Completed
+                            }
+                        );
+                        break;
+                    }
+                    broker.step_foreground(&mut dispatch, signal)?
+                }
+                ForegroundAction::Effect(job @ ForegroundJob::ObservationPublication(_)) => {
+                    let ForegroundDispatch::Running { transaction, .. } = &mut dispatch else {
+                        anyhow::bail!("publication lost its foreground owner");
+                    };
+                    assert!(transaction.observation_publication_in_flight);
+                    assert!(
+                        transaction.next().now_or_never().is_none(),
+                        "native result escaped before publication acknowledgment"
+                    );
+                    let signal = match job.run().await? {
+                        ForegroundSignal::ObservationPublicationNeedsForward { events } => {
+                            ForegroundSignal::ObservationPublicationDelivered(Ok(events))
+                        }
+                        signal => signal,
+                    };
+                    publications += 1;
+                    broker.step_foreground(&mut dispatch, signal)?
+                }
+                _ => {
+                    anyhow::bail!("unexpected foreground effect while transferring accepted prefix")
+                }
+            };
+        }
+        drop(native);
+        engine.close().await?;
+        Ok(())
+    })
+    .await
+    .context("bounded foreground prefix did not settle")?
+}
 
 #[derive(Clone, Copy)]
 enum ProviderFailure {
@@ -38,19 +223,46 @@ impl crate::provider::ProviderAdapter for CancelledNativeProvider {
     }
 
     /// Release the fixture without external resources.
-    async fn shutdown(&self) -> Result<()> {
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
 
     /// Keep explicit cleanup independent from the provider's reported cancellation.
-    async fn cleanup_execution(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
 
     /// Leave the adapter reusable after cancelled execution.
-    async fn cancel_session(&self, _: &str) -> Result<()> {
-        self.cancellations.fetch_add(1, Ordering::SeqCst);
-        Ok(())
+    async fn cancel_session(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move {
+            self.cancellations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CancelSession,
+                source,
+            )
+        })
     }
 
     /// Report no outstanding provider turn after the synchronous fixture result.

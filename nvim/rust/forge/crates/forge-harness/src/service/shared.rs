@@ -365,6 +365,10 @@ async fn trace(
         }
         _ => {}
     }
+    let snapshot_trace = trace.clone();
+    tokio::task::spawn_blocking(move || snapshot_trace.flush())
+        .await
+        .context("collect trace snapshot barrier")??;
     let status = match session_id.as_deref() {
         Some(session_id) => trace.session_status(session_id),
         None => trace.status(),

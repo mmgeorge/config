@@ -19,7 +19,7 @@ pub trait ProviderHost: Send + Sync + 'static {
     type Settings: Sync;
     type Submission: Sync;
     type MockResponseControl: Sync;
-    fn owner(request: &Self::Request) -> Result<ExecutionOwner, ProviderError>;
+    fn owner(request: &Self::Request) -> std::result::Result<ExecutionOwner, ProviderError>;
     fn output(events: Vec<ProviderEvent>, completion: Self::Completion) -> Self::Output;
     fn has_resources(settings: &Self::Settings) -> bool;
 }
@@ -33,21 +33,27 @@ pub trait Provider: Send + Sync + 'static {
         self: std::sync::Arc<Self>,
         request: <Self::Host as ProviderHost>::Request,
         scope: InvocationScope,
-    ) -> Result<(), ProviderError>;
+    ) -> std::result::Result<(), ProviderError>;
 
     /// Observe normalized events through the lifetime of one execution owner's session.
     async fn session_events(
         &self,
         owner: ExecutionOwner,
-    ) -> Result<events::ProviderEventStream, ProviderError>;
+    ) -> std::result::Result<events::ProviderEventStream, ProviderError>;
 
     /// Retire one failed owner's native binding and observation generation before replacement.
-    async fn reset_session(&self, _owner: &ExecutionOwner) -> Result<()> {
+    async fn reset_session(
+        &self,
+        _owner: &ExecutionOwner,
+    ) -> std::result::Result<(), ProviderError> {
         Err(UnsupportedCapability("session_replacement").into())
     }
 
     /// Revoke callback authority before collecting an owner with unreliable observation.
-    async fn fence_session(&self, _owner: &ExecutionOwner) -> Result<()> {
+    async fn fence_session(
+        &self,
+        _owner: &ExecutionOwner,
+    ) -> std::result::Result<(), ProviderError> {
         Err(UnsupportedCapability("session_fencing").into())
     }
 
@@ -57,7 +63,7 @@ pub trait Provider: Send + Sync + 'static {
         owner: &ExecutionOwner,
         scope: InvocationScope,
         input: <Self::Host as ProviderHost>::SteeringInput,
-    ) -> Result<(), ProviderError> {
+    ) -> std::result::Result<(), ProviderError> {
         if scope.owner != *owner {
             return Err(ProviderError::Rejected {
                 message: "steering scope belongs to a different execution owner".into(),
@@ -72,7 +78,7 @@ pub trait Provider: Send + Sync + 'static {
     async fn initialize_session(
         &self,
         _request: <Self::Host as ProviderHost>::Request,
-    ) -> Result<Option<ProviderSessionId>> {
+    ) -> std::result::Result<Option<ProviderSessionId>, ProviderError> {
         Ok(None)
     }
 
@@ -106,7 +112,7 @@ pub trait Provider: Send + Sync + 'static {
         &self,
         _request: ProviderCatalogRequest,
         setting: &<Self::Host as ProviderHost>::Settings,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), ProviderError> {
         if <Self::Host as ProviderHost>::has_resources(setting) {
             return Err(UnsupportedCapability("resource_selection").into());
         }
@@ -115,7 +121,7 @@ pub trait Provider: Send + Sync + 'static {
     /// Collect provider process ownership after admitted session work has drained.
     /// Publish final observations for known background tools before closing every
     /// session event stream. Callers drain those streams before releasing session leases.
-    async fn shutdown(&self) -> Result<()>;
+    async fn shutdown(&self) -> std::result::Result<(), ProviderError>;
 
     /// Return stable provider identity and capability without starting a provider process.
     fn descriptor(&self) -> ProviderDescriptor;
@@ -164,7 +170,7 @@ pub trait Provider: Send + Sync + 'static {
         _model: &str,
         _reasoning_effort: Option<&str>,
         _history: &str,
-    ) -> Result<String> {
+    ) -> std::result::Result<String, ProviderError> {
         Err(UnsupportedCapability("text_generation").into())
     }
 
@@ -246,10 +252,10 @@ pub trait Provider: Send + Sync + 'static {
     }
 
     /// Interrupt the parent and descendants for one session and await terminal evidence.
-    async fn cleanup_execution(&self, session_id: &str) -> Result<()>;
+    async fn cleanup_execution(&self, session_id: &str) -> std::result::Result<(), ProviderError>;
 
     /// Stop and collect one session through the same execution cleanup contract.
-    async fn cancel_session(&self, session_id: &str) -> Result<()> {
+    async fn cancel_session(&self, session_id: &str) -> std::result::Result<(), ProviderError> {
         self.cleanup_execution(session_id).await
     }
 

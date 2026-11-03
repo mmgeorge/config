@@ -42,6 +42,8 @@ pub async fn open(
     trace: Arc<dyn ProviderTrace>,
     correlation_id: &str,
 ) -> Result<super::handle::CopilotSession, ProviderError> {
+    client.ensure_healthy()?;
+    let generation = client.generation.clone();
     // Discover inherited sources before creating a session that could start or authenticate them.
     let selection = match &options.resources {
         ResourceDiscovery::Managed { selected_mcp, .. } => {
@@ -80,7 +82,6 @@ pub async fn open(
     } else {
         None
     };
-    let runtime = client.clone();
     let client = &client.inner;
     let native_id = options
         .session_id
@@ -203,6 +204,7 @@ pub async fn open(
         let mut events = super::event_stream::SessionEventStream::from_subscription(
             prepared.subscribe(), native_id, |_| true,
             trace.clone(), correlation_id.to_owned(), super::event_stream::StartupState::Pending,
+            generation.clone(),
         );
         let start = || prepared.start();
         fn future_bytes<F, Fut>(_: &F) -> usize
@@ -219,7 +221,8 @@ pub async fn open(
         let session = match started {
             Ok(session) => session,
             Err(error) => {
-                let cause = ProviderError::from(error);
+                let cause = generation.failure().map(ProviderError::Observation)
+                    .unwrap_or_else(|| ProviderError::from(error));
                 if let Err(cleanup) = events.close().await {
                     return Err(ProviderError::PreparationCleanup { cause: Arc::new(cause), cleanup: Arc::new(ProviderError::from(cleanup)) }.into());
                 }
@@ -228,7 +231,7 @@ pub async fn open(
         };
         trace.record(correlation_id, "future.stack_probe", json!({"phase":"copilot.prepared.ready","bytes":0}));
         Ok(super::handle::CopilotSession {
-            inner: Arc::new(session), events: super::intake::SessionIntake::new(events, runtime),
+            inner: Arc::new(session), events: super::intake::SessionIntake::new(events, generation.clone()), generation,
         })
     }.await;
     result.map_err(ProviderError::from)

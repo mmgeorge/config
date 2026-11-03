@@ -18,47 +18,47 @@ pub(crate) struct ForegroundFailure {
     admission_baseline_failed: bool,
     admission_effects: Option<AppliedProviderEvent>,
     admission_events: Vec<SessionEvent>,
-    rollback: CancellationRollbackPhase,
+    baseline_cleanup: FailureBaselinePhase,
 }
 
-enum CancellationRollbackPhase {
+enum FailureBaselinePhase {
     Unexamined,
     Pending,
     Complete,
 }
 
-/// Collect a cancelled baseline before optional native rollback, without the broker lock.
-pub(crate) struct CancelledTurnRollbackJob {
+/// Collect a failed pre-baseline owner before optional cancellation rollback, without the broker lock.
+pub(crate) struct FailureBaselineJob {
     provider: Arc<Provider>,
     session_id: String,
     exchange_id: String,
-    baseline: CancelledBaseline,
-    policy: CancelledTurnRollbackPolicy,
+    baseline: AbortedBaseline,
+    policy: FailureBaselinePolicy,
 }
 
-enum CancelledTurnRollbackPolicy {
+enum FailureBaselinePolicy {
     Retain,
     RequestNativeRollback,
 }
 
-enum CancelledTurnRollback {
+enum BaselineDisposition {
     Retracted,
     Retained,
 }
 
 /// Carry the captured exchange identity and collection/rollback result back to its owner.
-pub(crate) struct CancelledTurnRollbackResult {
+pub(crate) struct FailureBaselineResult {
     exchange_id: String,
-    outcome: Result<CancelledTurnRollback>,
+    outcome: Result<BaselineDisposition>,
 }
 
 /// Transfer an uncollected baseline to the registry if its foreground waiter disappears.
-struct CancelledBaseline {
+struct AbortedBaseline {
     task: Option<crate::checkpoint::CheckpointTask>,
     registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
 }
 
-impl CancelledBaseline {
+impl AbortedBaseline {
     /// Stop the baseline while retaining its handle until an explicit join.
     fn new(
         task: Option<crate::checkpoint::CheckpointTask>,
@@ -71,7 +71,7 @@ impl CancelledBaseline {
     }
 
     /// Bound foreground waiting while leaving incomplete work owned for drop recovery.
-    async fn collect(&mut self) -> Result<()> {
+    async fn collect(&mut self) -> std::result::Result<(), crate::checkpoint::CheckpointFailure> {
         let Some(task) = self.task.as_mut() else {
             return Ok(());
         };
@@ -80,44 +80,48 @@ impl CancelledBaseline {
                 self.task.take();
                 result
             }
-            Err(error) => Err(error).context("cancelled baseline collection timed out"),
+            Err(source) => Err(crate::checkpoint::CheckpointFailure::CollectionDeadline { source }),
         }
     }
 
     /// Treat requested task cancellation as collected, while preserving worker failures.
-    async fn join(task: &mut crate::checkpoint::CheckpointTask) -> Result<()> {
+    async fn join(
+        task: &mut crate::checkpoint::CheckpointTask,
+    ) -> std::result::Result<(), crate::checkpoint::CheckpointFailure> {
         match (&mut task.0).await {
-            Ok(result) => result
-                .map(|_| ())
-                .context("cancelled baseline worker failed"),
+            Ok(result) => result.map(|_| ()),
             Err(error) if error.is_cancelled() => Ok(()),
-            Err(error) => Err(error).context("cancelled baseline worker panicked"),
+            Err(source) => Err(crate::checkpoint::CheckpointFailure::WorkerJoin { source }),
         }
     }
 }
 
-impl Drop for CancelledBaseline {
+impl Drop for AbortedBaseline {
     fn drop(&mut self) {
         let Some(mut task) = self.task.take() else {
             return;
         };
-        if let Err(error) = self
-            .registry
-            .retain_cleanup(async move { Self::join(&mut task).await })
-        {
+        if let Err(error) = self.registry.retain_cleanup(
+            crate::provider::session_execution::CleanupWorkKind::CheckpointCollection,
+            async move {
+                Self::join(&mut task)
+                    .await
+                    .map_err(crate::provider::session_execution::CleanupWorkFailure::Checkpoint)
+            },
+        ) {
             self.registry.record_cleanup_failure(error);
         }
     }
 }
 
-impl CancelledTurnRollbackJob {
+impl FailureBaselineJob {
     /// Join the aborted baseline before requesting provider rollback or releasing the host.
-    pub(crate) async fn run(mut self) -> CancelledTurnRollbackResult {
+    pub(crate) async fn run(mut self) -> FailureBaselineResult {
         let outcome = async {
             self.baseline.collect().await?;
             match self.policy {
-                CancelledTurnRollbackPolicy::Retain => Ok(CancelledTurnRollback::Retained),
-                CancelledTurnRollbackPolicy::RequestNativeRollback => {
+                FailureBaselinePolicy::Retain => Ok(BaselineDisposition::Retained),
+                FailureBaselinePolicy::RequestNativeRollback => {
                     let retracted = tokio::time::timeout(
                         std::time::Duration::from_secs(30),
                         self.provider.rollback_cancelled_turn_for(&self.session_id),
@@ -125,15 +129,15 @@ impl CancelledTurnRollbackJob {
                     .await
                     .context("native cancelled-turn rollback timed out")??;
                     Ok(if retracted {
-                        CancelledTurnRollback::Retracted
+                        BaselineDisposition::Retracted
                     } else {
-                        CancelledTurnRollback::Retained
+                        BaselineDisposition::Retained
                     })
                 }
             }
         }
         .await;
-        CancelledTurnRollbackResult {
+        FailureBaselineResult {
             exchange_id: self.exchange_id,
             outcome,
         }
@@ -144,29 +148,48 @@ impl CancelledTurnRollbackJob {
 pub(crate) struct AdmissionCleanupJob {
     registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
     owner: crate::provider::ExecutionOwner,
-    checkpoint: Option<crate::checkpoint::CheckpointTask>,
+    baseline: AdmissionBaseline,
 }
 
+/// Carry native collection and the staged baseline's exact disposition to its host owner.
 pub(crate) struct AdmissionCleanupResult {
     engine: Result<(), ProviderError>,
-    checkpoint: Option<Result<crate::checkpoint::CheckpointRecord>>,
+    baseline: AdmissionBaselineResult,
+}
+
+enum AdmissionBaseline {
+    Capture(Option<crate::checkpoint::CheckpointTask>),
+    Abort(AbortedBaseline),
+}
+
+enum AdmissionBaselineResult {
+    Captured(Option<Result<crate::checkpoint::CheckpointRecord>>),
+    Aborted(std::result::Result<(), crate::checkpoint::CheckpointFailure>),
 }
 
 impl AdmissionCleanupJob {
+    /// Fence the staged native owner and collect its captured or explicitly aborted baseline.
     pub(crate) async fn run(mut self) -> AdmissionCleanupResult {
-        let checkpoint = async {
-            match self.checkpoint.as_mut() {
-                Some(task) => Some(
-                    (&mut task.0)
-                        .await
-                        .context("admission checkpoint worker failed")
-                        .and_then(|result| result),
-                ),
-                None => None,
+        let baseline = async {
+            match &mut self.baseline {
+                AdmissionBaseline::Abort(task) => {
+                    AdmissionBaselineResult::Aborted(task.collect().await)
+                }
+                AdmissionBaseline::Capture(task) => {
+                    AdmissionBaselineResult::Captured(match task.as_mut() {
+                        Some(task) => Some(
+                            (&mut task.0)
+                                .await
+                                .context("admission checkpoint worker failed")
+                                .and_then(|result| result.map_err(anyhow::Error::new)),
+                        ),
+                        None => None,
+                    })
+                }
             }
         };
-        let (engine, checkpoint) = tokio::join!(self.registry.fence(&self.owner), checkpoint);
-        AdmissionCleanupResult { engine, checkpoint }
+        let (engine, baseline) = tokio::join!(self.registry.fence(&self.owner), baseline);
+        AdmissionCleanupResult { engine, baseline }
     }
 }
 
@@ -384,6 +407,8 @@ impl HarnessBroker {
                 engine: transaction.engine.clone(),
                 native,
                 original: error,
+                trace: self.trace.clone(),
+                scope: transaction.state.scope.clone(),
             },
         ))
     }
@@ -443,7 +468,7 @@ impl HarnessBroker {
                     admission_baseline_failed: false,
                     admission_effects: None,
                     admission_events: Vec::new(),
-                    rollback: CancellationRollbackPhase::Unexamined,
+                    baseline_cleanup: FailureBaselinePhase::Unexamined,
                 });
                 Ok(ForegroundAction::WaitForPublicationDrain)
             }
@@ -505,23 +530,44 @@ impl HarnessBroker {
                 .secondary
                 .push(format!("cancel unsubmitted input: {error:#}"));
         }
-        let checkpoint = match self.exchange_runtime.as_mut() {
-            Some(runtime) if runtime.exchange_id == staged.exchange.id => runtime.checkpoint.take(),
+        let registry = self.execution_registry();
+        let baseline = match self.exchange_runtime.as_mut() {
+            Some(runtime)
+                if runtime.exchange_id == staged.exchange.id
+                    && runtime.tools_blocked()
+                    && runtime.checkpoint.is_some() =>
+            {
+                runtime
+                    .tool_gate
+                    .as_ref()
+                    .context("blocked staged baseline has no tool gate")?
+                    .complete(Err(format!(
+                        "admission failed before checkpoint persistence: {:#}",
+                        failure.original
+                    )))?;
+                AdmissionBaseline::Abort(AbortedBaseline::new(
+                    runtime.checkpoint.take(),
+                    registry.clone(),
+                ))
+            }
+            Some(runtime) if runtime.exchange_id == staged.exchange.id => {
+                AdmissionBaseline::Capture(runtime.checkpoint.take())
+            }
             Some(_) => {
                 failure
                     .secondary
                     .push("staged admission runtime belongs to another exchange".into());
                 failure.admission_baseline_failed = true;
-                None
+                AdmissionBaseline::Capture(None)
             }
-            None => None,
+            None => AdmissionBaseline::Capture(None),
         };
         failure.admission_cleanup_started = true;
         Ok(ForegroundAction::Effect(ForegroundJob::AdmissionCleanup(
             AdmissionCleanupJob {
-                registry: self.execution_registry(),
+                registry,
                 owner: crate::provider::ExecutionOwner::root(&self.session.id),
-                checkpoint,
+                baseline,
             },
         )))
     }
@@ -549,7 +595,36 @@ impl HarnessBroker {
         {
             failure.cleanup = Some(error);
         }
-        if let Some(checkpoint) = result.checkpoint {
+        let checkpoint = match result.baseline {
+            AdmissionBaselineResult::Captured(checkpoint) => checkpoint,
+            AdmissionBaselineResult::Aborted(collected) => {
+                let staged = admission
+                    .staged_interaction
+                    .as_mut()
+                    .context("failed staged baseline lost its exchange")?;
+                if let Err(error) = collected {
+                    failure
+                        .secondary
+                        .push(format!("collect failed admission baseline: {error}"));
+                }
+                let cancelled = failure.original.is::<TurnCancelled>();
+                staged.exchange.set_awaiting_input(false);
+                self.questions.cancel_chat(Some(&staged.exchange.id))?;
+                staged.exchange.finalization_error =
+                    (!cancelled).then(|| format!("{:#}", failure.original));
+                staged.exchange.finish(
+                    if cancelled {
+                        crate::exchange::ExchangeOutcome::Cancelled
+                    } else {
+                        crate::exchange::ExchangeOutcome::Failed
+                    },
+                    self.clock.now_ms(),
+                )?;
+                self.store.save_exchange(&staged.exchange)?;
+                None
+            }
+        };
+        if let Some(checkpoint) = checkpoint {
             let staged = admission
                 .staged_interaction
                 .as_mut()
@@ -798,7 +873,7 @@ impl HarnessBroker {
                 admission_baseline_failed: false,
                 admission_effects: None,
                 admission_events: Vec::new(),
-                rollback: CancellationRollbackPhase::Unexamined,
+                baseline_cleanup: FailureBaselinePhase::Unexamined,
             });
         }
         if transaction.native_goal.take().is_some() {
@@ -822,29 +897,13 @@ impl HarnessBroker {
                     .push(format!("record interrupted native goal: {error:#}"));
             }
         }
-        loop {
-            match transaction.native.events.try_next() {
-                Ok(Some(event)) => transaction.pending_session_observations.push_back(event),
-                Ok(None) => break,
-                Err(error) => {
-                    transaction
-                        .failure
-                        .as_mut()
-                        .unwrap()
-                        .secondary
-                        .push(format!("native observation drain failed: {error:#}"));
-                    break;
-                }
-            }
-        }
-        match transaction.session_events.drain() {
-            Ok(events) => transaction.pending_session_observations.extend(events),
-            Err(error) => transaction
+        if let Err(error) = self.collect_foreground_observations(transaction) {
+            transaction
                 .failure
                 .as_mut()
-                .unwrap()
+                .expect("foreground cleanup installs its failure before draining observations")
                 .secondary
-                .push(format!("session observation drain failed: {error:#}")),
+                .push(format!("foreground observation drain failed: {error:#}"));
         }
         self.advance_foreground_failure(dispatch)
     }
@@ -865,28 +924,56 @@ impl HarnessBroker {
             } => (transaction, admission),
             _ => anyhow::bail!("failure observations have no foreground owner"),
         };
-        if transaction.failure.is_none() || !transaction.pending_session_observations.is_empty() {
+        if transaction.failure.is_none() {
+            return Ok(ForegroundAction::Wait);
+        }
+        if transaction.pending_session_observations.is_empty()
+            && let Err(error) = self.collect_foreground_observations(transaction)
+        {
+            transaction
+                .failure
+                .as_mut()
+                .expect("foreground failure was checked before refilling observations")
+                .secondary
+                .push(format!("foreground observation drain failed: {error:#}"));
+        }
+        if !transaction.pending_session_observations.is_empty()
+            || transaction.observation_publication_in_flight
+        {
             return Ok(ForegroundAction::Wait);
         }
         let failure = transaction.failure.as_mut().unwrap();
-        if matches!(failure.rollback, CancellationRollbackPhase::Pending) {
+        self.trace.record(&self.session.id, "foreground.failure.advance", json!({
+            "exchange_id":transaction.state.interaction.id,
+            "cause":format!("{:#}",failure.original),
+            "cleanup":failure.cleanup.as_ref().map(ToString::to_string),
+            "checkpoint_pending":failure.checkpoint_pending,
+            "checkpoint_done":failure.checkpoint_done,
+            "baseline_pending":transaction.state.runtime.as_ref().is_some_and(|runtime| runtime.checkpoint.is_some()),
+            "tools_blocked":transaction.state.runtime.as_ref().is_some_and(ExchangeRuntime::tools_blocked),
+            "retraction_eligible":transaction.state.runtime.as_ref().is_some_and(|runtime| runtime.retraction_eligible),
+            "native_rollback":self.capability.native_turn_rollback,
+            "restore_prompt":transaction.native.cancellation.restore_prompt.load(Ordering::Acquire),
+            "retraction_allowed":transaction.native.cancellation.retraction_allowed.load(Ordering::Acquire),
+        }));
+        if matches!(failure.baseline_cleanup, FailureBaselinePhase::Pending) {
             return Ok(ForegroundAction::Wait);
         }
-        if matches!(failure.rollback, CancellationRollbackPhase::Unexamined)
-            && failure.original.is::<TurnCancelled>()
-            && failure.cleanup.is_none()
-            && transaction
-                .state
-                .runtime
-                .as_ref()
-                .is_some_and(ExchangeRuntime::tools_blocked)
+        if matches!(failure.baseline_cleanup, FailureBaselinePhase::Unexamined)
+            && transaction.state.runtime.as_ref().is_some_and(|runtime| {
+                runtime.tools_blocked()
+                    && (runtime.checkpoint.is_some() || failure.original.is::<TurnCancelled>())
+            })
         {
             let runtime = transaction
                 .state
                 .runtime
                 .as_mut()
-                .context("blocked cancellation requires its checkpoint runtime")?;
-            let retractable = runtime.retraction_eligible
+                .context("failed pre-baseline execution requires its checkpoint runtime")?;
+            let cancelled = failure.original.is::<TurnCancelled>();
+            let retractable = cancelled
+                && failure.cleanup.is_none()
+                && runtime.retraction_eligible
                 && self.capability.native_turn_rollback
                 && transaction
                     .native
@@ -898,44 +985,55 @@ impl HarnessBroker {
                     .cancellation
                     .retraction_allowed
                     .load(Ordering::Acquire);
-            // The native owner is collected and this gate proves no provider tool
-            // could pass the baseline. Cancel its owned worker instead of waiting
-            // for unrelated worktree writes before settling the stopped prompt.
+            // This denied gate proves no provider tool could pass the baseline,
+            // even when native collection reported failure. Collect its owned
+            // worker independently; native cleanup failure still forbids rollback.
             runtime
                 .tool_gate
                 .as_ref()
                 .context("blocked checkpoint gate is missing")?
-                .complete(Err(
-                    "turn cancelled before checkpoint admission completed".into()
-                ))?;
+                .complete(Err(format!(
+                    "execution ended before checkpoint admission completed: {:#}",
+                    failure.original
+                )))?;
             // CleanupForeground has already joined and closed this execution owner.
             // Replacement must collect registry cleanup before opening its successor.
             let baseline =
-                CancelledBaseline::new(runtime.checkpoint.take(), self.execution_registry());
+                AbortedBaseline::new(runtime.checkpoint.take(), self.execution_registry());
             let interaction = &mut transaction.state.interaction;
             self.questions.cancel_chat(Some(&interaction.id))?;
             interaction.set_awaiting_input(false);
-            interaction.finalization_error = None;
+            interaction.finalization_error = match &failure.cleanup {
+                Some(cleanup) => Some(format!(
+                    "{:#}; native cleanup failed: {cleanup}",
+                    failure.original
+                )),
+                None => (!cancelled).then(|| format!("{:#}", failure.original)),
+            };
             interaction.finish(
-                crate::exchange::ExchangeOutcome::Cancelled,
+                if cancelled {
+                    crate::exchange::ExchangeOutcome::Cancelled
+                } else {
+                    crate::exchange::ExchangeOutcome::Failed
+                },
                 self.clock.now_ms(),
             )?;
             self.store.save_exchange(interaction)?;
             failure.checkpoint_done = true;
-            failure.rollback = CancellationRollbackPhase::Pending;
-            return Ok(ForegroundAction::Effect(
-                ForegroundJob::CancelledTurnRollback(CancelledTurnRollbackJob {
+            failure.baseline_cleanup = FailureBaselinePhase::Pending;
+            return Ok(ForegroundAction::Effect(ForegroundJob::FailureBaseline(
+                FailureBaselineJob {
                     provider: self.provider.clone(),
                     session_id: self.session.id.clone(),
                     exchange_id: interaction.id.clone(),
                     baseline,
                     policy: if retractable {
-                        CancelledTurnRollbackPolicy::RequestNativeRollback
+                        FailureBaselinePolicy::RequestNativeRollback
                     } else {
-                        CancelledTurnRollbackPolicy::Retain
+                        FailureBaselinePolicy::Retain
                     },
-                }),
-            ));
+                },
+            )));
         }
         if transaction
             .state
@@ -1060,29 +1158,29 @@ impl HarnessBroker {
         self.prepare_foreground_failure_publication(admission)
     }
 
-    /// Apply native proof only to the cancelled exchange that requested rollback.
-    pub(crate) fn complete_cancelled_turn_rollback(
+    /// Apply collection or cancellation proof only to the failed exchange that owns the baseline.
+    pub(crate) fn complete_failure_baseline(
         &mut self,
         dispatch: &mut ForegroundDispatch,
-        result: CancelledTurnRollbackResult,
+        result: FailureBaselineResult,
     ) -> Result<ForegroundAction> {
         let transaction = match dispatch {
             ForegroundDispatch::Running { transaction, .. }
             | ForegroundDispatch::Finalizing { transaction, .. } => transaction,
-            _ => anyhow::bail!("native rollback has no foreground owner"),
+            _ => anyhow::bail!("baseline collection has no foreground owner"),
         };
         let failure = transaction
             .failure
             .as_mut()
-            .context("native rollback failure owner is missing")?;
+            .context("baseline collection failure owner is missing")?;
         anyhow::ensure!(
-            matches!(failure.rollback, CancellationRollbackPhase::Pending)
+            matches!(failure.baseline_cleanup, FailureBaselinePhase::Pending)
                 && transaction.state.interaction.id == result.exchange_id,
-            "native rollback result crosses foreground ownership"
+            "baseline collection result crosses foreground ownership"
         );
-        failure.rollback = CancellationRollbackPhase::Complete;
+        failure.baseline_cleanup = FailureBaselinePhase::Complete;
         match result.outcome {
-            Ok(CancelledTurnRollback::Retracted) => {
+            Ok(BaselineDisposition::Retracted) => {
                 self.store.delete_exchange(&result.exchange_id)?;
                 transaction.state.runtime.take();
                 failure.original = TurnRetracted {
@@ -1092,9 +1190,9 @@ impl HarnessBroker {
                 failure.admission_effects =
                     Some(AppliedProviderEvent::Timeline(self.reconcile_timeline()?));
             }
-            Ok(CancelledTurnRollback::Retained) => {}
+            Ok(BaselineDisposition::Retained) => {}
             Err(error) => failure.secondary.push(format!(
-                "collect cancelled baseline or roll back native turn: {error:#}"
+                "collect failed baseline or roll back cancelled native turn: {error:#}"
             )),
         }
         self.advance_foreground_failure(dispatch)
@@ -1519,13 +1617,42 @@ impl HarnessBroker {
         if let Some(scope) = idle_scope {
             self.reopened_execution.end_settlement(&scope);
         }
+        let settlement = match &*dispatch {
+            ForegroundDispatch::Running { transaction, .. }
+            | ForegroundDispatch::Finalizing { transaction, .. } => {
+                Some(transaction.settlement.clone())
+            }
+            ForegroundDispatch::Admitting(_)
+            | ForegroundDispatch::Done(_)
+            | ForegroundDispatch::Transitioning => None,
+        };
+        let collected = (|| -> Result<()> {
+            if let Some(settlement) = settlement
+                && self.host_settlement().is_some()
+            {
+                // Native cleanup and all publication jobs have joined. Keep an
+                // ambiguous or unpublished host mutation fenced for repair.
+                settlement.seal_effects(&[])?;
+                settlement.validate_effects_settled()?;
+                let mut checkout = settlement.checkout()?;
+                drop(checkout.take());
+                drop(checkout);
+                self.clear_host_settlement(&settlement)?;
+            }
+            Ok(())
+        })();
         let admission = match dispatch {
             ForegroundDispatch::Admitting(admission)
             | ForegroundDispatch::Running { admission, .. }
             | ForegroundDispatch::Finalizing { admission, .. } => admission,
             _ => unreachable!("failure owner checked above"),
         };
-        let failure = admission.failure.take().context("failure state missing")?;
+        let mut failure = admission.failure.take().context("failure state missing")?;
+        if let Err(error) = collected {
+            failure
+                .secondary
+                .push(format!("collect failed host settlement: {error:#}"));
+        }
         if admission.automatic_check_owner.is_none() {
             self.event_sink = None;
         }
@@ -1571,18 +1698,24 @@ mod tests {
             let task = tokio::spawn(async move {
                 let _exit = BaselineExit(Some(exited));
                 let _ = started.send(());
-                std::future::pending::<Result<crate::checkpoint::CheckpointRecord>>().await
+                std::future::pending::<
+                    std::result::Result<
+                        crate::checkpoint::CheckpointRecord,
+                        crate::checkpoint::CheckpointFailure,
+                    >,
+                >()
+                .await
             });
             ready.await?;
-            let job = CancelledTurnRollbackJob {
+            let job = FailureBaselineJob {
                 provider: broker.provider.clone(),
                 session_id: broker.session.id.clone(),
                 exchange_id: "cancelled-baseline".into(),
-                baseline: CancelledBaseline::new(
+                baseline: AbortedBaseline::new(
                     Some(crate::checkpoint::CheckpointTask(task)),
                     registry.clone(),
                 ),
-                policy: CancelledTurnRollbackPolicy::Retain,
+                policy: FailureBaselinePolicy::Retain,
             };
             if abandoned {
                 drop(job);
@@ -1594,7 +1727,7 @@ mod tests {
             } else {
                 let result =
                     tokio::time::timeout(std::time::Duration::from_secs(2), job.run()).await?;
-                assert!(matches!(result.outcome?, CancelledTurnRollback::Retained));
+                assert!(matches!(result.outcome?, BaselineDisposition::Retained));
             }
             assert_eq!(
                 exit.try_recv(),

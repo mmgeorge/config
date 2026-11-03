@@ -19,34 +19,70 @@ impl crate::provider::ProviderAdapter for StartupProvider {
     async fn initialize_session(
         &self,
         request: ProviderRequest,
-    ) -> Result<Option<forge_provider_api::ProviderSessionId>> {
-        assert!(request.input.text().is_empty());
-        self.calls.fetch_add(1, Ordering::AcqRel);
-        self.request.lock().unwrap().push(request.clone());
-        self.entered.notify_one();
-        self.release.acquire().await.unwrap().forget();
-        if request.provider_session_id.as_ref().map(|id| id.as_str())
-            == Some("missing-provider-thread")
-        {
-            return Err(crate::provider::ProviderError::SessionMissing {
-                message: "fixture missing provider thread".into(),
+    ) -> std::result::Result<
+        Option<forge_provider_api::ProviderSessionId>,
+        crate::provider::ProviderError,
+    > {
+        let result: anyhow::Result<Option<forge_provider_api::ProviderSessionId>> = async move {
+            assert!(request.input.text().is_empty());
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.request.lock().unwrap().push(request.clone());
+            self.entered.notify_one();
+            self.release.acquire().await.unwrap().forget();
+            if request.provider_session_id.as_ref().map(|id| id.as_str())
+                == Some("missing-provider-thread")
+            {
+                return Err(crate::provider::ProviderError::SessionMissing {
+                    message: "fixture missing provider thread".into(),
+                }
+                .into());
             }
-            .into());
+            if self.fail {
+                anyhow::bail!("fixture startup failure");
+            }
+            Ok(Some("prepared-provider-thread".to_owned().try_into()?))
         }
-        if self.fail {
-            anyhow::bail!("fixture startup failure");
-        }
-        Ok(Some("prepared-provider-thread".to_owned().try_into()?))
+        .await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::InitializeSession,
+                source,
+            )
+        })
     }
 
-    async fn shutdown(&self) -> Result<()> {
-        Ok(())
+    async fn shutdown(&self) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::Shutdown,
+                source,
+            )
+        })
     }
-    async fn cleanup_execution(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cleanup_execution(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                source,
+            )
+        })
     }
-    async fn cancel_session(&self, _: &str) -> Result<()> {
-        Ok(())
+    async fn cancel_session(
+        &self,
+        _: &str,
+    ) -> std::result::Result<(), crate::provider::ProviderError> {
+        let result: anyhow::Result<()> = async move { Ok(()) }.await;
+        result.map_err(|source| {
+            crate::provider::lifecycle_error::classify(
+                forge_provider_api::error::ProviderOperation::CancelSession,
+                source,
+            )
+        })
     }
     async fn has_active_turn(&self, _: &str) -> bool {
         false

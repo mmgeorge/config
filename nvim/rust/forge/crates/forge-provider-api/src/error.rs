@@ -1,5 +1,95 @@
 use crate::{events, retry};
 
+/// Identify the lifecycle operation whose external or legacy source failed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderOperation {
+    InitializeSession,
+    GenerateText,
+    ResetSession,
+    FenceSession,
+    CancelSession,
+    CleanupExecution,
+    Shutdown,
+    ReconcileSettings,
+    CollectEventReader,
+    CollectNativeRuntime,
+    RetireSession,
+    NativeTransport,
+    AdmitInput,
+}
+
+/// Classify the failure independently of provider-specific source vocabulary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderFailureKind {
+    Transport,
+    Protocol,
+    Provider,
+    Runtime,
+}
+
+/// Preserve a classified lifecycle operation and its original external cause.
+#[derive(Clone, Debug)]
+pub struct ProviderOperationFailure {
+    operation: ProviderOperation,
+    kind: ProviderFailureKind,
+    source: std::sync::Arc<dyn std::error::Error + Send + Sync>,
+}
+
+impl ProviderOperationFailure {
+    /// Create an operation failure at an explicit external or legacy adapter boundary.
+    pub fn new(
+        operation: ProviderOperation,
+        source: std::sync::Arc<dyn std::error::Error + Send + Sync>,
+    ) -> Self {
+        Self {
+            operation,
+            kind: ProviderFailureKind::Runtime,
+            source,
+        }
+    }
+
+    /// Create a native failure with an adapter-owned, explicit failure classification.
+    pub fn native(
+        operation: ProviderOperation,
+        kind: ProviderFailureKind,
+        source: std::sync::Arc<dyn std::error::Error + Send + Sync>,
+    ) -> Self {
+        Self {
+            operation,
+            kind,
+            source,
+        }
+    }
+
+    /// Get the operation independently of the native error's display text.
+    pub fn operation(&self) -> ProviderOperation {
+        self.operation
+    }
+
+    /// Get the adapter's failure classification without parsing its source text.
+    pub fn kind(&self) -> ProviderFailureKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for ProviderOperationFailure {
+    /// Render native details only at the caller's diagnostic boundary.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "provider {:?} failed: {}",
+            self.operation, self.source
+        )
+    }
+}
+
+impl std::error::Error for ProviderOperationFailure {
+    /// Retain the original SDK, transport, worker, or legacy host cause.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 #[derive(Debug)]
 /// Identifies user cancellation across broker and task-coordinator error boundaries.
 pub struct TurnCancelled;
@@ -68,6 +158,11 @@ impl ObservationCleanup {
         self.origin = Some(Box::new(origin));
         self
     }
+    /// Preserve a real source loss observed while an intentional collection was running.
+    pub fn with_observation(mut self, observation: crate::lifecycle::ObservationFailure) -> Self {
+        self.observation = observation;
+        self
+    }
     /// Get the typed error that triggered cleanup, when known.
     pub fn origin(&self) -> Option<&ProviderError> {
         self.origin.as_deref()
@@ -117,6 +212,15 @@ impl std::error::Error for ObservationCleanup {
 
 #[derive(Debug)]
 pub enum ProviderError {
+    /// A typed host/provider lifecycle invariant rejected a transition.
+    Contract(crate::lifecycle::LifecycleError),
+    /// A lifecycle operation failed at an explicitly classified adapter boundary.
+    Operation(ProviderOperationFailure),
+    /// Preserve the original failure and every distinct subsequent cleanup failure.
+    Combined {
+        primary: Box<ProviderError>,
+        secondary: Vec<ProviderError>,
+    },
     /// Observation failed and bounded cleanup did not complete successfully.
     Cleanup(std::sync::Arc<ObservationCleanup>),
     /// The selected provider does not implement this optional operation.
@@ -137,6 +241,8 @@ pub enum ProviderError {
     /// The adapter proved that this input was not consumed and may be continued safely.
     NotConsumed {
         message: String,
+        /// Retain a concrete local rejection while preserving proof of no native consumption.
+        cause: Option<std::sync::Arc<ProviderError>>,
     },
     /// Dispatch may have occurred, but native acceptance was not established.
     DeliveryUncertain {
@@ -167,6 +273,15 @@ pub enum ProviderError {
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Contract(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Operation(error) => std::fmt::Display::fmt(error, formatter),
+            Self::Combined { primary, secondary } => {
+                std::fmt::Display::fmt(primary, formatter)?;
+                for error in secondary {
+                    write!(formatter, "; cleanup: {error}")?;
+                }
+                Ok(())
+            }
             Self::Cleanup(error) => std::fmt::Display::fmt(error, formatter),
             Self::Unsupported(error) => std::fmt::Display::fmt(error, formatter),
             Self::Observation(failure) => {
@@ -182,7 +297,7 @@ impl std::fmt::Display for ProviderError {
                 "provider preparation failed before dispatch: {error}"
             ),
             Self::Cancelled => formatter.write_str("provider execution cancelled"),
-            Self::NotConsumed { message }
+            Self::NotConsumed { message, .. }
             | Self::DeliveryUncertain { message }
             | Self::Transport { message }
             | Self::Protocol { message }
@@ -198,6 +313,9 @@ impl std::fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Contract(error) => Some(error),
+            Self::Operation(error) => Some(error),
+            Self::Combined { primary, .. } => Some(primary.as_ref()),
             Self::Cleanup(error) => Some(error.as_ref()),
             Self::Unsupported(error) => Some(error),
             Self::RuntimeVersion(error) => Some(error),
@@ -206,8 +324,10 @@ impl std::error::Error for ProviderError {
             Self::Retryable(error) => Some(error.as_ref()),
             Self::Delivery(error) => Some(error),
             Self::Observation(error) => Some(error),
+            Self::NotConsumed { cause, .. } => cause
+                .as_ref()
+                .map(|error| error.as_ref() as &(dyn std::error::Error + 'static)),
             Self::Cancelled
-            | Self::NotConsumed { .. }
             | Self::DeliveryUncertain { .. }
             | Self::Transport { .. }
             | Self::Protocol { .. }
@@ -239,6 +359,13 @@ impl From<events::EventDeliveryError> for ProviderError {
     }
 }
 
+impl From<crate::lifecycle::LifecycleError> for ProviderError {
+    /// Preserve lifecycle rejection details without converting them to a protocol message.
+    fn from(error: crate::lifecycle::LifecycleError) -> Self {
+        Self::Contract(error)
+    }
+}
+
 impl From<anyhow::Error> for ProviderError {
     fn from(error: anyhow::Error) -> Self {
         let error = match error.downcast::<Self>() {
@@ -260,10 +387,16 @@ impl From<anyhow::Error> for ProviderError {
         if error.is::<TurnCancelled>() {
             return Self::Cancelled;
         }
-        Self::Provider {
-            code: None,
-            message: format!("{error:#}"),
-        }
+        let error = match error.downcast::<crate::version::RuntimeVersionError>() {
+            Ok(error) => return Self::RuntimeVersion(error),
+            Err(error) => error,
+        };
+        // Existing external adapter orchestration still supplies erased errors.
+        // Retain its actual source chain; retry permission is never inferred here.
+        Self::Operation(ProviderOperationFailure::new(
+            ProviderOperation::NativeTransport,
+            std::sync::Arc::from(error.into_boxed_dyn_error()),
+        ))
     }
 }
 
