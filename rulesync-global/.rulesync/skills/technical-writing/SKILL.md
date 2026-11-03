@@ -2,7 +2,7 @@
 name: technical-writing
 description: >-
   Author and revise technical documents, architectural overviews, RFCs,
-  reference docs, READMEs, API docstrings, and rustdoc. Use when creating or
+  specifications, reference docs, READMEs, API docstrings, and rustdoc. Use when creating or
   editing standalone documentation files or docstrings. Source code comments
   follow the active language skill.
 ---
@@ -87,6 +87,8 @@ Use this workflow when providing explanations to the user, or to develop new doc
 
 Each profile template describes its main claim, gives examples to adapt, and specifies what to include or leave out.
 
+When relaxing a specification, remove unnecessary restrictions rather than replace them with exhaustive permission statements or inherited format semantics.
+
 | Reader Objective | Document Profile |
 | --- | --- |
 | Understand a system or subsystem architecture | [Architectural overview](templates/architectural-overview.md) |
@@ -95,6 +97,7 @@ Each profile template describes its main claim, gives examples to adapt, and spe
 | Understand causal mechanics, mental models, or concepts | [Technical explanation](templates/explanation.md) |
 | Execute an operational procedure or runbook | [How-to guide](templates/how-to.md) |
 | Look up an exhaustive interface, CLI, schema, or error catalog | [Reference](templates/reference.md) |
+| Define or revise a format, protocol, schema, or conformance contract | [Specification](templates/specification.md) |
 | Learn a technology by building an end-to-end project | [Tutorial](templates/tutorial.md) |
 | Predict how a public API, docstring, or endpoint behaves | [API documentation](templates/api-documentation.md) |
 
