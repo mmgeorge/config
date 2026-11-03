@@ -107,7 +107,6 @@ function M.open(timeline_key)
   vim.bo[composer_buf].swapfile = false
   vim.bo[composer_buf].filetype = "ForgeHarnessInput"
   vim.bo[composer_buf].modifiable = true
-  vim.api.nvim_buf_set_lines(composer_buf, 0, -1, false, { "" })
   vim.wo[composer_win].wrap = true
   vim.wo[composer_win].linebreak = true
   vim.wo[composer_win].showbreak = ""

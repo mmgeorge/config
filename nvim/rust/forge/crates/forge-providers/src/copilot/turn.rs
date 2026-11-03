@@ -13,6 +13,14 @@ use tokio::sync::Notify;
 pub(crate) enum IdleOutcome {
     Completed,
     Aborted,
+    HostHandoff,
+}
+
+impl IdleOutcome {
+    /// Permit an unfinished native root only after interruption established its terminal idle.
+    fn interrupted(self) -> bool {
+        matches!(self, Self::Aborted | Self::HostHandoff)
+    }
 }
 
 pub enum CopilotRetraction {
@@ -195,7 +203,7 @@ impl CopilotTurnEvent {
             "Copilot terminal boundary has unresolved delivery"
         );
         anyhow::ensure!(
-            idle.outcome == IdleOutcome::Aborted
+            idle.outcome.interrupted()
                 || idle
                     .root_turns
                     .iter()
@@ -212,7 +220,7 @@ impl CopilotTurnEvent {
             let proven = covered.contains(message)
                 && root.is_some_and(|root| match idle.outcome {
                     IdleOutcome::Completed => matches!(root.phase, RootTurnPhase::Finished { .. }),
-                    IdleOutcome::Aborted => true,
+                    IdleOutcome::Aborted | IdleOutcome::HostHandoff => true,
                 });
             anyhow::ensure!(
                 proven,
@@ -257,7 +265,8 @@ impl CopilotTurnEvent {
                 anyhow::anyhow!("Copilot input has no correlated foreground start")
             })?;
             let terminal = match (&root.phase, idle.outcome) {
-                (RootTurnPhase::Finished { .. }, _) => {
+                (RootTurnPhase::Finished { .. }, _)
+                | (RootTurnPhase::Running, IdleOutcome::HostHandoff) => {
                     forge_provider_api::lifecycle::ExecutionResult::Completed {
                         completion: forge_provider_api::completion::ProviderCompletion::default()
                             .into(),
@@ -317,7 +326,7 @@ impl CopilotTurnEvent {
                         .as_ref()
                         .is_some_and(|covered| state.accepted_inputs.is_subset(covered))
                     && state.terminal_event.as_ref().is_some_and(|idle| {
-                        (idle.outcome == IdleOutcome::Aborted
+                        (idle.outcome.interrupted()
                             || idle
                                 .root_turns
                                 .iter()
@@ -328,7 +337,7 @@ impl CopilotTurnEvent {
                                     .get(message)
                                     .and_then(|input| consumed_root(&idle.root_turns, input))
                                     .is_some_and(|root| {
-                                        idle.outcome == IdleOutcome::Aborted
+                                        idle.outcome.interrupted()
                                             || matches!(root.phase, RootTurnPhase::Finished { .. })
                                     })
                             })
@@ -395,6 +404,35 @@ impl CopilotTurnEvent {
             .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
         state.cancelled = true;
         Ok(())
+    }
+
+    /// Fence abort behind every native send admitted before stop closed new input.
+    pub(crate) async fn finish_pending_sends(
+        &self,
+    ) -> std::result::Result<(), forge_provider_api::ProviderError> {
+        loop {
+            let changed = self.sends_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.state.lock().map_err(|_| {
+                    forge_provider_api::ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::CancelSession,
+                            forge_provider_api::ProviderFailureKind::Runtime,
+                        ),
+                    )
+                })?;
+                if state.pending_sends == 0 {
+                    return if state.uncertain_send {
+                        Err(forge_provider_api::ProviderError::DeliveryUncertain)
+                    } else {
+                        Ok(())
+                    };
+                }
+            }
+            changed.await;
+        }
     }
 
     pub async fn wait_finished(&self) {
@@ -1597,6 +1635,94 @@ mod tests {
         assert_eq!(executions[0].1, vec![first]);
         assert_eq!(executions[1].0, "start-b");
         assert_eq!(executions[1].1, vec![second]);
+        Ok(())
+    }
+
+    /// Native abort cannot overtake an already-admitted steering write.
+    #[tokio::test]
+    async fn cancellation_fences_new_sends_and_waits_for_admitted_steering() -> Result<()> {
+        let turn = CopilotTurnEvent::default();
+        let _guard = turn.activate(None, None)?;
+        let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
+        let steering = turn.steer(None, async {
+            acknowledged.await?;
+            Ok("receipt".into())
+        });
+        tokio::pin!(steering);
+        assert!(futures_util::poll!(&mut steering).is_pending());
+        turn.request_stop()?;
+        let fenced = turn.finish_pending_sends();
+        tokio::pin!(fenced);
+        assert!(futures_util::poll!(&mut fenced).is_pending());
+        assert!(
+            turn.steer(None, async {
+                panic!("closed input reached native dispatch")
+            })
+            .await
+            .is_err()
+        );
+        acknowledge.send(()).unwrap();
+        steering.await?;
+        fenced.await?;
+        Ok(())
+    }
+
+    /// A dropped write must retain uncertain delivery rather than certify a clean abort fence.
+    #[tokio::test]
+    async fn cancellation_fence_preserves_uncertain_send_outcome() -> Result<()> {
+        let turn = CopilotTurnEvent::default();
+        let _guard = turn.activate(None, None)?;
+        let mut steering = Box::pin(turn.steer(None, std::future::pending()));
+        assert!(futures_util::poll!(&mut steering).is_pending());
+        turn.request_stop()?;
+        drop(steering);
+        assert!(matches!(
+            turn.finish_pending_sends().await,
+            Err(forge_provider_api::ProviderError::DeliveryUncertain)
+        ));
+        Ok(())
+    }
+
+    /// Host-requested interruption can finish a structured handoff without a native turn-end.
+    #[tokio::test]
+    async fn host_handoff_idle_completes_only_its_correlated_execution() -> Result<()> {
+        let turn = CopilotTurnEvent::default();
+        let guard = turn.activate(None, None)?;
+        let submission = forge_provider_api::SubmissionId::try_from("handoff".to_owned())?;
+        guard
+            .send("cursor".into(), Some(submission.clone()), async {
+                Ok("receipt".into())
+            })
+            .await?;
+        turn.observe(&live_event(
+            "user",
+            None,
+            "user.message",
+            serde_json::json!({"messageId":"receipt","turnId":"0"}),
+        )?)?;
+        turn.observe(&live_event(
+            "start",
+            Some("user"),
+            "assistant.turn_start",
+            serde_json::json!({"turnId":"0"}),
+        )?)?;
+        let idle = live_event(
+            "idle",
+            Some("start"),
+            "session.idle",
+            serde_json::json!({"aborted":true}),
+        )?;
+        turn.observe(&idle)?;
+        turn.observe_idle_at(&idle, IdleOutcome::HostHandoff)?;
+        turn.idle_settled().await?;
+        let executions = turn.terminal_executions()?;
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].0, "start");
+        assert_eq!(executions[0].1, vec![submission]);
+        assert!(matches!(
+            executions[0].2,
+            forge_provider_api::lifecycle::ExecutionResult::Completed { .. }
+        ));
         Ok(())
     }
 

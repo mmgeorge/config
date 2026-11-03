@@ -1283,6 +1283,15 @@ impl HarnessService {
     }
 }
 
+/// Identify the provider-neutral boundary reached by foreground collection.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CollectionPhase {
+    CancellingApprovals,
+    CollectingExecution,
+    Collected,
+}
+
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
     compaction_workers: Mutex<CompactionWorkers>,
@@ -1697,6 +1706,57 @@ impl SessionController {
         Ok(result??)
     }
 
+    /// Bound foreground collection and fence admission when cleanup cannot establish quiescence.
+    async fn collect_execution(
+        &self,
+        session_id: &str,
+    ) -> Result<(), crate::provider::ProviderError> {
+        let provider = self.provider_handle();
+        let collection = async {
+            self.trace.record(
+                session_id,
+                "execution.collection",
+                json!({"phase":CollectionPhase::CancellingApprovals}),
+            );
+            self.permission
+                .cancel_owner(&crate::provider::ExecutionOwner::root(session_id), None)
+                .await
+                .map_err(|error| {
+                    crate::provider::lifecycle_error::classify(
+                        forge_provider_api::ProviderOperation::HostEffectPublication,
+                        error,
+                    )
+                })?;
+            self.trace.record(
+                session_id,
+                "execution.collection",
+                json!({"phase":CollectionPhase::CollectingExecution}),
+            );
+            let result = provider.cleanup_execution(session_id).await;
+            self.trace.record(
+                session_id,
+                "execution.collection",
+                json!({"phase":CollectionPhase::Collected}),
+            );
+            result
+        };
+        let result = tokio::time::timeout(Duration::from_secs(30), collection)
+            .await
+            .unwrap_or_else(|_| {
+                Err(crate::provider::ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::CleanupExecution,
+                        forge_provider_api::ProviderFailureKind::Timeout,
+                    ),
+                ))
+            });
+        if let Err(error) = &result {
+            self.task_controller.mark_native_goal_uncertain();
+            self.cancellation.fail_cleanup(error);
+        }
+        result
+    }
+
     /// Collects the native execution before a replacement prompt can release its owner.
     async fn interrupt_checks(&self, session_id: &str, run_id: &str) -> Result<()> {
         let active = self.checks.active()?;
@@ -1712,9 +1772,7 @@ impl SessionController {
             {
                 return Err(error);
             }
-            let owner = crate::provider::ExecutionOwner::root(session_id);
-            self.permission.cancel_owner(&owner, None).await?;
-            Ok(self.provider_handle().cleanup_execution(session_id).await?)
+            Ok(self.collect_execution(session_id).await?)
         }
         .await;
         if let Err(error) = cleanup {
@@ -3797,25 +3855,13 @@ async fn execute_task_transition_inner(
             if let Some(run_id) = controller.checks.active()? {
                 controller.checks.cancel(&run_id)?;
             }
-            let approval_owner = crate::provider::ExecutionOwner::root(
-                &controller.catalog_request.read().await.harness_session_id,
-            );
-            controller
-                .permission
-                .cancel_owner(&approval_owner, None)
-                .await?;
-            if let Err(error) = controller
-                .provider_handle()
-                .cleanup_execution(&operation.session_id)
-                .await
-            {
-                controller.cancellation.fail_cleanup(&error);
+            if let Err(error) = controller.collect_execution(&operation.session_id).await {
                 return Err(
                     anyhow::Error::new(error).context("collect current task before transition")
                 );
             }
             if restart {
-                controller.cancellation.request_restart();
+                controller.cancellation.finish_restart_cleanup();
             } else {
                 controller.cancellation.request(restore_prompt);
             }
@@ -5469,19 +5515,33 @@ async fn request_foreground_native_cancel(
     controller
         .cancellation
         .request_native_cancel(restore_prompt);
-    let owner = crate::provider::ExecutionOwner::root(session_id);
-    controller.permission.cancel_owner(&owner, None).await?;
     let provider = controller.provider_handle();
-    if !provider.has_active_turn(session_id).await {
-        controller.cancellation.request(restore_prompt);
-    }
-    match tokio::time::timeout(Duration::from_secs(15), provider.cancel_session(session_id)).await {
+    let cancellation = async {
+        let owner = crate::provider::ExecutionOwner::root(session_id);
+        controller
+            .permission
+            .cancel_owner(&owner, None)
+            .await
+            .map_err(|error| {
+                crate::provider::lifecycle_error::classify(
+                    forge_provider_api::ProviderOperation::HostEffectPublication,
+                    error,
+                )
+            })?;
+        if !provider.has_active_turn(session_id).await {
+            controller.cancellation.request(restore_prompt);
+        }
+        provider.cancel_session(session_id).await
+    };
+    match tokio::time::timeout(Duration::from_secs(15), cancellation).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
+            controller.task_controller.mark_native_goal_uncertain();
             controller.cancellation.request(restore_prompt);
             Err(anyhow::Error::new(error).context("native cancellation failed"))
         }
         Err(source) => {
+            controller.task_controller.mark_native_goal_uncertain();
             controller.cancellation.request(restore_prompt);
             Err(anyhow::Error::new(source).context("native cancellation exceeded 15 seconds"))
         }
@@ -5796,22 +5856,10 @@ async fn route_control_request(
         RuntimeMethod::SessionTurnRestart => {
             let _child_quiescence = quiesce_children(controller).await?;
             controller.cancellation.begin_cleanup(true, false)?;
-            let approval_owner = crate::provider::ExecutionOwner::root(
-                &controller.catalog_request.read().await.harness_session_id,
-            );
             controller
-                .permission
-                .cancel_owner(&approval_owner, None)
+                .collect_execution(&catalog_request.harness_session_id)
                 .await?;
-            if let Err(error) = controller
-                .provider_handle()
-                .cleanup_execution(&catalog_request.harness_session_id)
-                .await
-            {
-                controller.cancellation.fail_cleanup(&error);
-                return Err(error.into());
-            }
-            controller.cancellation.request_restart();
+            controller.cancellation.finish_restart_cleanup();
             let approval_owner = crate::provider::ExecutionOwner::root(
                 &controller.catalog_request.read().await.harness_session_id,
             );
@@ -7302,6 +7350,68 @@ mod tests {
         Ok(())
     }
 
+    /// Publish new questions once without turning state refreshes into an idle notification loop.
+    #[tokio::test]
+    async fn unchanged_question_relay_does_not_publish_refresh_notifications() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let controller = service.registry().await?.resolve(&session_id).await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let mut published_revision = None;
+        controller
+            .relay_questions(&sink, &mut published_revision)
+            .await?;
+        let initial = output.try_recv()?;
+        assert_eq!(
+            serde_json::from_slice::<Value>(initial.bytes())?["event"],
+            "questions_changed"
+        );
+        controller
+            .relay_questions(&sink, &mut published_revision)
+            .await?;
+        assert!(
+            matches!(output.try_recv(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+
+        controller.questions.ask(
+            "new-question",
+            "exchange",
+            crate::question::QuestionOrigin::Chat,
+            vec![crate::question::QuestionDraft {
+                header: "Layout".into(),
+                question: "Which layout?".into(),
+                requirement: crate::question::QuestionRequirement::Optional,
+                options: Vec::new(),
+            }],
+        )?;
+        controller
+            .relay_questions(&sink, &mut published_revision)
+            .await?;
+        let changed = output.try_recv()?;
+        assert_eq!(
+            serde_json::from_slice::<Value>(changed.bytes())?["payload"]["questions"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        controller
+            .relay_questions(&sink, &mut published_revision)
+            .await?;
+        assert!(
+            matches!(output.try_recv(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn required_chat_questions_enqueue_one_continuation_after_answer_delivery() -> Result<()>
     {
@@ -7341,7 +7451,7 @@ mod tests {
             }],
         )?;
         let (sink, _output) = forge_protocol::outbound::channel();
-        controller.relay_questions(&sink).await?;
+        controller.relay_questions(&sink, &mut None).await?;
         assert!(
             controller
                 .coordinator
@@ -7362,8 +7472,8 @@ mod tests {
                     },
                 },
             })?;
-        controller.relay_questions(&sink).await?;
-        controller.relay_questions(&sink).await?;
+        controller.relay_questions(&sink, &mut None).await?;
+        controller.relay_questions(&sink, &mut None).await?;
         let queued = controller.coordinator.submissions.snapshot()?;
         assert_eq!(queued.messages.len(), 2);
         assert!(matches!(
@@ -7458,8 +7568,8 @@ mod tests {
         .await??;
         assert!(!controller.questions.snapshot()?.questions[0].pending());
         assert_eq!(controller.questions.outbox()?.len(), 1);
-        controller.relay_questions(&sink).await?;
-        controller.relay_questions(&sink).await?;
+        controller.relay_questions(&sink, &mut None).await?;
+        controller.relay_questions(&sink, &mut None).await?;
         assert!(controller.questions.outbox()?.is_empty());
         let queued = controller.coordinator.submissions.snapshot()?;
         assert_eq!(queued.messages.len(), 1);
@@ -9128,6 +9238,102 @@ mod tests {
         Ok(())
     }
 
+    /// Fail a stranded native cleanup without committing the requested access change.
+    #[tokio::test]
+    async fn permission_transition_bounds_unresponsive_cleanup() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let descriptor = forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().expect("fixture identity"),
+        )
+        .expect("fixture descriptor");
+        let provider =
+            crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
+                Err(crate::provider::ProviderError::Cancelled)
+            });
+        provider.with_cleanup({
+            let started = started.clone();
+            let release = release.clone();
+            move |_| {
+                let started = started.clone();
+                let release = release.clone();
+                async move {
+                    started.notify_one();
+                    let _permit = release.acquire().await.unwrap();
+                    Ok(())
+                }
+            }
+        });
+        let provider_fixture =
+            crate::provider::test_support::ProviderTestSession::from_native(provider)?;
+        *controller.provider.write().unwrap() = provider_fixture.provider_handle();
+        let (sink, _output) = forge_protocol::outbound::channel();
+        service.start_provider_session(&session_id, &sink).await?;
+        while !controller.provider_ready().await {
+            tokio::task::yield_now().await;
+        }
+        let previous_execution = controller.coordinator.execution.acquire().await?;
+        let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+        let before = crate::session::SessionStore::load_session(&store, &session_id)?
+            .unwrap()
+            .access;
+        let mut operation = admit_task_intent(
+            &controller,
+            &session_id,
+            &Request {
+                id: 2,
+                method: "session.command.apply".into(),
+                params: json!({"operation_id":"blocked-permission","action":"permission","change":{"kind":"toggle_write_enabled"}}),
+            },
+            &mut store,
+        )?;
+        tokio::time::pause();
+        let mut transition = Box::pin(execute_task_transition(
+            &registry,
+            &controller,
+            &mut operation,
+            &mut store,
+            &sink,
+        ));
+        tokio::select! {
+            result = &mut transition => panic!("cleanup unexpectedly settled: {result:?}"),
+            () = started.notified() => {}
+        }
+        tokio::time::advance(Duration::from_secs(31)).await;
+        let error = transition
+            .await
+            .expect_err("unresponsive cleanup must fail the transition");
+        assert!(
+            matches!(error.downcast_ref::<crate::provider::ProviderError>(),
+            Some(crate::provider::ProviderError::Failure(failure))
+                if failure.operation() == forge_provider_api::ProviderOperation::CleanupExecution
+                    && failure.kind() == forge_provider_api::ProviderFailureKind::Timeout)
+        );
+        assert!(controller.task_controller.native_goal_is_uncertain());
+        assert!(!controller.agent_coordinator.is_quiescing());
+        assert_eq!(
+            crate::session::SessionStore::load_session(&store, &session_id)?
+                .unwrap()
+                .access,
+            before
+        );
+        release.add_permits(10);
+        drop(previous_execution);
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn conversation_undo_collects_execution_admission_before_rollback() -> Result<()> {
         let fixture = tempfile::tempdir()?;
@@ -10787,7 +10993,7 @@ mod tests {
                         },
                     },
                 })?;
-            controller.relay_questions(&sink).await?;
+            controller.relay_questions(&sink, &mut None).await?;
             assert!(controller.questions.outbox()?.is_empty());
             assert!(
                 !controller.task_input_is_current(&crate::input::InputPurpose::Question {

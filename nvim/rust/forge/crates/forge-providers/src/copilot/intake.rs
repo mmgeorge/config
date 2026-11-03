@@ -378,16 +378,18 @@ async fn decode_retained(
         output,
         sink,
     } = &mut *context;
-    let previous = decoder.root_address();
-    decoder.decode(&event, output, sink).await?;
     if event.agent_id.is_none()
         && event.event_type == "assistant.turn_start"
-        && decoder.root_address() != previous
+        && !decoder.owns_event(&event)
+        && decoder
+            .root_address()
+            .is_none_or(|address| address.turn_id.as_str() != event.id)
     {
         return Err(ProviderError::Observation(
-            ObservationFailure::OwnershipConflict,
+            ObservationFailure::UnexpectedExecution,
         ));
     }
+    decoder.decode(&event, output, sink).await?;
     Ok(())
 }
 
@@ -822,12 +824,16 @@ mod tests {
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if let Some(event) = observed.recv().await.unwrap()
-                    && let ProviderEvent::Execution { observation } = event.event
+                let event = observed.recv().await.unwrap().unwrap();
+                assert!(
+                    !matches!(event.event, ProviderEvent::Turn { .. }),
+                    "unadmitted work reached the host before ownership validation"
+                );
+                if let ProviderEvent::Execution { observation } = event.event
                     && matches!(
                         observation.update(),
                         ExecutionUpdate::ObservationLost {
-                            failure: ObservationFailure::OwnershipConflict,
+                            failure: ObservationFailure::UnexpectedExecution,
                             ..
                         }
                     )
@@ -840,7 +846,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             *intake.failure.borrow(),
-            Some(ObservationFailure::OwnershipConflict)
+            Some(ObservationFailure::UnexpectedExecution)
         ));
         intake.close().await.unwrap();
     }

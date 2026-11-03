@@ -26,6 +26,7 @@ struct BridgeFixtureProvider {
     fence_calls: AtomicUsize,
     retire_calls: AtomicUsize,
     cleanup_calls: AtomicUsize,
+    reconcile_calls: AtomicUsize,
 }
 
 impl BridgeFixtureProvider {
@@ -37,6 +38,7 @@ impl BridgeFixtureProvider {
             fence_calls: AtomicUsize::new(0),
             retire_calls: AtomicUsize::new(0),
             cleanup_calls: AtomicUsize::new(0),
+            reconcile_calls: AtomicUsize::new(0),
         })
     }
 
@@ -50,6 +52,17 @@ impl BridgeFixtureProvider {
 
 #[async_trait::async_trait]
 impl NativeProvider for BridgeFixtureProvider {
+    /// Record configuration writes against an initialized native session.
+    async fn reconcile_settings(
+        &self,
+        _: forge_provider_api::catalog::ProviderCatalogRequest,
+        _: forge_provider_api::SessionSettings,
+        _: forge_provider_api::ResourceSelection,
+    ) -> Result<(), ProviderError> {
+        self.reconcile_calls.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
     async fn initialize_session(
         &self,
         request: SessionRequest,
@@ -214,6 +227,43 @@ async fn bridge(
         Arc::new(crate::trace::TraceStore::open(root)?),
         root.to_owned(),
     ))
+}
+
+/// Defer cold configuration until initialization without poisoning later native writes.
+#[tokio::test]
+async fn cold_configuration_defers_native_write_until_initialization() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let native = BridgeFixtureProvider::new(false);
+    let bridge = bridge(root.path(), native.clone()).await?;
+    let request = provider_request(root.path());
+    let selection = crate::settings::PortableSettings::default();
+
+    bridge
+        .reconcile_settings(catalog_request(&request), &selection)
+        .await?;
+    let _events = bridge.session_events(request.owner()?).await?;
+    bridge
+        .reconcile_settings(catalog_request(&request), &selection)
+        .await?;
+    assert_eq!(native.reconcile_calls.load(Ordering::Acquire), 0);
+
+    bridge.initialize_session(request.clone()).await?;
+    bridge
+        .reconcile_settings(catalog_request(&request), &selection)
+        .await?;
+    assert_eq!(native.reconcile_calls.load(Ordering::Acquire), 1);
+
+    bridge.shutdown().await?;
+    assert!(matches!(
+        bridge
+            .reconcile_settings(catalog_request(&request), &selection)
+            .await,
+        Err(ProviderError::Failure(failure))
+            if failure.operation() == ProviderOperation::ReconcileSettings
+                && failure.kind() == ProviderFailureKind::Rejected
+    ));
+    assert_eq!(native.reconcile_calls.load(Ordering::Acquire), 1);
+    Ok(())
 }
 
 #[tokio::test]

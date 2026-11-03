@@ -2409,7 +2409,7 @@ local function close()
   local workspace = require("forge.views.harness.workspace")
   workspace.release(state)
   if state.presentation then
-    local ok, closed = pcall(state.presentation.close)
+    local ok, closed = pcall(state.presentation.close, { preserve_buffer = true })
     if not ok or not closed then
       workspace.attach(state)
       if not ok then error(closed, 0) end
@@ -2436,7 +2436,11 @@ end
 function M.activate_snapshot(result)
   local state = harness_state()
   local previous_session = state.session and state.session.id
-  if not snapshot.apply(state, result) then return end
+  if not snapshot.apply(state, result) then
+    state.initial_snapshot_pending = nil
+    M.render()
+    return
+  end
   if state.input and state.input.session_id == state.session.id then input_state.refresh(state) end
   state.initial_snapshot_pending = nil
   require("forge.views.harness.health").watch(state, function()

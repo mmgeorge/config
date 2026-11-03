@@ -17,6 +17,7 @@ use forge_provider_api::turn_control::{HostTurnStatus, TurnControl};
 use forge_provider_api::{
     ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation, SubmissionEvidence,
 };
+use futures_util::{StreamExt, stream};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -57,18 +58,90 @@ impl InvocationCallbacks {
     }
 }
 
+enum CallbackPhase {
+    Foreground,
+    Settled,
+}
+
+struct CallbackRegistration {
+    callbacks: InvocationCallbacks,
+    phase: CallbackPhase,
+}
+
 #[derive(Default)]
 struct CallbackRouter {
-    active: RwLock<HashMap<forge_provider_api::InvocationScope, InvocationCallbacks>>,
+    active: RwLock<HashMap<forge_provider_api::InvocationScope, CallbackRegistration>>,
     native_calls: RwLock<HashMap<String, InvocationCallbacks>>,
+    mcp_tools: RwLock<HashMap<String, HashSet<String>>>,
     next_generation: AtomicU64,
 }
 
 impl CallbackRouter {
+    /// Retain canonical tool names independently of the SDK's generated callback aliases.
+    async fn register_mcp_tools(
+        &self,
+        session: &CopilotSession,
+        resources: &forge_provider_api::ResourceSelection,
+    ) {
+        let servers = resources
+            .mcp
+            .iter()
+            .map(|server| server.name.clone())
+            .collect::<Vec<_>>();
+        let native = session.inner.clone();
+        let catalog = stream::iter(servers)
+            .map(move |server| {
+                let native = native.clone();
+                async move {
+                    let tools = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        native.rpc().mcp().list_tools(
+                            github_copilot_sdk::rpc::McpListToolsRequest {
+                                server_name: server.clone(),
+                            },
+                        ),
+                    )
+                    .await
+                    .ok()?
+                    .ok()?;
+                    Some((
+                        server,
+                        tools.tools.into_iter().map(|tool| tool.name).collect(),
+                    ))
+                }
+            })
+            .buffer_unordered(4)
+            .filter_map(futures_util::future::ready)
+            .collect()
+            .await;
+        *self.mcp_tools.write().await = catalog;
+    }
+
+    /// Resolve only one catalog-backed canonical identity; reject unknown or ambiguous aliases.
+    async fn canonical_mcp_target(&self, target: &str) -> Option<String> {
+        let (server, requested) = target.split_once('/')?;
+        let catalog = self.mcp_tools.read().await;
+        let mut matching = catalog
+            .get(server)?
+            .iter()
+            .filter(|tool| requested == tool.as_str() || requested == format!("{server}-{tool}"));
+        let canonical = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        Some(format!("{server}/{canonical}"))
+    }
+
     async fn install(&self, mut callbacks: InvocationCallbacks) -> Result<(), ProviderError> {
         let mut active = self.active.write().await;
         callbacks.generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        active.insert(callbacks.scope.clone(), callbacks);
+        active.insert(
+            callbacks.scope.clone(),
+            CallbackRegistration {
+                callbacks,
+                phase: CallbackPhase::Foreground,
+            },
+        );
         Ok(())
     }
 
@@ -80,7 +153,7 @@ impl CallbackRouter {
             .read()
             .await
             .get(scope)
-            .cloned()
+            .map(|registration| registration.callbacks.clone())
             .ok_or_else(|| failure(ProviderOperation::AdmitInput, ProviderFailureKind::Rejected))
     }
 
@@ -114,13 +187,30 @@ impl CallbackRouter {
             .any(|active| active.scope == *scope && active.generation == generation);
         if !still_owned {
             let mut active = self.active.write().await;
-            if active
-                .get(scope)
-                .is_some_and(|callbacks| callbacks.generation == generation)
-            {
+            if active.get(scope).is_some_and(|registration| {
+                registration.callbacks.generation == generation
+                    && matches!(registration.phase, CallbackPhase::Settled)
+            }) {
                 active.remove(scope);
             }
         }
+    }
+
+    /// Release foreground authority only after the prompt or its host settlement finishes.
+    async fn finish_foreground_scope(
+        &self,
+        scope: &forge_provider_api::InvocationScope,
+        generation: u64,
+    ) {
+        {
+            let mut active = self.active.write().await;
+            if let Some(registration) = active.get_mut(scope)
+                && registration.callbacks.generation == generation
+            {
+                registration.phase = CallbackPhase::Settled;
+            }
+        }
+        self.prune_settled_scope(scope, generation).await;
     }
 
     async fn callbacks_for_native_call(
@@ -227,7 +317,7 @@ impl TurnControl for CallbackRouter {
             .and_then(|active| {
                 active
                     .get(scope)
-                    .map(|callbacks| callbacks.control.tool_finished(scope, name))
+                    .map(|registration| registration.callbacks.control.tool_finished(scope, name))
             })
             .unwrap_or(false)
     }
@@ -245,7 +335,8 @@ impl forge_provider_api::ProviderHostEffects for CallbackRouter {
             .await
             .map_err(|_| forge_provider_api::session::HostEffectFailure::Retired)?;
         callbacks.effects.settle_foreground(binding, scope).await?;
-        self.prune_settled_scope(scope, callbacks.generation).await;
+        self.finish_foreground_scope(scope, callbacks.generation)
+            .await;
         Ok(())
     }
 }
@@ -262,8 +353,18 @@ impl NativeCallbackRouter for CallbackRouter {
     async fn authorize_native(
         &self,
         call_id: &str,
-        request: PermissionRequest,
+        mut request: PermissionRequest,
     ) -> PermissionResponse {
+        for target in &mut request.target_list {
+            if let forge_provider_api::permissions::PermissionTarget::Mcp { target } = target {
+                let Some(canonical) = self.canonical_mcp_target(target).await else {
+                    return PermissionResponse::Deny {
+                        reason: Some("MCP tool identity is unavailable or ambiguous.".into()),
+                    };
+                };
+                *target = canonical;
+            }
+        }
         match self.callbacks_for_native_call(call_id).await {
             Ok(callbacks)
                 if callbacks
@@ -291,7 +392,13 @@ impl NativeCallbackRouter for CallbackRouter {
             Some(call_id) => vec![self.callbacks_for_native_call(call_id).await?],
             // The SDK's pre-tool hook has no call identity. Fence all retained invocation
             // barriers for this binding instead of attributing the tool to a guessed owner.
-            None => self.active.read().await.values().cloned().collect(),
+            None => self
+                .active
+                .read()
+                .await
+                .values()
+                .map(|registration| registration.callbacks.clone())
+                .collect(),
         };
         if callbacks.is_empty() {
             return Err(failure(
@@ -601,12 +708,13 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
             workspace: PathBuf::from(&request.workspace),
             mode,
             system_message: request.system_instructions.clone(),
-            resources: if skills.is_empty() && selected_mcp.is_empty() {
-                super::session::ResourceDiscovery::Native
-            } else {
-                super::session::ResourceDiscovery::Managed {
-                    skill_directories: vec![profile_path.join("skills")],
-                    selected_mcp,
+            resources: match request.mode {
+                SessionMode::Background => super::session::ResourceDiscovery::Native,
+                SessionMode::Interactive | SessionMode::Child => {
+                    super::session::ResourceDiscovery::Managed {
+                        skill_directories: vec![profile_path.join("skills")],
+                        selected_mcp,
+                    }
                 }
             },
             excluded_tools: Vec::new(),
@@ -667,6 +775,9 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
                     )
                 })
             })?;
+        callbacks
+            .register_mcp_tools(&session, &request.resources)
+            .await;
         let turn = self.sessions.turn(&runtime_key).await;
         let binding = SessionBinding {
             id: binding_id.clone(),
@@ -1078,12 +1189,13 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
             workspace: PathBuf::from(&next_request.workspace),
             mode,
             system_message: next_request.system_instructions.clone(),
-            resources: if skills.is_empty() && selected_mcp.is_empty() {
-                super::session::ResourceDiscovery::Native
-            } else {
-                super::session::ResourceDiscovery::Managed {
-                    skill_directories: vec![profile_path.join("skills")],
-                    selected_mcp,
+            resources: match next_request.mode {
+                SessionMode::Background => super::session::ResourceDiscovery::Native,
+                SessionMode::Interactive | SessionMode::Child => {
+                    super::session::ResourceDiscovery::Managed {
+                        skill_directories: vec![profile_path.join("skills")],
+                        selected_mcp,
+                    }
                 }
             },
             excluded_tools: Vec::new(),
@@ -1152,6 +1264,10 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
             }
         };
         state.callbacks.retire_all(&state.binding.id).await?;
+        state
+            .callbacks
+            .register_mcp_tools(&session, &next_request.resources)
+            .await;
         *state.session.write().await = session;
         *state.request.lock().await = next_request;
         Ok(())
@@ -1214,6 +1330,14 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
 
     async fn cancel_session(&self, binding: &BindingId) -> Result<(), ProviderError> {
         let state = self.binding(binding).await?;
+        let trace = state.request.lock().await.trace.clone();
+        trace.record(forge_provider_api::trace::ProviderTraceRecord {
+            binding_id: binding.clone(),
+            event: forge_provider_api::trace::ProviderTraceEvent::CancellationStarted,
+            scope: None,
+            submission_id: None,
+            failure: None,
+        });
         state.turn.request_stop().map_err(|_| {
             failure(
                 ProviderOperation::CancelSession,
@@ -1222,12 +1346,35 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
         })?;
         let mut abort_error = None;
         if state.turn.is_active() {
-            if state.session.read().await.clone().abort().await.is_err() {
-                abort_error = Some(failure(
-                    ProviderOperation::CancelSession,
-                    ProviderFailureKind::Transport,
-                ));
-            }
+            let session = state.session.read().await.clone();
+            let stop = async {
+                let sends = state.turn.finish_pending_sends().await;
+                let aborted = session.abort().await;
+                match (sends, aborted) {
+                    (Ok(()), result) | (result, Ok(())) => result,
+                    (Err(primary), Err(secondary)) => Err(ProviderError::Combined {
+                        primary: Box::new(primary),
+                        secondary: vec![secondary],
+                    }),
+                }
+            };
+            let abort = tokio::time::timeout(std::time::Duration::from_secs(10), stop)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(failure(
+                        ProviderOperation::CancelSession,
+                        ProviderFailureKind::Timeout,
+                    ))
+                });
+            let failed = abort.as_ref().err().map(super::error::trace_failure_kind);
+            trace.record(forge_provider_api::trace::ProviderTraceRecord {
+                binding_id: binding.clone(),
+                event: forge_provider_api::trace::ProviderTraceEvent::CancellationAcknowledged,
+                scope: None,
+                submission_id: None,
+                failure: failed,
+            });
+            abort?;
             if tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 state.turn.wait_finished(),
@@ -1238,23 +1385,41 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
                 abort_error.get_or_insert_with(|| {
                     failure(
                         ProviderOperation::CancelSession,
-                        ProviderFailureKind::Transport,
+                        ProviderFailureKind::Timeout,
                     )
                 });
             }
         }
+        trace.record(forge_provider_api::trace::ProviderTraceRecord {
+            binding_id: binding.clone(),
+            event: forge_provider_api::trace::ProviderTraceEvent::ExecutionCollectionStarted,
+            scope: None,
+            submission_id: None,
+            failure: None,
+        });
         let mut join_error = None;
         match state.collect_execution().await {
             Ok(None | Some(Ok(()))) => {}
             Ok(Some(Err(error))) | Err(error) => join_error = Some(error),
         }
+        trace.record(forge_provider_api::trace::ProviderTraceRecord {
+            binding_id: binding.clone(),
+            event: forge_provider_api::trace::ProviderTraceEvent::ExecutionCollectionFinished,
+            scope: None,
+            submission_id: None,
+            failure: join_error.as_ref().map(super::error::trace_failure_kind),
+        });
         match (abort_error, join_error) {
             (Some(primary), Some(secondary)) => Err(ProviderError::Combined {
                 primary: Box::new(primary),
                 secondary: vec![secondary],
             }),
             (Some(error), None) | (None, Some(error)) => Err(error),
-            (None, None) => Ok(()),
+            (None, None) => {
+                // An aborted tool may never emit execution_complete. Revoke its routing before
+                // a later identity-free SDK hook evaluates barriers for this binding.
+                state.callbacks.retire_all(binding).await
+            }
         }
     }
 
@@ -1802,10 +1967,13 @@ impl CopilotProvider {
             }
             task_state
                 .callbacks
-                .prune_settled_scope(&grant_scope, callback_generation)
+                .finish_foreground_scope(&grant_scope, callback_generation)
                 .await;
             drop(guard);
-            result.map(|_| ())
+            match result {
+                Ok(_) | Err(ProviderError::Cancelled) => Ok(()),
+                Err(error) => Err(error),
+            }
         });
         *state.active.lock().await = Some(task);
         match activation.await {
@@ -1952,10 +2120,13 @@ impl CopilotProvider {
             }
             task_state
                 .callbacks
-                .prune_settled_scope(&task_scope, callback_generation)
+                .finish_foreground_scope(&task_scope, callback_generation)
                 .await;
             drop(guard);
-            result.map(|_| ())
+            match result {
+                Ok(_) | Err(ProviderError::Cancelled) => Ok(()),
+                Err(error) => Err(error),
+            }
         });
         *state.active.lock().await = Some(task);
         match activation.await {
@@ -2201,6 +2372,291 @@ fn accepted_message_ids(
         }
     }
     Ok(known_receipts)
+}
+
+#[cfg(test)]
+mod callback_tests {
+    use super::*;
+    use forge_provider_api::ProviderHostEffects;
+
+    struct Authority;
+
+    struct CancelledAuthority;
+
+    #[async_trait]
+    impl ProviderPermissions for CancelledAuthority {
+        async fn authorize(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+            _: PermissionRequest,
+        ) -> PermissionResponse {
+            PermissionResponse::Cancelled
+        }
+
+        async fn before_tool(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            Err(ProviderError::Cancelled)
+        }
+    }
+
+    #[async_trait]
+    impl ProviderPermissions for Authority {
+        async fn authorize(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+            _: PermissionRequest,
+        ) -> PermissionResponse {
+            PermissionResponse::Allow
+        }
+        async fn before_tool(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ProviderTools for Authority {
+        async fn call(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+            _: ToolCall,
+        ) -> Result<String, ProviderError> {
+            Ok("tool completed".into())
+        }
+    }
+
+    #[async_trait]
+    impl TurnControl for Authority {
+        async fn before_send(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn receive(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            std::future::pending().await
+        }
+        async fn close(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn status(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<HostTurnStatus, ProviderError> {
+            Ok(HostTurnStatus {
+                replay_safe: true,
+                control_handoff: false,
+                cancelled: false,
+                error: None,
+            })
+        }
+        fn tool_finished(&self, _: &forge_provider_api::InvocationScope, _: Option<&str>) -> bool {
+            false
+        }
+    }
+
+    #[async_trait]
+    impl ProviderHostEffects for Authority {
+        async fn settle_foreground(
+            &self,
+            _: &BindingId,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), forge_provider_api::HostEffectFailure> {
+            Ok(())
+        }
+    }
+
+    /// Install authority shared by successive native tool callbacks.
+    async fn install(router: &CallbackRouter, scope: &forge_provider_api::InvocationScope) -> u64 {
+        let authority = Arc::new(Authority);
+        router
+            .install(InvocationCallbacks {
+                scope: scope.clone(),
+                generation: 0,
+                permissions: authority.clone(),
+                tools: authority.clone(),
+                control: authority.clone(),
+                effects: authority,
+                allowed_tools: HashSet::from(["fixture_tool".into()]),
+                session_directory: None,
+            })
+            .await
+            .unwrap();
+        router.callbacks(scope).await.unwrap().generation
+    }
+
+    /// Exercise callback dispatch rather than only checking registry contents.
+    async fn call(router: &CallbackRouter, id: &str) {
+        assert_eq!(
+            router
+                .call_native(
+                    id,
+                    ToolCall {
+                        name: "fixture_tool".into(),
+                        arguments: json!({})
+                    }
+                )
+                .await
+                .unwrap(),
+            "tool completed"
+        );
+    }
+
+    /// Completing one tool cannot remove foreground authority needed by the next tool.
+    #[tokio::test]
+    async fn tool_completion_retains_live_foreground_callbacks() {
+        let router = CallbackRouter::default();
+        let scope = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ExecutionOwner::root("callbacks"),
+            "exchange",
+        );
+        install(&router, &scope).await;
+        for id in ["first", "second"] {
+            router.bind_native_call(id, &scope).await;
+            call(&router, id).await;
+            router.release_native_call(id).await;
+            router.before_send(&scope).await.unwrap();
+            router.status(&scope).await.unwrap();
+        }
+        router
+            .settle_foreground(&BindingId::new("binding").unwrap(), &scope)
+            .await
+            .unwrap();
+        assert!(router.callbacks(&scope).await.is_err());
+    }
+
+    /// Settled foreground retains callbacks still held by an admitted native call.
+    #[tokio::test]
+    async fn settled_callbacks_live_until_the_last_native_call_finishes() {
+        let router = CallbackRouter::default();
+        let scope = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ExecutionOwner::root("callbacks"),
+            "exchange",
+        );
+        install(&router, &scope).await;
+        router.bind_native_call("late", &scope).await;
+        router
+            .settle_foreground(&BindingId::new("binding").unwrap(), &scope)
+            .await
+            .unwrap();
+        call(&router, "late").await;
+        router.release_native_call("late").await;
+        assert!(router.callbacks(&scope).await.is_err());
+        assert!(router.callbacks_for_native_call("late").await.is_err());
+    }
+
+    /// Completing an old native call cannot revoke replacement foreground authority.
+    #[tokio::test]
+    async fn old_callback_completion_does_not_retire_a_new_generation() {
+        let router = CallbackRouter::default();
+        let scope = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ExecutionOwner::root("callbacks"),
+            "exchange",
+        );
+        let generation = install(&router, &scope).await;
+        router.bind_native_call("old", &scope).await;
+        router.finish_foreground_scope(&scope, generation).await;
+        let next = install(&router, &scope).await;
+        router.release_native_call("old").await;
+        assert_eq!(router.callbacks(&scope).await.unwrap().generation, next);
+        router.before_send(&scope).await.unwrap();
+    }
+
+    /// An aborted tool without a completion event cannot poison later identity-free hooks.
+    #[tokio::test]
+    async fn cancelled_native_calls_do_not_block_the_next_invocation() {
+        let router = CallbackRouter::default();
+        let owner = forge_provider_api::ExecutionOwner::root("callbacks");
+        let scope = forge_provider_api::InvocationScope::new(owner.clone(), "cancelled");
+        install(&router, &scope).await;
+        let mut callbacks = router.callbacks(&scope).await.unwrap();
+        callbacks.permissions = Arc::new(CancelledAuthority);
+        router.install(callbacks).await.unwrap();
+        let generation = router.callbacks(&scope).await.unwrap().generation;
+        router.bind_native_call("aborted-tool", &scope).await;
+        router.finish_foreground_scope(&scope, generation).await;
+        assert!(matches!(
+            router.before_tool_native(None).await,
+            Err(ProviderError::Cancelled)
+        ));
+
+        router
+            .retire_all(&BindingId::new("binding").unwrap())
+            .await
+            .unwrap();
+        let next = forge_provider_api::InvocationScope::new(owner, "next");
+        install(&router, &next).await;
+        router.before_tool_native(None).await.unwrap();
+        assert!(
+            router
+                .before_tool_native(Some("aborted-tool"))
+                .await
+                .is_err()
+        );
+        router.bind_native_call("new-tool", &next).await;
+        call(&router, "new-tool").await;
+    }
+
+    /// Hide generated MCP prefixes without confusing them with real prefixed tool names.
+    #[tokio::test]
+    async fn mcp_permission_aliases_require_a_unique_catalog_identity() {
+        let router = CallbackRouter::default();
+        router
+            .mcp_tools
+            .write()
+            .await
+            .insert("fixture".into(), HashSet::from(["read_marker".into()]));
+        assert_eq!(
+            router
+                .canonical_mcp_target("fixture/fixture-read_marker")
+                .await
+                .as_deref(),
+            Some("fixture/read_marker")
+        );
+        assert_eq!(
+            router
+                .canonical_mcp_target("fixture/read_marker")
+                .await
+                .as_deref(),
+            Some("fixture/read_marker")
+        );
+        assert!(
+            router
+                .canonical_mcp_target("fixture/unknown")
+                .await
+                .is_none()
+        );
+        router
+            .mcp_tools
+            .write()
+            .await
+            .get_mut("fixture")
+            .unwrap()
+            .insert("fixture-read_marker".into());
+        assert!(
+            router
+                .canonical_mcp_target("fixture/fixture-read_marker")
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            router
+                .canonical_mcp_target("fixture/fixture-fixture-read_marker")
+                .await
+                .as_deref(),
+            Some("fixture/fixture-read_marker")
+        );
+    }
 }
 
 #[cfg(test)]

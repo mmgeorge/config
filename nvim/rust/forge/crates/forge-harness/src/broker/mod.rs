@@ -1709,6 +1709,12 @@ impl TurnCancellation {
         self.request_native_cancel(false);
     }
 
+    /// Wake host restart finalization after native collection already established quiescence.
+    pub(crate) fn finish_restart_cleanup(&self) {
+        self.restart.store(true, Ordering::Release);
+        self.request(false);
+    }
+
     /// Retain provider delivery while cancellation waits for terminal execution evidence.
     pub(crate) fn begin_cleanup(&self, restart: bool, restore_prompt: bool) -> Result<()> {
         anyhow::ensure!(
@@ -10559,6 +10565,30 @@ mod test {
         assert!(futures_util::poll!(&mut expired).is_pending());
         tokio::time::advance(std::time::Duration::from_secs(30)).await;
         expired.await;
+    }
+
+    /// A collected restart must release host ownership without another native terminal event.
+    #[tokio::test]
+    async fn collected_restart_wakes_finalization_without_native_terminal() {
+        let cancellation = super::TurnCancellation::new();
+        cancellation.begin_cleanup(true, false).unwrap();
+        let cancelled = cancellation.cancelled();
+        tokio::pin!(cancelled);
+        assert!(futures_util::poll!(&mut cancelled).is_pending());
+        cancellation.finish_restart_cleanup();
+        cancelled.await;
+        assert!(
+            cancellation
+                .restart
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+        assert!(
+            cancellation
+                .native_cancel_deadline
+                .lock()
+                .unwrap()
+                .is_none()
+        );
     }
 
     include!("workflow_test.rs");

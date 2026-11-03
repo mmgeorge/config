@@ -119,6 +119,21 @@ local ok, failure = xpcall(function()
   navigation.activate({ session = second.session }, { open_mode = "tab" })
   assert(fourth.presentation == previous_fourth and not previous_fourth.closed, "tab activation closed an independent view")
   assert(vim.api.nvim_tabpage_is_valid(fourth_tab))
+  local draft_buffer = second.composer_buf
+  vim.api.nvim_buf_set_lines(draft_buffer, 0, -1, false, { "Retain draft across public close" })
+  assert(require("forge.shared.view_command_set").dispatch(
+    require("forge.views.harness.controller").command_set(), "close", second))
+  assert(vim.api.nvim_buf_is_valid(draft_buffer), "public close destroyed the unsent draft")
+  second.snapshot_revision = 7
+  client.session_initialize = function(callback, options)
+    assert(options and options.session_id == second.session.id, "reopen did not refresh the retained session")
+    vim.schedule(function() callback({ session = second.session, snapshot_revision = 6 }) end)
+  end
+  session.activate_harness(second)
+  require("forge.views.harness").open()
+  settled(second)
+  assert(second.composer_buf == draft_buffer)
+  assert(vim.api.nvim_buf_get_lines(draft_buffer, 0, -1, false)[1] == "Retain draft across public close")
   require("forge.views.harness.workspace").release(fourth)
   assert(fourth.presentation.close())
   require("forge.views.harness.workspace").release(second)

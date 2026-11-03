@@ -49,16 +49,6 @@ impl CodexResources {
         }
     }
 
-    /// Report whether the host supplied a managed skill selection for this binding.
-    pub(super) fn has_managed_skills(&self) -> bool {
-        !self.selection.skills.is_empty()
-    }
-
-    /// Report whether the host supplied a managed MCP selection for this binding.
-    pub(super) fn has_managed_mcp(&self) -> bool {
-        !self.selection.mcp.is_empty()
-    }
-
     /// Map private launch aliases back to canonical resource names before publishing activity.
     pub(super) fn mcp_aliases(&self) -> HashMap<String, String> {
         self.native_name
@@ -72,6 +62,7 @@ impl CodexResources {
         &self,
         rpc: &NativeRpc,
         workspace: &str,
+        retired_aliases: &[String],
     ) -> Result<Value, ProviderError> {
         let native = rpc
             .request(
@@ -80,30 +71,12 @@ impl CodexResources {
                 ProviderOperation::ReconcileSettings,
             )
             .await?;
-        let mut servers = Map::new();
-        if let Some(inherited) = native
-            .pointer("/config/mcp_servers")
-            .and_then(Value::as_object)
-        {
-            for name in inherited.keys() {
-                servers.insert(name.clone(), json!({"enabled":false}));
-            }
-        }
-        for resource in &self.selection.mcp {
-            let native_name = self.native_name.get(&resource.name).ok_or_else(|| {
-                failure(
-                    ProviderOperation::ReconcileSettings,
-                    ProviderFailureKind::Unknown,
-                )
-            })?;
-            if servers.contains_key(native_name) {
-                return Err(failure(
-                    ProviderOperation::ReconcileSettings,
-                    ProviderFailureKind::Rejected,
-                ));
-            }
-            servers.insert(native_name.clone(), native_server(resource)?);
-        }
+        let servers = self.server_configuration(
+            native
+                .pointer("/config/mcp_servers")
+                .and_then(Value::as_object),
+            retired_aliases,
+        )?;
         let mut roots = Vec::new();
         for skill in self.selection.skills.iter().filter(|skill| skill.enabled) {
             if skill.path.is_none() {
@@ -171,6 +144,42 @@ impl CodexResources {
         }))
     }
 
+    /// Exclude inherited and retired launches even when no selected server remains.
+    fn server_configuration(
+        &self,
+        inherited: Option<&Map<String, Value>>,
+        retired_aliases: &[String],
+    ) -> Result<Map<String, Value>, ProviderError> {
+        let mut servers = Map::new();
+        if let Some(inherited) = inherited {
+            for name in inherited.keys() {
+                servers.insert(name.clone(), json!({"enabled":false}));
+            }
+        }
+        for resource in &self.selection.mcp {
+            let native_name = self.native_name.get(&resource.name).ok_or_else(|| {
+                failure(
+                    ProviderOperation::ReconcileSettings,
+                    ProviderFailureKind::Unknown,
+                )
+            })?;
+            if servers.contains_key(native_name) {
+                return Err(failure(
+                    ProviderOperation::ReconcileSettings,
+                    ProviderFailureKind::Rejected,
+                ));
+            }
+            servers.insert(native_name.clone(), native_server(resource)?);
+        }
+        // Thread resume merges its prior overrides; omission would preserve an old launch.
+        for name in retired_aliases {
+            servers
+                .entry(name.clone())
+                .or_insert_with(|| json!({"enabled":false}));
+        }
+        Ok(servers)
+    }
+
     /// Resolve an enabled, user-invocable skill through native discovery before encoding its item.
     pub(super) async fn skill_path(
         &self,
@@ -213,9 +222,6 @@ impl CodexResources {
 
     /// Restore canonical names and hide inherited rows from normalized MCP discovery.
     pub(super) fn normalize_mcp(&self, native: Vec<McpDefinition>) -> Vec<McpDefinition> {
-        if self.selection.mcp.is_empty() {
-            return native;
-        }
         let mut native = native
             .into_iter()
             .map(|entry| (entry.name.clone(), entry))
@@ -360,7 +366,7 @@ mod tests {
             resource_id: None,
             scope: None,
             source_path: None,
-            name: alias,
+            name: alias.clone(),
             transport: McpTransportKind::Http,
             enabled: true,
             status: McpStatus::Connected,
@@ -370,10 +376,26 @@ mod tests {
             tools: Vec::new(),
             tool_error: None,
         };
-        let normalized = resources.normalize_mcp(vec![native]);
+        let normalized = resources.normalize_mcp(vec![native.clone()]);
         assert_eq!(normalized.len(), 1);
         assert_eq!(normalized[0].name, "repo tools");
         assert_eq!(normalized[0].status, McpStatus::Connected);
         assert_eq!(normalized[0].resource_id, None);
+
+        let retired = vec![alias.clone()];
+        let inherited = json!({"unselected":{"command":"must-not-run"}});
+        let selected = resources
+            .server_configuration(inherited.as_object(), &retired)
+            .unwrap();
+        assert_eq!(selected[&alias]["enabled"], true);
+        assert_eq!(selected["unselected"]["enabled"], false);
+
+        let empty = CodexResources::new(ResourceSelection::default(), "/private/empty".into());
+        let config = empty
+            .server_configuration(inherited.as_object(), &retired)
+            .unwrap();
+        assert_eq!(config[&alias]["enabled"], false);
+        assert_eq!(config["unselected"]["enabled"], false);
+        assert!(empty.normalize_mcp(vec![native]).is_empty());
     }
 }

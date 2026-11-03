@@ -43,6 +43,27 @@ pub(crate) fn native_failure(
     ProviderError::Failure(ProviderFailure::new(operation, kind))
 }
 
+/// Preserve an existing normalized category when recording nested adapter failures.
+pub(crate) fn trace_failure_kind(error: &ProviderError) -> ProviderFailureKind {
+    match error {
+        ProviderError::Failure(failure) => failure.kind(),
+        ProviderError::Combined { primary, .. } | ProviderError::PreparationFailed(primary) => {
+            trace_failure_kind(primary)
+        }
+        ProviderError::PreparationCleanup { cause, .. } => trace_failure_kind(cause),
+        ProviderError::Contract(_)
+        | ProviderError::Cleanup(_)
+        | ProviderError::Unsupported(_)
+        | ProviderError::Observation(_)
+        | ProviderError::RuntimeVersion(_)
+        | ProviderError::NotConsumed { .. }
+        | ProviderError::DeliveryUncertain
+        | ProviderError::Cancelled
+        | ProviderError::Retryable(_)
+        | ProviderError::Delivery(_) => ProviderFailureKind::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,6 +72,17 @@ mod tests {
     /// Preserve machine-readable failure semantics while discarding native diagnostics.
     #[test]
     fn native_codes_and_statuses_have_normalized_categories() {
+        let nested = ProviderError::Combined {
+            primary: Box::new(native_failure(
+                ProviderOperation::CancelSession,
+                ProviderFailureKind::Timeout,
+            )),
+            secondary: vec![native_failure(
+                ProviderOperation::CleanupExecution,
+                ProviderFailureKind::Rejected,
+            )],
+        };
+        assert_eq!(trace_failure_kind(&nested), ProviderFailureKind::Timeout);
         for (status, expected) in [
             (401, ProviderFailureKind::Authentication),
             (403, ProviderFailureKind::Authorization),

@@ -101,8 +101,11 @@ function M.open()
   local startup = require("forge.harness_startup_log").begin({ workspace = vim.fn.getcwd() })
   state.startup_trace = startup
   state.initial_snapshot_pending = true
+  local retained_session = state.session and state.transcript_buf and state.composer_buf
+    and vim.api.nvim_buf_is_valid(state.transcript_buf) and vim.api.nvim_buf_is_valid(state.composer_buf)
+  local timeline_key = retained_session and state.session.id or ("initial-pending-" .. tostring(vim.uv.hrtime()))
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab =
-    layout.open("initial-pending-" .. tostring(vim.uv.hrtime()))
+    layout.open(timeline_key)
   layout.attach_auto_height(state.composer_buf, state.composer_win)
   layout.attach_scroll_boundary(state.transcript_buf, state.transcript_win)
   controller.attach()
@@ -113,7 +116,7 @@ function M.open()
     if state.transcript_buf ~= transcript_buffer or not vim.api.nvim_buf_is_valid(transcript_buffer)
       or not valid_window(state.composer_win) then startup.finish("closed_before_ready") return end
     finish_start(state, result, start_error, error_detail)
-  end, nil, startup)
+  end, retained_session and { session_id = state.session.id } or nil, startup)
   vim.api.nvim_set_current_win(state.composer_win)
 end
 

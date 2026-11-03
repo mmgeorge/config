@@ -297,11 +297,6 @@ pub fn parse_model_catalog(result: &Value) -> Vec<ProviderModel> {
         .collect()
 }
 
-/// Quote a native configuration key without changing its literal name.
-pub fn quoted_config_segment(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 /// Order this provider's native effort vocabulary before publishing its model catalog.
 fn ordered_efforts(mut choices: Vec<String>) -> Vec<String> {
     let order = [
@@ -322,10 +317,6 @@ mod tests {
 
     #[test]
     fn parses_complete_skill_and_mcp_catalog_rows() {
-        assert_eq!(
-            quoted_config_segment("github.enterprise"),
-            "\"github.enterprise\""
-        );
         let skill_list = parse_skill_catalog(&json!({
             "data": [{
                 "cwd": "D:/repo",

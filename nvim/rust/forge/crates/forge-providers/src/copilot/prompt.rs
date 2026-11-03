@@ -232,7 +232,7 @@ pub async fn run(
     let mut retry_idle_deadline = None;
     let mut rejection = rejection::RejectionState::default();
     let mut provider_aborted = false;
-    let processing: std::result::Result<(), ProviderError> = async {
+    let processing: std::result::Result<super::turn::IdleOutcome, ProviderError> = async {
         loop {
             tokio::select! {
                 settled = turn_event.idle_settled() => {
@@ -270,14 +270,16 @@ pub async fn run(
                         } else {
                             Some(provider_event.id.clone())
                         };
-                        normalize_internal(turn_event.observe_idle_at(&provider_event, if aborted { super::turn::IdleOutcome::Aborted } else { super::turn::IdleOutcome::Completed }), ProviderOperation::NativeTransport, ProviderFailureKind::Protocol)?;
+                        let outcome = if execution_turn_stopped { super::turn::IdleOutcome::HostHandoff }
+                            else if aborted { super::turn::IdleOutcome::Aborted }
+                            else { super::turn::IdleOutcome::Completed };
+                        normalize_internal(turn_event.observe_idle_at(&provider_event, outcome), ProviderOperation::NativeTransport, ProviderFailureKind::Protocol)?;
                         if aborted {
                             let settled = tokio::time::timeout(std::time::Duration::from_secs(15), turn_event.idle_settled()).await
                                 .map_err(|_| ProviderError::DeliveryUncertain)?;
                             normalize_internal(settled, ProviderOperation::NativeTransport, ProviderFailureKind::Protocol)?;
                             decoder.finish_failure(forge_provider_api::turn::TurnOutcome::Cancelled, sink).await?;
-                            publish_terminal_executions(session, turn_event, sink, output).await?;
-                            return Err(ProviderError::Cancelled);
+                            return Ok(super::turn::IdleOutcome::Aborted);
                         }
                         continue;
                     }
@@ -352,8 +354,9 @@ pub async fn run(
 
             }
         }
-        Ok(())
+        Ok(super::turn::IdleOutcome::Completed)
         }.await;
+    let native_cancelled = matches!(processing, Ok(super::turn::IdleOutcome::Aborted));
     control.close(&options.scope).await?;
     let host_status = control.status(&options.scope).await?;
     let publication_failure = options
@@ -369,7 +372,14 @@ pub async fn run(
         };
         decoder.finish_failure(outcome, sink).await?;
         if let Some(failure) = publication_failure {
-            publish_failed_publication(session, turn_event, sink, output, failure).await?;
+            publish_terminal_executions(
+                session.id().as_ref(),
+                turn_event,
+                sink,
+                output,
+                TerminalPublication::Failed(failure),
+            )
+            .await?;
         } else {
             publish_observation_lost(sink, output).await?;
         }
@@ -378,7 +388,14 @@ pub async fn run(
     subscription.ensure_healthy()?;
     if let Some(failure) = publication_failure {
         decoder.finish_success(sink).await?;
-        publish_failed_publication(session, turn_event, sink, output, failure).await?;
+        publish_terminal_executions(
+            session.id().as_ref(),
+            turn_event,
+            sink,
+            output,
+            TerminalPublication::Failed(failure),
+        )
+        .await?;
         return Err(native_failure(
             ProviderOperation::HostEffectPublication,
             match failure {
@@ -406,13 +423,16 @@ pub async fn run(
                         ProviderFailureKind::Unknown,
                     )
                 })?;
-        publish_retryable_execution(
+        publish_terminal_executions(
+            session.id().as_ref(),
             turn_event,
             sink,
             output,
-            &address,
-            category,
-            continuation.clone(),
+            TerminalPublication::Retryable {
+                address: address.clone(),
+                category,
+                continuation: continuation.clone(),
+            },
         )
         .await?;
         return Err(ProviderError::Retryable(Box::new(
@@ -423,11 +443,18 @@ pub async fn run(
             },
         )));
     }
-    if host_status.cancelled {
+    if native_cancelled || host_status.cancelled {
         decoder
             .finish_failure(forge_provider_api::turn::TurnOutcome::Cancelled, sink)
             .await?;
-        publish_terminal_executions(session, turn_event, sink, output).await?;
+        publish_terminal_executions(
+            session.id().as_ref(),
+            turn_event,
+            sink,
+            output,
+            TerminalPublication::Settled,
+        )
+        .await?;
         return Err(ProviderError::Cancelled);
     }
     if !execution_turn_stopped && rejection.finish(host_status.control_handoff).is_err() {
@@ -454,8 +481,15 @@ pub async fn run(
             .await?;
     } else {
         decoder.finish_success(sink).await?;
-        publish_terminal_executions(session, turn_event, sink, output).await?;
     }
+    publish_terminal_executions(
+        session.id().as_ref(),
+        turn_event,
+        sink,
+        output,
+        TerminalPublication::Settled,
+    )
+    .await?;
     Ok(TurnResult {
         #[cfg(test)]
         completion: output.clone(),
@@ -483,12 +517,25 @@ fn with_attachment_context(
     prompt
 }
 
-/// Publish terminal execution observations after accepted inputs and live turns settle.
+/// Distinguish a collected foreground from one whose required host publication failed.
+#[derive(Clone)]
+enum TerminalPublication {
+    Settled,
+    Failed(forge_provider_api::session::HostEffectFailure),
+    Retryable {
+        address: forge_provider_api::TurnAddress,
+        category: forge_provider_api::retry::RetryCategory,
+        continuation: forge_provider_api::ContinuationToken,
+    },
+}
+
+/// Publish every consumed execution's start before any terminal can settle the invocation.
 async fn publish_terminal_executions(
-    session: &Session,
+    thread_id: &str,
     turn_event: &CopilotTurnEvent,
     sink: &ProviderEventSink,
     completion: &ProviderCompletion,
+    publication: TerminalPublication,
 ) -> Result<(), ProviderError> {
     use forge_provider_api::lifecycle::{ExecutionObservation, ExecutionResult, ExecutionUpdate};
 
@@ -499,154 +546,104 @@ async fn publish_terminal_executions(
         .as_millis()
         .try_into()
         .unwrap_or(i64::MAX);
-    for (native_event, covered_submissions, result) in normalize_internal(
+    let mut executions = normalize_internal(
         turn_event.terminal_executions(),
         ProviderOperation::NativeTransport,
         ProviderFailureKind::Protocol,
-    )? {
-        let address = forge_provider_api::TurnAddress {
-            scope: scope.clone(),
-            thread_id: session.id().to_string(),
-            turn_id: native_event.into(),
-        };
-        let result = match result {
-            ExecutionResult::Completed { .. } => ExecutionResult::Completed {
-                completion: completion.clone().into(),
-            },
-            ExecutionResult::Cancelled { .. } => ExecutionResult::Cancelled {
-                completion: completion.clone().into(),
-            },
-            ExecutionResult::Failed { failure, .. } => ExecutionResult::Failed {
-                completion: completion.clone().into(),
-                failure,
-            },
-        };
+    )?;
+    if let TerminalPublication::Retryable { address, .. } = &publication {
+        let index = executions
+            .iter()
+            .position(|(event, _, _)| {
+                address.scope == scope
+                    && address.thread_id == thread_id
+                    && address.turn_id.as_str() == event
+            })
+            .ok_or_else(|| {
+                native_failure(
+                    ProviderOperation::NativeTransport,
+                    ProviderFailureKind::Protocol,
+                )
+            })?;
+        // Publish retry eligibility last, after every other consumed execution is settled.
+        let retry = executions.remove(index);
+        executions.push(retry);
+    }
+
+    // Register steering's distinct native execution before the first input's terminal is visible.
+    // Repeating the already-published foreground start preserves the same immutable identity.
+    for (native_event, _, _) in &executions {
         let observation = ExecutionObservation::new(
             scope.clone(),
-            ExecutionUpdate::Finished {
-                address,
-                covered_submissions,
-                completed_at_ms,
-                result,
-            },
-        )?;
-        sink.send_wait(ProviderEvent::Execution { observation })
-            .await?;
-    }
-    Ok(())
-}
-
-/// Preserve native terminal evidence when required host effects fail to publish.
-async fn publish_failed_publication(
-    session: &Session,
-    turn_event: &CopilotTurnEvent,
-    sink: &ProviderEventSink,
-    completion: &ProviderCompletion,
-    failure: forge_provider_api::session::HostEffectFailure,
-) -> Result<(), ProviderError> {
-    use forge_provider_api::lifecycle::{ExecutionObservation, ExecutionResult, ExecutionUpdate};
-
-    let scope = sink.invocation_scope()?.clone();
-    let completed_at_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX);
-    for (native_event, covered_submissions, result) in normalize_internal(
-        turn_event.terminal_executions(),
-        ProviderOperation::NativeTransport,
-        ProviderFailureKind::Protocol,
-    )? {
-        let address = forge_provider_api::TurnAddress {
-            scope: scope.clone(),
-            thread_id: session.id().to_string(),
-            turn_id: native_event.into(),
-        };
-        let result = match result {
-            ExecutionResult::Completed { .. } => ExecutionResult::Completed {
-                completion: completion.clone().into(),
-            },
-            ExecutionResult::Cancelled { .. } => ExecutionResult::Cancelled {
-                completion: completion.clone().into(),
-            },
-            ExecutionResult::Failed { failure, .. } => ExecutionResult::Failed {
-                completion: completion.clone().into(),
-                failure,
-            },
-        };
-        let observation = ExecutionObservation::new(
-            scope.clone(),
-            ExecutionUpdate::PublicationFailed {
-                address,
-                covered_submissions,
-                completed_at_ms,
-                result,
-                failure,
-            },
-        )?;
-        sink.send_wait(ProviderEvent::Execution { observation })
-            .await?;
-    }
-    Ok(())
-}
-
-/// Publish retry eligibility while retaining the accepted inputs in native history.
-async fn publish_retryable_execution(
-    turn_event: &CopilotTurnEvent,
-    sink: &ProviderEventSink,
-    completion: &ProviderCompletion,
-    address: &forge_provider_api::TurnAddress,
-    category: forge_provider_api::retry::RetryCategory,
-    continuation: forge_provider_api::ContinuationToken,
-) -> Result<(), ProviderError> {
-    use forge_provider_api::lifecycle::{
-        ExecutionFailure, ExecutionObservation, ExecutionResult, ExecutionUpdate,
-    };
-
-    let (_, covered_submissions, _) = turn_event
-        .terminal_executions()
-        .map_err(|_| {
-            native_failure(
-                ProviderOperation::NativeTransport,
-                ProviderFailureKind::Protocol,
-            )
-        })?
-        .into_iter()
-        .find(|(native_event, _, _)| native_event == address.turn_id.as_str())
-        .ok_or_else(|| {
-            native_failure(
-                ProviderOperation::NativeTransport,
-                ProviderFailureKind::Protocol,
-            )
-        })?;
-    let scope = sink.invocation_scope()?.clone();
-    let observation = ExecutionObservation::new(
-        scope,
-        ExecutionUpdate::Finished {
-            address: address.clone(),
-            covered_submissions,
-            completed_at_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-                .try_into()
-                .unwrap_or(i64::MAX),
-            result: ExecutionResult::Failed {
-                completion: completion.clone().into(),
-                failure: ExecutionFailure::Retryable {
-                    address: address.clone(),
-                    category,
-                    continuation,
+            ExecutionUpdate::Started {
+                address: forge_provider_api::TurnAddress {
+                    scope: scope.clone(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: native_event.clone().into(),
                 },
             },
-        },
-    )?;
-    sink.send_wait(ProviderEvent::Execution { observation })
-        .await?;
+        )?;
+        sink.send_wait(ProviderEvent::Execution { observation })
+            .await?;
+    }
+    for (native_event, covered_submissions, result) in executions {
+        let address = forge_provider_api::TurnAddress {
+            scope: scope.clone(),
+            thread_id: thread_id.to_owned(),
+            turn_id: native_event.into(),
+        };
+        let result = match result {
+            ExecutionResult::Completed { .. } => ExecutionResult::Completed {
+                completion: completion.clone().into(),
+            },
+            ExecutionResult::Cancelled { .. } => ExecutionResult::Cancelled {
+                completion: completion.clone().into(),
+            },
+            ExecutionResult::Failed { failure, .. } => ExecutionResult::Failed {
+                completion: completion.clone().into(),
+                failure,
+            },
+        };
+        let result = match &publication {
+            TerminalPublication::Retryable {
+                address: retry,
+                category,
+                continuation,
+            } if retry == &address => ExecutionResult::Failed {
+                completion: completion.clone().into(),
+                failure: forge_provider_api::lifecycle::ExecutionFailure::Retryable {
+                    address: address.clone(),
+                    category: *category,
+                    continuation: continuation.clone(),
+                },
+            },
+            TerminalPublication::Settled
+            | TerminalPublication::Failed(_)
+            | TerminalPublication::Retryable { .. } => result,
+        };
+        let update = match &publication {
+            TerminalPublication::Settled | TerminalPublication::Retryable { .. } => {
+                ExecutionUpdate::Finished {
+                    address,
+                    covered_submissions,
+                    completed_at_ms,
+                    result,
+                }
+            }
+            TerminalPublication::Failed(failure) => ExecutionUpdate::PublicationFailed {
+                address,
+                covered_submissions,
+                completed_at_ms,
+                result,
+                failure: *failure,
+            },
+        };
+        let observation = ExecutionObservation::new(scope.clone(), update)?;
+        sink.send_wait(ProviderEvent::Execution { observation })
+            .await?;
+    }
     Ok(())
 }
-
 /// Report lost terminal observation without turning an operation error into native success.
 async fn publish_observation_lost(
     sink: &ProviderEventSink,
@@ -830,6 +827,139 @@ pub fn completes_exchange(event: &github_copilot_sdk::SessionEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Register steering's separate execution before publishing either input's terminal coverage.
+    #[tokio::test]
+    async fn steering_terminals_follow_all_matching_starts() -> anyhow::Result<()> {
+        use forge_provider_api::lifecycle::ExecutionUpdate;
+        let turn = CopilotTurnEvent::default();
+        let guard = turn.activate(None, None)?;
+        let first = forge_provider_api::SubmissionId::try_from("first".to_owned())?;
+        let second = forge_provider_api::SubmissionId::try_from("second".to_owned())?;
+        guard
+            .send("cursor".into(), Some(first.clone()), async {
+                Ok("receipt-first".into())
+            })
+            .await?;
+        turn.steer(Some(second.clone()), async { Ok("receipt-second".into()) })
+            .await?;
+        for (id, kind, data) in [
+            (
+                "user-first",
+                "user.message",
+                serde_json::json!({"messageId":"receipt-first","turnId":"0"}),
+            ),
+            (
+                "start-first",
+                "assistant.turn_start",
+                serde_json::json!({"turnId":"0"}),
+            ),
+            (
+                "end-first",
+                "assistant.turn_end",
+                serde_json::json!({"turnId":"0"}),
+            ),
+            (
+                "start-second",
+                "assistant.turn_start",
+                serde_json::json!({"turnId":"1"}),
+            ),
+            (
+                "user-second",
+                "user.message",
+                serde_json::json!({"messageId":"receipt-second","turnId":"1"}),
+            ),
+            (
+                "end-second",
+                "assistant.turn_end",
+                serde_json::json!({"turnId":"1"}),
+            ),
+        ] {
+            turn.observe(&serde_json::from_value(serde_json::json!({"id":id,"type":kind,"timestamp":"2026-11-03T00:00:00Z","data":data}))?)?;
+        }
+        let idle = serde_json::from_value(
+            serde_json::json!({"id":"idle","type":"session.idle","timestamp":"2026-11-03T00:00:00Z","data":{}}),
+        )?;
+        turn.observe(&idle)?;
+        turn.observe_idle_at(&idle, super::super::turn::IdleOutcome::Completed)?;
+        let scope = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ExecutionOwner::root("session"),
+            "invocation",
+        );
+        for publication in [
+            TerminalPublication::Settled,
+            TerminalPublication::Failed(forge_provider_api::HostEffectFailure::Uncertain),
+            TerminalPublication::Retryable {
+                address: forge_provider_api::TurnAddress {
+                    scope: scope.clone(),
+                    thread_id: "thread".into(),
+                    turn_id: "start-first".into(),
+                },
+                category: forge_provider_api::retry::RetryCategory::TemporaryTransport,
+                continuation: forge_provider_api::ContinuationToken::new(vec![1])?,
+            },
+        ] {
+            let retrying = matches!(publication, TerminalPublication::Retryable { .. });
+            let (sink, mut stream) = forge_provider_api::events::channel(
+                forge_provider_api::BindingId::new("binding")?,
+                scope.clone(),
+            );
+            publish_terminal_executions(
+                "thread",
+                &turn,
+                &sink,
+                &ProviderCompletion::default(),
+                publication,
+            )
+            .await?;
+            let mut starts = std::collections::HashSet::new();
+            let mut covered = std::collections::HashSet::new();
+            for index in 0..4 {
+                let event = stream.recv().await?.unwrap();
+                let ProviderEvent::Execution { observation } = event.event else {
+                    panic!("expected execution observation")
+                };
+                match observation.update() {
+                    ExecutionUpdate::Started { address } => {
+                        assert!(
+                            index < 2,
+                            "all executions must be admitted before terminal settlement"
+                        );
+                        starts.insert(address.turn_id.clone());
+                    }
+                    ExecutionUpdate::Finished {
+                        address,
+                        covered_submissions,
+                        result,
+                        ..
+                    }
+                    | ExecutionUpdate::PublicationFailed {
+                        address,
+                        covered_submissions,
+                        result,
+                        ..
+                    } => {
+                        assert!(starts.contains(&address.turn_id));
+                        covered.extend(covered_submissions.iter().cloned());
+                        assert_eq!(
+                            matches!(result, forge_provider_api::ExecutionResult::Failed { .. }),
+                            retrying && index == 3
+                        );
+                        if retrying && index == 3 {
+                            assert_eq!(address.turn_id.as_str(), "start-first");
+                        }
+                    }
+                    other => panic!("unexpected terminal sequence: {other:?}"),
+                }
+            }
+            assert_eq!(starts.len(), 2);
+            assert_eq!(
+                covered,
+                std::collections::HashSet::from([first.clone(), second.clone()])
+            );
+        }
+        Ok(())
+    }
 
     /// Finish the main agent independently from attached background work.
     #[test]

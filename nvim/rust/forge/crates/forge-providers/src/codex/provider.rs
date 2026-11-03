@@ -59,7 +59,6 @@ struct CodexBinding {
     workspace: String,
     model: Mutex<ModelSelection>,
     runtime: Mutex<Arc<CodexRuntime>>,
-    isolated_runtime: Mutex<bool>,
     rpc: RpcHandle,
     sink: ProviderEventSink,
     stream: Mutex<Option<ProviderEventStream>>,
@@ -216,13 +215,7 @@ impl CodexProvider {
             })?;
         let private_home = profile.path().to_path_buf();
         let resources = CodexResources::new(request.resources.clone(), private_home.clone());
-        let isolated_runtime =
-            !request.resources.mcp.is_empty() || !request.resources.skills.is_empty();
-        let runtime = if !isolated_runtime {
-            self.runtime.clone()
-        } else {
-            Arc::new(CodexRuntime::new(self.command.clone()))
-        };
+        let runtime = Arc::new(CodexRuntime::new(self.command.clone()));
         let connection = runtime.connect().await.map_err(|_| {
             failure(
                 ProviderOperation::InitializeSession,
@@ -252,12 +245,7 @@ impl CodexProvider {
             .map_err(ProviderError::from)?;
         rpc.notify("initialized", Value::Null).await?;
 
-        let resource_config =
-            if request.resources.mcp.is_empty() && request.resources.skills.is_empty() {
-                Value::Null
-            } else {
-                resources.configure(&rpc, &request.workspace).await?
-            };
+        let resource_config = resources.configure(&rpc, &request.workspace, &[]).await?;
         let mut parameters = match request.provider_session_id.as_ref() {
             Some(thread) => json!({
                 "threadId":thread.as_str(), "cwd":request.workspace,
@@ -330,7 +318,6 @@ impl CodexProvider {
             workspace: request.workspace,
             model: Mutex::new(request.model),
             runtime: Mutex::new(runtime),
-            isolated_runtime: Mutex::new(isolated_runtime),
             rpc: RpcHandle::new(rpc),
             sink,
             stream: Mutex::new(Some(stream)),
@@ -1182,16 +1169,12 @@ impl Provider for CodexProvider {
             Ok(())
         };
         let close_result = session.rpc.lock().await.close().await;
-        let runtime_result = if *session.isolated_runtime.lock().await {
-            session.runtime.lock().await.shutdown().await.map_err(|_| {
-                failure(
-                    ProviderOperation::CollectNativeRuntime,
-                    ProviderFailureKind::Transport,
-                )
-            })
-        } else {
-            Ok(())
-        };
+        let runtime_result = session.runtime.lock().await.shutdown().await.map_err(|_| {
+            failure(
+                ProviderOperation::CollectNativeRuntime,
+                ProviderFailureKind::Transport,
+            )
+        });
         self.bindings.lock().await.remove(binding);
         self.owners.lock().await.remove(&session.owner);
         let cleanup = [profile_result, close_result, runtime_result]
@@ -1250,14 +1233,14 @@ impl Provider for CodexProvider {
             .map_err(|error| error.into_provider_error(ProviderOperation::ReconcileSettings))?;
         let next_resources =
             CodexResources::new(resources.clone(), next_profile.path().to_path_buf());
-        let isolated = *session.isolated_runtime.lock().await
-            || !resources.mcp.is_empty()
-            || !resources.skills.is_empty();
-        let next_runtime = if isolated && !*session.isolated_runtime.lock().await {
-            Arc::new(CodexRuntime::new(self.command.clone()))
-        } else {
-            session.runtime.lock().await.clone()
-        };
+        let retired_aliases = session
+            .resources
+            .lock()
+            .await
+            .mcp_aliases()
+            .into_keys()
+            .collect::<Vec<_>>();
+        let next_runtime = session.runtime.lock().await.clone();
         let connection = match next_runtime.connect().await {
             Ok(connection) => connection,
             Err(_) => {
@@ -1295,13 +1278,9 @@ impl Provider for CodexProvider {
                 .and_then(|product| product.split_once('/').map(|(_, version)| version));
             requirement.validate(version).map_err(ProviderError::from)?;
             next_rpc.notify("initialized", Value::Null).await?;
-            let config = if resources.mcp.is_empty() && resources.skills.is_empty() {
-                Value::Null
-            } else {
-                next_resources
-                    .configure(&next_rpc, &session.workspace)
-                    .await?
-            };
+            let config = next_resources
+                .configure(&next_rpc, &session.workspace, &retired_aliases)
+                .await?;
             let thread_id = session
                 .binding
                 .provider_session_id
@@ -1358,7 +1337,6 @@ impl Provider for CodexProvider {
 
         let old_rpc = session.rpc.replace(next_rpc).await;
         *session.runtime.lock().await = next_runtime.clone();
-        *session.isolated_runtime.lock().await = isolated;
         {
             let mut context = session.mcp_context.lock().await;
             context.set_bindings(next_resources.mcp_aliases());
@@ -1490,6 +1468,7 @@ impl Provider for CodexProvider {
     }
 
     async fn shutdown(&self) -> Result<(), ProviderError> {
+        let mut errors = Vec::new();
         let mut catalog = self.catalog.lock().await;
         let catalog_result = match catalog.as_mut() {
             Some(CatalogConnection::Starting(task)) => Some(task.await.unwrap_or_else(|_| {
@@ -1503,7 +1482,9 @@ impl Provider for CodexProvider {
         };
         if let Some(Ok(rpc)) = &catalog_result {
             *catalog = Some(CatalogConnection::Ready(rpc.clone()));
-            rpc.close().await?;
+            if let Err(error) = rpc.close().await {
+                errors.push(error);
+            }
         }
         catalog.take();
         drop(catalog);
@@ -1514,7 +1495,6 @@ impl Provider for CodexProvider {
             .keys()
             .cloned()
             .collect::<Vec<_>>();
-        let mut errors = Vec::new();
         if let Some(Err(error)) = catalog_result {
             errors.push(error);
         }
@@ -1523,13 +1503,14 @@ impl Provider for CodexProvider {
                 errors.push(error);
             }
         }
+        if self.runtime.shutdown().await.is_err() {
+            errors.push(failure(
+                ProviderOperation::CollectNativeRuntime,
+                ProviderFailureKind::Transport,
+            ));
+        }
         if errors.is_empty() {
-            return self.runtime.shutdown().await.map_err(|_| {
-                failure(
-                    ProviderOperation::CollectNativeRuntime,
-                    ProviderFailureKind::Transport,
-                )
-            });
+            return Ok(());
         }
         Err(ProviderError::Combined {
             primary: Box::new(errors.remove(0)),
@@ -1550,15 +1531,15 @@ impl Provider for CodexProvider {
         let Some(binding) = self.owners.lock().await.get(owner).cloned() else {
             return false;
         };
-        self.binding(&binding).await.ok().is_some_and(|session| {
-            session.active.try_lock().ok().is_some_and(|active| {
-                active.as_ref().is_some_and(|execution| {
-                    execution
-                        .task
-                        .as_ref()
-                        .is_none_or(|task| !task.is_finished())
-                })
-            })
+        let Ok(session) = self.binding(&binding).await else {
+            return false;
+        };
+        let active = session.active.lock().await;
+        active.as_ref().is_some_and(|execution| {
+            execution
+                .task
+                .as_ref()
+                .is_none_or(|task| !task.is_finished())
         })
     }
 
@@ -1853,55 +1834,6 @@ impl Provider for CodexProvider {
         Ok(crate::codex::catalog::parse_skill_catalog(&catalog))
     }
 
-    async fn set_skill_enabled(
-        &self,
-        request: ProviderCatalogRequest,
-        name: &str,
-        enabled: bool,
-    ) -> Result<forge_provider_api::catalog::CatalogMutation, ProviderError> {
-        if name.trim().is_empty() {
-            return Err(failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        let session = self.request_binding(&request).await?;
-        if session.resources.lock().await.has_managed_skills() {
-            return Err(failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        let result = session
-            .rpc
-            .lock()
-            .await
-            .request(
-                "skills/config/write",
-                json!({
-                    "path":null,"name":name,"enabled":enabled
-                }),
-                ProviderOperation::ReconcileSettings,
-            )
-            .await?;
-        if result
-            .get("effectiveEnabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(enabled)
-            != enabled
-        {
-            return Err(failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        Ok(forge_provider_api::catalog::CatalogMutation {
-            name: name.to_owned(),
-            enabled,
-            restart_required: false,
-        })
-    }
-
     async fn mcp_configuration(
         &self,
         request: ProviderCatalogRequest,
@@ -1986,62 +1918,6 @@ impl Provider for CodexProvider {
             .await?;
         let parsed = crate::codex::catalog::parse_mcp_catalog(&json!({"data":rows}), &config);
         Ok(session.resources.lock().await.normalize_mcp(parsed))
-    }
-
-    async fn set_mcp_enabled(
-        &self,
-        request: ProviderCatalogRequest,
-        name: &str,
-        enabled: bool,
-    ) -> Result<forge_provider_api::catalog::CatalogMutation, ProviderError> {
-        if name.trim().is_empty() {
-            return Err(failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        let session = self.request_binding(&request).await?;
-        if session.resources.lock().await.has_managed_mcp() {
-            return Err(failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        let active = session.active.lock().await.is_some();
-        let config_name = crate::codex::catalog::quoted_config_segment(name);
-        let result = session
-            .rpc
-            .lock()
-            .await
-            .request(
-                "config/batchWrite",
-                json!({
-                    "edits":[{
-                        "keyPath":format!("mcp_servers.{config_name}.enabled"),
-                        "value":enabled,"mergeStrategy":"replace"
-                    }],
-                    "reloadUserConfig":true
-                }),
-                ProviderOperation::ReconcileSettings,
-            )
-            .await?;
-        if result.get("status").and_then(Value::as_str) == Some("okOverridden")
-            && result
-                .pointer("/overriddenMetadata/effectiveValue")
-                .and_then(Value::as_bool)
-                .unwrap_or(enabled)
-                != enabled
-        {
-            return Err(failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        Ok(forge_provider_api::catalog::CatalogMutation {
-            name: name.to_owned(),
-            enabled,
-            restart_required: active,
-        })
     }
 
     async fn fork(
@@ -2747,10 +2623,12 @@ async fn observe_execution(
                 signal = cancel.recv(), if !cancelled => {
                     if signal.is_some() {
                         cancelled = true;
-                        let params = json!({"threadId":address.thread_id,"turnId":address.turn_id});
                         let mut cancel_errors = Vec::new();
-                        if let Err(error) = session.rpc.lock().await.request("turn/interrupt", params, ProviderOperation::CancelSession).await {
-                            cancel_errors.push(error);
+                        if let Some(turn_id) = &active_parent_turn {
+                            let params = json!({"threadId":address.thread_id,"turnId":turn_id});
+                            if let Err(error) = session.rpc.lock().await.request("turn/interrupt", params, ProviderOperation::CancelSession).await {
+                                cancel_errors.push(error);
+                            }
                         }
                         for (thread_id, turn_id) in descendants.active_turns() {
                             if let Some(turn_id) = turn_id {
@@ -3913,6 +3791,37 @@ mod continuation_tests {
         submission::InputReceipt,
         turn_control::{HostTurnStatus, TurnControl},
     };
+
+    /// Collect the shared runtime even when catalog initialization has already failed.
+    #[tokio::test]
+    async fn shutdown_closes_runtime_after_catalog_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = CodexProvider::new(
+            vec![
+                root.path()
+                    .join("missing-provider")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            root.path().to_owned(),
+        )
+        .unwrap();
+        *provider.catalog.lock().await = Some(CatalogConnection::Starting(tokio::spawn(async {
+            Err(failure(
+                ProviderOperation::CollectNativeRuntime,
+                ProviderFailureKind::Transport,
+            ))
+        })));
+
+        assert!(provider.shutdown().await.is_err());
+        assert!(provider.catalog.lock().await.is_none());
+        let error = match provider.runtime.connect().await {
+            Ok(_) => panic!("shutdown runtime admitted another connection"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "shared Codex runtime is shut down");
+        provider.shutdown().await.unwrap();
+    }
 
     struct FixtureAuthority;
 

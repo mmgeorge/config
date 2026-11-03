@@ -1316,20 +1316,21 @@ mod tests {
                 forge_provider_api::PromptMode::Background,
             ] {
                 for resumed in [false, true] {
-                    let (client_write, mut peer_read) = tokio::io::duplex(1 << 20);
-                    let (mut peer_write, client_read) = tokio::io::duplex(1 << 20);
-                    let client = CopilotClient::new(
-                        github_copilot_sdk::Client::from_streams(
-                            client_read,
-                            client_write,
-                            std::env::temp_dir(),
-                        )
-                        .unwrap(),
-                    );
-                    let peer = tokio::spawn(async move {
-                        let discovery = read_frame(&mut peer_read).await;
-                        assert_eq!(discovery["method"], "mcp.discover");
-                        reply_frame(
+                    for selected in [false, true] {
+                        let (client_write, mut peer_read) = tokio::io::duplex(1 << 20);
+                        let (mut peer_write, client_read) = tokio::io::duplex(1 << 20);
+                        let client = CopilotClient::new(
+                            github_copilot_sdk::Client::from_streams(
+                                client_read,
+                                client_write,
+                                std::env::temp_dir(),
+                            )
+                            .unwrap(),
+                        );
+                        let peer = tokio::spawn(async move {
+                            let discovery = read_frame(&mut peer_read).await;
+                            assert_eq!(discovery["method"], "mcp.discover");
+                            reply_frame(
                             &mut peer_write,
                             &discovery,
                             serde_json::json!({
@@ -1341,92 +1342,100 @@ mod tests {
                             }),
                         )
                         .await;
-                        let create = read_frame(&mut peer_read).await;
-                        assert_eq!(
-                            create["method"],
-                            if resumed {
-                                "session.resume"
+                            let create = read_frame(&mut peer_read).await;
+                            assert_eq!(
+                                create["method"],
+                                if resumed {
+                                    "session.resume"
+                                } else {
+                                    "session.create"
+                                }
+                            );
+                            let expected = if mode == forge_provider_api::PromptMode::Background
+                                || !selected
+                            {
+                                serde_json::json!(["github", "selected", "workspace-extra"])
                             } else {
-                                "session.create"
-                            }
-                        );
-                        let expected = if mode == forge_provider_api::PromptMode::Background {
-                            serde_json::json!(["github", "selected", "workspace-extra"])
-                        } else {
-                            serde_json::json!(["github", "workspace-extra"])
-                        };
-                        assert_eq!(create["params"]["disabledMcpServers"], expected);
-                        let id = create["params"]["sessionId"].as_str().unwrap();
-                        reply_frame(
-                            &mut peer_write,
-                            &create,
-                            serde_json::json!({
-                                "sessionId":id, "workspacePath":std::env::temp_dir(),
-                            }),
-                        )
-                        .await;
-                        loop {
-                            let request = read_frame(&mut peer_read).await;
-                            match request["method"].as_str().unwrap() {
-                                "session.skills.reload" => {
-                                    reply_frame(&mut peer_write, &request, serde_json::json!({}))
+                                serde_json::json!(["github", "workspace-extra"])
+                            };
+                            assert_eq!(create["params"]["disabledMcpServers"], expected);
+                            assert_eq!(create["params"]["enableConfigDiscovery"], false);
+                            let id = create["params"]["sessionId"].as_str().unwrap();
+                            reply_frame(
+                                &mut peer_write,
+                                &create,
+                                serde_json::json!({
+                                    "sessionId":id, "workspacePath":std::env::temp_dir(),
+                                }),
+                            )
+                            .await;
+                            loop {
+                                let request = read_frame(&mut peer_read).await;
+                                match request["method"].as_str().unwrap() {
+                                    "session.skills.reload" => {
+                                        reply_frame(
+                                            &mut peer_write,
+                                            &request,
+                                            serde_json::json!({}),
+                                        )
                                         .await;
+                                    }
+                                    "session.options.update" => {
+                                        reply_frame(
+                                            &mut peer_write,
+                                            &request,
+                                            serde_json::json!({"success":true}),
+                                        )
+                                        .await;
+                                    }
+                                    "session.detach" => {
+                                        reply_frame(
+                                            &mut peer_write,
+                                            &request,
+                                            serde_json::json!({"success":true}),
+                                        )
+                                        .await;
+                                        break;
+                                    }
+                                    method => panic!("unexpected session setup request: {method}"),
                                 }
-                                "session.options.update" => {
-                                    reply_frame(
-                                        &mut peer_write,
-                                        &request,
-                                        serde_json::json!({"success":true}),
-                                    )
-                                    .await;
-                                }
-                                "session.detach" => {
-                                    reply_frame(
-                                        &mut peer_write,
-                                        &request,
-                                        serde_json::json!({"success":true}),
-                                    )
-                                    .await;
-                                    break;
-                                }
-                                method => panic!("unexpected session setup request: {method}"),
                             }
-                        }
-                    });
-                    let session = super::super::session::open(
-                        &client,
-                        SessionOptions {
-                            session_id: resumed.then(|| "saved-session".to_owned()),
-                            model: None,
-                            reasoning_effort: None,
-                            context_tier: None,
-                            workspace: std::env::temp_dir(),
-                            mode,
-                            system_message: String::new(),
-                            resources: if mode == forge_provider_api::PromptMode::Background {
-                                super::super::session::ResourceDiscovery::Native
-                            } else {
-                                super::super::session::ResourceDiscovery::Managed {
+                        });
+                        let session = super::super::session::open(
+                            &client,
+                            SessionOptions {
+                                session_id: resumed.then(|| "saved-session".to_owned()),
+                                model: None,
+                                reasoning_effort: None,
+                                context_tier: None,
+                                workspace: std::env::temp_dir(),
+                                mode,
+                                system_message: String::new(),
+                                resources: super::super::session::ResourceDiscovery::Managed {
                                     skill_directories: Vec::new(),
-                                    selected_mcp: vec!["selected".to_owned()],
-                                }
+                                    selected_mcp: if selected {
+                                        vec!["selected".to_owned()]
+                                    } else {
+                                        Vec::new()
+                                    },
+                                },
+                                excluded_tools: Vec::new(),
+                                tools: Vec::new(),
+                                native_callbacks: None,
                             },
-                            excluded_tools: Vec::new(),
-                            tools: Vec::new(),
-                            native_callbacks: None,
-                        },
-                        Arc::new(Host),
-                        Arc::new(Host),
-                        Arc::new(Trace),
-                        "mcp-before-create",
-                    )
-                    .await
-                    .unwrap();
-                    session.disconnect().await.unwrap();
-                    peer.await.unwrap();
-                    client.fail_generation(
-                        forge_provider_api::lifecycle::ObservationFailure::Disconnected,
-                    );
+                            Arc::new(Host),
+                            Arc::new(Host),
+                            Arc::new(Trace),
+                            "mcp-before-create",
+                        )
+                        .await
+                        .unwrap();
+                        session.disconnect().await.unwrap();
+                        peer.await.unwrap();
+                        client.fail_generation(
+                            forge_provider_api::lifecycle::ObservationFailure::Disconnected,
+                        );
+                    }
                 }
             }
         })

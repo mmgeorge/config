@@ -39,7 +39,11 @@ impl SessionController {
                 }))
     }
     /// Relay committed question messages through the existing durable delivery journal.
-    pub(super) async fn relay_questions(&self, sink: &MessageSender) -> Result<()> {
+    pub(super) async fn relay_questions(
+        &self,
+        sink: &MessageSender,
+        published_revision: &mut Option<u64>,
+    ) -> Result<()> {
         let _control = self.coordinator.control.acquire().await?;
         for message in self.questions.outbox()? {
             self.trace.record(
@@ -130,12 +134,18 @@ impl SessionController {
             self.questions.chat_continuation_admitted(&exchange_id)?;
             self.publish_input(update, sink).await?;
         }
+        let snapshot = self.questions.snapshot()?;
+        if *published_revision == Some(snapshot.revision) {
+            return Ok(());
+        }
+        let revision = snapshot.revision;
         sink.send_event(SessionEvent {
             session_id: self.observer.session_id().into(),
             event: "questions_changed".into(),
-            payload: serde_json::to_value(self.questions.snapshot()?)?,
+            payload: serde_json::to_value(snapshot)?,
         })
         .await?;
+        *published_revision = Some(revision);
         Ok(())
     }
 
@@ -359,6 +369,7 @@ impl SessionController {
             let steering = Arc::new(Semaphore::new(1));
             let mut native_goal_selection = None;
             let mut native_error_reported = false;
+            let mut published_questions = None;
             loop {
                 let notified = input.changed.notified();
                 let state_changed = admission_changed.notified();
@@ -372,7 +383,10 @@ impl SessionController {
                 let native_result = controller
                     .reconcile_native_goal(&mut native_goal_selection)
                     .await;
-                if let Err(error) = controller.relay_questions(&sink).await {
+                if let Err(error) = controller
+                    .relay_questions(&sink, &mut published_questions)
+                    .await
+                {
                     let _ = sink.send_event(SessionEvent { session_id: controller.observer.session_id().into(), event: "provider_event".into(), payload: json!({"kind":"error","text":format!("Question delivery failed: {error:#}")}) }).await;
                 }
                 let native_retry = native_result.is_err();

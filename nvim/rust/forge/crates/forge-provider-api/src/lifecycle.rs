@@ -171,6 +171,8 @@ pub enum ObservationFailure {
     Protocol,
     /// Foreground work conflicts with another admitted exchange on the same owner.
     OwnershipConflict,
+    /// New execution arrived after the invocation's foreground receiver was released.
+    UnexpectedExecution,
 }
 
 impl fmt::Display for ObservationFailure {
@@ -186,6 +188,9 @@ impl fmt::Display for ObservationFailure {
             Self::Protocol => formatter.write_str("provider observation violated its protocol"),
             Self::OwnershipConflict => {
                 formatter.write_str("provider execution conflicts with the admitted owner")
+            }
+            Self::UnexpectedExecution => {
+                formatter.write_str("provider started new execution after its input was settled")
             }
         }
     }

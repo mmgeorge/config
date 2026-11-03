@@ -250,16 +250,73 @@ impl CopilotSession {
             (Ok(()), Ok(())) => Ok(()),
         }
     }
+    /// Abort foreground generation and stop this session's detached shell tasks.
     pub async fn abort(&self) -> Result<(), ProviderError> {
         if self.events.client_stopped() {
             return Ok(());
         }
-        self.inner.abort().await.map(|_| ()).map_err(|_| {
+        let foreground = self.inner.abort().await.map_err(|_| {
             native_failure(
                 forge_provider_api::error::ProviderOperation::CancelSession,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
-        })
+        });
+        // Native abort acknowledges model interruption without stopping detached shell tasks.
+        let shells = async {
+            self.inner.rpc().tasks().refresh().await.map_err(|_| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::CancelSession,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                )
+            })?;
+            let tasks = self.inner.rpc().tasks().list().await.map_err(|_| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::CancelSession,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                )
+            })?;
+            let encoded = serde_json::to_value(tasks).map_err(|_| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::CancelSession,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                )
+            })?;
+            let inventory = crate::terminal::parse_snapshot(&encoded, true).map_err(|_| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::CancelSession,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                )
+            })?;
+            for terminal in inventory.terminal {
+                let result = self
+                    .inner
+                    .rpc()
+                    .tasks()
+                    .cancel(TasksCancelRequest { id: terminal.id })
+                    .await
+                    .map_err(|_| {
+                        native_failure(
+                            forge_provider_api::ProviderOperation::CancelSession,
+                            forge_provider_api::ProviderFailureKind::Transport,
+                        )
+                    })?;
+                if !result.cancelled {
+                    return Err(native_failure(
+                        forge_provider_api::ProviderOperation::CancelSession,
+                        forge_provider_api::ProviderFailureKind::Rejected,
+                    ));
+                }
+            }
+            Ok::<(), ProviderError>(())
+        }
+        .await;
+        match (foreground, shells) {
+            (Ok(()), result) | (result, Ok(())) => result,
+            (Err(primary), Err(secondary)) => Err(ProviderError::Combined {
+                primary: Box::new(primary),
+                secondary: vec![secondary],
+            }),
+        }
     }
 
     /// Report whether this binding belongs to a stopped native process.

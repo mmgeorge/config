@@ -214,7 +214,8 @@ pub struct SessionSettings {
     pub approval: Option<crate::approval::ApprovalMode>,
 }
 
-/// Select all normalized resources requested for one retained provider session.
+/// Select the complete resource set for one retained provider session.
+/// Empty selections exclude inherited resources rather than restoring native defaults.
 #[derive(Clone, Debug, Default)]
 pub struct ResourceSelection {
     /// Select portable skills by normalized definitions.

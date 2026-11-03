@@ -48,6 +48,16 @@ struct BoundSession {
     retired: Arc<Mutex<bool>>,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CollectionPhase {
+    RetiringCallbacks,
+    CallbacksRetired,
+    NativeCollectionStarted,
+    NativeCollectionFinished,
+    PublicationsCollected,
+}
+
 pub(super) struct EndpointLease {
     _server: ControlServer,
 }
@@ -710,6 +720,28 @@ impl ProviderBridge {
         selection: &crate::settings::PortableSettings,
     ) -> Result<(), ProviderError> {
         let _admission = self.admission.write().await;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(failure(
+                ProviderOperation::ReconcileSettings,
+                ProviderFailureKind::Rejected,
+            ));
+        }
+        let owner = request.owner().map_err(|_| {
+            failure(
+                ProviderOperation::ReconcileSettings,
+                ProviderFailureKind::Rejected,
+            )
+        })?;
+        let initialized = self
+            .sessions
+            .lock()
+            .await
+            .get(&owner)
+            .is_some_and(|session| session.initialized.get().is_some());
+        // Initialization reads committed settings; no native configuration exists to mutate yet.
+        if !initialized {
+            return Ok(());
+        }
         let descriptor = self.descriptor();
         let resources = match descriptor.capability.integration.resource_target.as_deref() {
             Some(target) => crate::settings::SessionResources::load_with_selection(
@@ -721,7 +753,7 @@ impl ProviderBridge {
             )
             .map_err(|_| {
                 failure(
-                    ProviderOperation::InitializeSession,
+                    ProviderOperation::ReconcileSettings,
                     ProviderFailureKind::Rejected,
                 )
             })?
@@ -1075,7 +1107,13 @@ impl ProviderBridge {
         let Some(owner) = self.owner_for_key(key).await else {
             return Ok(());
         };
+        let session_id = owner.session_id.as_str().to_owned();
         let session = self.session(owner).await;
+        self.trace.record(
+            &session_id,
+            "execution.cleanup",
+            serde_json::json!({"phase":CollectionPhase::RetiringCallbacks}),
+        );
         let pending = session
             .invocations
             .lock()
@@ -1087,17 +1125,37 @@ impl ProviderBridge {
         for invocation in &pending {
             invocation.cancel();
         }
+        self.trace.record(
+            &session_id,
+            "execution.cleanup",
+            serde_json::json!({"phase":CollectionPhase::CallbacksRetired}),
+        );
         let mut errors = Vec::new();
         if let Some(native) = session.initialized.get() {
             let retired = native.retired.lock().await;
+            self.trace.record(
+                &session_id,
+                "execution.cleanup",
+                serde_json::json!({"phase":CollectionPhase::NativeCollectionStarted}),
+            );
             if !*retired && let Err(error) = self.native.cleanup_execution(&native.binding.id).await
             {
                 errors.push(error);
             }
+            self.trace.record(
+                &session_id,
+                "execution.cleanup",
+                serde_json::json!({"phase":CollectionPhase::NativeCollectionFinished}),
+            );
         }
         if let Err(error) = collect_selected_invocations(pending).await {
             errors.push(error);
         }
+        self.trace.record(
+            &session_id,
+            "execution.cleanup",
+            serde_json::json!({"phase":CollectionPhase::PublicationsCollected}),
+        );
         combined(errors)
     }
 

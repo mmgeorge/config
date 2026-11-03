@@ -43,6 +43,15 @@ local succeeded, failure = xpcall(function()
   navigation.activate({ session = { id = durable_id } }, { state = source, open_mode = "current" })
   assert(session.harness == state and state.timeline_tab == source_tab)
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, true)[1] == "Unsent draft")
+  local retained_transcript, retained_composer = state.transcript_buf, state.composer_buf
+  vim.cmd("tabclose")
+  assert(not vim.api.nvim_tabpage_is_valid(state.timeline_tab))
+  navigation.activate({ session = { id = durable_id } })
+  assert(session.harness == state, "resume replaced the retained session owner")
+  assert(state.transcript_buf == retained_transcript and state.composer_buf == retained_composer,
+    "resume replaced retained buffers or collided with their durable names")
+  assert(vim.api.nvim_tabpage_is_valid(state.timeline_tab))
+  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, true)[1] == "Unsent draft")
 end, debug.traceback)
 package.loaded["forge.views.harness.controller"] = original_controller
 if not succeeded then

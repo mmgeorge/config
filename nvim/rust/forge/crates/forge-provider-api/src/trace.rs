@@ -10,6 +10,14 @@ pub enum ProviderTraceEvent {
     SubmissionAccepted,
     ExecutionStarted,
     ExecutionFinished,
+    /// Begin interruption of a retained provider binding.
+    CancellationStarted,
+    /// Record the cancellation request's native acknowledgement or normalized failure.
+    CancellationAcknowledged,
+    /// Begin joining the binding's retained execution worker.
+    ExecutionCollectionStarted,
+    /// Record the worker collection outcome without native payloads.
+    ExecutionCollectionFinished,
     ObservationLost,
     CallbackSettled,
     SessionRetired,

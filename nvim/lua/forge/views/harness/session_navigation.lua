@@ -137,6 +137,14 @@ function M.activate(result, options)
     end
     state = existing
   end
+  if not state and existing and reusable_buffer then
+    if not release_presentation(existing) then return end
+    existing.transcript_buf, existing.transcript_win, existing.composer_buf, existing.composer_win, existing.timeline_tab =
+      layout.open(next_session.id)
+    layout.attach_auto_height(existing.composer_buf, existing.composer_win)
+    layout.attach_scroll_boundary(existing.transcript_buf, existing.transcript_win)
+    state = existing
+  end
   if not state then
     state = options.open_mode == "current" and source_state or create_view("session-pending-" .. next_session.id)
   end
