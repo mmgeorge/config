@@ -232,7 +232,10 @@ impl From<crate::version::RuntimeVersionError> for ProviderError {
 
 impl From<events::EventDeliveryError> for ProviderError {
     fn from(error: events::EventDeliveryError) -> Self {
-        Self::Delivery(error)
+        match error {
+            events::EventDeliveryError::Observation(failure) => Self::Observation(failure),
+            error => Self::Delivery(error),
+        }
     }
 }
 
@@ -247,7 +250,7 @@ impl From<anyhow::Error> for ProviderError {
             Err(error) => error,
         };
         let error = match error.downcast::<events::EventDeliveryError>() {
-            Ok(error) => return Self::Delivery(error),
+            Ok(error) => return error.into(),
             Err(error) => error,
         };
         let error = match error.downcast::<retry::RetryableFailure>() {

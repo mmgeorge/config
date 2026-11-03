@@ -1388,13 +1388,6 @@ impl HarnessBroker {
             .context("finalization envelope is missing")?;
         // Commit the final publication barrier or admit an owned continuation.
         if finalization.phase == FinalizationPhase::FinalDrain {
-            anyhow::ensure!(
-                self.retained_foregrounds.len() < forge_protocol::MAX_PENDING_FRAMES
-                    || self
-                        .retained_foregrounds
-                        .contains_key(&transaction.state.scope.invocation_id),
-                "idle host settlement capacity exhausted"
-            );
             return finalization.checks_delivered();
         }
         if let Some((request, events)) = self.prepare_owned_clarification(

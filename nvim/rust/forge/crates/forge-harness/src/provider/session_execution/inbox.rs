@@ -61,7 +61,7 @@ impl SessionObservationInbox {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Retain the first terminal failure outside the bounded event queue.
+    /// Retain the first terminal failure until preceding events drain.
     pub(crate) fn fail(&self, failure: forge_provider_api::lifecycle::ObservationFailure) {
         let mut current = self
             .failure
@@ -83,12 +83,6 @@ impl SessionObservationInbox {
             !self.is_closed(),
             "session observation generation is closed"
         );
-        if pending.len() == forge_protocol::MAX_PENDING_FRAMES {
-            return Err(crate::provider::ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::Overflow,
-            )
-            .into());
-        }
         pending.push_back(event);
         drop(pending);
         self.ready.notify_one();
@@ -124,14 +118,6 @@ impl SessionObservationInbox {
             .retained_watchdogs
             .lock()
             .map_err(|_| anyhow!("retained watchdog lock poisoned"))?;
-        if current.len() == forge_protocol::MAX_PENDING_FRAMES
-            && !current.contains_key(&scope.invocation_id)
-        {
-            return Err(crate::provider::ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::Overflow,
-            )
-            .into());
-        }
         let mut watchdogs = self
             .watchdogs
             .lock()
@@ -196,13 +182,6 @@ impl SessionObservationInbox {
         if watchdog.is_monitored() {
             return Ok(());
         }
-        if tasks.len() >= forge_protocol::MAX_PENDING_FRAMES {
-            self.fail(forge_provider_api::lifecycle::ObservationFailure::Overflow);
-            return Err(crate::provider::ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::Overflow,
-            )
-            .into());
-        }
         if !watchdog.start_monitor() {
             return Ok(());
         }
@@ -254,7 +233,7 @@ impl SessionObservationInbox {
                             },
                         })
                     })();
-                    // Stop native work even when the bounded publication queue cannot accept its timeout.
+                    // Stop native work even when timeout publication fails.
                     let cancellation = provider.cancel_session(&scope.owner.runtime_key()).await;
                     match (publication, cancellation) {
                         (Err(publication), Err(cancellation)) => {
@@ -469,9 +448,9 @@ impl forge_provider_api::events::EventObserver for SessionObservationInbox {
 mod tests {
     use super::*;
 
-    /// Cancel native work and preserve structured cleanup failure when timeout output overflows.
+    /// Cancel native work without losing timeout evidence behind a publication backlog.
     #[tokio::test(start_paused = true)]
-    async fn timeout_cancels_native_work_even_when_publication_is_full() -> Result<()> {
+    async fn timeout_cancels_native_work_behind_large_publication_backlog() -> Result<()> {
         let data = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(data.path())?);
         let provider: Arc<crate::provider::Provider> = Arc::from(crate::provider::build(
@@ -526,7 +505,8 @@ mod tests {
             },
             update: crate::provider::ToolUpdate::Started,
         })?;
-        for _ in 1..forge_protocol::MAX_PENDING_FRAMES {
+        let event_count = forge_protocol::MAX_PENDING_FRAMES * 4;
+        for _ in 1..event_count {
             inbox.push(ProviderEvent::Diagnostic {
                 scope: scope.clone().into(),
                 diagnostic: crate::provider::ProviderDiagnostic {
@@ -541,23 +521,21 @@ mod tests {
             .await?
             .unwrap_err();
         assert!(cancellation.to_string().contains("cancelled"));
-        assert!(inbox.is_closed());
-        assert_eq!(inbox.drain()?.len(), forge_protocol::MAX_PENDING_FRAMES);
+        assert!(!inbox.is_closed());
+        let events = inbox.drain()?;
+        assert_eq!(events.len(), event_count + 2);
+        assert!(matches!(&events[event_count], ProviderEvent::Tool {
+            update: crate::provider::ToolUpdate::Finished {
+                outcome: crate::provider::ToolOutcome::Failed { diagnostic },
+            }, ..
+        } if diagnostic.code.as_deref() == Some("tool_timeout")));
         assert!(
-            inbox
-                .drain()
-                .unwrap_err()
-                .is::<crate::provider::ProviderError>()
+            matches!(&events[event_count + 1], ProviderEvent::Diagnostic {
+            diagnostic, ..
+        } if diagnostic.code.as_deref() == Some("tool_timeout"))
         );
-        let error = inbox.retire_background().await.unwrap_err();
-        let Some(crate::provider::ProviderError::Cleanup(cleanup)) = error.downcast_ref() else {
-            panic!("expected typed watchdog cleanup failure: {error:#}");
-        };
-        assert!(
-            matches!(cleanup.collection(), Some(forge_provider_api::error::CleanupFailure::Failed(error))
-            if matches!(error.as_ref(), crate::provider::ProviderError::Observation(forge_provider_api::lifecycle::ObservationFailure::Overflow)))
-        );
-        assert!(inbox.retire_background().await.is_err());
+        assert!(inbox.drain()?.is_empty());
+        inbox.retire_background().await?;
         Ok(())
     }
 

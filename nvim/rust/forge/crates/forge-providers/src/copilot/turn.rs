@@ -8,8 +8,6 @@ use std::sync::{
 };
 use tokio::sync::Notify;
 
-const MAX_CERTIFICATION_EVENTS: usize = 16_384;
-
 /// Describe the terminal state established by a native idle observation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IdleOutcome {
@@ -435,25 +433,12 @@ impl CopilotTurnEvent {
                 .state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-            if state.event_parents.len() >= MAX_CERTIFICATION_EVENTS
-                && !state.event_parents.contains_key(&event.id)
-            {
-                return Err(forge_provider_api::ProviderError::Observation(
-                    forge_provider_api::lifecycle::ObservationFailure::Overflow,
-                )
-                .into());
-            }
             state
                 .event_parents
                 .insert(event.id.clone(), event.parent_id.clone());
         }
-        if event.agent_id.is_none()
-            && event
-                .data
-                .get("parentAgentTaskId")
-                .is_none_or(serde_json::Value::is_null)
-            && event.event_type == "user.message"
-        {
+        // Root inputs also carry parentAgentTaskId; envelope ownership and receipt identity govern coverage.
+        if event.agent_id.is_none() && event.event_type == "user.message" {
             let mut state = self
                 .state
                 .lock()
@@ -804,8 +789,22 @@ mod tests {
         }
         assert!(turn.foreground_anchor()?.is_none());
         turn.observe(&serde_json::from_value(serde_json::json!({
+            "id":"child-input", "agentId":"child", "type":"user.message",
+            "timestamp":"2026-11-01T00:00:00Z",
+            "data":{"messageId":"receipt-id", "turnId":"child-turn", "parentAgentTaskId":"child-task"}
+        }))?)?;
+        turn.observe(&serde_json::from_value(serde_json::json!({
+            "id":"foreign-start", "parentId":"child-input", "type":"assistant.turn_start",
+            "timestamp":"2026-11-01T00:00:00Z", "data":{"turnId":"child-turn"}
+        }))?)?;
+        assert!(
+            turn.foreground_anchor()?.is_none(),
+            "child input established root ownership"
+        );
+        turn.observe(&serde_json::from_value(serde_json::json!({
             "id":"different-event-uuid", "type":"user.message", "timestamp":"2026-11-01T00:00:00Z",
-            "data":{"messageId":"receipt-id", "turnId":"current-turn", "content":"hello"}
+            "data":{"messageId":"receipt-id", "turnId":"current-turn", "content":"hello",
+                "parentAgentTaskId":"root-task"}
         }))?)?;
         assert!(turn.foreground_anchor()?.is_none());
         turn.observe(&serde_json::from_value(serde_json::json!({
@@ -842,6 +841,47 @@ mod tests {
         Ok(())
     }
 
+    /// Certify a long execution without rejecting its complete native ancestry.
+    #[tokio::test]
+    async fn terminal_certificate_preserves_long_event_history() -> Result<()> {
+        let turn = CopilotTurnEvent::default();
+        let guard = turn.activate(None, None)?;
+        let submission = forge_provider_api::lifecycle::SubmissionId::try_from("long".to_owned())?;
+        guard
+            .send("cursor".into(), Some(submission.clone()), async {
+                Ok("message".into())
+            })
+            .await?;
+        let mut parent = None;
+        for sequence in 0..16_388 {
+            let (kind, data) = match sequence {
+                0 => (
+                    "user.message",
+                    serde_json::json!({"messageId":"message","turnId":"turn"}),
+                ),
+                1 => ("assistant.turn_start", serde_json::json!({"turnId":"turn"})),
+                16_386 => ("assistant.turn_end", serde_json::json!({"turnId":"turn"})),
+                16_387 => ("session.idle", serde_json::json!({})),
+                _ => (
+                    "assistant.message_delta",
+                    serde_json::json!({"messageId":"answer","deltaContent":"text"}),
+                ),
+            };
+            let event: SessionEvent = serde_json::from_value(serde_json::json!({
+                "id":format!("event-{sequence}"),"parentId":parent,"type":kind,
+                "timestamp":"2026-11-02T00:00:00Z","data":data
+            }))?;
+            turn.observe(&event)?;
+            if kind == "session.idle" {
+                turn.observe_idle_at(&event, IdleOutcome::Completed)?;
+            }
+            parent = Some(event.id);
+        }
+        turn.idle_settled().await?;
+        assert_eq!(turn.certified_submissions()?, vec![submission]);
+        Ok(())
+    }
+
     /// Preserve host-to-native identity and require each completed turn in the idle chain.
     #[tokio::test]
     async fn terminal_certificate_covers_only_inputs_with_completed_turns() -> Result<()> {
@@ -861,7 +901,7 @@ mod tests {
                 "user-a",
                 None,
                 "user.message",
-                serde_json::json!({"messageId":"native-first","turnId":"a","content":"a"}),
+                serde_json::json!({"messageId":"native-first","turnId":"a","content":"a","parentAgentTaskId":"first-task"}),
             ),
             (
                 "start-a",
@@ -879,7 +919,7 @@ mod tests {
                 "user-b",
                 Some("end-a"),
                 "user.message",
-                serde_json::json!({"messageId":"native-second","turnId":"b","content":"b"}),
+                serde_json::json!({"messageId":"native-second","turnId":"b","content":"b","parentAgentTaskId":"second-task"}),
             ),
             (
                 "start-b",

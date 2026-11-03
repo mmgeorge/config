@@ -472,8 +472,7 @@ impl crate::provider::ProviderAdapter for MockProvider {
     }
 
     async fn cancel_session(&self, session_id: &str) -> Result<()> {
-        self.response_control.cancel_session(Some(session_id));
-        Ok(())
+        self.cleanup_execution(session_id).await
     }
 
     async fn has_active_turn(&self, session_id: &str) -> bool {
@@ -501,6 +500,7 @@ impl crate::provider::ProviderAdapter for MockProvider {
 
     async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
         self.response_control.cancel_session(Some(session_id));
+        self.session_events.cancel_runtime(session_id).await?;
         Ok(())
     }
     async fn reset_session(&self, owner: &ExecutionOwner) -> Result<()> {
@@ -650,6 +650,14 @@ impl MockProvider {
         request: ProviderRequest,
         event_sink: ProviderEventSink,
     ) -> Result<crate::provider::ProviderCompletion, ProviderError> {
+        if request
+            .control_context
+            .as_ref()
+            .and_then(|context| context.submission_cancelled.as_ref())
+            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(ProviderError::Cancelled);
+        }
         if self.provider_stream {
             let steering = self.steering_lane(&request.runtime_key()?);
             let mut active_steering = steering.activate(Some(event_sink.clone()))?;

@@ -402,7 +402,11 @@ impl HarnessBroker {
                 .is_none(),
             "previous exchange finalization is still pending"
         );
-        if self.turn_cancellation.requested.load(Ordering::Acquire) {
+        if self
+            .turn_cancellation
+            .submission_cancelled
+            .load(Ordering::Acquire)
+        {
             return Err(TurnCancelled.into());
         }
         let staged = admission

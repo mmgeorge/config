@@ -383,7 +383,7 @@ impl BackgroundManager {
             )
             .await;
         }
-        if !succeeded {
+        if !succeeded || !observation_reliable {
             let removed = self.retained.lock().await.remove(&key);
             if let Some(removed) = removed
                 && let Err(error) = self.retire(removed).await
@@ -412,15 +412,25 @@ impl BackgroundManager {
         request: &BackgroundRequest,
         key: &str,
     ) -> Result<(HarnessBroker, BackgroundLease, fs::File)> {
-        ensure!(
-            !self
-                .cleanup_pending
+        let pending: Vec<_> = self
+            .cleanup_pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|runtime| runtime.cache_key == key)
+            .cloned()
+            .collect();
+        for runtime in pending {
+            runtime
+                .runtime
+                .shutdown()
+                .await
+                .context("Background runtime collection is incomplete; cleanup retry failed")?;
+            self.cleanup_pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .any(|runtime| runtime.cache_key == key),
-            "Background runtime collection is incomplete; finish cleanup before replacing this owner"
-        );
+                .retain(|pending| !Arc::ptr_eq(pending, &runtime));
+        }
         ensure!(
             !request.config.model.trim().is_empty(),
             "Background model cannot be empty"
@@ -978,7 +988,30 @@ mod tests {
             crate::timeline::SessionEventKind::Configuration { state, field, reason, .. }
             if state == "failed" && field.iter().any(|field| field == "observation_loss") && reason.is_some()
         )));
+        let retiring = replacement.retained.clone();
         drop(replacement);
+        broker.release_lease()?;
+        drop(ownership);
+        manager.retained.lock().await.remove(&key);
+        registry.record_cleanup_failure(anyhow::anyhow!("first collection failure"));
+        assert!(manager.retire(retiring.clone()).await.is_err());
+        registry.record_cleanup_failure(anyhow::anyhow!("collection still incomplete"));
+        let failed = manager.prepare(&request, &key).await;
+        assert!(failed.is_err(), "pending cleanup admitted a replacement");
+        assert!(manager.retained.lock().await.get(&key).is_none());
+        assert!(
+            manager
+                .cleanup_pending
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|pending| Arc::ptr_eq(pending, &retiring))
+        );
+        let (mut broker, recovered, ownership) = manager.prepare(&request, &key).await?;
+        assert_eq!(recovered.retained.session_id, session_id);
+        assert!(!Arc::ptr_eq(&recovered.retained.runtime, &retiring.runtime));
+        assert!(manager.cleanup_pending.lock().unwrap().is_empty());
+        drop(recovered);
         broker.release_lease()?;
         drop(ownership);
         manager.shutdown().await?;

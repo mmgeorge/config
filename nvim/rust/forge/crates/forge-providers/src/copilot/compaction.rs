@@ -197,6 +197,61 @@ impl Drop for CompactionMonitor {
 mod tests {
     use super::*;
 
+    /// Retain the native summary, failure, accounting, and start identity through replay.
+    #[test]
+    fn compaction_retains_summary_failure_and_identity_across_replays() -> anyhow::Result<()> {
+        let started: github_copilot_sdk::SessionEvent =
+            serde_json::from_value(serde_json::json!({
+                "id":"compaction-start","type":"session.compaction_start",
+                "timestamp":"2026-10-29T12:00:00Z",
+                "data":{"model":"summary-model","conversationTokens":100}
+            }))?;
+        let completed: github_copilot_sdk::SessionEvent = serde_json::from_value(
+            serde_json::json!({
+                "id":"compaction-complete","type":"session.compaction_complete",
+                "timestamp":"2026-10-29T12:00:00Z",
+                "data":{
+                    "success":false,"error":"summary request failed","summaryContent":"Retain the contract.",
+                    "preCompactionTokens":100,"postCompactionTokens":40,"tokensRemoved":60,"messagesRemoved":0,
+                    "compactionTokensUsed":{"inputTokens":100,"outputTokens":20,"cacheReadTokens":0,
+                        "copilotUsage":{"totalNanoAiu":1.5,"tokenDetails":[{"tokenType":"input","tokenCount":100}]}}
+                }
+            }),
+        )?;
+        let first = super::super::decode::decode_compaction(&started, "root", None)?;
+        let settled = super::super::decode::decode_compaction(&completed, "root", Some(&first))?;
+        let replayed = super::super::decode::decode_compaction(&completed, "root", Some(&settled))?;
+        assert_eq!(replayed.id, started.id);
+        assert_eq!(replayed.state, CompactionState::Failed);
+        assert_eq!(
+            replayed.result.summary_content.as_deref(),
+            Some("Retain the contract.")
+        );
+        assert_eq!(
+            replayed.result.error.as_deref(),
+            Some("summary request failed")
+        );
+        assert_eq!(replayed.result.messages_removed, Some(0));
+        assert_eq!(replayed.result.model.as_deref(), Some("summary-model"));
+        assert_eq!(
+            replayed.result.before_context.unwrap().conversation_tokens,
+            Some(100)
+        );
+        let usage = replayed.result.compaction_tokens_used.unwrap();
+        assert_eq!(usage.cached_input, Some(0));
+        assert_eq!(usage.billing.unwrap().measurements[0].value, "1.5");
+        let orphan = super::super::decode::decode_compaction(
+            &serde_json::from_value(serde_json::json!({
+                "id":"orphan","type":"session.compaction_complete",
+                "timestamp":"2026-10-29T12:00:00Z","data":{"success":true}
+            }))?,
+            "root",
+            None,
+        )?;
+        assert_eq!(orphan.result.pre_compaction_tokens, None);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn compaction_identity_survives_turn_and_subscription_rebinding() {
         let (sink, _stream) =

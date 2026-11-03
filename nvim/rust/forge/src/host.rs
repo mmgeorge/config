@@ -692,6 +692,8 @@ fn handshake_response(envelope: RoutedRequestEnvelope) -> Result<Response> {
 fn request_failure_response(request_id: u64, error: &anyhow::Error) -> Response {
     let code = if error.is::<forge_harness::broker::RequestNotAdmitted>() {
         "not_admitted"
+    } else if error.is::<forge_harness::broker::TurnCancelled>() {
+        "turn_cancelled"
     } else if error.is::<forge_harness::buffer::TranscriptProjectionFailure>() {
         "invalid_state"
     } else {
@@ -759,6 +761,15 @@ async fn write_frame<Output: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Preserve early cancellation identity before a foreground result envelope exists.
+    #[test]
+    fn early_cancellation_retains_typed_response_code() {
+        let error = anyhow::Error::new(forge_harness::broker::TurnCancelled)
+            .context("prepare Harness request");
+        let response = request_failure_response(41, &error);
+        assert_eq!(response.error().unwrap().code, "turn_cancelled");
+    }
 
     #[test]
     fn transcript_projection_failure_is_invalid_state_through_context() {

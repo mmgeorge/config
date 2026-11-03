@@ -3,6 +3,8 @@ use crate::provider::test_support::ProviderTestExt as _;
 use crate::provider::{
     ApprovalUpdate, ExecutionOwner, InvocationScope, ToolOutcome, ToolUpdate, TurnUpdate,
 };
+use forge_provider_api::permissions::{PermissionResponse, ProviderPermissions as _};
+use forge_providers::copilot::permission::permission_from_copilot;
 use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
@@ -773,35 +775,21 @@ async fn copilot_disables_tool_search_and_binds_session_files_on_create_and_resu
             request.workspace.clone(),
             Some(sink),
         )?;
-        let handler = forge_providers::copilot::permission::handler(context);
-        let PermissionResult::Decision {
-            decision: expected,
-            context: _,
-        } = PermissionResult::approve_once()
-        else {
-            unreachable!()
-        };
-        let expected = serde_json::to_value(expected)?;
         for kind in ["read", "write"] {
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
-                handler.handle(
-                    SessionId::new(session.id()),
-                    RequestId::new(format!("session-{kind}")),
-                    serde_json::from_value(json!({
-                        "kind":kind, "path":session_directory.join("plan.md")
-                    }))?,
+                context.authorize(
+                    &session.id(),
+                    permission_from_copilot(
+                        format!("session-{kind}"),
+                        kind,
+                        json!({"kind":kind, "path":session_directory.join("plan.md")}),
+                        &request.workspace,
+                    ),
                 ),
             )
             .await?;
-            let PermissionResult::Decision {
-                decision,
-                context: _,
-            } = result
-            else {
-                panic!("session file access returned no decision")
-            };
-            assert_eq!(serde_json::to_value(decision)?, expected);
+            assert!(matches!(result, PermissionResponse::Allow));
             assert!(
                 events.try_recv().is_err(),
                 "session file access requested approval"
@@ -824,15 +812,18 @@ async fn retired_permission_context_rejects_pending_and_late_callbacks() -> Resu
         request.workspace.clone(),
         Some(sink),
     )?;
-    let handler = forge_providers::copilot::permission::handler(context.clone());
-    let pending_handler = handler.clone();
+    let pending_context = context.clone();
     let path = external.path().join("pending.txt");
     let pending = tokio::spawn(async move {
-        pending_handler
-            .handle(
-                serde_json::from_value(json!("native")).unwrap(),
-                serde_json::from_value(json!("pending")).unwrap(),
-                serde_json::from_value(json!({"kind":"write","path":path})).unwrap(),
+        pending_context
+            .authorize(
+                "native",
+                permission_from_copilot(
+                    "pending".into(),
+                    "write",
+                    json!({"kind":"write","path":path}),
+                    "",
+                ),
             )
             .await
     });
@@ -861,40 +852,30 @@ async fn retired_permission_context_rejects_pending_and_late_callbacks() -> Resu
             .is_err()
     );
     coordinator.cancel_owner(&request.owner()?, None).await?;
-    let PermissionResult::Decision { decision, .. } = pending.await? else {
-        anyhow::bail!("missing decision");
-    };
-    let PermissionResult::Decision {
-        decision: allowed, ..
-    } = PermissionResult::approve_once()
-    else {
-        unreachable!()
-    };
-    assert_ne!(
-        serde_json::to_value(decision)?,
-        serde_json::to_value(&allowed)?
-    );
+    assert!(matches!(
+        pending.await?,
+        PermissionResponse::Deny { .. } | PermissionResponse::Cancelled
+    ));
     assert!(
         forge_provider_api::permissions::ProviderPermissions::before_tool(context.as_ref())
             .await
             .is_err()
     );
-    let late = handler
-        .handle(
-            serde_json::from_value(json!("native"))?,
-            serde_json::from_value(json!("late"))?,
-            serde_json::from_value(
+    let late = context
+        .authorize(
+            "native",
+            permission_from_copilot(
+                "late".into(),
+                "write",
                 json!({"kind":"write","path":external.path().join("late.txt")}),
-            )?,
+                "",
+            ),
         )
         .await;
-    let PermissionResult::Decision { decision, .. } = late else {
-        anyhow::bail!("missing late decision");
-    };
-    assert_ne!(
-        serde_json::to_value(decision)?,
-        serde_json::to_value(&allowed)?
-    );
+    assert!(matches!(
+        late,
+        PermissionResponse::Deny { .. } | PermissionResponse::Cancelled
+    ));
     Ok(())
 }
 
@@ -915,25 +896,15 @@ async fn copilot_file_callbacks_apply_directory_scopes_without_sandbox() -> Resu
         request.workspace.clone(),
         Some(sink),
     )?;
-    let handler = forge_providers::copilot::permission::handler(context);
-    let PermissionResult::Decision {
-        decision: expected,
-        context: _,
-    } = PermissionResult::approve_once()
-    else {
-        unreachable!()
-    };
-    let expected = serde_json::to_value(expected)?;
     for kind in ["read", "write"] {
         let data = json!({"kind":kind,"path":external.path().join("file.txt")});
-        let waiting_handler = handler.clone();
+        let waiting_context = context.clone();
         let waiting_data = data.clone();
         let waiter = tokio::spawn(async move {
-            waiting_handler
-                .handle(
-                    serde_json::from_value(json!("native")).unwrap(),
-                    serde_json::from_value(json!("file")).unwrap(),
-                    serde_json::from_value(waiting_data).unwrap(),
+            waiting_context
+                .authorize(
+                    "native",
+                    permission_from_copilot("file".into(), kind, waiting_data, ""),
                 )
                 .await
         });
@@ -958,14 +929,7 @@ async fn copilot_file_callbacks_apply_directory_scopes_without_sandbox() -> Resu
                 None,
             )
             .await?;
-        let PermissionResult::Decision {
-            decision,
-            context: _,
-        } = waiter.await?
-        else {
-            panic!("approval returned no decision")
-        };
-        assert_eq!(serde_json::to_value(decision)?, expected);
+        assert!(matches!(waiter.await?, PermissionResponse::Allow));
         assert!(matches!(
             events.recv().await.unwrap().unwrap(),
             ProviderEvent::DirectoryAccess { .. }
@@ -979,21 +943,13 @@ async fn copilot_file_callbacks_apply_directory_scopes_without_sandbox() -> Resu
         ));
         let repeat = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            handler.handle(
-                serde_json::from_value(json!("native"))?,
-                serde_json::from_value(json!("repeat"))?,
-                serde_json::from_value(data)?,
+            context.authorize(
+                "native",
+                permission_from_copilot("repeat".into(), kind, data, ""),
             ),
         )
         .await?;
-        let PermissionResult::Decision {
-            decision,
-            context: _,
-        } = repeat
-        else {
-            panic!("repeat returned no decision")
-        };
-        assert_eq!(serde_json::to_value(decision)?, expected);
+        assert!(matches!(repeat, PermissionResponse::Allow));
     }
     Ok(())
 }
@@ -1664,6 +1620,363 @@ fn fixture() -> Result<(
     Ok((fixture, provider, request))
 }
 
+/// Preserve a native burst before send acknowledgment and finish the following prompt normally.
+#[tokio::test]
+async fn copilot_burst_before_acknowledgment_preserves_answer_and_next_prompt() -> Result<()> {
+    for mode in [PromptMode::Chat, PromptMode::Background] {
+        let (_fixture, provider, mut request) = fixture()?;
+        request.mode = mode;
+        let (client_read, mut server_write) = tokio::io::duplex(65536);
+        let (client_write, mut server_read) = tokio::io::duplex(65536);
+        provider
+            .runtime
+            .attach_streams(client_read, client_write, PathBuf::from(&request.workspace))
+            .await?;
+        let event_count = forge_protocol::MAX_PENDING_FRAMES * 8;
+        let server = async {
+            let session_id = serve_session_start(&mut server_read, &mut server_write, None).await?;
+            for attempt in 0..2 {
+                let send = serve_prompt_preparation(&mut server_read, &mut server_write).await?;
+                let message = format!("input-{attempt}");
+                let turn = "0";
+                let mut parent = None;
+                emit_event(
+                &mut server_write,
+                &session_id,
+                &mut parent,
+                "user.message",
+                json!({"messageId":message,"turnId":turn,"content":"fixture","parentAgentTaskId":"root-task"}),
+            )
+            .await?;
+                emit_event(
+                    &mut server_write,
+                    &session_id,
+                    &mut parent,
+                    "assistant.turn_start",
+                    json!({"turnId":turn}),
+                )
+                .await?;
+                emit_event(
+                    &mut server_write,
+                    &session_id,
+                    &mut parent,
+                    "assistant.message_start",
+                    json!({"messageId":format!("answer-{attempt}"),"phase":"final_answer"}),
+                )
+                .await?;
+                let count = if attempt == 0 { event_count } else { 1 };
+                for _ in 0..count {
+                    emit_event(
+                        &mut server_write,
+                        &session_id,
+                        &mut parent,
+                        "assistant.message_delta",
+                        json!({"messageId":format!("answer-{attempt}"),"deltaContent":"complete "}),
+                    )
+                    .await?;
+                }
+                respond(
+                    &mut server_write,
+                    &send,
+                    json!({"result":{"messageId":message}}),
+                )
+                .await?;
+                emit_event(&mut server_write, &session_id, &mut parent, "assistant.message",
+                json!({"messageId":format!("answer-{attempt}"),"phase":"final_answer","content":"complete ".repeat(count)})).await?;
+                emit_event(
+                    &mut server_write,
+                    &session_id,
+                    &mut parent,
+                    "assistant.turn_end",
+                    json!({"turnId":turn}),
+                )
+                .await?;
+                emit_event(
+                    &mut server_write,
+                    &session_id,
+                    &mut parent,
+                    "session.idle",
+                    json!({}),
+                )
+                .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let workflow = async {
+            for attempt in 0..2 {
+                let (sink, mut events) = event_channel(&request)?;
+                let running = provider.session_prompt_and_wait(request.clone(), sink);
+                tokio::pin!(running);
+                let mut answer = None;
+                let completion = loop {
+                    tokio::select! {
+                        completion = &mut running => break completion?,
+                        event = events.recv() => {
+                            if let Some(ProviderEvent::Message { update: crate::provider::MessageUpdate::Completed { text }, .. }) = event? {
+                                answer = Some(text);
+                            }
+                        }
+                    }
+                };
+                while let Some(event) = events.try_next()? {
+                    if let ProviderEvent::Message {
+                        update: crate::provider::MessageUpdate::Completed { text },
+                        ..
+                    } = event
+                    {
+                        answer = Some(text);
+                    }
+                }
+                assert_eq!(
+                    answer.as_deref(),
+                    Some(
+                        "complete "
+                            .repeat(if attempt == 0 { event_count } else { 1 })
+                            .as_str()
+                    )
+                );
+                if let Some(previous) = &request.provider_session_id {
+                    assert_eq!(completion.provider_session_id.as_ref(), Some(previous));
+                }
+                request.provider_session_id = completion.native.provider_session_id;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::try_join!(server, workflow)
+        })
+        .await??;
+    }
+    Ok(())
+}
+
+/// Recover a disconnected native transport without replaying the failed prompt or changing history.
+#[tokio::test]
+async fn copilot_disconnect_collects_execution_and_resumes_for_next_prompt() -> Result<()> {
+    for mode in [PromptMode::Chat, PromptMode::Background] {
+        let (_fixture, provider, mut request) = fixture()?;
+        request.mode = mode;
+        let (client_read, mut server_write) = tokio::io::duplex(65536);
+        let (client_write, mut server_read) = tokio::io::duplex(65536);
+        provider
+            .runtime
+            .attach_streams(client_read, client_write, PathBuf::from(&request.workspace))
+            .await?;
+        let (sink, mut events) = event_channel(&request)?;
+        let server = async {
+            let session_id = serve_session_start(&mut server_read, &mut server_write, None).await?;
+            let send = serve_prompt_preparation(&mut server_read, &mut server_write).await?;
+            respond(
+                &mut server_write,
+                &send,
+                json!({"result":{"messageId":"interrupted"}}),
+            )
+            .await?;
+            let mut parent = None;
+            emit_event(
+                &mut server_write,
+                &session_id,
+                &mut parent,
+                "user.message",
+                json!({"messageId":"interrupted","turnId":"interrupted","content":"fixture","parentAgentTaskId":"root-task"}),
+            )
+            .await?;
+            emit_event(
+                &mut server_write,
+                &session_id,
+                &mut parent,
+                "assistant.turn_start",
+                json!({"turnId":"interrupted"}),
+            )
+            .await?;
+            emit_event(
+                &mut server_write,
+                &session_id,
+                &mut parent,
+                "assistant.message_delta",
+                json!({"messageId":"partial","deltaContent":"unfinished"}),
+            )
+            .await?;
+            server_write.shutdown().await?;
+            Ok::<_, anyhow::Error>(session_id)
+        };
+        let (session_id, failed) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(
+                server,
+                provider.session_prompt_and_wait(request.clone(), sink)
+            )
+        })
+        .await?;
+        let session_id = session_id?;
+        assert!(failed.is_err(), "disconnected execution reported success");
+        let failure = failed.unwrap_err();
+        assert!(
+            !format!("{failure:#}").contains("within 8 seconds"),
+            "{failure:#}"
+        );
+        assert!(!provider.has_active_turn(&request.runtime_key()?).await);
+        while events.try_next().is_ok_and(|event| event.is_some()) {}
+        provider.recover(request.owner()?).await?;
+
+        let (client_read, mut server_write) = tokio::io::duplex(65536);
+        let (client_write, mut server_read) = tokio::io::duplex(65536);
+        provider
+            .runtime
+            .attach_streams(client_read, client_write, PathBuf::from(&request.workspace))
+            .await?;
+        request.provider_session_id = Some(session_id.clone().try_into()?);
+        let server = async {
+            serve_session_start(&mut server_read, &mut server_write, Some(&session_id)).await?;
+            let send = serve_prompt_preparation(&mut server_read, &mut server_write).await?;
+            respond(
+                &mut server_write,
+                &send,
+                json!({"result":{"messageId":"next"}}),
+            )
+            .await?;
+            let mut parent = None;
+            for (kind, data) in [
+                (
+                    "user.message",
+                    json!({"messageId":"next","turnId":"next","content":"fixture","parentAgentTaskId":"root-task"}),
+                ),
+                ("assistant.turn_start", json!({"turnId":"next"})),
+                (
+                    "assistant.message",
+                    json!({"messageId":"answer","phase":"final_answer","content":"Recovered answer"}),
+                ),
+                ("assistant.turn_end", json!({"turnId":"next"})),
+                ("session.idle", json!({})),
+            ] {
+                emit_event(&mut server_write, &session_id, &mut parent, kind, data).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let (sink, _events) = event_channel(&request)?;
+        let (_, completion) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(server, async {
+                provider
+                    .session_prompt_and_wait(request.clone(), sink)
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .await??;
+        assert_eq!(
+            completion
+                .provider_session_id
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some(session_id.as_str())
+        );
+    }
+    Ok(())
+}
+
+/// Serve native creation or exact-history resumption without a model request.
+async fn serve_session_start(
+    reader: &mut DuplexStream,
+    writer: &mut DuplexStream,
+    resumed: Option<&str>,
+) -> Result<String> {
+    let mut request = read_request(reader, writer).await?;
+    if request["method"] == "mcp.discover" {
+        respond(writer, &request, json!({"result":{"servers":[]}})).await?;
+        request = read_request(reader, writer).await?;
+    }
+    assert_eq!(
+        request["method"],
+        if resumed.is_some() {
+            "session.resume"
+        } else {
+            "session.create"
+        }
+    );
+    let session_id = request["params"]["sessionId"]
+        .as_str()
+        .context("missing native session ID")?
+        .to_owned();
+    if let Some(resumed) = resumed {
+        assert_eq!(session_id, resumed);
+    }
+    respond(
+        writer,
+        &request,
+        json!({"result":{"sessionId":session_id,"workspacePath":"."}}),
+    )
+    .await?;
+    if resumed.is_some() {
+        for (method, result) in [
+            ("session.skills.reload", json!({})),
+            (
+                "session.eventLog.read",
+                json!({"cursor":"resumed","cursorStatus":"ok","hasMore":false,"events":[]}),
+            ),
+        ] {
+            let mut request = read_request(reader, writer).await?;
+            if request["method"] == "session.options.update" {
+                respond(writer, &request, json!({"result":{"success":true}})).await?;
+                request = read_request(reader, writer).await?;
+            }
+            assert_eq!(request["method"], method);
+            respond(writer, &request, json!({"result":result})).await?;
+        }
+    }
+    Ok(session_id)
+}
+
+/// Serve snapshot requests while retaining the send acknowledgment for the test scenario.
+async fn serve_prompt_preparation(
+    reader: &mut DuplexStream,
+    writer: &mut DuplexStream,
+) -> Result<Value> {
+    for (method, result) in [
+        (
+            "session.plan.readSqlTodosWithDependencies",
+            json!({"rows":[],"dependencies":[]}),
+        ),
+        ("session.eventLog.tail", json!({"cursor":"before-send"})),
+    ] {
+        let mut request = read_request(reader, writer).await?;
+        if request["method"] == "session.options.update" {
+            respond(writer, &request, json!({"result":{"success":true}})).await?;
+            request = read_request(reader, writer).await?;
+        }
+        assert_eq!(request["method"], method);
+        respond(writer, &request, json!({"result":result})).await?;
+    }
+    let request = read_request(reader, writer).await?;
+    assert_eq!(request["method"], "session.send");
+    Ok(request)
+}
+
+/// Publish ordered native evidence with a complete parent chain.
+async fn emit_event(
+    writer: &mut DuplexStream,
+    session_id: &str,
+    parent: &mut Option<String>,
+    kind: &str,
+    payload: Value,
+) -> Result<()> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let ephemeral = matches!(
+        kind,
+        "assistant.message_delta" | "assistant.idle" | "session.idle"
+    );
+    write_frame(
+        writer,
+        json!({"jsonrpc":"2.0","method":"session.event","params":{
+            "sessionId":session_id,"event":{"id":id,"parentId":parent,"type":kind,
+            "timestamp":"2026-11-02T00:00:00Z","ephemeral":ephemeral,"data":payload}
+        }}),
+    )
+    .await?;
+    if !ephemeral {
+        *parent = Some(id);
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn copilot_rejection_feedback_preserves_denial_origin_and_cancellation() -> Result<()> {
     use crate::permissions::document::{CATEGORY_TOOL, PermissionDecision};
@@ -1711,18 +2024,25 @@ async fn copilot_rejection_feedback_preserves_denial_origin_and_cancellation() -
             request.workspace.clone(),
             Some(sink),
         )?;
-        let handler = forge_providers::copilot::permission::handler(context.clone());
+        let waiting_context = context.clone();
         let task = tokio::spawn(async move {
-            handler
-                .handle(
-                    SessionId::new("native"),
-                    RequestId::new("request"),
-                    serde_json::from_value(if scenario == "invalid" {
-                        json!({"kind":"shell","fullCommandText":"echo '","shell":"bash"})
-                    } else {
-                        json!({"kind":"custom-tool","toolName":"sample"})
-                    })
-                    .unwrap(),
+            waiting_context
+                .authorize(
+                    "native",
+                    permission_from_copilot(
+                        "request".into(),
+                        if scenario == "invalid" {
+                            "shell"
+                        } else {
+                            "custom-tool"
+                        },
+                        if scenario == "invalid" {
+                            json!({"kind":"shell","fullCommandText":"echo '","shell":"bash"})
+                        } else {
+                            json!({"kind":"custom-tool","toolName":"sample"})
+                        },
+                        "",
+                    ),
                 )
                 .await
         });
@@ -1755,55 +2075,45 @@ async fn copilot_rejection_feedback_preserves_denial_origin_and_cancellation() -
                     .await?;
             }
         }
-        let PermissionResult::Decision {
-            decision,
-            context: _,
-        } = tokio::time::timeout(std::time::Duration::from_secs(3), task).await??
-        else {
-            panic!("permission returned no decision")
-        };
-        let decision = serde_json::to_value(decision)?;
+        let decision = tokio::time::timeout(std::time::Duration::from_secs(3), task).await??;
         if scenario == "allow" {
-            assert_eq!(decision["kind"], "approve-once");
+            assert!(matches!(decision, PermissionResponse::Allow));
+        } else if scenario == "cancel" {
+            assert!(matches!(decision, PermissionResponse::Cancelled));
         } else {
-            assert_eq!(decision["kind"], "reject");
-            if scenario == "cancel" {
-                assert!(decision.get("feedback").is_none());
-            } else {
-                let feedback = decision["feedback"]
-                    .as_str()
-                    .context("missing rejection feedback")?;
-                assert!(
-                    feedback.starts_with(
-                        "Tool call rejected. The requested operation was not executed."
-                    )
-                );
-                assert!(feedback.contains("Do not retry or bypass this denial."));
-                assert!(feedback.contains("explain the blocker to the user"));
-                let reason = match scenario {
-                    "policy" | "policy-autonomous" => {
-                        "Harness permission or filesystem access policy"
-                    }
-                    "mode" => "Tool approval is set to reject all",
-                    "user" => "Rejected by the user",
-                    "timeout" => "timeout expired",
-                    "invalid" => "permission evaluation failed",
-                    _ => unreachable!(),
-                };
-                assert!(feedback.contains(reason), "{scenario}: {feedback}");
-                assert_eq!(
-                    feedback.contains("Rejected by the user"),
-                    scenario == "user"
-                );
-                assert_eq!(
-                    feedback.contains("Automatically rejected"),
-                    scenario != "user"
-                );
-                if mode == ApprovalMode::Deny {
-                    assert!(feedback.contains("no user is reviewing requests"));
-                    assert!(feedback.contains("allowed tools and commands"));
-                    assert!(feedback.contains("Do not wait for approval"));
-                }
+            let PermissionResponse::Deny {
+                reason: Some(feedback),
+            } = decision
+            else {
+                panic!("expected rejection feedback");
+            };
+            assert!(
+                feedback
+                    .starts_with("Tool call rejected. The requested operation was not executed.")
+            );
+            assert!(feedback.contains("Do not retry or bypass this denial."));
+            assert!(feedback.contains("explain the blocker to the user"));
+            let reason = match scenario {
+                "policy" | "policy-autonomous" => "Harness permission or filesystem access policy",
+                "mode" => "Tool approval is set to reject all",
+                "user" => "Rejected by the user",
+                "timeout" => "timeout expired",
+                "invalid" => "permission evaluation failed",
+                _ => unreachable!(),
+            };
+            assert!(feedback.contains(reason), "{scenario}: {feedback}");
+            assert_eq!(
+                feedback.contains("Rejected by the user"),
+                scenario == "user"
+            );
+            assert_eq!(
+                feedback.contains("Automatically rejected"),
+                scenario != "user"
+            );
+            if mode == ApprovalMode::Deny {
+                assert!(feedback.contains("no user is reviewing requests"));
+                assert!(feedback.contains("allowed tools and commands"));
+                assert!(feedback.contains("Do not wait for approval"));
             }
         }
         assert_eq!(context.cancelled().unwrap(), scenario == "cancel");

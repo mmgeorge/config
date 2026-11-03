@@ -106,6 +106,37 @@ impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized>
         self.owner(owner).await?.engine.steer_current(input).await
     }
 
+    /// Replace a failed owner through the production recovery path before another test request.
+    pub async fn recover(&self, owner: ExecutionOwner) -> anyhow::Result<()> {
+        self.registry.owner(owner.clone()).await?.close().await?;
+        let inbox = self.registry.observer(owner.clone())?;
+        // This fixture replaces inbox delivery with its separately joined stream.
+        inbox.close();
+        loop {
+            match inbox.drain() {
+                Ok(events) if events.is_empty() => break,
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<ProviderError>(),
+                        Some(ProviderError::Observation(_))
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.registry.replace(owner.clone()).await?;
+        if let Some(previous) = self.owners.lock().await.remove(&owner)
+            && let Some(observer) = previous.observer.lock().await.take()
+        {
+            observer.await?;
+        }
+        self.owner(owner).await?;
+        Ok(())
+    }
+
     /// Close all engines and join their independently retained observers.
     pub async fn close(&self) -> anyhow::Result<()> {
         self.registry.close().await?;
@@ -160,11 +191,6 @@ impl<P: ProviderAdapter<Host = harness::provider::HarnessProviderHost> + ?Sized>
                     }
                 };
                 let mut idle = retained.lock().await;
-                if idle.events.len() == forge_protocol::MAX_PENDING_FRAMES {
-                    idle.failure =
-                        Some(forge_provider_api::lifecycle::ObservationFailure::Overflow);
-                    break;
-                }
                 idle.events.push(event);
             }
         });

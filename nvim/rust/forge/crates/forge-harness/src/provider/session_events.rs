@@ -664,6 +664,8 @@ impl SessionEvents {
                     result = &mut execution => break result,
                 }
             };
+            // Release adapter guards before collecting delivery or publishing terminal evidence.
+            drop(execution);
             if let (Some(slot), Ok(result)) = (&completion, &output)
                 && let Err(error) = slot.publish(result.clone())
             {

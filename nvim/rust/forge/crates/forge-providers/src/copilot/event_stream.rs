@@ -24,7 +24,7 @@ pub(crate) enum StartupOutcome {
 
 /// Drains SDK notifications without owning the session or blocking on presentation.
 pub struct SessionEventStream {
-    receiver: tokio::sync::mpsc::Receiver<SessionEvent>,
+    receiver: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
     task: Option<tokio::task::JoinHandle<Result<()>>>,
     session_id: String,
     startup: Option<tokio::sync::watch::Sender<StartupState>>,
@@ -57,7 +57,7 @@ impl SessionEventStream {
         harness_session_id: String,
         initial: StartupState,
     ) -> Self {
-        let (sender, receiver) = tokio::sync::mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (startup, mut startup_state) = tokio::sync::watch::channel(initial);
         let stream_session_id = session_id.clone();
         let task = tokio::spawn(async move {
@@ -94,17 +94,8 @@ impl SessionEventStream {
                             );
                         }
                     };
-                    if accepts(&event) {
-                        match sender.try_send(event) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                return Err(forge_provider_api::ProviderError::Observation(
-                                    forge_provider_api::lifecycle::ObservationFailure::Overflow,
-                                )
-                                .into());
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return Ok(()),
-                        }
+                    if accepts(&event) && sender.send(event).is_err() {
+                        return Ok(());
                     }
                 }
             }
@@ -128,7 +119,7 @@ impl SessionEventStream {
 
     #[cfg(test)]
     pub(crate) fn fixture(
-        receiver: tokio::sync::mpsc::Receiver<SessionEvent>,
+        receiver: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
         task: tokio::task::JoinHandle<Result<()>>,
     ) -> Self {
         Self {
@@ -148,11 +139,13 @@ impl SessionEventStream {
 
     /// Stop and join the SDK subscription reader before releasing its session.
     pub(crate) async fn close(&mut self) -> Result<()> {
-        let Some(task) = self.task.take() else {
+        let Some(task) = self.task.as_mut() else {
             return Ok(());
         };
         task.abort();
-        match task.await {
+        let result = task.await;
+        self.task.take();
+        match result {
             Ok(result) => result,
             Err(error) if error.is_cancelled() => Ok(()),
             Err(error) => Err(error).context("Copilot event intake failed during collection"),
@@ -164,10 +157,13 @@ impl SessionEventStream {
         if let Some(event) = self.receiver.recv().await {
             return Ok(event);
         }
-        self.task
-            .take()
+        let result = self
+            .task
+            .as_mut()
             .context("Copilot event intake was already collected")?
-            .await
+            .await;
+        self.task.take();
+        result
             .with_context(|| {
                 format!(
                     "Copilot session {} intake task did not complete normally",
@@ -194,10 +190,41 @@ impl Drop for SessionEventStream {
 mod tests {
     use super::*;
 
+    /// Keep a producer's handle when another select branch interrupts error collection.
+    #[tokio::test]
+    async fn cancelled_receive_retains_producer_for_collection() {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(sender);
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            released.await?;
+            Err(forge_provider_api::ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Disconnected,
+            )
+            .into())
+        });
+        let mut stream = SessionEventStream::fixture(receiver, task);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1), stream.recv())
+                .await
+                .is_err()
+        );
+        assert!(stream.task.is_some());
+        release.send(()).unwrap();
+        let error = stream.recv().await.unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<forge_provider_api::ProviderError>(),
+            Some(forge_provider_api::ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Disconnected
+            ))
+        ));
+        stream.close().await.unwrap();
+    }
+
     /// Explicit close waits for the producer to drop its queue and can be repeated safely.
     #[tokio::test]
     async fn explicit_close_collects_the_subscription_task() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let probe = sender.clone();
         let (ready, started) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
@@ -214,7 +241,7 @@ mod tests {
 
     #[tokio::test]
     async fn intake_preserves_large_events_before_reporting_the_producer_error() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let content = "patch".repeat(forge_protocol::MAX_FRAME_BYTES);
         let expected = content.clone();
         let task = tokio::spawn(async move {
@@ -230,7 +257,6 @@ mod tests {
                     event_type: "tool.execution_start".into(),
                     data: serde_json::json!({"patch": content}),
                 })
-                .await
                 .unwrap();
             Err(anyhow::anyhow!("socket reset").context("SDK subscription disconnected"))
         });
@@ -252,7 +278,7 @@ mod tests {
 
     #[tokio::test]
     async fn intake_reports_task_panics_instead_of_clean_eof() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             let _sender = sender;
             panic!("intake fixture panic");
@@ -270,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn intake_reports_unexpected_successful_task_exit() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             drop(sender);
             Ok(())
@@ -291,7 +317,7 @@ mod tests {
 
     #[tokio::test]
     async fn intake_reports_task_cancellation() {
-        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let task = tokio::spawn(async move {
             let _sender = sender;
             std::future::pending::<Result<()>>().await

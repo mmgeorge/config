@@ -5305,15 +5305,6 @@ async fn drive_owned_foreground_initial(
                 publication_drain_requested = true;
             }
             crate::broker::ForegroundAction::Effect(job) => {
-                if jobs.len() + publications.len() >= forge_protocol::MAX_PENDING_FRAMES {
-                    deferred_failure = Some(
-                        crate::provider::ProviderError::Observation(
-                            forge_provider_api::lifecycle::ObservationFailure::Overflow,
-                        )
-                        .into(),
-                    );
-                    continue;
-                }
                 let publication = job.is_publication();
                 if publication && publication_active {
                     publications.push_back(job);
@@ -5421,6 +5412,9 @@ async fn request_foreground_native_cancel(
     let owner = crate::provider::ExecutionOwner::root(session_id);
     controller.permission.cancel_owner(&owner, None).await?;
     let provider = controller.provider_handle();
+    if !provider.has_active_turn(session_id).await {
+        controller.cancellation.request(restore_prompt);
+    }
     match tokio::time::timeout(Duration::from_secs(15), provider.cancel_session(session_id)).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
@@ -10975,8 +10969,18 @@ mod tests {
             .await?;
         let hold_id = held["id"].as_str().unwrap().to_owned();
         let (sink, mut output) = forge_protocol::outbound::channel();
+        let execution_idle = Arc::new(AtomicBool::new(false));
+        let observed_idle = execution_idle.clone();
         let reader = tokio::spawn(async move {
-            while output.recv().await?.is_some() {}
+            while let Some(frame) = output.recv().await? {
+                let event: Value = serde_json::from_slice(frame.bytes())?;
+                if event["event"] == "input_changed" {
+                    observed_idle.store(
+                        event["payload"]["execution_busy"] == false,
+                        Ordering::Release,
+                    );
+                }
+            }
             Ok::<(), anyhow::Error>(())
         });
         controller.attach_input(&sink).await?;
@@ -11145,6 +11149,13 @@ mod tests {
         .await
         .context("input delivery boundary 4")??;
         assert_eq!(controller.coordinator.execution.available_permits(), 1);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !execution_idle.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("final input publication retained stale execution ownership")?;
         let exchange = SqliteStore::open(&controller.data_root)?.list_exchange(&session_id)?;
         assert_eq!(
             exchange

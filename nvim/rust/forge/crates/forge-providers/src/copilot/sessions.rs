@@ -156,6 +156,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         }
         if let Some(binding) = active.as_mut().filter(|binding| {
             selection.reuse == SessionReuse::Compatible
+                && !binding.session.client_stopped()
                 && selection.tools.as_ref().is_none_or(|tools| {
                     tools
                         .iter()
@@ -465,15 +466,38 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         Ok(())
     }
 
-    /// Drop observation readers before shutting down the SDK client.
-    pub async fn close_observers(&self) {
+    /// Collect every session intake before SDK detach closes its subscription.
+    pub async fn close_observers(&self) -> Result<(), ProviderError> {
         self.terminals.lock().await.clear();
-        for slot in self.slots.lock().await.values() {
-            if let Some(binding) = slot.lock().await.as_mut() {
+        let slots: Vec<_> = self.slots.lock().await.values().cloned().collect();
+        let mut sessions = Vec::new();
+        for slot in slots {
+            let mut slot = slot.lock().await;
+            if let Some(binding) = slot.as_mut() {
                 binding.compaction.take();
+                sessions.push(binding.session.clone());
             }
         }
+        sessions.extend(
+            self.provisional
+                .lock()
+                .map_err(|_| ProviderError::Protocol {
+                    message: "Copilot provisional session registry poisoned".into(),
+                })?
+                .values()
+                .cloned(),
+        );
         self.subscriptions.lock().await.clear();
+        let mut failure = None;
+        for session in sessions {
+            if let Err(error) = session.events.close().await {
+                failure.get_or_insert(error);
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Disconnect one collected owner before allowing its history to be resumed.
@@ -841,14 +865,14 @@ mod tests {
                 for resumed in [false, true] {
                     let (client_write, mut peer_read) = tokio::io::duplex(1 << 20);
                     let (mut peer_write, client_read) = tokio::io::duplex(1 << 20);
-                    let client = CopilotClient {
-                        inner: github_copilot_sdk::Client::from_streams(
+                    let client = CopilotClient::new(
+                        github_copilot_sdk::Client::from_streams(
                             client_read,
                             client_write,
                             std::env::temp_dir(),
                         )
                         .unwrap(),
-                    };
+                    );
                     let peer = tokio::spawn(async move {
                         let discovery = read_frame(&mut peer_read).await;
                         assert_eq!(discovery["method"], "mcp.discover");
@@ -954,6 +978,111 @@ mod tests {
         .expect("pre-start MCP selection fixture timed out");
     }
 
+    /// Collect bound and provisional intake before SDK detach can close their subscriptions.
+    #[tokio::test]
+    async fn shutdown_collects_intake_before_detaching_sessions() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for provisional in [false, true] {
+                let (client_write, mut peer_read) = tokio::io::duplex(65536);
+                let (mut peer_write, client_read) = tokio::io::duplex(65536);
+                let client = CopilotClient::new(
+                    github_copilot_sdk::Client::from_streams(
+                        client_read,
+                        client_write,
+                        std::env::temp_dir(),
+                    )
+                    .unwrap(),
+                );
+                let peer = tokio::spawn(async move {
+                    let create = read_frame(&mut peer_read).await;
+                    reply_frame(
+                        &mut peer_write,
+                        &create,
+                        serde_json::json!({"sessionId":"shutdown", "workspacePath":"."}),
+                    )
+                    .await;
+                    let detach = read_frame(&mut peer_read).await;
+                    assert_eq!(detach["method"], "session.detach");
+                    reply_frame(
+                        &mut peer_write,
+                        &detach,
+                        serde_json::json!({"success":true}),
+                    )
+                    .await;
+                });
+                let native = Arc::new(
+                    client
+                        .inner
+                        .prepare_session(
+                            github_copilot_sdk::SessionConfig::default()
+                                .with_session_id(github_copilot_sdk::SessionId::new("shutdown")),
+                        )
+                        .unwrap()
+                        .start()
+                        .await
+                        .unwrap(),
+                );
+                let stream = super::super::event_stream::SessionEventStream::new(
+                    &native,
+                    |_| true,
+                    Arc::new(Trace),
+                    "shutdown".into(),
+                );
+                let session = Arc::new(CopilotSession {
+                    inner: native,
+                    events: super::super::intake::SessionIntake::new(stream, client.clone()),
+                });
+                let sessions = CopilotSessions::<()>::new(Arc::new(Trace));
+                if provisional {
+                    sessions
+                        .provisional
+                        .lock()
+                        .unwrap()
+                        .insert("owner".into(), session.clone());
+                } else {
+                    sessions.slots.lock().await.insert(
+                        "owner".into(),
+                        Arc::new(Mutex::new(Some(SessionBinding {
+                            session: session.clone(),
+                            history: SessionHistory::Submitted,
+                            repair: None,
+                            tool_schema: Vec::new(),
+                            compaction: None,
+                            mcp_failure: HashMap::new(),
+                            _profile: None,
+                        }))),
+                    );
+                }
+                sessions.close_observers().await.unwrap();
+                let scope = forge_provider_api::InvocationScope::new(
+                    forge_provider_api::ExecutionOwner::root("owner"),
+                    "exchange",
+                );
+                let (sink, _events) = forge_provider_api::events::channel(scope.clone());
+                let context = Arc::new(Mutex::new(super::super::intake::TurnContext {
+                    decoder: super::super::event_decoder::CopilotEventDecoder::new(
+                        scope,
+                        ".".into(),
+                    ),
+                    output: forge_provider_api::completion::ProviderCompletion::default(),
+                    sink,
+                }));
+                assert!(
+                    session.events.attach(context).await.is_err(),
+                    "shutdown left intake alive"
+                );
+                client.inner.stop().await.unwrap();
+                peer.await.unwrap();
+                assert!(
+                    !client.is_stopped(),
+                    "orderly shutdown was treated as observation loss"
+                );
+            }
+        })
+        .await
+        .expect("observer shutdown fixture timed out");
+    }
+
     /// A rejected create closes only its startup subscription and leaves the SDK client usable.
     #[tokio::test]
     async fn rejected_sdk_create_collects_subscription_without_stopping_client() {
@@ -965,7 +1094,7 @@ mod tests {
             std::env::temp_dir(),
         )
         .unwrap();
-        let client = CopilotClient { inner: sdk.clone() };
+        let client = CopilotClient::new(sdk.clone());
         let sessions = Arc::new(CopilotSessions::<tempfile::TempDir>::new(Arc::new(Trace)));
         let profile = tempfile::tempdir().unwrap();
         let path = profile.path().to_owned();
@@ -1083,14 +1212,14 @@ mod tests {
     async fn dropped_acquire_during_sdk_create_is_collected_before_lease_release() {
         let (client_write, mut peer_read) = tokio::io::duplex(1 << 20);
         let (mut peer_write, client_read) = tokio::io::duplex(1 << 20);
-        let client = CopilotClient {
-            inner: github_copilot_sdk::Client::from_streams(
+        let client = CopilotClient::new(
+            github_copilot_sdk::Client::from_streams(
                 client_read,
                 client_write,
                 std::env::temp_dir(),
             )
             .unwrap(),
-        };
+        );
         let sessions = Arc::new(CopilotSessions::<tempfile::TempDir>::new(Arc::new(Trace)));
         let profile = tempfile::tempdir().unwrap();
         let profile_path = profile.path().to_owned();

@@ -1,12 +1,7 @@
 use super::*;
-use crate::provider::{
-    CompactionState, ProviderOutput, TextUpdate, ToolActivityKind, ToolInvocation,
-};
+use crate::provider::{ProviderOutput, TextUpdate, ToolActivityKind, ToolInvocation};
 
-async fn collect(
-    native: Vec<SessionEvent>,
-    tasks: Option<Value>,
-) -> anyhow::Result<ProviderOutput> {
+async fn collect(native: Vec<Value>, tasks: Option<Value>) -> anyhow::Result<ProviderOutput> {
     let binding = scope();
     let (sink, mut receiver) = crate::provider::events::channel(binding.clone());
     let execution = async {
@@ -23,14 +18,16 @@ async fn collect(
             ..Default::default()
         };
         for event in native {
-            decoder.decode(&event, &mut completion, &sink).await?;
+            decoder
+                .decode(&serde_json::from_value(event)?, &mut completion, &sink)
+                .await?;
         }
         if let Some(tasks) = tasks {
             decoder
                 .publish_task_snapshot(tasks, "copilot-root".into(), &mut completion, &sink)
                 .await?;
         }
-        Ok::<_, crate::provider::ProviderError>(completion)
+        Ok::<_, anyhow::Error>(completion)
     };
     tokio::pin!(execution);
     let mut delivered = Vec::new();
@@ -163,58 +160,10 @@ async fn structured_changes_upgrade_generic_tools_and_survive_nameless_completio
     Ok(())
 }
 
-#[test]
-fn compaction_retains_summary_failure_and_identity_across_replays() -> anyhow::Result<()> {
-    let started = event(
-        "session.compaction_start",
-        json!({"model":"summary-model","conversationTokens":100}),
-    );
-    let completed = event(
-        "session.compaction_complete",
-        json!({
-            "success":false,"error":"summary request failed","summaryContent":"Retain the contract.",
-            "preCompactionTokens":100,"postCompactionTokens":40,"tokensRemoved":60,"messagesRemoved":0,
-            "compactionTokensUsed":{"inputTokens":100,"outputTokens":20,"cacheReadTokens":0,
-                "copilotUsage":{"totalNanoAiu":1.5,"tokenDetails":[{"tokenType":"input","tokenCount":100}]}}
-        }),
-    );
-    let first = forge_providers::copilot::decode::decode_compaction(&started, "root", None)?;
-    let settled =
-        forge_providers::copilot::decode::decode_compaction(&completed, "root", Some(&first))?;
-    let replayed =
-        forge_providers::copilot::decode::decode_compaction(&completed, "root", Some(&settled))?;
-    assert_eq!(replayed.id, started.id);
-    assert_eq!(replayed.state, CompactionState::Failed);
-    assert_eq!(
-        replayed.result.summary_content.as_deref(),
-        Some("Retain the contract.")
-    );
-    assert_eq!(
-        replayed.result.error.as_deref(),
-        Some("summary request failed")
-    );
-    assert_eq!(replayed.result.messages_removed, Some(0));
-    assert_eq!(replayed.result.model.as_deref(), Some("summary-model"));
-    assert_eq!(
-        replayed.result.before_context.unwrap().conversation_tokens,
-        Some(100)
-    );
-    let usage = replayed.result.compaction_tokens_used.unwrap();
-    assert_eq!(usage.cached_input, Some(0));
-    assert_eq!(usage.billing.unwrap().measurements[0].value, "1.5");
-    let orphan = forge_providers::copilot::decode::decode_compaction(
-        &event("session.compaction_complete", json!({"success":true})),
-        "root",
-        None,
-    )?;
-    assert_eq!(orphan.result.pre_compaction_tokens, None);
-    Ok(())
-}
-
 #[tokio::test]
 async fn publishes_root_model_before_turn_and_ignores_child_model() -> anyhow::Result<()> {
     let mut child = event("session.start", json!({"model":"child-model"}));
-    child.agent_id = Some("child".into());
+    child["agentId"] = json!("child");
     let output = collect(
         vec![
             event("session.start", json!({"model":"root-model"})),
@@ -247,14 +196,14 @@ async fn publishes_root_model_before_turn_and_ignores_child_model() -> anyhow::R
 #[tokio::test]
 async fn reports_every_model_call_and_addresses_late_child_usage() -> anyhow::Result<()> {
     let mut child_started = event("assistant.turn_start", json!({"turnId":"child-turn"}));
-    child_started.agent_id = Some("child".into());
+    child_started["agentId"] = json!("child");
     let mut child_finished = event("assistant.turn_end", json!({"turnId":"child-turn"}));
-    child_finished.agent_id = Some("child".into());
+    child_finished["agentId"] = json!("child");
     let mut child_usage = event(
         "assistant.usage",
         json!({"apiCallId":"child-call","inputTokens":10,"outputTokens":20}),
     );
-    child_usage.agent_id = Some("child".into());
+    child_usage["agentId"] = json!("child");
     let mut native = vec![start(), child_started];
     for id in ["call-one", "call-two"] {
         native.push(event("assistant.usage", json!({

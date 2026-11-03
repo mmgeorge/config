@@ -15,16 +15,12 @@ use forge_providers::copilot::sessions::{
 };
 #[cfg(test)]
 mod event_decoder;
-mod host_turn;
-#[cfg(test)]
-use forge_providers::copilot::prompt::completes_exchange;
 #[cfg(test)]
 mod file_change_test;
+mod host_turn;
 
 mod mcp;
 pub(crate) mod mock_stream;
-#[cfg(test)]
-use forge_providers::copilot::catalog::model_descriptor;
 use forge_providers::copilot::runtime::CopilotRuntime;
 
 use forge_providers::copilot::text_generation;
@@ -45,16 +41,6 @@ use crate::tools::{ControlToolRegistry, ControlTurnContext};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use forge_providers::copilot::handle::CopilotClient as Client;
-#[cfg(test)]
-use forge_providers::copilot::handle::{default_model_descriptor, model_options};
-#[cfg(test)]
-use github_copilot_sdk::handler::PermissionResult;
-#[cfg(test)]
-use github_copilot_sdk::session_events::ReasoningSummary;
-#[cfg(test)]
-use github_copilot_sdk::types::ContextTier;
-#[cfg(test)]
-use github_copilot_sdk::{Model, RequestId, SessionId};
 #[cfg(test)]
 use serde_json::Value;
 use serde_json::json;
@@ -491,7 +477,9 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
             .err()
             .map(anyhow::Error::from);
         self.runtime.close_admission();
-        self.sessions.close_observers().await;
+        if let Err(error) = self.sessions.close_observers().await {
+            failure.get_or_insert(error.into());
+        }
         let client_stopped = match self.runtime.shutdown().await {
             Ok(()) => forge_providers::copilot::sessions::ClientShutdown::Collected,
             Err(error) => {
@@ -805,7 +793,12 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
         let controls = self.control_router(session_id).await.cancel()?;
         let turn_event = self.turn_event(session_id).await;
         let stop = turn_event.request_stop()?;
-        if !stop.submitted && !stop.sending {
+        let stopped = (stop.submitted || stop.sending)
+            && self
+                .active_session(session_id)
+                .await
+                .is_some_and(|session| session.client_stopped());
+        if stopped || (!stop.submitted && !stop.sending) {
             self.session_events.cancel_runtime(session_id).await?;
         }
         let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
@@ -858,6 +851,7 @@ impl crate::provider::ProviderAdapter for CopilotProvider {
         let key = owner.runtime_key();
         self.fence_session(owner).await?;
         self.sessions.retire(&key).await?;
+        self.runtime.recover().await?;
         self.control_router_by_harness.lock().await.remove(&key);
         self.permission_context_by_harness.lock().await.remove(&key);
         self.session_events.reset_owner(owner).await?;
@@ -1114,26 +1108,6 @@ fn selected_reasoning_effort(
 
 #[cfg(test)]
 mod test {
-    /// Finish the main agent independently from attached background work.
-    #[test]
-    fn only_root_session_idle_finishes_the_provider_invocation() {
-        let mut event: github_copilot_sdk::SessionEvent =
-            serde_json::from_value(serde_json::json!({
-                "id":"idle", "type":"assistant.idle", "timestamp":"2026-09-18T00:00:00Z", "data":{}
-            }))
-            .unwrap();
-        assert!(!super::completes_exchange(&event));
-        event.agent_id = Some("child".into());
-        assert!(!super::completes_exchange(&event));
-        event.agent_id = None;
-        event.event_type = "assistant.turn_end".into();
-        assert!(!super::completes_exchange(&event));
-        event.event_type = "session.idle".into();
-        assert!(super::completes_exchange(&event));
-        event.agent_id = Some("child".into());
-        assert!(!super::completes_exchange(&event));
-    }
-
     use super::*;
 
     #[test]
@@ -1202,127 +1176,6 @@ mod test {
             selected_reasoning_effort(&model_list, &request).as_deref(),
             Some("medium")
         );
-    }
-
-    #[test]
-    fn provides_an_auto_model_when_native_discovery_is_empty() {
-        let model = default_model_descriptor();
-
-        assert!(model.is_default);
-        assert_eq!(model.id, "default");
-        assert!(model.reasoning.is_empty());
-        assert!(model.context_window.is_empty());
-    }
-
-    #[test]
-    fn maps_provider_reasoning_context_and_vision_metadata() {
-        let model: Model = serde_json::from_value(serde_json::json!({
-            "id": "gpt-test",
-            "name": "Ignored display label",
-            "defaultReasoningEffort": "low",
-            "supportedReasoningEfforts": ["low", "high"],
-            "capabilities": {
-                "limits": {
-                    "max_context_window_tokens": 272000,
-                    "max_output_tokens": 128000
-                },
-                "supports": { "reasoningEffort": true, "vision": true }
-            },
-            "billing": {
-                "tokenPrices": {
-                    "maxPromptTokens": 300000,
-                    "longContext": { "maxPromptTokens": 1072000 }
-                }
-            }
-        }))
-        .unwrap();
-
-        let descriptor = model_descriptor(model);
-
-        assert_eq!(descriptor.id, "gpt-test");
-        assert_eq!(descriptor.reasoning, ["low", "high"]);
-        assert_eq!(descriptor.default_reasoning.as_deref(), Some("low"));
-        assert_eq!(descriptor.context_window[0].id, "default");
-        assert_eq!(descriptor.context_window[0].token_limit, Some(272_000));
-        assert_eq!(descriptor.context_window[1].id, "long_context");
-        assert_eq!(descriptor.context_window[1].token_limit, None);
-        assert!(descriptor.vision);
-    }
-
-    #[test]
-    fn maps_explicit_context_without_billing_metadata() {
-        let model: Model = serde_json::from_value(serde_json::json!({
-            "id": "gpt-test",
-            "name": "Test model",
-            "capabilities": {
-                "limits": { "max_context_window_tokens": 272000 }
-            }
-        }))
-        .unwrap();
-
-        let descriptor = model_descriptor(model);
-
-        assert_eq!(descriptor.context_window.len(), 1);
-        assert_eq!(descriptor.context_window[0].token_limit, Some(272_000));
-    }
-
-    #[test]
-    fn does_not_infer_missing_context_limits_from_billing_or_output() {
-        for context_limit in [
-            serde_json::Value::Null,
-            serde_json::json!(0),
-            serde_json::json!(-1),
-        ] {
-            let model: Model = serde_json::from_value(serde_json::json!({
-                "id": "gpt-test",
-                "name": "Test model",
-                "capabilities": {
-                    "limits": {
-                        "max_context_window_tokens": context_limit,
-                        "max_output_tokens": 128000
-                    }
-                },
-                "billing": {
-                    "tokenPrices": {
-                        "maxPromptTokens": 272000,
-                        "longContext": { "maxPromptTokens": 1000000 }
-                    }
-                }
-            }))
-            .unwrap();
-
-            let descriptor = model_descriptor(model);
-
-            assert_eq!(descriptor.context_window.len(), 2);
-            assert!(
-                descriptor
-                    .context_window
-                    .iter()
-                    .all(|context| context.token_limit.is_none())
-            );
-            assert_eq!(
-                descriptor.default_context_window.as_deref(),
-                Some("default")
-            );
-        }
-    }
-
-    #[test]
-    fn applies_reasoning_and_context_to_a_native_model_switch() {
-        let options = model_options(Some("high".into()), Some("long_context"));
-
-        assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(options.reasoning_summary, Some(ReasoningSummary::Concise));
-        assert!(matches!(
-            options.context_tier,
-            Some(ContextTier::LongContext)
-        ));
-        for context in [None, Some("unknown")] {
-            assert_eq!(
-                model_options(None, context).reasoning_summary,
-                Some(ReasoningSummary::Concise)
-            );
-        }
     }
 
     #[tokio::test]

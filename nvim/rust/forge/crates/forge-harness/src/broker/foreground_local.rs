@@ -82,7 +82,12 @@ impl HarnessBroker {
             while !previous.ready_for_replacement()? {
                 match self.drain_session_events() {
                     Ok(events) => forwarded.extend(events),
-                    Err(error) if matches!(error.downcast_ref::<ProviderError>(), Some(ProviderError::Observation(_))) => {
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<ProviderError>(),
+                            Some(ProviderError::Observation(_))
+                        ) =>
+                    {
                         forwarded.push(self.event("provider_event", json!({
                             "kind":"error", "text":format!("Session observation failed: {error:#}"),
                         }))?);
@@ -91,7 +96,9 @@ impl HarnessBroker {
                 }
             }
             let registry = self.execution_registry();
-            let observer = registry.replace(crate::provider::ExecutionOwner::root(&self.session.id)).await?;
+            let observer = registry
+                .replace(crate::provider::ExecutionOwner::root(&self.session.id))
+                .await?;
             self.observer.replace_session_events(observer);
             self.task_controller.reset_native_goal_generation()?;
         }
@@ -229,25 +236,14 @@ impl HarnessBroker {
                 ForegroundAction::WaitForPublicationDrain => drain = true,
                 action @ (ForegroundAction::Effect(_)
                 | ForegroundAction::CancelJobsAndEffect(_)) => {
-                    let (job, cleanup) = match action {
-                        ForegroundAction::Effect(job) => (job, false),
+                    let job = match action {
+                        ForegroundAction::Effect(job) => job,
                         ForegroundAction::CancelJobsAndEffect(job) => {
                             drain = false;
-                            (job, true)
+                            job
                         }
                         _ => unreachable!(),
                     };
-                    if !cleanup
-                        && jobs.len() + publications.len() >= forge_protocol::MAX_PENDING_FRAMES
-                    {
-                        deferred_failure = Some(
-                            crate::provider::ProviderError::Observation(
-                                forge_provider_api::lifecycle::ObservationFailure::Overflow,
-                            )
-                            .into(),
-                        );
-                        continue;
-                    }
                     let publication = job.is_publication();
                     if publication && publication_active {
                         publications.push_back(job);

@@ -523,7 +523,7 @@ local function generate_description(cwd, head_commit, context, callback)
     if not snapshot then callback(nil, failure or "Missing Background settings") return end
     local generation, configuration_failure = client.generation_get_config()
     if not generation then callback(nil, configuration_failure) return end
-    local choice = settings.model(snapshot, generation.backend.kind)
+    local choice = settings.model(snapshot, generation.provider.kind)
     client.generation_request({
       operation = "pull_request", workspace = cwd, comparison = "pull_request", head = head_commit,
       input = pr_system_prompt .. "\n\n" .. context,

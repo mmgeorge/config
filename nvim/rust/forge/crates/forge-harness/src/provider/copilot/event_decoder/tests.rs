@@ -8,20 +8,19 @@ use serde_json::json;
 #[path = "conformance_tests.rs"]
 mod conformance_tests;
 
-fn event(kind: &str, data: Value) -> SessionEvent {
-    serde_json::from_value(json!({
+fn event(kind: &str, data: Value) -> Value {
+    json!({
         "id": uuid::Uuid::new_v4().to_string(),
         "timestamp":"2026-10-29T12:00:00Z",
         "type":kind, "data":data,
-    }))
-    .unwrap()
+    })
 }
 
 fn scope() -> InvocationScope {
     InvocationScope::new(crate::provider::ExecutionOwner::root("session"), "exchange")
 }
 
-async fn replay(native: Vec<SessionEvent>, synthesize: bool) -> anyhow::Result<Vec<ProviderEvent>> {
+async fn replay(native: Vec<Value>, synthesize: bool) -> anyhow::Result<Vec<ProviderEvent>> {
     let scope = scope();
     let (sink, mut receiver) = crate::provider::events::channel(scope.clone());
     let execution = async {
@@ -34,13 +33,15 @@ async fn replay(native: Vec<SessionEvent>, synthesize: bool) -> anyhow::Result<V
             ..Default::default()
         };
         for event in native {
-            decoder.decode(&event, &mut output, &sink).await?;
+            decoder
+                .decode(&serde_json::from_value(event)?, &mut output, &sink)
+                .await?;
         }
         if synthesize {
             decoder.finish_success(&sink).await?;
             decoder.finish_success(&sink).await?;
         }
-        Ok::<_, crate::provider::ProviderError>(())
+        Ok::<_, anyhow::Error>(())
     };
     tokio::pin!(execution);
     let mut result = Vec::new();
@@ -60,7 +61,7 @@ async fn replay(native: Vec<SessionEvent>, synthesize: bool) -> anyhow::Result<V
     }
 }
 
-fn start() -> SessionEvent {
+fn start() -> Value {
     event(
         "assistant.turn_start",
         json!({"turnId":"0","interactionId":"interaction"}),
@@ -205,8 +206,8 @@ async fn background_wakeup_reuses_native_pair_without_restarting_completed_turn(
         })
         .collect();
     assert_eq!(starts.len(), 2);
-    assert_eq!(starts[0].turn_id.as_str(), first.id);
-    assert_eq!(starts[1].turn_id.as_str(), wakeup.id);
+    assert_eq!(starts[0].turn_id.as_str(), first["id"].as_str().unwrap());
+    assert_eq!(starts[1].turn_id.as_str(), wakeup["id"].as_str().unwrap());
     assert_ne!(starts[0], starts[1]);
     let finishes: Vec<_> = delivered
         .iter()
@@ -619,15 +620,17 @@ async fn cancelled_stream_does_not_synthesize_response() -> anyhow::Result<()> {
         },
         ..Default::default()
     };
-    decoder.decode(&start(), &mut output, &sink).await?;
+    decoder
+        .decode(&serde_json::from_value(start())?, &mut output, &sink)
+        .await?;
     decoder
         .decode(
-            &event(
+            &serde_json::from_value(event(
                 "assistant.message",
                 json!({
                     "messageId":"commentary","phase":"commentary","content":"Progress"
                 }),
-            ),
+            ))?,
             &mut output,
             &sink,
         )

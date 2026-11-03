@@ -989,7 +989,6 @@ dependencies = [
  "forge-providers",
  "forge-shell",
  "futures-util",
- "github-copilot-sdk",
  "hex",
  "home",
  "jsonschema",

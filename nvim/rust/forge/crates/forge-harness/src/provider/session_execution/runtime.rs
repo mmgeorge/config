@@ -1041,7 +1041,7 @@ struct Driver {
     committed_invocations: HashMap<InvocationId, Invocation>,
     submissions: JoinSet<SubmissionOutcome>,
     deliveries: JoinSet<Result<(), ProviderError>>,
-    delivery: Option<mpsc::Sender<Delivery>>,
+    delivery: Option<mpsc::UnboundedSender<Delivery>>,
     cleanup: JoinSet<forge_provider_api::error::ObservationCleanup>,
     failed_waiters: Vec<FailedWaiter>,
     commands: mpsc::Sender<Command>,
@@ -1092,7 +1092,7 @@ impl SessionExecution {
     ) -> Result<Self, ProviderError> {
         let mut events = provider.session_events(owner.clone()).await?;
         let (commands, mut receive) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
-        let (delivery, output) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+        let (delivery, output) = mpsc::unbounded_channel();
         let mut deliveries = JoinSet::new();
         deliveries.spawn(deliver(output));
         let healthy = Arc::new(AtomicBool::new(true));
@@ -1127,7 +1127,7 @@ impl SessionExecution {
                                 match events.try_recv() {
                                     Ok(event) => {
                                         driver.event(event);
-                                        // Let the bounded presentation worker collect each accepted frame.
+                                        // Let the presentation worker collect each accepted frame.
                                         tokio::task::yield_now().await;
                                     },
                                     Err(crate::provider::events::EventDeliveryError::Empty | crate::provider::events::EventDeliveryError::Closed { .. }) => break,
@@ -1223,6 +1223,21 @@ impl SessionExecution {
     /// Stop accepting work and join the driver after its bounded cleanup and delivery drain.
     pub(crate) async fn close(&self) -> Result<(), ProviderError> {
         let mut task = self.task.lock().await;
+        if let ExecutionTask::Failed(previous) = &*task {
+            let report = collect_failed_execution(
+                self.provider.as_ref(),
+                &self.owner,
+                previous.observation().clone(),
+            )
+            .await;
+            if !report.collected() {
+                let report = Arc::new(report);
+                *task = ExecutionTask::Failed(report.clone());
+                return Err(ProviderError::Cleanup(report));
+            }
+            *task = ExecutionTask::Closed;
+            return Ok(());
+        }
         let handle = match &mut *task {
             ExecutionTask::Running(handle) => handle,
             ExecutionTask::Closed => return Ok(()),
@@ -1650,7 +1665,9 @@ impl Driver {
                 }
                 if self.failed {
                     let _ = reply.send(Err(ProviderError::Observation(
-                        ObservationFailure::Overflow,
+                        self.first_failure
+                            .clone()
+                            .unwrap_or(ObservationFailure::Disconnected),
                     )));
                     return;
                 }
@@ -1837,18 +1854,6 @@ impl Driver {
                 {
                     invocation.ticket_outstanding = false;
                     let _ = reply.send(Err(SettlementError::Stale));
-                    return;
-                }
-                if self.committed_invocations.len() >= forge_protocol::MAX_PENDING_FRAMES
-                    && !self
-                        .committed_invocations
-                        .contains_key(&scope.invocation_id)
-                {
-                    let failure = ObservationFailure::Overflow;
-                    let _ = reply.send(Err(SettlementError::Provider(ProviderError::Observation(
-                        failure.clone(),
-                    ))));
-                    self.fail_observation(failure);
                     return;
                 }
                 match invocation
@@ -2038,18 +2043,18 @@ impl Driver {
             event,
             fallback: Some(self.idle.clone()),
         }) {
-            self.fail_observation(ObservationFailure::Overflow);
+            self.fail_observation(ObservationFailure::Disconnected);
             return;
         }
         self.settle(&scope.invocation_id);
     }
 
-    /// Retain initialization and late output under a bounded owner-wide observer.
+    /// Retain initialization and late output under the owner-wide observer.
     fn idle_event(&mut self, event: ProviderEvent) {
         match self.idle.clone() {
             SessionObserver::Inbox(inbox) => {
                 if !self.enqueue(Delivery::Inbox { inbox, event }) {
-                    self.fail_observation(ObservationFailure::Overflow);
+                    self.fail_observation(ObservationFailure::Disconnected);
                 }
             }
             SessionObserver::Stream(idle) => {
@@ -2065,7 +2070,7 @@ impl Driver {
                     event,
                     fallback: None,
                 }) {
-                    self.fail_observation(ObservationFailure::Overflow);
+                    self.fail_observation(ObservationFailure::Disconnected);
                 }
             }
         }
@@ -2076,13 +2081,9 @@ impl Driver {
             delivery.fail(ObservationFailure::Disconnected);
             return false;
         };
-        match sender.try_send(delivery) {
+        match sender.send(delivery) {
             Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(delivery)) => {
-                delivery.fail(ObservationFailure::Overflow);
-                false
-            }
-            Err(mpsc::error::TrySendError::Closed(delivery)) => {
+            Err(mpsc::error::SendError(delivery)) => {
                 delivery.fail(ObservationFailure::Disconnected);
                 false
             }
@@ -2156,7 +2157,7 @@ impl Driver {
                     result: Err(error),
                 })
             {
-                self.fail_all("execution result delivery overflowed or closed");
+                self.fail_all("execution result delivery closed");
             }
             return;
         }
@@ -2206,7 +2207,7 @@ impl Driver {
         });
         invocation.ticket_outstanding = true;
         if !self.enqueue(Delivery::Complete { reply, result }) {
-            self.fail_all("execution result delivery overflowed or closed");
+            self.fail_all("execution result delivery closed");
         }
     }
 
@@ -2301,7 +2302,6 @@ impl Driver {
             self.first_failure = Some(failure.clone());
             let provider = self.provider.clone();
             let owner = self.owner.clone();
-            let key = self.owner.runtime_key();
             let observation = failure.clone();
             let cleanup_origin = match &origin {
                 FailureOrigin::DeliveryUncertain { message } => {
@@ -2318,30 +2318,7 @@ impl Driver {
                 }
             };
             self.cleanup.spawn(async move {
-                let deadline = std::time::Duration::from_secs(15);
-                let fence = tokio::time::timeout(deadline, provider.fence_session(&owner)).await;
-                let cancellation =
-                    tokio::time::timeout(deadline, provider.cancel_session(&key)).await;
-                // Collection still runs when the stop request fails or exceeds its deadline.
-                let collection =
-                    tokio::time::timeout(deadline, provider.cleanup_execution(&key)).await;
-                use forge_provider_api::error::{CleanupFailure, ObservationCleanup};
-                let classify = |result: Result<
-                    Result<(), anyhow::Error>,
-                    tokio::time::error::Elapsed,
-                >| match result {
-                    Ok(Ok(())) => None,
-                    Ok(Err(error)) => {
-                        Some(CleanupFailure::Failed(Box::new(ProviderError::from(error))))
-                    }
-                    Err(_) => Some(CleanupFailure::TimedOut),
-                };
-                let report = ObservationCleanup::new(
-                    observation,
-                    classify(fence),
-                    classify(cancellation),
-                    classify(collection),
-                );
+                let report = collect_failed_execution(provider.as_ref(), &owner, observation).await;
                 match cleanup_origin {
                     Some(origin) => report.with_origin(origin),
                     None => report,
@@ -2393,6 +2370,34 @@ impl Driver {
     }
 }
 
+/// Retry cleanup without admitting new work or replaying the failed invocation.
+async fn collect_failed_execution(
+    provider: &Provider,
+    owner: &ExecutionOwner,
+    failure: ObservationFailure,
+) -> forge_provider_api::error::ObservationCleanup {
+    use forge_provider_api::error::{CleanupFailure, ObservationCleanup};
+
+    let deadline = std::time::Duration::from_secs(15);
+    let key = owner.runtime_key();
+    let fence = tokio::time::timeout(deadline, provider.fence_session(owner)).await;
+    let cancellation = tokio::time::timeout(deadline, provider.cancel_session(&key)).await;
+    // Collection still runs when the stop request fails or exceeds its deadline.
+    let collection = tokio::time::timeout(deadline, provider.cleanup_execution(&key)).await;
+    let classify =
+        |result: Result<Result<(), anyhow::Error>, tokio::time::error::Elapsed>| match result {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(CleanupFailure::Failed(Box::new(ProviderError::from(error)))),
+            Err(_) => Some(CleanupFailure::TimedOut),
+        };
+    ObservationCleanup::new(
+        failure,
+        classify(fence),
+        classify(cancellation),
+        classify(collection),
+    )
+}
+
 impl Delivery {
     /// Resolve a rejected delivery without stranding the associated completion waiter.
     fn fail(self, failure: ObservationFailure) {
@@ -2409,7 +2414,7 @@ impl Delivery {
 }
 
 /// Preserve provider event order across foreground and idle presentation sinks.
-async fn deliver(mut pending: mpsc::Receiver<Delivery>) -> Result<(), ProviderError> {
+async fn deliver(mut pending: mpsc::UnboundedReceiver<Delivery>) -> Result<(), ProviderError> {
     while let Some(delivery) = pending.recv().await {
         let result = match delivery {
             Delivery::Inbox { inbox, event } => {
@@ -2643,9 +2648,9 @@ mod tests {
         Ok(())
     }
 
-    /// A failed collection remains fenced on every subsequent close attempt.
+    /// Retry a failed collection before releasing the old execution owner.
     #[tokio::test]
-    async fn close_retains_incomplete_cleanup_failure() -> anyhow::Result<()> {
+    async fn close_retries_incomplete_cleanup_before_releasing_owner() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
         let provider: Arc<Provider> = Arc::from(crate::provider::build(
@@ -2674,13 +2679,14 @@ mod tests {
             orderly_shutdown: Arc::new(AtomicBool::new(false)),
             task: tokio::sync::Mutex::new(ExecutionTask::Running(task)),
         };
-        for _ in 0..2 {
-            let Err(ProviderError::Cleanup(actual)) = engine.close().await else {
-                panic!("incomplete cleanup must remain a failure");
-            };
-            assert!(Arc::ptr_eq(&actual, &expected));
-            assert!(!actual.collected());
-        }
+        let Err(ProviderError::Cleanup(actual)) = engine.close().await else {
+            panic!("incomplete cleanup must remain a failure");
+        };
+        assert!(Arc::ptr_eq(&actual, &expected));
+        assert!(!actual.collected());
+        engine.close().await?;
+        assert!(matches!(*engine.task.lock().await, ExecutionTask::Closed));
+        engine.close().await?;
         Ok(())
     }
 
@@ -2897,7 +2903,7 @@ mod tests {
                 idle_observation: false,
             },
         );
-        let (delivery, mut deliveries) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+        let (delivery, mut deliveries) = mpsc::unbounded_channel();
         let (commands, _receive) = mpsc::channel(1);
         let mut driver = Driver {
             owner,
@@ -3052,7 +3058,7 @@ mod tests {
                 idle_observation: false,
             },
         );
-        let (delivery, mut pending) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+        let (delivery, mut pending) = mpsc::unbounded_channel();
         let (commands, _receive) = mpsc::channel(1);
         let mut driver = Driver {
             owner,
@@ -3148,7 +3154,7 @@ mod tests {
                 idle_observation: false,
             },
         );
-        let (delivery, _pending) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+        let (delivery, _pending) = mpsc::unbounded_channel();
         let (commands, _receive) = mpsc::channel(1);
         let mut driver = Driver {
             owner,
@@ -3228,7 +3234,7 @@ mod tests {
                 idle_observation: false,
             },
         );
-        let (delivery, _pending) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+        let (delivery, _pending) = mpsc::unbounded_channel();
         let (commands, _receive) = mpsc::channel(1);
         let mut driver = Driver {
             owner,
@@ -3272,7 +3278,7 @@ mod tests {
         Ok(())
     }
 
-    /// Saturated presentation queues fail completion waiters explicitly instead of dropping them.
+    /// Closed presentation queues fail completion waiters instead of dropping them.
     #[tokio::test]
     async fn rejected_completion_resolves_with_observation_failure() {
         let (reply, response) = oneshot::channel();
@@ -3280,10 +3286,10 @@ mod tests {
             reply,
             result: Err(protocol("original")),
         }
-        .fail(ObservationFailure::Overflow);
+        .fail(ObservationFailure::Disconnected);
         assert!(matches!(
             response.await.unwrap(),
-            Err(ProviderError::Observation(ObservationFailure::Overflow))
+            Err(ProviderError::Observation(ObservationFailure::Disconnected))
         ));
     }
 

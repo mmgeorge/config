@@ -366,11 +366,13 @@ impl EventReceiver {
         loop {
             let frame = match self.receiver.try_drain() {
                 Ok(frame) => Some(frame),
-                Err(_) => self
-                    .receiver
-                    .recv()
-                    .await
-                    .map_err(|error| self.failure(EventDeliveryError::queue(error)))?,
+                Err(_) => match self.receiver.recv().await {
+                    Ok(frame) => frame,
+                    Err(error) => match self.receiver.try_drain() {
+                        Ok(frame) => Some(frame),
+                        Err(_) => return Err(self.failure(EventDeliveryError::queue(error))),
+                    },
+                },
             };
             match frame {
                 Some(frame) => {

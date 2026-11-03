@@ -30,7 +30,7 @@ local fetch_failure
 local notices = {}
 local original_write = require("forge.git.write").execute
 local original_forge_open_pr = forge.open_pr
-local original_host_request = require("forge.client").request_host
+local original_request = require("forge.client").request
 local creation_draft
 local creation_capture
 local opened_pull_request
@@ -90,8 +90,8 @@ end
 
 open_pr._set_state_path_for_test(state_path)
 reset()
-forge.setup({ pr_buffer_name = "ForgePRTest" })
-gh.set_backend({
+forge.setup({ pr_buffer_name = "ForgePRTest", harness = { provider = "copilot" } })
+gh.set_provider({
   system_async = function(command, _, cb)
     local key = command_key(command)
     if key == "gh\tpr\tview\t" .. created_pr_url .. "\t--json\tid,number,title,body,url,headRefName,headRefOid,baseRefOid,baseRefName,headRepository,headRepositoryOwner,commits,files,changedFiles,additions,deletions,reviewRequests,milestone,isDraft,state,createdAt,updatedAt,closedAt" then
@@ -131,7 +131,10 @@ gh.set_backend({
 package.loaded["ai"] = { generate = function() error("PR generation bypassed Harness") end }
 package.loaded["forge.integrations.background_settings"] = {
   request = function(_, _, callback) callback({ settings = {} }) end,
-  model = function() return { model = "test-background-model", thinking = "low" } end,
+  model = function(_, provider)
+    assert_true(provider == "copilot", "PR generation lost the selected provider")
+    return { model = "test-background-model", thinking = "low" }
+  end,
 }
 vim.notify = function(message) notices[#notices + 1] = tostring(message) end
 require("forge.git.write").execute = function(directory, action, callback)
@@ -140,7 +143,7 @@ require("forge.git.write").execute = function(directory, action, callback)
   callback({ ok = true, output = "" })
 end
 local function native_request(method, params, callback)
-  if method == "repository.generate" then
+  if method == "repository.generation" then
     if params.operation == "pull_request" then
       assert_true(params.workspace == root and params.comparison == "pull_request", "PR generation lost workspace")
       assert_true(params.head == captured_head, "PR generation lost its captured HEAD")
@@ -159,14 +162,14 @@ local function native_request(method, params, callback)
     if context_failure then callback(nil, context_failure) return end
     if context_conflicts then callback({ state = "conflicts", source_requests = 0, diff_pairs = 0 }) return end
     callback({ state = "ready", prompt = { system = "", user = compact_context } })
-  elseif method == "github.creation.context" then
+  elseif method == "github.pull_request.creation.context" then
     assert_true(params.directory == root, "creation context lost workspace")
     callback({ repository = { hostname = require("github.repo_cache").hostname(), owner = "org", name = "repo" },
       repository_node_id = "R_test", branch = "feature/current", head_commit = captured_head })
-  elseif method == "github.review.draft" then callback(creation_draft)
-  elseif method == "github.review.draft.write" then creation_draft = vim.deepcopy(params.draft) callback(true)
+  elseif method == "github.review.draft.get" then callback(creation_draft)
+  elseif method == "github.review.draft.save" then creation_draft = vim.deepcopy(params.draft) callback(true)
   elseif method == "github.recovery.inspect" then callback(nil)
-  elseif method == "github.actor" then callback({ node_id = "ACTOR_test", login = "viewer" })
+  elseif method == "github.actor.get" then callback({ node_id = "ACTOR_test", login = "viewer" })
   elseif method == "github.review.mutate" then
     creation_capture = vim.deepcopy(params.request)
     assert_true(creation_capture.resource.number == 0 and creation_capture.resource.kind == "repository", "creation used a PR-number scope")
@@ -175,13 +178,15 @@ local function native_request(method, params, callback)
     callback({ version = 1, resource = params.request.resource,
       capture = { operation_id = params.request.operation_id, actor = params.request.actor_node_id },
       state = { phase = "confirmed", result = { html_url = created_pr_url, number = 42 } } })
-  elseif method == "github.recovery.settle_draft" then
+  elseif method == "github.recovery.draft.settle" then
     assert_true(creation_capture ~= nil and params.operation_id == creation_capture.operation_id, "creation settlement lost operation identity")
     creation_draft = vim.deepcopy(params.draft)
     callback(true)
   else callback(nil, "unavailable fixture route " .. method) end
 end
-require("forge.client").request_host = native_request
+require("forge.client").request = function(request, callback)
+  native_request(request.method, request.params, callback)
+end
 require("github.pr_creation")._set_runner_for_test(native_request)
 require("github.mutation")._set_runner_for_test(native_request)
 forge.open_pr = function(pr, options)
@@ -235,13 +240,13 @@ end
 
 local function cleanup()
   require("forge.git.write").execute = original_write
-  require("forge.client").request_host = original_host_request
+  require("forge.client").request = original_request
   require("github.pr_creation")._set_runner_for_test(nil)
   require("github.mutation")._set_runner_for_test(nil)
   forge.open_pr = original_forge_open_pr
   open_pr._set_state_path_for_test(nil)
-  gh.reset_backend()
-  forge.reset_git_backend()
+  gh.reset_provider()
+  forge.reset_git_provider()
   package.loaded["ai"] = original_ai
   package.loaded["forge.integrations.background_settings"] = original_background
   pcall(vim.fn.delete, state_path)

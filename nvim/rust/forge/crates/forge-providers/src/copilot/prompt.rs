@@ -375,3 +375,28 @@ async fn input_text(session: &Arc<Session>, input: &PromptInput) -> Result<Strin
 pub fn completes_exchange(event: &github_copilot_sdk::SessionEvent) -> bool {
     event.agent_id.is_none() && event.event_type == "session.idle"
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Finish the main agent independently from attached background work.
+    #[test]
+    fn only_root_session_idle_finishes_the_provider_invocation() {
+        let mut event: github_copilot_sdk::SessionEvent =
+            serde_json::from_value(serde_json::json!({
+                "id":"idle", "type":"assistant.idle", "timestamp":"2026-09-18T00:00:00Z", "data":{}
+            }))
+            .unwrap();
+        assert!(!completes_exchange(&event));
+        event.agent_id = Some("child".into());
+        assert!(!completes_exchange(&event));
+        event.agent_id = None;
+        event.event_type = "assistant.turn_end".into();
+        assert!(!completes_exchange(&event));
+        event.event_type = "session.idle".into();
+        assert!(completes_exchange(&event));
+        event.agent_id = Some("child".into());
+        assert!(!completes_exchange(&event));
+    }
+}

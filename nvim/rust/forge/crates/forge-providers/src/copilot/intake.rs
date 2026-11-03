@@ -6,12 +6,13 @@ use std::sync::Arc;
 use forge_provider_api::completion::ProviderCompletion;
 use forge_provider_api::lifecycle::{ExecutionObservation, ExecutionUpdate, ObservationFailure};
 use forge_provider_api::{ProviderError, ProviderEvent, ProviderEventSink};
-use github_copilot_sdk::{Client, SessionEvent};
+use github_copilot_sdk::SessionEvent;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::event_decoder::CopilotEventDecoder;
 use super::event_stream::SessionEventStream;
+use super::handle::CopilotClient;
 
 /// Retain decoder identity and output after the prompt's host result has returned.
 pub(crate) struct TurnContext {
@@ -27,7 +28,7 @@ enum Command {
     Attach {
         generation: DeliveryGeneration,
         context: Arc<Mutex<TurnContext>>,
-        reply: oneshot::Sender<Result<mpsc::Receiver<SessionEvent>, ProviderError>>,
+        reply: oneshot::Sender<Result<mpsc::UnboundedReceiver<SessionEvent>, ProviderError>>,
     },
     Release {
         generation: DeliveryGeneration,
@@ -42,31 +43,31 @@ enum IntakeState {
     Active {
         generation: DeliveryGeneration,
         context: Arc<Mutex<TurnContext>>,
-        sender: mpsc::Sender<SessionEvent>,
+        sender: mpsc::UnboundedSender<SessionEvent>,
     },
     Retained(Arc<Mutex<TurnContext>>),
 }
 
 /// Own the session reader independently of each temporary foreground subscriber.
 pub(crate) struct SessionIntake {
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::UnboundedSender<Command>,
     failure: watch::Sender<Option<ObservationFailure>>,
-    client: Client,
+    client: CopilotClient,
     task: Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Release a foreground observer while retaining its decoder for late native events.
 pub(crate) struct TurnReceiver {
-    receiver: mpsc::Receiver<SessionEvent>,
-    commands: mpsc::Sender<Command>,
+    receiver: mpsc::UnboundedReceiver<SessionEvent>,
+    commands: mpsc::UnboundedSender<Command>,
     generation: DeliveryGeneration,
     failure: watch::Sender<Option<ObservationFailure>>,
-    client: Client,
+    client: CopilotClient,
 }
 
 impl SessionIntake {
-    pub(crate) fn new(mut stream: SessionEventStream, client: Client) -> Self {
-        let (commands, mut receive) = mpsc::channel(16);
+    pub(crate) fn new(mut stream: SessionEventStream, client: CopilotClient) -> Self {
+        let (commands, mut receive) = mpsc::unbounded_channel();
         let (failure, mut failures) = watch::channel(None);
         let failed = failure.clone();
         let native = client.clone();
@@ -87,12 +88,12 @@ impl SessionIntake {
                                     let _ = reply.send(Err(ProviderError::Rejected { message: "Copilot session already has a foreground observer".into() }));
                                     continue;
                                 }
-                                let (sender, receiver) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+                                let (sender, receiver) = mpsc::unbounded_channel();
                                 if let IntakeState::Retained(previous) = &state && !Arc::ptr_eq(previous, &context) {
                                     retired.push(previous.clone());
                                 }
                                 if let IntakeState::Unbound(pending) = &mut state {
-                                    for event in pending.drain(..) { sender.try_send(event).map_err(|_| ProviderError::Observation(ObservationFailure::Overflow))?; }
+                                    for event in pending.drain(..) { sender.send(event).map_err(|_| ProviderError::Observation(ObservationFailure::Disconnected))?; }
                                 }
                                 state = IntakeState::Active { generation, context, sender };
                                 let _ = reply.send(Ok(receiver));
@@ -122,14 +123,12 @@ impl SessionIntake {
                             }
                             match &mut state {
                                 IntakeState::Unbound(pending) => {
-                                    if pending.len() == forge_protocol::MAX_PENDING_FRAMES { return Err(ProviderError::Observation(ObservationFailure::Overflow)); }
                                     pending.push_back(event);
                                 },
                                 IntakeState::Active { sender, context, .. } => {
-                                    match sender.try_send(event) {
+                                    match sender.send(event) {
                                         Ok(()) => {},
-                                        Err(mpsc::error::TrySendError::Full(_)) => return Err(ProviderError::Observation(ObservationFailure::Overflow)),
-                                        Err(mpsc::error::TrySendError::Closed(event)) => {
+                                        Err(mpsc::error::SendError(event)) => {
                                             let retained = context.clone();
                                             decode_retained(&retained, event).await?;
                                             state = IntakeState::Retained(retained);
@@ -153,9 +152,14 @@ impl SessionIntake {
                 failed.send_replace(Some(reason.clone()));
                 native.force_stop();
                 let context = match state {
-                    IntakeState::Active { context, .. } | IntakeState::Retained(context) => {
+                    IntakeState::Active {
+                        context, sender, ..
+                    } => {
+                        // The prompt holds this context until its receiver closes.
+                        drop(sender);
                         Some(context)
                     }
+                    IntakeState::Retained(context) => Some(context),
                     IntakeState::Unbound(_) => None,
                 };
                 if let Some(context) = context {
@@ -203,7 +207,6 @@ impl SessionIntake {
                 context,
                 reply,
             })
-            .await
             .map_err(|_| self.closed())?;
         let receiver = response.await.map_err(|_| self.closed())??;
         Ok(TurnReceiver {
@@ -221,7 +224,7 @@ impl SessionIntake {
             return Ok(());
         };
         let (reply, response) = oneshot::channel();
-        if self.commands.send(Command::Close { reply }).await.is_ok() {
+        if self.commands.send(Command::Close { reply }).is_ok() {
             let _ = response.await;
         }
         pending.await.map_err(|error| ProviderError::Protocol {
@@ -229,6 +232,11 @@ impl SessionIntake {
         })?;
         task.take();
         Ok(())
+    }
+
+    /// Report whether the shared native transport has already been stopped.
+    pub(crate) fn client_stopped(&self) -> bool {
+        self.client.is_stopped()
     }
 
     fn closed(&self) -> ProviderError {
@@ -266,13 +274,13 @@ impl Drop for TurnReceiver {
     fn drop(&mut self) {
         if self
             .commands
-            .try_send(Command::Release {
+            .send(Command::Release {
                 generation: self.generation,
             })
             .is_err()
         {
             self.failure
-                .send_replace(Some(ObservationFailure::Overflow));
+                .send_replace(Some(ObservationFailure::Disconnected));
             self.client.force_stop();
         }
     }
@@ -316,14 +324,16 @@ mod tests {
 
     async fn fixture() -> (
         SessionIntake,
-        mpsc::Sender<SessionEvent>,
+        mpsc::UnboundedSender<SessionEvent>,
         Arc<Mutex<TurnContext>>,
         forge_provider_api::ProviderEventStream,
     ) {
         let (read, _read_peer) = tokio::io::duplex(4096);
         let (write, _write_peer) = tokio::io::duplex(4096);
-        let client = Client::from_streams(read, write, std::env::temp_dir()).unwrap();
-        let (sender, receiver) = mpsc::channel(32);
+        let client = CopilotClient::new(
+            github_copilot_sdk::Client::from_streams(read, write, std::env::temp_dir()).unwrap(),
+        );
+        let (sender, receiver) = mpsc::unbounded_channel();
         let task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
         let intake = SessionIntake::new(SessionEventStream::fixture(receiver, task), client);
         let scope = InvocationScope::new(ExecutionOwner::root("session"), "exchange");
@@ -348,6 +358,74 @@ mod tests {
             sink,
         }));
         (intake, sender, context, observed)
+    }
+
+    /// Retain startup and foreground bursts while the prompt temporarily stops receiving.
+    #[tokio::test]
+    async fn bursts_survive_before_attach_and_while_foreground_is_paused() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            for attached in [false, true] {
+                let (intake, sender, context, _observed) = fixture().await;
+                let mut receiver = if attached {
+                    Some(intake.attach(context.clone()).await.unwrap())
+                } else {
+                    None
+                };
+                let event_count = 16_384;
+                for sequence in 0..event_count {
+                    sender
+                        .send(event(
+                            &format!("burst-{sequence}"),
+                            "assistant.message_delta",
+                            json!({"messageId":"answer","deltaContent":sequence.to_string()}),
+                        ))
+                        .unwrap();
+                }
+                tokio::task::yield_now().await;
+                assert!(intake.failure.borrow().is_none());
+                let receiver = match receiver.as_mut() {
+                    Some(receiver) => receiver,
+                    None => receiver.insert(intake.attach(context).await.unwrap()),
+                };
+                for sequence in 0..event_count {
+                    assert_eq!(
+                        receiver.recv().await.unwrap().id,
+                        format!("burst-{sequence}")
+                    );
+                }
+                intake.close().await.unwrap();
+                assert!(!intake.client_stopped());
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Close the receiver before failure publication waits for the prompt's decoder lock.
+    #[tokio::test]
+    async fn observation_loss_releases_locked_prompt_before_publishing_failure() {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let (intake, sender, context, mut observed) = fixture().await;
+            let mut receiver = intake.attach(context.clone()).await.unwrap();
+            let active = context.lock().await;
+            for sequence in 0..256 {
+                sender.send(event(&format!("prefix-{sequence}"), "session.usage_info", json!({}))).unwrap();
+            }
+            while receiver.receiver.len() != 256 {
+                tokio::task::yield_now().await;
+            }
+            intake.failure.send_replace(Some(ObservationFailure::Disconnected));
+            for sequence in 0..256 {
+                assert_eq!(receiver.recv().await.unwrap().id, format!("prefix-{sequence}"));
+            }
+            assert!(matches!(receiver.recv().await, Err(ProviderError::Observation(ObservationFailure::Disconnected))));
+            assert!(intake.client_stopped());
+            drop(active);
+            assert!(matches!(observed.recv().await.unwrap(), Some(ProviderEvent::Execution { observation })
+                if matches!(observation.update(), ExecutionUpdate::ObservationLost { failure: ObservationFailure::Disconnected, .. })));
+            intake.close().await.unwrap();
+            assert!(matches!(intake.attach(context).await, Err(ProviderError::Observation(ObservationFailure::Disconnected))));
+        }).await.unwrap();
     }
 
     /// A known old message keeps its original sink after another invocation attaches.
@@ -411,7 +489,6 @@ mod tests {
                     "messageId":"old-message", "deltaContent":" last"
                 }),
             ))
-            .await
             .unwrap();
         let late = tokio::time::timeout(std::time::Duration::from_secs(1), observed.recv())
             .await
@@ -438,7 +515,6 @@ mod tests {
                 "assistant.message",
                 json!({"messageId":"answer","phase":"final_answer","content":"late answer"}),
             ))
-            .await
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
@@ -469,7 +545,6 @@ mod tests {
                 "assistant.turn_start",
                 json!({"turnId":"second"}),
             ))
-            .await
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {

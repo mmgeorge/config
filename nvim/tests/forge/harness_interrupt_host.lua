@@ -25,11 +25,14 @@ local success, failure = xpcall(function()
     opened = snapshot
   end)
   assert(vim.wait(10000, function() return opened ~= nil end, 10), "host initialization stalled")
-  local finished, rejected, cancelled
+  local mock = dofile(root .. "/nvim/tests/forge/support/mock_provider.lua")
+  local held = mock.hold(opened.session.id, "chat")
+  local finished, rejected, cancelled, completion_error, completion_detail
   client.request({ method = "session.prompt.submit", params = { text = "Wait for interruption" }, session_id = opened.session.id }, function(_, request_error, detail)
-    assert(request_error and detail.code == "turn_cancelled", vim.inspect({ request_error, detail }))
+    completion_error, completion_detail = request_error, detail
     finished = true
   end)
+  assert(held:wait().prompt == "Wait for interruption")
   client.request({ method = "session.prompt.submit", params = { text = "Must not reset cancellation" }, session_id = opened.session.id }, function(_, request_error)
     assert(request_error and request_error:find("execution request is already running", 1, true), request_error)
     rejected = true
@@ -40,10 +43,11 @@ local success, failure = xpcall(function()
     cancelled = result.cancel_requested
   end)
   assert(vim.wait(10000, function() return finished and cancelled end, 10), "cancellation failed to settle")
+  assert(completion_error and completion_detail.code == "turn_cancelled", vim.inspect({ completion_error, completion_detail }))
 
-  finished, cancelled = false, false
+  finished, cancelled, completion_error, completion_detail = false, false, nil, nil
   client.request({ method = "session.prompt.submit", params = { text = "Cancel immediately after admission" }, session_id = opened.session.id }, function(_, request_error, detail)
-    assert(request_error and detail.code == "turn_cancelled", vim.inspect({ request_error, detail }))
+    completion_error, completion_detail = request_error, detail
     finished = true
   end)
   client.request({ method = "session.turn.cancel", params = {}, session_id = opened.session.id }, function(result, request_error)
@@ -51,6 +55,7 @@ local success, failure = xpcall(function()
     cancelled = result.cancel_requested
   end)
   assert(vim.wait(10000, function() return finished and cancelled end, 10), "early cancellation was lost")
+  assert(completion_error and completion_detail.code == "turn_cancelled", vim.inspect({ completion_error, completion_detail }))
   assert(#errors == 0, table.concat(errors, "\n"))
 end, debug.traceback)
 client.host_stop()

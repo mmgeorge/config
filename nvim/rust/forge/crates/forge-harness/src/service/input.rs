@@ -1859,11 +1859,10 @@ impl SessionController {
             let response = match response {
                 Ok(response) => response,
                 Err(error) => {
-                    let result = self
+                    drop(admission);
+                    return self
                         .settle_input(message, submission, Err(error), false, sink)
                         .await;
-                    drop(admission);
-                    return result;
                 }
             };
             for event in response.event {
@@ -1903,11 +1902,10 @@ impl SessionController {
                 None => Ok(()),
             }
         };
-        let result = self
-            .settle_input(message, submission, result, steer, sink)
-            .await;
+        // Publish the settled input only after its finalized execution releases ownership.
         drop(admission);
-        result
+        self.settle_input(message, submission, result, steer, sink)
+            .await
     }
 
     async fn settle_input(

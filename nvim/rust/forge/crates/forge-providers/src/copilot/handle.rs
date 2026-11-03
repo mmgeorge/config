@@ -13,10 +13,12 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone)]
 pub struct CopilotClient {
     pub(crate) inner: github_copilot_sdk::Client,
+    stopped: Arc<AtomicBool>,
 }
 
 pub struct CopilotSession {
@@ -30,6 +32,32 @@ pub struct SkillSelection {
 }
 
 impl CopilotClient {
+    /// Create a shared runtime handle whose stop state follows every session.
+    pub(crate) fn new(inner: github_copilot_sdk::Client) -> Self {
+        Self {
+            inner,
+            stopped: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Report whether collection or observation failure stopped this runtime generation.
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    /// Stop the native transport before marking its shared generation unavailable.
+    pub(crate) fn force_stop(&self) {
+        self.inner.force_stop();
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    /// Collect the SDK runtime before marking its shared handles unavailable.
+    pub(crate) async fn stop(&self) -> Result<(), github_copilot_sdk::StopErrors> {
+        self.inner.stop().await?;
+        self.stopped.store(true, Ordering::Release);
+        Ok(())
+    }
+
     pub async fn models(&self) -> Result<Vec<ProviderModel>, ProviderError> {
         let result: Result<Vec<ProviderModel>> = async {
             let models = self
@@ -218,6 +246,9 @@ impl CopilotSession {
     }
     pub async fn disconnect(&self) -> Result<(), ProviderError> {
         let intake = self.events.close().await;
+        if self.events.client_stopped() {
+            return intake;
+        }
         let native = self
             .inner
             .disconnect()
@@ -235,6 +266,9 @@ impl CopilotSession {
         }
     }
     pub async fn abort(&self) -> Result<(), ProviderError> {
+        if self.events.client_stopped() {
+            return Ok(());
+        }
         self.inner
             .abort()
             .await
@@ -242,6 +276,11 @@ impl CopilotSession {
             .map_err(|error| ProviderError::Transport {
                 message: error.to_string(),
             })
+    }
+
+    /// Report whether this binding belongs to a stopped native process.
+    pub fn client_stopped(&self) -> bool {
+        self.events.client_stopped()
     }
     pub async fn set_model(
         &self,
@@ -792,4 +831,35 @@ pub fn model_options(
         options = options.with_context_tier(context_tier);
     }
     options
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provides_an_auto_model_when_native_discovery_is_empty() {
+        let model = default_model_descriptor();
+        assert!(model.is_default);
+        assert_eq!(model.id, "default");
+        assert!(model.reasoning.is_empty());
+        assert!(model.context_window.is_empty());
+    }
+
+    #[test]
+    fn applies_reasoning_and_context_to_a_native_model_switch() {
+        let options = model_options(Some("high".into()), Some("long_context"));
+        assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(options.reasoning_summary, Some(ReasoningSummary::Concise));
+        assert!(matches!(
+            options.context_tier,
+            Some(ContextTier::LongContext)
+        ));
+        for context in [None, Some("unknown")] {
+            assert_eq!(
+                model_options(None, context).reasoning_summary,
+                Some(ReasoningSummary::Concise)
+            );
+        }
+    }
 }

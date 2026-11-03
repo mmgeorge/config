@@ -204,14 +204,6 @@ impl HarnessBroker {
         let action = match signal {
             ForegroundSignal::Native(NativeForegroundSignal::ProviderEvent(observation)) => {
                 if transaction.native_goal.is_some() {
-                    if transaction.pending_session_observations.len()
-                        >= forge_protocol::MAX_PENDING_FRAMES
-                    {
-                        return Err(ProviderError::Observation(
-                            forge_provider_api::lifecycle::ObservationFailure::Overflow,
-                        )
-                        .into());
-                    }
                     transaction
                         .pending_session_observations
                         .push_back(observation);
@@ -557,23 +549,9 @@ impl HarnessBroker {
         transaction: &mut ForegroundTransaction,
     ) -> Result<()> {
         while let Some(event) = transaction.native.events.try_next()? {
-            if transaction.pending_session_observations.len() >= forge_protocol::MAX_PENDING_FRAMES
-            {
-                return Err(ProviderError::Observation(
-                    forge_provider_api::lifecycle::ObservationFailure::Overflow,
-                )
-                .into());
-            }
             transaction.pending_session_observations.push_back(event);
         }
         for event in transaction.session_events.drain()? {
-            if transaction.pending_session_observations.len() >= forge_protocol::MAX_PENDING_FRAMES
-            {
-                return Err(ProviderError::Observation(
-                    forge_provider_api::lifecycle::ObservationFailure::Overflow,
-                )
-                .into());
-            }
             transaction.pending_session_observations.push_back(event);
         }
         Ok(())

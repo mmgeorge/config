@@ -49,7 +49,6 @@ uuid = { workspace = true, features = ["serde", "v4"] }
 zip = { workspace = true, features = ["deflate"] }
 
 [dev-dependencies]
-github-copilot-sdk = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-tungstenite = { workspace = true }
 tree-sitter = { workspace = true }

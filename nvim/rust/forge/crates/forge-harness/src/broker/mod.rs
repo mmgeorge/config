@@ -10441,7 +10441,7 @@ fn default_goal_max_turns() -> u32 {
     20
 }
 
-pub(crate) use forge_provider_api::error::TurnCancelled;
+pub use forge_provider_api::error::TurnCancelled;
 
 #[cfg(test)]
 mod test {

@@ -122,6 +122,94 @@ pub fn order_models(models: &mut [ProviderModel]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_provider_reasoning_context_and_vision_metadata() {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "id": "gpt-test",
+            "name": "Ignored display label",
+            "defaultReasoningEffort": "low",
+            "supportedReasoningEfforts": ["low", "high"],
+            "capabilities": {
+                "limits": {
+                    "max_context_window_tokens": 272000,
+                    "max_output_tokens": 128000
+                },
+                "supports": { "reasoningEffort": true, "vision": true }
+            },
+            "billing": {
+                "tokenPrices": {
+                    "maxPromptTokens": 300000,
+                    "longContext": { "maxPromptTokens": 1072000 }
+                }
+            }
+        }))
+        .unwrap();
+        let descriptor = model_descriptor(model);
+        assert_eq!(descriptor.id, "gpt-test");
+        assert_eq!(descriptor.reasoning, ["low", "high"]);
+        assert_eq!(descriptor.default_reasoning.as_deref(), Some("low"));
+        assert_eq!(descriptor.context_window[0].id, "default");
+        assert_eq!(descriptor.context_window[0].token_limit, Some(272_000));
+        assert_eq!(descriptor.context_window[1].id, "long_context");
+        assert_eq!(descriptor.context_window[1].token_limit, None);
+        assert!(descriptor.vision);
+    }
+
+    #[test]
+    fn maps_explicit_context_without_billing_metadata() {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "id": "gpt-test",
+            "name": "Test model",
+            "capabilities": {
+                "limits": { "max_context_window_tokens": 272000 }
+            }
+        }))
+        .unwrap();
+        let descriptor = model_descriptor(model);
+        assert_eq!(descriptor.context_window.len(), 1);
+        assert_eq!(descriptor.context_window[0].token_limit, Some(272_000));
+    }
+
+    #[test]
+    fn does_not_infer_missing_context_limits_from_billing_or_output() {
+        for context_limit in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+        ] {
+            let model: Model = serde_json::from_value(serde_json::json!({
+                "id": "gpt-test",
+                "name": "Test model",
+                "capabilities": {
+                    "limits": {
+                        "max_context_window_tokens": context_limit,
+                        "max_output_tokens": 128000
+                    }
+                },
+                "billing": {
+                    "tokenPrices": {
+                        "maxPromptTokens": 272000,
+                        "longContext": { "maxPromptTokens": 1000000 }
+                    }
+                }
+            }))
+            .unwrap();
+            let descriptor = model_descriptor(model);
+            assert_eq!(descriptor.context_window.len(), 2);
+            assert!(
+                descriptor
+                    .context_window
+                    .iter()
+                    .all(|context| context.token_limit.is_none())
+            );
+            assert_eq!(
+                descriptor.default_context_window.as_deref(),
+                Some("default")
+            );
+        }
+    }
+
     #[test]
     fn native_model_order_is_published_without_picker_name_rules() {
         let mut models: Vec<ProviderModel> = [

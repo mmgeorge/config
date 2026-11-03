@@ -89,6 +89,67 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    struct PermissionPolicy {
+        response: PermissionResponse,
+    }
+
+    #[async_trait]
+    impl ProviderPermissions for PermissionPolicy {
+        /// Verify the native callback's identity and normalized request at the host boundary.
+        async fn authorize(
+            &self,
+            session_id: &str,
+            request: PermissionRequest,
+        ) -> PermissionResponse {
+            assert_eq!(session_id, "native");
+            assert_eq!(request.id, "request");
+            assert_eq!(
+                request.target_list,
+                vec![PermissionTarget::Write {
+                    path: "file.rs".into()
+                }]
+            );
+            self.response.clone()
+        }
+
+        /// Admit the unused pre-tool barrier for this permission-only fixture.
+        async fn before_tool(&self) -> Result<(), forge_provider_api::ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// Preserve host authorization and denial feedback in the SDK response.
+    #[tokio::test]
+    async fn callback_maps_host_decisions_without_losing_feedback() {
+        for (response, expected) in [
+            (PermissionResponse::Allow, json!({"kind":"approve-once"})),
+            (
+                PermissionResponse::Deny {
+                    reason: Some("Policy denied this write.".into()),
+                },
+                json!({"kind":"reject","feedback":"Policy denied this write."}),
+            ),
+            (
+                PermissionResponse::Deny { reason: None },
+                json!({"kind":"reject"}),
+            ),
+            (PermissionResponse::Cancelled, json!({"kind":"reject"})),
+        ] {
+            let callback = handler(Arc::new(PermissionPolicy { response }));
+            let result = callback
+                .handle(
+                    SessionId::new("native"),
+                    RequestId::new("request"),
+                    serde_json::from_value(json!({"kind":"write","path":"file.rs"})).unwrap(),
+                )
+                .await;
+            let PermissionResult::Decision { decision, .. } = result else {
+                panic!("native callback omitted its decision");
+            };
+            assert_eq!(serde_json::to_value(decision).unwrap(), expected);
+        }
+    }
+
     #[test]
     fn callback_paths_and_operation_are_preserved_without_title_inference() {
         for operation in ["read", "write"] {

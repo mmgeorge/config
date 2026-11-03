@@ -80,6 +80,7 @@ pub async fn open(
     } else {
         None
     };
+    let runtime = client.clone();
     let client = &client.inner;
     let native_id = options
         .session_id
@@ -227,7 +228,7 @@ pub async fn open(
         };
         trace.record(correlation_id, "future.stack_probe", json!({"phase":"copilot.prepared.ready","bytes":0}));
         Ok(super::handle::CopilotSession {
-            inner: Arc::new(session), events: super::intake::SessionIntake::new(events, client.clone()),
+            inner: Arc::new(session), events: super::intake::SessionIntake::new(events, runtime),
         })
     }.await;
     result.map_err(ProviderError::from)

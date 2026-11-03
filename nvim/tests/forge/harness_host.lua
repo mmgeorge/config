@@ -3,7 +3,7 @@ local root = vim.fs.normalize(vim.fn.getcwd())
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
 vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
-local name = "forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
+local name = "forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 local executable = data .. "/" .. name
 assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), executable))
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
@@ -23,7 +23,8 @@ local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 local success, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
-  require("forge").setup({ diff_logging = false, harness_logging = false, harness = { provider = "mock" } })
+  require("forge").setup({ diff_logging = false, harness_logging = false,
+    text_correction = { enabled = false }, harness = { provider = "mock" } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return #errors > 0 or (state.presentation and state.presentation.ready) end, 10), "native Harness did not open")
   assert(#errors == 0, table.concat(errors, "\n"))

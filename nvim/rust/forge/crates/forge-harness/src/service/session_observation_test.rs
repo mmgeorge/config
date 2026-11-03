@@ -481,7 +481,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     let (message_sink, mut output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&message_sink).await?;
     let broker_guard = controller.broker.lock().await;
-    let diagnostic_count = forge_protocol::MAX_PENDING_FRAMES / 2;
+    let diagnostic_count = forge_protocol::MAX_PENDING_FRAMES * 4;
     // Keep the native session stream open after the producer finishes. Dropping
     // its last sender would be an unexpected disconnect, not a drained session.
     let session_sink = provider_sink.clone();
@@ -578,9 +578,9 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     Ok(())
 }
 
-/// Overflow retains the accepted prefix and reports the original typed loss.
+/// A native loss preserves all queued output even when it exceeds the former event limit.
 #[tokio::test]
-async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Result<()> {
+async fn session_observation_disconnect_retains_large_backlog_and_reports_loss() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
@@ -605,21 +605,19 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
     controller.attach_session_events(&output).await?;
     let guard = controller.broker.lock().await;
     for sequence in 0..(forge_protocol::MAX_PENDING_FRAMES * 2) {
-        if sink
-            .send_wait(ProviderEvent::Diagnostic {
-                scope: scope.clone(),
-                diagnostic: ProviderDiagnostic {
-                    code: Some("overflow".into()),
-                    message: format!("observation-{sequence}"),
-                    fatal: false,
-                },
-            })
-            .await
-            .is_err()
-        {
-            break;
-        }
+        sink.send_wait(ProviderEvent::Diagnostic {
+            scope: scope.clone(),
+            diagnostic: ProviderDiagnostic {
+                code: Some("overflow".into()),
+                message: format!("observation-{sequence}"),
+                fatal: false,
+            },
+        })
+        .await?;
     }
+    sink.fail(crate::provider::events::EventDeliveryError::Observation(
+        forge_provider_api::lifecycle::ObservationFailure::Disconnected,
+    ));
     let inbox = controller.observer.session_events();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !inbox.is_closed() {
@@ -627,12 +625,9 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
         }
     })
     .await
-    .context("overflow did not close observation")?;
+    .context("disconnect did not close observation")?;
     let accepted = inbox.drain()?;
-    assert!(
-        !accepted.is_empty(),
-        "overflow discarded the accepted prefix"
-    );
+    assert_eq!(accepted.len(), forge_protocol::MAX_PENDING_FRAMES * 2);
     for (sequence, event) in accepted.iter().enumerate() {
         let ProviderEvent::Diagnostic { diagnostic, .. } = event else {
             panic!("unexpected accepted event: {event:?}")
@@ -641,12 +636,12 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
     }
     let error = inbox
         .drain()
-        .expect_err("overflow must report observation loss");
+        .expect_err("disconnect must report observation loss");
     assert!(
         matches!(
             error.downcast_ref::<crate::provider::ProviderError>(),
             Some(crate::provider::ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::Overflow
+                forge_provider_api::lifecycle::ObservationFailure::Disconnected
             ))
         ),
         "unexpected failure: {error:#}"
