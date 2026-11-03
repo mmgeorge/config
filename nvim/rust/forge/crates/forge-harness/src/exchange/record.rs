@@ -861,8 +861,7 @@ impl Exchange {
         self.resume(now_ms)
     }
 
-    /// Seed interrupted restart history for state-machine and presentation fixtures.
-    #[cfg(test)]
+    /// Preserve the exchange and settle interrupted turns before a policy restart.
     pub(crate) fn pause_for_restart(&mut self, now_ms: i64) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.state() == ExchangeState::Running,

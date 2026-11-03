@@ -203,6 +203,15 @@ impl ForegroundFinalization {
             "host publication is not pending"
         );
         self.settlement.validate_effects_settled()?;
+        if outcome == crate::exchange::ExchangeOutcome::Cancelled
+            && broker.turn_cancellation.restart.load(Ordering::Acquire)
+        {
+            if runtime.checkpoint.is_some() {
+                self.phase = FinalizationPhase::InitialCheckpoint;
+                return Ok(ForegroundAction::Wait);
+            }
+            return self.park_for_restart(broker, exchange);
+        }
         if outcome == crate::exchange::ExchangeOutcome::Cancelled {
             broker.questions.cancel_chat(Some(&exchange.id))?;
             exchange.set_awaiting_input(false);
@@ -260,7 +269,25 @@ impl ForegroundFinalization {
             "unexpected initial checkpoint"
         );
         broker.finish_initial_checkpoint(runtime, exchange, result)?;
+        if matches!(self.outcome, Err(ProviderError::Cancelled))
+            && broker.turn_cancellation.restart.load(Ordering::Acquire)
+        {
+            return self.park_for_restart(broker, exchange);
+        }
         self.prepare_checkpoint(broker, exchange)
+    }
+
+    /// Keep the original checkpoint and exchange open for the configuration continuation.
+    fn park_for_restart(
+        &mut self,
+        broker: &mut HarnessBroker,
+        exchange: &mut Exchange,
+    ) -> Result<ForegroundAction> {
+        exchange.pause_for_restart(broker.clock.now_ms())?;
+        broker.store.save_exchange(exchange)?;
+        broker.save_session()?;
+        self.phase = FinalizationPhase::Checks;
+        Ok(ForegroundAction::Wait)
     }
 
     fn prepare_checkpoint(
@@ -1182,7 +1209,13 @@ impl HarnessBroker {
             Ok(output) => output.clone(),
             Err(ProviderError::Cancelled) => {
                 let mut output = ProviderCompletion::default();
-                output.native.provider_session_id = transaction.request.provider_session_id.clone();
+                output.native.provider_session_id = self
+                    .session
+                    .provider_session_id
+                    .clone()
+                    .map(TryInto::try_into)
+                    .transpose()?
+                    .or_else(|| transaction.request.provider_session_id.clone());
                 output.native.capability = self.capability.clone();
                 for batch in finalization.settlement.batches()? {
                     output.merge_execution(batch.completion);
@@ -1350,7 +1383,7 @@ impl HarnessBroker {
         let mut events = std::mem::take(&mut finalization.events);
         if !finalization.exchange_event_published && !finalization.exchange_event_staged {
             events.push(self.event(
-                if interaction.awaiting_input() {
+                if interaction.awaiting_input() || !interaction.is_finished() {
                     "exchange_updated"
                 } else {
                     "exchange_complete"
@@ -1519,7 +1552,12 @@ impl HarnessBroker {
         self.refresh_input_schedule()?;
         self.active_wait_projection = None;
         let response = if matches!(finalization.outcome, Err(ProviderError::Cancelled)) {
-            Response::failure(request_id, "turn_cancelled", "Turn cancelled by user")
+            let message = if self.turn_cancellation.restart.load(Ordering::Acquire) {
+                "Turn interrupted to apply configuration"
+            } else {
+                "Turn cancelled by user"
+            };
+            Response::failure(request_id, "turn_cancelled", message)
         } else {
             Response::success(request_id, value)?
         };

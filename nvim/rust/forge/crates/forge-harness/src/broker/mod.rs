@@ -1706,7 +1706,7 @@ impl TurnCancellation {
     /// Interrupt provider execution while retaining the current exchange for resumption.
     pub fn request_restart(&self) {
         self.restart.store(true, Ordering::Release);
-        self.request(false);
+        self.request_native_cancel(false);
     }
 
     /// Retain provider delivery while cancellation waits for terminal execution evidence.
@@ -14294,7 +14294,7 @@ mod test {
         let native_invocation = invocation.clone();
         let native = crate::provider::test_support::EventFixtureProvider::new(
             descriptor,
-            move |request, sink, mut cancelled| {
+            move |request, sink, _cancelled| {
                 let invocation = native_invocation.clone();
                 let cancellation = cancellation.clone();
                 async move {
@@ -14306,10 +14306,9 @@ mod test {
                     let attempt = invocation.fetch_add(1, Ordering::SeqCst);
                     let address = TurnAddress {
                         scope: request.scope.clone(),
-                        thread_id: "restart-fixture-session".into(),
+                        thread_id: "restart-thread".into(),
                         turn_id: format!("turn-{attempt}").into(),
                     };
-                    let sink = sink.invocation_sink(&request.scope)?;
                     sink.send_wait(ProviderEvent::Execution {
                         observation: ExecutionObservation::new(
                             request.scope.clone(),
@@ -14319,14 +14318,21 @@ mod test {
                         )?,
                     })
                     .await?;
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
+                    })
+                    .await?;
                     if attempt == 0 {
                         cancellation.request_restart();
-                        while !*cancelled.borrow_and_update() {
-                            cancelled
-                                .changed()
-                                .await
-                                .map_err(|_| forge_provider_api::ProviderError::Cancelled)?;
-                        }
+                        sink.send_wait(ProviderEvent::Turn {
+                            address: address.clone(),
+                            update: crate::provider::TurnUpdate::Finished {
+                                outcome: forge_provider_api::turn::TurnOutcome::Interrupted,
+                                completed_at_ms: 100,
+                            },
+                        })
+                        .await?;
                         sink.send_wait(ProviderEvent::Execution {
                             observation: ExecutionObservation::new(
                                 request.scope.clone(),
@@ -14363,6 +14369,14 @@ mod test {
                         );
                         assert!(!request.instructions.contains("Original request:"));
                     }
+                    sink.send_wait(ProviderEvent::Turn {
+                        address: address.clone(),
+                        update: crate::provider::TurnUpdate::Finished {
+                            outcome: forge_provider_api::turn::TurnOutcome::Completed,
+                            completed_at_ms: 100,
+                        },
+                    })
+                    .await?;
                     sink.send_wait(ProviderEvent::Execution {
                         observation: ExecutionObservation::new(
                             request.scope.clone(),

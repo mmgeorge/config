@@ -3814,7 +3814,11 @@ async fn execute_task_transition_inner(
                     anyhow::Error::new(error).context("collect current task before transition")
                 );
             }
-            controller.cancellation.request(restore_prompt);
+            if restart {
+                controller.cancellation.request_restart();
+            } else {
+                controller.cancellation.request(restore_prompt);
+            }
             // Execution ownership includes finalization and response delivery, independently of read-only broker locks.
             Arc::clone(&controller.coordinator.execution)
                 .acquire_owned()

@@ -1231,9 +1231,13 @@ impl HarnessBroker {
             let delivery = self.prepare_provider_delivery(AppliedProviderEvent::Update(update))?;
             let resume = if captured.resume {
                 let previous = self.store.latest_exchange(&self.session.id)?.context("interrupted exchange is missing")?;
-                let notice = format!("The user changed filesystem access from {} to {} and approval mode from {} to {}. Continue the interrupted work under the updated policy. Saved approval rules still apply. Preserve completed work. Before retrying an interrupted operation, inspect its recorded outcome and any affected files.",
-                    previous_access, self.session.access.abbreviation(), previous_approval.label(), captured.selected_approval.label());
-                Some(if previous.elicitation().is_some() { notice } else { format!("{notice}\n\nOriginal request: {}", previous.prompt) })
+                if previous.is_finished() {
+                    None
+                } else {
+                    let notice = format!("The user changed filesystem access from {} to {} and approval mode from {} to {}. Continue the interrupted work under the updated policy. Saved approval rules still apply. Preserve completed work. Before retrying an interrupted operation, inspect its recorded outcome and any affected files.",
+                        previous_access, self.session.access.abbreviation(), previous_approval.label(), captured.selected_approval.label());
+                    Some(if previous.elicitation().is_some() { notice } else { format!("{notice}\n\nOriginal request: {}", previous.prompt) })
+                }
             } else { None };
             let value = serde_json::to_value(self.snapshot()?)?;
             Ok(PermissionConfigurationResult { delivery, resume, value })
@@ -1787,6 +1791,32 @@ mod owned_tests {
             broker.store.list_exchange(&broker.session.id)?.len(),
             before
         );
+        Ok(())
+    }
+
+    /// A completed exchange must not replay when a queued write toggle reaches its owner.
+    #[tokio::test]
+    async fn write_toggle_does_not_resume_an_exchange_that_finished_during_cleanup() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let exchange = super::super::test::completed_interaction(
+            "finished-before-toggle",
+            &broker.session.id,
+            Vec::new(),
+        );
+        broker.store.save_exchange(&exchange)?;
+        let before = broker.session.access.write_access;
+        let captured = broker.prepare_permission_configuration(
+            &json!({"change":{"kind":"toggle_write_enabled"},"resume":true}),
+        )?;
+        let result = broker.commit_permission_configuration(captured)?;
+        assert!(result.resume.is_none());
+        assert_ne!(broker.session.access.write_access, before);
+        let after = broker.store.latest_exchange(&broker.session.id)?.unwrap();
+        assert_eq!(after.id, exchange.id);
+        assert!(after.is_finished());
         Ok(())
     }
 }
