@@ -1,98 +1,32 @@
 ---
 name: typescript
 description: >-
-  Design, implement, refactor, and review TypeScript code. Use when changing .ts, .tsx,
-  .mts, or .cts files, type definitions, unions, generics, or tsconfig type-checking
-  behavior.
+  Design, implement, refactor, review, and test TypeScript code. Use for .ts, .tsx,
+  .mts, or .cts files, type modeling with unions and generics, async state
+  coordination, typed boundaries, and tsconfig type-checking behavior.
 ---
 
-# TypeScript engineering
+# TypeScript
 
 ## Type safety
 
-A value typed `any`, a cast, or a `string` that stands for a closed set compiles while deferring the failure to runtime. Encode each invariant in a type so the type check rejects misuse.
+Unvalidated input must not reach internal consumers. Validate at entry and carry domain types through internal contracts.
 
-- Keep `strict` enabled. Never weaken compiler options to make code pass.
-- Make values valid by construction. Validate once in a parser or static factory, keep the raw constructor private, and let consumers trust the resulting type without rechecking it.
-- Never use `any`. Type untrusted input as `unknown` and narrow it with a parser or type guard where it enters the program.
-- Never silence the checker with `as` casts or non-null `!` assertions. Narrow with control flow, a literal discriminant, a type guard, or a validating parser. `as const` is allowed.
-- Narrow with a `type` property typed as a literal union, such as `type: "raster" | "vector"`, or with a type guard, not `instanceof`. Never type the discriminant as `string`. `instanceof` needs a runtime import of the class, which creates a hard module dependency, pulls the class and its imports into the bundle, and fails across duplicate package copies.
-- Model a closed set of cases as a discriminated union on a `type` property typed as a literal union. Never use a `type: string` field or an object of optional fields interpreted by type.
-- Replace boolean flags and co-dependent optional fields with a union whose members hold exactly the valid combinations.
-- Handle unions exhaustively. End each `switch` with `assertNever`, so a new member fails the type check at every consumer.
-- Brand identifiers and units that share a primitive, so swapped arguments fail to compile. A plain `type SessionId = string` alias does not count, because it stays interchangeable.
-- Represent absence with `undefined` or an optional property, never a sentinel such as `-1` or `""`.
-- Mark properties and arrays `readonly` when callers must not mutate them.
-- Check object literals against a type with `satisfies` when widening would lose literal types.
+- Never use `any`. Accept untrusted input as `unknown`; parse it in the receiving adapter and keep wire spellings there.
+- Make values valid by construction. Validate once in a parser or static factory, keep raw constructors private, and avoid downstream revalidation.
+- Narrow instead of using `as` or non-null `!` assertions. Allow only `as const` and brand casts inside constructors that validate the brand's invariant.
+- Model closed cases with literal `type` discriminants and case-specific payloads, not string tags, boolean flags, or co-dependent optional fields. Keep shared required identity non-optional.
+- Narrow with discriminants or type guards, never `instanceof`; class identity requires runtime imports and can fail across duplicate packages.
+- Handle unions exhaustively with an `assertNever(value: never): never` fallback.
+- Represent open external vocabularies with explicit `{ type: "missing" }` and `{ type: "unknown"; raw: string }` cases, not catch-alls that defer parsing.
+- Before using `string`, check whether a literal union or discriminated union can represent the domain values. Use unions for known cases; reserve plain strings for genuinely free-form text or raw input at external boundaries.
+- Use validated branded types for structured values such as identifiers and units, so values sharing a primitive cannot be confused. Plain aliases do not provide this distinction.
+- Represent absence with `undefined` or optional properties, never sentinels.
+- Use `readonly` for properties and arrays callers must not mutate, and `satisfies` to check object literals without losing literal types.
+- Return domain types, not strings consumers must decode. Never pass `unknown`, `object`, or `Record<string, unknown>` onward as an internal domain payload.
+- Preserve persisted and wire representations during refactors.
 
-A union whose consumer cannot forget a case:
-
-```ts
-type RequestState =
-  | { type: "pending" }
-  | { type: "ready"; body: Uint8Array }
-  | { type: "failed"; error: RequestError };
-
-function assertNever(value: never): never {
-  throw new Error(`Unhandled case: ${JSON.stringify(value)}`);
-}
-
-function label(state: RequestState): string {
-  switch (state.type) {
-    case "pending":
-      return "Waiting";
-    case "ready":
-      return `${state.body.length} bytes`;
-    case "failed":
-      return state.error.message;
-    default:
-      return assertNever(state);
-  }
-}
-```
-
-A branded identifier that a plain string cannot satisfy:
-
-```ts
-type SessionId = string & { readonly brand: unique symbol };
-
-function parseSessionId(raw: string): SessionId | undefined {
-  return /^[a-z0-9-]+$/.test(raw) ? (raw as SessionId) : undefined;
-}
-```
-
-The brand constructor is the one place a cast is allowed, because it runs the validation the brand promises.
-
-A discriminant check needs only a type import. Bad: the value import loads `RasterLayer` and everything it imports:
-
-```ts
-import { RasterLayer } from "./layers/raster-layer";
-
-if (layer instanceof RasterLayer) {
-```
-
-Good: the check reads a property, and `import type` disappears at compile time:
-
-```ts
-import type { RasterLayer } from "./layers/raster-layer";
-
-function isRasterLayer(layer: Layer): layer is RasterLayer {
-  return layer.type === "raster";
-}
-```
-
-## Typed boundaries
-
-Stringly typed contracts compile while hiding unhandled cases, misspelled kinds, and missing fields until runtime. Every module, adapter, event, and message boundary carries typed values.
-
-- Parse external data inside the adapter that receives it. Never type a `JSON.parse` result, `fetch` body, or message payload with `as`. Wire spellings never cross the adapter boundary.
-- Return typed values from interfaces and contracts, never strings callers parse or compare.
-- Never use `Record<string, unknown>`, `unknown`, or `object` as a contract payload.
-- Keep identity that every case requires non-optional.
-- Give a field with an open external vocabulary explicit `{ type: "missing" }` and `{ type: "unknown"; raw: string }` members. Never add a catch-all member that defers parsing to consumers.
-- Never change a persisted or wire representation as a side effect of a refactor.
-
-## Encapsulated state
+## Encapsulation
 
 A class that exposes its internals makes every caller responsible for its invariant. Each class owns its invariant, and callers change state only through methods that keep it valid.
 
@@ -101,11 +35,25 @@ A class that exposes its internals makes every caller responsible for its invari
 - Complete every fallible or awaited step before mutating state, so a rejection leaves the object unchanged.
 - Tie paired operations, such as subscribe and unsubscribe, to a `Disposable` acquired with `using` when the project's TypeScript and runtime support it. Otherwise release them in `finally`.
 
+## Naming
+
+Name methods `nounVerb`, placing the target before the operation. Omit the noun when the receiver makes the target unambiguous (`get`); otherwise, qualify only as much as needed (`sourceGet`, `assetGet`, `sourceAssetGet`). Keep target names consistent across related operations (`sourceGet`, `sourceSet`, `sourceRemove`).
+
+- Name fields by their contents (`sources`, `assets`), never `data`. Name monotonic counts `<domain>Count`.
+- Use camelCase for values, functions, and methods, and PascalCase for types, interfaces, and classes.
+- Put context parameters first.
+- Do not prefix interface names with `I` or type names with `Typed`.
+- Preserve names required by external interfaces, framework conventions, overrides, and wire formats.
+
 ## Errors
 
 - Never throw strings or plain objects. Throw `Error` subclasses, or return a discriminated result union when callers branch on the failure.
 - Preserve the underlying failure with `new Error(message, { cause })`.
 - Render error text only at a UI, log, command, or transport boundary.
+
+## Async
+
+Centralize related state changes so their ordering and interactions are easy to reason about. In complex async flows, have handlers record intent and let one coordinated update path apply changes. Consider commands with completion promises when the state owner should control execution order while callers await results. Use command queues, update passes, or schemas where they clarify that coordination.
 
 ## Control flow
 
@@ -173,12 +121,16 @@ const revision = this.revision;
 await this.store.write(draft, revision);
 ```
 
+# Testing
+
+Sparingly use add unit tests for algorithms, parsers, and codecs only. Mock external boundaries when isolation proves the owned logic.
+
+Most tests should be integration, include tests on coverage of lifecycle, persistence, concurrent handoff, plugins, rendering, and host/library boundaries.
+
+When running tests, prefer a name filter or a cached fixture.
+
 ## Verification
 
 - Validate in the order type check, test, read-only format check, lint, build. Run the project's existing type-check script, or its configured `tsc --noEmit` command, first, and fix type errors before running tests.
-- Finish source-changing preparation, such as code generation, before validation starts. Repeat the affected checks after any later source change. Run the formatter in check mode, such as `prettier --check`, so validation never rewrites files. If a formatting fix changes source, restart from the type check.
+- Finish source-changing preparation, such as code generation, before validation starts. Repeat the affected checks after any later source change.
 - Run the type check, lint, tests, and build through the project's package scripts with the same `tsconfig`, package, and working directory as the development build. Lint and test the same affected package instead of widening to the whole workspace.
-- Use isolated unit tests with mocked external boundaries for parsers, state machines, and error decisions. Use real modules for integration coverage of lifecycle, persistence, and rendering boundaries.
-- Select the smallest test coverage that exercises the change. Run individual tests through the test runner's name or file filter, batching related tests in one invocation. Escalate to the whole package only when individual tests cannot cover the affected behavior, and to the workspace only for demonstrated cross-package impact or an explicit user request. State the reason before broadening. A passing targeted test, a type error, or an unknown test name does not justify a broader run.
-- For a slow test, prefer a name filter or a cached fixture. Run an unavoidable slow suite with an explicit timeout.
-- Report the executed command, timeout, exit status, execution duration for slow runs, and the specific error output or generated artifact.

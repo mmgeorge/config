@@ -1,15 +1,19 @@
 ---
 name: rust
 description: >-
-  Design, implement, refactor, review, and test Rust code. Use when changing .rs
-  files, Cargo dependencies, modules, types, ownership, control flow, Facet, Serde,
-  or thiserror derives, error handling, rustdoc, or tests. Also use for Mutex, RwLock,
-  atomics, channels, shared-state publication, Rust dynamic libraries, FFI, and hot reload.
+  Design, implement, refactor, review, and test Rust code. Use for .rs files, Cargo
+  dependencies, type and ownership design, async state coordination, synchronization
+  (Mutex, RwLock, atomics, channels), Serde, Facet, thiserror, rustdoc, FFI, dynamic
+  libraries, and hot reload.
 ---
 
-# Rust engineering
+# Rust
 
 Apply every required convention to each Rust change. Read a reference only when the change matches its trigger in the reference table.
+
+## Crate Research
+
+- Research new crates and their APIs through the `docs` MCP server (`docs-mcp`) before falling back to GitHub source.
 
 ## Required conventions
 
@@ -19,7 +23,8 @@ An invariant checked only at runtime fails on a path that tests may never reach.
 
 - Make success values valid by construction. Keep fields private and expose a fallible constructor or `TryFrom` that validates once at entry. Downstream consumers stay infallible unless they add a new failure source.
 - Remember that a derived `Deserialize` or `Facet` impl bypasses the constructor. Deserialize a validated type through a raw type and `TryFrom` (Serde's `#[serde(try_from = "Raw")]`, or Facet's proxy) so loaded data passes the same validation.
-- Wrap identifiers and quantities in newtypes when values of one primitive type can be confused, so swapped arguments fail to compile. A `type` alias does not count, because it stays interchangeable with its target.
+- Before using `String` or `&str`, check whether an enum can represent the domain values. Use enums for known cases; reserve plain strings for genuinely free-form text or raw input at external boundaries.
+- Use validated newtypes for structured values such as identifiers and quantities, so values sharing a primitive cannot be confused. A `type` alias does not provide this distinction.
 - Replace `bool` parameters, string discriminants, and flag fields with co-dependent `Option`s with an enum whose variants hold exactly the valid combinations.
 - Represent absence with `Option`, never a sentinel such as `-1`, `0`, or `""`.
 - Convert numbers with `From`, or with `TryFrom` when the value may not fit. Never use `as` where it can truncate, wrap, or change sign.
@@ -29,16 +34,6 @@ An invariant checked only at runtime fails on a path that tests may never reach.
 - Tie paired operations, such as register and unregister, to a guard whose `Drop` performs the release.
 - Keep concrete types through abstractions with generics or associated types. Use `dyn Trait` only for heterogeneous collections or plugin boundaries, never recovered by downcasting.
 - Reserve `expect` for invariants the type system cannot express, and state the invariant in its message.
-
-### Encapsulated invariants
-
-A type that exposes its internals makes every caller responsible for its invariant, and one careless caller corrupts it for all. Each type owns its invariant. Callers read through `&T` and change state only through methods that keep it valid, without knowing how it is kept.
-
-- Never expose `&mut` access or `pub` fields for state that carries an invariant. Provide mutation methods that preserve it.
-- Return `&[T]`, `&str`, or iterators instead of `&Vec<T>`, `&String`, or internal collections.
-- Combine check-then-act sequences into one operation, such as get-or-create.
-- Complete every fallible step before assigning in a `&mut self` method, so an error leaves the value unchanged.
-- Keep interior mutability private. Never return `RefMut`, lock guards, or other borrows of internal state from a public method.
 
 ### Typed boundaries
 
@@ -70,7 +65,17 @@ pub enum BackendEvent {
 }
 ```
 
-### Modules and declarations
+### Encapsulation
+
+Each type owns and protects its invariants. Expose read-only access through `&T` and mutation methods that preserve validity without exposing implementation details.
+
+- Never expose `&mut` access or `pub` fields for state that carries an invariant. Provide mutation methods that preserve it.
+- Return `&[T]`, `&str`, or iterators instead of `&Vec<T>`, `&String`, or internal collections.
+- Combine check-then-act sequences into one operation, such as get-or-create.
+- Complete every fallible step before assigning in a `&mut self` method, so an error leaves the value unchanged.
+- Keep interior mutability private. Never return `RefMut`, lock guards, or other borrows of internal state from a public method.
+
+### Modules
 
 - Keep `mod.rs` limited to `mod` declarations and re-exports.
 - Start one owned concept in one file. Promote it to a directory only when distinct child modules emerge. Name the directory after the shared feature area so no child repeats its name. Never split a file only to reduce its length.
@@ -80,9 +85,21 @@ pub enum BackendEvent {
 
 ### Naming
 
+Name methods `noun_verb`, placing the target before the operation. Omit the noun when the receiver makes the target unambiguous (`get`, `get_mut`); otherwise, qualify only as much as needed (`source_get`, `asset_get`, `source_asset_get`). Keep target names consistent across related operations (`source_get`, `source_get_mut`, `source_remove`).
+
 - Name fields by their contents (`sources`, `assets`), never `data`. Name monotonic counts `<domain>_count`.
 - Put context parameters first after the receiver.
 - Do not add a `with_*` constructor for a single caller or a `Typed` prefix to a type name.
+
+### Serialization
+
+- Inspect the library's existing serialized types before adding one. Use Serde when any existing serialized type uses it. Otherwise use Facet. Never add a parallel serialization stack.
+- Never change a persisted or wire representation as a side effect of a Rust refactor.
+- Check the installed serialization crate's documentation before using a derive or attribute.
+
+### Async mutations
+
+Centralize related state changes so their ordering and interactions are easy to reason about. In complex async flows, have handlers record intent and let one coordinated update path apply changes. Consider commands with completion promises when the state owner should control execution order while callers await results. Use command queues, update passes, or schemas where they clarify that coordination.
 
 ### Control flow
 
@@ -97,11 +114,6 @@ pub enum BackendEvent {
 - Use `anyhow` only where no caller distinguishes failures, such as binary entry points and top-level orchestration. Library and domain APIs return typed errors.
 - Check the installed error crate's documentation before using a derive or attribute.
 
-### Serialization
-
-- Inspect the library's existing serialized types before adding one. Use Serde when any existing serialized type uses it. Otherwise use Facet. Never add a parallel serialization stack.
-- Never change a persisted or wire representation as a side effect of a Rust refactor.
-- Check the installed serialization crate's documentation before using a derive or attribute.
 
 ### Documentation
 
@@ -145,19 +157,23 @@ drop(guard);
 | [testing.md](references/testing.md) | Adding, moving, or removing tests |
 
 
-## Crate research
+## Testing
 
-- Research new crates and their APIs through the `docs` MCP server (`docs-mcp`) before falling back to GitHub source.
+Sparingly use add unit tests for algorithms, parsers, and codecs only. Mock external boundaries when isolation proves the owned logic.
+
+Most tests should be integration, include tests on coverage of lifecycle, persistence, concurrent handoff, plugins, rendering, and host/library boundaries.
+
+### Place tests at their boundary
+
+Keep unit tests in the inline `#[cfg(test)]` module of the file they cover.
+
+Keep crate-private integration workflows in the owning module's test module, so they exercise production composition without exposing implementation details. Use the crate's `tests/` directory for public contracts and multi-crate boundaries. Follow the existing fixture layout.
 
 ## Verification
 
 - Validate in the order `cargo check`, `cargo test`, `cargo fmt --check`, `cargo clippy`, `cargo build`. Run `cargo check` on the affected package and target first, and fix compiler errors before running tests. After a compilation failure, repeat `cargo check` before retrying a test.
-- Finish source-changing preparation, such as code generation, before validation starts. Repeat the affected checks after any later source change. If a formatting fix changes source, restart from `cargo check`.
-- Pass `cargo check`, `cargo clippy`, `cargo test`, and `cargo build` the same arguments as the project's development build: the same toolchain, `--target`, profile, `--features` selection, `RUSTFLAGS`, working directory, and target directory. Select the same package and binary or library for clippy and tests. A mismatched argument invalidates the build cache and recompiles the dependency graph.
-- Do not add `--all-targets`, `--tests`, `--all-features`, `--release`, or a separate `--target-dir` by default. Select a named integration-test executable (`--test <name>`) only when the requested coverage requires it.
-- Do not claim complete build-cache reuse between clippy and tests. Even with aligned arguments, the test harness and clippy analysis produce distinct artifacts.
-- Select the smallest test coverage that exercises the change. Run individual tests with `cargo test -p <package> <filter>`, batching related tests in one invocation. Escalate to the whole package only when individual tests cannot cover the affected behavior, and to the workspace only for demonstrated cross-package impact or an explicit user request. State the reason before broadening. A passing targeted test, a compilation failure, or an unknown test name does not justify a broader run.
-- For a slow test, prefer a name filter or a cached fixture. Run an unavoidable slow suite with an explicit timeout.
-- Report the executed command, timeout, exit status, execution duration for slow runs, and the specific error output or generated artifact. Report unrelated warnings or failures separately and leave unrelated code untouched.
 - Never run broad automatic-fix commands such as `cargo clippy --fix` or `cargo fix`.
-- Never start a long-lived development process for verification.
+- Finish source-changing preparation, such as code generation, before validation starts. Repeat the affected checks after any later source change. If a formatting fix changes source, restart from `cargo check`.
+- Pass `cargo check`, `cargo clippy`, `cargo test`, and `cargo build` the same arguments as the project's development build. A mismatched argument invalidates the build cache and recompiles the dependency graph.
+- Do not add `--all-targets`, `--tests`, `--all-features`, `--release`, or a separate `--target-dir` by default. Select a named integration-test executable (`--test <name>`) only when the requested coverage requires it.
+- Select the smallest test coverage that exercises the change. Run individual tests with `cargo test -p <package> <filter>`, batching related tests in one invocation.
