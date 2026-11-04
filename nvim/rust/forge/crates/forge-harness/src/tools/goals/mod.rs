@@ -13,7 +13,7 @@ mod tests {
     #[test]
     fn rejected_goal_control_preserves_only_genuine_native_evidence() -> crate::tools::ToolResult<()>
     {
-        let task = crate::task::Task::goal("Goal".into(), Default::default(), false, 1);
+        let task = crate::task::Task::goal("Goal".into(), Default::default(), 1);
         for (name, arguments, complete) in [
             ("goal_complete", serde_json::json!({"summary":"Done"}), true),
             (

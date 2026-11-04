@@ -50,6 +50,10 @@ mod tests {
     }
 
     /// Preserve one notification when a retained worker owns the eventual enqueue.
+    #[allow(
+        clippy::async_yields_async,
+        reason = "Admission returns the retained worker without waiting for its completion"
+    )]
     #[tokio::test]
     async fn admission_transfers_to_retained_worker() {
         let (admitted, admission) = oneshot::channel();

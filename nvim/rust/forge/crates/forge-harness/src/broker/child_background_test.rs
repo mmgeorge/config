@@ -8,61 +8,119 @@ fn child_background_fixture(
     completion: ChildBackgroundCompletion,
 ) -> Arc<crate::provider::test_support::EventFixtureProvider> {
     let descriptor = crate::provider::ProviderDescriptor {
-        kind: crate::provider::ProviderId::new("test-child-background").expect("fixture ID is valid"),
+        kind: crate::provider::ProviderId::new("test-child-background")
+            .expect("fixture ID is valid"),
         label: "Normalized child background fixture".into(),
         capability: crate::provider::test_support::fixture_capability(),
     };
-    crate::provider::test_support::EventFixtureProvider::new(descriptor, move |request, sink, mut cancelled| async move {
-        let scope = request.scope.clone();
-        let thread_id = "child-background-thread";
-        let turn = crate::provider::TurnAddress { scope: scope.clone(), thread_id: thread_id.into(), turn_id: "original-turn".into() };
-        let tool = crate::provider::ToolAddress { turn: turn.clone(), tool_id: "original-background-tool".into() };
-        let native_completion = forge_provider_api::completion::ProviderCompletion {
-            provider_session_id: Some(thread_id.to_owned().try_into().expect("fixture ID is valid")),
-            capability: crate::provider::test_support::fixture_capability(),
-            ..Default::default()
-        };
-        sink.send_wait(ProviderEvent::Execution { observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-            scope.clone(), forge_provider_api::lifecycle::ExecutionUpdate::Started { address: turn.clone() },
-        )? }).await?;
-        sink.send_wait(ProviderEvent::Turn { address: turn.clone(), update: crate::provider::TurnUpdate::Started { started_at_ms: 1 } }).await?;
-        for update in [
-            crate::provider::ToolUpdate::Requested { invocation: crate::provider::ToolInvocation {
-                semantics: Default::default(), kind: crate::provider::ToolActivityKind::Command,
-                name: "background-command".into(), title: "Original child background command".into(), arguments: json!({"command":"fixture"}),
-            }},
-            crate::provider::ToolUpdate::Started,
-            crate::provider::ToolUpdate::Output { update: crate::provider::TextUpdate::Append("initial-output\n".into()) },
-            crate::provider::ToolUpdate::Backgrounded,
-        ] {
-            sink.send_wait(ProviderEvent::Tool { address: tool.clone(), update }).await?;
-        }
-        sink.send_wait(ProviderEvent::Turn { address: turn.clone(), update: crate::provider::TurnUpdate::Finished {
-            outcome: crate::turn::TurnOutcome::Completed, completed_at_ms: 2,
-        }}).await?;
-        sink.send_wait(ProviderEvent::Execution { observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-            scope.clone(), forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                address: turn.clone(), covered_submissions: vec![request.submission_id], completed_at_ms: 2,
-                result: forge_provider_api::lifecycle::ExecutionResult::Completed { completion: native_completion.into() },
-            },
-        )? }).await?;
-        if matches!(completion, ChildBackgroundCompletion::Shutdown) {
-            loop {
-                if cancelled.changed().await.is_err() || *cancelled.borrow() { break; }
+    crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        move |request, sink, mut cancelled| async move {
+            let scope = request.scope.clone();
+            let thread_id = "child-background-thread";
+            let turn = crate::provider::TurnAddress {
+                scope: scope.clone(),
+                thread_id: thread_id.into(),
+                turn_id: "original-turn".into(),
+            };
+            let tool = crate::provider::ToolAddress {
+                turn: turn.clone(),
+                tool_id: "original-background-tool".into(),
+            };
+            let native_completion = forge_provider_api::completion::ProviderCompletion {
+                provider_session_id: Some(
+                    thread_id
+                        .to_owned()
+                        .try_into()
+                        .expect("fixture ID is valid"),
+                ),
+                capability: crate::provider::test_support::fixture_capability(),
+                ..Default::default()
+            };
+            sink.send_wait(ProviderEvent::Execution {
+                observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                    scope.clone(),
+                    forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                        address: turn.clone(),
+                    },
+                )?,
+            })
+            .await?;
+            sink.send_wait(ProviderEvent::Turn {
+                address: turn.clone(),
+                update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
+            })
+            .await?;
+            for update in [
+                crate::provider::ToolUpdate::Requested {
+                    invocation: crate::provider::ToolInvocation {
+                        semantics: Default::default(),
+                        kind: crate::provider::ToolActivityKind::Command,
+                        name: "background-command".into(),
+                        title: "Original child background command".into(),
+                        arguments: json!({"command":"fixture"}),
+                    },
+                },
+                crate::provider::ToolUpdate::Started,
+                crate::provider::ToolUpdate::Output {
+                    update: crate::provider::TextUpdate::Append("initial-output\n".into()),
+                },
+                crate::provider::ToolUpdate::Backgrounded,
+            ] {
+                sink.send_wait(ProviderEvent::Tool {
+                    address: tool.clone(),
+                    update,
+                })
+                .await?;
             }
-        }
-        let outcome = match completion {
-            ChildBackgroundCompletion::Shutdown => crate::provider::ToolOutcome::Interrupted,
-            ChildBackgroundCompletion::Natural => crate::provider::ToolOutcome::Succeeded,
-        };
-        for update in [
-            crate::provider::ToolUpdate::Output { update: crate::provider::TextUpdate::Append("shutdown-tail\n".into()) },
-            crate::provider::ToolUpdate::Finished { outcome },
-        ] {
-            sink.invocation_sink(&scope)?.send_wait(ProviderEvent::Tool { address: tool.clone(), update }).await?;
-        }
-        Ok(())
-    })
+            sink.send_wait(ProviderEvent::Turn {
+                address: turn.clone(),
+                update: crate::provider::TurnUpdate::Finished {
+                    outcome: crate::turn::TurnOutcome::Completed,
+                    completed_at_ms: 2,
+                },
+            })
+            .await?;
+            sink.send_wait(ProviderEvent::Execution {
+                observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                    scope.clone(),
+                    forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                        address: turn.clone(),
+                        covered_submissions: vec![request.submission_id],
+                        completed_at_ms: 2,
+                        result: forge_provider_api::lifecycle::ExecutionResult::Completed {
+                            completion: native_completion.into(),
+                        },
+                    },
+                )?,
+            })
+            .await?;
+            if matches!(completion, ChildBackgroundCompletion::Shutdown) {
+                loop {
+                    if cancelled.changed().await.is_err() || *cancelled.borrow() {
+                        break;
+                    }
+                }
+            }
+            let outcome = match completion {
+                ChildBackgroundCompletion::Shutdown => crate::provider::ToolOutcome::Interrupted,
+                ChildBackgroundCompletion::Natural => crate::provider::ToolOutcome::Succeeded,
+            };
+            for update in [
+                crate::provider::ToolUpdate::Output {
+                    update: crate::provider::TextUpdate::Append("shutdown-tail\n".into()),
+                },
+                crate::provider::ToolUpdate::Finished { outcome },
+            ] {
+                sink.send_wait(ProviderEvent::Tool {
+                    address: tool.clone(),
+                    update,
+                })
+                .await?;
+            }
+            Ok(())
+        },
+    )
 }
 /// Persist shutdown observations before the coordinator can complete the managed child.
 #[tokio::test]
@@ -87,7 +145,9 @@ async fn assert_managed_child_background_completion(
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     let native = child_background_fixture(completion);
     let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
-    broker.agent_provider_factory.register(fixture.provider_handle());
+    broker
+        .agent_provider_factory
+        .register(fixture.provider_handle());
     let (admitted, _) = broker
         .start_agent(json!({"profile":"worker","text":"Background fixture"}))
         .await?;

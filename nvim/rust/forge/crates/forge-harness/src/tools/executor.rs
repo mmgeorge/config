@@ -310,7 +310,6 @@ mod test {
                 crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                     "Replacement".into(),
                     Default::default(),
-                    false,
                     2,
                 ))),
                 2,

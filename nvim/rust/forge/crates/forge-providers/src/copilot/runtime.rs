@@ -53,8 +53,14 @@ impl CopilotRuntime {
         }
     }
 
-    pub fn command(&self) -> &[String] {
-        &self.command
+    /// Get the version validated for the retained native process without probing or starting it.
+    pub async fn validated_version(&self) -> Option<String> {
+        match self.client.lock().await.as_ref() {
+            Some(RuntimeClient::Ready { _validation, .. }) => {
+                Some(_validation.version().to_string())
+            }
+            Some(RuntimeClient::Unvalidated(_)) | None => None,
+        }
     }
 
     #[cfg(test)]
@@ -82,14 +88,14 @@ impl CopilotRuntime {
         let mut client = self.client.lock().await;
         if self.closed.load(Ordering::Acquire) || client.is_some() {
             return Err(provider_failure(
-                forge_provider_api::error::ProviderOperation::InitializeSession,
+                forge_provider_api::error::ProviderOperation::SessionOpen,
                 forge_provider_api::error::ProviderFailureKind::Rejected,
             ));
         }
         *client = Some(RuntimeClient::Unvalidated(CopilotClient::new(
             Client::from_streams(reader, writer, workspace).map_err(|_| {
                 provider_failure(
-                    forge_provider_api::error::ProviderOperation::NativeTransport,
+                    forge_provider_api::error::ProviderOperation::InputSubmit,
                     forge_provider_api::error::ProviderFailureKind::Transport,
                 )
             })?,
@@ -105,7 +111,7 @@ impl CopilotRuntime {
         let _initializing = self.initializing.lock().await;
         if self.closed.load(Ordering::Acquire) {
             return Err(provider_failure(
-                forge_provider_api::error::ProviderOperation::InitializeSession,
+                forge_provider_api::error::ProviderOperation::SessionOpen,
                 forge_provider_api::error::ProviderFailureKind::Rejected,
             ));
         }
@@ -135,7 +141,7 @@ impl CopilotRuntime {
                             forge_provider_api::error::ProviderFailureKind::Transport
                         };
                         provider_failure(
-                            forge_provider_api::error::ProviderOperation::InitializeSession,
+                            forge_provider_api::error::ProviderOperation::SessionOpen,
                             kind,
                         )
                     })?);
@@ -143,7 +149,7 @@ impl CopilotRuntime {
                 if self.closed.load(Ordering::Acquire) {
                     started.force_stop();
                     return Err(provider_failure(
-                        forge_provider_api::error::ProviderOperation::InitializeSession,
+                        forge_provider_api::error::ProviderOperation::SessionOpen,
                         forge_provider_api::error::ProviderFailureKind::Rejected,
                     ));
                 }
@@ -164,7 +170,7 @@ impl CopilotRuntime {
             transport.force_stop();
             state.take();
             return Err(provider_failure(
-                forge_provider_api::error::ProviderOperation::InitializeSession,
+                forge_provider_api::error::ProviderOperation::SessionOpen,
                 forge_provider_api::error::ProviderFailureKind::Rejected,
             ));
         }
@@ -202,7 +208,7 @@ impl CopilotRuntime {
             }
             Some(RuntimeClient::Ready { .. }) | Some(RuntimeClient::Unvalidated(_)) | None => {
                 Err(provider_failure(
-                    forge_provider_api::error::ProviderOperation::RecoverSession,
+                    forge_provider_api::error::ProviderOperation::InputReconcile,
                     forge_provider_api::error::ProviderFailureKind::Rejected,
                 ))
             }
@@ -225,7 +231,7 @@ impl CopilotRuntime {
             }
             Some(RuntimeClient::Ready { .. }) | Some(RuntimeClient::Unvalidated(_)) | None => {
                 Err(provider_failure(
-                    forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::error::ProviderOperation::Shutdown,
                     forge_provider_api::error::ProviderFailureKind::Rejected,
                 ))
             }
@@ -253,7 +259,7 @@ impl CopilotRuntime {
         if let Shutdown::Running(task) = &mut *shutdown {
             let result = task.await.unwrap_or_else(|_| {
                 Err(std::sync::Arc::new(provider_failure(
-                    forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::error::ProviderOperation::Shutdown,
                     forge_provider_api::error::ProviderFailureKind::Runtime,
                 )))
             });
@@ -291,7 +297,7 @@ pub(crate) async fn validate_version(
     let requirement = forge_provider_api::version::RuntimeRequirement::new(
         crate::registry::select("copilot").map_err(|_| {
             ProviderError::Failure(forge_provider_api::error::ProviderFailure::new(
-                forge_provider_api::error::ProviderOperation::InitializeSession,
+                forge_provider_api::error::ProviderOperation::SessionOpen,
                 forge_provider_api::error::ProviderFailureKind::Unknown,
             ))
         })?,
@@ -538,6 +544,10 @@ mod tests {
             .clone();
         runtime.shutdown().await.unwrap();
         assert!(client.is_stopped());
+        assert!(
+            client.generation.is_collected(),
+            "successful SDK stop did not publish positive collection proof"
+        );
         assert!(runtime.client.lock().await.is_none());
     }
 
@@ -565,13 +575,13 @@ mod tests {
         *runtime.shutdown.lock().await = Shutdown::Running(tokio::spawn(async move {
             released.await.map_err(|_| {
                 std::sync::Arc::new(provider_failure(
-                    forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::error::ProviderOperation::Shutdown,
                     forge_provider_api::error::ProviderFailureKind::Runtime,
                 ))
             })?;
             collecting.stop().await.map_err(|_| {
                 std::sync::Arc::new(provider_failure(
-                    forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::error::ProviderOperation::Shutdown,
                     forge_provider_api::error::ProviderFailureKind::Transport,
                 ))
             })
@@ -620,7 +630,7 @@ mod tests {
         *runtime.shutdown.lock().await = Shutdown::Running(tokio::spawn(async move {
             released.await.map_err(|_| {
                 std::sync::Arc::new(provider_failure(
-                    forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::error::ProviderOperation::Shutdown,
                     forge_provider_api::error::ProviderFailureKind::Runtime,
                 ))
             })
@@ -654,6 +664,11 @@ mod tests {
                 let original = runtime.client(".").await.unwrap();
                 runtime.client(".").await.unwrap();
                 original.fail_generation(ObservationFailure::Disconnected);
+                assert!(original.generation.is_stopped());
+                assert!(
+                    !original.generation.is_collected(),
+                    "transport failure manufactured SDK collection proof"
+                );
                 let failed = runtime
                     .failed_generation()
                     .await

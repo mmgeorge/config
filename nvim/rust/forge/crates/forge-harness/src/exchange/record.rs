@@ -665,35 +665,6 @@ impl Exchange {
         Ok(())
     }
 
-    pub(crate) fn inherit_native_turn(
-        &mut self,
-        address: crate::provider::TurnAddress,
-        now_ms: i64,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            matches!(self.origin, super::ExchangeOrigin::TaskContinuation { .. })
-                && self.state() == ExchangeState::Running
-                && self.turn.is_empty(),
-            "native invocation binding requires a new running continuation exchange"
-        );
-        anyhow::ensure!(
-            address.scope.owner.session_id
-                == forge_provider_api::SessionId::from(self.session_id.as_str())
-                && address.scope.owner.agent_id
-                    == forge_provider_api::AgentId::from(self.agent_id.as_str())
-                && !address.scope.invocation_id.as_str().is_empty()
-                && !address.thread_id.is_empty()
-                && !address.turn_id.as_str().is_empty(),
-            "native continuation invocation has a different execution owner"
-        );
-        self.turn.push(crate::turn::Turn::new(
-            format!("{}:turn:1", self.id),
-            address,
-            now_ms,
-        ));
-        Ok(())
-    }
-
     /// Resolve an execution address without creating work from a late content event.
     pub fn turn_mut(
         &mut self,

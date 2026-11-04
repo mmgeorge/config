@@ -2,12 +2,9 @@ use super::*;
 use crate::provider::test_support::ProviderTestSession;
 use forge_provider_api::{
     ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation,
-    events::{self, ProviderEventSink, ProviderEventStream},
+    events::{self, ProviderEventSink},
     provider::Provider,
-    session::{
-        BindingId, ContinuationOutcome, InputAcceptance, PromptRequest, RecoveryToken,
-        SessionBinding, SessionRequest, SteeringRequest,
-    },
+    session::{BindingId, InputAcceptance, PromptRequest, SessionBinding, SessionRequest},
     terminal::TerminalSnapshot,
 };
 use std::{
@@ -26,157 +23,148 @@ struct StartupProvider {
     request: StandardMutex<Vec<SessionRequest>>,
     fail: bool,
     starting: AtomicBool,
-    streams: Mutex<HashMap<BindingId, ProviderEventStream>>,
     sinks: Mutex<HashMap<BindingId, ProviderEventSink>>,
 }
 
 #[async_trait::async_trait]
 impl Provider for StartupProvider {
-    async fn initialize_session(
+    async fn session_open(
         &self,
+        context: forge_provider_api::OperationContext,
         request: SessionRequest,
-    ) -> std::result::Result<SessionBinding, ProviderError> {
+    ) -> std::result::Result<forge_provider_api::OpenedSession, ProviderError> {
+        context.check_admission(ProviderOperation::SessionOpen)?;
         self.calls.fetch_add(1, Ordering::AcqRel);
         self.request.lock().unwrap().push(request.clone());
         self.starting.store(true, Ordering::Release);
         self.entered.notify_one();
-        self.release
-            .acquire()
-            .await
-            .map_err(|_| ProviderError::Cancelled)?
-            .forget();
+        tokio::select! {
+            permit = self.release.acquire() => permit.map_err(|_| ProviderError::Cancelled)?.forget(),
+            interruption = context.interrupted() => {
+                self.starting.store(false, Ordering::Release);
+                return Err(interruption.failure(ProviderOperation::SessionOpen, forge_provider_api::ProviderPhase::Preparation, forge_provider_api::FailureDisposition::Unchanged));
+            }
+        }
+        if let Err(error) = context.check_admission(ProviderOperation::SessionOpen) {
+            self.starting.store(false, Ordering::Release);
+            return Err(error);
+        }
         if request
-            .provider_session_id
-            .as_ref()
+            .history
+            .resume_id()
             .is_some_and(|id| id.as_str() == "missing-provider-thread")
         {
             self.starting.store(false, Ordering::Release);
             return Err(startup_failure(
-                ProviderOperation::RecoverSession,
+                ProviderOperation::SessionOpen,
                 ProviderFailureKind::SessionMissing,
             ));
         }
         if self.fail {
             self.starting.store(false, Ordering::Release);
             return Err(startup_failure(
-                ProviderOperation::InitializeSession,
+                ProviderOperation::SessionOpen,
                 ProviderFailureKind::Initialization,
             ));
         }
         let binding_id = BindingId::new(uuid::Uuid::new_v4().to_string()).map_err(|_| {
-            startup_failure(
-                ProviderOperation::InitializeSession,
-                ProviderFailureKind::Unknown,
-            )
+            startup_failure(ProviderOperation::SessionOpen, ProviderFailureKind::Unknown)
         })?;
-        let scope = forge_provider_api::EventScope::SessionOperation {
+        let scope = forge_provider_api::EventScope::Binding {
             owner: request.owner.clone(),
-            operation_id: binding_id.as_str().to_owned(),
         };
         let (sink, stream) = events::channel(binding_id.clone(), scope);
-        self.streams.lock().await.insert(binding_id.clone(), stream);
         self.sinks.lock().await.insert(binding_id.clone(), sink);
         self.starting.store(false, Ordering::Release);
-        Ok(SessionBinding {
-            id: binding_id,
-            provider_session_id: Some(request.provider_session_id.unwrap_or_else(|| {
-                "prepared-provider-thread"
-                    .to_owned()
-                    .try_into()
-                    .expect("fixture provider ID is valid")
-            })),
+        Ok(forge_provider_api::OpenedSession {
+            capabilities: forge_provider_api::capability::CapabilityManifest::from_descriptor(
+                self.descriptor(),
+            ),
+            events: stream,
+            binding: SessionBinding {
+                id: binding_id,
+                provider_session_id: Some(request.history.resume_id().cloned().unwrap_or_else(
+                    || {
+                        "prepared-provider-thread"
+                            .to_owned()
+                            .try_into()
+                            .expect("fixture provider ID is valid")
+                    },
+                )),
+            },
         })
     }
 
-    async fn take_session_events(
+    async fn input_submit(
         &self,
-        binding: &BindingId,
-    ) -> std::result::Result<ProviderEventStream, ProviderError> {
-        self.streams.lock().await.remove(binding).ok_or_else(|| {
-            startup_failure(
-                ProviderOperation::CollectEventReader,
-                ProviderFailureKind::SessionMissing,
-            )
-        })
-    }
-    async fn session_prompt(
-        &self,
+        context: forge_provider_api::OperationContext,
         _: &BindingId,
         _: PromptRequest,
     ) -> std::result::Result<InputAcceptance, ProviderError> {
+        context.check_admission(ProviderOperation::InputSubmit)?;
         Err(startup_failure(
-            ProviderOperation::AdmitInput,
+            ProviderOperation::InputSubmit,
             ProviderFailureKind::Rejected,
         ))
     }
-    async fn continue_session(
+    async fn session_configure(
         &self,
+        context: forge_provider_api::OperationContext,
         _: &BindingId,
-        _: forge_provider_api::ContinuationRequest,
-    ) -> std::result::Result<ContinuationOutcome, ProviderError> {
+        _: forge_provider_api::SessionConfiguration,
+    ) -> std::result::Result<forge_provider_api::ConfiguredSession, ProviderError> {
+        context.check_admission(ProviderOperation::SessionConfigure)?;
         Err(startup_failure(
-            ProviderOperation::AdmitInput,
+            ProviderOperation::SessionConfigure,
             ProviderFailureKind::Rejected,
         ))
     }
-    async fn session_steer(
+    async fn session_close(
         &self,
-        _: &BindingId,
-        _: SteeringRequest,
-    ) -> std::result::Result<forge_provider_api::SteeringAcceptance, ProviderError> {
-        Err(startup_failure(
-            ProviderOperation::AdmitInput,
-            ProviderFailureKind::Rejected,
-        ))
-    }
-    async fn retire_session(&self, binding: &BindingId) -> std::result::Result<(), ProviderError> {
-        self.streams.lock().await.remove(binding);
+        context: forge_provider_api::OperationContext,
+        binding: &BindingId,
+    ) -> std::result::Result<(), ProviderError> {
+        context.check_admission(ProviderOperation::SessionClose)?;
         self.sinks.lock().await.remove(binding);
         Ok(())
     }
-    async fn cancel_session(&self, binding: &BindingId) -> std::result::Result<(), ProviderError> {
-        self.retire_session(binding).await
+    async fn cancel(
+        &self,
+        context: forge_provider_api::OperationContext,
+        _: &BindingId,
+        _: forge_provider_api::CancelRequest,
+    ) -> std::result::Result<forge_provider_api::InvocationSettlement, ProviderError> {
+        context.check_admission(ProviderOperation::Cancel)?;
+        Err(startup_failure(
+            ProviderOperation::Cancel,
+            ProviderFailureKind::Rejected,
+        ))
     }
-    async fn cleanup_execution(&self, _: &BindingId) -> std::result::Result<(), ProviderError> {
+    async fn inspect(
+        &self,
+        context: forge_provider_api::OperationContext,
+        _: forge_provider_api::catalog::WorkspaceContext,
+    ) -> std::result::Result<forge_provider_api::ProviderSetup, ProviderError> {
+        context.check_admission(ProviderOperation::Inspect)?;
+        Err(startup_failure(
+            ProviderOperation::Inspect,
+            ProviderFailureKind::Rejected,
+        ))
+    }
+    async fn shutdown(
+        &self,
+        context: forge_provider_api::OperationContext,
+    ) -> std::result::Result<(), ProviderError> {
+        context.check_admission(ProviderOperation::Shutdown)?;
+        self.sinks.lock().await.clear();
         Ok(())
     }
-    async fn fence_session(&self, binding: &BindingId) -> std::result::Result<(), ProviderError> {
-        if let Some(sink) = self.sinks.lock().await.get(binding) {
-            sink.fail(forge_provider_api::events::EventDeliveryError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::Disconnected,
-            ));
-        }
-        Ok(())
-    }
-    async fn recover_session(
+    async fn terminal_list(
         &self,
-        request: SessionRequest,
-        _: Option<RecoveryToken>,
-    ) -> std::result::Result<SessionBinding, ProviderError> {
-        self.initialize_session(request).await
-    }
-    async fn shutdown(&self) -> std::result::Result<(), ProviderError> {
-        Ok(())
-    }
-    async fn active_session_id_for(
-        &self,
-        _: &forge_provider_api::ExecutionOwner,
-    ) -> std::result::Result<Option<forge_provider_api::ProviderSessionId>, ProviderError> {
-        Ok(None)
-    }
-    fn descriptor(&self) -> forge_provider_api::ProviderDescriptor {
-        forge_providers::registry::descriptor(
-            &forge_providers::registry::nonselectable_id().expect("registry fixture identity"),
-        )
-        .expect("registry fixture descriptor")
-    }
-    async fn has_active_turn(&self, _: &forge_provider_api::ExecutionOwner) -> bool {
-        false
-    }
-    async fn background_terminals(
-        &self,
-        _: forge_provider_api::ProviderCatalogRequest,
+        context: forge_provider_api::OperationContext,
+        _: &BindingId,
     ) -> std::result::Result<TerminalSnapshot, ProviderError> {
+        context.check_admission(ProviderOperation::TerminalList)?;
         Ok(TerminalSnapshot {
             supported: true,
             starting: self.starting.load(Ordering::Acquire),
@@ -186,6 +174,13 @@ impl Provider for StartupProvider {
 }
 
 impl StartupProvider {
+    fn descriptor(&self) -> forge_provider_api::ProviderDescriptor {
+        forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().expect("registry fixture identity"),
+        )
+        .expect("registry fixture descriptor")
+    }
+
     fn new(fail: bool, permits: usize) -> Self {
         Self {
             entered: Notify::new(),
@@ -194,7 +189,6 @@ impl StartupProvider {
             request: StandardMutex::new(Vec::new()),
             fail,
             starting: AtomicBool::new(false),
-            streams: Mutex::new(HashMap::new()),
             sinks: Mutex::new(HashMap::new()),
         }
     }
@@ -216,7 +210,13 @@ async fn provider_startup_is_nonblocking_persists_ready_identity_and_reports_fai
         let broker = HarnessBroker::initialize(initialize)?;
         let controller = SessionController::new(broker)?;
         let provider = Arc::new(StartupProvider::new(fail, 0));
-        let provider_fixture = ProviderTestSession::from_native(provider.clone())?;
+        let provider_fixture = ProviderTestSession::from_registered(
+            forge_providers::registry::RegisteredProvider::new(
+                provider.descriptor(),
+                provider.clone(),
+                None,
+            ),
+        )?;
         *controller.provider.write().unwrap() = provider_fixture.provider_handle();
         controller
             .broker
@@ -338,7 +338,13 @@ async fn provider_startup_recovers_only_missing_empty_sessions() -> Result<()> {
         let broker = HarnessBroker::initialize(serde_json::from_value(parameters)?)?;
         let controller = SessionController::new(broker)?;
         let provider = Arc::new(StartupProvider::new(false, 2));
-        let provider_fixture = ProviderTestSession::from_native(provider.clone())?;
+        let provider_fixture = ProviderTestSession::from_registered(
+            forge_providers::registry::RegisteredProvider::new(
+                provider.descriptor(),
+                provider.clone(),
+                None,
+            ),
+        )?;
         *controller.provider.write().unwrap() = provider_fixture.provider_handle();
         controller
             .broker
@@ -362,7 +368,8 @@ async fn provider_startup_recovers_only_missing_empty_sessions() -> Result<()> {
             assert!(controller.provider_ready().await);
             assert!(
                 provider.request.lock().unwrap()[0]
-                    .provider_session_id
+                    .history
+                    .resume_id()
                     .is_none()
             );
             assert_eq!(
@@ -384,8 +391,9 @@ async fn provider_startup_recovers_only_missing_empty_sessions() -> Result<()> {
             assert!(!controller.provider_ready().await);
             assert_eq!(
                 provider.request.lock().unwrap()[0]
-                    .provider_session_id
-                    .clone()
+                    .history
+                    .resume_id()
+                    .cloned()
                     .map(String::from),
                 session.provider_session_id
             );
@@ -416,7 +424,12 @@ async fn rename_without_exchanges_is_local_and_survives_provider_replacement() -
     let broker = HarnessBroker::initialize(serde_json::from_value(parameters.clone())?)?;
     let controller = SessionController::new(broker)?;
     let provider = Arc::new(StartupProvider::new(false, 0));
-    let provider_fixture = ProviderTestSession::from_native(provider.clone())?;
+    let provider_fixture =
+        ProviderTestSession::from_registered(forge_providers::registry::RegisteredProvider::new(
+            provider.descriptor(),
+            provider.clone(),
+            None,
+        ))?;
     *controller.provider.write().unwrap() = provider_fixture.provider_handle();
     controller
         .broker

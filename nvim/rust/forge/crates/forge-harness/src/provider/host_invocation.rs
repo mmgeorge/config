@@ -17,6 +17,7 @@ use super::{CompletionSlot, ProviderCompletion};
 
 /// Retain host callback authority and effects for exactly one normalized invocation.
 pub(crate) struct HostInvocation {
+    provider_closed: Arc<std::sync::atomic::AtomicBool>,
     binding: BindingId,
     scope: InvocationScope,
     request: super::ProviderRequest,
@@ -81,6 +82,7 @@ impl Drop for RunningHostCall {
 
 /// Own the callback transports and policy leases retained by one invocation.
 pub(crate) struct HostInvocationResources {
+    pub(crate) provider_closed: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) permissions: Arc<crate::permissions::provider::ProviderPermissionContext>,
     pub(crate) directories: Option<super::approval::DirectoryExecution>,
     pub(crate) endpoint: Arc<crate::tools::control_session::ControlSession>,
@@ -101,10 +103,7 @@ impl HostEventRelay {
         binding: BindingId,
         mut events: forge_provider_api::events::ProviderEventStream,
         sender: tokio::sync::mpsc::UnboundedSender<
-            Result<
-                forge_provider_api::ProviderEvent,
-                forge_provider_api::events::EventDeliveryError,
-            >,
+            Result<super::bridge::HostEvent, forge_provider_api::events::EventDeliveryError>,
         >,
     ) -> Self {
         let (stop, mut stopping) = tokio::sync::oneshot::channel();
@@ -119,7 +118,7 @@ impl HostEventRelay {
                     return Err(HostEffectFailure::Retired);
                 }
                 sender
-                    .send(Ok(event.event))
+                    .send(Ok(super::bridge::HostEvent::host(event.event)))
                     .map_err(|_| HostEffectFailure::Retired)
             };
             loop {
@@ -177,10 +176,19 @@ impl HostEventRelay {
 #[derive(Default)]
 struct InvocationState {
     admission: Admission,
+    native_input: NativeInputAdmission,
     pending: usize,
     failure: Option<HostEffectFailure>,
     execution_finished: bool,
     foreground_settled: bool,
+}
+
+/// Distinguish host-only preparation from an input request handed to the adapter.
+#[derive(Clone, Copy, Default)]
+pub(super) enum NativeInputAdmission {
+    #[default]
+    Preparing,
+    Requested,
 }
 
 #[derive(Default)]
@@ -207,6 +215,7 @@ impl HostInvocation {
         resources: HostInvocationResources,
     ) -> Self {
         let HostInvocationResources {
+            provider_closed,
             permissions,
             directories,
             endpoint,
@@ -222,6 +231,7 @@ impl HostInvocation {
         let checkpoint = context.checkpoint.clone();
         let lsp = context.lsp.clone();
         Self {
+            provider_closed,
             binding,
             scope,
             request: request.invocation_snapshot(),
@@ -259,7 +269,7 @@ impl HostInvocation {
     }
 
     /// Cancel this invocation's tools without granting replacement callbacks its authority.
-    pub(crate) fn cancel(&self) {
+    pub(super) fn cancel(&self) -> NativeInputAdmission {
         let permission_failure = self.permissions.retire().err();
         let mut state = self
             .state
@@ -269,6 +279,7 @@ impl HostInvocation {
         if permission_failure.is_some() {
             state.failure.get_or_insert(HostEffectFailure::Uncertain);
         }
+        let native_input = state.native_input;
         drop(state);
         self.executor.cancel();
         self.directories
@@ -281,6 +292,7 @@ impl HostInvocation {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         self.changed.notify_waiters();
+        native_input
     }
 
     /// Keep settled invocations and their late background observers outside foreground cleanup.
@@ -288,6 +300,16 @@ impl HostInvocation {
         self.state
             .lock()
             .map_or(true, |state| !state.foreground_settled)
+    }
+
+    /// Commit the native-call boundary while this exact host invocation still permits admission.
+    pub(crate) fn request_native_input(&self) -> Result<(), ProviderError> {
+        let mut state = self.state.lock().map_err(|_| rejected())?;
+        if !matches!(state.admission, Admission::Open) {
+            return Err(ProviderError::PreparationFailed(Box::new(rejected())));
+        }
+        state.native_input = NativeInputAdmission::Requested;
+        Ok(())
     }
 
     /// Append host-owned skill-read observations after their normalized source event.
@@ -319,6 +341,20 @@ impl HostInvocation {
             return Err(rejected());
         }
         let mut state = self.state.lock().map_err(|_| rejected())?;
+        if self
+            .provider_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ProviderFailure::new(
+                ProviderOperation::InputSubmit,
+                ProviderFailureKind::BindingClosed,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Admission,
+                forge_provider_api::FailureDisposition::Invalidated,
+            )
+            .into());
+        }
         if !matches!(state.admission, Admission::Open) {
             return Err(rejected());
         }
@@ -437,7 +473,7 @@ impl HostInvocation {
             {
                 let owner = owner.ok_or_else(|| {
                     ProviderError::Failure(ProviderFailure::new(
-                        ProviderOperation::HostEffectPublication,
+                        ProviderOperation::InputSubmit,
                         ProviderFailureKind::Rejected,
                     ))
                 })?;
@@ -480,7 +516,7 @@ impl HostInvocation {
                     ProviderError::Cancelled
                 } else {
                     ProviderError::Failure(ProviderFailure::new(
-                        ProviderOperation::HostEffectPublication,
+                        ProviderOperation::InputSubmit,
                         ProviderFailureKind::Unknown,
                     ))
                 }
@@ -491,7 +527,7 @@ impl HostInvocation {
                 if let Some(effect) = &result.invocation {
                     crate::tools::apply_invocation(effect, &mut completion).map_err(|_| {
                         ProviderError::Failure(ProviderFailure::new(
-                            ProviderOperation::HostEffectPublication,
+                            ProviderOperation::InputSubmit,
                             ProviderFailureKind::Rejected,
                         ))
                     })?;
@@ -641,7 +677,7 @@ impl TurnControl for HostInvocation {
     async fn close(&self, scope: &InvocationScope) -> Result<(), ProviderError> {
         self.settle(scope).await.map_err(|_| {
             ProviderError::Failure(ProviderFailure::new(
-                ProviderOperation::HostEffectPublication,
+                ProviderOperation::InputSubmit,
                 ProviderFailureKind::Unknown,
             ))
         })
@@ -664,7 +700,7 @@ impl TurnControl for HostInvocation {
             cancelled: matches!(state.admission, Admission::Cancelled),
             error: completion.control_error.map(|_| {
                 ProviderError::Failure(ProviderFailure::new(
-                    ProviderOperation::HostEffectPublication,
+                    ProviderOperation::InputSubmit,
                     ProviderFailureKind::Rejected,
                 ))
             }),
@@ -683,7 +719,7 @@ impl TurnControl for HostInvocation {
 /// Reject callbacks without exposing host storage or provider implementation state.
 fn rejected() -> ProviderError {
     ProviderError::Failure(ProviderFailure::new(
-        ProviderOperation::HostEffectPublication,
+        ProviderOperation::InputSubmit,
         ProviderFailureKind::Rejected,
     ))
 }

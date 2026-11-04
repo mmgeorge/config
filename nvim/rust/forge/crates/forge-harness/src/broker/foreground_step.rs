@@ -57,9 +57,6 @@ impl HarnessBroker {
             ForegroundSignal::AdmissionFailureCheckpointCompleted(result) => {
                 return self.complete_staged_admission_checkpoint(dispatch, result);
             }
-            ForegroundSignal::RetractionGoalRestored(result) => {
-                return self.complete_foreground_retraction_goal(dispatch, result);
-            }
             ForegroundSignal::FailureAdmissionEventsForwarded(result) => {
                 return self.foreground_failure_admission_events_forwarded(dispatch, result);
             }
@@ -206,7 +203,6 @@ impl HarnessBroker {
                 }
                 if transaction.question_stop_pending
                     || !transaction.steering.pending_deliveries.is_empty()
-                    || transaction.native_goal.is_some()
                     || transaction.observation_publication_in_flight
                     || !transaction.pending_session_observations.is_empty()
                 {
@@ -272,20 +268,10 @@ impl HarnessBroker {
         };
         let action = match signal {
             ForegroundSignal::Native(NativeForegroundSignal::ProviderEvent(observation)) => {
-                if transaction.native_goal.is_some() {
-                    transaction
-                        .pending_session_observations
-                        .push_back(observation);
-                    return Ok(ForegroundAction::Wait);
-                }
-                match self.apply_foreground_observation(transaction, observation)? {
-                    ForegroundEventApplication::Publication(job) => {
-                        Ok(ForegroundAction::Effect(*job))
-                    }
-                    ForegroundEventApplication::NativeGoalContinuation(observation) => {
-                        self.begin_native_goal_transition(transaction, *observation)
-                    }
-                }
+                let delivery = self.apply_foreground_observation(transaction, observation)?;
+                Ok(ForegroundAction::Effect(ForegroundJob::Publication(
+                    delivery,
+                )))
             }
             ForegroundSignal::Native(NativeForegroundSignal::Cancelled)
                 if transaction.collection.is_some() =>
@@ -315,6 +301,10 @@ impl HarnessBroker {
             ForegroundSignal::UserDeliverySettled(input, _flight) => {
                 if let Some(input) = input {
                     transaction.steering.deferred.push_back(input);
+                } else {
+                    // Refresh only after successful delivery can extend native coverage.
+                    // A staged effect cancelled before delivery leaves no later readiness to collect.
+                    transaction.steering.refresh_readiness = true;
                 }
                 Ok(ForegroundAction::Wait)
             }
@@ -377,10 +367,6 @@ impl HarnessBroker {
                     self.prepare_provider_delivery(applied)?,
                 )))
             }
-            ForegroundSignal::FinalCheckpoint(result) => match result {
-                Ok(result) => self.complete_native_goal_checkpoint(transaction, result),
-                Err(error) => self.fail_native_goal_checkpoint(transaction, error),
-            },
             ForegroundSignal::Cleanup(ExecutionCleanup::Idle | ExecutionCleanup::Pending) => {
                 Ok(ForegroundAction::Wait)
             }
@@ -411,10 +397,6 @@ impl HarnessBroker {
                 transaction,
                 anyhow::anyhow!("execution cleanup failed: {message}"),
             ),
-            ForegroundSignal::SessionObservationsReady if transaction.native_goal.is_some() => {
-                self.collect_foreground_observations(transaction)?;
-                Ok(ForegroundAction::Wait)
-            }
             ForegroundSignal::SessionObservationsReady
                 if transaction.observation_publication_in_flight =>
             {
@@ -454,8 +436,7 @@ impl HarnessBroker {
             }
             ForegroundSignal::PublicationDelivered(events) => {
                 admission.events.extend(events);
-                if transaction.native_goal.is_none()
-                    && !transaction.observation_publication_in_flight
+                if !transaction.observation_publication_in_flight
                     && !transaction.pending_session_observations.is_empty()
                 {
                     self.apply_foreground_session_observations(transaction)
@@ -522,10 +503,10 @@ impl HarnessBroker {
             | ForegroundSignal::FailureAdmissionEventsForwarded(_)
             | ForegroundSignal::FailurePublicationCompleted(_)
             | ForegroundSignal::FailureCheckpointCompleted(_)
+            | ForegroundSignal::FinalCheckpoint(_)
             | ForegroundSignal::FailureBaselineCompleted(_)
             | ForegroundSignal::AdmissionCleanupCompleted(_)
             | ForegroundSignal::AdmissionFailureCheckpointCompleted(_)
-            | ForegroundSignal::RetractionGoalRestored(_)
             | ForegroundSignal::PlanMutationCompleted(_)
             | ForegroundSignal::LiveHost(_)
             | ForegroundSignal::PlanSubmissionCompleted(_)
@@ -575,7 +556,11 @@ impl HarnessBroker {
         transaction.question_stop_pending = true;
         Ok(ForegroundAction::Effect(ForegroundJob::QuestionStop {
             provider: self.provider.clone(),
-            session_id: self.session.id.clone(),
+            engine: transaction.engine.clone(),
+            scope: transaction
+                .engine
+                .active_invocation_scope()?
+                .unwrap_or_else(|| transaction.state.scope.clone()),
             fallback: self
                 .session
                 .provider_session_id
@@ -602,20 +587,11 @@ impl HarnessBroker {
                         transaction.state.interaction.id.as_str(),
                     )
             }) {
-                return match self.apply_foreground_observation(transaction, observation)? {
-                    ForegroundEventApplication::Publication(job) => match *job {
-                        ForegroundJob::Publication(delivery) => {
-                            transaction.observation_publication_in_flight = true;
-                            Ok(ForegroundAction::Effect(
-                                ForegroundJob::ObservationPublication(delivery),
-                            ))
-                        }
-                        _ => anyhow::bail!("unexpected observation publication job"),
-                    },
-                    ForegroundEventApplication::NativeGoalContinuation(observation) => {
-                        self.begin_native_goal_transition(transaction, *observation)
-                    }
-                };
+                let delivery = self.apply_foreground_observation(transaction, observation)?;
+                transaction.observation_publication_in_flight = true;
+                return Ok(ForegroundAction::Effect(
+                    ForegroundJob::ObservationPublication(delivery),
+                ));
             }
             let mut events = Vec::new();
             let applied = if matches!(observation, ProviderEvent::Tool { .. }) {

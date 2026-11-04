@@ -23,8 +23,18 @@ impl HarnessBroker {
             execution_id: dispatched_execution_id,
             entry_id,
         } = self.prepare_foreground_provider_context(staged)?;
-        let scope =
-            crate::provider::InvocationScope::new(request.owner()?, staged.exchange.id.clone());
+        let scope = match staged.reservation.as_ref() {
+            Some(reservation) => {
+                anyhow::ensure!(
+                    Arc::ptr_eq(&reservation.engine, &engine),
+                    "prepared continuation execution owner changed"
+                );
+                reservation.scope.clone()
+            }
+            None => {
+                crate::provider::InvocationScope::new(request.owner()?, staged.exchange.id.clone())
+            }
+        };
         let (live_host_sender, live_host_receiver) =
             crate::provider::LiveHostEffectSender::channel();
         if let Some(context) = request.control_context.as_mut() {
@@ -158,6 +168,11 @@ impl HarnessBroker {
         }
 
         // Install host settlement ownership before native callbacks can be dispatched.
+        let submission = request
+            .submission
+            .as_ref()
+            .context("prepared foreground has no input receipt")?;
+        engine.reserve_invocation(scope.clone(), submission.clone())?;
         let active = self
             .parent_input
             .activate(Some(provider_event_sink.clone()))?;
@@ -239,14 +254,12 @@ impl HarnessBroker {
             question_stop_pending: false,
             question_override: None,
             pending_native_ready: None,
+            retraction_boundary: None,
             scan_enabled: execution.is_some(),
             cleanup_open: true,
             execution_open: true,
             _agent_lease: agent_lease,
             _check_lease: check_lease,
-            native_goal: None,
-            pending_goal_effects: Vec::new(),
-            pending_goal_events: Vec::new(),
             pending_session_observations: std::collections::VecDeque::new(),
             observation_publication_in_flight: false,
             finalization: None,

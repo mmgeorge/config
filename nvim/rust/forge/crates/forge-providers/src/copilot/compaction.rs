@@ -200,7 +200,7 @@ impl CompactionMonitor {
             }
             subscription.close().await.map_err(|_| {
                 native_failure(
-                    forge_provider_api::ProviderOperation::CollectEventReader,
+                    forge_provider_api::ProviderOperation::SessionClose,
                     forge_provider_api::ProviderFailureKind::Runtime,
                 )
             })
@@ -222,7 +222,7 @@ impl CompactionMonitor {
         };
         let result = task.await.map_err(|_| {
             native_failure(
-                forge_provider_api::ProviderOperation::CollectEventReader,
+                forge_provider_api::ProviderOperation::SessionClose,
                 forge_provider_api::ProviderFailureKind::Runtime,
             )
         });
@@ -332,9 +332,8 @@ mod tests {
         }
         let (sink, _events) = forge_provider_api::events::channel(
             forge_provider_api::BindingId::new("compaction-failure").unwrap(),
-            forge_provider_api::EventScope::SessionOperation {
+            forge_provider_api::EventScope::Binding {
                 owner: forge_provider_api::ExecutionOwner::root("compaction-failure"),
-                operation_id: "observer".into(),
             },
         );
         let mut monitor = CompactionMonitor::from_stream(
@@ -354,9 +353,8 @@ mod tests {
     async fn compaction_identity_survives_turn_and_subscription_rebinding() {
         let (sink, _stream) = forge_provider_api::events::channel(
             forge_provider_api::BindingId::new("compaction-observer").unwrap(),
-            forge_provider_api::EventScope::SessionOperation {
+            forge_provider_api::EventScope::Binding {
                 owner: forge_provider_api::ExecutionOwner::root("session"),
-                operation_id: "compaction-observer".into(),
             },
         );
         let subscription = CompactionSubscription::new(sink);

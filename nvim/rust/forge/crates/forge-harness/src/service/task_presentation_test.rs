@@ -103,7 +103,6 @@ async fn goal_clear_retires_open_paused_status_without_another_turn() -> Result<
     let task = Task::goal(
         "Retain paused status until cleared".into(),
         Default::default(),
-        false,
         1,
     );
     controller

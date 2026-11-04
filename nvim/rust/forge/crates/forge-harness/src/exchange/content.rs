@@ -549,7 +549,7 @@ impl Exchange {
         if !existing && !matches!(update, crate::provider::ToolUpdate::Requested { .. }) {
             return Err(crate::provider::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::CollectEventReader,
+                    forge_provider_api::ProviderOperation::SessionClose,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 ),
             )

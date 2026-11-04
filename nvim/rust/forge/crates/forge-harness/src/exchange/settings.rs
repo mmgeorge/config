@@ -58,10 +58,6 @@ impl SettingsRun {
                 result = task => SettingsEvent::Reconciled(result.unwrap_or_else(|error| Err(OperationFailure::JobObservationLost(error)))),
                 _ = tokio::time::sleep_until(*deadline) => SettingsEvent::Deadline,
             },
-            SettingsStage::Cleanup { task, deadline } => tokio::select! {
-                result = task => SettingsEvent::Cleaned(result.unwrap_or_else(|error| Err(OperationFailure::JobObservationLost(error)))),
-                _ = tokio::time::sleep_until(*deadline) => SettingsEvent::Deadline,
-            },
             SettingsStage::Preparing(_)
             | SettingsStage::Committing(_)
             | SettingsStage::Finalizing => SettingsEvent::Ready,
@@ -134,19 +130,11 @@ impl SettingsRun {
                     self.validate(broker, purpose, preparation, &[])
                 }
                 SettingsStage::Committing(candidate) => {
-                    let committed = broker
+                    broker
                         .commit_configuration_candidate(candidate)
                         .map_err(OperationFailure::Domain)?;
                     // The common final configuration update publishes the committed snapshot once.
-                    self.stage = match committed.cleanup {
-                        Some(job) => SettingsStage::Cleanup {
-                            task: tokio::spawn(async move {
-                                job.run().await.map_err(OperationFailure::Domain)
-                            }),
-                            deadline: deadline(60),
-                        },
-                        None => SettingsStage::Finalizing,
-                    };
+                    self.stage = SettingsStage::Finalizing;
                     Ok(SettingsProgress::Waiting)
                 }
                 SettingsStage::Finalizing => {
@@ -177,7 +165,6 @@ impl SettingsRun {
                 SettingsStage::Catalog { .. }
                 | SettingsStage::AwaitingCollection
                 | SettingsStage::Reconcile { .. }
-                | SettingsStage::Cleanup { .. }
                 | SettingsStage::Consumed => {
                     unreachable!("only synchronous settings stages produce ready facts")
                 }
@@ -212,20 +199,6 @@ impl SettingsRun {
                 self.stage = SettingsStage::Committing(candidate);
                 Ok(SettingsProgress::Waiting)
             }
-            SettingsEvent::Cleaned(result) => {
-                let SettingsStage::Cleanup {
-                    task: _,
-                    deadline: _,
-                } = stage
-                else {
-                    unreachable!("cleanup facts belong to the retained cleanup task")
-                };
-                broker
-                    .commit_configuration_reconcile(result?)
-                    .map_err(OperationFailure::Domain)?;
-                self.stage = SettingsStage::Finalizing;
-                Ok(SettingsProgress::Waiting)
-            }
             SettingsEvent::Deadline => {
                 unreachable!("deadline handling preserves the still-owned task above")
             }
@@ -250,12 +223,6 @@ impl SettingsRun {
                 task, candidate, ..
             } => Some(tokio::spawn(async move {
                 let _candidate = candidate;
-                match task.await {
-                    Ok(Ok(_)) => Ok(()),
-                    Ok(Err(_)) | Err(_) => Err(crate::provider::ProviderError::DeliveryUncertain),
-                }
-            })),
-            SettingsStage::Cleanup { task, .. } => Some(tokio::spawn(async move {
                 match task.await {
                     Ok(Ok(_)) => Ok(()),
                     Ok(Err(_)) | Err(_) => Err(crate::provider::ProviderError::DeliveryUncertain),
@@ -316,7 +283,7 @@ impl SettingsRun {
                     job.run().await.map_err(|error| {
                         OperationFailure::Reconciliation(
                             crate::provider::lifecycle_error::classify(
-                                forge_provider_api::ProviderOperation::ReconcileSettings,
+                                forge_provider_api::ProviderOperation::SessionConfigure,
                                 error,
                             ),
                         )
@@ -341,7 +308,6 @@ pub(super) enum SettingsEvent {
     Ready,
     Catalog(Result<ConfigurationCatalogResult, OperationFailure>),
     Reconciled(Result<ConfigurationReconcileResult, OperationFailure>),
-    Cleaned(Result<ConfigurationReconcileResult, OperationFailure>),
     Deadline,
 }
 
@@ -352,7 +318,6 @@ impl SettingsEvent {
             Self::Ready => "settings_ready",
             Self::Catalog(_) => "settings_catalog_completed",
             Self::Reconciled(_) => "settings_reconcile_completed",
-            Self::Cleaned(_) => "settings_cleanup_completed",
             Self::Deadline => "settings_deadline",
         }
     }
@@ -392,10 +357,6 @@ enum SettingsStage {
         deadline: tokio::time::Instant,
     },
     Committing(Box<ConfigurationCandidate>),
-    Cleanup {
-        task: tokio::task::JoinHandle<Result<ConfigurationReconcileResult, OperationFailure>>,
-        deadline: tokio::time::Instant,
-    },
     Finalizing,
     Consumed,
 }

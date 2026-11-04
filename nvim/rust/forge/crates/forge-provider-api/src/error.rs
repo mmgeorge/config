@@ -1,61 +1,184 @@
 use crate::{events, retry};
 
 /// Identify the normalized operation whose provider boundary failed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderOperation {
-    InitializeSession,
-    InspectRuntime,
-    GenerateText,
-    CompactSession,
-    ResetSession,
-    FenceSession,
-    CancelSession,
-    CleanupExecution,
-    Shutdown,
-    ReconcileSettings,
-    CollectEventReader,
-    CollectNativeRuntime,
-    RetireSession,
-    NativeTransport,
-    AdmitInput,
+    /// Open a fresh live generation atomically with its event reader.
+    SessionOpen,
+    /// Apply complete settled session defaults.
+    SessionConfigure,
+    /// Create separate history at a stable boundary.
+    SessionFork,
+    /// Compact settled native history.
+    SessionCompact,
+    /// Revoke and collect an entire binding.
+    SessionClose,
+    /// Interrupt and settle one exact invocation.
+    Cancel,
+    /// Admit a journaled input into idle execution.
+    InputSubmit,
+    /// Deliver input into an exact active invocation.
+    InputSteer,
+    /// Observe stored native delivery evidence.
+    InputReconcile,
+    /// Retract an explicitly authorized exact cancelled input.
+    InputRetract,
+    /// Discover installation and runtime support without mutation.
+    Inspect,
+    /// Execute explicitly selected credential setup.
     Authenticate,
-    RecoverSession,
-    HostEffectPublication,
-    RecordInput,
+    /// Collect all provider-owned work and shared runtimes.
+    Shutdown,
+    /// Read normalized opaque model choices.
+    ModelList,
+    /// Read native skill definitions and state.
+    SkillList,
+    /// Read configured or observed MCP state.
+    McpList,
+    /// Read shells owned by one exact binding.
+    TerminalList,
+    /// Stop one shell without interrupting unrelated execution.
+    TerminalTerminate,
 }
 
 /// Classify a provider failure without carrying its native code, payload, or message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFailureKind {
+    /// The host explicitly cancelled the addressed operation.
+    Cancelled,
+    /// A retained operation identity was reused with a different immutable context or request.
+    OperationConflict,
+    /// The sole owned open result was already transferred to its original consumer.
+    OperationResultTaken,
+    /// Required credentials are absent, invalid, or no longer authenticated.
     Authentication,
+    /// The requested action is outside the admitted authority.
     Authorization,
+    /// Native context capacity prevents the requested operation.
     ContextLimit,
+    /// Runtime or session preparation could not be established.
     Initialization,
+    /// The requested normalized policy cannot be enforced.
     Policy,
+    /// Native evidence violated the adapter protocol or normalized contract.
     Protocol,
+    /// The provider account exhausted a reported usage allowance.
     Quota,
+    /// The provider temporarily limited the request rate.
     RateLimited,
+    /// The provider positively rejected the operation; effect disposition remains explicit.
     Rejected,
+    /// The native runtime failed outside a more specific normalized category.
     Runtime,
+    /// The exact requested history or binding cannot be found.
     SessionMissing,
+    /// The native communication channel failed.
     Transport,
+    /// A bounded wait elapsed; this category alone does not prove non-consumption.
     Timeout,
+    /// The adapter cannot classify the native cause more precisely.
     Unknown,
+    /// Required journal or receipt persistence failed.
     Persistence,
+    /// The addressed binding is permanently closed.
+    BindingClosed,
+    /// The binding lost authority after an unrecoverable partial mutation or observation failure.
+    BindingInvalidated,
+    /// Settled history is required but execution remains active.
+    ExecutionActive,
+    /// Native terminal evidence is required before collection or history mutation.
+    ExecutionNotTerminal,
+    /// The target invocation does not own the addressed native work.
+    WrongInvocation,
+    /// An exact history position no longer matches the requested mutation.
+    HistoryConflict,
+    /// Surviving resources prevent safe configuration replacement.
+    ResourceConflict,
 }
 
-/// Preserve a normalized operation and failure class after adapter conversion.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Identify a lifecycle subphase independently of the requested operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderPhase {
+    /// Validate identity and authority before native mutation.
+    Admission,
+    /// Prepare or replace private transport resources.
+    Preparation,
+    /// Hand work to the native transport.
+    Dispatch,
+    /// Observe native acknowledgement and lifecycle evidence.
+    Observation,
+    /// Request native interruption.
+    Interruption,
+    /// Join foreground workers and callbacks.
+    Collection,
+    /// Persist required delivery evidence.
+    Persistence,
+    /// Release an entire binding or shared runtime.
+    Close,
+}
+
+/// Preserve what a failed operation proves about binding authority and native effects.
+/// The failure category alone never establishes replay eligibility. Use this disposition
+/// together with exact delivery/history evidence; Uncertain and Invalidated forbid blind replay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureDisposition {
+    /// Native mutation did not occur and the binding remains usable.
+    Unchanged,
+    /// Native delivery or mutation may have occurred; automatic replay is forbidden.
+    Uncertain,
+    /// Callback authority is revoked and collection ownership remains retained.
+    Invalidated,
+    /// Required collection succeeded and the addressed binding is closed.
+    Closed,
+}
+
+/// Own a safe normalized cause, actual requested operation, lifecycle phase, and effect disposition.
+/// This value excludes native payloads and diagnostics. Reattributing an operation must preserve
+/// the cause, phase, and effects; independent cleanup causes retain their own operation tags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct ProviderFailure {
     operation: ProviderOperation,
     kind: ProviderFailureKind,
+    phase: ProviderPhase,
+    disposition: FailureDisposition,
 }
 
 impl ProviderFailure {
-    /// Create a provider-neutral operation failure after native classification.
+    /// Create a rejection before native effects, with Admission/Unchanged evidence.
+    /// Classify every later failure with at_phase; this constructor never proves that a
+    /// request already handed to native transport was not consumed.
     pub const fn new(operation: ProviderOperation, kind: ProviderFailureKind) -> Self {
-        Self { operation, kind }
+        Self {
+            operation,
+            kind,
+            phase: ProviderPhase::Admission,
+            disposition: FailureDisposition::Unchanged,
+        }
+    }
+
+    /// Classify the failed phase and retained binding authority explicitly.
+    pub const fn at_phase(mut self, phase: ProviderPhase, disposition: FailureDisposition) -> Self {
+        self.phase = phase;
+        self.disposition = disposition;
+        self
+    }
+    /// Attribute a normalized cause to the public operation without changing its phase or effects.
+    pub const fn for_operation(mut self, operation: ProviderOperation) -> Self {
+        self.operation = operation;
+        self
+    }
+
+    /// Get the lifecycle phase which failed.
+    pub const fn phase(self) -> ProviderPhase {
+        self.phase
+    }
+    /// Get the usable or invalidated binding disposition after failure.
+    pub const fn disposition(self) -> FailureDisposition {
+        self.disposition
     }
 
     /// Get the failed normalized provider operation.
@@ -103,7 +226,9 @@ impl std::error::Error for TurnCancelled {}
 /// Preserve a failed cleanup phase without flattening its typed failure category.
 #[derive(Clone, Debug)]
 pub enum CleanupFailure {
+    /// A bounded cleanup wait ended without proving collection completed.
     TimedOut,
+    /// The attempted cleanup phase produced an independently typed cause.
     Failed(Box<ProviderError>),
 }
 
@@ -223,36 +348,82 @@ impl std::error::Error for ObservationCleanup {
     }
 }
 
-/// Preserve normalized provider failure semantics across return and stream boundaries.
+/// Own normalized failure evidence across return and event boundaries.
+/// Combined and preparation wrappers preserve independently failed cleanup phases. Neither
+/// rendering nor operation reattribution may turn uncertain delivery into rejection or flatten
+/// a scoped native cleanup failure into an unstructured string.
 #[derive(Clone, Debug)]
 pub enum ProviderError {
+    /// A normalized identity, coverage, or lifecycle invariant was rejected.
     Contract(crate::lifecycle::LifecycleError),
+    /// The actual requested operation failed with a typed cause, phase, and disposition.
     Failure(ProviderFailure),
+    /// The requested operation failed together with independently scoped cleanup work.
     Combined {
+        /// Original requested-operation cause.
         primary: Box<ProviderError>,
+        /// Independent additional causes in observation order; operation tags remain unchanged.
         secondary: Vec<ProviderError>,
     },
+    /// Observation failed and each attempted cleanup phase has a retained typed report.
     Cleanup(std::sync::Arc<ObservationCleanup>),
+    /// An optional operation or mode was rejected before native mutation.
     Unsupported(crate::capability::UnsupportedCapability),
+    /// Reliable native observation ended without proving terminal completion.
     Observation(crate::lifecycle::ObservationFailure),
+    /// The selected runtime does not satisfy the adapter version contract.
     RuntimeVersion(crate::version::RuntimeVersionError),
+    /// Native preparation failed before its requested execution could be admitted.
     PreparationFailed(Box<ProviderError>),
+    /// Preparation failed and required preparation cleanup failed independently.
     PreparationCleanup {
+        /// Preparation cause attributed to the requested operation.
         cause: Box<ProviderError>,
+        /// Independent cleanup cause whose own operation, phase, and disposition remain intact.
         cleanup: Box<ProviderError>,
     },
-    /// The provider proved non-consumption and issued a single-use continuation capability.
-    NotConsumed {
-        continuation: crate::ContinuationToken,
-    },
+    /// Positive final evidence proves this attempt was not consumed; only the host may retry.
+    NotConsumed,
     /// Dispatch may have occurred, but acceptance was not established.
     DeliveryUncertain,
+    /// Host cancellation was observed; independent cleanup failure must remain separate.
     Cancelled,
+    /// Native terminal failure carries normalized evidence for host-owned retry policy.
     Retryable(Box<retry::RetryableFailure>),
+    /// Normalized event delivery failed and its typed transport/observation cause is retained.
     Delivery(events::EventDeliveryError),
 }
 
 impl ProviderError {
+    /// Attribute the primary normalized cause to the operation actually requested.
+    /// Preserve independent cleanup causes and all non-normalized typed evidence unchanged.
+    pub fn for_operation(self, operation: ProviderOperation) -> Self {
+        match self {
+            Self::Failure(failure) => Self::Failure(failure.for_operation(operation)),
+            Self::Combined { primary, secondary } => Self::Combined {
+                primary: Box::new(primary.for_operation(operation)),
+                secondary,
+            },
+            Self::PreparationFailed(cause) => {
+                Self::PreparationFailed(Box::new(cause.for_operation(operation)))
+            }
+            Self::PreparationCleanup { cause, cleanup } => Self::PreparationCleanup {
+                cause: Box::new(cause.for_operation(operation)),
+                cleanup,
+            },
+            unchanged @ (Self::Contract(_)
+            | Self::Cleanup(_)
+            | Self::Unsupported(_)
+            | Self::Observation(_)
+            | Self::RuntimeVersion(_)
+            | Self::NotConsumed
+            | Self::DeliveryUncertain
+            | Self::Cancelled
+            | Self::Retryable(_)
+            | Self::Delivery(_)) => unchanged,
+        }
+    }
+
     /// Identify cancellation without hiding an independent cleanup or transport failure.
     pub fn is_clean_cancellation(&self) -> bool {
         match self {
@@ -268,7 +439,7 @@ impl ProviderError {
             | Self::Observation(_)
             | Self::RuntimeVersion(_)
             | Self::PreparationCleanup { .. }
-            | Self::NotConsumed { .. }
+            | Self::NotConsumed
             | Self::DeliveryUncertain
             | Self::Retryable(_)
             | Self::Delivery(_) => false,
@@ -299,9 +470,7 @@ impl std::fmt::Display for ProviderError {
                 formatter,
                 "provider preparation failed: {cause}; cleanup failed: {cleanup}"
             ),
-            Self::NotConsumed { .. } => {
-                formatter.write_str("provider proved input was not consumed")
-            }
+            Self::NotConsumed => formatter.write_str("provider proved input was not consumed"),
             Self::DeliveryUncertain => formatter.write_str("provider input delivery is uncertain"),
             Self::Cancelled => formatter.write_str("provider execution cancelled"),
             Self::Retryable(error) => std::fmt::Display::fmt(error, formatter),
@@ -324,7 +493,7 @@ impl std::error::Error for ProviderError {
             Self::PreparationCleanup { cause, .. } => Some(cause.as_ref()),
             Self::Retryable(error) => Some(error.as_ref()),
             Self::Delivery(error) => Some(error),
-            Self::NotConsumed { .. } | Self::DeliveryUncertain | Self::Cancelled => None,
+            Self::NotConsumed | Self::DeliveryUncertain | Self::Cancelled => None,
         }
     }
 }
@@ -365,7 +534,7 @@ impl From<crate::execution::ExecutionOwnerError> for ProviderError {
 impl From<crate::session::RecoveryTokenError> for ProviderError {
     fn from(_error: crate::session::RecoveryTokenError) -> Self {
         Self::Failure(ProviderFailure::new(
-            ProviderOperation::RecoverSession,
+            ProviderOperation::SessionOpen,
             ProviderFailureKind::Rejected,
         ))
     }
@@ -381,6 +550,65 @@ impl From<TurnCancelled> for ProviderError {
 mod cleanup_tests {
     use super::{CleanupFailure, ObservationCleanup, ProviderError};
     use crate::lifecycle::ObservationFailure;
+
+    /// Reattribute only the requested cause while retaining independent cleanup operations and phases.
+    #[test]
+    fn operation_attribution_preserves_primary_phase_and_independent_cleanup_causes() {
+        use super::{
+            FailureDisposition, ProviderFailure, ProviderFailureKind, ProviderOperation,
+            ProviderPhase,
+        };
+        let primary = ProviderFailure::new(
+            ProviderOperation::InputSubmit,
+            ProviderFailureKind::Persistence,
+        )
+        .at_phase(ProviderPhase::Persistence, FailureDisposition::Uncertain);
+        let nested_cleanup = ProviderFailure::new(
+            ProviderOperation::SessionClose,
+            ProviderFailureKind::Transport,
+        )
+        .at_phase(ProviderPhase::Close, FailureDisposition::Invalidated);
+        let independent =
+            ProviderFailure::new(ProviderOperation::Cancel, ProviderFailureKind::Timeout)
+                .at_phase(ProviderPhase::Collection, FailureDisposition::Invalidated);
+        let error = ProviderError::Combined {
+            primary: Box::new(ProviderError::PreparationFailed(Box::new(
+                ProviderError::PreparationCleanup {
+                    cause: Box::new(ProviderError::Failure(primary)),
+                    cleanup: Box::new(ProviderError::Failure(nested_cleanup)),
+                },
+            ))),
+            secondary: vec![
+                ProviderError::Failure(independent),
+                ProviderError::DeliveryUncertain,
+            ],
+        }
+        .for_operation(ProviderOperation::InputSteer);
+        let ProviderError::Combined {
+            primary: attributed,
+            secondary,
+        } = error
+        else {
+            panic!("combined cause was flattened");
+        };
+        let ProviderError::PreparationFailed(preparation) = *attributed else {
+            panic!("preparation cause was flattened");
+        };
+        let ProviderError::PreparationCleanup { cause, cleanup } = *preparation else {
+            panic!("independent cleanup was flattened");
+        };
+        let ProviderError::Failure(attributed) = *cause else {
+            panic!("normalized primary cause was lost");
+        };
+        assert_eq!(attributed.operation(), ProviderOperation::InputSteer);
+        assert_eq!(attributed.kind(), primary.kind());
+        assert_eq!(attributed.phase(), ProviderPhase::Persistence);
+        assert_eq!(attributed.disposition(), FailureDisposition::Uncertain);
+        assert!(matches!(*cleanup, ProviderError::Failure(failure) if failure == nested_cleanup));
+        assert!(
+            matches!(secondary.as_slice(), [ProviderError::Failure(failure), ProviderError::DeliveryUncertain] if *failure == independent)
+        );
+    }
 
     #[test]
     fn cleanup_retains_each_failed_phase() {
@@ -414,11 +642,11 @@ mod cleanup_tests {
                 ObservationFailure::Disconnected,
                 Some(CleanupFailure::TimedOut),
                 Some(failure(
-                    ProviderOperation::CancelSession,
+                    ProviderOperation::Cancel,
                     ProviderFailureKind::Transport,
                 )),
                 Some(failure(
-                    ProviderOperation::CollectNativeRuntime,
+                    ProviderOperation::SessionClose,
                     ProviderFailureKind::Runtime,
                 )),
             )
@@ -426,7 +654,7 @@ mod cleanup_tests {
         );
         let mut report = first.clone();
         std::sync::Arc::make_mut(&mut report).record_collection_failure(failure(
-            ProviderOperation::CollectEventReader,
+            ProviderOperation::SessionClose,
             ProviderFailureKind::Protocol,
         ));
         let report = report

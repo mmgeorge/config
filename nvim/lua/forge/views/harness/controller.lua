@@ -579,6 +579,9 @@ end
 
 
 
+---Refresh canonical session state without interpreting command receipts as snapshots.
+M.synchronize_state = synchronize_state
+
 local function on_event(event, payload)
   local state = harness_state()
   if event == "publication_confirmed" then

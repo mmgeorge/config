@@ -39,6 +39,7 @@ junction = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }

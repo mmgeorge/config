@@ -37,7 +37,7 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
     let first = create_provider(provider, &data, &request)?;
     let mut missing = request.clone();
     missing.provider_session_id = Some(uuid::Uuid::new_v4().to_string().try_into()?);
-    let unavailable = first.initialize_session(missing).await;
+    let unavailable = first.session_open(missing).await;
     eprintln!("{provider}: missing history result {unavailable:?}");
     assert!(
         unavailable.is_err(),
@@ -50,10 +50,10 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
         Some(forge_harness::provider::ProviderError::Failure(failure))
             if failure.kind() == forge_provider_api::ProviderFailureKind::SessionMissing
     ));
-    let prepared = first.initialize_session(request.clone()).await;
+    let prepared = first.session_open(request.clone()).await;
     if let Ok(Some(thread)) = &prepared {
         assert_eq!(
-            first.initialize_session(request.clone()).await?.as_ref(),
+            first.session_open(request.clone()).await?.as_ref(),
             Some(thread)
         );
     }
@@ -64,18 +64,13 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
     request.provider_session_id = None;
     let second = create_provider(provider, &data, &request)?;
     let result: Result<forge_provider_api::ProviderSessionId> = async {
-        let prepared = second.initialize_session(request.clone()).await?.context("missing prepared thread")?;
+        let prepared = second.session_open(request.clone()).await?.context("missing prepared thread")?;
         assert_ne!(prepared, thread);
         let mut inventory = catalog.clone();
         inventory.access = request.access.clone();
         inventory.provider_session_id = Some(prepared.clone());
-        second.as_provider().mcp_list(inventory.clone()).await?;
-        second.as_provider().background_terminals(inventory.clone()).await?;
-        if provider == "codex" {
-            let mut goal_request = request.clone();
-            goal_request.provider_session_id = Some(prepared.clone());
-            second.as_provider().goal_status(goal_request, forge_harness::provider::NativeGoalUpdate::Absent).await?;
-        }
+        second.as_provider().mcp_list(forge_provider_api::McpQuery::Observed(second.as_provider().query_context(&inventory).await?)).await?;
+        second.as_provider().terminal_list(inventory.clone()).await?;
         // Exercise the live binding independently of a caller-supplied identity.
         request.provider_session_id = None;
         request.input = ProviderInput::from_text("Remember the exact token FORGE-RESUME-72931. Reply only with that token. Do not use any tools.");
@@ -89,32 +84,19 @@ async fn session_lifecycle(provider: &str) -> Result<()> {
         let warm = second.session_prompt_and_collect(request.clone()).await?;
         assert_eq!(warm.completion.provider_session_id.as_ref().map(|id| id.as_str()), Some(conversation.as_str()));
         assert_token(&warm.event);
-        second.as_provider().background_terminals(inventory).await?;
-        if provider == "codex" {
-            second.as_provider().goal_status(request.clone(), forge_harness::provider::native_goal_update("Verify resumed thread".into(), forge_harness::goal::GoalState::Active)).await?;
-            second.as_provider().goal_status(request.clone(), forge_harness::provider::NativeGoalUpdate::Absent).await?;
-        }
+        second.as_provider().terminal_list(inventory).await?;
         Ok(conversation)
     }.await;
     second.as_provider().shutdown().await?;
     request.provider_session_id = Some(result?);
     let third = create_provider(provider, &data, &request)?;
     let resumed: Result<()> = async {
-        let resumed = third.initialize_session(request.clone()).await?;
+        let resumed = third.session_open(request.clone()).await?;
         assert_eq!(resumed, request.provider_session_id);
         let mut inventory = catalog.clone();
         inventory.access = request.access.clone();
         inventory.provider_session_id = resumed;
-        third.as_provider().background_terminals(inventory).await?;
-        if provider == "codex" {
-            third
-                .as_provider()
-                .goal_status(
-                    request.clone(),
-                    forge_harness::provider::NativeGoalUpdate::Absent,
-                )
-                .await?;
-        }
+        third.as_provider().terminal_list(inventory).await?;
         assert_token(&third.session_prompt_and_collect(request).await?.event);
         Ok(())
     }

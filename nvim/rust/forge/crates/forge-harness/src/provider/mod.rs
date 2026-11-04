@@ -9,6 +9,7 @@ pub use forge_provider_api::compaction;
 pub type ProviderCompactionRequest =
     forge_provider_api::compaction::ProviderCompactionRequest<ProviderRequest>;
 mod bridge;
+pub(crate) use bridge::{ConfigureReceipt, ConfiguredBindingReceipt};
 mod completion;
 mod live_host_effect;
 pub(crate) use live_host_effect::{LiveHostCommit, LiveHostEffect, LiveHostEffectSender};
@@ -18,6 +19,7 @@ mod host_invocation;
 pub(crate) mod lifecycle_error;
 pub(crate) mod mcp;
 pub mod mock_response;
+pub(crate) mod operation;
 mod prompt;
 pub(crate) mod retry;
 pub(crate) use completion::{CompletionSlot, HostEffectBatch};
@@ -28,8 +30,8 @@ pub use forge_provider_api::ServiceTier;
 pub use forge_provider_api::submission::{DispatchObserver, DispatchTracker};
 pub(crate) mod text_generation;
 pub use catalog::{
-    CatalogCapability, CatalogMutation, McpDefinition, McpStatus, McpToolDefinition,
-    ProviderCatalogRequest, ProviderInput, ResourceScope, SkillDefinition,
+    CatalogCapability, McpDefinition, McpStatus, McpToolDefinition, ProviderCatalogRequest,
+    ProviderInput, ResourceScope, SkillDefinition,
 };
 pub use execution::{
     AgentId, EventScope, ExchangeId, ExecutionOwner, InvocationId, InvocationScope, MessageAddress,
@@ -63,6 +65,6 @@ pub use forge_provider_api::tool::ToolActivityKind;
 pub use forge_provider_api::error::ProviderError;
 pub use forge_provider_api::event::*;
 
-pub use forge_provider_api::{NativeGoalStatus, NativeGoalUpdate, PromptMode};
+pub use forge_provider_api::PromptMode;
 
 pub use forge_provider_api::completion::TurnMetrics;

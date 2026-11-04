@@ -50,10 +50,14 @@ impl ProviderTestSession {
     }
 
     /// Wrap a normalized native provider in the production bridge for isolated tests.
-    pub fn from_native<P>(native: Arc<P>) -> anyhow::Result<Self>
-    where
-        P: forge_provider_api::provider::Provider + 'static,
-    {
+    pub fn from_native(native: Arc<super::fixture::EventFixtureProvider>) -> anyhow::Result<Self> {
+        Self::from_registered(native.registration())
+    }
+
+    /// Attach an adapter and explicit immutable metadata without reconstructing its descriptor.
+    pub fn from_registered(
+        registration: forge_providers::registry::RegisteredProvider,
+    ) -> anyhow::Result<Self> {
         let directory = Arc::new(tempfile::tempdir()?);
         let permission_store = Arc::new(std::sync::RwLock::new(
             harness::permissions::store::PermissionStore::load(
@@ -65,9 +69,8 @@ impl ProviderTestSession {
             permission_store,
         ));
         let trace = Arc::new(harness::trace::TraceStore::open(directory.path())?);
-        let native: Arc<dyn forge_provider_api::provider::Provider> = native;
         let provider = Arc::new(harness::provider::Provider::new(
-            native,
+            registration,
             permissions,
             trace.clone(),
             directory.path().to_path_buf(),
@@ -97,6 +100,17 @@ impl ProviderTestSession {
         })
     }
 
+    /// Read the exact cached active invocation without initializing or polling a provider binding.
+    pub(crate) fn active_invocation_scope(
+        &self,
+        owner: &ExecutionOwner,
+    ) -> Result<Option<InvocationScope>, ProviderError> {
+        match self.registry.existing_owner(owner)? {
+            Some(engine) => engine.active_invocation_scope(),
+            None => Ok(None),
+        }
+    }
+
     /// Get the production provider interface for journal reconciliation.
     pub fn as_provider(&self) -> &harness::provider::Provider {
         self.provider.as_ref()
@@ -108,12 +122,12 @@ impl ProviderTestSession {
     }
 
     /// Install session observation before native initialization can emit updates.
-    pub async fn initialize_session(
+    pub async fn session_open(
         &self,
         request: ProviderRequest,
     ) -> anyhow::Result<Option<forge_provider_api::ProviderSessionId>> {
         self.owner(request.owner()?).await?;
-        Ok(self.provider.initialize_session(request).await?)
+        Ok(self.provider.session_open(request).await?)
     }
 
     /// Steer through the same owner and reducer used for complete-result collection.
@@ -141,7 +155,7 @@ impl ProviderTestSession {
         if scope.owner != owner {
             return Err(ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::AdmitInput,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 ),
             ));
@@ -159,18 +173,37 @@ impl ProviderTestSession {
                 .await
                 .map_err(|error| {
                     harness::provider::lifecycle_error::classify(
-                        forge_provider_api::ProviderOperation::AdmitInput,
+                        forge_provider_api::ProviderOperation::InputSubmit,
                         error,
                     )
                 })
         });
         let mut observed = Vec::new();
         let mut stream_open = true;
+        // The retry owner admits fresh invocations in this exchange. Preserve each exact
+        // scope when mirroring host output; a native sink never acquires broader authority.
+        let relay_sink =
+            |event: &ProviderEvent| -> Result<Option<ProviderEventSink>, ProviderError> {
+                let Some(sink) = &sink else {
+                    return Ok(None);
+                };
+                if matches!(event, ProviderEvent::Execution { .. }) {
+                    return Ok(None);
+                }
+                let event_scope = event.scope();
+                if &event_scope == sink.scope() {
+                    return Ok(Some(sink.clone()));
+                }
+                match event_scope.invocation() {
+                    Some(invocation) => Ok(Some(sink.successor_invocation_sink(invocation)?)),
+                    None => Ok(Some(sink.clone())),
+                }
+            };
         loop {
             tokio::select! {
                 result = &mut completion => {
                     while let Ok(event) = stream.try_recv() {
-                        if let Some(sink) = &sink && !matches!(event, ProviderEvent::Execution { .. }) {
+                        if let Some(sink) = relay_sink(&event)? {
                             sink.send_wait(event.clone()).await?;
                         }
                         observed.push(event);
@@ -179,7 +212,7 @@ impl ProviderTestSession {
                 }
                 event = stream.recv(), if stream_open => {
                     let Some(event) = event? else { stream_open = false; continue; };
-                    if let Some(sink) = &sink && !matches!(event, ProviderEvent::Execution { .. }) {
+                    if let Some(sink) = relay_sink(&event)? {
                         sink.send_wait(event.clone()).await?;
                     }
                     observed.push(event);
@@ -294,7 +327,7 @@ impl ProviderTestSession {
         if scope.owner != owner {
             return Err(ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::AdmitInput,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 ),
             ));
@@ -402,12 +435,12 @@ impl ProviderTestExt for ProviderTestSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_provider_api::lifecycle::ExecutionUpdate;
     use harness::provider::{PromptMode, ProviderInput, ProviderLaunch, SteeringInput};
 
-    /// Keep the production observer active after a complete-result waiter returns.
+    /// Reject steering after collection instead of starting an unowned successor invocation.
     #[tokio::test]
-    async fn collected_result_retains_idle_continuation_observation() -> anyhow::Result<()> {
+    async fn collected_result_rejects_late_steering_without_starting_successor()
+    -> anyhow::Result<()> {
         let workspace = tempfile::tempdir()?;
         let trace = Arc::new(harness::trace::TraceStore::open(workspace.path())?);
         let provider: Arc<harness::provider::Provider> = harness::provider::build(
@@ -455,46 +488,19 @@ mod tests {
             forge_providers::registry::nonselectable_id()
                 .expect("registry supplies a nonselectable fixture identity"),
         )?;
-        fixture
-            .steer_current(
-                owner.clone(),
-                SteeringInput::User {
-                    text: "continue".into(),
-                    attachments: Vec::new(),
-                    submission: Some(receipt),
-                },
-            )
-            .await?;
-        let execution = fixture.owner(owner).await?;
-        let scope = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let scope =
-                    execution
-                        .idle
-                        .lock()
-                        .await
-                        .events
-                        .iter()
-                        .find_map(|event| match event {
-                            ProviderEvent::Execution { observation }
-                                if matches!(
-                                    observation.update(),
-                                    ExecutionUpdate::Finished { .. }
-                                ) =>
-                            {
-                                Some(observation.scope().clone())
-                            }
-                            _ => None,
-                        });
-                if let Some(scope) = scope {
-                    break scope;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await?;
-        let ready = execution.engine.wait_ready(scope).await?;
-        ready.ticket.commit().await?;
+        assert!(
+            fixture
+                .steer_current(
+                    owner,
+                    SteeringInput::User {
+                        text: "continue".into(),
+                        attachments: Vec::new(),
+                        submission: Some(receipt),
+                    },
+                )
+                .await
+                .is_err()
+        );
         fixture.close().await?;
         provider.shutdown().await?;
         Ok(())

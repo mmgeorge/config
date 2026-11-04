@@ -21,17 +21,20 @@ fn live_host_failure(error: &anyhow::Error) -> ProviderError {
     use forge_provider_api::error::{ProviderFailure, ProviderFailureKind, ProviderOperation};
     if error.is::<LiveHostRejection>() {
         ProviderError::Failure(ProviderFailure::new(
-            ProviderOperation::HostEffectPublication,
+            ProviderOperation::InputSubmit,
             ProviderFailureKind::Rejected,
         ))
     } else if error.is::<rusqlite::Error>() {
-        ProviderError::Failure(ProviderFailure::new(
-            ProviderOperation::HostEffectPublication,
-            ProviderFailureKind::Runtime,
-        ))
+        ProviderError::Failure(
+            ProviderFailure::new(ProviderOperation::InputSubmit, ProviderFailureKind::Runtime)
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Persistence,
+                    forge_provider_api::FailureDisposition::Uncertain,
+                ),
+        )
     } else {
         crate::provider::lifecycle_error::classify_source(
-            ProviderOperation::HostEffectPublication,
+            ProviderOperation::InputSubmit,
             error.as_ref(),
         )
     }

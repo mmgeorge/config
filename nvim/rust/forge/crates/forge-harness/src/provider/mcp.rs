@@ -1,5 +1,6 @@
-use super::{McpDefinition, McpStatus, Provider, ProviderCatalogRequest};
+use super::{McpDefinition, McpStatus, Provider};
 use anyhow::{Context, Result};
+use forge_provider_api::catalog::{McpQuery, QueryContext};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::task::JoinHandle;
@@ -27,7 +28,8 @@ impl McpDiscovery {
     pub(crate) async fn snapshot(
         &mut self,
         provider: Arc<Provider>,
-        request: ProviderCatalogRequest,
+        context: QueryContext,
+        configured: Option<Vec<McpDefinition>>,
     ) -> Result<Vec<McpDefinition>> {
         if self.pending.as_ref().is_some_and(JoinHandle::is_finished) {
             let result = self
@@ -45,7 +47,10 @@ impl McpDiscovery {
                         return Err(error);
                     }
                     for server in &mut self.servers {
-                        if server.enabled {
+                        if server.enabled
+                            && !(server.status == McpStatus::Unavailable
+                                && server.status_detail.is_some())
+                        {
                             server.status = McpStatus::Failed;
                             server.status_detail = Some(
                                 forge_provider_api::SanitizedMessage::new("MCP discovery failed")
@@ -62,12 +67,15 @@ impl McpDiscovery {
                 .completed_at
                 .is_none_or(|completed| completed.elapsed() > Duration::from_secs(5))
         {
-            let configured = tokio::time::timeout(
-                Duration::from_secs(10),
-                provider.mcp_configuration(request.clone()),
-            )
-            .await
-            .context("MCP configuration discovery timed out")??;
+            let configured = match configured {
+                Some(configured) => configured,
+                None => tokio::time::timeout(
+                    Duration::from_secs(10),
+                    provider.mcp_list(McpQuery::Configured(context.clone())),
+                )
+                .await
+                .context("MCP configuration discovery timed out")??,
+            };
             let previous = std::mem::replace(&mut self.servers, configured);
             if self.servers.is_empty() {
                 self.completed_at = Some(Instant::now());
@@ -97,11 +105,15 @@ impl McpDiscovery {
                     }
                 }
             }
+            let configured = self.servers.clone();
             self.pending = Some(tokio::spawn(async move {
-                tokio::time::timeout(Duration::from_secs(120), provider.mcp_list(request))
-                    .await
-                    .context("MCP startup discovery timed out after 120 seconds")?
-                    .map_err(anyhow::Error::from)
+                let observed = tokio::time::timeout(
+                    Duration::from_secs(120),
+                    provider.mcp_list(McpQuery::Observed(context)),
+                )
+                .await
+                .context("MCP startup discovery timed out after 120 seconds")??;
+                Ok(merge_configured(configured, observed))
             }));
         }
         Ok(self.servers.clone())
@@ -158,34 +170,38 @@ mod test {
             descriptor(),
             |_request, _sink: ProviderEventSink, _cancelled| async { Ok::<(), ProviderError>(()) },
         )
-        .with_mcp_configuration(move |_request| async move {
-            let mut working = native_server("working", NativeMcpStatus::Unavailable);
-            working.status_detail = unavailable_reason.map(|reason| {
-                forge_provider_api::diagnostic::SanitizedMessage::new(reason)
-                    .expect("fixture message is nonempty")
-            });
-            Ok(vec![
-                working,
-                native_server("unwired", NativeMcpStatus::Unavailable),
-            ])
-        })
-        .with_mcp_list(move |_request| {
+        .with_mcp_list(move |query| {
             let release = release.clone();
             let calls = calls.clone();
             async move {
-                calls.fetch_add(1, Ordering::SeqCst);
-                release.notified().await;
-                let mut failed = native_server("unwired", NativeMcpStatus::Failed);
-                failed.status_detail = Some(
-                    forge_provider_api::diagnostic::SanitizedMessage::new(
-                        "connection could not be initialized",
-                    )
-                    .expect("fixture message is nonempty"),
-                );
-                Ok(vec![
-                    native_server("working", NativeMcpStatus::Connected),
-                    failed,
-                ])
+                match query {
+                    McpQuery::Configured(_) => {
+                        let mut working = native_server("working", NativeMcpStatus::Unavailable);
+                        working.status_detail = unavailable_reason.map(|reason| {
+                            forge_provider_api::diagnostic::SanitizedMessage::new(reason)
+                                .expect("fixture message is nonempty")
+                        });
+                        Ok(vec![
+                            working,
+                            native_server("unwired", NativeMcpStatus::Unavailable),
+                        ])
+                    }
+                    McpQuery::Observed(_) => {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        release.notified().await;
+                        let mut failed = native_server("unwired", NativeMcpStatus::Failed);
+                        failed.status_detail = Some(
+                            forge_provider_api::diagnostic::SanitizedMessage::new(
+                                "connection could not be initialized",
+                            )
+                            .expect("fixture message is nonempty"),
+                        );
+                        Ok(vec![
+                            native_server("working", NativeMcpStatus::Connected),
+                            failed,
+                        ])
+                    }
+                }
             }
         });
         let session = crate::provider::test_support::ProviderTestSession::from_native(fixture)
@@ -193,22 +209,17 @@ mod test {
         session.provider_handle()
     }
 
-    fn request() -> ProviderCatalogRequest {
-        ProviderCatalogRequest {
-            execution_owner: None,
-            harness_session_id: "test".into(),
-            workspace: ".".into(),
-            access: Default::default(),
-            approval_mode: crate::session::ApprovalMode::Ask,
-            provider_session_id: None,
-        }
+    fn request() -> QueryContext {
+        QueryContext::Workspace(forge_provider_api::catalog::WorkspaceContext {
+            workspace: "D:/work".into(),
+        })
     }
 
     #[tokio::test]
     async fn closing_discovery_cancels_the_retained_provider_request() {
         let provider = bridge(Arc::new(Notify::new()), Arc::new(AtomicUsize::new(0)), None);
         let mut discovery = McpDiscovery::default();
-        discovery.snapshot(provider, request()).await.unwrap();
+        discovery.snapshot(provider, request(), None).await.unwrap();
         tokio::task::yield_now().await;
         let pending = discovery.pending.as_ref().unwrap().abort_handle();
         drop(discovery);
@@ -224,7 +235,7 @@ mod test {
             Some("credential reference is unset"),
         );
         let mut discovery = McpDiscovery::default();
-        let rows = discovery.snapshot(provider, request()).await.unwrap();
+        let rows = discovery.snapshot(provider, request(), None).await.unwrap();
         assert_eq!(rows[0].status, McpStatus::Unavailable);
         assert_eq!(
             rows[0]
@@ -244,7 +255,7 @@ mod test {
         let mut discovery = McpDiscovery::default();
         for _ in 0..3 {
             let rows = discovery
-                .snapshot(provider.clone(), request())
+                .snapshot(provider.clone(), request(), None)
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 2);
@@ -255,7 +266,7 @@ mod test {
         release.notify_one();
         tokio::task::yield_now().await;
         let rows = discovery
-            .snapshot(provider.clone(), request())
+            .snapshot(provider.clone(), request(), None)
             .await
             .unwrap();
         assert_eq!(rows[0].status, McpStatus::Connected);
@@ -269,7 +280,7 @@ mod test {
         );
         assert_eq!(
             discovery
-                .snapshot(provider.clone(), request())
+                .snapshot(provider.clone(), request(), None)
                 .await
                 .unwrap(),
             rows
@@ -278,7 +289,7 @@ mod test {
         discovery.completed_at = Some(Instant::now() - Duration::from_secs(6));
         assert_eq!(
             discovery
-                .snapshot(provider.clone(), request())
+                .snapshot(provider.clone(), request(), None)
                 .await
                 .unwrap(),
             rows
@@ -287,7 +298,10 @@ mod test {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         release.notify_one();
         tokio::task::yield_now().await;
-        assert_eq!(discovery.snapshot(provider, request()).await.unwrap(), rows);
+        assert_eq!(
+            discovery.snapshot(provider, request(), None).await.unwrap(),
+            rows
+        );
     }
 }
 
@@ -349,6 +363,68 @@ mod tests {
             tools: Vec::new(),
             tool_error: None,
         }
+    }
+
+    /// Keep host selection and credential failures authoritative while importing native readiness.
+    #[tokio::test]
+    async fn host_configured_rows_bypass_native_definitions_and_preserve_metadata() -> Result<()> {
+        let descriptor = forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().expect("fixture identity"),
+        )?;
+        let native =
+            crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
+                Ok(())
+            })
+            .with_mcp_list(|query| async move {
+                match query {
+                    McpQuery::Configured(_) => {
+                        panic!("host-owned definitions must not query native configuration")
+                    }
+                    McpQuery::Observed(_) => Ok(vec![
+                        server("ready", true, McpStatus::Connected),
+                        server("disabled", true, McpStatus::Connected),
+                        server("unselected", true, McpStatus::Connected),
+                    ]),
+                }
+            });
+        let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+        let provider = fixture.provider_handle();
+        let mut missing = server("missing", true, McpStatus::Unavailable);
+        missing.status_detail = Some(forge_provider_api::SanitizedMessage::new(
+            "Required credential is missing",
+        )?);
+        let configured = vec![
+            server("ready", true, McpStatus::Loading),
+            server("disabled", false, McpStatus::Disabled),
+            missing.clone(),
+        ];
+        let context = QueryContext::Workspace(forge_provider_api::catalog::WorkspaceContext {
+            workspace: "D:/work".into(),
+        });
+        let mut discovery = McpDiscovery::default();
+        assert_eq!(
+            discovery
+                .snapshot(provider.clone(), context.clone(), Some(configured.clone()))
+                .await?,
+            configured
+        );
+        while !discovery
+            .pending
+            .as_ref()
+            .expect("observation job is retained")
+            .is_finished()
+        {
+            tokio::task::yield_now().await;
+        }
+        let observed = discovery
+            .snapshot(provider, context, Some(configured))
+            .await?;
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed[0].status, McpStatus::Connected);
+        assert_eq!(observed[0].resource_id.as_deref(), Some("shared-ready"));
+        assert_eq!(observed[1].status, McpStatus::Disabled);
+        assert_eq!(observed[2], missing);
+        Ok(())
     }
 
     /// Keep configuration authoritative while importing only runtime readiness and tools.

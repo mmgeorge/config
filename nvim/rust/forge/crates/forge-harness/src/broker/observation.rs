@@ -39,11 +39,25 @@ pub(crate) struct BrokerObserver {
 pub(super) struct ObservationMetadata {
     pub revision: u64,
     pub capability: ProviderCapability,
+    pub manifest: Option<forge_provider_api::CapabilityManifest>,
     pub active_wait: Option<ActiveWait>,
     pub no_checkpoint: bool,
 }
 
 impl BrokerObserver {
+    /// Read negotiated task steering support without querying or configuring a provider.
+    pub(crate) fn task_steering_supported(&self, kind: crate::task::TaskKind) -> Result<bool> {
+        let metadata = self
+            .metadata
+            .read()
+            .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?;
+        Ok(metadata.capability.native_steer
+            && metadata
+                .manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.task_steering.contains(&kind)))
+    }
+
     /// Get the bounded internal check route installed by the session exchange owner.
     pub(crate) fn check_owner_sender(&self) -> Result<crate::checks::owner::CheckOwnerSender> {
         self.check_runner.owner_sender()
@@ -69,27 +83,26 @@ impl BrokerObserver {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = inbox;
     }
-    #[cfg(test)]
-    pub(crate) fn set_native_goal_for_test(&self, supported: bool) -> Result<()> {
-        self.metadata
-            .write()
-            .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?
-            .capability
-            .native_goal = supported;
-        Ok(())
-    }
-
-    pub(crate) fn native_goal_supported(&self) -> Result<bool> {
-        Ok(self
+    pub(crate) fn input_readiness(&self) -> Result<InputReadiness> {
+        let state = self.admission.snapshot()?;
+        let metadata = self
             .metadata
             .read()
             .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?
-            .capability
-            .native_goal)
-    }
-
-    pub(crate) fn input_readiness(&self) -> Result<InputReadiness> {
-        let state = self.admission.snapshot()?;
+            .clone();
+        let task = self
+            .admission
+            .runtime()?
+            .active_task
+            .as_ref()
+            .map(|task| task.kind());
+        let native_steer = metadata.capability.native_steer
+            && task.is_none_or(|kind| {
+                metadata
+                    .manifest
+                    .as_ref()
+                    .is_some_and(|manifest| manifest.task_steering.contains(&kind))
+            });
         let mut has_approval = false;
         for approval in self.permission_coordinator.pending_list()? {
             if let Some(id) = approval.exchange_id {
@@ -107,12 +120,7 @@ impl BrokerObserver {
                 )
             }),
             checks_running: self.check_runner.active()?.is_some(),
-            native_steer: self
-                .metadata
-                .read()
-                .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?
-                .capability
-                .native_steer,
+            native_steer,
         })
     }
     pub(crate) fn session_id(&self) -> &str {
@@ -297,6 +305,7 @@ impl BrokerObserver {
         let metadata = ObservationMetadata {
             revision,
             capability: broker.capability.clone(),
+            manifest: broker.latest_manifest.clone(),
             active_wait: broker.active_wait_projection.clone(),
             no_checkpoint: matches!(broker.workspace_kind, WorkspaceKind::Untracked(_)),
         };
@@ -971,4 +980,67 @@ struct PlanChoice {
     implemented: bool,
     state: PlanState,
     digest: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ordered negotiation must change pending task admission without accepting stale revisions.
+    #[test]
+    fn negotiated_task_steering_updates_readiness_and_rejects_stale_snapshots() -> Result<()> {
+        use forge_provider_api::capability::{CapabilityId, CapabilityManifest, Support};
+        let root = tempfile::tempdir()?;
+        let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
+            "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"capability-owner",
+            "provider":{"kind":"mock","command":[]},
+        }))?)?;
+        let mut task = crate::task::Task::goal(
+            "Continue through negotiated steering".into(),
+            Default::default(),
+            1,
+        );
+        task.request_entry("Begin the retained goal".into(), 1)?;
+        broker.task_controller.change(
+            &mut broker.store,
+            None,
+            crate::task::TaskChange::Install(Box::new(task)),
+            1,
+        )?;
+        let mut manifest = CapabilityManifest::from_descriptor(broker.provider.descriptor());
+        manifest.effective_revision = 1;
+        manifest.task_steering = vec![crate::task::TaskKind::Goal];
+        manifest
+            .capability
+            .iter_mut()
+            .find(|entry| entry.id == CapabilityId::NativeSteer)
+            .context("capability manifest omits steering")?
+            .support = Support::Supported;
+        let initial = manifest.clone();
+        let scope = forge_provider_api::EventScope::Binding {
+            owner: crate::provider::ExecutionOwner::root(&broker.session.id),
+        };
+        broker.observe_session_event(ProviderEvent::CapabilitiesChanged {
+            scope: scope.clone(),
+            capabilities: manifest.clone(),
+        })?;
+        assert!(broker.observer.input_readiness()?.native_steer);
+        manifest.effective_revision = 2;
+        manifest.task_steering = vec![crate::task::TaskKind::Plan];
+        broker.observe_session_event(ProviderEvent::CapabilitiesChanged {
+            scope: scope.clone(),
+            capabilities: manifest,
+        })?;
+        assert!(!broker.observer.input_readiness()?.native_steer);
+        broker.observe_session_event(ProviderEvent::CapabilitiesChanged {
+            scope,
+            capabilities: initial,
+        })?;
+        assert!(!broker.observer.input_readiness()?.native_steer);
+        assert_eq!(
+            broker.latest_manifest.as_ref().unwrap().effective_revision,
+            2
+        );
+        Ok(())
+    }
 }

@@ -31,9 +31,6 @@ use super::input_receipts::InputReceiptError;
 use super::input_receipts::{InputReceiptFact, InputReceiptWake, InputReceipts};
 use super::journal::{CommandJournalError, CommandRecord};
 use super::native_command::NativeCommandProgress;
-use super::native_goal::{
-    NativeGoalError, NativeGoalEvent, NativeGoalReply, NativeGoalSelection, NativeGoalSync,
-};
 use super::queue::{CommandQueue, CommandReply};
 use super::rollback_run::{RollbackProgress, RollbackRecovery};
 use super::services::OwnerServices;
@@ -275,7 +272,6 @@ impl ExchangeOwner {
                 foreground_access: ForegroundAccess::Open,
                 input_receipts: InputReceipts::default(),
                 input_delivery: None,
-                native_goal: NativeGoalSync::default(),
                 idle_settlement: IdleSettlement::NotRequested,
                 question_inputs: super::question_input::QuestionInputs::default(),
                 question_waits: super::question_wait::QuestionWaits::default(),
@@ -503,22 +499,6 @@ impl ExchangeOwner {
             .map_err(|_| InputOfferError::ObservationLost)?
     }
 
-    /// Observe canonical native-goal synchronization without owning its transport lifetime.
-    pub(crate) async fn synchronize_native_goal(
-        &self,
-    ) -> Result<Option<NativeGoalSelection>, NativeGoalError> {
-        let (reply, response) = oneshot::channel();
-        self.sender
-            .try_send(OwnerEvent::NativeGoal { reply })
-            .map_err(|error| match error {
-                mpsc::error::TrySendError::Full(_) => NativeGoalError::QueueFull,
-                mpsc::error::TrySendError::Closed(_) => NativeGoalError::OwnerClosed,
-            })?;
-        response
-            .await
-            .map_err(|_| NativeGoalError::ObservationLost)?
-    }
-
     /// Recover only the selected observation generation through owner-retained stages.
     pub(crate) async fn recover_observation(
         &self,
@@ -586,7 +566,6 @@ pub(crate) struct ExchangeDriver {
     foreground_access: ForegroundAccess,
     input_receipts: InputReceipts,
     input_delivery: Option<InputDeliveryRun>,
-    native_goal: NativeGoalSync,
     idle_settlement: IdleSettlement,
     question_inputs: super::question_input::QuestionInputs,
     question_waits: super::question_wait::QuestionWaits,
@@ -1008,10 +987,6 @@ impl ExchangeDriver {
                 },
             )
             .await;
-            // Apply ready goal facts before another command can observe their stale acknowledgment state.
-            if let Some(event) = self.native_goal.next().now_or_never() {
-                self.apply_native_goal(event, &services, &trace, &session_id, update_step);
-            }
             if steering_ready.is_none()
                 && !matches!(
                     &pending_wake,
@@ -1023,6 +998,9 @@ impl ExchangeDriver {
             {
                 let status = foreground_status(
                     &self.foreground_access,
+                    foreground
+                        .as_ref()
+                        .map_or(Ok(None), |runtime| runtime.transaction.invocation_scope()),
                     foreground.is_some() || !pending.is_empty() || !self.steering.is_empty(),
                 );
                 steering_ready = next_steering(&mut self.steering, status).now_or_never();
@@ -1045,6 +1023,9 @@ impl ExchangeDriver {
             }
             let event_status = foreground_status(
                 &self.foreground_access,
+                foreground
+                    .as_ref()
+                    .map_or(Ok(None), |runtime| runtime.transaction.invocation_scope()),
                 foreground.is_some()
                     || !pending.is_empty()
                     || !self.steering.is_empty()
@@ -1069,7 +1050,7 @@ impl ExchangeDriver {
                 if ready_wake.is_none() {
                     ready_wake = command
                         .as_mut()
-                        .and_then(|command| command.next(event_status).now_or_never())
+                        .and_then(|command| command.next(event_status.clone()).now_or_never())
                         .map(DriverWake::Command);
                 }
                 if ready_wake.is_none() {
@@ -1081,7 +1062,7 @@ impl ExchangeDriver {
                     ready_wake = self
                         .input_delivery
                         .as_mut()
-                        .and_then(|run| run.next(event_status).now_or_never())
+                        .and_then(|run| run.next(event_status.clone()).now_or_never())
                         .map(|event| {
                             DriverWake::InputDelivery(InputDeliveryTarget::Foreground, event)
                         });
@@ -1116,7 +1097,7 @@ impl ExchangeDriver {
                 if ready_wake.is_none() {
                     ready_wake = shutdown
                         .as_mut()
-                        .and_then(|shutdown| shutdown.next(event_status).now_or_never())
+                        .and_then(|shutdown| shutdown.next(event_status.clone()).now_or_never())
                         .map(DriverWake::Shutdown);
                 }
                 if ready_wake.is_none()
@@ -1194,7 +1175,6 @@ impl ExchangeDriver {
                         && self.steering.is_empty()
                         && input_cleanup.is_empty()
                         && check_runs.is_empty()
-                        && self.native_goal.is_idle()
                         && automatic_checks.is_none()
                         && automatic_repair.is_none()
                         && task_verification.is_none()
@@ -1225,7 +1205,7 @@ impl ExchangeDriver {
                         Ok(false) => {}
                         Err(error) => {
                             trace.record(&session_id, "exchange.observation_recovery.failed", serde_json::json!({"reason":error.to_string(),"update_step":update_step}));
-                            services.tasks.mark_native_goal_uncertain();
+                            services.tasks.mark_configuration_uncertain();
                             self.observation_recovery.finish(Err(error));
                             self.foreground_access = ForegroundAccess::CollectionLost;
                         }
@@ -1806,26 +1786,6 @@ impl ExchangeDriver {
                         | crate::broker::OwnedCheckProgress::Finished => {}
                     }
                 }
-                if (command.is_none() && !self.commands.has_pending()
-                    || command.as_ref().is_some_and(ActiveCommand::needs_goal_sync))
-                    && !self.commands.storage_unavailable()
-                    && matches!(self.foreground_access, ForegroundAccess::Open)
-                    && !self
-                        .input_delivery
-                        .as_ref()
-                        .is_some_and(InputDeliveryRun::preparing)
-                {
-                    match broker.try_lock() {
-                        Ok(mut broker) => self.native_goal.start(
-                            &services,
-                            &mut broker,
-                            &trace,
-                            &session_id,
-                            update_step,
-                        ),
-                        Err(_) => broker_deferred = true,
-                    }
-                }
                 if !closed
                     && matches!(self.idle_settlement, IdleSettlement::Requested)
                     && foreground.is_none()
@@ -1835,7 +1795,6 @@ impl ExchangeDriver {
                     && !self.commands.storage_unavailable()
                     && self.input_delivery.is_none()
                     && self.steering.is_empty()
-                    && !self.native_goal.preparing()
                     && failed_foregrounds.is_empty()
                     && cancellation_cleanup.is_empty()
                     && rollback_cleanup.is_empty()
@@ -1948,7 +1907,6 @@ impl ExchangeDriver {
                 && retained_rollbacks.is_empty()
                 && self.input_delivery.is_none()
                 && input_cleanup.is_empty()
-                && self.native_goal.is_idle()
                 && self.question_waits.is_idle()
                 && self.question_tools.is_empty()
                 && self.steering.is_empty()
@@ -2003,6 +1961,9 @@ impl ExchangeDriver {
             }
             let foreground_status = foreground_status(
                 &self.foreground_access,
+                foreground
+                    .as_ref()
+                    .map_or(Ok(None), |runtime| runtime.transaction.invocation_scope()),
                 foreground.is_some()
                     || !pending.is_empty()
                     || !self.steering.is_empty()
@@ -2052,13 +2013,12 @@ impl ExchangeDriver {
                             _ = services.publications.reconciliation_expiry() => {},
                         }
                     } => DriverWake::Publication,
-                    observed = async { match steering_ready.take() { Some(observed) => observed, None => next_steering(&mut self.steering, foreground_status).await } } => {
+                    observed = async { match steering_ready.take() { Some(observed) => observed, None => next_steering(&mut self.steering, foreground_status.clone()).await } } => {
                         DriverWake::InputDelivery(InputDeliveryTarget::Steering(observed.0), observed.1)
                     },
-                    event = self.native_goal.next() => DriverWake::NativeGoal(event),
                     event = self.observation_recovery.next(), if self.observation_recovery.started() => DriverWake::ObservationRecovery(event),
                     event = async { match self.input_delivery.as_mut() {
-                        Some(run) => run.next(foreground_status).await,
+                        Some(run) => run.next(foreground_status.clone()).await,
                         None => std::future::pending().await,
                     }} => DriverWake::InputDelivery(InputDeliveryTarget::Foreground, event),
                     collected = input_cleanup.join_next(), if !input_cleanup.is_empty() => DriverWake::InputCollected(collected),
@@ -2114,13 +2074,13 @@ impl ExchangeDriver {
                     _ = self.shutdown_retry.notified(), if closed => DriverWake::ShutdownRetry,
                     event = async {
                         match shutdown.as_mut() {
-                            Some(shutdown) => shutdown.next(foreground_status).await,
+                            Some(shutdown) => shutdown.next(foreground_status.clone()).await,
                             None => std::future::pending().await,
                         }
                     } => DriverWake::Shutdown(event),
                     prepared = async {
                         match command.as_mut() {
-                            Some(command) => command.next(foreground_status).await,
+                            Some(command) => command.next(foreground_status.clone()).await,
                             None => std::future::pending().await,
                         }
                     } => DriverWake::Command(prepared),
@@ -2170,7 +2130,7 @@ impl ExchangeDriver {
                                     self.foreground_access = ForegroundAccess::Open;
                                 }
                                 Err(_) => {
-                                    services.tasks.mark_native_goal_uncertain();
+                                    services.tasks.mark_configuration_uncertain();
                                     self.observation_recovery.finish(Err(super::provider_lifecycle::ProviderLifecycleFailure::StateUnavailable));
                                     self.foreground_access = ForegroundAccess::CollectionLost;
                                 }
@@ -2179,6 +2139,7 @@ impl ExchangeDriver {
                         Ok(false) => {}
                         Err(error) => {
                             trace.record(&session_id, "exchange.observation_recovery.failed", serde_json::json!({"reason":error.to_string(),"update_step":update_step}));
+                            services.tasks.mark_configuration_uncertain();
                             self.observation_recovery.finish(Err(error));
                             self.foreground_access = ForegroundAccess::CollectionLost;
                         }
@@ -2201,7 +2162,7 @@ impl ExchangeDriver {
                         .expect("shutdown evidence retains its collection owner")
                         .update(
                             event,
-                            foreground_status,
+                            foreground_status.clone(),
                             &mut *broker.lock().await,
                             &services,
                         );
@@ -2236,9 +2197,6 @@ impl ExchangeDriver {
                 DriverWake::QuestionWait => self.question_inputs.request(),
                 DriverWake::QuestionTool => {}
                 DriverWake::BrokerAvailable => {}
-                DriverWake::NativeGoal(event) => {
-                    self.apply_native_goal(event, &services, &trace, &session_id, update_step);
-                }
                 DriverWake::InputDelivery(target, event) => {
                     let mut run = match &target {
                         InputDeliveryTarget::Foreground => self.input_delivery.take(),
@@ -2253,7 +2211,7 @@ impl ExchangeDriver {
                     }));
                     let progress = run.update(
                         event,
-                        foreground_status,
+                        foreground_status.clone(),
                         &mut *broker.lock().await,
                         &services,
                         &mut self.input_receipts,
@@ -2946,7 +2904,7 @@ impl ExchangeDriver {
                         let mut broker = broker.lock().await;
                         let progress = run.update(
                             event,
-                            foreground_status,
+                            foreground_status.clone(),
                             &mut broker,
                             &services,
                             !self.commands.storage_unavailable(),
@@ -3146,7 +3104,7 @@ impl ExchangeDriver {
                     let progress = match self.input_receipts.observe_acceptance(&services) {
                         Ok(()) => run.update(
                             event,
-                            foreground_status,
+                            foreground_status.clone(),
                             &mut *broker.lock().await,
                             &services,
                             !self.commands.storage_unavailable(),
@@ -3239,43 +3197,6 @@ impl ExchangeDriver {
                                 },
                                 &id,
                             );
-                            command = Some(ActiveCommand::Task(run));
-                        }
-                        Ok(TaskCommandProgress::SynchronizeGoal { reply, events }) => {
-                            publish_task_state(
-                                command_messages.as_ref(),
-                                &services,
-                                &trace,
-                                &session_id,
-                                &id,
-                                update_step,
-                            );
-                            publish_control(
-                                events,
-                                None,
-                                OwnerUpdateContext {
-                                    services: &services,
-                                    trace: &trace,
-                                    session: &session_id,
-                                    step: update_step,
-                                },
-                                &id,
-                            );
-                            let available = if self.commands.storage_unavailable() {
-                                Err(NativeGoalError::StateUnavailable)
-                            } else if matches!(self.foreground_access, ForegroundAccess::Open) {
-                                Ok(())
-                            } else {
-                                Err(NativeGoalError::Uncertain)
-                            };
-                            let sync = self.native_goal.request(
-                                reply,
-                                available,
-                                &trace,
-                                &session_id,
-                                update_step,
-                            );
-                            trace.record(&session_id, "exchange.command.effect_requested", serde_json::json!({"command_id":id.as_str(),"effect":"native_goal_synchronization","sync_id":sync,"update_step":update_step}));
                             command = Some(ActiveCommand::Task(run));
                         }
                         Ok(TaskCommandProgress::Finished { outcome, events }) => {
@@ -3467,7 +3388,7 @@ impl ExchangeDriver {
                     let progress = match self.input_receipts.observe_acceptance(&services) {
                         Ok(()) => run.update(
                             event,
-                            foreground_status,
+                            foreground_status.clone(),
                             &mut *broker.lock().await,
                             &services,
                             !self.commands.storage_unavailable(),
@@ -3608,7 +3529,7 @@ impl ExchangeDriver {
                                     }
                                     OperationFailure::Reconciliation(error) => {
                                         let diagnostic = crate::provider::lifecycle_error::diagnostic(
-                                            forge_provider_api::ProviderOperation::ReconcileSettings, &error,
+                                            forge_provider_api::ProviderOperation::SessionConfigure, &error,
                                         );
                                         trace.record(&session_id, "exchange.configuration.reconciliation_failed", serde_json::json!({
                                             "command_id":command_id.as_str(),"update_step":update_step,"kind":diagnostic.kind,
@@ -3773,7 +3694,7 @@ impl ExchangeDriver {
                     let progress = match self.input_receipts.observe_acceptance(&services) {
                         Ok(()) if !self.commands.storage_unavailable() => transition.update(
                             event,
-                            foreground_status,
+                            foreground_status.clone(),
                             &mut *broker.lock().await,
                             &services,
                         ),
@@ -4315,24 +4236,6 @@ impl ExchangeDriver {
         }
     }
 
-    /// Apply a goal fact under current storage certification before admitting another native effect.
-    fn apply_native_goal(
-        &mut self,
-        event: NativeGoalEvent,
-        services: &OwnerServices,
-        trace: &TraceStore,
-        session: &str,
-        step: u64,
-    ) {
-        let certified = if self.commands.storage_unavailable() {
-            Err(NativeGoalError::StateUnavailable)
-        } else {
-            Ok(())
-        };
-        self.native_goal
-            .update(event, certified, services, trace, session, step);
-    }
-
     /// Restore a pending delivery to the same root or steering owner that produced its event.
     fn restore_delivery(&mut self, target: &InputDeliveryTarget, run: InputDeliveryRun) {
         match target {
@@ -4461,9 +4364,8 @@ impl ExchangeDriver {
             || matches!(steering_admission, SteeringAdmission::Closed)
             || self.receiver.is_closed()
             || self.commands.has_pending()
+            || services.tasks.configuration_is_uncertain()
             || self.commands.storage_unavailable()
-            || self.native_goal.preparing()
-            || services.tasks.native_goal_is_uncertain()
             || self
                 .input_delivery
                 .as_ref()
@@ -4774,8 +4676,7 @@ impl ExchangeDriver {
                     if self.receiver.is_closed()
                         || active.is_some()
                         || self.commands.has_pending()
-                        || self.native_goal.preparing()
-                        || services.tasks.native_goal_is_uncertain()
+                        || services.tasks.configuration_is_uncertain()
                         || !matches!(self.foreground_access, ForegroundAccess::Open)
                     {
                         return Ok(None);
@@ -4891,9 +4792,8 @@ impl ExchangeDriver {
                     || matches!(steering_admission, SteeringAdmission::Closed)
                     || self.receiver.is_closed()
                     || self.commands.has_pending()
+                    || services.tasks.configuration_is_uncertain()
                     || self.commands.storage_unavailable()
-                    || self.native_goal.preparing()
-                    || services.tasks.native_goal_is_uncertain()
                     || !pending.is_empty()
                     || self
                         .input_delivery
@@ -4940,25 +4840,6 @@ impl ExchangeDriver {
                 }.await;
                 notify_input_offer(reply, outcome, trace, session, &input, step);
             }
-            OwnerEvent::NativeGoal { reply } => {
-                let available = if self.receiver.is_closed() {
-                    Err(NativeGoalError::OwnerClosed)
-                } else if self.commands.storage_unavailable() {
-                    Err(NativeGoalError::StateUnavailable)
-                } else if matches!(
-                    self.foreground_access,
-                    ForegroundAccess::Collecting
-                        | ForegroundAccess::Collected
-                        | ForegroundAccess::CollectionLost
-                        | ForegroundAccess::Unavailable(_)
-                ) {
-                    Err(NativeGoalError::Uncertain)
-                } else {
-                    Ok(())
-                };
-                self.native_goal
-                    .request(reply, available, trace, session, step);
-            }
             OwnerEvent::InputOffer {
                 offer,
                 messages: output,
@@ -4976,8 +4857,7 @@ impl ExchangeDriver {
                 if active.is_some()
                     || self.receiver.is_closed()
                     || self.commands.has_pending()
-                    || self.native_goal.preparing()
-                    || services.tasks.native_goal_is_uncertain()
+                    || services.tasks.configuration_is_uncertain()
                     || self.commands.storage_unavailable()
                     || self.input_delivery.is_some()
                     || !self.steering.is_empty()
@@ -5454,7 +5334,6 @@ impl ExchangeDriver {
                 self.question_waits.close();
                 self.receiver.close();
                 self.commands.close(trace, session, step);
-                self.native_goal.close(trace, session, step);
             }
         }
     }
@@ -5550,9 +5429,6 @@ enum OwnerEvent {
         messages: MessageSender,
         reply: InputOfferReply,
     },
-    NativeGoal {
-        reply: NativeGoalReply,
-    },
     InputOffer {
         offer: InputDeliveryOffer,
         messages: MessageSender,
@@ -5632,6 +5508,7 @@ async fn next_steering(
     let mut waiting = futures_util::stream::FuturesUnordered::new();
     for (id, run) in runs {
         let id = id.clone();
+        let foreground = foreground.clone();
         waiting.push(async move { (id, run.next(foreground).await) });
     }
     match waiting.next().await {
@@ -5664,7 +5541,6 @@ enum DriverWake {
     BrokerAvailable,
     QuestionInput,
     Publication,
-    NativeGoal(NativeGoalEvent),
     InputDelivery(InputDeliveryTarget, InputDeliveryEvent),
     InputCollected(Option<Result<CollectedInput, tokio::task::JoinError>>),
     InputReceipt(InputReceiptWake),
@@ -5739,11 +5615,10 @@ fn steering_input_eligible(
         InputPurpose::User => true,
         InputPurpose::Clarification { .. } => false,
         InputPurpose::TaskEntry { start, .. } => {
-            let provider = services
-                .provider
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            provider.supports_task_steering(start.kind)
+            services
+                .observer
+                .task_steering_supported(start.kind)
+                .map_err(InputOfferError::Queue)?
                 && task
                     .as_ref()
                     .and_then(|task| task.entry.as_ref())
@@ -5925,10 +5800,18 @@ enum CancellationCleanupPhase {
 }
 
 /// Derive collection readiness from owned foreground work and explicit availability.
-fn foreground_status(access: &ForegroundAccess, has_work: bool) -> ForegroundStatus {
+fn foreground_status(
+    access: &ForegroundAccess,
+    scope: Result<Option<crate::provider::InvocationScope>, crate::provider::ProviderError>,
+    has_work: bool,
+) -> ForegroundStatus {
+    let scope = match scope {
+        Ok(scope) => scope,
+        Err(_) => return ForegroundStatus::Unavailable,
+    };
     match access {
         ForegroundAccess::Open | ForegroundAccess::Collected if has_work => {
-            ForegroundStatus::Active
+            scope.map_or(ForegroundStatus::Local, ForegroundStatus::Active)
         }
         ForegroundAccess::Open | ForegroundAccess::Collected => ForegroundStatus::Quiescent,
         ForegroundAccess::Collecting
@@ -6113,7 +5996,7 @@ fn retain_publication(
 async fn collect_failed_foreground(
     mut runtime: ForegroundRuntime,
     original: anyhow::Error,
-    provider: Arc<crate::provider::Provider>,
+    _provider: Arc<crate::provider::Provider>,
     permissions: Arc<crate::provider::approval::PermissionCoordinator>,
     session: String,
     trace: Arc<TraceStore>,
@@ -6130,7 +6013,7 @@ async fn collect_failed_foreground(
             .await
             .map_err(|error| {
                 crate::provider::lifecycle_error::classify(
-                    forge_provider_api::ProviderOperation::HostEffectPublication,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     error,
                 )
             })
@@ -6138,10 +6021,27 @@ async fn collect_failed_foreground(
     .catch_unwind()
     .await
     .unwrap_or(Err(crate::provider::ProviderError::DeliveryUncertain));
-    let native = std::panic::AssertUnwindSafe(provider.cleanup_execution(&session))
-        .catch_unwind()
-        .await
-        .unwrap_or(Err(crate::provider::ProviderError::DeliveryUncertain));
+    let invocation =
+        runtime
+            .transaction
+            .invocation_scope()
+            .map(|scope| match (&runtime.transaction, scope) {
+                (
+                    ForegroundDispatch::Running { transaction, .. }
+                    | ForegroundDispatch::Finalizing { transaction, .. },
+                    Some(scope),
+                ) => Some((transaction.engine.clone(), scope)),
+                _ => None,
+            });
+    let native = std::panic::AssertUnwindSafe(async {
+        match invocation? {
+            Some((engine, scope)) => engine.cancel_exchange(scope).await,
+            None => Ok(()),
+        }
+    })
+    .catch_unwind()
+    .await
+    .unwrap_or(Err(crate::provider::ProviderError::DeliveryUncertain));
     let cleanup = match (approvals, native) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -6436,9 +6336,6 @@ impl ForegroundRuntime {
             Ok(confirmation) if confirmation.scope() == scope => {
                 let target = match confirmation.target() {
                     forge_provider_api::submission::DispatchTarget::Input(_) => "input",
-                    forge_provider_api::submission::DispatchTarget::Continuation(_) => {
-                        "continuation"
-                    }
                 };
                 trace.record(session, "exchange.dispatch.confirmed", serde_json::json!({
                     "work_id":self.id,"scope":scope,"binding_id":confirmation.binding().as_str(),
@@ -6525,7 +6422,7 @@ impl ForegroundRuntime {
                 ForegroundSignal::LiveHost(request) => {
                     request.reject(crate::provider::ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::HostEffectPublication,
+                            forge_provider_api::ProviderOperation::InputSubmit,
                             forge_provider_api::ProviderFailureKind::Runtime,
                         ),
                     ));
@@ -6723,6 +6620,9 @@ fn retain_review_answer(
     root: &std::path::Path,
     result: &DispatchResult,
 ) -> Result<()> {
+    if result.response.error().is_some() {
+        return Ok(());
+    }
     let id = result
         .response
         .result()

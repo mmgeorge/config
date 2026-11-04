@@ -412,7 +412,6 @@ async fn abandoned_wait_does_not_restore_an_answer_after_its_task_is_cleared() -
             crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                 "Question task".into(),
                 Default::default(),
-                false,
                 1,
             ))),
             1,

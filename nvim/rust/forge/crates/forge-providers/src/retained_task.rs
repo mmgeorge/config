@@ -5,6 +5,7 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 pub(crate) struct RetainedTask {
     state: Mutex<TaskState>,
+    operation: ProviderOperation,
 }
 
 enum TaskState {
@@ -14,9 +15,13 @@ enum TaskState {
 
 impl RetainedTask {
     /// Create the sole retained owner of a spawned native worker.
-    pub(crate) fn new(task: JoinHandle<Result<(), ProviderError>>) -> Self {
+    pub(crate) fn new(
+        operation: ProviderOperation,
+        task: JoinHandle<Result<(), ProviderError>>,
+    ) -> Self {
         Self {
             state: Mutex::new(TaskState::Running(task)),
+            operation,
         }
     }
 
@@ -33,10 +38,12 @@ impl RetainedTask {
         let mut state = self.state.lock().await;
         let result = match &mut *state {
             TaskState::Running(task) => task.await.unwrap_or_else(|_| {
-                Err(ProviderError::Failure(ProviderFailure::new(
-                    ProviderOperation::CollectEventReader,
-                    ProviderFailureKind::Runtime,
-                )))
+                Err(ProviderError::Failure(
+                    ProviderFailure::new(self.operation, ProviderFailureKind::Runtime).at_phase(
+                        forge_provider_api::ProviderPhase::Collection,
+                        forge_provider_api::FailureDisposition::Invalidated,
+                    ),
+                ))
             }),
             TaskState::Collected(result) => return result.clone(),
         };
@@ -53,10 +60,13 @@ mod tests {
     #[tokio::test]
     async fn cancelled_join_keeps_the_original_prompt_worker() {
         let (release, wait) = tokio::sync::oneshot::channel();
-        let task = RetainedTask::new(tokio::spawn(async move {
-            let _ = wait.await;
-            Ok(())
-        }));
+        let task = RetainedTask::new(
+            ProviderOperation::InputSubmit,
+            tokio::spawn(async move {
+                let _ = wait.await;
+                Ok(())
+            }),
+        );
         let mut collecting = Box::pin(task.join());
         assert!(futures_util::poll!(collecting.as_mut()).is_pending());
         drop(collecting);
@@ -79,9 +89,10 @@ mod tests {
     /// Keep a typed native failure unchanged across repeated collection.
     #[tokio::test]
     async fn native_failure_survives_repeated_collection() {
-        let task = RetainedTask::new(tokio::spawn(async {
-            Err(ProviderError::DeliveryUncertain)
-        }));
+        let task = RetainedTask::new(
+            ProviderOperation::InputSubmit,
+            tokio::spawn(async { Err(ProviderError::DeliveryUncertain) }),
+        );
         for _ in 0..2 {
             assert!(matches!(
                 task.join().await,
@@ -93,9 +104,12 @@ mod tests {
     /// Report a panicked worker without exposing its native panic text.
     #[tokio::test]
     async fn worker_panic_is_normalized_and_retained() {
-        let task = RetainedTask::new(tokio::spawn(async {
-            panic!("private prompt panic marker");
-        }));
+        let task = RetainedTask::new(
+            ProviderOperation::InputSubmit,
+            tokio::spawn(async {
+                panic!("private prompt panic marker");
+            }),
+        );
         for _ in 0..2 {
             let error = task.join().await.unwrap_err();
             assert!(matches!(&error, ProviderError::Failure(failure)

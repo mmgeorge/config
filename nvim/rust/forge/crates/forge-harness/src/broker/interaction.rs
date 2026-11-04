@@ -446,7 +446,9 @@ impl HarnessBroker {
                 now_ms,
                 selected,
             )?;
-        interaction.input_message_id = input_message_id;
+        // Internal continuations have their own journal record but no new user input identity.
+        // Keep the originating input link when they resume the same retained exchange.
+        interaction.input_message_id = input_message_id.or(interaction.input_message_id);
         interaction.approval_mode = Some(self.session.approval_mode);
         if new_interaction && let Some(admission) = admission {
             interaction.origin = admission.origin.clone();
@@ -583,14 +585,16 @@ impl HarnessBroker {
             serde_json::to_value(&output)?,
         );
         interaction.pause(self.clock.now_ms());
-        self.capability = output.capability.clone();
-        self.session.native_fork = output.capability.native_fork;
-        self.session.native_compact = output.capability.native_compact;
         if let Some(context_usage) = output.metrics.context_usage.clone() {
             self.session.context_usage = Some(context_usage);
             self.context_usage_fresh = true;
         }
-        self.session.provider_session_id = output.provider_session_id.clone().map(Into::into);
+        if let Some(identity) = &output.provider_session_id {
+            self.retain_session_identity(
+                &crate::provider::ExecutionOwner::root(&self.session.id),
+                identity,
+            )?;
+        }
         self.session.provider_checkpoint_id = output.provider_checkpoint_id.clone();
         if !output.runtime.provider.is_empty() {
             self.session.provider_label = output.runtime.provider.clone();
@@ -640,6 +644,139 @@ impl HarnessBroker {
 #[cfg(test)]
 mod receipt_tests {
     use super::*;
+
+    /// Terminal snapshots are historical observations, not a second negotiated capability authority.
+    #[tokio::test]
+    async fn completion_preserves_negotiated_capability_authority() -> Result<()> {
+        use forge_provider_api::capability::{CapabilityId, Support};
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let (mut exchange, _, _) = broker
+            .test_stage_interaction_for_turn("Preserve negotiated support", true, 100)
+            .await?;
+        for (revision, supported) in [(1, true), (2, false)] {
+            let mut manifest = forge_provider_api::CapabilityManifest::from_descriptor(
+                broker.provider.descriptor(),
+            );
+            manifest.effective_revision = revision;
+            for capability in &mut manifest.capability {
+                if matches!(
+                    capability.id,
+                    CapabilityId::NativeFork
+                        | CapabilityId::NativeCompact
+                        | CapabilityId::NativeSteer
+                ) {
+                    capability.support = if supported {
+                        Support::Supported
+                    } else {
+                        Support::Unsupported
+                    };
+                }
+            }
+            broker.apply_effective_capabilities(manifest.clone())?;
+            let expected = serde_json::to_value(&broker.capability)?;
+            let mut stale = broker.capability.clone();
+            stale.native_fork = !supported;
+            stale.native_compact = !supported;
+            stale.native_steer = !supported;
+            broker.session.provider_checkpoint_id = Some("previous-turn-checkpoint".into());
+            let completion = ProviderCompletion {
+                native: forge_provider_api::completion::ProviderCompletion {
+                    capability: stale,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            broker.stage_host_completion(&mut exchange, completion, PromptMode::Chat)?;
+            assert_eq!(serde_json::to_value(&broker.capability)?, expected);
+            assert_eq!(
+                serde_json::to_value(&broker.latest_manifest)?,
+                serde_json::to_value(Some(&manifest))?
+            );
+            {
+                let metadata = broker.observer.metadata.read().unwrap();
+                assert_eq!(serde_json::to_value(&metadata.capability)?, expected);
+                assert_eq!(
+                    serde_json::to_value(&metadata.manifest)?,
+                    serde_json::to_value(Some(&manifest))?
+                );
+            }
+            assert_eq!(broker.session.native_fork, supported);
+            assert_eq!(broker.session.native_compact, supported);
+            let stored = broker.store.load_session(&broker.session.id)?.unwrap();
+            assert_eq!(stored.native_fork, supported);
+            assert_eq!(stored.native_compact, supported);
+            assert!(
+                broker.session.provider_checkpoint_id.is_none(),
+                "absent per-turn retraction eligibility was preserved"
+            );
+        }
+        Ok(())
+    }
+
+    /// A routing thread is not durable history, and absent terminal metadata cannot erase known history.
+    #[tokio::test]
+    async fn turn_routes_and_absent_completion_preserve_native_history() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let (mut exchange, _, _) = broker
+            .test_stage_interaction_for_turn("Retain native history", true, 100)
+            .await?;
+        let address = crate::provider::TurnAddress {
+            scope: crate::provider::InvocationScope::new(
+                crate::provider::ExecutionOwner::root(&broker.session.id),
+                exchange.id.clone(),
+            ),
+            thread_id: "arbitrary-routing-thread".into(),
+            turn_id: "routing-turn".into(),
+        };
+        broker.apply_turn_observation(
+            &exchange,
+            &address,
+            &crate::provider::TurnUpdate::Started { started_at_ms: 100 },
+        )?;
+        assert!(
+            broker.session.provider_session_id.is_none(),
+            "turn routing created durable native history"
+        );
+        broker.session.provider_session_id = Some("known-native-history".into());
+        broker.save_session()?;
+        broker.apply_turn_observation(
+            &exchange,
+            &address,
+            &crate::provider::TurnUpdate::Started { started_at_ms: 101 },
+        )?;
+        assert_eq!(
+            broker.session.provider_session_id.as_deref(),
+            Some("known-native-history")
+        );
+        let completion = ProviderCompletion {
+            native: forge_provider_api::completion::ProviderCompletion {
+                capability: broker.capability.clone(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        broker.stage_host_completion(&mut exchange, completion, PromptMode::Chat)?;
+        assert_eq!(
+            broker.session.provider_session_id.as_deref(),
+            Some("known-native-history")
+        );
+        assert_eq!(
+            broker
+                .store
+                .load_session(&broker.session.id)?
+                .unwrap()
+                .provider_session_id
+                .as_deref(),
+            Some("known-native-history")
+        );
+        Ok(())
+    }
 
     #[test]
     fn rejected_callback_cannot_reappear_in_stale_terminal_effects() -> Result<()> {

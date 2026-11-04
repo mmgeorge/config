@@ -8,10 +8,10 @@ pub(crate) use cleanup::{
 mod runtime;
 pub(crate) use inbox::{ObservationEnd, SessionObservationInbox};
 pub(crate) use runtime::{
-    ContinuationAttempt, HostEffectAdmission, HostEffectGuard, HostEffectId, HostEffectKind,
-    HostEffectOutput, NativeReady, OwnerCloseReason, RegistryError, ResultEffectAdmission,
-    SessionExecution, SessionExecutionRegistry, SettlementCell, SettlementCheckout,
-    SettlementError,
+    ContinuationAttempt, ExchangeCollection, HostEffectAdmission, HostEffectGuard, HostEffectId,
+    HostEffectKind, HostEffectOutput, NativeReady, OwnerCloseReason, RegistryError,
+    ResultEffectAdmission, SessionExecution, SessionExecutionRegistry, SettlementCell,
+    SettlementCheckout, SettlementError,
 };
 
 use std::collections::{HashMap, HashSet};
@@ -179,7 +179,10 @@ impl ExecutionState {
         let publication_failure = match &update {
             ExecutionUpdate::PublicationFailed { failure, .. }
             | ExecutionUpdate::ResolutionPublicationFailed { failure, .. } => Some(*failure),
-            _ => None,
+            ExecutionUpdate::Started { .. }
+            | ExecutionUpdate::Finished { .. }
+            | ExecutionUpdate::ResolvedWithoutExecution { .. }
+            | ExecutionUpdate::ObservationLost { .. } => None,
         };
         match update {
             ExecutionUpdate::Started { address } => {

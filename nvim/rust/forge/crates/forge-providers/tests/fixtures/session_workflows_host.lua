@@ -87,7 +87,12 @@ end
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 
+local wait_exchange
 local function request(method, parameter, target_session)
+  local previous_count
+  if method == "session.prompt.submit" or method == "session.goal.set" then
+    previous_count = #request("session.exchange.list", {}, target_session)
+  end
   if method ~= "session.command.operation.get" then print("ACP request: " .. provider .. " " .. method) end
   local settled, value, failure
   local function receive(result, error)
@@ -124,7 +129,35 @@ local function request(method, parameter, target_session)
   }))
   assert(not failure, method .. ": " .. tostring(failure))
   if method ~= "session.command.operation.get" then print("ACP response: " .. provider .. " " .. method) end
+  -- Submission responds after durable admission; fixture assertions separately await execution.
+  if previous_count then wait_exchange(previous_count, timeout, target_session) end
   return value
+end
+
+wait_exchange = function(previous_count, timeout, target_session)
+  local observed, snapshot
+  local answered = {}
+  assert(vim.wait(timeout or 90000, function()
+    for _, approval in ipairs(state.approval or {}) do
+      if not answered[approval.id] then
+        answered[approval.id] = true
+        local answer_list = {}
+        for _, item in ipairs(approval.item_list or {}) do
+          answer_list[#answer_list + 1] = { item_id = item.id, choice_id = "allow_once" }
+        end
+        client.request({ method = "session.approval.resolve", params = { approval_id = approval.id, answer_list = answer_list },
+          session_id = target_session or assert(state.session).id }, function(_, error) assert(not error, error) end)
+      end
+    end
+    observed = request("session.exchange.list", {}, target_session)
+    if #observed <= previous_count then return false end
+    local latest = observed[#observed]
+    if latest.state == "complete" or latest.state == "failed" then return true end
+    snapshot = request("session.state.get", {}, target_session)
+    return snapshot.active_elicitation ~= nil and snapshot.active_elicitation ~= vim.NIL and not state.busy
+  end, 100), "execution did not settle after command admission: " .. vim.inspect({ exchange = observed, snapshot = snapshot, data_root = data }))
+  assert(observed[#observed].state ~= "failed", vim.inspect(observed[#observed]))
+  return observed[#observed]
 end
 
 local function settle(operation)
@@ -362,7 +395,9 @@ local succeeded, failure = xpcall(function()
     end
     assert(file_diff, "file diff capability was not reported")
     if provider == "antigravity" then
-      assert(file_diff.support == "limited", "Antigravity hid its structured diff limitation")
+      assert(type(file_diff.support) == "table" and file_diff.support.limited
+        and vim.tbl_contains(file_diff.support.limited.restrictions, "unstructured_diffs"),
+        "Antigravity hid its typed structured diff limitation")
       local file_tool = false
       for _, turn in ipairs(exchange[#exchange].turn) do
         for _, tool in pairs(turn.tool.item) do
@@ -481,12 +516,14 @@ local succeeded, failure = xpcall(function()
         for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
           if line:match("^ACTIVE_SETTINGS_STARTED") then return true end
         end
-        return settled
+        assert(not failure, tostring(failure))
+        return false
       end, 10), "active-settings prompt did not stream its start marker")
-      assert(not settled, "active-settings prompt completed before the configuration change: " .. tostring(failure))
+      assert(settled and not failure, "submit command did not acknowledge durable admission")
+      assert(state.busy, "active-settings execution completed before the configuration change")
       local operation_id = set_resource(resources[1], false, 90000)
-      assert(vim.wait(10000, function() return settled end, 10), "interrupted request did not settle")
-      assert(not failure or detail and (detail.code == "turn_cancelled" or detail.code == "turn_retracted"), tostring(failure))
+      wait_exchange(#before_exchange, 90000)
+      assert(not failure, tostring(failure))
       local after = request("session.state.get")
       assert(after.session.provider_session_id == before.session.provider_session_id, "active configuration replaced provider history")
       local resumed_exchange = request("session.exchange.list")
@@ -540,6 +577,7 @@ local succeeded, failure = xpcall(function()
     request("session.permission.set", { change = { kind = "set_approval", mode = "ask" } })
     assert(request("session.state.get").session.approval_mode == "ask", "approval fixture must use Read permission")
     print("ACP settings restart and history continuity passed: " .. provider)
+    local approval_exchange_count = #request("session.exchange.list")
     local settled, prompt_error, answered = false, nil, {}
     client.request({ method = "session.prompt.submit", params = { text = "Create approval-test.txt containing APPROVED_ONCE using a file-edit tool. Do not use a shell. Then reply APPROVAL_VERIFIED." }, session_id = assert(require("forge.session").harness.session).id }, function(_, request_error)
       prompt_error, settled = request_error, true
@@ -557,7 +595,9 @@ local succeeded, failure = xpcall(function()
           end)
         end
       end
-      return settled
+      if not settled or not next(answered) then return false end
+      local exchanges = request("session.exchange.list")
+      return #exchanges > approval_exchange_count and exchanges[#exchanges].state == "complete"
     end, 20), "approved file edit did not finish")
     assert(not prompt_error, prompt_error)
     assert(next(answered), "provider did not request Read-mode approval: " .. vim.inspect({
@@ -573,15 +613,22 @@ local succeeded, failure = xpcall(function()
     print("ACP Yolo file workflow passed: " .. provider)
   end
   if vim.g.forge_acp_test_lifecycle then
-    local settled, failure_detail = false, nil
-    client.request({ method = "session.prompt.submit", params = { text = "Write a detailed 2000-word explanation of asynchronous state machines. Do not use tools." }, session_id = assert(require("forge.session").harness.session).id }, function(_, error, detail)
-      failure_detail, settled = error and detail, true
+    local previous = #request("session.exchange.list")
+    local admitted, command_error = false, nil
+    client.request({ method = "session.prompt.submit", params = { text = "Begin with CANCEL_READY on its own line, then write a detailed 2000-word explanation of asynchronous state machines. Do not use tools." }, session_id = assert(state.session).id }, function(_, error)
+      command_error, admitted = error, true
     end)
-    vim.wait(1000, function() return settled end, 10)
-    assert(not settled, "cancellation fixture completed before interruption")
+    assert(vim.wait(30000, function()
+      local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+      return admitted and text:find("CANCEL_READY", 1, true) and state.busy
+    end, 10), "cancellation fixture did not reach active generation")
+    assert(not command_error, tostring(command_error))
     request("session.turn.cancel")
-    assert(vim.wait(10000, function() return settled end, 10), "cancelled provider turn did not settle")
-    assert(failure_detail and failure_detail.code == "turn_cancelled", vim.inspect(failure_detail))
+    local cancelled = request("session.exchange.list")
+    assert(#cancelled == previous + 1 and cancelled[#cancelled].completed_at_ms ~= nil,
+      "cancel command did not await execution settlement: " .. vim.inspect(cancelled[#cancelled]))
+    local outcome = cancelled[#cancelled].turn[#cancelled[#cancelled].turn].state.outcome
+    assert(outcome == "cancelled" or outcome == "interrupted", "cancellation lost terminal evidence: " .. vim.inspect(outcome))
     request("session.prompt.submit", { text = "Reply with exactly AFTER_CANCEL. Do not call tools." })
     local resumed = request("session.state.get")
     assert(resumed.session.provider_session_id == snapshot.session.provider_session_id, "cancellation replaced provider history")
@@ -615,6 +662,10 @@ local succeeded, failure = xpcall(function()
     local question = pending.elicitation.question_set.questions[1]
     request("session.question.answer", { question_id = question.id, response = { kind = "selected", option = "Alpha" } })
     request("session.question.continue")
+    assert(vim.wait(90000, function()
+      local exchanges = request("session.exchange.list")
+      return exchanges[#exchanges].id == exchange_id and exchanges[#exchanges].state == "complete"
+    end, 100), "question continuation did not settle its exchange")
     require("forge.views.picker").close(false)
     local completed = request("session.exchange.list")
     assert(completed[#completed].id == exchange_id and completed[#completed].state == "complete", vim.inspect(completed[#completed]))

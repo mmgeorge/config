@@ -1,10 +1,14 @@
 vim.loader.enable(false)
 local client = require("forge.client")
+local input = require("forge.views.harness.input_state")
+local state = { session = { id = "publication" } }
+local host = dofile("nvim/tests/forge/support/input.lua").new(state)
 local requests = {}
 client.host_is_accepting = function() return true end
 client.request = function(request_specification, callback)
   local params = request_specification.params or {}
 
+  if host.request(request_specification.method, params, callback) then return end
   callback = dofile("nvim/tests/forge/support/presentation_status.lua")(params, callback)
   if params.operation == "background_terminals" then callback({ supported = false }) return end
   requests[#requests + 1] = { params = params, callback = callback, time = vim.uv.hrtime() }
@@ -64,6 +68,7 @@ requests[3].callback({ patch = {} })
 timer:stop()
 timer:close()
 assert(observations > 0)
+input.attach(state, function() end)
 ---@type string[]
 local prompt_rows = {}
 for index = 1, 5000 do prompt_rows[index] = string.rep("complete prompt ", 5) end
@@ -71,14 +76,15 @@ local prompt = table.concat(prompt_rows, "\n")
 assert(#prompt > 65536)
 vim.api.nvim_buf_set_lines(composer, 0, -1, false, prompt_rows)
 local submitted = false
-require("forge.views.harness.prompt_submission").start({ session = { id = "publication" } },
+require("forge.views.harness.prompt_submission").start(state,
   { text = prompt, context = assert(owner.capture_prompt()) }, function(result, failure)
   assert(result and not failure, failure)
   submitted = true
 end)
-local submission = requests[#requests]
-assert(submission.params.text == prompt, "large composer draft lost content")
-submission.callback({ accepted = true })
+local submission = host.requests[#host.requests]
+assert(submission.parameters.action.kind == "submit"
+  and submission.parameters.action.message.text == prompt, "large composer draft lost content")
+host.complete(submission)
 assert(submitted, "large composer submission did not finish")
 owner.sync()
 assert(owner.close())

@@ -16,7 +16,7 @@ pub(super) enum ActiveCommand {
     Agent(Box<AgentCommandRun>),
     /// Rollback retains native collection and detached filesystem work.
     Rollback(Box<RollbackRun>),
-    /// Task control retains collection, atomic mutation, and required goal synchronization.
+    /// Task control retains collection, atomic mutation, and journaled input scheduling.
     Task(Box<TaskCommandRun>),
     /// Input admission/editing has a finite preparation and commit boundary.
     Input(InputCommandRun),
@@ -112,19 +112,19 @@ impl ActiveCommand {
         }
     }
 
-    /// Apply confirmed dispatch to a matching active configuration without another command.
+    /// Apply confirmed dispatch to the task operation awaiting its exact handoff.
     pub(super) fn observe_dispatch(
         &mut self,
         work: uuid::Uuid,
         confirmation: &forge_provider_api::submission::DispatchConfirmation,
     ) {
         match self {
-            Self::NativeCommand(run) => run.observe_dispatch(work, confirmation),
             Self::Task(run) => run.observe_dispatch(work, confirmation),
             Self::Agent(_)
             | Self::Rollback(_)
             | Self::Input(_)
             | Self::Configuration(_)
+            | Self::NativeCommand(_)
             | Self::Cancel { .. } => {}
         }
     }
@@ -132,12 +132,12 @@ impl ActiveCommand {
     /// Fail the dispatch wait if its foreground ends without confirmed transport handoff.
     pub(super) fn dispatch_lost(&mut self, work: uuid::Uuid) {
         match self {
-            Self::NativeCommand(run) => run.dispatch_lost(work),
             Self::Task(run) => run.dispatch_lost(work),
             Self::Agent(_)
             | Self::Rollback(_)
             | Self::Input(_)
             | Self::Configuration(_)
+            | Self::NativeCommand(_)
             | Self::Cancel { .. } => {}
         }
     }
@@ -146,27 +146,16 @@ impl ActiveCommand {
     pub(super) async fn next(&mut self, foreground: ForegroundStatus) -> CommandEvent {
         match self {
             Self::Agent(run) => CommandEvent::Agent(run.next().await),
-            Self::Rollback(run) => CommandEvent::Rollback(run.next(foreground).await),
-            Self::Task(run) => CommandEvent::Task(run.next(foreground).await),
+            Self::Rollback(run) => CommandEvent::Rollback(run.next(foreground.clone()).await),
+            Self::Task(run) => CommandEvent::Task(run.next(foreground.clone()).await),
             Self::Input(run) => CommandEvent::Input(run.next().await),
             Self::Configuration(_) => CommandEvent::Configuration,
-            Self::NativeCommand(run) => CommandEvent::NativeCommand(run.next(foreground).await),
-            Self::Cancel { transition, .. } => {
-                CommandEvent::Cancel(transition.next(foreground).await)
+            Self::NativeCommand(run) => {
+                CommandEvent::NativeCommand(run.next(foreground.clone()).await)
             }
-        }
-    }
-
-    /// Allow an active task command's required internal goal effect to run without releasing its FIFO slot.
-    pub(super) fn needs_goal_sync(&self) -> bool {
-        match self {
-            Self::Task(run) => run.needs_goal_sync(),
-            Self::Agent(_)
-            | Self::Rollback(_)
-            | Self::Input(_)
-            | Self::Configuration(_)
-            | Self::NativeCommand(_)
-            | Self::Cancel { .. } => false,
+            Self::Cancel { transition, .. } => {
+                CommandEvent::Cancel(transition.next(foreground.clone()).await)
+            }
         }
     }
 }
@@ -177,7 +166,7 @@ pub(super) enum CommandEvent {
     Agent(AgentCommandEvent),
     /// Rollback collection or detached file work produced one retained fact.
     Rollback(RollbackEvent),
-    /// Task control has a correlated collection, commit, or goal-synchronization fact.
+    /// Task control has a correlated collection, commit, or input scheduling fact.
     Task(TaskCommandEvent),
     /// A local configuration command is ready for its owner-controlled commit.
     Configuration,

@@ -79,7 +79,7 @@ impl OwnerShutdown {
     pub(super) async fn next(&mut self, foreground: ForegroundStatus) -> ShutdownEvent {
         match &mut self.state {
             ShutdownState::Collecting(transition) => {
-                ShutdownEvent::Transition(transition.next(foreground).await)
+                ShutdownEvent::Transition(transition.next(foreground.clone()).await)
             }
             ShutdownState::Recovering(task) => ShutdownEvent::Recovered(Box::new(task.await)),
             ShutdownState::Retiring(task) => ShutdownEvent::Retired(task.await),

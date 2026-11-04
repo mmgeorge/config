@@ -7,6 +7,7 @@ mod acp;
 mod codex;
 mod copilot;
 mod mock;
+mod pending_input;
 mod retained_task;
 mod terminal;
 mod tool_display;

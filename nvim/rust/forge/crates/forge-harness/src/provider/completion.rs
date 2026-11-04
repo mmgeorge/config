@@ -156,7 +156,7 @@ impl CompletionSlot {
 
 fn publication_failure() -> ProviderError {
     ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-        forge_provider_api::ProviderOperation::HostEffectPublication,
+        forge_provider_api::ProviderOperation::InputSubmit,
         forge_provider_api::ProviderFailureKind::Runtime,
     ))
 }

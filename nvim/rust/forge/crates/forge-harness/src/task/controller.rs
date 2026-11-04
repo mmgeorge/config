@@ -47,35 +47,31 @@ pub(crate) struct SessionTaskController {
 }
 
 impl SessionTaskController {
-    /// Serialize provider goal writes independently from synchronous task mutations.
-    pub(crate) fn native_goal_lane(&self) -> Arc<tokio::sync::Mutex<()>> {
-        self.admission.native_goal_lane()
+    /// Serialize configuration writes with generation retirement.
+    pub(crate) fn configuration_lane(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.admission.configuration_lane()
     }
 
-    pub(crate) fn native_goal_written(&self) -> Result<u64> {
-        self.admission.native_goal_written()
+    /// Block admission after an uncertain configuration mutation.
+    pub(crate) fn mark_configuration_uncertain(&self) {
+        self.admission.mark_configuration_uncertain();
     }
-    pub(crate) fn native_goal_epoch(&self) -> u64 {
-        self.admission.native_goal_epoch()
+
+    /// Reject another configuration write until generation recovery completes.
+    pub(crate) fn ensure_configuration_certain(&self) -> Result<()> {
+        self.admission.ensure_configuration_certain()
     }
-    pub(crate) fn mark_native_goal_uncertain(&self) {
-        self.admission.mark_native_goal_uncertain();
+
+    /// Get whether configuration mutation requires generation recovery.
+    pub(crate) fn configuration_is_uncertain(&self) -> bool {
+        self.admission.configuration_is_uncertain()
     }
-    pub(crate) fn ensure_native_goal_certain(&self) -> Result<()> {
-        self.admission.ensure_native_goal_certain()
+
+    /// Clear uncertainty after the old provider generation has been collected.
+    pub(crate) fn reset_configuration_generation(&self) -> Result<()> {
+        self.admission.reset_configuration_generation()
     }
-    pub(crate) fn native_goal_is_uncertain(&self) -> bool {
-        self.admission.native_goal_is_uncertain()
-    }
-    pub(crate) fn reset_native_goal_generation(&self) -> Result<()> {
-        self.admission.reset_native_goal_generation()
-    }
-    pub(crate) fn acknowledge_native_goal(&self, epoch: u64) {
-        self.admission.acknowledge_native_goal(epoch);
-    }
-    pub(crate) async fn wait_native_goal_acknowledged(&self, epoch: u64) {
-        self.admission.wait_native_goal_acknowledged(epoch).await;
-    }
+
     /// Commit a typed observation under the task revision that admitted its operation.
     pub(crate) fn apply(
         &self,
@@ -760,12 +756,9 @@ impl SessionTaskController {
                 }
                 let previous = task.clone();
                 let decision = match &mut task.workflow {
-                    WorkflowSnapshot::Goal { goal } => crate::goal::observe(
-                        &mut goal.state,
-                        &mut goal.continuation,
-                        goal.native,
-                        evidence,
-                    ),
+                    WorkflowSnapshot::Goal { goal } => {
+                        crate::goal::observe(&mut goal.state, &mut goal.continuation, evidence)
+                    }
                     WorkflowSnapshot::Execute { execution } => {
                         evidence.structured_complete = false;
                         let mut state = match execution.record.state {
@@ -776,12 +769,8 @@ impl SessionTaskController {
                             PlanExecutionState::Complete => GoalState::Complete,
                             PlanExecutionState::Cancelled => GoalState::Cleared,
                         };
-                        let decision = crate::goal::observe(
-                            &mut state,
-                            &mut execution.continuation,
-                            false,
-                            evidence,
-                        );
+                        let decision =
+                            crate::goal::observe(&mut state, &mut execution.continuation, evidence);
                         execution.record.state = match state {
                             GoalState::Active => PlanExecutionState::Active,
                             GoalState::Paused => PlanExecutionState::Paused,
@@ -1065,12 +1054,7 @@ impl SessionTaskController {
             .change(
                 &mut store,
                 None,
-                TaskChange::Install(Box::new(Task::goal(
-                    "Finish".into(),
-                    Default::default(),
-                    false,
-                    1,
-                ))),
+                TaskChange::Install(Box::new(Task::goal("Finish".into(), Default::default(), 1))),
                 1,
             )
             .unwrap();
@@ -1178,7 +1162,7 @@ impl SessionTaskController {
                     }
                 }
                 TaskCommand::Pause(_) | TaskCommand::Clear(_) => {
-                    crate::exchange::journal::TaskCommandCommit::AwaitGoal {
+                    crate::exchange::journal::TaskCommandCommit::Complete {
                         command: id.clone(),
                         outcome: outcome.clone(),
                     }
@@ -1233,8 +1217,6 @@ impl SessionTaskController {
                             command: id.clone(),
                             task: selected,
                             source: source.clone(),
-                            completion:
-                                crate::exchange::journal::TaskAttachmentCompletion::Complete,
                         },
                     ),
                     ..Default::default()
@@ -1329,8 +1311,6 @@ impl SessionTaskController {
                             command: id.clone(),
                             task: selected.clone(),
                             source,
-                            completion:
-                                crate::exchange::journal::TaskAttachmentCompletion::AwaitGoal,
                         });
                     TaskCommandCheckpoint::Control {
                         outcome: Box::new(crate::exchange::command::TaskCommandOutcome::Attached {
@@ -1617,17 +1597,11 @@ impl SessionTaskController {
                 },
                 _ => return Err(TaskCommandFailure::IdentityConflict.into()),
             };
-            effects.owner_task_commit = Some(if finite {
-                crate::exchange::journal::TaskCommandCommit::Complete {
+            effects.owner_task_commit =
+                Some(crate::exchange::journal::TaskCommandCommit::Complete {
                     command: id.clone(),
                     outcome: outcome.clone(),
-                }
-            } else {
-                crate::exchange::journal::TaskCommandCommit::AwaitGoal {
-                    command: id.clone(),
-                    outcome: outcome.clone(),
-                }
-            });
+                });
             Ok((
                 TaskCommandCheckpoint::Control {
                     outcome: Box::new(outcome),
@@ -2242,7 +2216,6 @@ fn goal_view(task: &super::active::TaskSnapshot) -> Result<super::GoalSnapshot> 
                 PlanExecutionState::Cancelled => GoalState::Cleared,
             },
             continuation: execution.continuation.clone(),
-            native: false,
             observed_checkpoint: execution.record.observed_checkpoint.clone(),
             reported_status: None,
         },
@@ -2465,7 +2438,6 @@ mod tests {
         let mut task = Task::goal(
             "Keep first acknowledgement".into(),
             ContinuationBudget::new(20, 2),
-            false,
             2,
         );
         task.request_entry("Start once".into(), 2)?;
@@ -2540,7 +2512,7 @@ mod tests {
     fn task_entry_commit_and_acknowledgement_fence_control_admission() -> Result<()> {
         let (_root, mut store, controller) = SessionTaskController::test_goal();
         let previous = controller.current()?.unwrap();
-        let mut task = Task::goal("New goal".into(), Default::default(), false, 2);
+        let mut task = Task::goal("New goal".into(), Default::default(), 2);
         task.request_entry("Work on the new goal".into(), 2)?;
         let command = super::super::TaskOperation {
             revision: 0,
@@ -2856,7 +2828,6 @@ mod tests {
                 TaskChange::Install(Box::new(Task::goal(
                     "Replacement".into(),
                     Default::default(),
-                    false,
                     2,
                 ))),
                 2,
@@ -2904,7 +2875,6 @@ mod tests {
                 TaskChange::Install(Box::new(Task::goal(
                     "Finish".into(),
                     ContinuationBudget::default(),
-                    false,
                     1,
                 ))),
                 1,

@@ -121,7 +121,7 @@ local success, failure = xpcall(function()
   if lost then
     local failure_text = tostring(second_error) .. table.concat(errors, " | ")
     assert(failure_text:find("uncertain delivery", 1, true), failure_text)
-    assert(failure_text:find("ACP prompt failed:", 1, true), failure_text)
+    assert(not failure_text:find("session/prompt", 1, true), "native protocol detail escaped normalization: " .. failure_text)
   else
     assert(not native[2]:find("FIRST_SUBMISSION_MARKER", 1, true), "accepted input was replayed as missing context")
     assert(native[2]:find("SECOND_SUBMISSION_MARKER", 1, true), "follow-up input was lost")

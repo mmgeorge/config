@@ -133,7 +133,7 @@ async fn native_compaction_updates_keep_summary_and_operation_scope() {
     let owner = ExecutionOwner::root("fixture");
     let scope = forge_provider_api::EventScope::SessionOperation {
         owner,
-        operation_id: "compact-fixture".into(),
+        operation_id: forge_provider_api::OperationId::new("compact-fixture").unwrap(),
     };
     let binding = forge_provider_api::BindingId::new("fixture-binding").unwrap();
     let (sink, mut stream) = events::channel(binding, scope.clone());

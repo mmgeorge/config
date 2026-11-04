@@ -10,10 +10,12 @@ use crate::broker::{HarnessBroker, PriorFinalization, PriorFinalizationAction};
 use crate::provider::{ExchangeId, ProviderError};
 
 /// Report the owner's actual foreground availability, without inspecting semaphore counts.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) enum ForegroundStatus {
     /// An admitted foreground transaction still owns work or settlement.
-    Active,
+    Active(crate::provider::InvocationScope),
+    /// Owned host work has not admitted a provider invocation.
+    Local,
     /// No foreground transaction owns work.
     Quiescent,
     /// Prior cleanup did not establish usable execution availability.
@@ -64,6 +66,16 @@ pub(super) enum TransitionOutcome {
     Reconfigured { exchange: Option<ExchangeId> },
 }
 
+/// Retain the exact invocation owner selected before asynchronous cancellation.
+#[derive(Clone)]
+struct InvocationCollection {
+    engine: std::sync::Arc<crate::provider::session_execution::SessionExecution>,
+    scope: crate::provider::InvocationScope,
+    collection: std::sync::Arc<
+        std::sync::Mutex<Option<crate::provider::session_execution::ExchangeCollection>>,
+    >,
+}
+
 /// Keep legacy admission and child resource gates owned until cancellation settles.
 pub(super) struct ControlOwnership {
     control: Option<OwnedSemaphorePermit>,
@@ -76,11 +88,39 @@ pub(super) struct ExchangeTransition {
     intent: TransitionIntent,
     stage: TransitionStage,
     generation: Option<ProviderGenerationPermit>,
+    invocation: Option<InvocationCollection>,
     uncommitted: Option<TransitionEvent>,
     foreground_signals: std::collections::VecDeque<crate::broker::ForegroundSignal>,
 }
 
 impl ExchangeTransition {
+    /// Authorize a configured successor only after this exact reconfiguration has drained.
+    pub(super) fn authorize_replacement(
+        &self,
+        selected: &ExchangeId,
+    ) -> Result<Option<tokio::task::JoinHandle<Result<(), ProviderError>>>, TransitionFailure> {
+        if !matches!(self.intent, TransitionIntent::Reconfigure { .. })
+            || !matches!(self.stage, TransitionStage::Ready { .. })
+        {
+            return Err(TransitionFailure::Uncertain);
+        }
+        let Some(invocation) = self.invocation.clone() else {
+            return Ok(None);
+        };
+        if &invocation.scope.exchange_id != selected {
+            return Err(TransitionFailure::Rejected(CommandFailure::ExchangeChanged));
+        }
+        let collection = invocation
+            .collection
+            .lock()
+            .map_err(|_| TransitionFailure::Uncertain)?
+            .take()
+            .ok_or(TransitionFailure::Uncertain)?;
+        Ok(Some(tokio::spawn(async move {
+            invocation.engine.resume_exchange(collection).await
+        })))
+    }
+
     /// Transfer ordered collection decisions to the owner-held foreground before reading native events.
     pub(super) fn take_collection_signal(&mut self) -> Option<crate::broker::ForegroundSignal> {
         self.foreground_signals.pop_front()
@@ -206,6 +246,7 @@ impl ExchangeTransition {
             intent,
             stage: TransitionStage::Acquiring(task),
             generation,
+            invocation: None,
             uncommitted: None,
             foreground_signals: std::collections::VecDeque::new(),
         }
@@ -227,7 +268,7 @@ impl ExchangeTransition {
                 () = tokio::time::sleep_until(*deadline) => TransitionEvent::CollectionDeadline,
             },
             TransitionStage::Draining { deadline, .. } => match foreground {
-                ForegroundStatus::Active => {
+                ForegroundStatus::Active(_) | ForegroundStatus::Local => {
                     tokio::time::sleep_until(*deadline).await;
                     TransitionEvent::CollectionDeadline
                 }
@@ -326,8 +367,31 @@ impl ExchangeTransition {
                 else {
                     unreachable!("acquired control ownership was installed before preparation")
                 };
-                let native = matches!(foreground, ForegroundStatus::Active)
-                    || matches!(view.execution, crate::broker::ControlExecution::Native)
+                let scope = match &foreground {
+                    ForegroundStatus::Active(scope) => Some(scope.clone()),
+                    ForegroundStatus::Local
+                    | ForegroundStatus::Quiescent
+                    | ForegroundStatus::Unavailable => view.steering_scope.clone(),
+                };
+                self.invocation = scope
+                    .map(|scope| {
+                        let engine = broker
+                            .execution_registry()
+                            .existing_owner(&scope.owner)
+                            .map_err(|error| TransitionFailure::Domain(error.into()))?
+                            .ok_or(TransitionFailure::Uncertain)?;
+                        Ok::<_, TransitionFailure>(InvocationCollection {
+                            engine,
+                            scope,
+                            collection: Default::default(),
+                        })
+                    })
+                    .transpose()?;
+                let native = matches!(
+                    foreground,
+                    ForegroundStatus::Active(_) | ForegroundStatus::Local
+                ) || matches!(view.execution, crate::broker::ControlExecution::Native)
+                    || self.invocation.is_some()
                     || check.is_some();
                 if native {
                     self.foreground_signals.push_back(
@@ -347,8 +411,9 @@ impl ExchangeTransition {
                     let services = services.clone();
                     let children = self.intent.children();
                     let generation = self.generation.clone();
+                    let invocation = self.invocation.clone();
                     let task = tokio::spawn(async move {
-                        collect_resources(&services, check, children, generation).await
+                        collect_resources(&services, check, children, generation, invocation).await
                     });
                     self.stage = TransitionStage::Collecting {
                         target: view.selection,
@@ -622,6 +687,7 @@ impl ExchangeTransition {
             compactions: Vec::new(),
             lost_compactions: Vec::new(),
             generation: self.generation,
+            invocation: self.invocation,
             uncommitted: self.uncommitted,
         }
     }
@@ -654,6 +720,7 @@ pub(super) struct RetainedTransition {
     intent: TransitionIntent,
     jobs: Vec<tokio::task::JoinHandle<Result<(), ProviderError>>>,
     generation: Option<ProviderGenerationPermit>,
+    invocation: Option<InvocationCollection>,
     compaction_jobs: Vec<(
         super::command::ContextCompactionId,
         tokio::task::JoinHandle<crate::broker::CompactionResult>,
@@ -681,6 +748,7 @@ impl RetainedTransition {
             compactions: Vec::new(),
             lost_compactions: Vec::new(),
             generation: None,
+            invocation: None,
             uncommitted: None,
         }
     }
@@ -869,6 +937,7 @@ impl RetainedTransition {
                     check,
                     self.intent.children(),
                     self.generation.clone(),
+                    self.invocation.clone(),
                 )
                 .await
             }
@@ -1074,12 +1143,13 @@ async fn collect_resources(
     check: Option<String>,
     child_policy: ChildCollectionPolicy,
     generation: Option<ProviderGenerationPermit>,
+    invocation: Option<InvocationCollection>,
 ) -> Result<(), ProviderError> {
     let generation = match generation {
         Some(generation) => generation,
         None => services.observe_provider_generation().await,
     };
-    let provider = generation.provider();
+    let _generation = generation;
     let session = services.observer.session_id();
     let owner = crate::provider::ExecutionOwner::root(session);
     let approvals = services
@@ -1087,7 +1157,19 @@ async fn collect_resources(
         .cancel_owner(&owner, None)
         .await
         .map_err(collection_failure);
-    let native = provider.cleanup_execution(session).await;
+    let native = match invocation {
+        Some(invocation) => match invocation.engine.collect_exchange(invocation.scope).await {
+            Ok(collection) => match invocation.collection.lock() {
+                Ok(mut slot) => {
+                    *slot = Some(collection);
+                    Ok(())
+                }
+                Err(_) => Err(ProviderError::DeliveryUncertain),
+            },
+            Err(error) => Err(error),
+        },
+        None => Ok(()),
+    };
     let host = async {
         if let Some(id) = check {
             loop {
@@ -1127,10 +1209,17 @@ async fn collect_resources(
 
 /// Normalize an existing host-effect error at the generic collection boundary.
 fn collection_failure(error: anyhow::Error) -> ProviderError {
-    crate::provider::lifecycle_error::classify(
-        forge_provider_api::ProviderOperation::HostEffectPublication,
+    let error = crate::provider::lifecycle_error::classify(
+        forge_provider_api::ProviderOperation::Cancel,
         error,
-    )
+    );
+    if let ProviderError::Failure(failure) = error {
+        return ProviderError::Failure(failure.at_phase(
+            forge_provider_api::ProviderPhase::Collection,
+            forge_provider_api::FailureDisposition::Uncertain,
+        ));
+    }
+    error
 }
 
 /// Keep native observation loss distinct from an uncommitted host-state write.

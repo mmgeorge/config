@@ -6,7 +6,7 @@ Optional fields serialize as JSON null unless an explicit skip rule says otherwi
 
 Session and snapshot revisions belong to one `runtime_epoch`. An asynchronous callback must still own the captured session, host generation, and epoch before applying these values. A snapshot does not transfer ownership of an interactive session. Exchange and timeline content arrive through their document or exchange APIs, rather than the skipped native fields below.
 
-`SessionPurpose` defaults to `conversation` for older records. Internal Plan Review answer forks use `plan_review_answer`, remain available through explicit session access, and do not compete with user conversations during automatic startup selection. This purpose is selected by the native fork caller, not by the public request payload.
+`SessionPurpose` defaults to `conversation` for newly constructed session values. Stored sessions must still carry current host contract version 61; a missing or older version rejects before changed payloads decode. Internal Plan Review answer forks use `plan_review_answer`, remain available through explicit session access, and do not compete with user conversations during automatic startup selection. This purpose is selected by the native fork caller, not by the public request payload.
 
 ## InitializeRequest
 
@@ -27,10 +27,10 @@ pub struct InitializeRequest {
     pub permission_file: Option<String>,
     pub workspace: String,
     pub client_id: String,
-    pub backend: BackendLaunch,
+    pub provider: ProviderLaunch,
     #[serde(default)]
     /// Supplies explicit launch descriptors for cross-provider children.
-    pub backend_launch_by_provider: HashMap<String, BackendLaunch>,
+    pub provider_launch_by_provider: HashMap<String, ProviderLaunch>,
     #[serde(default = "default_model")]
     pub model: String,
     #[serde(default = "default_effort")]
@@ -75,7 +75,7 @@ pub struct BrokerSnapshot {
     pub session: HarnessSession,
     #[serde(skip)]
     pub exchange: Vec<Exchange>,
-    pub capability: BackendCapability,
+    pub capability: ProviderCapability,
     pub no_checkpoint: bool,
     pub restore_recovery: Option<Value>,
     pub active_plan: Option<PlanRecord>,
@@ -215,7 +215,7 @@ pub struct ActiveTask {
 Source: [session/mod.rs](../../../rust/forge/crates/forge-harness/src/session/mod.rs).
 
 ```rust
-/// Represents one durable conversation and its backend identity.
+/// Represents one durable conversation and its provider identity.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HarnessSession {
     /// Controls automatic resumption while retaining explicit access to every session.
@@ -235,8 +235,8 @@ pub struct HarnessSession {
     pub primary_agent_id: String,
     pub name: String,
     pub workspace: String,
-    pub backend: String,
-    pub backend_session_id: Option<String>,
+    pub provider: String,
+    pub provider_session_id: Option<String>,
     pub provider_checkpoint_id: Option<String>,
     pub provider_fork_state: ProviderForkState,
     pub model: String,
@@ -258,7 +258,7 @@ pub struct HarnessSession {
     #[serde(default)]
     pub context_window: Option<String>,
     #[serde(default)]
-    pub service_tier: crate::backend::ServiceTier,
+    pub service_tier: crate::provider::ServiceTier,
     #[serde(default)]
     pub access: crate::session::AccessPolicy,
     #[serde(default)]
@@ -373,7 +373,7 @@ pub enum SessionPhase {
         activity: WorkflowActivity,
     },
     RetryingProvider {
-        retry: crate::backend::retry::ProviderRetry,
+        retry: crate::provider::retry::ProviderRetry,
         activity: WorkflowActivity,
     },
     PlanningFailed {
@@ -691,27 +691,30 @@ pub struct AttachmentSelection {
 }
 ```
 
-## BackendLaunch
+## ProviderLaunch
 
-Source: [backend/contract.rs](../../../rust/forge/crates/forge-harness/src/backend/contract.rs).
+Source: [model.rs](../../../rust/forge/crates/forge-provider-api/src/model.rs).
 
 ```rust
-/// Represents one executable backend launch descriptor.
+/// Represents one executable provider launch descriptor.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BackendLaunch {
-    pub kind: String,
+pub struct ProviderLaunch {
+    pub kind: ProviderId,
     pub command: Vec<String>,
 }
 ```
 
-## BackendCapability
+## ProviderCapability
 
-Source: [backend/contract.rs](../../../rust/forge/crates/forge-harness/src/backend/contract.rs).
+Source: [model.rs](../../../rust/forge/crates/forge-provider-api/src/model.rs).
 
 ```rust
-/// Represents backend features that control visible Harness actions.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct BackendCapability {
+/// Represents provider features that control visible Harness actions.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+pub struct ProviderCapability {
+    /// Integration-owned support declarations consumed without provider identity switches.
+    #[serde(default)]
+    pub integration: ProviderIntegration,
     #[serde(default)]
     /// Enables OS isolation controls only for providers on the sandbox allowlist.
     pub os_sandbox: bool,
@@ -723,7 +726,6 @@ pub struct BackendCapability {
     pub compaction: CompactionCapability,
     pub native_steer: bool,
     pub native_turn_rollback: bool,
-    pub native_goal: bool,
     pub model_selection: bool,
     pub effort_selection: bool,
     pub fast_mode: bool,
@@ -741,35 +743,36 @@ pub struct BackendCapability {
 }
 ```
 
-## BackendContextWindow
+## ProviderContextWindow
 
-Source: [backend/contract.rs](../../../rust/forge/crates/forge-harness/src/backend/contract.rs).
+Source: [model.rs](../../../rust/forge/crates/forge-provider-api/src/model.rs).
 
 ```rust
 /// Represents one selectable context-window tier advertised by a provider.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct BackendContextWindow {
+pub struct ProviderContextWindow {
     pub id: String,
     pub token_limit: Option<u64>,
 }
 ```
 
-## BackendModel
+## ProviderModel
 
-Source: [backend/contract.rs](../../../rust/forge/crates/forge-harness/src/backend/contract.rs).
+Source: [model.rs](../../../rust/forge/crates/forge-provider-api/src/model.rs).
 
 ```rust
 /// Represents one model and the controls advertised by its provider.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BackendModel {
+pub struct ProviderModel {
     pub id: String,
     #[serde(default)]
     /// Service tiers explicitly advertised for this model.
     pub service_tiers: Vec<ServiceTier>,
+    /// Reasoning choices in ascending effort order, normalized by the adapter.
     pub reasoning: Vec<String>,
     pub default_reasoning: Option<String>,
     pub selected_reasoning: Option<String>,
-    pub context_window: Vec<BackendContextWindow>,
+    pub context_window: Vec<ProviderContextWindow>,
     pub default_context_window: Option<String>,
     pub selected_context_window: Option<String>,
     pub vision: bool,
@@ -781,69 +784,186 @@ pub struct BackendModel {
 
 ## Support
 
-Source: [backend/capability.rs](../../../rust/forge/crates/forge-harness/src/backend/capability.rs).
+Source: [capability.rs](../../../rust/forge/crates/forge-provider-api/src/capability.rs).
 
 ```rust
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 /// Distinguishes supported behavior from provider limitations.
 pub enum Support {
     /// The operation preserves its full Harness contract.
     Supported,
     /// The operation works with the reported restriction.
-    Limited,
+    Limited { restrictions: Vec<CapabilityRestriction> },
     /// The adapter rejects the operation before dispatch.
     Unsupported,
 }
 ```
 
-## Capability
+## CapabilityRestriction
 
-Source: [backend/capability.rs](../../../rust/forge/crates/forge-harness/src/backend/capability.rs).
+Source: [capability.rs](../../../rust/forge/crates/forge-provider-api/src/capability.rs).
 
 ```rust
-#[derive(Clone, Debug, Serialize)]
+/// Encode actionable limits independently of user-facing explanatory text.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityRestriction {
+    /// Enforce filesystem scopes only for operations which use normalized permission callbacks.
+    PermissionCallbacksOnly,
+    /// Native edit tools may omit structured diff output; host checkpoint review remains available.
+    UnstructuredDiffs,
+    /// Provider enterprise terminal policy can execute without normalized approval callbacks.
+    EnterpriseTerminalPolicy,
+    /// Inherited project-native skills remain available despite the explicit portable selection.
+    InheritedSkills,
+    /// Permit only the listed normalized task kinds when steering an active invocation.
+    TaskKinds(Vec<crate::input::TaskKind>),
+    /// Require the exact source checkpoint for history mutation.
+    CheckpointRequired,
+    /// Require settled foreground execution before applying configuration or history mutation.
+    SettledOnly,
+}
+```
+
+## CapabilityId
+
+Source: [capability.rs](../../../rust/forge/crates/forge-provider-api/src/capability.rs).
+
+```rust
+/// Identify a normalized capability independently of provider names or native protocol methods.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityId {
+    Prompt,
+    Cancel,
+    Resume,
+    Cleanup,
+    Tools,
+    Goals,
+    Queue,
+    Undo,
+    Plans,
+    Questions,
+    SessionDelete,
+    NativeFork,
+    NativeCompact,
+    NativeSteer,
+    NativeTurnRollback,
+    CompactionLifecycle,
+    BackgroundCompaction,
+    CompactionSummary,
+    CompactionMetrics,
+    ModelSelection,
+    EffortSelection,
+    FastMode,
+    UltrafastMode,
+    SkillCatalog,
+    McpCatalog,
+    ApprovalRules,
+    OsSandbox,
+    BackgroundTerminals,
+    FileDiff,
+    BackgroundTermination,
+    Recap,
+    RuntimeSetup,
+    Authentication,
+    AgentObserve,
+    AgentSpawn,
+    AgentFollowup,
+    AgentMessage,
+    AgentInterrupt,
+    AgentCrossProvider,
+    LspTools,
+    SubagentTools,
+    SessionTools,
+    NativeAgentSuppression,
+    SkillMutation,
+    NativeImport,
+    McpMutation,
+    McpRuntimeStatus,
+    McpToolCatalog,
+    FilesystemAccess,
+}
+```
+
+## CapabilityOwner
+
+Source: [capability.rs](../../../rust/forge/crates/forge-provider-api/src/capability.rs).
+
+```rust
+/// Identify the layer that implements a normalized capability.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityOwner {
+    Forge,
+    Provider,
+}
+```
+
+## CapabilityApplication
+
+Source: [capability.rs](../../../rust/forge/crates/forge-provider-api/src/capability.rs).
+
+```rust
+/// Specify when a changed setting takes effect.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityApplication {
+    Immediate,
+    Idle,
+    /// Apply complete configuration after invocation settlement.
+    Settled,
+}
+```
+
+## Capability
+
+Source: [capability.rs](../../../rust/forge/crates/forge-provider-api/src/capability.rs).
+
+```rust
+#[derive(Clone, Debug, Deserialize, Serialize)]
 /// Describes one user-visible operation and its application boundary.
 pub struct Capability {
     /// Identifies the operation across providers and menu refreshes.
-    pub id: &'static str,
+    pub id: CapabilityId,
     /// Names the menu group.
-    pub group: &'static str,
+    pub group: String,
     /// Names the operation in the menu.
-    pub label: &'static str,
+    pub label: String,
     /// Records whether every provider must implement this operation.
     pub required: bool,
     /// Identifies Forge or the provider as the implementation owner.
-    pub implementation: &'static str,
+    pub implementation: CapabilityOwner,
     /// Reports support independently of discovery availability.
     pub support: Support,
     /// Describes the configuration application boundary.
-    pub application: &'static str,
+    pub application: CapabilityApplication,
     /// Explains the observable restriction or guarantee.
-    pub reason: &'static str,
+    pub reason: String,
 }
 ```
 
 ## CapabilityManifest
 
-Source: [backend/capability.rs](../../../rust/forge/crates/forge-harness/src/backend/capability.rs).
+Source: [capability.rs](../../../rust/forge/crates/forge-provider-api/src/capability.rs).
 
 ```rust
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 /// Captures one coherent provider capability revision for presentation and dispatch.
 pub struct CapabilityManifest {
-    /// Identifies the selected backend.
-    pub backend: BackendKind,
+    /// Identifies the selected provider.
+    pub provider: ProviderId,
     /// Identifies the provider in the menu.
     pub label: String,
     /// Changes when the capability schema changes.
     pub revision: u64,
+    /// Increase whenever negotiated support changes; independent of schema revision.
+    pub effective_revision: u64,
+    /// Permit steering only for explicitly negotiated normalized task kinds.
+    pub task_steering: Vec<crate::input::TaskKind>,
     /// Retains the negotiated agent version when the transport exposes it.
     pub provider_version: Option<String>,
-    /// Distinguishes startup discovery from ready and blocked runtime state.
-    pub availability: &'static str,
-    /// Retains a bounded runtime explanation independent of feature support.
-    pub availability_reason: Option<String>,
     /// Reports unavailable default resources without exposing credential values.
     pub notice: Vec<String>,
     /// Contains supported and unsupported operations.
@@ -853,7 +973,7 @@ pub struct CapabilityManifest {
 
 ## SkillDefinition
 
-Source: [backend/catalog.rs](../../../rust/forge/crates/forge-harness/src/backend/catalog.rs).
+Source: [catalog.rs](../../../rust/forge/crates/forge-provider-api/src/catalog.rs).
 
 ```rust
 /// Describes one provider skill exposed to Harness callers.
@@ -877,7 +997,7 @@ pub struct SkillDefinition {
 
 ## McpStatus
 
-Source: [backend/catalog.rs](../../../rust/forge/crates/forge-harness/src/backend/catalog.rs).
+Source: [catalog.rs](../../../rust/forge/crates/forge-provider-api/src/catalog.rs).
 
 ```rust
 /// Defines the normalized lifecycle state shown by the MCP picker.
@@ -895,7 +1015,7 @@ pub enum McpStatus {
 
 ## McpToolDefinition
 
-Source: [backend/catalog.rs](../../../rust/forge/crates/forge-harness/src/backend/catalog.rs).
+Source: [catalog.rs](../../../rust/forge/crates/forge-provider-api/src/catalog.rs).
 
 ```rust
 /// Describes one cached tool nested under its owning MCP server.
@@ -908,7 +1028,7 @@ pub struct McpToolDefinition {
 
 ## McpDefinition
 
-Source: [backend/catalog.rs](../../../rust/forge/crates/forge-harness/src/backend/catalog.rs).
+Source: [catalog.rs](../../../rust/forge/crates/forge-provider-api/src/catalog.rs).
 
 ```rust
 /// Describes one complete provider MCP row and its cached tool inventory.
@@ -938,14 +1058,14 @@ pub struct McpDefinition {
 
 ## ApprovalRequestView
 
-Source: [backend/approval.rs](../../../rust/forge/crates/forge-harness/src/backend/approval.rs).
+Source: [approval.rs](../../../rust/forge/crates/forge-provider-api/src/approval.rs).
 
 ```rust
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ApprovalRequestView {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_owner: Option<crate::backend::ExecutionOwner>,
+    pub execution_owner: Option<crate::provider::ExecutionOwner>,
     pub exchange_id: Option<String>,
     pub turn_id: Option<String>,
     pub provider: String,
@@ -962,7 +1082,7 @@ pub struct ApprovalRequestView {
 
 ## ApprovalAnswer
 
-Source: [backend/approval.rs](../../../rust/forge/crates/forge-harness/src/backend/approval.rs).
+Source: [approval.rs](../../../rust/forge/crates/forge-provider-api/src/approval.rs).
 
 ```rust
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -975,7 +1095,7 @@ pub struct ApprovalAnswer {
 
 ## ApprovalChoice
 
-Source: [backend/approval.rs](../../../rust/forge/crates/forge-harness/src/backend/approval.rs).
+Source: [approval.rs](../../../rust/forge/crates/forge-provider-api/src/approval.rs).
 
 ```rust
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -992,7 +1112,7 @@ pub struct ApprovalChoice {
 
 ## ApprovalItem
 
-Source: [backend/approval.rs](../../../rust/forge/crates/forge-harness/src/backend/approval.rs).
+Source: [approval.rs](../../../rust/forge/crates/forge-provider-api/src/approval.rs).
 
 ```rust
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1009,7 +1129,7 @@ pub struct ApprovalItem {
 
 ## ApprovalResolution
 
-Source: [backend/approval.rs](../../../rust/forge/crates/forge-harness/src/backend/approval.rs).
+Source: [approval.rs](../../../rust/forge/crates/forge-provider-api/src/approval.rs).
 
 ```rust
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

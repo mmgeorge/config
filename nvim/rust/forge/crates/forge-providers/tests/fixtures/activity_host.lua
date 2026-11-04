@@ -84,22 +84,19 @@ local succeeded, failure = xpcall(function()
     .. "Determine the counter after 23 updates and whether the result is odd. Explain the arithmetic briefly "
     .. "and finish with CODEX_ACTIVITY_VERIFIED." })
   assert(#errors == 0, table.concat(errors, "\n"))
-  assert(vim.wait(5000, function()
+  assert(vim.wait(90000, function()
     return not state.busy and transcript():find("Thought", 1, true)
       and transcript():find("CODEX_ACTIVITY_VERIFIED", 1, true)
   end, 10), "completed turn did not publish its settled transcript\n" .. transcript())
   local trace_path = request("host.trace.status").path
-  local initialized, accepted, finished = false, false, false
+  local received, dispatched, responded = false, false, false
   for _, line in ipairs(vim.fn.readfile(trace_path)) do
     local record = vim.json.decode(line)
-    local payload = record.payload or {}
-    if record.event == "provider.lifecycle" then
-      initialized = initialized or payload.event == "session_initialized"
-      accepted = accepted or payload.event == "submission_accepted"
-      finished = finished or payload.event == "execution_finished"
-    end
+    received = received or record.event == "exchange.command.received"
+    dispatched = dispatched or record.event == "exchange.dispatch.confirmed"
+    responded = responded or record.event == "exchange.foreground.response"
   end
-  assert(initialized and accepted and finished, "normalized provider lifecycle is incomplete: " .. trace_path)
+  assert(received and dispatched and responded, "owner command/dispatch/completion trace is incomplete: " .. trace_path)
   assert(working_status, "live status did not render during provider activity")
   local controller = require("forge.views.harness.controller")
   vim.api.nvim_set_current_win(state.transcript_win)

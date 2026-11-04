@@ -20,9 +20,13 @@ pub mod input;
 pub mod lifecycle;
 pub mod message;
 pub mod model;
+pub mod operation_context;
+pub mod operations;
 pub mod permissions;
 pub mod progress;
 pub mod provider_session_id;
+pub mod request_identity;
+pub mod retained_operation;
 pub mod retry;
 pub mod service_tier;
 pub mod session;
@@ -37,19 +41,23 @@ pub mod turn_control;
 pub mod usage;
 pub mod version;
 
-pub use catalog::ProviderCatalogRequest;
+pub use capability::{CapabilityManifest, CapabilityRestriction};
+pub use catalog::{McpQuery, QueryContext, WorkspaceContext};
 pub use change::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
 pub use checklist::{ChecklistStatus, ProviderChecklistEntry, ProviderChecklistUpdate};
 pub use compaction::{Compaction, CompactionState};
 pub use diagnostic::{SanitizedMessage, SanitizedMessageError};
-pub use error::{ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation};
+pub use error::{
+    FailureDisposition, ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation,
+    ProviderPhase,
+};
 pub use event::*;
 pub use events::{ProviderEventSink, ProviderEventStream};
 pub use execution::*;
 pub use generation::{ReasoningSelection, TextGenerationRequest, TextValidator};
 pub use input::{
     FileAttachment, MessageInput, PromptInput, QuestionReply, QuestionReplyOption,
-    QuestionReplyResponse,
+    QuestionReplyResponse, TaskKind, TaskStart,
 };
 pub use lifecycle::{
     CompletionSnapshot, ExecutionFailure, ExecutionObservation, ExecutionResult, ExecutionUpdate,
@@ -57,26 +65,21 @@ pub use lifecycle::{
 };
 pub use message::{MessageClassification, MessageId, MessageRole, MessageUpdate};
 pub use model::*;
+pub use operation_context::*;
+pub use operations::*;
 pub use provider_session_id::{ProviderSessionId, ProviderSessionIdError};
-pub use service_tier::ServiceTier;
-pub use session::{
-    BindingId, BindingIdError, CheckpointId, CheckpointIdError, ContinuationOutcome,
-    ContinuationRequest, ContinuationToken, ConversationForkRequest, ForkTarget, HostEffectFailure,
-    HostToolEndpoint, InputAcceptance, InvocationCallbacks, InvocationConfiguration, McpLaunch,
-    McpTransport, ModelSelection, PromptRequest, ProviderHostEffects, RecoveredInput,
-    RecoveryToken, RecoveryTokenError, ResourceLease, ResourceSelection, SessionBinding,
-    SessionMode, SessionRequest, SessionSettings, SteeringAcceptance, SteeringDelivery,
-    SteeringRequest, SubmissionEvidence,
+pub use request_identity::{
+    PromptRequestIdentity, SessionRequestIdentity, SteeringRequestIdentity,
 };
+pub use service_tier::ServiceTier;
+pub use session::*;
 pub use tool::{
     TextUpdate, ToolActivityKind, ToolDiagnostic, ToolInvocation, ToolOutcome, ToolStatus,
     ToolUpdate,
 };
 pub use trace::{ProviderTrace, ProviderTraceEvent, ProviderTraceRecord};
 
-pub mod native_goal;
 pub use input::PromptMode;
-pub use native_goal::{NativeGoalCommand, NativeGoalStatus, NativeGoalUpdate};
 
 pub mod completion;
 pub use completion::TurnMetrics;
@@ -85,6 +88,6 @@ pub mod capability;
 pub mod provider;
 pub use provider::{
     AuthenticationInteraction, AuthenticationMethod, AuthenticationMethodId,
-    AuthenticationMethodIdError, CompactionRequest, GoalStopMode, ProviderSetup,
-    RuntimeAvailability, RuntimeOrigin, RuntimeVersions, TerminalLaunch, VersionObservation,
+    AuthenticationMethodIdError, CompactionRequest, ProviderSetup, RuntimeAvailability,
+    RuntimeOrigin, RuntimeVersions, TerminalLaunch, VersionObservation,
 };

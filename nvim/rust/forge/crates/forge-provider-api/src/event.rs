@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 pub struct BoundProviderEvent {
     /// Identify the exact live provider binding; retired bindings cannot update replacements.
     pub binding_id: crate::session::BindingId,
+    /// Identify the final normalized event position represented by this envelope.
+    pub sequence: crate::EventSequence,
     /// Carry the provider-neutral observation.
     pub event: ProviderEvent,
 }
@@ -19,6 +21,25 @@ pub struct BoundProviderEvent {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProviderEvent {
+    /// Prove all native foreground resources have been collected for one invocation.
+    Settled {
+        settlement: Box<crate::InvocationSettlement>,
+    },
+    /// Publish scoped collection failure while the adapter retains unfinished resource ownership.
+    SettlementFailed {
+        scope: InvocationScope,
+        failure: crate::ProviderFailure,
+    },
+    /// Publish effective support on the same ordered stream used for dependent admissions.
+    CapabilitiesChanged {
+        scope: EventScope,
+        capabilities: crate::capability::CapabilityManifest,
+    },
+    /// Publish a late-resolved durable history identity independently of display-only runtime text.
+    SessionIdentity {
+        scope: EventScope,
+        provider_session_id: crate::ProviderSessionId,
+    },
     /// Carry validated execution lifecycle evidence independently of RPC completion.
     Execution {
         observation: crate::lifecycle::ExecutionObservation,
@@ -143,6 +164,11 @@ pub enum ParentBoundaryUpdate {
 impl ProviderEvent {
     pub fn scope(&self) -> EventScope {
         match self {
+            Self::Settled { settlement } => settlement.scope.clone().into(),
+            Self::SettlementFailed { scope, .. } => scope.clone().into(),
+            Self::CapabilitiesChanged { scope, .. } | Self::SessionIdentity { scope, .. } => {
+                scope.clone()
+            }
             Self::Execution { observation } => observation.scope().clone().into(),
             Self::Message { address, .. } => address.turn.scope.clone().into(),
             Self::Tool { address, .. } => address.turn.scope.clone().into(),
@@ -219,16 +245,4 @@ pub struct ProviderRuntime {
     /// Display text only; use ProviderDescriptor.kind for machine identity.
     pub provider: String,
     pub model: Option<String>,
-}
-
-impl ProviderRuntime {
-    /// Publishes resolved provider identity independently of turn content and completion.
-    pub fn resolved_event(&self, scope: InvocationScope) -> ProviderEvent {
-        ProviderEvent::Runtime {
-            scope,
-            update: RuntimeUpdate::Resolved {
-                runtime: self.clone(),
-            },
-        }
-    }
 }

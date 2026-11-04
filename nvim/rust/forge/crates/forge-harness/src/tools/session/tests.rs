@@ -478,7 +478,6 @@ fn session_status_separates_approval_access_and_active_task() -> Result<()> {
     selected.active_task = Some(crate::task::Task::goal(
         "Inspect".into(),
         Default::default(),
-        false,
         1,
     ));
     store.save_session(&selected)?;

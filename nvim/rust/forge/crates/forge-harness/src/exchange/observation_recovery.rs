@@ -13,7 +13,7 @@ use crate::{
 };
 use std::sync::Arc;
 use tokio::{
-    sync::{OwnedMutexGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, oneshot},
+    sync::{OwnedRwLockWriteGuard, OwnedSemaphorePermit, oneshot},
     task::JoinHandle,
 };
 
@@ -49,7 +49,7 @@ pub(super) struct Lease {
     owner: ExecutionOwner,
     _control: OwnedSemaphorePermit,
     retirement: OwnedRwLockWriteGuard<()>,
-    goal: OwnedMutexGuard<()>,
+    configuration: tokio::sync::OwnedMutexGuard<()>,
 }
 
 pub(super) struct Replacement {
@@ -137,11 +137,11 @@ impl ObservationRecovery {
                 self.finish(Err(ProviderLifecycleFailure::GenerationChanged));
                 return Ok(true);
             }
-            if !target.is_closed() && !services.tasks.native_goal_is_uncertain() {
+            if !target.is_closed() && !services.tasks.configuration_is_uncertain() {
                 self.finish(Ok(()));
                 return Ok(true);
             }
-            if services.tasks.native_goal_is_uncertain() {
+            if services.tasks.configuration_is_uncertain() {
                 broker
                     .recover_pending_configuration()
                     .map_err(|_| ProviderLifecycleFailure::StateUnavailable)?;
@@ -152,7 +152,7 @@ impl ObservationRecovery {
             let owner = ExecutionOwner::root(services.observer.session_id());
             let control = services.control.clone();
             let lane = services.provider_lane.clone();
-            let goal = services.tasks.native_goal_lane();
+            let configuration = services.tasks.configuration_lane();
             self.deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(60));
             self.stage = Stage::Collecting(tokio::spawn(async move {
                 let control = control
@@ -160,7 +160,7 @@ impl ObservationRecovery {
                     .await
                     .map_err(|_| ProviderLifecycleFailure::ControllerClosed)?;
                 let retirement = lane.write_owned().await;
-                let goal = goal.lock_owned().await;
+                let configuration = configuration.lock_owned().await;
                 registry.fence(&owner).await?;
                 Ok(Lease {
                     provider,
@@ -169,7 +169,7 @@ impl ObservationRecovery {
                     owner,
                     _control: control,
                     retirement,
-                    goal,
+                    configuration,
                 })
             }));
         }
@@ -216,7 +216,7 @@ impl ObservationRecovery {
                             .map_err(|error| {
                                 ProviderLifecycleFailure::Provider(
                                     crate::provider::lifecycle_error::classify(
-                                        forge_provider_api::ProviderOperation::InitializeSession,
+                                        forge_provider_api::ProviderOperation::SessionOpen,
                                         error.into(),
                                     ),
                                 )
@@ -350,12 +350,15 @@ impl ObservationRecovery {
                 }
                 services
                     .tasks
-                    .reset_native_goal_generation()
+                    .reset_configuration_generation()
+                    .map_err(|_| ProviderLifecycleFailure::StateUnavailable)?;
+                broker
+                    .clear_effective_capabilities()
                     .map_err(|_| ProviderLifecycleFailure::StateUnavailable)?;
                 services.observer.replace_session_events(inbox);
                 let provider = lease.provider.clone();
                 // Publish the new inbox under retirement; release guards before initialization observes it.
-                drop(lease.goal);
+                drop(lease.configuration);
                 drop(lease.retirement);
                 drop(lease._control);
                 self.stage = Stage::Initializing(tokio::spawn(

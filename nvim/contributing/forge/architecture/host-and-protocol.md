@@ -24,7 +24,7 @@ The client sends `protocol_version` during initialization, and the host requires
 
 `forge-protocol::message` owns `Request`, `Response`, `ProtocolError`, `SessionEvent`, and `Message`. A `Response` holds exactly one result or error, and a successful JSON null stays an explicit result. Deserialization rejects missing or duplicate IDs, unknown fields, and records that mix response and event fields.
 
-`forge/protocol_contract.json` defines the event vocabulary, routing policy, required payload fields, and node enum spellings. Rust embeds it at compile time, and Lua loads it at runtime. Serialization rejects undeclared events and missing fields. Lua validates frames through the same contract, and unknown variants, conflicting identities, or invalid counters stop the connection. Any contract change requires a wire-version change.
+`forge/protocol_contract.json` defines the event vocabulary, routing policy, required payload fields, and node enum spellings. Rust embeds it at compile time, and Lua loads it at runtime. Serialization rejects undeclared events and missing fields. Lua validates frames through the same contract, and unknown variants, conflicting identities, or invalid counters stop the connection. Any contract change requires a wire-version change. The provider lifecycle migration uses wire version 35; running components with an older contract reject the handshake before feature payload decoding.
 
 Irrecoverable transcript publication failures are classified as `invalid_state`. Lua then stops automatic retries, keeps the last applied transcript, and reports that reopening is required. Admission failures report `not_admitted`, and other failures report `request_failed`.
 

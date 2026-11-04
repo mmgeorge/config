@@ -254,6 +254,7 @@ async fn owner_close_retries_failed_retirement_of_same_binding() -> Result<()> {
     let root = tempfile::tempdir()?;
     crate::checks::configure_fixture(root.path());
     let cleanup_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let closing_bindings = Arc::new(std::sync::Mutex::new(Vec::new()));
     let retry_allowed = Arc::new(AtomicBool::new(false));
     let descriptor = forge_providers::registry::descriptor(
         &forge_providers::registry::nonselectable_id().unwrap(),
@@ -263,13 +264,16 @@ async fn owner_close_retries_failed_retirement_of_same_binding() -> Result<()> {
         crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
             Ok(())
         });
-    native.with_cleanup({
+    native.with_session_close({
         let cleanup_calls = cleanup_calls.clone();
+        let closing_bindings = closing_bindings.clone();
         let retry_allowed = retry_allowed.clone();
-        move |_| {
+        move |binding| {
             let cleanup_calls = cleanup_calls.clone();
+            let closing_bindings = closing_bindings.clone();
             let retry_allowed = retry_allowed.clone();
             async move {
+                closing_bindings.lock().unwrap().push(binding);
                 cleanup_calls.fetch_add(1, Ordering::AcqRel);
                 if !retry_allowed.load(Ordering::Acquire) {
                     return Err(crate::provider::ProviderError::DeliveryUncertain);
@@ -356,6 +360,11 @@ async fn owner_close_retries_failed_retirement_of_same_binding() -> Result<()> {
         return Err(retain_cleanup_failure(root, &controller, error));
     }
     assert!(cleanup_calls.load(Ordering::Acquire) >= 2);
+    {
+        let bindings = closing_bindings.lock().unwrap();
+        assert!(bindings.len() >= 2);
+        assert!(bindings.iter().all(|binding| binding == &bindings[0]));
+    }
     assert!(original_inbox.is_closed());
     assert!(Arc::ptr_eq(
         &original_provider,

@@ -52,6 +52,10 @@ impl ExecutionAdmission {
     pub(crate) fn available_permits(&self) -> usize {
         self.0.available_permits()
     }
+    /// Get whether fatal collection permanently closed this session's execution admission.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.0.is_closed()
+    }
     pub(crate) fn close(&self) {
         self.0.close();
     }

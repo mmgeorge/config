@@ -94,19 +94,18 @@ async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publicati
             transaction.session_events.push(event.clone())?;
         }
         transaction.pending_native_ready = Some(Ok(ProviderCompletion::default()));
-        transaction.native_goal = Some(NativeGoalTransition::ContinuationInitial {
-            observation: frames[0].clone(),
-        });
         broker.collect_foreground_observations(&mut transaction)?;
         assert_eq!(
             transaction.pending_session_observations.len(),
             forge_protocol::MAX_PENDING_FRAMES
         );
         assert!(
-            transaction.next().now_or_never().is_none(),
-            "full held staging consumed another source frame"
+            matches!(
+                transaction.next().now_or_never(),
+                Some(Ok(ForegroundSignal::SessionObservationsReady))
+            ),
+            "a full staging prefix must be applied before reading another frame"
         );
-        transaction.native_goal = None;
         let mut dispatch = ForegroundDispatch::Running {
             transaction: Box::new(transaction),
             admission,
@@ -274,7 +273,7 @@ fn cancellation_fixture(
                         .await
                         .map_err(|_| {
                             ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                                forge_provider_api::ProviderOperation::HostEffectPublication,
+                                forge_provider_api::ProviderOperation::InputSubmit,
                                 forge_provider_api::ProviderFailureKind::Runtime,
                             ))
                         })?;
@@ -386,7 +385,7 @@ fn cancellation_fixture(
                     .await
                     .map_err(|_| {
                         ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::HostEffectPublication,
+                            forge_provider_api::ProviderOperation::InputSubmit,
                             forge_provider_api::ProviderFailureKind::Runtime,
                         ))
                     })?;
@@ -631,7 +630,7 @@ async fn collected_foreground_retains_actual_native_success_and_failure() -> Res
                 } else {
                     Err(crate::provider::ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::AdmitInput,
+                            forge_provider_api::ProviderOperation::InputSubmit,
                             forge_provider_api::ProviderFailureKind::Rejected,
                         ),
                     ))
@@ -700,7 +699,7 @@ async fn collected_transaction_drains_native_result_without_recancelling() -> Re
             } else {
                 Err(ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::AdmitInput,
+                        forge_provider_api::ProviderOperation::InputSubmit,
                         forge_provider_api::ProviderFailureKind::Rejected,
                     ),
                 ))

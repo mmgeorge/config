@@ -116,12 +116,17 @@ impl InvocationScope {
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventScope {
+    /// Observe a retained live binding without inventing an invocation or mutation operation.
+    Binding {
+        /// Identify the host conversation which owns this stream; the envelope identifies its generation.
+        owner: ExecutionOwner,
+    },
     Invocation {
         invocation: InvocationScope,
     },
     SessionOperation {
         owner: ExecutionOwner,
-        operation_id: String,
+        operation_id: crate::OperationId,
     },
 }
 
@@ -135,14 +140,14 @@ impl EventScope {
     pub fn owner(&self) -> &ExecutionOwner {
         match self {
             Self::Invocation { invocation } => &invocation.owner,
-            Self::SessionOperation { owner, .. } => owner,
+            Self::Binding { owner } | Self::SessionOperation { owner, .. } => owner,
         }
     }
 
     pub fn invocation(&self) -> Option<&InvocationScope> {
         match self {
             Self::Invocation { invocation } => Some(invocation),
-            Self::SessionOperation { .. } => None,
+            Self::Binding { .. } | Self::SessionOperation { .. } => None,
         }
     }
 }

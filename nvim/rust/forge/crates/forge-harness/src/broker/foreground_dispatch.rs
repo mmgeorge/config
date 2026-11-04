@@ -81,6 +81,38 @@ enum AdmissionPhase {
 }
 
 impl ForegroundDispatch {
+    /// Capture the latest admitted invocation in this foreground's explicit execution chain.
+    pub(crate) fn invocation_scope(
+        &self,
+    ) -> Result<Option<crate::provider::InvocationScope>, ProviderError> {
+        let transaction = match self {
+            Self::Running { transaction, .. } | Self::Finalizing { transaction, .. } => transaction,
+            Self::Admitting(admission) => {
+                return Ok(admission
+                    .staged_interaction
+                    .as_ref()
+                    .and_then(|staged| staged.reservation.as_ref())
+                    .map(|reservation| reservation.scope.clone()));
+            }
+            Self::Done(_) | Self::Transitioning => return Ok(None),
+        };
+        let scope = transaction
+            .engine
+            .active_invocation_scope()?
+            .unwrap_or_else(|| transaction.state.scope.clone());
+        if scope.owner != transaction.state.scope.owner
+            || scope.exchange_id != transaction.state.scope.exchange_id
+        {
+            return Err(ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::Cancel,
+                    forge_provider_api::ProviderFailureKind::WrongInvocation,
+                ),
+            ));
+        }
+        Ok(Some(scope))
+    }
+
     /// Static diagnostic label; never includes command or provider payloads.
     pub(crate) fn diagnostic_name(&self) -> &'static str {
         match self {
@@ -198,13 +230,11 @@ impl ForegroundDispatch {
                 }
                 if !transaction.failure_cleanup_active
                     && !transaction.observation_publication_in_flight
-                    && transaction.native_goal.is_none()
                     && !transaction.pending_session_observations.is_empty()
                 {
                     Ok(ForegroundSignal::SessionObservationsReady)
                 } else if !transaction.failure_cleanup_active
                     && !transaction.observation_publication_in_flight
-                    && transaction.native_goal.is_none()
                     && !transaction.idle_native_active
                     && transaction.pending_session_observations.is_empty()
                     && transaction
@@ -215,7 +245,6 @@ impl ForegroundDispatch {
                     Ok(ForegroundSignal::FinalizeEffectsRequested)
                 } else if !transaction.failure_cleanup_active
                     && !transaction.observation_publication_in_flight
-                    && transaction.native_goal.is_none()
                     && !transaction.idle_native_active
                     && transaction.pending_session_observations.is_empty()
                     && transaction
@@ -226,7 +255,6 @@ impl ForegroundDispatch {
                     Ok(ForegroundSignal::FinalizeChecksRequested)
                 } else if !transaction.failure_cleanup_active
                     && !transaction.observation_publication_in_flight
-                    && transaction.native_goal.is_none()
                     && !transaction.idle_native_active
                     && transaction.pending_session_observations.is_empty()
                     && transaction
@@ -248,13 +276,11 @@ impl ForegroundDispatch {
 /// Own catalog I/O while the broker remains available to session observers.
 pub(crate) struct QuestionModelCatalogJob {
     provider: Arc<Provider>,
-    request: ProviderRequest,
+    request: ProviderCatalogRequest,
 }
 
-/// Own the provider readiness call independently of broker state.
+/// Acquire the exact session execution owner without retaining broker state.
 pub(crate) struct ProviderPrepareJob {
-    provider: Arc<Provider>,
-    session_id: String,
     cancellation: Arc<TurnCancellation>,
     registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
     owner: crate::provider::ExecutionOwner,
@@ -288,8 +314,15 @@ pub(crate) struct StagedInteraction {
     pub(crate) mode: PromptMode,
     pub(crate) input: ProviderInput,
     pub(crate) submission: Arc<crate::provider::submission::Submission>,
+    pub(super) reservation: Option<ForegroundReservation>,
     pub(crate) events: Vec<SessionEvent>,
     pub(crate) effects: Vec<AppliedProviderEvent>,
+}
+
+/// Retain owner-issued cancellation authority before any native execution future is polled.
+pub(super) struct ForegroundReservation {
+    pub(super) scope: crate::provider::InvocationScope,
+    pub(super) engine: Arc<crate::provider::session_execution::SessionExecution>,
 }
 
 impl ForegroundAdmission {
@@ -382,10 +415,8 @@ impl ForegroundAdmission {
 
 impl QuestionModelCatalogJob {
     pub(crate) async fn run(self) -> Result<Vec<crate::provider::ProviderModel>> {
-        self.provider
-            .model_list(self.request)
-            .await
-            .map_err(Into::into)
+        let context = self.provider.query_context(&self.request).await?;
+        self.provider.model_list(context).await.map_err(Into::into)
     }
 }
 
@@ -393,11 +424,10 @@ impl ProviderPrepareJob {
     pub(crate) async fn run(
         self,
     ) -> Result<Arc<crate::provider::session_execution::SessionExecution>> {
-        let engine = self.registry.owner(self.owner).await?;
         tokio::select! {
             biased;
             () = self.cancellation.cancelled() => Err(TurnCancelled.into()),
-            result = self.provider.prepare_turn(&self.session_id) => { result?; Ok(engine) },
+            engine = self.registry.owner(self.owner) => Ok(engine?),
         }
     }
 }
@@ -518,10 +548,21 @@ impl HarnessBroker {
             match resume {
                 configuration::SelectedContinuation::NoWork => Ok(None),
                 configuration::SelectedContinuation::Staged {
-                    interaction,
+                    mut interaction,
                     clarification,
                     planning,
                 } => {
+                    let owner = crate::provider::ExecutionOwner::root(&self.session.id);
+                    let engine = self
+                        .execution_registry()
+                        .existing_owner(&owner)?
+                        .context("selected continuation has no retained execution owner")?;
+                    let scope = crate::provider::InvocationScope::new(
+                        owner,
+                        interaction.exchange.id.clone(),
+                    );
+                    engine.reserve_invocation(scope.clone(), interaction.submission.clone())?;
+                    interaction.reservation = Some(ForegroundReservation { scope, engine });
                     admission.staged_interaction = Some(*interaction);
                     admission.clarification = clarification;
                     admission.planning = planning;
@@ -607,12 +648,10 @@ impl HarnessBroker {
         )))
     }
 
-    /// Capture provider readiness after earlier exchange finalization is complete.
+    /// Capture execution-owner acquisition after earlier exchange finalization is complete.
     pub(crate) fn prepare_provider_turn_job(&mut self) -> ProviderPrepareJob {
         let registry = self.execution_registry();
         ProviderPrepareJob {
-            provider: self.provider.clone(),
-            session_id: self.session.id.clone(),
             cancellation: self.turn_cancellation.clone(),
             registry,
             owner: crate::provider::ExecutionOwner::root(&self.session.id),
@@ -655,6 +694,7 @@ impl HarnessBroker {
             mode,
             input,
             submission,
+            reservation: None,
             events,
             effects,
         })
@@ -1031,7 +1071,7 @@ impl HarnessBroker {
     pub(crate) fn prepare_question_model_catalog(&self) -> Result<QuestionModelCatalogJob> {
         Ok(QuestionModelCatalogJob {
             provider: self.provider.clone(),
-            request: self.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
+            request: self.provider_catalog_request()?,
         })
     }
 
@@ -1889,7 +1929,7 @@ impl TaskCompactionJob {
     pub(crate) async fn run(
         self,
     ) -> Result<crate::provider::Compaction, crate::provider::ProviderError> {
-        self.provider.compact(self.request).await
+        self.provider.session_compact(self.request).await
     }
 }
 
@@ -1966,7 +2006,7 @@ impl HarnessBroker {
                 state.compaction.state = crate::provider::CompactionState::Failed;
                 state.compaction.result.diagnostic =
                     Some(crate::provider::lifecycle_error::diagnostic(
-                        forge_provider_api::ProviderOperation::CompactSession,
+                        forge_provider_api::ProviderOperation::SessionCompact,
                         &error,
                     ));
                 state.record.detail = SessionEventKind::Compaction {
@@ -2240,5 +2280,71 @@ impl HarnessBroker {
         let patch = self.reconcile_after_dispatch()?;
         let delivery = self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?;
         Ok((dispatch, delivery))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Cancel exact retained preparation before any foreground or Execute future is polled.
+    #[tokio::test]
+    async fn selected_continuation_reservation_is_collectible_before_preparation() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let owner = crate::provider::ExecutionOwner::root(&broker.session.id);
+        let engine = broker.execution_registry().owner(owner.clone()).await?;
+        let mut original = broker.stage_foreground_interaction(
+            "Retain this exchange",
+            PromptMode::Chat,
+            Some(&ExchangeAdmission::chat("Retain this exchange".into())),
+            ProviderInput::from_text("Retain this exchange"),
+        )?;
+        let selected: crate::provider::ExchangeId = original.exchange.id.clone().into();
+        original.exchange.pause_for_restart(101)?;
+        broker.store.save_exchange(&original.exchange)?;
+        let mut previous = None;
+        for ordinal in 0..2 {
+            let (sink, _updates) = publication::channel();
+            let dispatch = broker
+                .begin_selected_continuation_dispatch(
+                    &selected,
+                    format!("Configured continuation {ordinal}"),
+                    sink,
+                )?
+                .context("selected continuation was not retained")?;
+            let ForegroundDispatch::Admitting(admission) = &dispatch else {
+                anyhow::bail!("retained continuation advanced before owner preparation");
+            };
+            let staged = admission
+                .staged_interaction
+                .as_ref()
+                .context("retained continuation has no prepared input")?;
+            let scope = dispatch
+                .invocation_scope()?
+                .context("preparation has no owner-issued scope")?;
+            assert_eq!(scope.owner, owner);
+            assert_eq!(scope.exchange_id, selected);
+            assert!(previous.as_ref().is_none_or(|prior| prior != &scope));
+            assert!(engine.active_invocation_snapshot()?.is_none());
+            let collection = engine.collect_exchange(scope.clone()).await?;
+            assert_eq!(
+                staged.submission.record()?.delivery,
+                crate::provider::submission::SubmissionState::Cancelled
+            );
+            assert!(engine.admitted_invocation(&scope)?);
+            assert!(engine.active_invocation_snapshot()?.is_none());
+            engine.resume_exchange(collection).await?;
+            previous = Some(scope);
+            drop(dispatch);
+            let mut exchange = broker.store.load_exchange(selected.as_str())?.unwrap();
+            exchange.pause_for_restart(102 + ordinal)?;
+            broker.store.save_exchange(&exchange)?;
+        }
+        engine.close().await?;
+        broker.provider.shutdown().await?;
+        Ok(())
     }
 }

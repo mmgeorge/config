@@ -1,70 +1,142 @@
 use crate::{ProviderDescriptor, ProviderId};
 use serde::{Deserialize, Serialize};
 
+/// Distinguishes supported behavior from provider limitations.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-/// Distinguishes supported behavior from provider limitations.
 pub enum Support {
     /// The operation preserves its full Harness contract.
     Supported,
     /// The operation works with the reported restriction.
-    Limited,
+    Limited {
+        /// Actionable typed restrictions; producers include at least one restriction for Limited support.
+        restrictions: Vec<CapabilityRestriction>,
+    },
     /// The adapter rejects the operation before dispatch.
     Unsupported,
+}
+
+/// Encode actionable limits independently of user-facing explanatory text.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityRestriction {
+    /// Enforce filesystem scopes only for operations which use normalized permission callbacks.
+    PermissionCallbacksOnly,
+    /// Native edit tools may omit structured diff output; host checkpoint review remains available.
+    UnstructuredDiffs,
+    /// Provider enterprise terminal policy can execute without normalized approval callbacks.
+    EnterpriseTerminalPolicy,
+    /// Inherited project-native skills remain available despite the explicit portable selection.
+    InheritedSkills,
+    /// Permit only the listed normalized task kinds when steering an active invocation.
+    TaskKinds(Vec<crate::input::TaskKind>),
+    /// Require the exact source checkpoint for history mutation.
+    CheckpointRequired,
+    /// Require settled foreground execution before applying configuration or history mutation.
+    SettledOnly,
 }
 
 /// Identify a normalized capability independently of provider names or native protocol methods.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityId {
+    /// Journaled model input admission.
     Prompt,
+    /// Exact invocation cancellation and settlement.
     Cancel,
+    /// Durable history resume through a fresh binding.
     Resume,
+    /// Native foreground collection, automatic on completion and part of cancel/close.
     Cleanup,
+    /// Invocation-scoped host control tools.
     Tools,
+    /// Harness-owned objective and continuation workflow.
     Goals,
+    /// Harness-owned durable input queuing.
     Queue,
+    /// Host workspace checkpoint restoration.
     Undo,
+    /// Harness-owned plan review and execution.
     Plans,
+    /// Host-correlated question forms and replies.
     Questions,
+    /// Host-owned saved-session deletion.
     SessionDelete,
+    /// Separate native retained-history fork.
     NativeFork,
+    /// Explicit correlated native history compaction.
     NativeCompact,
+    /// Exact active-invocation input delivery.
     NativeSteer,
+    /// Checked cancelled-input history retraction.
     NativeTurnRollback,
+    /// Native compaction lifecycle observations.
     CompactionLifecycle,
+    /// Compaction observations outside active input execution.
     BackgroundCompaction,
+    /// Provider-exposed compaction summary evidence.
     CompactionSummary,
+    /// Provider-exposed compaction usage evidence.
     CompactionMetrics,
+    /// Opaque normalized model selection.
     ModelSelection,
+    /// Normalized reasoning effort selection.
     EffortSelection,
+    /// Fast service policy selection.
     FastMode,
+    /// Ultrafast service policy selection.
     UltrafastMode,
+    /// Native skill definition discovery and enforceable selection.
     SkillCatalog,
+    /// Configured and observed MCP discovery.
     McpCatalog,
+    /// Saved host permission/approval rules.
     ApprovalRules,
+    /// Enforceable operating-system isolation policy.
     OsSandbox,
+    /// Binding-owned shell inventory.
     BackgroundTerminals,
+    /// Structured provider file-change observations.
     FileDiff,
+    /// Independent binding-owned shell termination.
     BackgroundTermination,
+    /// Host summary/recap generation workflow.
     Recap,
+    /// Runtime installation/version inspection.
     RuntimeSetup,
+    /// Explicit provider authentication interaction.
     Authentication,
+    /// Host observation of delegated agents.
     AgentObserve,
+    /// Harness-owned delegated-agent creation.
     AgentSpawn,
+    /// Harness-owned follow-up input to an agent.
     AgentFollowup,
+    /// Harness-owned inter-agent messaging.
     AgentMessage,
+    /// Harness-owned agent interruption.
     AgentInterrupt,
+    /// Host selection of provider/model per delegated owner.
     AgentCrossProvider,
+    /// Host editor language-server queries.
     LspTools,
+    /// Host model-facing delegation tools.
     SubagentTools,
+    /// Host session discovery/history tools.
     SessionTools,
+    /// Enforcement of host-owned delegation authority.
     NativeAgentSuppression,
+    /// Skill enablement applied through complete session configuration.
     SkillMutation,
+    /// Explicit host import of native resource definitions.
     NativeImport,
+    /// MCP enablement applied through complete session configuration.
     McpMutation,
+    /// Read-only observed MCP readiness.
     McpRuntimeStatus,
+    /// Read-only observed MCP tools.
     McpToolCatalog,
+    /// Normalized filesystem authority and its typed restrictions.
     FilesystemAccess,
 }
 
@@ -72,7 +144,9 @@ pub enum CapabilityId {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityOwner {
+    /// Harness owns the workflow and its scheduling decisions.
     Forge,
+    /// The native adapter implements the documented provider boundary.
     Provider,
 }
 
@@ -80,31 +154,23 @@ pub enum CapabilityOwner {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityApplication {
+    /// No additional deferred application phase is advertised; operation preconditions still apply.
     Immediate,
+    /// Host scheduling waits for no active execution and still honors operation-specific collection barriers.
     Idle,
-    SessionRestart,
-    ServerRestart,
-    ExecutionRestart,
+    /// Apply complete configuration after invocation settlement.
+    Settled,
 }
 
-/// Describe whether capability discovery is ready for the selected runtime.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilityAvailability {
-    Ready,
-    Starting,
-    Unavailable,
-}
-
-#[derive(Clone, Debug, Serialize)]
 /// Describes one user-visible operation and its application boundary.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Capability {
     /// Identifies the operation across providers and menu refreshes.
     pub id: CapabilityId,
     /// Names the menu group.
-    pub group: &'static str,
+    pub group: String,
     /// Names the operation in the menu.
-    pub label: &'static str,
+    pub label: String,
     /// Records whether every provider must implement this operation.
     pub required: bool,
     /// Identifies Forge or the provider as the implementation owner.
@@ -117,21 +183,24 @@ pub struct Capability {
     pub reason: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
-/// Captures one coherent provider capability revision for presentation and dispatch.
+/// Own one coherent baseline or negotiated support snapshot for presentation and admission.
+/// Registration supplies baseline support; open/configure return effective binding snapshots
+/// and ordered capability observations publish later changes. Loading/failure state belongs
+/// to host discovery, not placeholder availability fields in this manifest.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CapabilityManifest {
     /// Identifies the selected provider.
     pub provider: ProviderId,
     /// Identifies the provider in the menu.
     pub label: String,
-    /// Changes when the capability schema changes.
+    /// Capability schema version, independent of event sequencing and negotiated support changes.
     pub revision: u64,
+    /// Binding-local support revision, advanced by the adapter when negotiated support changes.
+    pub effective_revision: u64,
+    /// Task kinds eligible for active steering; an empty list permits no task steering.
+    pub task_steering: Vec<crate::input::TaskKind>,
     /// Retains the negotiated agent version when the transport exposes it.
     pub provider_version: Option<String>,
-    /// Distinguishes startup discovery from ready and blocked runtime state.
-    pub availability: CapabilityAvailability,
-    /// Retains a bounded runtime explanation independent of feature support.
-    pub availability_reason: Option<String>,
     /// Reports unavailable default resources without exposing credential values.
     pub notice: Vec<String>,
     /// Contains supported and unsupported operations.
@@ -139,7 +208,9 @@ pub struct CapabilityManifest {
 }
 
 impl CapabilityManifest {
-    /// Build the capability inventory from the adapter's effective descriptor.
+    /// Create a baseline inventory from the supplied descriptor with effective revision zero.
+    /// Adapters refine binding-specific support and its revision before publishing effective snapshots;
+    /// registry metadata alone does not prove that a runtime negotiated optional support.
     pub fn from_descriptor(descriptor: ProviderDescriptor) -> Self {
         let flags = &descriptor.capability;
         let mut capability = Vec::new();
@@ -147,8 +218,8 @@ impl CapabilityManifest {
             |id, group, label, required, implementation, supported, application, reason: &str| {
                 capability.push(Capability {
                     id,
-                    group,
-                    label,
+                    group: String::from(group),
+                    label: String::from(label),
                     required,
                     implementation,
                     support: if supported {
@@ -311,7 +382,7 @@ impl CapabilityManifest {
             false,
             CapabilityOwner::Provider,
             flags.os_sandbox,
-            CapabilityApplication::SessionRestart,
+            CapabilityApplication::Settled,
             "Only integrations that declare enforced OS isolation enable this control",
         );
         add(
@@ -415,7 +486,7 @@ impl CapabilityManifest {
             false,
             CapabilityOwner::Forge,
             true,
-            CapabilityApplication::ServerRestart,
+            CapabilityApplication::Settled,
             "Off by default. Read-only agent queries; interactive plan navigation stays available",
         );
         add(
@@ -425,7 +496,7 @@ impl CapabilityManifest {
             false,
             CapabilityOwner::Forge,
             true,
-            CapabilityApplication::ServerRestart,
+            CapabilityApplication::Settled,
             "Off by default. Manual child spawning remains available and children cannot delegate",
         );
         add(
@@ -435,7 +506,7 @@ impl CapabilityManifest {
             false,
             CapabilityOwner::Forge,
             true,
-            CapabilityApplication::ServerRestart,
+            CapabilityApplication::Settled,
             "On by default. Disabling hides history tools but retains configuration inspection and the Harness skill",
         );
         add(
@@ -445,7 +516,7 @@ impl CapabilityManifest {
             false,
             CapabilityOwner::Provider,
             flags.integration.native_agent_suppression,
-            CapabilityApplication::SessionRestart,
+            CapabilityApplication::Settled,
             "Requires an integration that can disable provider-native delegation",
         );
         add(
@@ -455,7 +526,7 @@ impl CapabilityManifest {
             false,
             CapabilityOwner::Provider,
             flags.catalog.skill,
-            CapabilityApplication::SessionRestart,
+            CapabilityApplication::Settled,
             "Forge persists desired selection and verifies the provider result",
         );
         add(
@@ -465,7 +536,7 @@ impl CapabilityManifest {
             false,
             CapabilityOwner::Forge,
             true,
-            CapabilityApplication::ServerRestart,
+            CapabilityApplication::Settled,
             "Explicit source preview and selection. Imported entries start disabled and preserve native value references",
         );
         add(
@@ -475,11 +546,7 @@ impl CapabilityManifest {
             false,
             CapabilityOwner::Provider,
             flags.catalog.mcp,
-            if flags.catalog.live_mcp_mutation {
-                CapabilityApplication::Immediate
-            } else {
-                CapabilityApplication::ServerRestart
-            },
+            CapabilityApplication::Settled,
             "Forge persists desired selection independently of native provider configuration",
         );
         for (id, label, supported) in [
@@ -507,12 +574,12 @@ impl CapabilityManifest {
         }
         capability.push(Capability {
             id: CapabilityId::FilesystemAccess,
-            group: "Security",
-            label: "Filesystem access scopes",
+            group: "Security".into(),
+            label: "Filesystem access scopes".into(),
             required: false,
             implementation: CapabilityOwner::Forge,
-            support: Support::Limited,
-            application: CapabilityApplication::ExecutionRestart,
+            support: Support::Limited { restrictions: vec![CapabilityRestriction::PermissionCallbacksOnly] },
+            application: CapabilityApplication::Settled,
             reason: "Scopes and write-off apply to reported file operations. Shell commands, MCP internals, and operations without permission callbacks retain provider-native restrictions".into(),
         });
         for limitation in &flags.integration.limitations {
@@ -530,46 +597,79 @@ impl CapabilityManifest {
         Self {
             provider: descriptor.kind,
             label: descriptor.label,
-            revision: 6,
+            revision: 7,
+            effective_revision: 0,
+            task_steering: if flags.native_steer {
+                vec![
+                    crate::input::TaskKind::Goal,
+                    crate::input::TaskKind::Plan,
+                    crate::input::TaskKind::Execute,
+                ]
+            } else {
+                Vec::new()
+            },
             capability,
             provider_version: None,
-            availability: CapabilityAvailability::Ready,
-            availability_reason: None,
             notice: Vec::new(),
         }
     }
 }
 
-#[derive(Clone, Debug)]
 /// Rejects an optional operation without reporting empty discovery as success.
+#[derive(Clone, Debug)]
 pub struct UnsupportedCapability(pub ProviderFeature);
 
 /// Identify an unsupported normalized feature without interpreting arbitrary strings.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderFeature {
+    /// Runtime installation and version inspection.
     RuntimeSetup,
+    /// Explicit provider credential setup.
     Authentication,
+    /// Terminal-based authentication interaction.
     TerminalAuthentication,
+    /// Complete normalized resource selection.
     ResourceSelection,
+    /// Separate durable native history fork.
     NativeFork,
+    /// Forking from an immutable provider checkpoint.
     CheckpointFork,
+    /// Binding-owned terminal inventory.
     BackgroundTerminals,
+    /// Independent terminal termination.
     BackgroundTermination,
+    /// The complete isolated-text session mode.
     TextGeneration,
+    /// Opaque normalized model selection.
     ModelSelection,
+    /// Explicit provider-default model selection.
     ModelDefaultReset,
+    /// Normalized reasoning effort selection.
     EffortSelection,
+    /// Explicit provider-default reasoning selection.
     ReasoningDefaultReset,
+    /// Normalized context-window tier selection.
     ContextWindowSelection,
+    /// Normalized service-tier selection.
     ServiceTier,
+    /// Native skill definition discovery.
     SkillCatalog,
+    /// Skill enablement through complete session configuration.
     SkillMutation,
+    /// Configured and observed MCP discovery.
     McpCatalog,
+    /// MCP enablement through complete session configuration.
     McpMutation,
+    /// Enforcement of normalized MCP launch authority.
     McpLaunchRequirements,
+    /// Correlated native history compaction.
     NativeCompact,
-    NativeGoal,
+    /// Exact active-invocation input delivery.
+    NativeSteer,
+    /// Checked exact cancelled-input history retraction.
+    NativeTurnRollback,
+    /// Admitted image attachment input.
     ImageInput,
 }
 
@@ -584,8 +684,11 @@ impl std::error::Error for UnsupportedCapability {}
 /// Records a restriction supplied by the integration that owns the operation.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct FeatureLimitation {
+    /// Normalized feature whose baseline support is restricted.
     pub id: CapabilityId,
+    /// Typed supported subset; this cannot upgrade an unsupported baseline feature.
     pub support: Support,
+    /// User-facing explanation; admission uses typed support and restrictions.
     pub reason: String,
 }
 
@@ -597,7 +700,7 @@ mod test {
     #[test]
     fn capability_wire_identifiers_apply_the_expected_restrictions() {
         let restriction = serde_json::json!({
-            "id": "file_diff", "support": "limited", "reason": "fixture restriction"
+            "id": "file_diff", "support": {"limited": {"restrictions": ["permission_callbacks_only"]}}, "reason": "fixture restriction"
         });
         let limitation: FeatureLimitation = serde_json::from_value(restriction.clone()).unwrap();
         let manifest = CapabilityManifest::from_descriptor(ProviderDescriptor {
@@ -616,7 +719,7 @@ mod test {
             .iter()
             .find(|row| row.id == CapabilityId::FileDiff)
             .unwrap();
-        assert!(matches!(row.support, Support::Limited));
+        assert!(matches!(row.support, Support::Limited { .. }));
         let encoded = serde_json::to_value(&manifest).unwrap();
         let row = encoded["capability"]
             .as_array()
@@ -626,10 +729,9 @@ mod test {
             .unwrap();
         assert_eq!(row["implementation"], "provider");
         assert_eq!(row["application"], "immediate");
-        assert_eq!(encoded["availability"], "ready");
         assert!(
             serde_json::from_value::<FeatureLimitation>(serde_json::json!({
-                "id": "unrecognized_native_method", "support": "limited", "reason": "unmapped"
+                "id": "unrecognized_native_method", "support": {"limited": {"restrictions": ["permission_callbacks_only"]}}, "reason": "unmapped"
             }))
             .is_err()
         );
@@ -646,7 +748,9 @@ mod test {
                         runtime_setup: true,
                         limitations: vec![FeatureLimitation {
                             id: CapabilityId::FileDiff,
-                            support: Support::Limited,
+                            support: Support::Limited {
+                                restrictions: vec![CapabilityRestriction::PermissionCallbacksOnly],
+                            },
                             reason: "fixture restriction".into(),
                         }],
                         ..Default::default()
@@ -675,7 +779,7 @@ mod test {
             ));
             assert!(matches!(
                 find(CapabilityId::FileDiff).support,
-                Support::Limited
+                Support::Limited { .. }
             ));
             assert_eq!(find(CapabilityId::FileDiff).reason, "fixture restriction");
         }

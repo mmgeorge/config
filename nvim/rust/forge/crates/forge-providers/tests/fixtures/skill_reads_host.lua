@@ -40,6 +40,13 @@ local function request(method, parameter)
     return settled
   end, 10), method .. " timed out: " .. vim.inspect(errors))
   assert(not failure, method .. ": " .. tostring(failure))
+  if method == "session.prompt.submit" then
+    assert(vim.wait(90000, function()
+      for _, approval in ipairs(state.approval or {}) do approvals[approval.id] = true end
+      local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+      return not state.busy and text:find("SKILL_READ_VERIFIED", 1, true)
+    end, 10), "skill execution did not settle after durable submission")
+  end
   return result
 end
 local succeeded, failure = xpcall(function()
@@ -79,18 +86,13 @@ local succeeded, failure = xpcall(function()
   end, 10), "skill activity did not expand")
   local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
   assert(snapshot.status.kind == "idle", "provider execution did not settle")
-  local function script_output(value)
-    if type(value) ~= "table" then return false end
-    for _, key in ipairs({ "aggregatedOutput", "combinedOutput" }) do
-      if type(value[key]) == "string" and value[key]:find("SKILL_SCRIPT_VERIFIED", 1, true) then return true end
-    end
-    for _, child in pairs(value) do if script_output(child) then return true end end
-    return false
-  end
   local script_verified = false
-  for _, line in ipairs(vim.fn.readfile(request("host.trace.status").path)) do
-    local record = vim.json.decode(line)
-    if script_output(record.payload) then script_verified = true break end
+  for _, exchange in ipairs(request("session.exchange.list")) do
+    for _, turn in ipairs(exchange.turn) do
+      for _, tool in pairs(turn.tool.item) do
+        if tool.output:find("SKILL_SCRIPT_VERIFIED", 1, true) then script_verified = true end
+      end
+    end
   end
   assert(script_verified, "provider command output did not confirm the bundled script\n" .. text)
   assert(text:find("Read skill · fixture", 1, true), "confirmed skill read has no timeline event")

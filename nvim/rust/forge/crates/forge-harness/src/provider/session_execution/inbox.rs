@@ -145,7 +145,7 @@ impl SessionObservationInbox {
             for watchdog in watchdogs {
                 watchdog.observe(event).map_err(|error| {
                     crate::provider::lifecycle_error::classify(
-                        forge_provider_api::error::ProviderOperation::CollectEventReader,
+                        forge_provider_api::error::ProviderOperation::InputSubmit,
                         error,
                     )
                 })?;
@@ -184,7 +184,7 @@ impl SessionObservationInbox {
         {
             previous.retire_idle().map_err(|error| {
                 crate::provider::lifecycle_error::classify(
-                    forge_provider_api::error::ProviderOperation::CollectEventReader,
+                    forge_provider_api::error::ProviderOperation::InputSubmit,
                     error,
                 )
             })?;
@@ -193,7 +193,7 @@ impl SessionObservationInbox {
         Ok(())
     }
 
-    /// Retain deadlines through certified idle reopening and background execution.
+    /// Retain admitted tool deadlines after the foreground result waiter leaves.
     pub(crate) fn monitor_background(
         self: &Arc<Self>,
         scope: crate::provider::InvocationScope,
@@ -202,7 +202,7 @@ impl SessionObservationInbox {
     ) -> Result<()> {
         watchdog.finish_foreground().map_err(|error| {
             crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CollectEventReader,
+                forge_provider_api::error::ProviderOperation::InputSubmit,
                 error,
             )
         })?;
@@ -229,7 +229,7 @@ impl SessionObservationInbox {
             {
                 let failure = self.retain_watchdog_failure(
                     crate::provider::lifecycle_error::classify_source(
-                        forge_provider_api::error::ProviderOperation::CollectEventReader,
+                        forge_provider_api::error::ProviderOperation::InputSubmit,
                         &error,
                     ),
                 );
@@ -251,13 +251,13 @@ impl SessionObservationInbox {
                     let timeout = tokio::select! {
                         biased;
                         () = wait_for_close(&closed, &monitor_closed) => return Ok(()),
-                        timeout = watchdog.expired() => timeout.map_err(|error| crate::provider::lifecycle_error::classify(forge_provider_api::error::ProviderOperation::CollectEventReader, error))?,
+                        timeout = watchdog.expired() => timeout.map_err(|error| crate::provider::lifecycle_error::classify(forge_provider_api::error::ProviderOperation::InputSubmit, error))?,
                     };
                     let Some(timeout) = timeout else {
                         if !tokio::select! {
                             biased;
                             () = wait_for_close(&closed, &monitor_closed) => Ok(false),
-                            resumed = watchdog.resumed() => resumed.map_err(|error| crate::provider::lifecycle_error::classify(forge_provider_api::error::ProviderOperation::CollectEventReader, error)),
+                            resumed = watchdog.resumed() => resumed.map_err(|error| crate::provider::lifecycle_error::classify(forge_provider_api::error::ProviderOperation::InputSubmit, error)),
                         }? {
                             return Ok(());
                         }
@@ -298,7 +298,7 @@ impl SessionObservationInbox {
                         inbox.fail(failure.clone());
                     }
                     // Stop native work even when timeout publication fails.
-                    let cancellation = provider.cancel_session(&scope.owner.runtime_key()).await;
+                    let cancellation = provider.cancel_invocation(scope.clone()).await.map(|_| ());
                     match (publication, cancellation) {
                         (Err(publication), Err(cancellation)) => {
                             return Err(ProviderError::Combined { primary: Box::new(publication), secondary: vec![cancellation] });
@@ -353,7 +353,7 @@ impl SessionObservationInbox {
                 && !error.is_cancelled()
             {
                 self.retain_watchdog_failure(crate::provider::lifecycle_error::classify_source(
-                    forge_provider_api::error::ProviderOperation::CollectEventReader,
+                    forge_provider_api::error::ProviderOperation::InputSubmit,
                     &error,
                 ));
             }
@@ -519,7 +519,7 @@ impl forge_provider_api::events::EventObserver for SessionObservationInbox {
 /// Preserve typed inbox synchronization failures at the engine boundary.
 fn inbox_poisoned(_component: &'static str) -> ProviderError {
     ProviderError::Failure(forge_provider_api::error::ProviderFailure::new(
-        forge_provider_api::error::ProviderOperation::CollectEventReader,
+        forge_provider_api::error::ProviderOperation::InputSubmit,
         forge_provider_api::ProviderFailureKind::Runtime,
     ))
 }
@@ -565,15 +565,11 @@ mod tests {
         use forge_provider_api::{ProviderFailure, ProviderFailureKind, ProviderOperation};
         let inbox = super::SessionObservationInbox::default();
         let first = inbox.retain_watchdog_failure(
-            ProviderFailure::new(
-                ProviderOperation::CancelSession,
-                ProviderFailureKind::Transport,
-            )
-            .into(),
+            ProviderFailure::new(ProviderOperation::Cancel, ProviderFailureKind::Transport).into(),
         );
         let second = inbox.retain_watchdog_failure(
             ProviderFailure::new(
-                ProviderOperation::CollectEventReader,
+                ProviderOperation::InputSubmit,
                 ProviderFailureKind::Protocol,
             )
             .into(),
@@ -613,9 +609,8 @@ mod tests {
     #[test]
     fn bounded_draining_preserves_large_observation_stream() -> Result<()> {
         let inbox = SessionObservationInbox::default();
-        let scope = crate::provider::EventScope::SessionOperation {
+        let scope = crate::provider::EventScope::Binding {
             owner: crate::provider::ExecutionOwner::root("session"),
-            operation_id: "large-observation-stream".into(),
         };
         let mut observed = Vec::new();
         let count = forge_protocol::MAX_PENDING_FRAMES * 4;
@@ -658,9 +653,8 @@ mod tests {
     -> Result<()> {
         let inbox = SessionObservationInbox::default();
         let event = |index| ProviderEvent::Diagnostic {
-            scope: crate::provider::EventScope::SessionOperation {
+            scope: crate::provider::EventScope::Binding {
                 owner: crate::provider::ExecutionOwner::root("session"),
-                operation_id: format!("operation-{index}"),
             },
             diagnostic: fixture_diagnostic(format!("frame-{index:03}: α🦀")),
         };
@@ -713,31 +707,94 @@ mod tests {
         Ok(())
     }
 
-    /// Preserve typed loss and still cancel native work when timeout publication meets a full inbox.
-    #[tokio::test(start_paused = true)]
-    async fn timeout_cancels_native_work_even_when_publication_is_full() -> Result<()> {
-        let data = tempfile::tempdir()?;
-        let trace = Arc::new(crate::trace::TraceStore::open(data.path())?);
-        let provider: Arc<crate::provider::Provider> = crate::provider::build(
-            crate::provider::ProviderLaunch {
-                kind: forge_providers::registry::nonselectable_id()
-                    .expect("registry supplies a nonselectable fixture identity"),
-                command: Vec::new(),
-            },
-            crate::provider::approval::PermissionCoordinator::transient(data.path())?,
-            trace,
-            data.path().into(),
-        )?;
-        let scope = crate::provider::InvocationScope::new(
-            crate::provider::ExecutionOwner::root("session"),
-            "exchange",
-        );
-        provider
-            .initialize_session(crate::provider::ProviderRequest {
+    /// Retain real admitted native work independently of its foreground result waiter.
+    struct AdmittedWork {
+        _directory: tempfile::TempDir,
+        _session: crate::provider::test_support::ProviderTestSession,
+        registry: super::super::SessionExecutionRegistry,
+        engine: Arc<super::super::SessionExecution>,
+        provider: Arc<crate::provider::Provider>,
+        scope: crate::provider::InvocationScope,
+        turn: crate::provider::TurnAddress,
+        result: tokio::task::JoinHandle<
+            std::result::Result<crate::provider::ProviderCompletion, ProviderError>,
+        >,
+    }
+
+    impl AdmittedWork {
+        /// Admit a cancellable invocation and await its real native Started boundary.
+        async fn start() -> Result<Self> {
+            let directory = tempfile::tempdir()?;
+            let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
+            let store = crate::provider::submission::SubmissionStore::open(
+                directory.path(),
+                trace.clone(),
+            )?;
+            let started = Arc::new(tokio::sync::Semaphore::new(0));
+            let entered = started.clone();
+            let native = crate::provider::test_support::EventFixtureProvider::new(
+                forge_provider_api::ProviderDescriptor {
+                    kind: forge_providers::registry::nonselectable_id()
+                        .expect("registry supplies fixture identity"),
+                    label: "Watchdog collection fixture".into(),
+                    capability: Default::default(),
+                },
+                move |request, sink, mut cancelled| {
+                    let entered = entered.clone();
+                    async move {
+                        let address = crate::provider::TurnAddress {
+                            scope: request.scope.clone(),
+                            thread_id: "thread".into(),
+                            turn_id: "admitted".into(),
+                        };
+                        sink.send_wait(ProviderEvent::Execution {
+                            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                                request.scope.clone(),
+                                forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                                    address: address.clone(),
+                                },
+                            )
+                            .expect("fixture native address belongs to its invocation"),
+                        })
+                        .await?;
+                        entered.add_permits(1);
+                        loop {
+                            if *cancelled.borrow_and_update() {
+                                break;
+                            }
+                            if cancelled.changed().await.is_err() {
+                                return Err(ProviderError::DeliveryUncertain);
+                            }
+                        }
+                        sink.send_wait(ProviderEvent::Execution {
+                            observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                                request.scope,
+                                forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                                    address, covered_submissions: vec![request.submission_id],
+                                    completed_at_ms: crate::provider::retry::now_ms(),
+                                    result: forge_provider_api::lifecycle::ExecutionResult::Cancelled {
+                                        completion: forge_provider_api::completion::ProviderCompletion::default().into(),
+                                    },
+                                },
+                            ).expect("fixture cancellation covers its admitted input"),
+                        }).await?;
+                        Ok(())
+                    }
+                },
+            );
+            let session = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+            let provider = session.provider_handle();
+            let registry = super::super::SessionExecutionRegistry::new(provider.clone(), trace);
+            let scope = crate::provider::InvocationScope::new(
+                crate::provider::ExecutionOwner::root("session"),
+                "exchange",
+            );
+            let engine = registry.owner(scope.owner.clone()).await?;
+            let input = crate::provider::ProviderRequest {
                 dispatch: forge_provider_api::submission::DispatchTracker::default(),
                 execution_owner: Some(scope.owner.clone()),
                 harness_session_id: scope.owner.session_id.to_string(),
-                workspace: data.path().to_string_lossy().into_owned(),
+                workspace: directory.path().to_string_lossy().into_owned(),
                 input: crate::provider::ProviderInput::from_text("timeout fixture"),
                 mode: crate::provider::PromptMode::Chat,
                 model: "default".into(),
@@ -750,28 +807,34 @@ mod tests {
                 submission: None,
                 recovered_input: Vec::new(),
                 control_context: None,
+            };
+            let turn = crate::provider::TurnAddress {
+                scope: scope.clone(),
+                thread_id: "thread".into(),
+                turn_id: "admitted".into(),
+            };
+            let (sink, _events) = crate::provider::events::channel(scope.clone());
+            let running = engine.clone();
+            let result = tokio::spawn(async move { running.run_once(input, sink, &store).await });
+            crate::provider::test_support::wait_gate(&started).await?;
+            Ok(Self {
+                _directory: directory,
+                _session: session,
+                registry,
+                engine,
+                provider,
+                scope,
+                turn,
+                result,
             })
-            .await?;
-        let runtime_key = scope.owner.runtime_key();
-        let control = provider.mock_response_control().unwrap();
-        let held = control
-            .dispatch(
-                &runtime_key,
-                crate::provider::mock_response::MockResponseCommand::Hold {
-                    mode: None,
-                    any_session: false,
-                },
-            )
-            .await?;
-        let waiting = control.dispatch(
-            &runtime_key,
-            crate::provider::mock_response::MockResponseCommand::Wait {
-                id: held["id"].as_str().unwrap().to_owned(),
-            },
-        );
-        tokio::pin!(waiting);
-        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        }
+    }
 
+    /// Preserve typed loss and still cancel native work when timeout publication meets a full inbox.
+    #[tokio::test]
+    async fn timeout_cancels_native_work_even_when_publication_is_full() -> Result<()> {
+        let work = AdmittedWork::start().await?;
+        let scope = work.scope.clone();
         let inbox = Arc::new(SessionObservationInbox::default());
         let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
             crate::session::InputTimeout {
@@ -782,11 +845,7 @@ mod tests {
         inbox.watch_tools(&scope, &watchdog)?;
         inbox.push(ProviderEvent::Tool {
             address: crate::provider::ToolAddress {
-                turn: crate::provider::TurnAddress {
-                    scope: scope.clone(),
-                    thread_id: "thread".into(),
-                    turn_id: "turn".into(),
-                },
+                turn: work.turn.clone(),
                 tool_id: "stalled".into(),
             },
             update: crate::provider::ToolUpdate::Started,
@@ -803,12 +862,18 @@ mod tests {
                 },
             })?;
         }
-        inbox.start_tool_monitor(scope, watchdog, provider.clone())?;
-        let cancellation = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
-            .await?
-            .unwrap_err();
-        assert!(cancellation.to_string().contains("cancelled"));
-        assert!(inbox.is_closed());
+        inbox.start_tool_monitor(scope, watchdog, work.provider.clone())?;
+        let cancellation =
+            tokio::time::timeout(std::time::Duration::from_secs(5), work.result).await??;
+        assert!(
+            matches!(cancellation, Err(ProviderError::Cancelled)),
+            "{cancellation:?}"
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_close(&inbox.closed, &inbox.monitor_closed),
+        )
+        .await?;
         assert_eq!(inbox.drain()?.len(), forge_protocol::MAX_PENDING_FRAMES);
         let failure = inbox.drain().unwrap_err();
         assert!(
@@ -833,30 +898,20 @@ mod tests {
             if matches!(error.as_ref(), crate::provider::ProviderError::Observation(forge_provider_api::lifecycle::ObservationFailure::Overflow)))
         );
         assert!(inbox.retire_background().await.is_err());
-        provider.shutdown().await?;
+        work.registry.close().await?;
+        work.provider.shutdown().await?;
         Ok(())
     }
 
-    /// Keep timeout observation alive when native work starts after its result waiter has gone.
-    #[tokio::test(start_paused = true)]
-    async fn idle_reopening_rearms_tool_deadlines_without_a_result_waiter() -> Result<()> {
-        let data = tempfile::tempdir()?;
-        let trace = Arc::new(crate::trace::TraceStore::open(data.path())?);
-        let provider: Arc<crate::provider::Provider> = crate::provider::build(
-            crate::provider::ProviderLaunch {
-                kind: forge_providers::registry::nonselectable_id()
-                    .expect("registry supplies a nonselectable fixture identity"),
-                command: Vec::new(),
-            },
-            crate::provider::approval::PermissionCoordinator::transient(data.path())?,
-            trace,
-            data.path().into(),
-        )?;
+    /// Keep timeout observation alive for admitted native work after its result waiter has gone.
+    #[tokio::test]
+    async fn admitted_execution_rearms_tool_deadlines_without_a_result_waiter() -> Result<()> {
+        let work = AdmittedWork::start().await?;
+        work.result.abort();
+        let aborted = work.result.await.unwrap_err();
+        assert!(aborted.is_cancelled());
         let inbox = Arc::new(SessionObservationInbox::default());
-        let scope = crate::provider::InvocationScope::new(
-            crate::provider::ExecutionOwner::root("session"),
-            "exchange",
-        );
+        let scope = work.scope.clone();
         let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
             crate::session::InputTimeout {
                 amount: 1,
@@ -864,19 +919,12 @@ mod tests {
             },
         )?);
         inbox.watch_tools(&scope, &watchdog)?;
-        inbox.monitor_background(scope.clone(), watchdog, provider)?;
-        tokio::task::yield_now().await;
-        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        inbox.monitor_background(scope.clone(), watchdog, work.provider.clone())?;
         assert!(inbox.drain()?.is_empty());
-
-        let turn = crate::provider::TurnAddress {
-            scope: scope.clone(),
-            thread_id: "thread".into(),
-            turn_id: "idle-continuation".into(),
-        };
+        let turn = work.turn.clone();
         inbox.push(ProviderEvent::Execution {
             observation: forge_provider_api::lifecycle::ExecutionObservation::new(
-                scope,
+                scope.clone(),
                 forge_provider_api::lifecycle::ExecutionUpdate::Started {
                     address: turn.clone(),
                 },
@@ -885,7 +933,7 @@ mod tests {
         inbox.push(ProviderEvent::Tool {
             address: crate::provider::ToolAddress {
                 turn,
-                tool_id: "resumed-tool".into(),
+                tool_id: "admitted-tool".into(),
             },
             update: crate::provider::ToolUpdate::Started,
         })?;
@@ -899,9 +947,18 @@ mod tests {
                 inbox.notified().await?;
             }
         }).await??;
+        let ready = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            work.engine.wait_ready(scope),
+        )
+        .await??;
+        assert!(matches!(ready.outcome, Err(ProviderError::Cancelled)));
+        ready.ticket.commit().await?;
         inbox.close();
         inbox.retire_background().await?;
         assert!(inbox.background_tasks.lock().unwrap().is_empty());
+        work.registry.close().await?;
+        work.provider.shutdown().await?;
         Ok(())
     }
 
@@ -1027,9 +1084,8 @@ mod tests {
         assert!(
             inbox
                 .push(ProviderEvent::Diagnostic {
-                    scope: crate::provider::EventScope::SessionOperation {
+                    scope: crate::provider::EventScope::Binding {
                         owner: crate::provider::ExecutionOwner::root("session"),
-                        operation_id: "old".into(),
                     },
                     diagnostic: crate::provider::ProviderDiagnostic {
                         kind: forge_provider_api::ProviderFailureKind::Unknown,
@@ -1048,9 +1104,8 @@ mod tests {
     async fn failure_survives_until_preceding_events_drain() -> Result<()> {
         let inbox = SessionObservationInbox::default();
         let event = ProviderEvent::Diagnostic {
-            scope: crate::provider::EventScope::SessionOperation {
+            scope: crate::provider::EventScope::Binding {
                 owner: crate::provider::ExecutionOwner::root("session"),
-                operation_id: "initialization".into(),
             },
             diagnostic: crate::provider::ProviderDiagnostic {
                 kind: forge_provider_api::ProviderFailureKind::Unknown,

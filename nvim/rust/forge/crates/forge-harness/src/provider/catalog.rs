@@ -1,5 +1,35 @@
 use serde::{Deserialize, Serialize};
 
+/// Retain the host owner's published session defaults for resource preparation and UI reads.
+/// Native discovery receives an explicit workspace or binding context instead of this snapshot.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ProviderCatalogRequest {
+    /// Identify the independent agent owner while preserving the visible settings scope.
+    pub execution_owner: Option<super::ExecutionOwner>,
+    /// Identify the host session whose owner publishes these defaults.
+    pub harness_session_id: String,
+    /// Select the settings and resource workspace.
+    pub workspace: String,
+    /// Retain confirmed host filesystem policy.
+    pub access: crate::session::AccessPolicy,
+    /// Retain confirmed host approval policy.
+    pub approval_mode: crate::session::ApprovalMode,
+    /// Identify durable history without granting authority to open a second binding.
+    pub provider_session_id: Option<forge_provider_api::ProviderSessionId>,
+}
+
+impl ProviderCatalogRequest {
+    /// Get the runtime key owned by the published session snapshot.
+    pub fn runtime_key(&self) -> Result<String, forge_provider_api::ExecutionOwnerError> {
+        Ok(self.owner()?.runtime_key())
+    }
+
+    /// Resolve the exact host owner without changing the visible preference scope.
+    pub fn owner(&self) -> Result<super::ExecutionOwner, forge_provider_api::ExecutionOwnerError> {
+        super::ExecutionOwner::resolve(&self.execution_owner, &self.harness_session_id)
+    }
+}
+
 /// Applies saved model controls while retaining provider defaults for unset values.
 pub(crate) fn select_model_settings(
     model_list: &mut [super::ProviderModel],

@@ -16,7 +16,8 @@ client.request = function(request_specification, callback)
 end
 package.loaded["forge.views.harness.controller"] = {
   refresh_winbar = function() end,
-  activate_snapshot = function() end,
+  activate_snapshot = function() error("Plan command receipt is not a session snapshot") end,
+  synchronize_state = function() end,
   render = function() end,
   present_plan_question = function() end,
   task_transition = function() error("approval issued a second execution command") end,

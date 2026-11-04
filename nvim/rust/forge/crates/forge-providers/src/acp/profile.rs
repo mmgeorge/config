@@ -15,7 +15,7 @@ pub(crate) fn create(
             antigravity(root, skills, &home)
         }
     };
-    profile.map_err(|error| error.into_provider_error(ProviderOperation::InitializeSession))
+    profile.map_err(|error| error.into_provider_error(ProviderOperation::SessionOpen))
 }
 
 fn claude(
@@ -61,10 +61,7 @@ pub(crate) fn native_home() -> Result<PathBuf, ProviderError> {
 }
 
 fn failure(kind: ProviderFailureKind) -> ProviderError {
-    ProviderError::Failure(ProviderFailure::new(
-        ProviderOperation::InitializeSession,
-        kind,
-    ))
+    ProviderError::Failure(ProviderFailure::new(ProviderOperation::SessionOpen, kind))
 }
 
 #[cfg(test)]

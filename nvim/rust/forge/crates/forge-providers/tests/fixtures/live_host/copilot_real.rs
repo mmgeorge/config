@@ -8,7 +8,7 @@ use std::time::Duration;
 
 #[tokio::test]
 #[ignore = "requires authenticated Copilot and performs a real model request"]
-async fn isolated_commit_generation_uses_existing_login_without_starting_shared_client() {
+async fn isolated_commit_generation_uses_existing_login_without_creating_persistent_history() {
     let temporary = tempfile::tempdir().unwrap();
     let provider =
         super::build_provider("copilot", Vec::new(), temporary.path(), temporary.path()).unwrap();
@@ -27,9 +27,8 @@ async fn isolated_commit_generation_uses_existing_login_without_starting_shared_
     assert!(!message.is_empty());
     assert!(
         provider
-            .active_session_id_for(&request.harness_session_id)
+            .retained_session_id(&request.owner().unwrap())
             .await
-            .unwrap()
             .is_none()
     );
     provider.shutdown().await.unwrap();
@@ -62,7 +61,8 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
         .unwrap();
     let trace = std::sync::Arc::new(forge_harness::trace::TraceStore::open(&data).unwrap());
     trace.configure(true).unwrap();
-    let provider = super::build_provider("copilot", Vec::new(), &data, &workspace).unwrap();
+    let test_session = super::provider_session("copilot", Vec::new(), &data, &workspace).unwrap();
+    let provider = test_session.provider_handle();
     let request = ProviderCatalogRequest {
         execution_owner: None,
         harness_session_id: "copilot-mcp-no-args-test".into(),
@@ -71,10 +71,19 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
         approval_mode: ApprovalMode::Ask,
         provider_session_id: None,
     };
-    let server = tokio::time::timeout(Duration::from_secs(40), provider.mcp_list(request.clone()))
+    test_session
+        .session_open(super::prompt_request(&request))
         .await
-        .expect("Copilot MCP startup timed out")
         .unwrap();
+    let server = tokio::time::timeout(
+        Duration::from_secs(40),
+        provider.mcp_list(forge_provider_api::McpQuery::Observed(
+            provider.query_context(&request).await.unwrap(),
+        )),
+    )
+    .await
+    .expect("Copilot MCP startup timed out")
+    .unwrap();
     assert_eq!(server.len(), 2);
     assert_eq!(
         server
@@ -102,11 +111,15 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
         std::fs::read_to_string(trace.session_status(&request.harness_session_id).path).unwrap();
     assert!(!log.contains("copilot.mcp.start_failed"));
     let session_id = provider
-        .active_session_id_for(&request.harness_session_id)
+        .retained_session_id(&request.owner().unwrap())
         .await
-        .unwrap()
         .unwrap();
-    let server = provider.mcp_list(request.clone()).await.unwrap();
+    let server = provider
+        .mcp_list(forge_provider_api::McpQuery::Observed(
+            provider.query_context(&request).await.unwrap(),
+        ))
+        .await
+        .unwrap();
     assert_eq!(
         server
             .iter()
@@ -117,20 +130,16 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
     );
     assert_eq!(
         provider
-            .active_session_id_for(&request.harness_session_id)
+            .retained_session_id(&request.owner().unwrap())
             .await
-            .unwrap()
             .as_ref()
             .map(|id| id.as_str()),
         Some(session_id.as_str())
     );
-    let terminals = tokio::time::timeout(
-        Duration::from_secs(10),
-        provider.background_terminals(request),
-    )
-    .await
-    .expect("Copilot terminal status timed out")
-    .unwrap();
+    let terminals = tokio::time::timeout(Duration::from_secs(10), provider.terminal_list(request))
+        .await
+        .expect("Copilot terminal status timed out")
+        .unwrap();
     assert!(terminals.supported);
     assert!(terminals.terminal.is_empty());
     provider.shutdown().await.unwrap();
@@ -152,7 +161,7 @@ async fn lists_native_copilot_skills_and_mcp_rows() {
     };
     let skill_list = tokio::time::timeout(
         Duration::from_secs(30),
-        provider.skill_list(request.clone()),
+        provider.skill_list(provider.query_context(&request).await.unwrap()),
     )
     .await
     .expect("Copilot skill list timed out")
@@ -162,7 +171,9 @@ async fn lists_native_copilot_skills_and_mcp_rows() {
     new_session_request.harness_session_id = "copilot-new-catalog".into();
     let mcp_list = tokio::time::timeout(
         Duration::from_secs(30),
-        provider.mcp_list(new_session_request),
+        provider.mcp_list(forge_provider_api::McpQuery::Configured(
+            provider.query_context(&new_session_request).await.unwrap(),
+        )),
     )
     .await
     .expect("Copilot MCP list timed out")

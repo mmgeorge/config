@@ -85,7 +85,7 @@ impl SessionController {
             .owner(owner)
             .await
             .map_err(ProviderLifecycleFailure::Provider)?;
-        let provider_session_id = provider.initialize_session(request.clone()).await?;
+        let provider_session_id = provider.session_open(request.clone()).await?;
         if self.input_stopping.load(Ordering::Acquire) {
             return Err(ProviderLifecycleFailure::ControllerClosed);
         }

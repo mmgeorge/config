@@ -1086,7 +1086,6 @@ impl BrokerObserver {
             plan.title.clone(),
             execution,
             crate::session::continuation::ContinuationBudget::new(goal_max_turns, 5),
-            false,
             now_ms,
         );
         let planning_task = session.active_task.as_ref().filter(|task| {

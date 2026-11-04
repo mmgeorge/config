@@ -247,7 +247,6 @@ mod tests {
                 crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                     "Observe this workspace".into(),
                     Default::default(),
-                    false,
                     1,
                 ))),
                 1,

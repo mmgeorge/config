@@ -89,7 +89,7 @@ pub struct MessageInput {
 }
 
 /// Identify one admitted file independently of a provider's attachment wire format.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FileAttachment {
     /// Canonical admitted file retained for the provider invocation.
     pub path: std::path::PathBuf,

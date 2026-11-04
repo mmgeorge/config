@@ -223,7 +223,7 @@ fn runtime_projection_tracks_commits_without_database_reads() -> Result<()> {
     owner.save_session(&session)?;
     let projection = owner.session_admission(&session.id)?;
     let mut writer = SqliteStore::open(root.path())?;
-    let task = crate::task::Task::goal("original".into(), Default::default(), false, 1);
+    let task = crate::task::Task::goal("original".into(), Default::default(), 1);
     writer.commit_task_change(&session.id, None, 1, |active| {
         *active = Some(task.clone());
         Ok(())
@@ -233,7 +233,7 @@ fn runtime_projection_tracks_commits_without_database_reads() -> Result<()> {
         "original"
     );
     writer.connection.execute_batch("CREATE TRIGGER fail_task BEFORE UPDATE ON session_record BEGIN SELECT RAISE(ABORT,'failed task write'); END;")?;
-    let mut replacement = crate::task::Task::goal("committed".into(), Default::default(), false, 2);
+    let mut replacement = crate::task::Task::goal("committed".into(), Default::default(), 2);
     assert!(
         writer
             .commit_task_change(&session.id, Some(&task.revision), 2, |active| {
@@ -287,13 +287,8 @@ fn runtime_projection_tracks_commits_without_database_reads() -> Result<()> {
             "observed_document_version":0,"observed_check":[],"created_at_ms":0
         }),
     )?;
-    let execute_task = crate::task::Task::execute(
-        "committed".into(),
-        execution.clone(),
-        Default::default(),
-        false,
-        4,
-    )?;
+    let execute_task =
+        crate::task::Task::execute("committed".into(), execution.clone(), Default::default(), 4)?;
     writer.commit_task_change(&session.id, Some(&replacement.revision), 4, |active| {
         *active = Some(execute_task.clone());
         Ok(())

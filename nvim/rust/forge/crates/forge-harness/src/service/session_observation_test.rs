@@ -119,7 +119,8 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
     let replacement = provider.event_sink(&owner).await?;
     let scope = EventScope::SessionOperation {
         owner,
-        operation_id: "replacement".into(),
+        operation_id: forge_provider_api::OperationId::new("replacement")
+            .expect("fixture operation identity is nonempty"),
     };
     replacement
         .bind_scope(scope.clone())?
@@ -137,7 +138,8 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
         old.send_wait(ProviderEvent::Diagnostic {
             scope: EventScope::SessionOperation {
                 owner: ExecutionOwner::root(&session_id),
-                operation_id: "old".into()
+                operation_id: forge_provider_api::OperationId::new("old")
+                    .expect("fixture operation identity is nonempty")
             },
             diagnostic: session_test_diagnostic("stale"),
         })
@@ -178,6 +180,8 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
         WidthProfile::default(),
     )?;
     let controller = SessionController::new(broker)?;
+    let execution_registry = controller.broker.lock().await.execution_registry();
+    let engine = execution_registry.owner(owner.clone()).await?;
     controller.trace.configure(true)?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let delivered = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
@@ -236,7 +240,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     })
     .await
     .context("accepted native prompt did not publish working status")??;
-    assert!(provider.has_active_turn(&owner).await);
+    assert!(engine.active_invocation_snapshot()?.is_some());
     assert_eq!(controller.coordinator.execution.available_permits(), 0);
     let submission_id = foreground
         .submission_id
@@ -289,7 +293,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
         crate::exchange::ExchangeState::Failed
     );
     drop(broker);
-    assert!(!provider.has_active_turn(&owner).await);
+    assert!(engine.active_invocation_snapshot()?.is_none());
     assert_eq!(foreground.calls.load(Ordering::Acquire), 1);
     assert!(
         matches!(
@@ -337,7 +341,10 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
     if let Some(task) = controller.input_task.lock().await.take() {
         tokio::time::timeout(Duration::from_secs(5), task).await??;
     }
-    provider.shutdown().await?;
+    let native_shutdown = crate::provider::operation::OperationControl::fresh(
+        forge_provider_api::ProviderOperation::Shutdown,
+    )?;
+    provider.shutdown(native_shutdown.context()).await?;
     if let Err(error) =
         tokio::time::timeout(Duration::from_secs(5), controller.finish_session_events()).await?
     {
@@ -369,7 +376,8 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     let owner = ExecutionOwner::root(&session_id);
     let scope = EventScope::SessionOperation {
         owner: owner.clone(),
-        operation_id: "observation-fixture".into(),
+        operation_id: forge_provider_api::OperationId::new("observation-fixture")
+            .expect("fixture operation identity is nonempty"),
     };
     let provider = observation_provider(None);
     let _provider_fixture =
@@ -488,7 +496,8 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
     let owner = ExecutionOwner::root(&session_id);
     let scope = EventScope::SessionOperation {
         owner: owner.clone(),
-        operation_id: "overflow".into(),
+        operation_id: forge_provider_api::OperationId::new("overflow")
+            .expect("fixture operation identity is nonempty"),
     };
     let provider = observation_provider(None);
     let _provider_fixture =
@@ -646,12 +655,15 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
     controller.attach_session_events(&message_sink).await?;
     // Persisted background work requires an opened native binding, not just attached UI output.
     execution.owner(owner.clone()).await?;
-    bridge.initialize_session(initialization).await?;
+    bridge.session_open(initialization).await?;
     let broker_guard = controller.broker.lock().await;
     let shutdown_controller = controller.clone();
     let shutdown = tokio::spawn(async move {
         execution.begin_orderly_shutdown().await?;
-        provider.shutdown().await?;
+        let native_shutdown = crate::provider::operation::OperationControl::fresh(
+            forge_provider_api::ProviderOperation::Shutdown,
+        )?;
+        provider.shutdown(native_shutdown.context()).await?;
         execution.close().await?;
         shutdown_controller.finish_session_events().await?;
         shutdown_controller.broker.lock().await.release_lease()?;
@@ -724,7 +736,10 @@ async fn cancelled_session_observation_join_retains_collector_for_retry() -> Res
     );
     assert!(controller.session_event_task.lock().await.is_some());
     execution.begin_orderly_shutdown().await?;
-    provider.shutdown().await?;
+    let native_shutdown = crate::provider::operation::OperationControl::fresh(
+        forge_provider_api::ProviderOperation::Shutdown,
+    )?;
+    provider.shutdown(native_shutdown.context()).await?;
     execution.close().await?;
     tokio::time::timeout(Duration::from_secs(2), controller.finish_session_events()).await??;
     assert!(controller.session_event_task.lock().await.is_none());
@@ -793,6 +808,6 @@ async fn saturated_observer_transport_does_not_block_recovery() -> Result<()> {
         &old_inbox,
         &controller.observer.session_events()
     ));
-    assert!(!controller.task_controller.native_goal_is_uncertain());
+    assert!(!controller.task_controller.configuration_is_uncertain());
     Ok(())
 }

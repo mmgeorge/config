@@ -60,6 +60,12 @@ impl From<SubmissionId> for String {
 pub enum LifecycleError {
     /// A journal identity was empty.
     EmptySubmission,
+    /// A retained mutation operation identity was empty.
+    EmptyOperation,
+    /// A journal delivery-attempt identity was empty.
+    EmptyDeliveryAttempt,
+    /// A binding-scoped terminal identity was empty.
+    EmptyTerminal,
     /// The execution address belongs to a different invocation.
     OwnershipMismatch,
     /// Terminal coverage repeats an input journal identity.
@@ -79,6 +85,9 @@ impl fmt::Display for LifecycleError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptySubmission => f.write_str("submission identity is empty"),
+            Self::EmptyOperation => f.write_str("provider operation identity is empty"),
+            Self::EmptyDeliveryAttempt => f.write_str("delivery attempt identity is empty"),
+            Self::EmptyTerminal => f.write_str("provider terminal identity is empty"),
             Self::OwnershipMismatch => {
                 f.write_str("execution address belongs to another invocation")
             }
@@ -213,7 +222,6 @@ pub enum ExecutionFailure {
     Retryable {
         address: TurnAddress,
         category: crate::retry::RetryCategory,
-        continuation: crate::ContinuationToken,
     },
 }
 

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Describe one host tool independently of its native provider transport.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ControlToolDefinition {
     /// Stable tool name advertised to the model.
     pub name: &'static str,

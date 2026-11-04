@@ -13,6 +13,7 @@ mod input;
 mod intake;
 mod mcp;
 mod message_state;
+mod operation;
 mod permission;
 mod prompt;
 pub(crate) mod provider;
@@ -23,8 +24,10 @@ mod session;
 mod session_directory;
 mod sessions;
 mod terminal;
-mod text_generation;
 mod turn;
 
 mod compaction_metrics;
 mod tool_semantics;
+
+#[cfg(test)]
+mod test_peer;

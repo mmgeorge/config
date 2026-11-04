@@ -11,9 +11,9 @@ use serde_json::json;
 
 use super::{Provider, ProviderRequest};
 use crate::trace::TraceStore;
-use forge_provider_api::{RecoveryToken, SubmissionId};
+use forge_provider_api::{DeliveryAttemptId, RecoveryToken, SubmissionId};
 
-const SUBMISSION_FORMAT_VERSION: u32 = 2;
+const SUBMISSION_FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -69,6 +69,11 @@ impl From<&SubmissionState> for SubmissionPhase {
 /// Full input retained independently of exchange completion and diagnostic logging.
 pub struct SubmissionRecord {
     format_version: u32,
+    revision: u64,
+    /// Exact delivery attempt retained across process loss and read-only reconciliation.
+    pub(crate) attempt_id: DeliveryAttemptId,
+    /// Distinguish Harness recovery instructions from original user input.
+    origin: JournalOrigin,
     #[serde(default)]
     pub input_message_id: Option<String>,
     /// Exact task observation authority captured before this input can dispatch.
@@ -86,7 +91,22 @@ pub struct SubmissionRecord {
     pub error: Option<String>,
 }
 
-/// Read old delivery envelopes without interpreting the provider's checkpoint payload.
+/// Preserve the author of a logical input independently of its native delivery attempt.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JournalOrigin {
+    User,
+    HostContinuation,
+}
+
+/// Retain read-only evidence until the owning exchange validates its journal revision.
+#[derive(Debug)]
+pub(crate) struct SubmissionReconciliation {
+    snapshot: SubmissionRecord,
+    evidence: forge_provider_api::SubmissionEvidence,
+}
+
+/// Reject incompatible journals before decoding the changed invocation payload.
 impl<'de> Deserialize<'de> for SubmissionRecord {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -99,71 +119,39 @@ impl<'de> Deserialize<'de> for SubmissionRecord {
             #[serde(default)]
             task_receipt: Option<crate::task::TaskReceiptPermit>,
             id: String,
-            request: ProviderRequest,
+            request: serde_json::Value,
+            revision: Option<u64>,
+            attempt_id: Option<DeliveryAttemptId>,
+            origin: Option<JournalOrigin>,
             delivery: serde_json::Value,
             included: Vec<String>,
             error: Option<String>,
         }
-        #[derive(Deserialize)]
-        #[serde(tag = "state", rename_all = "snake_case")]
-        enum LegacyDelivery {
-            Prepared,
-            Sending {
-                target: serde_json::Value,
-            },
-            Accepted {
-                receipt: serde_json::Value,
-                target: Option<serde_json::Value>,
-            },
-            Cancelled,
-        }
         let stored = StoredRecord::deserialize(deserializer)?;
-        let legacy = stored.format_version.is_none();
-        let delivery = match stored.format_version {
-            Some(SUBMISSION_FORMAT_VERSION) => {
-                serde_json::from_value(stored.delivery).map_err(serde::de::Error::custom)?
-            }
-            None => {
-                let token =
-                    |value: serde_json::Value| -> std::result::Result<RecoveryToken, D::Error> {
-                        let bytes = serde_json::to_vec(&value).map_err(serde::de::Error::custom)?;
-                        RecoveryToken::new(bytes).map_err(serde::de::Error::custom)
-                    };
-                match serde_json::from_value::<LegacyDelivery>(stored.delivery)
-                    .map_err(serde::de::Error::custom)?
-                {
-                    LegacyDelivery::Prepared => SubmissionState::Prepared,
-                    LegacyDelivery::Sending { target } => SubmissionState::Sending {
-                        target: Some(token(target)?),
-                    },
-                    LegacyDelivery::Accepted { receipt, target } => SubmissionState::Accepted {
-                        receipt: Some(token(receipt)?),
-                        target: target.map(token).transpose()?,
-                    },
-                    LegacyDelivery::Cancelled => SubmissionState::Cancelled,
-                }
-            }
-            Some(_) => {
-                return Err(serde::de::Error::custom(
-                    "unsupported submission journal format",
-                ));
-            }
-        };
+        if stored.format_version != Some(SUBMISSION_FORMAT_VERSION) {
+            return Err(serde::de::Error::custom(
+                "This session uses an older host contract; create a new session",
+            ));
+        }
+        let delivery = serde_json::from_value(stored.delivery).map_err(serde::de::Error::custom)?;
         Ok(Self {
             format_version: SUBMISSION_FORMAT_VERSION,
+            revision: stored
+                .revision
+                .ok_or_else(|| serde::de::Error::custom("missing submission revision"))?,
+            attempt_id: stored
+                .attempt_id
+                .ok_or_else(|| serde::de::Error::custom("missing delivery attempt"))?,
+            origin: stored
+                .origin
+                .ok_or_else(|| serde::de::Error::custom("missing input origin"))?,
             input_message_id: stored.input_message_id,
             task_receipt: stored.task_receipt,
             id: stored.id,
-            request: stored.request,
+            request: serde_json::from_value(stored.request).map_err(serde::de::Error::custom)?,
             delivery,
             included: stored.included,
-            error: if legacy {
-                stored
-                    .error
-                    .map(|_| "Earlier provider operation failed".to_owned())
-            } else {
-                stored.error
-            },
+            error: stored.error,
         })
     }
 }
@@ -191,6 +179,19 @@ pub(crate) struct SubmissionStore {
 }
 
 impl SubmissionStore {
+    /// Journal a newly authored recovery instruction separately from the original user input.
+    pub(crate) fn prepare_continuation(
+        self: &Arc<Self>,
+        request: &ProviderRequest,
+        provider: super::ProviderId,
+    ) -> Result<Arc<Submission>> {
+        let submission = self.prepare(request, provider)?;
+        submission.update(|record| {
+            record.origin = JournalOrigin::HostContinuation;
+            Ok(())
+        })?;
+        Ok(submission)
+    }
     pub(crate) fn submission(self: &Arc<Self>, id: &str) -> Result<Arc<Submission>> {
         if let Some(submission) = self
             .live
@@ -327,6 +328,9 @@ impl SubmissionStore {
         let provider = serde_json::to_string(&provider)?;
         let record = SubmissionRecord {
             format_version: SUBMISSION_FORMAT_VERSION,
+            revision: 0,
+            attempt_id: DeliveryAttemptId::new(uuid::Uuid::new_v4().to_string())?,
+            origin: JournalOrigin::User,
             input_message_id,
             task_receipt: None,
             id: uuid::Uuid::new_v4().to_string(),
@@ -355,7 +359,7 @@ impl SubmissionStore {
                 ensure!(
                     existing_provider == provider,
                     super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::RecordInput,
+                        forge_provider_api::ProviderOperation::InputSubmit,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     ))
                 );
@@ -369,7 +373,7 @@ impl SubmissionStore {
                                 SubmissionState::Prepared | SubmissionState::Cancelled
                             ),
                         super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::RecordInput,
+                            forge_provider_api::ProviderOperation::InputSubmit,
                             forge_provider_api::ProviderFailureKind::Protocol,
                         ))
                     );
@@ -432,6 +436,63 @@ impl SubmissionStore {
         Ok(submission)
     }
 
+    /// Prove that every retained attempt and every selected local input remained unconsumed.
+    /// Accepted delivery never returns to Prepared. Sending returns only on positive rejection;
+    /// retirement changes only Prepared to Cancelled, so these states also cover earlier attempts.
+    pub(crate) fn proves_session_unconsumed(
+        &self,
+        owner: &super::ExecutionOwner,
+        workspace: &str,
+        provider: super::ProviderId,
+        input_ids: &[String],
+    ) -> Result<bool> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
+        let mut statement = connection.prepare(
+            "SELECT runtime,provider,payload FROM submission WHERE runtime=?1 OR json_extract(payload,'$.request.harness_session_id')=?2",
+        )?;
+        let expected_runtime = owner.runtime_key();
+        let expected_provider = serde_json::to_string(&provider)?;
+        let records = statement.query_map(
+            params![expected_runtime, owner.session_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )?;
+        let mut covered = std::collections::HashSet::new();
+        let mut records_seen = std::collections::HashSet::new();
+        let mut included = Vec::new();
+        for record in records {
+            let (runtime, provider, payload) = record?;
+            let record: SubmissionRecord = serde_json::from_str(&payload)?;
+            if runtime != expected_runtime
+                || provider != expected_provider
+                || record.request.owner()? != *owner
+                || record.request.harness_session_id != owner.session_id.as_str()
+                || record.request.workspace != workspace
+                || !matches!(
+                    record.delivery,
+                    SubmissionState::Prepared | SubmissionState::Cancelled
+                )
+            {
+                return Ok(false);
+            }
+            records_seen.insert(record.id);
+            included.extend(record.included);
+            if let Some(id) = record.input_message_id {
+                covered.insert(id);
+            }
+        }
+        Ok(input_ids.iter().all(|id| covered.contains(id))
+            && included.iter().all(|id| records_seen.contains(id)))
+    }
+
     /// Reads all unfinished inputs for the same execution owner and provider in admission order.
     pub fn pending(
         &self,
@@ -489,7 +550,7 @@ impl SubmissionStore {
             .await
             .map_err(|_| {
                 super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::RecordInput,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     forge_provider_api::ProviderFailureKind::Persistence,
                 ))
             })?
@@ -631,6 +692,12 @@ pub struct Submission {
     dispatch: Mutex<Option<SubmissionDispatch>>,
 }
 
+/// Bind native receipt callbacks to the immutable attempt captured before dispatch.
+struct AttemptReceipt {
+    submission: Arc<Submission>,
+    attempt_id: DeliveryAttemptId,
+}
+
 /// Distinguish the worker retaining input from its independently owned native prompt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SubmissionDispatch {
@@ -680,6 +747,16 @@ impl Drop for SubmissionFlight {
 }
 
 impl Submission {
+    /// Capture receipt authority which cannot acknowledge or reject a later delivery attempt.
+    pub(crate) fn receipt_for_attempt(
+        self: &Arc<Self>,
+    ) -> Result<Arc<dyn forge_provider_api::submission::InputReceipt>, super::ProviderError> {
+        let attempt_id = self.record().map_err(journal_failure)?.attempt_id;
+        Ok(Arc::new(AttemptReceipt {
+            submission: self.clone(),
+            attempt_id,
+        }))
+    }
     /// Bind receipt authority once while native delivery is still provably unstarted.
     pub(crate) fn bind_task_receipt(&self, permit: crate::task::TaskReceiptPermit) -> Result<()> {
         self.update(|record| {
@@ -711,7 +788,7 @@ impl Submission {
                     && record.request.harness_session_id == request.harness_session_id
                     && record.request.workspace == request.workspace,
                 super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::RecordInput,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 ))
             );
@@ -723,7 +800,7 @@ impl Submission {
                 SubmissionState::Accepted { .. } => {
                     return Err(super::ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::RecordInput,
+                            forge_provider_api::ProviderOperation::InputSubmit,
                             forge_provider_api::ProviderFailureKind::Rejected,
                         ),
                     )
@@ -774,7 +851,7 @@ impl Submission {
     {
         let invalid = || {
             forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::AdmitInput,
+                forge_provider_api::ProviderOperation::InputSubmit,
                 forge_provider_api::ProviderFailureKind::Protocol,
             ))
         };
@@ -783,7 +860,7 @@ impl Submission {
             return Err(invalid());
         }
         let reporter = tracker
-            .track_input(binding, scope, self.receipt_id.clone())
+            .track_input(binding, scope, self.receipt_id.clone(), record.attempt_id)
             .map_err(|_| invalid())?;
         *self.dispatch_observer.lock().map_err(|_| invalid())? = Some(tracker.observer());
         Ok(reporter)
@@ -803,7 +880,7 @@ impl Submission {
             .map_err(|_| {
                 forge_provider_api::ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::AdmitInput,
+                        forge_provider_api::ProviderOperation::InputSubmit,
                         forge_provider_api::ProviderFailureKind::Protocol,
                     ),
                 )
@@ -879,16 +956,13 @@ impl Submission {
     pub(crate) fn acceptance(&self) -> tokio::sync::watch::Receiver<bool> {
         self.acceptance.subscribe()
     }
-    pub(crate) async fn reconcile(
+    /// Observe delivery without changing eligibility or publishing acceptance from a worker.
+    pub(crate) async fn observe_reconciliation(
         self: &Arc<Self>,
         provider: &Provider,
-    ) -> Result<SubmissionRecord> {
+    ) -> Result<SubmissionReconciliation> {
         let record = self.record()?;
-        if matches!(record.delivery, SubmissionState::Accepted { .. }) {
-            self.notify_accepted();
-            return Ok(record);
-        }
-        if matches!(record.delivery, SubmissionState::Sending { .. }) {
+        let evidence = if matches!(record.delivery, SubmissionState::Sending { .. }) {
             let request = record.request.clone();
             let provider_kind = provider.descriptor().kind;
             let known = self
@@ -899,32 +973,79 @@ impl Submission {
                 SubmissionState::Sending { target } => target.as_ref(),
                 _ => None,
             };
-            match provider
-                .reconcile_submission(&self.receipt_id, target, &known)
+            provider
+                .input_reconcile(forge_provider_api::InputReconcileRequest {
+                    submission_id: self.receipt_id.clone(),
+                    attempt_id: record.attempt_id.clone(),
+                    provider_session_id: record.request.provider_session_id.clone(),
+                    token: target.cloned(),
+                    accepted_receipts: known,
+                })
                 .await?
+        } else {
+            forge_provider_api::SubmissionEvidence::Unknown
+        };
+        Ok(SubmissionReconciliation {
+            snapshot: record,
+            evidence,
+        })
+    }
+
+    /// Apply evidence only while the exact journal revision, attempt, and history remain current.
+    pub(crate) fn apply_reconciliation(
+        &self,
+        observation: SubmissionReconciliation,
+    ) -> Result<SubmissionRecord> {
+        let SubmissionReconciliation { snapshot, evidence } = observation;
+        if let forge_provider_api::SubmissionEvidence::Accepted {
+            receipt,
+            provider_session_id,
+        } = evidence
+        {
+            self.commit_acceptance(receipt, Some((&snapshot, provider_session_id)), None)
+                .map_err(uncertain_journal_failure)?;
+            return self.record();
+        }
+        self.update(|record| {
+            if record.id != snapshot.id
+                || record.revision != snapshot.revision
+                || record.attempt_id != snapshot.attempt_id
+                || record.delivery != snapshot.delivery
+                || record.request.provider_session_id != snapshot.request.provider_session_id
             {
-                forge_provider_api::SubmissionEvidence::Accepted {
-                    receipt,
-                    provider_session_id,
-                } => {
-                    self.persist(move |submission| {
-                        submission.accepted(receipt)?;
-                        submission.update(|record| {
-                            record.request.provider_session_id = provider_session_id;
-                            Ok(())
-                        })
-                    })
-                    .await?;
-                    return self.record();
+                return Ok(());
+            }
+            match evidence {
+                forge_provider_api::SubmissionEvidence::Accepted { .. } => {
+                    unreachable!("accepted evidence is committed atomically above")
                 }
                 forge_provider_api::SubmissionEvidence::NotAccepted => {
-                    self.persist(|submission| submission.rejected("Input was not accepted".into()))
-                        .await?;
+                    if matches!(record.delivery, SubmissionState::Sending { .. }) {
+                        record.delivery = SubmissionState::Prepared;
+                        record.attempt_id =
+                            DeliveryAttemptId::new(uuid::Uuid::new_v4().to_string())?;
+                        record.error = Some("Input was not accepted".into());
+                    }
                 }
                 forge_provider_api::SubmissionEvidence::Unknown => {}
             }
+            Ok(())
+        })
+        .map_err(journal_failure)?;
+        let record = self.record()?;
+        if matches!(record.delivery, SubmissionState::Accepted { .. }) {
+            self.notify_accepted();
         }
         Ok(record)
+    }
+
+    /// Compose reconciliation for fixtures whose test body is the synchronous state owner.
+    #[cfg(test)]
+    pub(crate) async fn reconcile(
+        self: &Arc<Self>,
+        provider: &Provider,
+    ) -> Result<SubmissionRecord> {
+        self.apply_reconciliation(self.observe_reconciliation(provider).await?)
     }
     /// Returns the stable host identity used for correlation, never a deduplication promise.
     pub fn id(&self) -> &str {
@@ -968,6 +1089,19 @@ impl Submission {
 
     /// Atomically acknowledges this message and every earlier input it carried.
     pub fn accepted(&self, receipt: Option<RecoveryToken>) -> Result<()> {
+        self.commit_acceptance(receipt, None, None)
+    }
+
+    /// Validate recovered acceptance under the same transaction that commits included inputs.
+    fn commit_acceptance(
+        &self,
+        receipt: Option<RecoveryToken>,
+        recovered: Option<(
+            &SubmissionRecord,
+            Option<forge_provider_api::ProviderSessionId>,
+        )>,
+        attempt: Option<&DeliveryAttemptId>,
+    ) -> Result<()> {
         let mut connection = self
             .store
             .connection
@@ -976,6 +1110,33 @@ impl Submission {
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut record = self.record()?;
+        ensure!(
+            attempt.is_none_or(|attempt| attempt == &record.attempt_id),
+            super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderFailureKind::WrongInvocation,
+            ))
+        );
+        ensure!(
+            attempt.is_none()
+                || matches!(
+                    record.delivery,
+                    SubmissionState::Sending { .. } | SubmissionState::Accepted { .. }
+                ),
+            super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderFailureKind::Protocol,
+            ))
+        );
+        if let Some((snapshot, _)) = &recovered
+            && (record.id != snapshot.id
+                || record.revision != snapshot.revision
+                || record.attempt_id != snapshot.attempt_id
+                || record.delivery != snapshot.delivery
+                || record.request.provider_session_id != snapshot.request.provider_session_id)
+        {
+            return Ok(());
+        }
         if matches!(record.delivery, SubmissionState::Accepted { .. }) {
             drop(transaction);
             drop(connection);
@@ -995,6 +1156,13 @@ impl Submission {
             receipt: receipt.clone(),
             target: target.clone(),
         };
+        if let Some((_, provider_session_id)) = recovered {
+            record.request.provider_session_id = provider_session_id;
+        }
+        record.revision = record
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("submission revision exhausted"))?;
         let mut changed = vec![record.clone()];
         for id in &record.included {
             let payload: String = transaction.query_row(
@@ -1011,6 +1179,10 @@ impl Submission {
                 receipt: receipt.clone(),
                 target: target.clone(),
             };
+            earlier.revision = earlier
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("submission revision exhausted"))?;
             changed.push(earlier);
         }
         for changed in &changed {
@@ -1053,6 +1225,7 @@ impl Submission {
                 "accepted or cancelled submission cannot be rejected"
             );
             record.delivery = SubmissionState::Prepared;
+            record.attempt_id = DeliveryAttemptId::new(uuid::Uuid::new_v4().to_string())?;
             record.error = Some(error);
             Ok(())
         })
@@ -1075,7 +1248,30 @@ impl Submission {
     pub(crate) fn retire_prepared(
         &self,
     ) -> std::result::Result<SubmissionRetirement, super::ProviderError> {
+        self.retire_attempt(None)
+    }
+
+    /// Prevent only the exact registered delivery attempt without cancelling a successor attempt.
+    pub(crate) fn retire_prepared_attempt(
+        &self,
+        attempt: &DeliveryAttemptId,
+    ) -> std::result::Result<SubmissionRetirement, super::ProviderError> {
+        self.retire_attempt(Some(attempt))
+    }
+
+    /// Validate attempt authority and commit prepared retirement in one journal transaction.
+    fn retire_attempt(
+        &self,
+        attempt: Option<&DeliveryAttemptId>,
+    ) -> std::result::Result<SubmissionRetirement, super::ProviderError> {
         self.update(|record| {
+            ensure!(
+                attempt.is_none_or(|attempt| attempt == &record.attempt_id),
+                super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::Cancel,
+                    forge_provider_api::ProviderFailureKind::WrongInvocation,
+                ))
+            );
             Ok(match record.delivery {
                 SubmissionState::Prepared => {
                     record.delivery = SubmissionState::Cancelled;
@@ -1086,12 +1282,7 @@ impl Submission {
                 SubmissionState::Accepted { .. } => SubmissionRetirement::Accepted,
             })
         })
-        .map_err(|_| {
-            super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::RecordInput,
-                forge_provider_api::ProviderFailureKind::Persistence,
-            ))
-        })
+        .map_err(journal_failure)
     }
 
     /// Commit a receipt change and expose its result only after durable publication.
@@ -1109,6 +1300,10 @@ impl Submission {
         let mut record = self.record()?;
         let was_prepared = record.delivery == SubmissionState::Prepared;
         let output = change(&mut record)?;
+        record.revision = record
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("submission revision exhausted"))?;
         if was_prepared && matches!(record.delivery, SubmissionState::Sending { .. }) {
             let mut statement = transaction.prepare(
                 "SELECT other.id FROM submission AS other JOIN submission AS current ON current.id=?1 WHERE other.id<>current.id AND other.runtime=current.runtime AND other.provider=current.provider AND json_extract(other.payload,'$.delivery.state')='sending'",
@@ -1156,8 +1351,30 @@ impl Submission {
         Ok(output)
     }
 
-    /// Reconciles prior uncertain input, then attaches only definitely undelivered context.
+    /// Reconcile fixture recovery under its test body's explicit journal ownership.
+    #[cfg(test)]
     pub async fn recover(&self, provider: &Provider, request: &mut ProviderRequest) -> Result<()> {
+        self.recover_with_owner(provider, request, None).await
+    }
+
+    /// Observe uncertain deliveries and submit their evidence to the retained execution owner.
+    pub(crate) async fn recover_owned(
+        &self,
+        provider: &Provider,
+        request: &mut ProviderRequest,
+        owner: &super::session_execution::SessionExecution,
+    ) -> Result<()> {
+        self.recover_with_owner(provider, request, Some(owner))
+            .await
+    }
+
+    /// Attach only inputs whose evidence was revalidated at the owning admission boundary.
+    async fn recover_with_owner(
+        &self,
+        provider: &Provider,
+        request: &mut ProviderRequest,
+        owner: Option<&super::session_execution::SessionExecution>,
+    ) -> Result<()> {
         let provider_kind = provider.descriptor().kind;
         for pending in self
             .store
@@ -1168,7 +1385,11 @@ impl Submission {
             }
             if matches!(pending.delivery, SubmissionState::Sending { .. }) {
                 let handle = self.store.submission(&pending.id)?;
-                let reconciled = handle.reconcile(provider).await?;
+                let observation = handle.observe_reconciliation(provider).await?;
+                let reconciled = match owner {
+                    Some(owner) => owner.reconcile_input(handle, observation).await?,
+                    None => handle.apply_reconciliation(observation)?,
+                };
                 if matches!(reconciled.delivery, SubmissionState::Accepted { .. }) {
                     if request.provider_session_id.is_none() {
                         request.provider_session_id = reconciled.request.provider_session_id;
@@ -1194,10 +1415,18 @@ impl Submission {
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl forge_provider_api::submission::InputReceipt for Submission {
     fn id(&self) -> &SubmissionId {
         &self.receipt_id
+    }
+
+    /// Get the journaled attempt which must match the immutable dispatch request.
+    fn attempt_id(&self) -> Result<DeliveryAttemptId, forge_provider_api::ProviderError> {
+        self.record()
+            .map(|record| record.attempt_id)
+            .map_err(journal_failure)
     }
 
     async fn record_sending(
@@ -1215,7 +1444,7 @@ impl forge_provider_api::submission::InputReceipt for Submission {
     ) -> Result<(), forge_provider_api::ProviderError> {
         self.persist(move |submission| submission.accepted(receipt))
             .await
-            .map_err(journal_failure)
+            .map_err(uncertain_journal_failure)
     }
 
     async fn record_rejected(
@@ -1233,22 +1462,171 @@ impl forge_provider_api::submission::InputReceipt for Submission {
     ) -> Result<(), forge_provider_api::ProviderError> {
         self.persist(move |submission| submission.failed(reason.to_string()))
             .await
-            .map_err(journal_failure)
+            .map_err(uncertain_journal_failure)
     }
 }
 
-/// Preserve normalized receipt failures at the legacy persistence boundary.
+#[async_trait::async_trait]
+impl forge_provider_api::submission::InputReceipt for AttemptReceipt {
+    /// Get the stable logical input independently of this attempt's delivery identity.
+    fn id(&self) -> &SubmissionId {
+        self.submission.receipt_id()
+    }
+
+    /// Get the immutable attempt captured before native preparation and dispatch.
+    fn attempt_id(&self) -> Result<DeliveryAttemptId, super::ProviderError> {
+        Ok(self.attempt_id.clone())
+    }
+
+    /// Persist sending only while this exact receipt still owns a prepared journal entry.
+    async fn record_sending(
+        self: Arc<Self>,
+        token: Option<RecoveryToken>,
+    ) -> Result<(), super::ProviderError> {
+        let attempt_id = self.attempt_id.clone();
+        self.submission
+            .persist(move |submission| {
+                submission.update(|record| {
+                    ensure!(
+                        record.attempt_id == attempt_id
+                            && record.delivery == SubmissionState::Prepared,
+                        "receipt no longer owns prepared input"
+                    );
+                    record.delivery = SubmissionState::Sending { target: token };
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(journal_failure)
+    }
+
+    /// Atomically acknowledge this attempt and every earlier input it carried.
+    async fn record_accepted(
+        self: Arc<Self>,
+        receipt: Option<RecoveryToken>,
+    ) -> Result<(), super::ProviderError> {
+        let attempt_id = self.attempt_id.clone();
+        self.submission
+            .persist(move |submission| {
+                submission.commit_acceptance(receipt, None, Some(&attempt_id))
+            })
+            .await
+            .map_err(uncertain_journal_failure)
+    }
+
+    /// Rotate delivery authority only after a positive rejection for this exact attempt.
+    async fn record_rejected(
+        self: Arc<Self>,
+        reason: super::ProviderError,
+    ) -> Result<(), super::ProviderError> {
+        let attempt_id = self.attempt_id.clone();
+        self.submission
+            .persist(move |submission| {
+                submission.update(|record| {
+                    ensure!(
+                        record.attempt_id == attempt_id
+                            && matches!(
+                                record.delivery,
+                                SubmissionState::Prepared | SubmissionState::Sending { .. }
+                            ),
+                        "receipt no longer owns rejectable input"
+                    );
+                    record.delivery = SubmissionState::Prepared;
+                    record.attempt_id = DeliveryAttemptId::new(uuid::Uuid::new_v4().to_string())?;
+                    record.error = Some(reason.to_string());
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(journal_failure)
+    }
+
+    /// Retain uncertainty without allowing an old worker to overwrite a replacement attempt.
+    async fn record_failure(
+        self: Arc<Self>,
+        reason: super::ProviderError,
+    ) -> Result<(), super::ProviderError> {
+        let attempt_id = self.attempt_id.clone();
+        self.submission
+            .persist(move |submission| {
+                submission.update(|record| {
+                    ensure!(
+                        record.attempt_id == attempt_id,
+                        super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderFailureKind::WrongInvocation,
+                        ))
+                    );
+                    record.error = Some(reason.to_string());
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(uncertain_journal_failure)
+    }
+}
+
+/// Preserve normalized receipt failures at the persistence boundary.
 pub(crate) fn journal_failure(error: anyhow::Error) -> super::ProviderError {
     match error.downcast::<super::ProviderError>() {
         Ok(error) => error,
-        Err(error) => super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-            forge_provider_api::ProviderOperation::RecordInput,
-            if error.is::<forge_provider_api::execution::ExecutionOwnerError>() {
-                forge_provider_api::ProviderFailureKind::Protocol
+        Err(error) => {
+            let failure = if error.is::<forge_provider_api::execution::ExecutionOwnerError>() {
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                )
             } else {
-                forge_provider_api::ProviderFailureKind::Persistence
-            },
-        )),
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderFailureKind::Persistence,
+                )
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Persistence,
+                    forge_provider_api::FailureDisposition::Unchanged,
+                )
+            };
+            super::ProviderError::Failure(failure)
+        }
+    }
+}
+
+/// Preserve accepted-or-uncertain delivery when recording its evidence fails after native effects.
+fn uncertain_journal_failure(error: anyhow::Error) -> super::ProviderError {
+    match error.downcast::<super::ProviderError>() {
+        Ok(super::ProviderError::Failure(failure)) => super::ProviderError::Failure(
+            forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::InputSubmit,
+                failure.kind(),
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Persistence,
+                forge_provider_api::FailureDisposition::Uncertain,
+            ),
+        ),
+        Ok(error) => super::ProviderError::Combined {
+            primary: Box::new(super::ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderFailureKind::Persistence,
+                )
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Persistence,
+                    forge_provider_api::FailureDisposition::Uncertain,
+                ),
+            )),
+            secondary: vec![error],
+        },
+        Err(_) => super::ProviderError::Failure(
+            forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderFailureKind::Persistence,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Persistence,
+                forge_provider_api::FailureDisposition::Uncertain,
+            ),
+        ),
     }
 }
 
@@ -1264,6 +1642,67 @@ mod tests {
 
     fn fixture_provider_id() -> super::super::ProviderId {
         forge_providers::registry::nonselectable_id().expect("registry supplies fixture identity")
+    }
+
+    /// Positive rejection certifies an older attempt; unknown or accepted attempts remain barriers.
+    #[test]
+    fn session_nonconsumption_requires_positive_evidence_for_every_input_and_attempt() -> Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let request = request("retained input");
+        let owner = request.owner()?;
+        let ids = vec!["retained-input".to_owned()];
+        let proof = || {
+            store.proves_session_unconsumed(&owner, &request.workspace, fixture_provider_id(), &ids)
+        };
+        assert!(
+            !proof()?,
+            "missing journal evidence authorized identity reset"
+        );
+        let submission = store.prepare_input_request(
+            &request,
+            fixture_provider_id(),
+            SubmissionOrigin::QueuedInput(crate::exchange::command::InputId::new(&ids[0])?),
+        )?;
+        assert!(proof()?);
+        let old_attempt = submission.record()?.attempt_id;
+        submission.sending(None)?;
+        submission.failed("unknown native delivery".into())?;
+        submission.cancel()?;
+        assert!(
+            !proof()?,
+            "retirement converted uncertain delivery into nonconsumption"
+        );
+        submission.rejected("positive native NotAccepted evidence".into())?;
+        assert_ne!(old_attempt, submission.record()?.attempt_id);
+        assert!(
+            proof()?,
+            "positive rejection did not certify the earlier attempt"
+        );
+        submission.cancel()?;
+        assert!(
+            proof()?,
+            "positive prepared retirement lost nonconsumption evidence"
+        );
+        let successor = store.prepare_input_request(
+            &request,
+            fixture_provider_id(),
+            SubmissionOrigin::QueuedInput(crate::exchange::command::InputId::new(&ids[0])?),
+        )?;
+        successor.sending(None)?;
+        successor.accepted(None)?;
+        assert!(
+            successor
+                .rejected("cannot undo accepted input".into())
+                .is_err()
+        );
+        successor.cancel()?;
+        assert!(
+            !proof()?,
+            "a prior accepted attempt authorized identity reset"
+        );
+        Ok(())
     }
 
     /// Keep handoff separate from durable acceptance and reject a foreign owner.
@@ -1305,51 +1744,182 @@ mod tests {
         Ok(())
     }
 
-    /// Preserve old input and delivery state while wrapping native evidence without decoding it.
+    /// Reject old session payloads before attempting to deserialize their changed request shape.
     #[test]
-    fn legacy_delivery_preserves_uncertainty_and_opaque_evidence() -> Result<()> {
-        let evidence = json!({"opaque_old_format":"private-native-canary"});
-        for state in ["prepared", "sending", "accepted", "cancelled"] {
-            let mut delivery = json!({"state":state});
-            if state == "sending" || state == "accepted" {
-                delivery["target"] = evidence.clone();
-            }
-            if state == "accepted" {
-                delivery["receipt"] = json!("private-receipt-canary");
-            }
+    fn incompatible_submission_contract_requires_new_session() {
+        for version in [None, Some(SUBMISSION_FORMAT_VERSION - 1)] {
             let value = json!({
-                "id":"legacy-input", "request":request("saved input"), "delivery":delivery,
-                "included":[], "error":"private-native-error-canary",
+                "format_version":version,
+                "id":"old", "request":{"deliberately_invalid_payload":true},
+                "delivery":{"state":"prepared"}, "included":[], "error":null,
             });
-            let record: SubmissionRecord = serde_json::from_value(value)?;
-            assert_eq!(record.format_version, SUBMISSION_FORMAT_VERSION);
-            assert_eq!(record.request.input.text(), "saved input");
-            match record.delivery {
-                SubmissionState::Prepared => assert_eq!(state, "prepared"),
-                SubmissionState::Sending { target } => {
-                    assert_eq!(state, "sending");
-                    assert_eq!(
-                        serde_json::from_slice::<serde_json::Value>(target.unwrap().as_bytes())?,
-                        evidence
-                    );
-                }
-                SubmissionState::Accepted { receipt, .. } => {
-                    assert_eq!(state, "accepted");
-                    assert!(receipt.is_some());
-                }
-                SubmissionState::Cancelled => assert_eq!(state, "cancelled"),
-            }
-            assert_eq!(
-                record.error.as_deref(),
-                Some("Earlier provider operation failed")
-            );
+            let error = serde_json::from_value::<SubmissionRecord>(value).unwrap_err();
+            assert!(error.to_string().contains("create a new session"));
         }
-        let future = json!({
-            "format_version":SUBMISSION_FORMAT_VERSION + 1,
-            "id":"future", "request":request("saved input"),
-            "delivery":{"state":"prepared"}, "included":[], "error":null,
-        });
-        assert!(serde_json::from_value::<SubmissionRecord>(future).is_err());
+    }
+
+    /// A positive rejection exposes its committed Prepared state on the first owner application.
+    #[test]
+    fn proven_nonacceptance_returns_committed_state_and_rotates_attempt() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let input = store.prepare(&request("pending"), fixture_provider_id())?;
+        input.sending(None)?;
+        let snapshot = input.record()?;
+        let attempt = snapshot.attempt_id.clone();
+        let after = input.apply_reconciliation(SubmissionReconciliation {
+            snapshot,
+            evidence: forge_provider_api::SubmissionEvidence::NotAccepted,
+        })?;
+        assert_eq!(after.delivery, SubmissionState::Prepared);
+        assert_ne!(after.attempt_id, attempt);
+        assert_eq!(input.record()?.delivery, SubmissionState::Prepared);
+        Ok(())
+    }
+
+    /// A history read cannot revoke acceptance or reset a replacement attempt after it becomes stale.
+    #[test]
+    fn stale_nonacceptance_preserves_late_acceptance_and_new_attempt() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        for accepted in [true, false] {
+            let input = store.prepare(&request("pending"), fixture_provider_id())?;
+            input.sending(None)?;
+            let snapshot = input.record()?;
+            if accepted {
+                input.accepted(Some(token("late-acceptance")))?;
+            } else {
+                input.rejected("positive rejection".into())?;
+                input.sending(None)?;
+            }
+            let current = input.record()?;
+            let after = input.apply_reconciliation(SubmissionReconciliation {
+                snapshot,
+                evidence: forge_provider_api::SubmissionEvidence::NotAccepted,
+            })?;
+            assert_eq!(after.delivery, current.delivery);
+            assert_eq!(after.attempt_id, current.attempt_id);
+        }
+        Ok(())
+    }
+
+    /// Native callback authority cannot acknowledge input after positive rejection rotated its attempt.
+    #[tokio::test]
+    async fn retired_attempt_receipt_cannot_acknowledge_replacement_attempt() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let input = store.prepare(&request("pending"), fixture_provider_id())?;
+        let receipt = input.receipt_for_attempt()?;
+        let old_attempt = receipt.attempt_id()?;
+        receipt.clone().record_sending(None).await?;
+        receipt
+            .clone()
+            .record_rejected(super::super::ProviderError::Cancelled)
+            .await?;
+        let replacement = input.receipt_for_attempt()?;
+        assert_ne!(old_attempt, replacement.attempt_id()?);
+        let stale_cancel = input.retire_prepared_attempt(&old_attempt).unwrap_err();
+        assert!(
+            matches!(stale_cancel, super::super::ProviderError::Failure(failure)
+            if failure.operation() == forge_provider_api::ProviderOperation::Cancel
+                && failure.kind() == forge_provider_api::ProviderFailureKind::WrongInvocation)
+        );
+        assert_eq!(input.record()?.delivery, SubmissionState::Prepared);
+        replacement.clone().record_sending(None).await?;
+        assert!(receipt.record_accepted(Some(token("stale"))).await.is_err());
+        assert!(matches!(
+            input.record()?.delivery,
+            SubmissionState::Sending { .. }
+        ));
+        replacement.record_accepted(Some(token("current"))).await?;
+        assert!(matches!(
+            input.record()?.delivery,
+            SubmissionState::Accepted { .. }
+        ));
+        Ok(())
+    }
+
+    /// Distinguish persistence before dispatch from lost accepted-or-uncertain delivery evidence.
+    #[tokio::test]
+    async fn receipt_persistence_failures_preserve_native_effect_disposition() -> Result<()> {
+        #[derive(Clone, Copy)]
+        enum Boundary {
+            Sending,
+            Accepted,
+            Rejected,
+            Uncertain,
+        }
+        for boundary in [
+            Boundary::Sending,
+            Boundary::Accepted,
+            Boundary::Rejected,
+            Boundary::Uncertain,
+        ] {
+            let root = tempfile::tempdir()?;
+            let store =
+                SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+            let input = store.prepare(&request("pending"), fixture_provider_id())?;
+            let receipt = input.receipt_for_attempt()?;
+            if !matches!(boundary, Boundary::Sending) {
+                receipt.clone().record_sending(None).await?;
+            }
+            store.connection.lock().unwrap().execute_batch(
+                "CREATE TRIGGER fail_receipt_write BEFORE UPDATE ON submission
+                 BEGIN SELECT RAISE(FAIL,'fixture journal write failed'); END;",
+            )?;
+            let error = match boundary {
+                Boundary::Sending => receipt.record_sending(None).await,
+                Boundary::Accepted => {
+                    receipt
+                        .record_accepted(Some(token("native-accepted")))
+                        .await
+                }
+                Boundary::Rejected => {
+                    receipt
+                        .record_rejected(super::super::ProviderError::NotConsumed)
+                        .await
+                }
+                Boundary::Uncertain => {
+                    receipt
+                        .record_failure(super::super::ProviderError::DeliveryUncertain)
+                        .await
+                }
+            }
+            .unwrap_err();
+            let super::super::ProviderError::Failure(failure) = error else {
+                panic!("expected normalized receipt persistence failure");
+            };
+            assert_eq!(
+                failure.operation(),
+                forge_provider_api::ProviderOperation::InputSubmit
+            );
+            assert_eq!(
+                failure.kind(),
+                forge_provider_api::ProviderFailureKind::Persistence
+            );
+            assert_eq!(
+                failure.phase(),
+                forge_provider_api::ProviderPhase::Persistence
+            );
+            assert_eq!(
+                failure.disposition(),
+                match boundary {
+                    Boundary::Sending | Boundary::Rejected =>
+                        forge_provider_api::FailureDisposition::Unchanged,
+                    Boundary::Accepted | Boundary::Uncertain =>
+                        forge_provider_api::FailureDisposition::Uncertain,
+                }
+            );
+            match boundary {
+                Boundary::Sending => {
+                    assert_eq!(input.record()?.delivery, SubmissionState::Prepared)
+                }
+                Boundary::Accepted | Boundary::Rejected | Boundary::Uncertain => assert!(matches!(
+                    input.record()?.delivery,
+                    SubmissionState::Sending { .. }
+                )),
+            }
+        }
         Ok(())
     }
 
@@ -1363,7 +1933,7 @@ mod tests {
         let input = store.prepare(&request("rejected input"), fixture_provider_id())?;
         let reason = || {
             forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::AdmitInput,
+                forge_provider_api::ProviderOperation::InputSubmit,
                 forge_provider_api::ProviderFailureKind::Rejected,
             ))
         };
@@ -1657,16 +2227,23 @@ mod tests {
                 }
             },
         );
+        let preparation = control.clone();
+        provider.with_pre_dispatch(move |_request| {
+            let preparation = preparation.clone();
+            async move {
+                if preparation.fail_before_send.swap(false, Ordering::SeqCst) {
+                    return Err(forge_provider_api::ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderFailureKind::Rejected,
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+        });
         let admission = control.clone();
         provider.with_admission(move |_request| {
-            if admission.fail_before_send.swap(false, Ordering::SeqCst) {
-                return Err(forge_provider_api::ProviderError::Failure(
-                    forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::AdmitInput,
-                        forge_provider_api::ProviderFailureKind::Rejected,
-                    ),
-                ));
-            }
             if admission.lose_ack.swap(false, Ordering::SeqCst) {
                 return Err(forge_provider_api::ProviderError::DeliveryUncertain);
             }
@@ -1910,6 +2487,10 @@ mod tests {
             .await
             .is_err()
         );
+        assert_eq!(control.send_count.load(Ordering::SeqCst), 0);
+        let pending = store.pending(&earlier, fixture_provider_id(), None)?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].delivery, SubmissionState::Prepared);
         drop(store);
         let store = SubmissionStore::open(directory.path(), trace.clone())?;
         crate::provider::test_support::retry_prompt(
@@ -2108,6 +2689,12 @@ mod tests {
             .await
             .is_err()
         );
+        let pending = store.pending(&request(""), fixture_provider_id(), None)?;
+        assert_eq!(pending.len(), 1);
+        assert!(matches!(
+            pending[0].delivery,
+            SubmissionState::Sending { .. }
+        ));
         for text in ["second", "third"] {
             let mut input = request(text);
             input.submission = Some(store.prepare(&input, fixture_provider_id())?);

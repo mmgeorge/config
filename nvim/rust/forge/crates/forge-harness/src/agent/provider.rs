@@ -90,7 +90,11 @@ impl AgentProviderFactory {
         let capability = provider.descriptor().capability;
         let model = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            provider.model_list(request),
+            provider.model_list(forge_provider_api::QueryContext::Workspace(
+                forge_provider_api::WorkspaceContext {
+                    workspace: request.workspace.clone(),
+                },
+            )),
         )
         .await
         .context("child model catalog exceeded 30 seconds");

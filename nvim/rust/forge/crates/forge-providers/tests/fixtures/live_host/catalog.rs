@@ -1,6 +1,5 @@
-use super::collect::ProviderTestExt as _;
 use anyhow::{Context, Result};
-use forge_harness::provider::{McpStatus, ProviderInput};
+use forge_harness::provider::McpStatus;
 use serde_json::json;
 use std::time::Duration;
 
@@ -17,7 +16,11 @@ async fn live_mcp_catalog() {
     .unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        provider.mcp_list(super::catalog_request(workspace.path(), "mcp-catalog-test")),
+        provider.mcp_list(forge_provider_api::McpQuery::Configured(
+            forge_provider_api::QueryContext::Workspace(forge_provider_api::WorkspaceContext {
+                workspace: workspace.path().to_string_lossy().into_owned(),
+            }),
+        )),
     )
     .await;
     provider.shutdown().await.unwrap();
@@ -33,7 +36,7 @@ async fn default_cli_resolution_starts_and_collects_without_a_session() {
     let request = super::catalog_request(workspace.path(), "copilot-startup");
     let result = tokio::time::timeout(
         Duration::from_secs(30),
-        provider.model_list(super::prompt_request(&request)),
+        provider.model_list(provider.query_context(&request).await.unwrap()),
     )
     .await;
     provider.shutdown().await.unwrap();
@@ -45,9 +48,8 @@ async fn default_cli_resolution_starts_and_collects_without_a_session() {
     );
     assert!(
         provider
-            .active_session_id_for(&request.harness_session_id)
+            .retained_session_id(&request.owner().unwrap())
             .await
-            .unwrap()
             .is_none(),
         "model discovery created a conversation"
     );
@@ -88,60 +90,77 @@ end
         }})
         .to_string(),
     )?;
-    forge_harness::settings::SettingsStore::open(fixture.path())?
-        .configure_catalog(fixture.path())?;
-    let test_session = super::provider_session(
-        "codex",
-        vec!["codex".into(), "app-server".into()],
-        fixture.path(),
-        fixture.path(),
-    )?;
-    let provider = test_session.provider_handle();
-    let mut request = super::catalog_request(fixture.path(), "mcp-terminal-smoke");
-    let mut settings = forge_harness::settings::SettingsStore::open(fixture.path())?;
-    let configuration = provider.mcp_configuration(request.clone()).await?;
-    let snapshot = settings.get(&request.workspace, &request.harness_session_id, "codex")?;
-    let mut desired = snapshot.desired;
-    let missing = configuration
-        .iter()
-        .find(|server| server.name == "missing")
-        .context("missing MCP definition was not exposed")?;
-    let missing_id = missing
-        .resource_id
-        .clone()
-        .context("managed MCP definition has no resource identity")?;
-    desired.mcp.insert(missing_id, true);
-    settings.update(
-        snapshot.revision,
-        forge_harness::settings::SettingScope::Session,
-        &request.workspace,
-        &request.harness_session_id,
-        &desired,
-    )?;
-    drop(settings);
-    let outcome = tokio::time::timeout(Duration::from_secs(60), async {
-        provider
-            .reconcile_settings(request.clone(), &desired)
+    let data_root = fixture.path().join("data");
+    let initialize = serde_json::from_value(json!({
+        "config_dir": fixture.path(), "data_root": data_root, "workspace": fixture.path(),
+        "client_id": "live-mcp-terminal", "model": "gpt-6-luna", "effort": "low",
+        "provider": { "kind": "codex", "command": ["codex", "app-server"] },
+    }))?;
+    let mut service = super::workflows::WorkflowService::open(initialize).await?;
+    let outcome = tokio::time::timeout(Duration::from_secs(90), async {
+        let initial = service
+            .request("session.provider.mcp.list", json!({}))
             .await?;
-        let mut prompt = super::prompt_request(&request);
-        prompt.input = ProviderInput::from_text("Reply OK. Do not use tools or change files.");
-        prompt.effort = "low".into();
-        anyhow::ensure!(
-            !provider.model_list(prompt.clone()).await?.is_empty(),
-            "model catalog missing"
-        );
-        request.provider_session_id = test_session
-            .session_prompt_and_collect(prompt)
-            .await?
-            .completion
-            .native
-            .provider_session_id;
+        let configured: Vec<forge_provider_api::catalog::McpDefinition> =
+            serde_json::from_value(initial)?;
+        let missing_id = configured
+            .iter()
+            .find(|server| server.name == "missing")
+            .context("configured missing-credential row was not exposed")?
+            .resource_id
+            .clone()
+            .context("managed MCP definition has no resource identity")?;
+        let settings = service.request("settings.get", json!({})).await?;
+        let mut desired = settings["desired"].clone();
+        desired["mcp"][missing_id.as_str()] = json!(true);
+        let operation = service.request("settings.update", json!({
+            "scope": "session", "expected_revision": settings["revision"], "desired": desired,
+        })).await?;
+        loop {
+            let applied = service
+                .request(
+                    "session.command.operation.get",
+                    json!({ "operation_id": operation["id"] }),
+                )
+                .await?;
+            anyhow::ensure!(
+                applied["state"] != "failed",
+                "MCP settings application failed: {applied}"
+            );
+            if applied["state"] == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        service
+            .request(
+                "session.prompt.submit",
+                json!({ "text": "Reply OK. Do not use tools or change files." }),
+            )
+            .await?;
+        service.wait_idle().await?;
         for _ in 0..2 {
-            let servers = provider.mcp_list(request.clone()).await?;
+            let servers = loop {
+                let rows = service
+                    .request("session.provider.mcp.list", json!({}))
+                    .await?;
+                let servers: Vec<forge_provider_api::catalog::McpDefinition> =
+                    serde_json::from_value(rows)?;
+                if servers.iter().any(|server| {
+                    server.name == "fixture"
+                        && server.status == McpStatus::Connected
+                        && server.tools.iter().any(|tool| tool.name == "ready")
+                }) {
+                    break servers;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            };
             let unavailable = servers
                 .iter()
                 .find(|server| server.name == "missing")
-                .context("missing MCP row disappeared")?;
+                .context(
+                    "missing credential row disappeared during native readiness observation",
+                )?;
             anyhow::ensure!(
                 unavailable.status == McpStatus::Unavailable,
                 "missing credential did not stay isolated"
@@ -152,30 +171,20 @@ end
                     .as_ref()
                     .map(forge_provider_api::SanitizedMessage::as_str)
                     .is_some_and(|reason| reason.contains("FORGE_LIVE_MCP_MISSING_608C")),
-                "missing credential reason disappeared"
+                "missing credential explanation disappeared"
             );
-            let server = servers
-                .iter()
-                .find(|server| server.name == "fixture")
-                .context("fixture MCP absent")?;
+            let before = service.request("session.state.get", json!({})).await?;
+            service.terminal_snapshot().await?;
+            let after = service.request("session.state.get", json!({})).await?;
             anyhow::ensure!(
-                server.status == McpStatus::Connected,
-                "fixture MCP status: {:?}",
-                server.status
+                before["session"]["provider_session_id"] == after["session"]["provider_session_id"],
+                "terminal observation replaced native history"
             );
-            anyhow::ensure!(
-                server.tools.iter().any(|tool| tool.name == "ready"),
-                "fixture tool missing"
-            );
-            provider.background_terminals(request.clone()).await?;
-            provider
-                .reconcile_settings(request.clone(), &Default::default())
-                .await?;
         }
         Ok::<_, anyhow::Error>(())
     })
     .await;
-    provider.shutdown().await?;
+    service.shutdown().await?;
     outcome.context("live MCP smoke test timed out")??;
     Ok(())
 }

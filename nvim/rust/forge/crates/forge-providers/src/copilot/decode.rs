@@ -24,7 +24,7 @@ pub fn decode_compaction(
             .and_then(Value::as_bool)
             .ok_or_else(|| {
                 super::error::native_failure(
-                    forge_provider_api::ProviderOperation::NativeTransport,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 )
             })?
@@ -37,13 +37,13 @@ pub fn decode_compaction(
     .map(Into::into)
     .map_err(|_error| {
         super::error::native_failure(
-            forge_provider_api::ProviderOperation::NativeTransport,
+            forge_provider_api::ProviderOperation::InputSubmit,
             forge_provider_api::ProviderFailureKind::Protocol,
         )
     })?;
     if succeeded && result.diagnostic.is_some() {
         return Err(super::error::native_failure(
-            forge_provider_api::ProviderOperation::NativeTransport,
+            forge_provider_api::ProviderOperation::InputSubmit,
             forge_provider_api::ProviderFailureKind::Protocol,
         ));
     }

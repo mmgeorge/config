@@ -6,7 +6,9 @@ This guide explains the retry contract and how to allow a new error. For the del
 
 ## Lifecycle
 
-`provider/retry.rs` owns retry policy shared by root, child, and Background sessions. Each attempt waits on the shared session execution engine, which separates submission acceptance from normalized terminal evidence. A successful submission RPC cannot trigger completion or a retry. Adapters classify native terminal errors as `RetryableFailure` only after checking `replay_safe`. The runner passes the opaque continuation token and fresh callbacks to `Provider::continue_session`; the native owner retains the accepted history, model, settings, and input identity. Retries stay in the same exchange and do not append the user's message again.
+`provider/retry.rs` owns retry policy shared by root, child, and Background sessions. Each attempt waits on the shared session execution engine, which separates submission acceptance from normalized terminal evidence. A successful submission RPC cannot trigger completion or a retry. Adapters classify native terminal errors as `RetryableFailure` only after checking `replay_safe`. After native settlement and the host commit barrier, the host journals a new continuation instruction under `JournalOrigin::HostContinuation` and submits it with ordinary `input_submit`. It uses a fresh invocation scope and submission identity in the same owner and exchange, preserves completed work and effects, and does not resend the accepted original input. Provider adapters supply normalized failure evidence and never decide continuation policy.
+
+Definitely unconsumed input follows a different path: the host retains its original logical journal identity, rotates its delivery attempt after positive rejection, and may admit it under a fresh invocation scope. Unknown delivery remains blocked and never enters either replay path. No native continuation token or resume-computation operation exists.
 
 The first attempt has no delay. Five retries then wait 1, 5, 10, 30, and 60 seconds. The budget belongs to one runner invocation and does not reset after each error. After the fifth retry, or on any non-retryable error, the actual provider error goes through the normal failure path.
 
@@ -43,6 +45,6 @@ Sources:
 
 ## Diagnostics
 
-With Harness tracing enabled, `/log` keeps `provider.retry` entries for failed, scheduled, started, recovered, stopped, exhausted, and cancelled retries. Failed entries retain normalized categories and correlation identities; native codes, payloads, error text, and continuation bytes do not cross this boundary. Provider-specific reproduction data belongs in a private adapter fixture.
+With Harness tracing enabled, `/log` keeps `provider.retry` entries for failed, scheduled, started, recovered, stopped, exhausted, and cancelled retries. Failed entries retain normalized categories and correlation identities; native codes, payloads, error text, and opaque recovery bytes do not cross this boundary. Provider-specific reproduction data belongs in a private adapter fixture.
 
 The final UI error preserves the normalized failure category rather than replacing it with a retry-limit message.

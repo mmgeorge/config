@@ -1,6 +1,6 @@
 //! Own session intake independently of submissions and scoped result waiters.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -63,6 +63,19 @@ struct OwnerExecution {
 }
 
 impl SessionExecutionRegistry {
+    /// Get an already installed owner without creating a binding or observer generation.
+    pub(crate) fn existing_owner(
+        &self,
+        owner: &ExecutionOwner,
+    ) -> Result<Option<Arc<SessionExecution>>, ProviderError> {
+        Ok(self
+            .owners
+            .lock()
+            .map_err(|_| protocol("execution registry poisoned"))?
+            .get(owner)
+            .and_then(|slot| slot.engine.get())
+            .cloned())
+    }
     pub(crate) fn new(provider: Arc<Provider>, trace: Arc<crate::trace::TraceStore>) -> Self {
         Self {
             provider,
@@ -204,11 +217,7 @@ impl SessionExecutionRegistry {
             // Reader closure is not native collection evidence. Perform this
             // even if an earlier fence already joined the reader, and retain
             // the binding on any failure so a later close retries it.
-            self.provider.cancel_session(&owner.runtime_key()).await?;
-            self.provider
-                .cleanup_execution(&owner.runtime_key())
-                .await?;
-            self.provider.reset_session(owner).await?;
+            self.provider.session_close_owner(owner).await?;
             if let Some(engine) = slot.engine.get() {
                 engine.close().await?;
             }
@@ -240,7 +249,7 @@ impl SessionExecutionRegistry {
             return Err(protocol("old execution observations have not been consumed").into());
         }
         old.observer.retire_background().await?;
-        self.provider.reset_session(&owner).await?;
+        self.provider.session_close_owner(&owner).await?;
         let observer = Arc::new(super::SessionObservationInbox::default());
         let engine = Arc::new(
             SessionExecution::open(
@@ -324,6 +333,12 @@ pub(crate) struct SessionExecution {
     healthy: Arc<AtomicBool>,
     orderly_shutdown: Arc<AtomicBool>,
     task: tokio::sync::Mutex<ExecutionTask>,
+    activity: Arc<Mutex<Option<InvocationScope>>>,
+    admitted: Arc<Mutex<std::collections::HashSet<InvocationScope>>>,
+    #[cfg(test)]
+    delivery_pressure: tokio::sync::watch::Receiver<bool>,
+    #[cfg(test)]
+    presentation_queue: mpsc::WeakSender<Delivery>,
 }
 
 /// Native completion preview and the exclusive token required for host settlement.
@@ -961,6 +976,38 @@ pub(crate) enum OwnerCloseReason {
 
 enum Command {
     Close(Option<OwnerCloseReason>),
+    ReserveInvocation {
+        scope: InvocationScope,
+        reservation: InputReservation,
+    },
+    ResumeExchange {
+        collection: ExchangeCollection,
+        reply: oneshot::Sender<Result<(), ProviderError>>,
+    },
+    CancelExchange {
+        scope: InvocationScope,
+        reply: oneshot::Sender<Result<ExchangeCollection, ProviderError>>,
+    },
+    ReconcileInput {
+        submission: Arc<crate::provider::submission::Submission>,
+        observation: Box<crate::provider::submission::SubmissionReconciliation>,
+        reply: oneshot::Sender<anyhow::Result<crate::provider::submission::SubmissionRecord>>,
+    },
+    HostEffectsCollected {
+        scope: InvocationScope,
+        operation_id: forge_provider_api::OperationId,
+        result: Result<(), ProviderError>,
+    },
+    Cancel {
+        scope: InvocationScope,
+        reply: CancellationReply,
+    },
+    CancellationFinished {
+        scope: InvocationScope,
+        outcome: CancellationKind,
+        result: Result<(), ProviderError>,
+        reply: CancellationReply,
+    },
     #[cfg(test)]
     TestPublishEffect {
         scope: InvocationScope,
@@ -990,7 +1037,7 @@ enum Command {
         submission: Option<SubmissionId>,
         sink: ProviderEventSink,
         completion: Box<crate::tools::ControlTurnContext>,
-        continuation: Option<(u64, u64, u64)>,
+        continuation: Option<(InvocationScope, u64, u64, u64)>,
         stale: Option<oneshot::Sender<ProviderRequest>>,
         abandoned: Arc<AtomicBool>,
         reply: oneshot::Sender<Result<NativeReady, ProviderError>>,
@@ -1031,6 +1078,8 @@ struct Invocation {
     reply: Option<oneshot::Sender<Result<NativeReady, ProviderError>>>,
     completion: crate::tools::ControlTurnContext,
     terminal: Option<Result<forge_provider_api::lifecycle::ExecutionResult, ProviderError>>,
+    native_settlement: Option<forge_provider_api::InvocationSettlement>,
+    host_collection: HostCollection,
     publication_failure: Option<ProviderError>,
     pending_controls: usize,
     revision: u64,
@@ -1040,11 +1089,86 @@ struct Invocation {
     idle_observation: bool,
 }
 
+/// Keep native settlement separate from host-owned callback and checkpoint collection.
+#[derive(Clone, Copy)]
+enum HostCollection {
+    Pending,
+    Collecting,
+    Settled,
+}
+
 struct SubmissionOutcome {
     scope: InvocationScope,
     submission: Option<SubmissionId>,
     control_reply: Option<oneshot::Sender<Result<(), ProviderError>>>,
     result: Result<(), ProviderError>,
+}
+
+/// Retain exact dispatch and receipt ownership while native acceptance remains asynchronous.
+struct AttemptControl {
+    submission: Arc<crate::provider::submission::Submission>,
+    dispatch: crate::provider::DispatchObserver,
+    task: tokio::task::AbortHandle,
+    finished: tokio::sync::watch::Receiver<bool>,
+    attempt_id: forge_provider_api::DeliveryAttemptId,
+}
+
+/// Retain the exact journal authority registered before prepared foreground publication.
+struct InputReservation {
+    submission: Arc<crate::provider::submission::Submission>,
+    attempt_id: forge_provider_api::DeliveryAttemptId,
+}
+
+/// Preserve collected predispatch evidence without retaining live receipt or callback resources.
+struct PreventedInput {
+    submission_id: SubmissionId,
+    attempt_id: forge_provider_api::DeliveryAttemptId,
+}
+
+/// Distinguish externally committed preparation from a later execution attempt stopped at its fence.
+enum ReservationOrigin {
+    PreparedForeground,
+    Execution,
+}
+
+/// Prove the exact owner-issued cancellation generation collected for configuration replacement.
+#[derive(Clone)]
+pub(crate) struct ExchangeCollection {
+    scope: InvocationScope,
+    fence_id: forge_provider_api::OperationId,
+    commands: mpsc::Sender<Command>,
+}
+
+/// Preserve the exact cancellation postcondition for invocation and configuration observers.
+enum CancellationReply {
+    #[cfg(test)]
+    Invocation(oneshot::Sender<Result<(), ProviderError>>),
+    Exchange {
+        collection: ExchangeCollection,
+        reply: oneshot::Sender<Result<ExchangeCollection, ProviderError>>,
+    },
+}
+
+impl CancellationReply {
+    /// Publish collection proof only after the owner establishes successful cancellation collection.
+    fn complete(self, result: Result<(), ProviderError>) {
+        match self {
+            #[cfg(test)]
+            Self::Invocation(reply) => {
+                let _ = reply.send(result);
+            }
+            Self::Exchange { collection, reply } => {
+                let _ = reply.send(result.map(|_| collection));
+            }
+        }
+    }
+}
+
+/// Distinguish a proven unsent input from native work whose own settlement must be observed.
+#[derive(Clone, Copy)]
+enum CancellationKind {
+    Prevented,
+    Native,
 }
 
 #[derive(Clone)]
@@ -1106,11 +1230,14 @@ struct Driver {
     queue_loss_reported: AtomicBool,
     state: ExecutionState,
     invocations: HashMap<InvocationId, Invocation>,
-    /// Completed authority retained for positively correlated idle continuations.
+    /// Retain completed authority to reject late native work and deduplicate terminal evidence.
     committed_invocations: HashMap<InvocationId, Invocation>,
     submissions: JoinSet<SubmissionOutcome>,
     deliveries: JoinSet<Result<(), ProviderError>>,
     delivery: Option<mpsc::Sender<Delivery>>,
+    pending_delivery: VecDeque<Delivery>,
+    #[cfg(test)]
+    delivery_pressure: tokio::sync::watch::Sender<bool>,
     cleanup: JoinSet<forge_provider_api::error::ObservationCleanup>,
     failed_waiters: Vec<FailedWaiter>,
     commands: mpsc::Sender<Command>,
@@ -1122,9 +1249,197 @@ struct Driver {
     cleanup_failure: Option<Arc<forge_provider_api::error::ObservationCleanup>>,
     retiring: Option<OwnerCloseReason>,
     idle: SessionObserver,
+    activity: Arc<Mutex<Option<InvocationScope>>>,
+    admitted: Arc<Mutex<std::collections::HashSet<InvocationScope>>>,
+    attempts: HashMap<InvocationScope, AttemptControl>,
+    cancelled_admissions: std::collections::HashSet<InvocationScope>,
+    cancelled_exchanges: HashMap<crate::provider::ExchangeId, ExchangeCollection>,
+    prevented_invocations: HashMap<InvocationScope, PreventedInput>,
+    reservations: HashMap<InvocationScope, InputReservation>,
+    latest_reservations: HashMap<crate::provider::ExchangeId, InvocationScope>,
+    submission_exits: HashMap<tokio::task::Id, tokio::sync::watch::Sender<bool>>,
 }
 
 impl SessionExecution {
+    /// Inspect already-admitted presentation frames without retaining the delivery worker's lifetime.
+    #[cfg(test)]
+    pub(crate) fn presentation_queued_snapshot(&self) -> usize {
+        self.presentation_queue
+            .upgrade()
+            .map_or(0, |sender| sender.max_capacity() - sender.capacity())
+    }
+
+    /// Transfer exact prepared input authority to the owner before foreground scheduling is externally committed.
+    pub(crate) fn reserve_invocation(
+        &self,
+        scope: InvocationScope,
+        submission: Arc<crate::provider::submission::Submission>,
+    ) -> Result<(), ProviderError> {
+        if scope.owner != self.owner || !self.healthy.load(Ordering::Acquire) {
+            return Err(protocol("prepared reservation has no live owner"));
+        }
+        let record = submission
+            .record()
+            .map_err(crate::provider::submission::journal_failure)?;
+        if record.request.owner()? != self.owner
+            || !matches!(
+                record.delivery,
+                crate::provider::submission::SubmissionState::Prepared
+                    | crate::provider::submission::SubmissionState::Cancelled
+            )
+        {
+            return Err(ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderFailureKind::WrongInvocation,
+                ),
+            ));
+        }
+        self.commands
+            .try_send(Command::ReserveInvocation {
+                scope,
+                reservation: InputReservation {
+                    submission,
+                    attempt_id: record.attempt_id,
+                },
+            })
+            .map_err(|_| {
+                ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderFailureKind::Rejected,
+                ))
+            })
+    }
+    /// Authorize an explicit configuration replacement after the prior exchange's native and host collection.
+    pub(crate) async fn resume_exchange(
+        &self,
+        collection: ExchangeCollection,
+    ) -> Result<(), ProviderError> {
+        if collection.scope.owner != self.owner || !self.commands.same_channel(&collection.commands)
+        {
+            return Err(protocol(
+                "configuration replacement belongs to another owner",
+            ));
+        }
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ResumeExchange { collection, reply })
+            .await
+            .map_err(|_| protocol("execution owner closed before configuration replacement"))?;
+        response
+            .await
+            .map_err(|_| protocol("execution owner lost configuration replacement result"))?
+    }
+    /// Stop the host continuation scheduler and cancel the exact active attempt of this exchange.
+    pub(crate) async fn cancel_exchange(
+        &self,
+        scope: InvocationScope,
+    ) -> Result<(), ProviderError> {
+        self.collect_exchange(scope).await.map(drop)
+    }
+
+    /// Collect the actual latest scheduled attempt and retain its exact cancellation generation proof.
+    pub(crate) async fn collect_exchange(
+        &self,
+        scope: InvocationScope,
+    ) -> Result<ExchangeCollection, ProviderError> {
+        if scope.owner != self.owner {
+            return Err(protocol("exchange cancellation belongs to another owner"));
+        }
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::CancelExchange { scope, reply })
+            .await
+            .map_err(|_| protocol("execution owner closed before exchange cancellation"))?;
+        response
+            .await
+            .map_err(|_| protocol("execution owner lost exchange cancellation result"))?
+    }
+    /// Prove that this owner admitted a scope even after its native settlement was published.
+    pub(crate) fn admitted_invocation(
+        &self,
+        scope: &InvocationScope,
+    ) -> Result<bool, ProviderError> {
+        if scope.owner != self.owner {
+            return Ok(false);
+        }
+        self.admitted
+            .lock()
+            .map(|scopes| scopes.contains(scope))
+            .map_err(|_| protocol("admitted scope snapshot poisoned"))
+    }
+    /// Get the retained owner's currently admitted scope for an explicit host exchange cancellation.
+    pub(crate) fn active_invocation_scope(&self) -> Result<Option<InvocationScope>, ProviderError> {
+        self.activity
+            .lock()
+            .map(|scope| scope.clone())
+            .map_err(|_| protocol("activity snapshot poisoned"))
+    }
+    /// Validate and commit worker evidence on the sole owner before recovery can use it.
+    pub(crate) async fn reconcile_input(
+        &self,
+        submission: Arc<crate::provider::submission::Submission>,
+        observation: crate::provider::submission::SubmissionReconciliation,
+    ) -> anyhow::Result<crate::provider::submission::SubmissionRecord> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::ReconcileInput {
+                submission,
+                observation: Box::new(observation),
+                reply,
+            })
+            .await
+            .map_err(|_| protocol("execution owner closed before reconciliation"))?;
+        response
+            .await
+            .map_err(|_| protocol("execution owner lost reconciliation result"))?
+    }
+    /// Cancel exact host admission or await its native settlement without selecting a successor.
+    #[cfg(test)]
+    pub(crate) async fn cancel(&self, scope: InvocationScope) -> Result<(), ProviderError> {
+        if scope.owner != self.owner {
+            return Err(protocol("cancellation belongs to another owner"));
+        }
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(Command::Cancel {
+                scope,
+                reply: CancellationReply::Invocation(reply),
+            })
+            .await
+            .map_err(|_| protocol("execution owner closed before cancellation"))?;
+        response
+            .await
+            .map_err(|_| protocol("execution owner lost cancellation result"))?
+    }
+    /// Inspect the owner's published admission in deterministic host lifecycle fixtures.
+    #[cfg(test)]
+    pub(crate) fn active_invocation_snapshot(
+        &self,
+    ) -> Result<Option<InvocationScope>, ProviderError> {
+        self.activity
+            .lock()
+            .map(|scope| scope.clone())
+            .map_err(|_| protocol("activity snapshot poisoned"))
+    }
+    /// Read the exact owner's published admission state while applying an exchange command.
+    pub(crate) fn invocation_active_snapshot(
+        &self,
+        scope: &InvocationScope,
+    ) -> Result<bool, ProviderError> {
+        if scope.owner != self.owner || !self.healthy.load(Ordering::Acquire) {
+            return Err(protocol("invocation observation has no live owner"));
+        }
+        let active = self
+            .activity
+            .lock()
+            .map_err(|_| protocol("activity snapshot poisoned"))?;
+        Ok(active.as_ref() == Some(scope))
+    }
+    /// Get immutable registration identity for host-authored journal entries.
+    pub(crate) fn provider_id(&self) -> crate::provider::ProviderId {
+        self.provider.descriptor().kind
+    }
     #[cfg(test)]
     pub(crate) async fn publish_idle_test_effect(
         &self,
@@ -1164,9 +1479,15 @@ impl SessionExecution {
         let mut events = provider.session_events(owner.clone()).await?;
         let (commands, mut receive) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
         let (delivery, output) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+        #[cfg(test)]
+        let presentation_queue = delivery.downgrade();
         let mut deliveries = JoinSet::new();
         deliveries.spawn(deliver(output));
+        #[cfg(test)]
+        let (delivery_pressure, pressure_observer) = tokio::sync::watch::channel(false);
         let healthy = Arc::new(AtomicBool::new(true));
+        let activity = Arc::new(Mutex::new(None));
+        let admitted = Arc::new(Mutex::new(Default::default()));
         let orderly_shutdown = Arc::new(AtomicBool::new(false));
         let driver_shutdown = orderly_shutdown.clone();
         let mut driver = Driver {
@@ -1180,6 +1501,9 @@ impl SessionExecution {
             submissions: JoinSet::new(),
             deliveries,
             delivery: Some(delivery),
+            pending_delivery: VecDeque::new(),
+            #[cfg(test)]
+            delivery_pressure: delivery_pressure.clone(),
             cleanup: JoinSet::new(),
             failed_waiters: Vec::new(),
             commands: commands.clone(),
@@ -1191,16 +1515,48 @@ impl SessionExecution {
             cleanup_failure: None,
             retiring: None,
             idle: SessionObserver::Inbox(observer),
+            activity: activity.clone(),
+            admitted: admitted.clone(),
+            attempts: HashMap::new(),
+            cancelled_admissions: Default::default(),
+            cancelled_exchanges: Default::default(),
+            prevented_invocations: Default::default(),
+            reservations: Default::default(),
+            latest_reservations: Default::default(),
+            submission_exits: Default::default(),
         };
         let task = tokio::spawn(async move {
+            let mut events_closed = false;
             loop {
+                // Stop native intake at the first blocked frame, but keep control and collection selectable.
+                let delivery_capacity = driver
+                    .delivery
+                    .clone()
+                    .expect("intake retains its delivery sender");
                 tokio::select! {
+                    capacity = delivery_capacity.reserve_owned(), if !driver.pending_delivery.is_empty() => {
+                        match capacity {
+                            Ok(permit) => {
+                                let delivery = driver.pending_delivery.pop_front()
+                                    .expect("capacity is requested only for retained delivery");
+                                permit.send(delivery);
+                                #[cfg(test)]
+                                driver.delivery_pressure.send_replace(!driver.pending_delivery.is_empty());
+                            },
+                            Err(_) => {
+                                for delivery in driver.pending_delivery.drain(..) {
+                                    delivery.fail(ObservationFailure::Disconnected);
+                                }
+                                driver.fail_observation(ObservationFailure::Disconnected);
+                            },
+                        }
+                    },
                     command = receive.recv() => match command {
                         Some(Command::Close(reason)) => {
-                            loop {
+                            while driver.pending_delivery.is_empty() {
                                 match events.try_recv() {
                                     Ok(event) => {
-                                        driver.event(event);
+                                        driver.native_event(event).await;
                                         // Let the presentation worker collect each accepted frame.
                                         tokio::task::yield_now().await;
                                     },
@@ -1225,15 +1581,20 @@ impl SessionExecution {
                         Some(command) => driver.command(command),
                         None => break,
                     },
-                    event = events.recv() => match event {
-                        Ok(Some(event)) => driver.event(event),
+                    event = events.recv(), if !events_closed && driver.pending_delivery.is_empty() => match event {
+                        Ok(Some(event)) => driver.native_event(event).await,
                         Ok(None) => {
                             if !driver_shutdown.load(Ordering::Acquire) {
                                 driver.fail_observation(ObservationFailure::Disconnected);
+                                break;
                             }
-                            break;
+                            if driver.retiring.is_none() { break; }
+                            events_closed = true;
                         },
-                        Err(crate::provider::events::EventDeliveryError::Closed) if driver_shutdown.load(Ordering::Acquire) => break,
+                        Err(crate::provider::events::EventDeliveryError::Closed) if driver_shutdown.load(Ordering::Acquire) => {
+                            if driver.retiring.is_none() { break; }
+                            events_closed = true;
+                        },
                         Err(crate::provider::events::EventDeliveryError::Observation(failure)) => {
                             driver.fail_observation(failure); break;
                         },
@@ -1242,10 +1603,11 @@ impl SessionExecution {
                         },
                         Err(error) => { driver.fail_all(&error.to_string()); break; }
                     },
-                    delivered = driver.submissions.join_next(), if !driver.submissions.is_empty() => {
+                    delivered = driver.submissions.join_next_with_id(), if !driver.submissions.is_empty() => {
                         match delivered {
-                            Some(Ok(outcome)) => driver.acceptance(outcome),
-                            Some(Err(error)) => driver.fail_operation(ObservationFailure::LifecycleUnavailable, forge_provider_api::error::ProviderOperation::CollectEventReader, Arc::new(error)),
+                            Some(Ok((id, outcome))) => { driver.submission_finished(id); driver.acceptance(outcome); },
+                            Some(Err(error)) if error.is_cancelled() => { driver.submission_finished(error.id()); },
+                            Some(Err(error)) => { driver.submission_finished(error.id()); driver.fail_operation(ObservationFailure::LifecycleUnavailable, forge_provider_api::error::ProviderOperation::InputSubmit, Arc::new(error)); },
                             None => {},
                         }
                     },
@@ -1253,16 +1615,21 @@ impl SessionExecution {
                         match result {
                             Some(Ok(Ok(()))) | None => {},
                             Some(Ok(Err(ProviderError::Observation(failure)))) => driver.fail_observation(failure),
-                            Some(Ok(Err(error))) => driver.fail_operation(ObservationFailure::Disconnected, forge_provider_api::error::ProviderOperation::CollectEventReader, Arc::new(error)),
-                            Some(Err(error)) => driver.fail_operation(ObservationFailure::LifecycleUnavailable, forge_provider_api::error::ProviderOperation::CollectEventReader, Arc::new(error)),
+                            Some(Ok(Err(error))) => driver.fail_operation(ObservationFailure::Disconnected, forge_provider_api::error::ProviderOperation::InputSubmit, Arc::new(error)),
+                            Some(Err(error)) => driver.fail_operation(ObservationFailure::LifecycleUnavailable, forge_provider_api::error::ProviderOperation::InputSubmit, Arc::new(error)),
                         }
                     },
                     result = driver.cleanup.join_next(), if !driver.cleanup.is_empty() => { driver.cleanup_finished(result); },
                 }
-                if driver.retiring.is_some() && driver.cleanup.is_empty() && !driver.failed {
-                    loop {
+                driver.publish_activity();
+                if driver.retiring.is_some()
+                    && driver.cleanup.is_empty()
+                    && !driver.failed
+                    && driver.pending_delivery.is_empty()
+                {
+                    while driver.pending_delivery.is_empty() {
                         match events.try_recv() {
-                            Ok(event) => driver.event(event),
+                            Ok(event) => driver.native_event(event).await,
                             Err(
                                 crate::provider::events::EventDeliveryError::Empty
                                 | crate::provider::events::EventDeliveryError::Closed,
@@ -1292,27 +1659,40 @@ impl SessionExecution {
                             }
                         }
                     }
-                    while let Some(outcome) = driver.submissions.try_join_next() {
+                    while let Some(outcome) = driver.submissions.try_join_next_with_id() {
                         match outcome {
-                            Ok(outcome) => driver.acceptance(outcome),
-                            Err(error) => driver.fail_operation(
-                                ObservationFailure::LifecycleUnavailable,
-                                forge_provider_api::error::ProviderOperation::CollectEventReader,
-                                Arc::new(error),
-                            ),
+                            Ok((id, outcome)) => {
+                                driver.submission_finished(id);
+                                driver.acceptance(outcome);
+                            }
+                            Err(error) if error.is_cancelled() => {
+                                driver.submission_finished(error.id())
+                            }
+                            Err(error) => {
+                                driver.submission_finished(error.id());
+                                driver.fail_operation(
+                                    ObservationFailure::LifecycleUnavailable,
+                                    forge_provider_api::error::ProviderOperation::InputSubmit,
+                                    Arc::new(error),
+                                );
+                            }
                         }
                     }
-                    if driver.state.active_scope().is_some()
-                        || !driver.submissions.is_empty()
-                        || driver
-                            .invocations
-                            .values()
-                            .any(|invocation| invocation.pending_controls != 0)
+                    if driver.pending_delivery.is_empty()
+                        && (driver.state.active_scope().is_some()
+                            || !driver.submissions.is_empty()
+                            || driver
+                                .invocations
+                                .values()
+                                .any(|invocation| invocation.pending_controls != 0))
                     {
                         driver.fail_observation(ObservationFailure::LifecycleUnavailable);
                     }
                 }
-                if (driver.failed || driver.retiring.is_some()) && driver.cleanup.is_empty() {
+                if (driver.failed
+                    || driver.retiring.is_some() && driver.pending_delivery.is_empty())
+                    && driver.cleanup.is_empty()
+                {
                     break;
                 }
             }
@@ -1323,30 +1703,48 @@ impl SessionExecution {
                 driver.fail_observation(ObservationFailure::Disconnected);
             }
             driver.submissions.abort_all();
-            while let Some(result) = driver.submissions.join_next().await {
-                if let Err(error) = result
-                    && !error.is_cancelled()
-                {
-                    driver.retain_collection_failure(
-                        forge_provider_api::error::ProviderOperation::CollectEventReader,
-                        Arc::new(error),
-                    );
+            while let Some(result) = driver.submissions.join_next_with_id().await {
+                match result {
+                    Ok((id, _)) => driver.submission_finished(id),
+                    Err(error) => {
+                        driver.submission_finished(error.id());
+                        if !error.is_cancelled() {
+                            driver.retain_collection_failure(
+                                forge_provider_api::error::ProviderOperation::InputSubmit,
+                                Arc::new(error),
+                            );
+                        }
+                    }
                 }
             }
             while let Some(result) = driver.cleanup.join_next().await {
                 driver.cleanup_finished(Some(result));
             }
-            driver.delivery.take();
+            let delivery = driver.delivery.take();
             let drained = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                if let Some(delivery) = delivery {
+                    while let Some(retained) = driver.pending_delivery.pop_front() {
+                        if let Err(error) = delivery.send(retained).await {
+                            error.0.fail(ObservationFailure::Disconnected);
+                            driver.retain_collection_failure(
+                                forge_provider_api::ProviderOperation::InputSubmit,
+                                Arc::new(ProviderError::Observation(
+                                    ObservationFailure::Disconnected,
+                                )),
+                            );
+                        }
+                    }
+                    drop(delivery);
+                }
                 while let Some(result) = driver.deliveries.join_next().await {
                     match result {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => driver.retain_collection_failure(
-                            forge_provider_api::error::ProviderOperation::CollectEventReader,
+                            forge_provider_api::error::ProviderOperation::InputSubmit,
                             Arc::new(error),
                         ),
                         Err(error) => driver.retain_collection_failure(
-                            forge_provider_api::error::ProviderOperation::CollectEventReader,
+                            forge_provider_api::error::ProviderOperation::InputSubmit,
                             Arc::new(error),
                         ),
                     }
@@ -1354,8 +1752,11 @@ impl SessionExecution {
             })
             .await;
             if let Err(source) = drained {
+                for delivery in driver.pending_delivery.drain(..) {
+                    delivery.fail(ObservationFailure::Disconnected);
+                }
                 driver.retain_collection_failure(
-                    forge_provider_api::error::ProviderOperation::CollectEventReader,
+                    forge_provider_api::error::ProviderOperation::InputSubmit,
                     Arc::new(source),
                 );
                 driver.deliveries.abort_all();
@@ -1364,7 +1765,7 @@ impl SessionExecution {
                         && !error.is_cancelled()
                     {
                         driver.retain_collection_failure(
-                            forge_provider_api::error::ProviderOperation::CollectEventReader,
+                            forge_provider_api::error::ProviderOperation::InputSubmit,
                             Arc::new(error),
                         );
                     }
@@ -1373,6 +1774,9 @@ impl SessionExecution {
             driver.idle.close(
                 (!driver.failed).then_some(driver.retiring.unwrap_or(OwnerCloseReason::Shutdown)),
             );
+            if let Ok(mut activity) = driver.activity.lock() {
+                *activity = None;
+            }
             if let Some(report) = driver.cleanup_failure {
                 return Err(ProviderError::Cleanup(report));
             }
@@ -1390,6 +1794,12 @@ impl SessionExecution {
             healthy,
             orderly_shutdown,
             task: tokio::sync::Mutex::new(ExecutionTask::Running(task)),
+            activity,
+            admitted,
+            #[cfg(test)]
+            delivery_pressure: pressure_observer,
+            #[cfg(test)]
+            presentation_queue,
         })
     }
 
@@ -1410,6 +1820,7 @@ impl SessionExecution {
     }
 
     /// Collect intentional cancellation only after native termination is positively observed.
+    #[cfg(test)]
     pub(crate) async fn close_with_reason(
         &self,
         reason: OwnerCloseReason,
@@ -1445,7 +1856,7 @@ impl SessionExecution {
         let result = match result {
             Ok(result) => result,
             Err(error) => Err(crate::provider::lifecycle_error::classify_source(
-                forge_provider_api::error::ProviderOperation::CollectEventReader,
+                forge_provider_api::error::ProviderOperation::InputSubmit,
                 &error,
             )),
         };
@@ -1497,9 +1908,8 @@ impl SessionExecution {
         ProviderError,
     > {
         let (sink, stream) =
-            crate::provider::events::channel(crate::provider::EventScope::SessionOperation {
+            crate::provider::events::channel(crate::provider::EventScope::Binding {
                 owner: self.owner.clone(),
-                operation_id: uuid::Uuid::new_v4().to_string(),
             });
         let (reply, response) = oneshot::channel();
         self.commands
@@ -1619,20 +2029,30 @@ impl SessionExecution {
         sink: ProviderEventSink,
         store: &Arc<crate::provider::submission::SubmissionStore>,
     ) -> Result<ContinuationAttempt, ProviderError> {
+        let supplied = sink.invocation_scope()?;
         if !self.commands.same_channel(&ticket.commands)
-            || sink.invocation_scope()? != &ticket.scope
+            || supplied.owner != ticket.scope.owner
+            || supplied.exchange_id != ticket.scope.exchange_id
         {
             return Err(protocol(
                 "continuation ticket belongs to another invocation or generation",
             ));
         }
+        let scope =
+            InvocationScope::new(ticket.scope.owner.clone(), ticket.scope.exchange_id.clone());
+        let sink = sink.successor_invocation_sink(&scope)?;
         let (stale, mut rejected) = oneshot::channel();
         let result = self
             .submit_until_ready(
                 request,
                 sink,
                 store,
-                Some((ticket.revision, ticket.effects_revision, ticket.nonce)),
+                Some((
+                    ticket.scope.clone(),
+                    ticket.revision,
+                    ticket.effects_revision,
+                    ticket.nonce,
+                )),
                 Some(stale),
             )
             .await;
@@ -1648,21 +2068,14 @@ impl SessionExecution {
         mut request: ProviderRequest,
         sink: ProviderEventSink,
         store: &Arc<crate::provider::submission::SubmissionStore>,
-        continuation: Option<(u64, u64, u64)>,
+        continuation: Option<(InvocationScope, u64, u64, u64)>,
         stale: Option<oneshot::Sender<ProviderRequest>>,
     ) -> Result<NativeReady, ProviderError> {
         let scope = sink.invocation_scope()?.clone();
         if request.owner()? != self.owner || scope.owner != self.owner {
             return Err(protocol("execution request belongs to another owner"));
         }
-        let resuming = request
-            .control_context
-            .as_ref()
-            .is_some_and(|context| context.provider_continuation.is_some());
-        let id = if resuming {
-            request.submission = None;
-            None
-        } else {
+        let id = {
             let submission = match request.submission.take() {
                 Some(submission) => submission,
                 None => store
@@ -1670,7 +2083,7 @@ impl SessionExecution {
                     .map_err(|_| protocol("submission preparation failed"))?,
             };
             submission
-                .recover(self.provider.as_ref(), &mut request)
+                .recover_owned(self.provider.as_ref(), &mut request, self)
                 .await
                 .map_err(|_| protocol("submission recovery failed"))?;
             let id = SubmissionId::try_from(submission.id().to_owned())
@@ -1740,6 +2153,161 @@ impl Drop for SessionExecution {
 }
 
 impl Driver {
+    /// Register the exact prepared input once while retaining only lightweight collected prevention evidence.
+    fn reserve_input(
+        &mut self,
+        scope: InvocationScope,
+        reservation: InputReservation,
+        origin: ReservationOrigin,
+    ) -> Result<(), ProviderError> {
+        let invalid = || {
+            ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderFailureKind::WrongInvocation,
+            ))
+        };
+        if scope.owner != self.owner || self.failed {
+            return Err(invalid());
+        }
+        let record = reservation
+            .submission
+            .record()
+            .map_err(crate::provider::submission::journal_failure)?;
+        if record.request.owner()? != self.owner || record.attempt_id != reservation.attempt_id {
+            return Err(invalid());
+        }
+        let mut admitted = self
+            .admitted
+            .lock()
+            .map_err(|_| protocol("admitted scope snapshot poisoned"))?;
+        if admitted.contains(&scope) {
+            let reserved = match self.reservations.get(&scope) {
+                Some(previous)
+                    if previous.submission.receipt_id() == reservation.submission.receipt_id()
+                        && previous.attempt_id == reservation.attempt_id =>
+                {
+                    true
+                }
+                Some(_) | None => false,
+            };
+            let prevented = self
+                .prevented_invocations
+                .get(&scope)
+                .is_some_and(|previous| {
+                    &previous.submission_id == reservation.submission.receipt_id()
+                        && previous.attempt_id == reservation.attempt_id
+                });
+            return if reserved || prevented {
+                Ok(())
+            } else {
+                Err(invalid())
+            };
+        }
+        match record.delivery {
+            crate::provider::submission::SubmissionState::Prepared
+            | crate::provider::submission::SubmissionState::Cancelled => {}
+            crate::provider::submission::SubmissionState::Sending { .. }
+            | crate::provider::submission::SubmissionState::Accepted { .. } => {
+                return Err(invalid());
+            }
+        }
+        admitted.insert(scope.clone());
+        let publish = match origin {
+            ReservationOrigin::PreparedForeground => true,
+            ReservationOrigin::Execution => {
+                !self.cancelled_exchanges.contains_key(&scope.exchange_id)
+                    && !self.cancelled_admissions.contains(&scope)
+            }
+        };
+        if publish {
+            self.latest_reservations
+                .insert(scope.exchange_id.clone(), scope.clone());
+        }
+        if matches!(
+            record.delivery,
+            crate::provider::submission::SubmissionState::Cancelled
+        ) {
+            self.prevented_invocations.insert(
+                scope,
+                PreventedInput {
+                    submission_id: reservation.submission.receipt_id().clone(),
+                    attempt_id: reservation.attempt_id,
+                },
+            );
+        } else {
+            self.reservations.insert(scope, reservation);
+        }
+        Ok(())
+    }
+    /// Acknowledge task destruction before cancellation collects resources created during preparation.
+    fn submission_finished(&mut self, id: tokio::task::Id) {
+        if let Some(finished) = self.submission_exits.remove(&id) {
+            finished.send_replace(true);
+        }
+    }
+    /// Publish a read-only owner snapshot without transferring transition authority to readers.
+    fn publish_activity(&self) {
+        if let Ok(mut activity) = self.activity.lock() {
+            *activity = (!self.failed && self.retiring.is_none())
+                .then(|| {
+                    self.state
+                        .active_scope()
+                        .filter(|scope| {
+                            self.invocations
+                                .get(&scope.invocation_id)
+                                .is_some_and(|invocation| invocation.native_settlement.is_none())
+                        })
+                        .cloned()
+                })
+                .flatten();
+        }
+    }
+    /// Reduce a binding event before acknowledging its stream position to operation waiters.
+    async fn native_event(&mut self, envelope: crate::provider::bridge::HostEvent) {
+        let crate::provider::bridge::HostEvent { event, native } = envelope;
+        let category = event_category(&event);
+        let scope = event.scope();
+        if scope.owner() != &self.owner {
+            self.fail_observation(ObservationFailure::OwnershipConflict);
+            return;
+        }
+        let identity_first =
+            matches!(&event, ProviderEvent::SessionIdentity { .. }) && native.is_some();
+        if identity_first
+            && scope
+                .invocation()
+                .is_some_and(|scope| !self.state.contains(scope))
+        {
+            self.fail_observation(ObservationFailure::OwnershipConflict);
+            return;
+        }
+        // Identity reducers consult consumed binding metadata; publish only after that metadata advances.
+        // Native terminal and settlement events retain their reducer-before-watermark ordering.
+        let after_consumption = if identity_first {
+            Some(event)
+        } else {
+            self.event(event);
+            None
+        };
+        if let Some((binding, sequence)) = native {
+            if let Err(error) = self.provider.event_consumed(&binding, sequence).await {
+                self.fail_observation_with_origin(
+                    ObservationFailure::Protocol,
+                    FailureOrigin::Error(error),
+                );
+                return;
+            } else {
+                self.trace.record(self.owner.session_id.as_str(), "provider.event.consumed", serde_json::json!({
+                    "binding_id":binding, "sequence":sequence, "scope":scope, "category":category,
+                }));
+            }
+        }
+        if let Some(event) = after_consumption
+            && !self.failed
+        {
+            self.event(event);
+        }
+    }
     /// Preserve a failed owned task while keeping the first observation cause immutable.
     fn retain_collection_failure(
         &mut self,
@@ -1793,15 +2361,12 @@ impl Driver {
         self.retiring = Some(reason);
         self.healthy.store(false, Ordering::Release);
         let provider = self.provider.clone();
-        let key = self.owner.runtime_key();
+        let owner = self.owner.clone();
         self.cleanup.spawn(async move {
             use forge_provider_api::error::{CleanupFailure, ObservationCleanup};
             let deadline = std::time::Duration::from_secs(15);
-            // Deliberate retirement preserves terminal evidence. Failure-only fencing
-            // poisons the native event stream before cancellation can publish it.
-            // cancel_session revokes host callbacks before collecting native work.
-            let cancellation = tokio::time::timeout(deadline, provider.cancel_session(&key)).await;
-            let collection = tokio::time::timeout(deadline, provider.cleanup_execution(&key)).await;
+            let collection =
+                tokio::time::timeout(deadline, provider.session_close_owner(&owner)).await;
             let classify = |result: Result<
                 Result<(), ProviderError>,
                 tokio::time::error::Elapsed,
@@ -1813,7 +2378,7 @@ impl Driver {
             ObservationCleanup::new(
                 ObservationFailure::LifecycleUnavailable,
                 None,
-                classify(cancellation),
+                None,
                 classify(collection),
             )
             .with_origin(ProviderError::Cancelled)
@@ -1822,6 +2387,313 @@ impl Driver {
     fn command(&mut self, command: Command) {
         match command {
             Command::Close(_) => unreachable!("close is handled by the driver loop"),
+            Command::ReserveInvocation { scope, reservation } => {
+                if let Err(error) =
+                    self.reserve_input(scope, reservation, ReservationOrigin::PreparedForeground)
+                {
+                    self.fail_observation_with_origin(
+                        ObservationFailure::OwnershipConflict,
+                        FailureOrigin::Error(error),
+                    );
+                }
+            }
+            Command::ResumeExchange { collection, reply } => {
+                let scope = collection.scope.clone();
+                let admitted = match self.admitted.lock() {
+                    Ok(admitted) => admitted.contains(&scope),
+                    Err(_) => {
+                        let _ = reply.send(Err(protocol("admitted scope snapshot poisoned")));
+                        return;
+                    }
+                };
+                let collected = |invocation: &Invocation| {
+                    invocation.pending_controls == 0
+                        && invocation.terminal.is_some()
+                        && invocation.native_settlement.is_some()
+                        && matches!(invocation.host_collection, HostCollection::Settled)
+                };
+                let prior = self
+                    .invocations
+                    .get(&scope.invocation_id)
+                    .or_else(|| self.committed_invocations.get(&scope.invocation_id))
+                    .filter(|invocation| invocation.scope == scope);
+                let previous_collected =
+                    prior.is_some_and(collected) || self.prevented_invocations.contains_key(&scope);
+                let all_collected = self
+                    .invocations
+                    .values()
+                    .filter(|invocation| invocation.scope.exchange_id == scope.exchange_id)
+                    .all(collected);
+                let current_fence = self
+                    .cancelled_exchanges
+                    .get(&scope.exchange_id)
+                    .is_some_and(|fence| {
+                        fence.scope == scope
+                            && fence.fence_id == collection.fence_id
+                            && self.commands.same_channel(&collection.commands)
+                    });
+                let latest = self.latest_reservations.get(&scope.exchange_id) == Some(&scope);
+                if self.failed
+                    || scope.owner != self.owner
+                    || !admitted
+                    || !previous_collected
+                    || !current_fence
+                    || !latest
+                {
+                    let _ = reply.send(Err(ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::SessionConfigure,
+                            forge_provider_api::ProviderFailureKind::WrongInvocation,
+                        ),
+                    )));
+                    return;
+                }
+                if self.state.active_scope().is_some() || !all_collected {
+                    let _ = reply.send(Err(ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::SessionConfigure,
+                            forge_provider_api::ProviderFailureKind::ExecutionActive,
+                        ),
+                    )));
+                    return;
+                }
+                self.cancelled_exchanges.remove(&scope.exchange_id);
+                let _ = reply.send(Ok(()));
+            }
+            Command::CancelExchange { scope, reply } => {
+                let registered = self
+                    .admitted
+                    .lock()
+                    .is_ok_and(|admitted| admitted.contains(&scope));
+                let fence = if registered {
+                    self.latest_reservations
+                        .get(&scope.exchange_id)
+                        .cloned()
+                        .unwrap_or_else(|| scope.clone())
+                } else {
+                    scope.clone()
+                };
+                let collection = ExchangeCollection {
+                    scope: fence.clone(),
+                    fence_id: forge_provider_api::OperationId::new(
+                        uuid::Uuid::new_v4().to_string(),
+                    )
+                    .expect("generated exchange fence identity is nonempty"),
+                    commands: self.commands.clone(),
+                };
+                self.cancelled_exchanges
+                    .insert(scope.exchange_id.clone(), collection.clone());
+                let target = self
+                    .state
+                    .active_scope()
+                    .filter(|active| {
+                        active.owner == scope.owner && active.exchange_id == scope.exchange_id
+                    })
+                    .cloned()
+                    .unwrap_or(fence);
+                self.command(Command::Cancel {
+                    scope: target,
+                    reply: CancellationReply::Exchange { collection, reply },
+                });
+            }
+            Command::HostEffectsCollected {
+                scope,
+                operation_id,
+                result,
+            } => {
+                self.trace.record(self.owner.session_id.as_str(), "provider.operation.completed", serde_json::json!({
+                    "operation_id":operation_id, "operation":forge_provider_api::ProviderOperation::InputSubmit,
+                    "phase":forge_provider_api::ProviderPhase::Collection, "scope":scope, "success":result.is_ok(),
+                }));
+                let Some(invocation) =
+                    self.invocations
+                        .get_mut(&scope.invocation_id)
+                        .filter(|invocation| {
+                            invocation.scope == scope
+                                && matches!(invocation.host_collection, HostCollection::Collecting)
+                        })
+                else {
+                    return;
+                };
+                match result {
+                    Ok(()) => invocation.host_collection = HostCollection::Settled,
+                    Err(error) => {
+                        self.fail_observation_with_origin(
+                            ObservationFailure::LifecycleUnavailable,
+                            FailureOrigin::Error(error),
+                        );
+                        return;
+                    }
+                }
+                self.settle(&scope.invocation_id);
+            }
+            Command::ReconcileInput {
+                submission,
+                observation,
+                reply,
+            } => {
+                let result = if self.failed {
+                    Err(protocol("reconciliation has no live owner").into())
+                } else {
+                    submission.apply_reconciliation(*observation)
+                };
+                let _ = reply.send(result);
+            }
+            Command::Cancel { scope, reply } => {
+                if self.failed || scope.owner != self.owner {
+                    reply.complete(Err(protocol("cancellation has no live owner")));
+                    return;
+                }
+                if self
+                    .invocations
+                    .get(&scope.invocation_id)
+                    .or_else(|| self.committed_invocations.get(&scope.invocation_id))
+                    .is_some_and(|invocation| {
+                        invocation.scope == scope
+                            && invocation.native_settlement.is_some()
+                            && matches!(invocation.host_collection, HostCollection::Settled)
+                    })
+                {
+                    reply.complete(Ok(()));
+                    return;
+                }
+                let Some(attempt) = self.attempts.get(&scope) else {
+                    if let Some(reservation) = self.reservations.remove(&scope) {
+                        match reservation
+                            .submission
+                            .retire_prepared_attempt(&reservation.attempt_id)
+                        {
+                            Ok(
+                                crate::provider::submission::SubmissionRetirement::Prevented
+                                | crate::provider::submission::SubmissionRetirement::AlreadyCancelled,
+                            ) => {
+                                self.prevented_invocations.insert(
+                                    scope,
+                                    PreventedInput {
+                                        submission_id: reservation.submission.receipt_id().clone(),
+                                        attempt_id: reservation.attempt_id,
+                                    },
+                                );
+                                reply.complete(Ok(()));
+                            }
+                            Ok(
+                                crate::provider::submission::SubmissionRetirement::Sending
+                                | crate::provider::submission::SubmissionRetirement::Accepted,
+                            ) => {
+                                self.reservations.insert(scope, reservation);
+                                reply.complete(Err(ProviderError::DeliveryUncertain));
+                            }
+                            Err(error) => {
+                                self.reservations.insert(scope, reservation);
+                                reply.complete(Err(error));
+                            }
+                        }
+                        return;
+                    }
+                    self.cancelled_admissions.insert(scope);
+                    reply.complete(Ok(()));
+                    return;
+                };
+                let retirement = match attempt
+                    .submission
+                    .retire_prepared_attempt(&attempt.attempt_id)
+                {
+                    Ok(retirement) => retirement,
+                    Err(error) => {
+                        reply.complete(Err(error));
+                        return;
+                    }
+                };
+                let provider = self.provider.clone();
+                let mut dispatch = attempt.dispatch.clone();
+                let mut finished = attempt.finished.clone();
+                let kind = match retirement {
+                    crate::provider::submission::SubmissionRetirement::Prevented
+                    | crate::provider::submission::SubmissionRetirement::AlreadyCancelled => {
+                        attempt.task.abort();
+                        CancellationKind::Prevented
+                    }
+                    crate::provider::submission::SubmissionRetirement::Sending
+                    | crate::provider::submission::SubmissionRetirement::Accepted => {
+                        CancellationKind::Native
+                    }
+                };
+                let commands = self.commands.clone();
+                self.deliveries.spawn(async move {
+                    let result = match kind {
+                        CancellationKind::Prevented => {
+                            let stopped = finished.wait_for(|finished| *finished).await.map(drop);
+                            match stopped {
+                                Ok(()) => {
+                                    provider
+                                        .cancel_prepared_invocation(&scope, retirement)
+                                        .await
+                                }
+                                Err(_) => Err(protocol(
+                                    "prevented submission lost task collection evidence",
+                                )),
+                            }
+                        }
+                        CancellationKind::Native => match dispatch.wait().await {
+                            Ok(confirmation) if confirmation.scope() == &scope => {
+                                provider.cancel_invocation(scope.clone()).await.map(|_| ())
+                            }
+                            Ok(_) => Err(protocol("cancellation dispatch identity changed")),
+                            Err(_) => Err(ProviderError::DeliveryUncertain),
+                        },
+                    };
+                    let _ = commands
+                        .send(Command::CancellationFinished {
+                            scope,
+                            outcome: kind,
+                            result,
+                            reply,
+                        })
+                        .await;
+                    Ok(())
+                });
+            }
+            Command::CancellationFinished {
+                scope,
+                outcome,
+                result,
+                reply,
+            } => {
+                if matches!(outcome, CancellationKind::Prevented) && result.is_ok() {
+                    if let Some(attempt) = self.attempts.get(&scope) {
+                        self.prevented_invocations.insert(
+                            scope.clone(),
+                            PreventedInput {
+                                submission_id: attempt.submission.receipt_id().clone(),
+                                attempt_id: attempt.attempt_id.clone(),
+                            },
+                        );
+                        if self
+                            .state
+                            .delivery(
+                                &scope,
+                                attempt.submission.receipt_id(),
+                                DeliveryState::NotConsumed,
+                            )
+                            .is_err()
+                        {
+                            reply.complete(Err(protocol(
+                                "prevented cancellation conflicts with delivery",
+                            )));
+                            return;
+                        }
+                    }
+                    if let Some(invocation) = self
+                        .invocations
+                        .get_mut(&scope.invocation_id)
+                        .filter(|invocation| invocation.scope == scope)
+                    {
+                        invocation.terminal = Some(Err(ProviderError::Cancelled));
+                    }
+                    self.settle(&scope.invocation_id);
+                }
+                reply.complete(result);
+            }
             #[cfg(test)]
             Command::TestPublishEffect {
                 scope,
@@ -1867,7 +2739,13 @@ impl Driver {
                 authority,
                 reply,
             } => {
-                if self.failed || !self.state.contains(&scope) {
+                if self.failed
+                    || self.state.active_scope() != Some(&scope)
+                    || self
+                        .invocations
+                        .get(&scope.invocation_id)
+                        .is_none_or(|invocation| invocation.native_settlement.is_some())
+                {
                     let _ = reply.send(Err(not_admitted()));
                     return;
                 }
@@ -1912,18 +2790,18 @@ impl Driver {
                         {
                             Err(error) => Err(ProviderError::PreparationFailed(Box::new(
                                 crate::provider::lifecycle_error::classify(
-                                    forge_provider_api::ProviderOperation::AdmitInput,
+                                    forge_provider_api::ProviderOperation::InputSubmit,
                                     error,
                                 ),
                             ))),
                             Ok(_) => {
                                 let result = provider
-                                    .session_steer(&scope.owner, scope.clone(), input)
+                                    .input_steer(&scope.owner, scope.clone(), input)
                                     .await;
                                 if dispatch_authority
                                     .as_ref()
                                     .is_some_and(|authority| authority.validate_scope().is_err())
-                                    && !matches!(&result, Err(ProviderError::NotConsumed { .. }))
+                                    && !matches!(&result, Err(ProviderError::NotConsumed))
                                 {
                                     Err(ProviderError::DeliveryUncertain)
                                 } else {
@@ -2002,11 +2880,131 @@ impl Driver {
                     let _ = reply.send(Err(ProviderError::Cancelled));
                     return;
                 }
-                if let Some((revision, effects_revision, nonce)) = continuation {
+                let Some(receipt) = request.submission.as_ref() else {
+                    let _ = reply.send(Err(protocol("execution has no journal authority")));
+                    return;
+                };
+                let record = match receipt.record() {
+                    Ok(record) => record,
+                    Err(error) => {
+                        let _ =
+                            reply.send(Err(crate::provider::submission::journal_failure(error)));
+                        return;
+                    }
+                };
+                if let Some(prevented) = self.prevented_invocations.get(&scope) {
+                    let result = if prevented.submission_id == *receipt.receipt_id()
+                        && prevented.attempt_id == record.attempt_id
+                    {
+                        ProviderError::Cancelled
+                    } else {
+                        ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderFailureKind::WrongInvocation,
+                        ))
+                    };
+                    let _ = reply.send(Err(result));
+                    return;
+                }
+                if !self.reservations.contains_key(&scope)
+                    && let Err(error) = self.reserve_input(
+                        scope.clone(),
+                        InputReservation {
+                            submission: receipt.clone(),
+                            attempt_id: record.attempt_id.clone(),
+                        },
+                        ReservationOrigin::Execution,
+                    )
+                {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+                if self.prevented_invocations.contains_key(&scope) {
+                    let _ = reply.send(Err(ProviderError::Cancelled));
+                    return;
+                }
+                let reservation = self
+                    .reservations
+                    .remove(&scope)
+                    .expect("execution reservation was installed above");
+                if reservation.submission.receipt_id() != receipt.receipt_id()
+                    || reservation.attempt_id != record.attempt_id
+                {
+                    let _ = reply.send(Err(ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderFailureKind::WrongInvocation,
+                        ),
+                    )));
+                    return;
+                }
+                let attempt_id = reservation.attempt_id;
+                if matches!(
+                    record.delivery,
+                    crate::provider::submission::SubmissionState::Cancelled
+                ) {
+                    self.prevented_invocations.insert(
+                        scope.clone(),
+                        PreventedInput {
+                            submission_id: receipt.receipt_id().clone(),
+                            attempt_id,
+                        },
+                    );
+                    let _ = reply.send(Err(ProviderError::Cancelled));
+                    return;
+                }
+                if !matches!(
+                    record.delivery,
+                    crate::provider::submission::SubmissionState::Prepared
+                ) {
+                    let _ = reply.send(Err(ProviderError::DeliveryUncertain));
+                    return;
+                }
+                if self.cancelled_admissions.remove(&scope)
+                    || self.cancelled_exchanges.contains_key(&scope.exchange_id)
+                {
+                    match receipt.retire_prepared_attempt(&attempt_id) {
+                        Ok(
+                            crate::provider::submission::SubmissionRetirement::Prevented
+                            | crate::provider::submission::SubmissionRetirement::AlreadyCancelled,
+                        ) => {
+                            self.prevented_invocations.insert(
+                                scope.clone(),
+                                PreventedInput {
+                                    submission_id: receipt.receipt_id().clone(),
+                                    attempt_id,
+                                },
+                            );
+                        }
+                        Ok(
+                            crate::provider::submission::SubmissionRetirement::Sending
+                            | crate::provider::submission::SubmissionRetirement::Accepted,
+                        ) => {
+                            let _ = reply.send(Err(ProviderError::DeliveryUncertain));
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error));
+                            return;
+                        }
+                    }
+                    let _ = reply.send(Err(ProviderError::Cancelled));
+                    return;
+                }
+                if let Some((previous_scope, revision, effects_revision, nonce)) = continuation {
+                    if scope.owner != previous_scope.owner
+                        || scope.exchange_id != previous_scope.exchange_id
+                        || scope.invocation_id == previous_scope.invocation_id
+                    {
+                        let _ = reply.send(Err(protocol(
+                            "continuation requires a fresh scope within its exchange",
+                        )));
+                        return;
+                    }
                     let Some(invocation) = self
                         .invocations
-                        .get_mut(&scope.invocation_id)
-                        .filter(|invocation| invocation.scope == scope)
+                        .get_mut(&previous_scope.invocation_id)
+                        .filter(|invocation| invocation.scope == previous_scope)
                     else {
                         let _ = reply.send(Err(protocol(
                             "continuation invocation is no longer retained",
@@ -2024,7 +3022,7 @@ impl Driver {
                         || invocation.pending_controls != 0
                         || invocation.reply.is_some()
                         || !matches!(
-                            self.state.readiness(&scope),
+                            self.state.readiness(&previous_scope),
                             Ok(ExecutionReadiness::Complete)
                         )
                         || !matches!(effects_current, Ok(true))
@@ -2053,20 +3051,33 @@ impl Driver {
                         self.fail_all("continuation completion slot failed");
                         return;
                     }
-                    let Some(next_revision) = invocation.revision.checked_add(1) else {
-                        let _ = reply.send(Err(protocol("settlement revision exhausted")));
-                        self.fail_all("settlement revision exhausted");
-                        return;
-                    };
-                    invocation.revision = next_revision;
-                    invocation.ticket_outstanding = false;
-                    invocation.terminal = None;
-                    invocation.publication_failure = None;
-                    invocation.output = sink;
-                    invocation.idle_observation = false;
-                    invocation.completion = context.clone();
-                    invocation.reply = Some(reply);
-                    invocation.abandoned = abandoned;
+                    let completion = context.clone();
+                    let previous = self
+                        .invocations
+                        .remove(&previous_scope.invocation_id)
+                        .expect("continuation predecessor was validated under the owner");
+                    self.attempts.remove(&previous_scope);
+                    self.committed_invocations
+                        .insert(previous_scope.invocation_id.clone(), previous);
+                    self.invocations.insert(
+                        scope.invocation_id.clone(),
+                        Invocation {
+                            scope: scope.clone(),
+                            output: sink,
+                            reply: Some(reply),
+                            completion,
+                            terminal: None,
+                            native_settlement: None,
+                            host_collection: HostCollection::Pending,
+                            publication_failure: None,
+                            pending_controls: 0,
+                            revision: 0,
+                            ticket_outstanding: false,
+                            ticket_nonce: 0,
+                            abandoned,
+                            idle_observation: false,
+                        },
+                    );
                 } else {
                     if !self.invocations.is_empty() || self.state.active_scope().is_some() {
                         let _ = reply.send(Err(protocol(
@@ -2088,6 +3099,8 @@ impl Driver {
                             reply: Some(reply),
                             completion,
                             terminal: None,
+                            native_settlement: None,
+                            host_collection: HostCollection::Pending,
                             publication_failure: None,
                             pending_controls: 0,
                             revision: 0,
@@ -2099,8 +3112,12 @@ impl Driver {
                     );
                 }
                 let provider = self.provider.clone();
-                self.submissions.spawn(async move {
-                    let result = provider.session_prompt(request, scope.clone()).await;
+                let attempt_scope = scope.clone();
+                let attempt_submission = request.submission.clone();
+                let attempt_dispatch = request.dispatch.observer();
+                let (finished, finish_observer) = tokio::sync::watch::channel(false);
+                let task = self.submissions.spawn(async move {
+                    let result = provider.input_submit(request, scope.clone()).await;
                     SubmissionOutcome {
                         scope,
                         submission,
@@ -2108,6 +3125,19 @@ impl Driver {
                         result,
                     }
                 });
+                self.submission_exits.insert(task.id(), finished);
+                if let Some(submission) = attempt_submission {
+                    self.attempts.insert(
+                        attempt_scope,
+                        AttemptControl {
+                            submission,
+                            dispatch: attempt_dispatch,
+                            task,
+                            finished: finish_observer,
+                            attempt_id,
+                        },
+                    );
+                }
             }
             Command::WaitReady {
                 scope,
@@ -2179,6 +3209,7 @@ impl Driver {
                     .commit_provider_execution(effects_revision)
                 {
                     Ok(true) => {
+                        self.attempts.remove(&scope);
                         self.committed_tickets
                             .insert((scope.invocation_id.clone(), nonce), scope.clone());
                         if let Some(mut invocation) = self.invocations.remove(&scope.invocation_id)
@@ -2223,7 +3254,7 @@ impl Driver {
             }
             let delivery = match &result {
                 Ok(()) => DeliveryState::Accepted,
-                Err(ProviderError::NotConsumed { .. } | ProviderError::PreparationFailed(_)) => {
+                Err(ProviderError::NotConsumed | ProviderError::PreparationFailed(_)) => {
                     DeliveryState::NotConsumed
                 }
                 Err(_) => DeliveryState::Uncertain,
@@ -2247,7 +3278,7 @@ impl Driver {
         }
         let delivery = match &result {
             Ok(()) => DeliveryState::Accepted,
-            Err(ProviderError::NotConsumed { .. } | ProviderError::PreparationFailed(_)) => {
+            Err(ProviderError::NotConsumed | ProviderError::PreparationFailed(_)) => {
                 DeliveryState::NotConsumed
             }
             Err(_) => DeliveryState::Uncertain,
@@ -2273,43 +3304,88 @@ impl Driver {
             self.fail_all("foreign owner in provider stream");
             return;
         }
+        if let ProviderEvent::SettlementFailed { scope, failure } = &event {
+            if !self.state.contains(scope) {
+                self.fail_observation(ObservationFailure::OwnershipConflict);
+                return;
+            }
+            self.fail_observation_with_origin(
+                ObservationFailure::LifecycleUnavailable,
+                FailureOrigin::Error(ProviderError::Failure(*failure)),
+            );
+            return;
+        }
         let Some(scope) = event.scope().invocation().cloned() else {
             self.idle_event(event);
             return;
         };
-        if !self.invocations.contains_key(&scope.invocation_id)
-            && matches!(&event, ProviderEvent::Execution { observation } if matches!(observation.update(), ExecutionUpdate::Started { .. }))
-            && let Some(committed) = self.committed_invocations.get(&scope.invocation_id)
-        {
-            if committed.scope != scope || !self.invocations.is_empty() {
-                // Keep the original native attribution before fencing both host
-                // contexts. Removing A before detecting active B loses A's loss
-                // certificate and can make its accepted work appear complete.
-                self.idle_event(event);
-                let invocation = self
+        if let ProviderEvent::Settled { settlement } = &event {
+            let Some(invocation) = self
+                .invocations
+                .get_mut(&scope.invocation_id)
+                .filter(|invocation| invocation.scope == scope)
+            else {
+                if self
                     .committed_invocations
-                    .remove(&scope.invocation_id)
-                    .expect("conflicting committed invocation was checked");
-                self.invocations
-                    .insert(invocation.scope.invocation_id.clone(), invocation);
+                    .contains_key(&scope.invocation_id)
+                {
+                    return;
+                }
+                self.fail_observation(ObservationFailure::OwnershipConflict);
+                return;
+            };
+            if invocation
+                .native_settlement
+                .as_ref()
+                .is_some_and(|previous| {
+                    previous.binding_id != settlement.binding_id
+                        || previous.result != settlement.result
+                })
+            {
                 self.fail_observation(ObservationFailure::OwnershipConflict);
                 return;
             }
-            let mut invocation = self
-                .committed_invocations
-                .remove(&scope.invocation_id)
-                .expect("reopening committed invocation was checked");
-            if let Err(error) = invocation.completion.provider_completion.begin_attempt() {
-                self.fail_all(&error.to_string());
+            if let Some(Ok(terminal)) = &invocation.terminal
+                && terminal != &settlement.result
+            {
+                self.fail_observation(ObservationFailure::Protocol);
                 return;
             }
-            invocation.terminal = None;
-            invocation.publication_failure = None;
-            invocation.reply = None;
-            invocation.ticket_outstanding = false;
-            invocation.idle_observation = true;
+            invocation.native_settlement = Some(settlement.as_ref().clone());
+            if matches!(invocation.host_collection, HostCollection::Pending) {
+                invocation.host_collection = HostCollection::Collecting;
+                let operation_id =
+                    forge_provider_api::OperationId::new(uuid::Uuid::new_v4().to_string())
+                        .expect("generated host collection identity is nonempty");
+                self.trace.record(self.owner.session_id.as_str(), "provider.operation.started", serde_json::json!({
+                    "operation_id":operation_id, "operation":forge_provider_api::ProviderOperation::InputSubmit,
+                    "phase":forge_provider_api::ProviderPhase::Collection, "scope":scope,
+                }));
+                let provider = self.provider.clone();
+                let commands = self.commands.clone();
+                self.deliveries.spawn(async move {
+                    let result = provider.collect_host_effects(&scope).await;
+                    let _ = commands
+                        .send(Command::HostEffectsCollected {
+                            scope,
+                            operation_id,
+                            result,
+                        })
+                        .await;
+                    Ok(())
+                });
+            }
+            return;
+        }
+        if !self.invocations.contains_key(&scope.invocation_id)
+            && matches!(&event, ProviderEvent::Execution { observation } if matches!(observation.update(), ExecutionUpdate::Started { .. }))
+            && let Some(invocation) = self.committed_invocations.remove(&scope.invocation_id)
+        {
+            self.idle_event(event);
             self.invocations
-                .insert(scope.invocation_id.clone(), invocation);
+                .insert(invocation.scope.invocation_id.clone(), invocation);
+            self.fail_observation(ObservationFailure::OwnershipConflict);
+            return;
         }
         if !self.invocations.contains_key(&scope.invocation_id) {
             if let ProviderEvent::Execution { observation } = &event {
@@ -2346,6 +3422,12 @@ impl Driver {
             .get_mut(&scope.invocation_id)
             .expect("active invocation was checked");
         if let ProviderEvent::Execution { observation } = &event {
+            if matches!(observation.update(), ExecutionUpdate::Started { .. })
+                && invocation.native_settlement.is_some()
+            {
+                self.fail_observation(ObservationFailure::OwnershipConflict);
+                return;
+            }
             let Some(revision) = invocation.revision.checked_add(1) else {
                 self.fail_all("settlement revision exhausted");
                 return;
@@ -2355,7 +3437,11 @@ impl Driver {
                 invocation.terminal = Some(Err(protocol(&error.to_string())));
             } else {
                 invocation.terminal = match observation.update() {
-                    ExecutionUpdate::Started { .. } => None,
+                    ExecutionUpdate::Started { .. } => {
+                        invocation.native_settlement = None;
+                        invocation.host_collection = HostCollection::Pending;
+                        None
+                    }
                     ExecutionUpdate::Finished { result, .. }
                     | ExecutionUpdate::ResolvedWithoutExecution { result, .. } => {
                         Some(Ok(result.clone()))
@@ -2377,7 +3463,7 @@ impl Driver {
                         };
                         invocation.publication_failure = Some(ProviderError::Failure(
                             forge_provider_api::ProviderFailure::new(
-                                forge_provider_api::ProviderOperation::HostEffectPublication,
+                                forge_provider_api::ProviderOperation::InputSubmit,
                                 kind,
                             ),
                         ));
@@ -2433,48 +3519,63 @@ impl Driver {
         }
     }
 
-    fn enqueue(&self, delivery: Delivery) -> bool {
+    /// Retain ordered publication while selecting capacity alongside owner control commands.
+    fn enqueue(&mut self, delivery: Delivery) -> bool {
+        if matches!(&delivery, Delivery::Complete { reply, .. } if reply.is_closed()) {
+            return true;
+        }
         let Some(sender) = self.delivery.as_ref() else {
             delivery.fail(ObservationFailure::Disconnected);
             return false;
         };
-        match sender.try_send(delivery) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(delivery)) => {
-                if !self.queue_loss_reported.swap(true, Ordering::AcqRel) {
-                    let (stage, source_scope, event_bytes) = match &delivery {
-                        Delivery::Inbox { event, .. } => (
-                            "engine_idle",
-                            Some(event.scope()),
-                            serde_json::to_vec(event).ok().map(|encoded| encoded.len()),
-                        ),
-                        Delivery::Event { event, .. } => (
-                            "engine_foreground",
-                            Some(event.scope()),
-                            serde_json::to_vec(event).ok().map(|encoded| encoded.len()),
-                        ),
-                        Delivery::Complete { result, .. } => (
-                            "engine_completion",
-                            result.as_ref().as_ref().ok().map(|ready| {
-                                crate::provider::EventScope::from(ready.ticket.scope.clone())
-                            }),
-                            None,
-                        ),
-                    };
-                    self.trace.record(self.owner.session_id.as_str(), "provider.observation_queue_lost", serde_json::json!({
-                        "provider":self.provider.descriptor().kind, "stage":stage,
-                        "queued":sender.max_capacity(), "capacity":sender.max_capacity(),
-                        "queued_bytes":null, "event_bytes":event_bytes, "source_scope":source_scope, "owner":self.owner,
-                    }));
+        let delivery = if self.pending_delivery.is_empty() {
+            match sender.try_send(delivery) {
+                Ok(()) => return true,
+                Err(mpsc::error::TrySendError::Full(delivery)) => delivery,
+                Err(mpsc::error::TrySendError::Closed(delivery)) => {
+                    delivery.fail(ObservationFailure::Disconnected);
+                    return false;
                 }
-                delivery.fail(ObservationFailure::Overflow);
-                false
             }
-            Err(mpsc::error::TrySendError::Closed(delivery)) => {
-                delivery.fail(ObservationFailure::Disconnected);
-                false
-            }
+        } else {
+            delivery
+        };
+        if self.pending_delivery.len() < forge_protocol::MAX_PENDING_FRAMES {
+            self.pending_delivery.push_back(delivery);
+            #[cfg(test)]
+            self.delivery_pressure.send_replace(true);
+            return true;
         }
+        if !self.queue_loss_reported.swap(true, Ordering::AcqRel) {
+            let (stage, source_scope, event_bytes) = match &delivery {
+                Delivery::Inbox { event, .. } => (
+                    "engine_idle",
+                    Some(event.scope()),
+                    serde_json::to_vec(event).ok().map(|encoded| encoded.len()),
+                ),
+                Delivery::Event { event, .. } => (
+                    "engine_foreground",
+                    Some(event.scope()),
+                    serde_json::to_vec(event).ok().map(|encoded| encoded.len()),
+                ),
+                Delivery::Complete { result, .. } => (
+                    "engine_completion",
+                    result
+                        .as_ref()
+                        .as_ref()
+                        .ok()
+                        .map(|ready| ready.ticket.scope.clone().into()),
+                    None,
+                ),
+            };
+            self.trace.record(self.owner.session_id.as_str(), "provider.observation_queue_lost", serde_json::json!({
+                "provider":self.provider.descriptor().kind, "stage":stage,
+                "queued":self.pending_delivery.len(), "capacity":forge_protocol::MAX_PENDING_FRAMES,
+                "queued_bytes":null, "event_bytes":event_bytes, "source_scope":source_scope, "owner":self.owner,
+            }));
+        }
+        delivery.fail(ObservationFailure::Overflow);
+        false
     }
 
     fn settle(&mut self, id: &InvocationId) {
@@ -2516,18 +3617,25 @@ impl Driver {
             self.fail_observation_with_origin(failure, origin);
             return;
         }
+        if matches!(invocation.terminal, Some(Ok(_)))
+            && (invocation.native_settlement.is_none()
+                || !matches!(invocation.host_collection, HostCollection::Settled))
+        {
+            return;
+        }
         if self.invocations.get(id).is_some_and(|invocation| {
             matches!(
                 &invocation.terminal,
-                Some(Err(
-                    ProviderError::PreparationFailed(_) | ProviderError::NotConsumed { .. }
-                ))
+                Some(Err(ProviderError::PreparationFailed(_)
+                    | ProviderError::NotConsumed
+                    | ProviderError::Cancelled))
             )
         }) {
             let mut invocation = self
                 .invocations
                 .remove(id)
                 .expect("invocation checked above");
+            self.attempts.remove(&invocation.scope);
             if let (Some(reply), Some(Err(error))) =
                 (invocation.reply.take(), invocation.terminal.take())
                 && !self.enqueue(Delivery::Complete {
@@ -2616,7 +3724,7 @@ impl Driver {
                     None,
                     Some(forge_provider_api::error::CleanupFailure::Failed(Box::new(
                         crate::provider::lifecycle_error::classify_source(
-                            forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                            forge_provider_api::error::ProviderOperation::SessionClose,
                             &error,
                         ),
                     ))),
@@ -2654,9 +3762,8 @@ impl Driver {
             }
             self.cleanup_failure = Some(report.clone());
             self.idle.diagnostic(ProviderEvent::Diagnostic {
-                scope: crate::provider::EventScope::SessionOperation {
+                scope: crate::provider::EventScope::Binding {
                     owner: self.owner.clone(),
-                    operation_id: uuid::Uuid::new_v4().to_string(),
                 },
                 diagnostic: crate::provider::ProviderDiagnostic {
                     kind: forge_provider_api::ProviderFailureKind::Runtime,
@@ -2693,25 +3800,26 @@ impl Driver {
     }
 
     fn fail_observation_with_origin(&mut self, failure: ObservationFailure, origin: FailureOrigin) {
-        if !self.failed {
-            self.healthy.store(false, Ordering::Release);
-            self.failed = true;
-            self.first_failure = Some(failure.clone());
-            let provider = self.provider.clone();
-            let owner = self.owner.clone();
-            let observation = failure.clone();
-            let cleanup_origin = match &origin {
-                FailureOrigin::Observation => None,
-                FailureOrigin::Error(error) => Some(error.clone()),
-            };
-            self.cleanup.spawn(async move {
-                let report = collect_failed_execution(provider.as_ref(), &owner, observation).await;
-                match cleanup_origin {
-                    Some(origin) => report.with_origin(origin),
-                    None => report,
-                }
-            });
+        if self.failed {
+            return;
         }
+        self.healthy.store(false, Ordering::Release);
+        self.failed = true;
+        self.first_failure = Some(failure.clone());
+        let provider = self.provider.clone();
+        let owner = self.owner.clone();
+        let observation = failure.clone();
+        let cleanup_origin = match &origin {
+            FailureOrigin::Observation => None,
+            FailureOrigin::Error(error) => Some(error.clone()),
+        };
+        self.cleanup.spawn(async move {
+            let report = collect_failed_execution(provider.as_ref(), &owner, observation).await;
+            match cleanup_origin {
+                Some(origin) => report.with_origin(origin),
+                None => report,
+            }
+        });
         match &self.idle {
             SessionObserver::Inbox(inbox) => inbox.fail(failure.clone()),
             SessionObserver::Stream(sink) => sink.fail(
@@ -2753,23 +3861,14 @@ async fn collect_failed_execution(
     use forge_provider_api::error::{CleanupFailure, ObservationCleanup};
 
     let deadline = std::time::Duration::from_secs(15);
-    let key = owner.runtime_key();
-    let fence = tokio::time::timeout(deadline, provider.fence_session(owner)).await;
-    let cancellation = tokio::time::timeout(deadline, provider.cancel_session(&key)).await;
-    // Collection still runs when the stop request fails or exceeds its deadline.
-    let collection = tokio::time::timeout(deadline, provider.cleanup_execution(&key)).await;
+    let collection = tokio::time::timeout(deadline, provider.session_close_owner(owner)).await;
     let classify =
         |result: Result<Result<(), ProviderError>, tokio::time::error::Elapsed>| match result {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(CleanupFailure::Failed(Box::new(error))),
             Err(_) => Some(CleanupFailure::TimedOut),
         };
-    ObservationCleanup::new(
-        failure,
-        classify(fence),
-        classify(cancellation),
-        classify(collection),
-    )
+    ObservationCleanup::new(failure, None, None, classify(collection))
 }
 
 impl Delivery {
@@ -2835,9 +3934,34 @@ async fn deliver(mut pending: mpsc::Receiver<Delivery>) -> Result<(), ProviderEr
     Ok(())
 }
 
+/// Classify observation logs without recording prompt text, tool payloads, or native details.
+fn event_category(event: &ProviderEvent) -> &'static str {
+    match event {
+        ProviderEvent::Settled { .. } => "settled",
+        ProviderEvent::SettlementFailed { .. } => "settlement_failed",
+        ProviderEvent::CapabilitiesChanged { .. } => "capabilities_changed",
+        ProviderEvent::SessionIdentity { .. } => "session_identity",
+        ProviderEvent::Execution { .. } => "execution",
+        ProviderEvent::Message { .. } => "message",
+        ProviderEvent::Tool { .. } => "tool",
+        ProviderEvent::Turn { .. } => "turn",
+        ProviderEvent::Usage { .. } => "usage",
+        ProviderEvent::Runtime { .. } => "runtime",
+        ProviderEvent::Compaction { .. } => "compaction",
+        ProviderEvent::Agent { .. } => "agent",
+        ProviderEvent::Checklist { .. } => "checklist",
+        ProviderEvent::Approval { .. } => "approval",
+        ProviderEvent::DirectoryAccess { .. } => "directory_access",
+        ProviderEvent::InputAccepted { .. } => "input_accepted",
+        ProviderEvent::Retry { .. } => "retry",
+        ProviderEvent::Diagnostic { .. } => "diagnostic",
+        ProviderEvent::ParentBoundary { .. } => "parent_boundary",
+    }
+}
+
 fn protocol(_message: &str) -> ProviderError {
     ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-        forge_provider_api::ProviderOperation::CollectEventReader,
+        forge_provider_api::ProviderOperation::InputSubmit,
         forge_provider_api::ProviderFailureKind::Protocol,
     ))
 }
@@ -2845,7 +3969,7 @@ fn protocol(_message: &str) -> ProviderError {
 fn not_admitted() -> ProviderError {
     ProviderError::PreparationFailed(Box::new(ProviderError::Failure(
         forge_provider_api::ProviderFailure::new(
-            forge_provider_api::ProviderOperation::AdmitInput,
+            forge_provider_api::ProviderOperation::InputSteer,
             forge_provider_api::ProviderFailureKind::Rejected,
         ),
     )))
@@ -3070,6 +4194,10 @@ mod tests {
             healthy: Arc::new(AtomicBool::new(true)),
             orderly_shutdown: Arc::new(AtomicBool::new(false)),
             task: tokio::sync::Mutex::new(ExecutionTask::Running(task)),
+            activity: Default::default(),
+            admitted: Default::default(),
+            delivery_pressure: tokio::sync::watch::channel(false).1,
+            presentation_queue: mpsc::channel(1).0.downgrade(),
         };
         let Err(ProviderError::Cleanup(actual)) = engine.close().await else {
             panic!("incomplete cleanup must remain a failure");
@@ -3082,9 +4210,10 @@ mod tests {
         Ok(())
     }
 
-    /// Retain the owner until host commit and invalidate a ticket when a steer reopens work.
+    /// Retain host ownership, reject late steering, and admit ordinary successor input with fresh identity.
     #[tokio::test]
-    async fn host_ticket_blocks_admission_and_reopens_on_steering() -> anyhow::Result<()> {
+    async fn host_ticket_blocks_admission_and_rolls_ordinary_successor_scope() -> anyhow::Result<()>
+    {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
         let provider: Arc<Provider> = crate::provider::build(
@@ -3179,17 +4308,23 @@ mod tests {
             forge_providers::registry::nonselectable_id()
                 .expect("registry supplies a nonselectable fixture identity"),
         )?;
+        assert!(
+            engine
+                .steer(
+                    scope.clone(),
+                    crate::provider::SteeringInput::User {
+                        text: "continue".into(),
+                        attachments: Vec::new(),
+                        submission: Some(receipt),
+                    },
+                )
+                .await
+                .is_err(),
+            "late steering reopened settled work"
+        );
         engine
-            .steer(
-                scope.clone(),
-                crate::provider::SteeringInput::User {
-                    text: "continue".into(),
-                    attachments: Vec::new(),
-                    submission: Some(receipt),
-                },
-            )
-            .await
-            .context("steer retained ticket")?;
+            .publish_idle_test_effect(scope.clone(), ProviderCompletion::default())
+            .await?;
         assert!(matches!(
             ready.ticket.commit().await,
             Err(SettlementError::Stale)
@@ -3214,7 +4349,7 @@ mod tests {
         )
         .await??;
         assert!(current.outcome.is_ok());
-        let (continuation_sink, _events) = crate::provider::events::channel(scope);
+        let (continuation_sink, _events) = crate::provider::events::channel(scope.clone());
         let next = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             engine.continue_attempt(&current.ticket, request, continuation_sink, &store),
@@ -3226,6 +4361,10 @@ mod tests {
             panic!("current continuation must be admitted");
         };
         assert!(next.outcome.is_ok());
+        assert_ne!(next.ticket.scope.invocation_id, scope.invocation_id);
+        assert_eq!(next.ticket.scope.exchange_id, scope.exchange_id);
+        assert!(engine.admitted_invocation(&next.ticket.scope)?);
+
         assert!(matches!(
             current.ticket.commit().await,
             Err(SettlementError::Stale)
@@ -3237,9 +4376,9 @@ mod tests {
         Ok(())
     }
 
-    /// Idle native work retains its new host effects until host acknowledgment.
+    /// A native terminal cannot release the owner before provider settlement and host-effect commit.
     #[tokio::test]
-    async fn idle_reopen_retains_host_effect_until_new_commit() -> anyhow::Result<()> {
+    async fn native_terminal_waits_for_settlement_and_host_effect_commit() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
         let provider: Arc<Provider> = crate::provider::build(
@@ -3259,11 +4398,6 @@ mod tests {
             scope: scope.clone(),
             thread_id: "thread".into(),
             turn_id: "first".into(),
-        };
-        let later = crate::provider::TurnAddress {
-            scope: scope.clone(),
-            thread_id: "thread".into(),
-            turn_id: "later".into(),
         };
         let completed = forge_provider_api::lifecycle::ExecutionResult::Completed {
             completion: forge_provider_api::completion::ProviderCompletion::default().into(),
@@ -3289,15 +4423,18 @@ mod tests {
         let context = crate::tools::ControlTurnContext::inactive(PromptMode::Chat);
         let slot = context.provider_completion.clone();
         let (sink, _events) = crate::provider::events::channel(scope.clone());
+        let (reply, response) = oneshot::channel();
         let mut committed = HashMap::new();
         committed.insert(
             scope.invocation_id.clone(),
             Invocation {
                 scope: scope.clone(),
                 output: sink,
-                reply: None,
+                reply: Some(reply),
                 completion: context,
                 terminal: Some(Ok(completed.clone())),
+                native_settlement: None,
+                host_collection: HostCollection::Pending,
                 publication_failure: None,
                 pending_controls: 0,
                 revision: 1,
@@ -3315,11 +4452,13 @@ mod tests {
             owner,
             provider,
             state,
-            invocations: HashMap::new(),
-            committed_invocations: committed,
+            invocations: committed,
+            committed_invocations: HashMap::new(),
             submissions: JoinSet::new(),
             deliveries: JoinSet::new(),
             delivery: Some(delivery),
+            pending_delivery: VecDeque::new(),
+            delivery_pressure: tokio::sync::watch::channel(false).0,
             cleanup: JoinSet::new(),
             failed_waiters: Vec::new(),
             commands,
@@ -3331,15 +4470,21 @@ mod tests {
             cleanup_failure: None,
             retiring: None,
             idle: SessionObserver::Inbox(Arc::default()),
+            activity: Default::default(),
+            admitted: Default::default(),
+            attempts: HashMap::new(),
+            cancelled_admissions: Default::default(),
+            cancelled_exchanges: Default::default(),
+            prevented_invocations: Default::default(),
+            reservations: Default::default(),
+            latest_reservations: Default::default(),
+            submission_exits: Default::default(),
         };
-        driver.event(ProviderEvent::Execution {
-            observation: ExecutionObservation::new(
-                scope.clone(),
-                ExecutionUpdate::Started {
-                    address: later.clone(),
-                },
-            )?,
-        });
+        driver.settle(&scope.invocation_id);
+        assert!(
+            deliveries.try_recv().is_err(),
+            "terminal bypassed provider settlement"
+        );
         slot.publish(ProviderCompletion {
             plan_question: Some(crate::plan::PlanQuestionSet {
                 id: "idle-question".into(),
@@ -3347,22 +4492,22 @@ mod tests {
             }),
             ..Default::default()
         })?;
-        driver.event(ProviderEvent::Execution {
-            observation: ExecutionObservation::new(
-                scope.clone(),
-                ExecutionUpdate::Finished {
-                    address: later,
-                    covered_submissions: Vec::new(),
-                    completed_at_ms: 2,
-                    result: completed,
-                },
-            )?,
+        driver.event(ProviderEvent::Settled {
+            settlement: Box::new(forge_provider_api::InvocationSettlement {
+                binding_id: forge_provider_api::BindingId::new("binding")?,
+                scope: scope.clone(),
+                result: completed,
+                watermark: forge_provider_api::EventSequence::new(2),
+            }),
         });
-        let (reply, response) = oneshot::channel();
-        driver.command(Command::WaitReady {
+        assert!(
+            deliveries.try_recv().is_err(),
+            "native settlement bypassed host-owned collection"
+        );
+        driver.command(Command::HostEffectsCollected {
             scope: scope.clone(),
-            abandoned: Arc::new(AtomicBool::new(false)),
-            reply,
+            operation_id: forge_provider_api::OperationId::new("fixture-collection")?,
+            result: Ok(()),
         });
         while let Some(delivery) = deliveries.recv().await {
             if let Delivery::Complete { reply, result } = delivery {
@@ -3416,10 +4561,15 @@ mod tests {
             authority: Some(authority),
             reply,
         });
-        assert!(matches!(
-            response.await?,
-            Err(ProviderError::NotConsumed { .. })
-        ));
+        let response = response.await?;
+        let Err(ProviderError::PreparationFailed(cause)) = response else {
+            panic!("collected owner admitted stale child control: {response:?}");
+        };
+        assert!(matches!(cause.as_ref(), ProviderError::Failure(failure)
+            if failure.operation() == forge_provider_api::ProviderOperation::InputSteer
+                && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected
+                && failure.phase() == forge_provider_api::ProviderPhase::Admission
+                && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged));
         assert!(
             driver.submissions.is_empty(),
             "revoked callback dispatched native work"
@@ -3458,6 +4608,8 @@ mod tests {
                 reply: Some(reply),
                 completion: crate::tools::ControlTurnContext::inactive(PromptMode::Chat),
                 terminal: None,
+                native_settlement: None,
+                host_collection: HostCollection::Pending,
                 publication_failure: None,
                 pending_controls: 0,
                 revision: 0,
@@ -3480,6 +4632,8 @@ mod tests {
             submissions: JoinSet::new(),
             deliveries: JoinSet::new(),
             delivery: Some(delivery),
+            pending_delivery: VecDeque::new(),
+            delivery_pressure: tokio::sync::watch::channel(false).0,
             cleanup: JoinSet::new(),
             failed_waiters: Vec::new(),
             commands,
@@ -3491,6 +4645,15 @@ mod tests {
             cleanup_failure: None,
             retiring: None,
             idle: SessionObserver::Inbox(Arc::default()),
+            activity: Default::default(),
+            admitted: Default::default(),
+            attempts: HashMap::new(),
+            cancelled_admissions: Default::default(),
+            cancelled_exchanges: Default::default(),
+            prevented_invocations: Default::default(),
+            reservations: Default::default(),
+            latest_reservations: Default::default(),
+            submission_exits: Default::default(),
         };
         driver.acceptance(SubmissionOutcome {
             scope: scope.clone(),
@@ -3498,7 +4661,7 @@ mod tests {
             control_reply: None,
             result: Err(ProviderError::PreparationFailed(Box::new(
                 ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::InitializeSession,
+                    forge_provider_api::ProviderOperation::SessionOpen,
                     forge_provider_api::ProviderFailureKind::Initialization,
                 )),
             ))),
@@ -3560,6 +4723,8 @@ mod tests {
                             .into(),
                     },
                 )),
+                native_settlement: None,
+                host_collection: HostCollection::Pending,
                 publication_failure: None,
                 pending_controls: 0,
                 revision: 0,
@@ -3582,6 +4747,8 @@ mod tests {
             submissions: JoinSet::new(),
             deliveries: JoinSet::new(),
             delivery: Some(delivery),
+            pending_delivery: VecDeque::new(),
+            delivery_pressure: tokio::sync::watch::channel(false).0,
             cleanup: JoinSet::new(),
             failed_waiters: Vec::new(),
             commands,
@@ -3593,6 +4760,15 @@ mod tests {
             cleanup_failure: None,
             retiring: None,
             idle: SessionObserver::Inbox(Arc::default()),
+            activity: Default::default(),
+            admitted: Default::default(),
+            attempts: HashMap::new(),
+            cancelled_admissions: Default::default(),
+            cancelled_exchanges: Default::default(),
+            prevented_invocations: Default::default(),
+            reservations: Default::default(),
+            latest_reservations: Default::default(),
+            submission_exits: Default::default(),
         };
         driver.settle(&scope.invocation_id);
         assert!(matches!(
@@ -3646,6 +4822,8 @@ mod tests {
                 completion: crate::tools::ControlTurnContext::inactive(PromptMode::Chat),
                 terminal: None,
                 pending_controls: 0,
+                native_settlement: None,
+                host_collection: HostCollection::Pending,
                 publication_failure: None,
                 revision: 0,
                 ticket_outstanding: false,
@@ -3667,6 +4845,8 @@ mod tests {
             submissions: JoinSet::new(),
             deliveries: JoinSet::new(),
             delivery: Some(delivery),
+            pending_delivery: VecDeque::new(),
+            delivery_pressure: tokio::sync::watch::channel(false).0,
             cleanup: JoinSet::new(),
             failed_waiters: Vec::new(),
             commands,
@@ -3678,6 +4858,15 @@ mod tests {
             cleanup_failure: None,
             retiring: None,
             idle: SessionObserver::Inbox(Arc::default()),
+            activity: Default::default(),
+            admitted: Default::default(),
+            attempts: HashMap::new(),
+            cancelled_admissions: Default::default(),
+            cancelled_exchanges: Default::default(),
+            prevented_invocations: Default::default(),
+            reservations: Default::default(),
+            latest_reservations: Default::default(),
+            submission_exits: Default::default(),
         };
         let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
             scope.clone(),
@@ -3736,7 +4925,7 @@ mod tests {
         let registry = SessionExecutionRegistry::new(provider.clone(), trace.clone());
         let engine = registry.owner(owner.clone()).await?;
         assert!(Arc::ptr_eq(&engine, &registry.owner(owner.clone()).await?));
-        let mut idle = engine.session_events().await?;
+        let _idle = engine.session_events().await?;
         let mut retained_scope = None;
         for exchange in ["one", "two"] {
             let mut request = ProviderRequest {
@@ -3758,7 +4947,11 @@ mod tests {
                 control_context: None,
             };
             request.model = provider
-                .model_list(request.clone())
+                .model_list(forge_provider_api::QueryContext::Workspace(
+                    forge_provider_api::WorkspaceContext {
+                        workspace: request.workspace.clone(),
+                    },
+                ))
                 .await?
                 .into_iter()
                 .next()
@@ -3834,57 +5027,31 @@ mod tests {
             forge_providers::registry::nonselectable_id()
                 .expect("registry supplies a nonselectable fixture identity"),
         )?;
-        let input = SubmissionId::try_from(receipt.id().to_owned())?;
-        engine
+        let rejected = engine
             .steer(
-                scope.clone(),
+                scope,
                 crate::provider::SteeringInput::User {
                     text: "continue original work".into(),
                     attachments: Vec::new(),
-                    submission: Some(receipt),
+                    submission: Some(receipt.clone()),
                 },
             )
-            .await
-            .context("steer retained invocation")?;
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            let mut started = false;
-            loop {
-                if let Some(ProviderEvent::Execution { observation }) =
-                    idle.recv().await.context("observe retained invocation")?
-                {
-                    assert_eq!(observation.scope(), &scope);
-                    match observation.update() {
-                        ExecutionUpdate::Started { .. } => started = true,
-                        ExecutionUpdate::Finished {
-                            covered_submissions,
-                            ..
-                        } => {
-                            assert!(started);
-                            assert!(covered_submissions.contains(&input));
-                            return Ok::<_, anyhow::Error>(());
-                        }
-                        ExecutionUpdate::ObservationLost { failure, .. } => {
-                            anyhow::bail!("idle continuation lost observation: {failure}")
-                        }
-                        ExecutionUpdate::ResolvedWithoutExecution { .. } => {
-                            anyhow::bail!("mock continuation unexpectedly had no native execution")
-                        }
-                        ExecutionUpdate::PublicationFailed { .. }
-                        | ExecutionUpdate::ResolutionPublicationFailed { .. } => {
-                            anyhow::bail!("mock continuation failed host publication")
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .context("complete retained steering before deadline")??;
-
-        let ready = engine
-            .wait_ready(scope)
-            .await
-            .context("settle observed idle execution")?;
-        ready.ticket.commit().await?;
+            .await;
+        assert!(
+            matches!(rejected,
+            Err(ProviderError::PreparationFailed(error))
+            if matches!(error.as_ref(), ProviderError::Failure(failure)
+                if failure.operation() == forge_provider_api::ProviderOperation::InputSteer
+                    && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)),
+            "retired native invocation accepted new input"
+        );
+        assert!(
+            matches!(
+                receipt.record()?.delivery,
+                crate::provider::submission::SubmissionState::Prepared
+            ),
+            "rejected late steering changed durable delivery evidence"
+        );
         registry.close().await.context("close fixture registry")?;
         registry.close().await.context("close fixture registry")?;
         assert!(

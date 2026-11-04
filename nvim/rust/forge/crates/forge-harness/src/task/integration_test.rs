@@ -164,7 +164,7 @@ fn goal_stall_resume_and_completion_preserve_identity_without_execution_gates() 
 /// Reject inconsistent loaded summaries instead of letting editor state choose a workflow.
 #[test]
 fn persisted_task_rejects_contradictory_phase_lifecycle_and_work() -> Result<()> {
-    let task = Task::goal("Inspect the result".into(), Default::default(), false, 1);
+    let task = Task::goal("Inspect the result".into(), Default::default(), 1);
     let valid = serde_json::to_value(&task)?;
     let restored: Task = serde_json::from_value(valid.clone())?;
     assert_eq!(restored.id, task.id);
@@ -208,7 +208,6 @@ fn implementation_cannot_jump_to_manual_verification_or_completion() -> Result<(
                 "Implement accepted plan".into(),
                 record.clone(),
                 Default::default(),
-                false,
                 1,
             )?)),
             2,

@@ -16,6 +16,8 @@ end
 ---@param result table
 function HarnessSnapshot.apply(state, result)
   result = assert(presentation_value(result), "Harness snapshot is missing")
+  assert(type(result) == "table" and type(result.session) == "table" and type(result.session.id) == "string" and result.session.id ~= "",
+    "Harness snapshot is missing its session identity")
   if state.session and result.session and state.session.id == result.session.id
     and state.runtime_epoch == result.runtime_epoch
     and (result.snapshot_revision or 0) < (state.snapshot_revision or 0) then return false end

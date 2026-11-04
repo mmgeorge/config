@@ -166,7 +166,6 @@ async fn queued_question_creation_rejects_revoked_taskless_authority() -> Result
         crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
             "Replacement".into(),
             Default::default(),
-            false,
             1,
         ))),
         2,

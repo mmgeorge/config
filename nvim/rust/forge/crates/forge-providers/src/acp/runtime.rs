@@ -180,11 +180,8 @@ fn parse_claude_version(output: &[u8]) -> Result<String, forge_provider_api::Pro
 fn version_failure(
     kind: forge_provider_api::ProviderFailureKind,
 ) -> forge_provider_api::ProviderError {
-    forge_provider_api::ProviderFailure::new(
-        forge_provider_api::ProviderOperation::InspectRuntime,
-        kind,
-    )
-    .into()
+    forge_provider_api::ProviderFailure::new(forge_provider_api::ProviderOperation::Inspect, kind)
+        .into()
 }
 
 #[cfg(test)]

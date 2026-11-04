@@ -88,7 +88,11 @@ async fn lists_provider_owned_codex_model_metadata() {
         Duration::from_secs(30),
         provider
             .as_provider()
-            .model_list(request(repository.path(), PromptMode::Chat, "")),
+            .model_list(forge_provider_api::QueryContext::Workspace(
+                forge_provider_api::WorkspaceContext {
+                    workspace: repository.path().to_string_lossy().into_owned(),
+                },
+            )),
     )
     .await
     .expect("Codex model list timed out")
@@ -127,7 +131,13 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
 
     let skill_list = tokio::time::timeout(
         Duration::from_secs(30),
-        provider.as_provider().skill_list(catalog_request.clone()),
+        provider.as_provider().skill_list(
+            provider
+                .as_provider()
+                .query_context(&catalog_request)
+                .await
+                .unwrap(),
+        ),
     )
     .await
     .expect("Codex skill list timed out")
@@ -136,11 +146,22 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
     assert!(skill_list.iter().all(|skill| !skill.name.is_empty()));
     assert!(skill_list.iter().all(|skill| skill.path.is_some()));
 
-    let mut new_session_catalog_request = catalog_request;
-    new_session_catalog_request.harness_session_id = "new-catalog-session".into();
+    provider
+        .session_open(super::prompt_request(&catalog_request))
+        .await
+        .unwrap();
+    let new_session_catalog_request = catalog_request;
     let mcp_list = tokio::time::timeout(
         Duration::from_secs(30),
-        provider.as_provider().mcp_list(new_session_catalog_request),
+        provider
+            .as_provider()
+            .mcp_list(forge_provider_api::McpQuery::Observed(
+                provider
+                    .as_provider()
+                    .query_context(&new_session_catalog_request)
+                    .await
+                    .unwrap(),
+            )),
     )
     .await
     .expect("Codex MCP list timed out")
@@ -160,7 +181,7 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
     );
     let fork = provider
         .as_provider()
-        .fork(ProviderForkRequest {
+        .session_fork(ProviderForkRequest {
             source: request(repository.path(), PromptMode::Chat, ""),
             target_harness_session_id: "prepared-fork-session".into(),
             checkpoint_id: None,
@@ -200,7 +221,11 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     .unwrap();
     provider
         .as_provider()
-        .model_list(request(repository.path(), PromptMode::Chat, ""))
+        .model_list(forge_provider_api::QueryContext::Workspace(
+            forge_provider_api::WorkspaceContext {
+                workspace: repository.path().to_string_lossy().into_owned(),
+            },
+        ))
         .await
         .unwrap();
     let answer_request = ProviderRequest {
@@ -285,7 +310,11 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     );
     let model_list = provider
         .as_provider()
-        .model_list(request(repository.path(), PromptMode::Chat, ""))
+        .model_list(forge_provider_api::QueryContext::Workspace(
+            forge_provider_api::WorkspaceContext {
+                workspace: repository.path().to_string_lossy().into_owned(),
+            },
+        ))
         .await
         .unwrap();
     let model = model_list
@@ -404,50 +433,14 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         "verified\n"
     );
     assert!(
-        executed.evidence.structured_complete
-            || executed.evidence.native_state == Some(forge_harness::goal::GoalState::Complete)
+        executed.evidence.structured_complete,
+        "Harness goal_complete evidence was absent"
     );
 
     execute.provider_session_id = executed.native.provider_session_id;
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        provider.as_provider().goal_status(
-            execute.clone(),
-            forge_harness::provider::native_goal_update(
-                "Complete the plan".into(),
-                forge_harness::goal::GoalState::Paused,
-            ),
-        ),
-    )
-    .await
-    .expect("Codex goal pause timed out")
-    .unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        provider.as_provider().goal_status(
-            execute.clone(),
-            forge_harness::provider::native_goal_update(
-                "Complete the plan".into(),
-                forge_harness::goal::GoalState::Active,
-            ),
-        ),
-    )
-    .await
-    .expect("Codex goal resume timed out")
-    .unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        provider.as_provider().goal_status(
-            execute.clone(),
-            forge_harness::provider::NativeGoalUpdate::Absent,
-        ),
-    )
-    .await
-    .expect("Codex goal clear timed out")
-    .unwrap();
     let forked = tokio::time::timeout(
         Duration::from_secs(30),
-        provider.as_provider().fork(ProviderForkRequest {
+        provider.as_provider().session_fork(ProviderForkRequest {
             source: execute,
             target_harness_session_id: "forked-harness-session".into(),
             checkpoint_id: None,

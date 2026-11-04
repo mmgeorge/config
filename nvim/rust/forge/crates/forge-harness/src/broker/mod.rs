@@ -314,8 +314,6 @@ pub(crate) enum AppliedProviderEvent {
     Timeline(TimelinePatch),
     /// Publish multiple already-applied effects in their original order.
     Effects(Vec<AppliedProviderEvent>),
-    /// Continue an active native goal through its checkpoint transition.
-    NativeGoalContinuation(ProviderEvent),
 }
 
 /// Own ordered presentation delivery independently of mutable broker state.
@@ -569,14 +567,15 @@ pub(crate) struct ForegroundTransaction {
     pub(crate) question_stop_pending: bool,
     pub(crate) question_override: Option<ProviderCompletion>,
     pub(crate) pending_native_ready: Option<Result<ProviderCompletion, ProviderError>>,
+    pub(crate) retraction_boundary: Option<(
+        crate::provider::InvocationScope,
+        forge_provider_api::CheckpointId,
+    )>,
     pub(crate) scan_enabled: bool,
     pub(crate) cleanup_open: bool,
     pub(crate) execution_open: bool,
     pub(crate) _agent_lease: crate::agent::AgentToolLease,
     pub(crate) _check_lease: crate::checks::CheckToolLease,
-    pub(crate) native_goal: Option<NativeGoalTransition>,
-    pub(crate) pending_goal_effects: Vec<AppliedProviderEvent>,
-    pub(crate) pending_goal_events: Vec<SessionEvent>,
     pub(crate) pending_session_observations: std::collections::VecDeque<ProviderEvent>,
     pub(crate) observation_publication_in_flight: bool,
     pub(crate) finalization: Option<Box<foreground_finalization::ForegroundFinalization>>,
@@ -584,21 +583,6 @@ pub(crate) struct ForegroundTransaction {
     pub(crate) failure_inbox_open: bool,
     pub(crate) failure: Option<foreground_failure::ForegroundFailure>,
     pub(crate) failure_secondary: Vec<String>,
-}
-
-/// Track checkpoint phases for an authorized native-goal continuation.
-pub(crate) enum NativeGoalTransition {
-    Initial {
-        observation: ProviderEvent,
-        outcome: crate::exchange::ExchangeOutcome,
-    },
-    Final {
-        observation: ProviderEvent,
-        outcome: crate::exchange::ExchangeOutcome,
-    },
-    ContinuationInitial {
-        observation: ProviderEvent,
-    },
 }
 
 /// Preserve the owner's collection disposition independently of provider cancellation flags.
@@ -670,8 +654,8 @@ pub(crate) enum ForegroundSignal {
     },
     PlanScan,
     PlanScanned(Box<Result<execution::ExecutionScanResult>>),
-    PlanMutationCompleted(Result<foreground_plan_effect::PlanMutationResult>),
     FinalCheckpoint(Result<checkpoint_settlement::FinalCheckpointResult>),
+    PlanMutationCompleted(Result<foreground_plan_effect::PlanMutationResult>),
     AutomaticCheckRefreshed(Box<Result<check_admission::AutomaticCheckRefreshResult>>),
     AutomaticCheckCompleted(Box<Result<check_admission::AutomaticCheckResult>>),
     SettlementReady {
@@ -707,7 +691,6 @@ pub(crate) enum ForegroundSignal {
     AdmissionFailureCheckpointCompleted(Result<checkpoint_settlement::FinalCheckpointResult>),
     FailureCheckpointCompleted(Result<checkpoint_settlement::FinalCheckpointResult>),
     FailureBaselineCompleted(foreground_failure::FailureBaselineResult),
-    RetractionGoalRestored(Result<()>),
     PlanSubmissionCompleted(Result<foreground_plan_effect::PlanSubmissionResult>),
     PlanQuestionCompleted(Result<foreground_plan_effect::PlanQuestionResult>),
     GoalProgressCompleted(Box<Result<foreground_goal_effect::GoalProgressResult>>),
@@ -797,8 +780,8 @@ impl ForegroundSignal {
             Self::RevisionChecksUpdated { .. } => "RevisionChecksUpdated",
             Self::PlanScan => "PlanScan",
             Self::PlanScanned(..) => "PlanScanned",
-            Self::PlanMutationCompleted(..) => "PlanMutationCompleted",
             Self::FinalCheckpoint(..) => "FinalCheckpoint",
+            Self::PlanMutationCompleted(..) => "PlanMutationCompleted",
             Self::AutomaticCheckRefreshed(..) => "AutomaticCheckRefreshed",
             Self::AutomaticCheckCompleted(..) => "AutomaticCheckCompleted",
             Self::SettlementReady { .. } => "SettlementReady",
@@ -820,7 +803,6 @@ impl ForegroundSignal {
             Self::AdmissionFailureCheckpointCompleted(..) => "AdmissionFailureCheckpointCompleted",
             Self::FailureCheckpointCompleted(..) => "FailureCheckpointCompleted",
             Self::FailureBaselineCompleted(..) => "FailureBaselineCompleted",
-            Self::RetractionGoalRestored(..) => "RetractionGoalRestored",
             Self::PlanSubmissionCompleted(..) => "PlanSubmissionCompleted",
             Self::PlanQuestionCompleted(..) => "PlanQuestionCompleted",
             Self::GoalProgressCompleted(..) => "GoalProgressCompleted",
@@ -889,12 +871,6 @@ impl OwnedEffectReceipts {
     }
 }
 
-/// Distinguish an applied provider event from a goal checkpoint transition.
-pub(crate) enum ForegroundEventApplication {
-    Publication(Box<ForegroundJob>),
-    NativeGoalContinuation(Box<ProviderEvent>),
-}
-
 /// Retain a child launch and the response that becomes valid after it starts.
 pub(crate) struct PendingAgentLaunch {
     work: crate::agent::AgentWork,
@@ -957,7 +933,6 @@ pub(crate) enum ForegroundJob {
     ObservationPublication(PendingProviderDelivery),
     FailureCheckpoint(Box<checkpoint_settlement::FinalCheckpointJob>),
     FailureBaseline(foreground_failure::FailureBaselineJob),
-    RetractionGoal(Box<foreground_failure::RetractionGoalJob>),
     PlanSubmission(Box<foreground_plan_effect::PlanSubmissionJob>),
     LivePlanSubmission(Box<foreground_plan_effect::PlanSubmissionJob>),
     LivePlanMutation(Box<foreground_plan_effect::PlanMutationJob>),
@@ -975,7 +950,8 @@ pub(crate) enum ForegroundJob {
     },
     QuestionStop {
         provider: Arc<Provider>,
-        session_id: String,
+        engine: Arc<crate::provider::session_execution::SessionExecution>,
+        scope: crate::provider::InvocationScope,
         fallback: Option<forge_provider_api::ProviderSessionId>,
         checkpoint: Option<String>,
         capability: ProviderCapability,
@@ -1032,9 +1008,9 @@ pub(crate) enum ForegroundJob {
         message: String,
         request: OwnedAgentRequest,
     },
-    FinalCheckpoint(Box<checkpoint_settlement::FinalCheckpointJob>),
     AutomaticCheckRefresh(Box<check_admission::AutomaticCheckRefresh>),
     AutomaticCheckRun(Box<check_admission::AutomaticCheckRun>),
+    FinalCheckpoint(Box<checkpoint_settlement::FinalCheckpointJob>),
     SettlementRefresh {
         engine: Arc<crate::provider::session_execution::SessionExecution>,
         scope: crate::provider::InvocationScope,
@@ -1080,7 +1056,6 @@ impl ForegroundJob {
             Self::ObservationPublication(..) => "ObservationPublication",
             Self::FailureCheckpoint(..) => "FailureCheckpoint",
             Self::FailureBaseline(..) => "FailureBaseline",
-            Self::RetractionGoal(..) => "RetractionGoal",
             Self::PlanSubmission(..) => "PlanSubmission",
             Self::LivePlanSubmission(..) => "LivePlanSubmission",
             Self::LivePlanMutation(..) => "LivePlanMutation",
@@ -1106,9 +1081,9 @@ impl ForegroundJob {
             Self::AgentInterrupt { .. } => "AgentInterrupt",
             Self::AgentSpawnSelect { .. } => "AgentSpawnSelect",
             Self::AgentMessageSteer { .. } => "AgentMessageSteer",
-            Self::FinalCheckpoint(..) => "FinalCheckpoint",
             Self::AutomaticCheckRefresh(..) => "AutomaticCheckRefresh",
             Self::AutomaticCheckRun(..) => "AutomaticCheckRun",
+            Self::FinalCheckpoint(..) => "FinalCheckpoint",
             Self::SettlementRefresh { .. } => "SettlementRefresh",
             Self::SettlementCommit { .. } => "SettlementCommit",
             Self::UserSteering { .. } => "UserSteering",
@@ -1122,8 +1097,8 @@ impl ForegroundJob {
             Self::AdmissionCleanup(_)
             | Self::AdmissionFailureCheckpoint(_)
             | Self::FailureCheckpoint(_)
+            | Self::FinalCheckpoint(_)
             | Self::FailureBaseline(_)
-            | Self::RetractionGoal(_)
             | Self::CleanupForeground { .. }
             | Self::QuestionStop { .. }
             | Self::PriorObservation(_)
@@ -1131,7 +1106,6 @@ impl ForegroundJob {
             | Self::PriorFinal(_)
             | Self::AgentCancelApprovals { .. }
             | Self::AgentInterrupt { .. }
-            | Self::FinalCheckpoint(_)
             | Self::SettlementRefresh { .. }
             | Self::SettlementCommit { .. }
             | Self::SettleUserDelivery { .. }
@@ -1231,11 +1205,7 @@ impl ForegroundJob {
                     "exchange_id":scope.exchange_id, "phase":"engine_close_started", "cause":format!("{original:#}"),
                 }));
                 let mut cleanup = if original.is::<TurnCancelled>() {
-                    engine
-                        .close_with_reason(
-                            crate::provider::session_execution::OwnerCloseReason::Cancelled,
-                        )
-                        .await
+                    engine.cancel_exchange(scope.clone()).await
                 } else {
                     engine.close().await
                 };
@@ -1247,7 +1217,7 @@ impl ForegroundJob {
                         && cleanup.is_ok()
                     {
                         cleanup = Err(crate::provider::lifecycle_error::classify_source(
-                            forge_provider_api::ProviderOperation::CollectEventReader,
+                            forge_provider_api::ProviderOperation::SessionClose,
                             &error,
                         ));
                     }
@@ -1338,16 +1308,6 @@ impl ForegroundJob {
             Self::FailureCheckpoint(job) => Ok(ForegroundSignal::FailureCheckpointCompleted(
                 job.run().await,
             )),
-            Self::RetractionGoal(job) => {
-                use futures_util::FutureExt;
-                let result = std::panic::AssertUnwindSafe(job.run())
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(anyhow::anyhow!("native retraction goal restore panicked"))
-                    });
-                Ok(ForegroundSignal::RetractionGoalRestored(result))
-            }
             Self::PlanSubmission(job) | Self::LivePlanSubmission(job) => {
                 Ok(ForegroundSignal::PlanSubmissionCompleted(job.run().await))
             }
@@ -1370,18 +1330,19 @@ impl ForegroundJob {
             }
             Self::QuestionStop {
                 provider,
-                session_id,
+                engine,
+                scope,
                 fallback,
                 checkpoint,
                 capability,
             } => {
                 let result = async {
                     let provider_session_id = provider
-                        .active_session_id_for(&session_id)
-                        .await?
+                        .retained_session_id(&scope.owner)
+                        .await
                         .or(fallback);
-                    provider
-                        .cleanup_execution(&session_id)
+                    engine
+                        .cancel_exchange(scope)
                         .await
                         .context("stop execution for required questions")?;
                     Ok(ProviderCompletion {
@@ -1467,10 +1428,7 @@ impl ForegroundJob {
                         completed += 1;
                         if let Some(provider) = &item.provider {
                             tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                                provider.cancel_session(&item.owner.runtime_key()).await?;
-                                provider
-                                    .cleanup_execution(&item.owner.runtime_key())
-                                    .await?;
+                                provider.session_close_owner(&item.owner).await?;
                                 provider.shutdown().await
                             })
                             .await
@@ -1523,13 +1481,13 @@ impl ForegroundJob {
                     result,
                 })
             }
-            Self::FinalCheckpoint(job) => Ok(ForegroundSignal::FinalCheckpoint(job.run().await)),
             Self::AutomaticCheckRefresh(job) => Ok(ForegroundSignal::AutomaticCheckRefreshed(
                 Box::new(job.run().await),
             )),
             Self::AutomaticCheckRun(job) => Ok(ForegroundSignal::AutomaticCheckCompleted(
                 Box::new(job.run().await),
             )),
+            Self::FinalCheckpoint(job) => Ok(ForegroundSignal::FinalCheckpoint(job.run().await)),
             Self::SettlementRefresh {
                 engine,
                 scope,
@@ -1548,7 +1506,7 @@ impl ForegroundJob {
                     if let Err(error) = input.cancel_undispatched().await {
                         return Ok(ForegroundSignal::SettlementCommitted(Err(
                             SettlementError::Provider(crate::provider::lifecycle_error::classify(
-                                forge_provider_api::ProviderOperation::HostEffectPublication,
+                                forge_provider_api::ProviderOperation::InputSubmit,
                                 error,
                             )),
                         )));
@@ -1647,14 +1605,12 @@ impl ForegroundTransaction {
                 }
                 continue;
             }
-            if self.native_goal.is_none()
-                && !self.observation_publication_in_flight
+            if !self.observation_publication_in_flight
                 && !self.pending_session_observations.is_empty()
             {
                 return Ok(ForegroundSignal::SessionObservationsReady);
             }
-            if self.native_goal.is_none()
-                && !self.observation_publication_in_flight
+            if !self.observation_publication_in_flight
                 && !self.question_stop_pending
                 && self.steering.pending_deliveries.is_empty()
                 && self.pending_native_ready.is_some()
@@ -2145,7 +2101,6 @@ struct ExchangeAdmission {
 
 struct PromptControlSnapshot {
     session: HarnessSession,
-    goal: Option<GoalRecord>,
     execution: Vec<PlanExecutionRecord>,
     plan: Vec<PlanRecord>,
 }
@@ -2199,6 +2154,8 @@ pub struct HarnessBroker {
     execution_registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
     session: HarnessSession,
     capability: ProviderCapability,
+    latest_manifest: Option<forge_provider_api::CapabilityManifest>,
+    configuration_identity: Option<crate::provider::ConfiguredBindingReceipt>,
     pub(crate) goal_max_turns: u32,
     permission_store: Arc<RwLock<PermissionStore>>,
     permission_coordinator: Arc<PermissionCoordinator>,
@@ -2493,12 +2450,38 @@ impl HarnessBroker {
             startup_started.elapsed().as_secs_f64() * 1000.0,
         );
         store.lock_session(&session.id)?;
+        let submission_store =
+            crate::provider::submission::SubmissionStore::open(&data_root, trace.clone())?;
+        let exchanges = store.list_exchange(&session.id)?;
+        let input_ids: Option<Vec<_>> = exchanges
+            .iter()
+            .map(|exchange| {
+                if exchange.agent_id == session.primary_agent_id
+                    && exchange.session_id == session.id
+                {
+                    exchange
+                        .input_message_id
+                        .clone()
+                        .filter(|id| !id.trim().is_empty())
+                } else {
+                    None
+                }
+            })
+            .collect();
         // Provider-only preparation is disposable across runtimes. Keep all local metadata,
-        // including names and settings, while replacing only an unused provider identity.
+        // including retained interrupted exchanges, while replacing only an unused provider identity.
         if session.background.is_none()
+            && session.purpose == crate::session::SessionPurpose::Conversation
             && session.provider_fork_state == ProviderForkState::Ready
             && session.provider_checkpoint_id.is_none()
-            && !store.has_conversation_history(&session.id)?
+            && !store.has_fork_lineage(&session.id)?
+            && let Some(input_ids) = input_ids
+            && submission_store.proves_session_unconsumed(
+                &crate::provider::ExecutionOwner::root(&session.id),
+                &session.workspace,
+                provider_descriptor.kind,
+                &input_ids,
+            )?
         {
             session.provider_session_id = None;
         }
@@ -2594,6 +2577,7 @@ impl HarnessBroker {
             metadata: RwLock::new(observation::ObservationMetadata {
                 revision: 0,
                 capability: capability.clone(),
+                manifest: None,
                 active_wait: None,
                 no_checkpoint: matches!(workspace_kind, WorkspaceKind::Untracked(_)),
             }),
@@ -2616,10 +2600,7 @@ impl HarnessBroker {
             task_controller: Arc::new(crate::task::SessionTaskController::new(
                 observer.admission.clone(),
             )?),
-            submission_store: crate::provider::submission::SubmissionStore::open(
-                &data_root,
-                trace.clone(),
-            )?,
+            submission_store,
             context_usage_fresh: false,
             lsp: runtime.lsp.clone(),
             active_operation_id: None,
@@ -2644,6 +2625,8 @@ impl HarnessBroker {
             provider,
             session,
             capability,
+            latest_manifest: None,
+            configuration_identity: None,
             goal_max_turns: request.goal_max_turns,
             permission_store,
             permission_coordinator,
@@ -2801,7 +2784,6 @@ impl HarnessBroker {
         });
         Some(crate::tools::ControlTurnContext {
             provider_completion: Default::default(),
-            provider_continuation: None,
             questions: Some(self.questions.clone()),
             question_events: self.question_events.clone(),
             live_host_effects: None,
@@ -2812,31 +2794,6 @@ impl HarnessBroker {
                 .map(|runtime| runtime.exchange_id.clone()),
             question_discussion: self.question_discussion,
             task_controller: Some(self.task_controller.clone()),
-            native_goal: if mode == PromptMode::GoalContinuation {
-                self.task_controller
-                    .current()
-                    .ok()
-                    .flatten()
-                    .and_then(|task| match task.workflow.clone() {
-                        crate::task::WorkflowSnapshot::Goal { goal } if goal.native => Some(
-                            if matches!(
-                                &self.input_purpose,
-                                crate::input::InputPurpose::TaskContinuation { .. }
-                            ) {
-                                forge_provider_api::NativeGoalCommand::Resume {
-                                    objective: goal.objective,
-                                }
-                            } else {
-                                forge_provider_api::NativeGoalCommand::Set {
-                                    objective: goal.objective,
-                                }
-                            },
-                        ),
-                        _ => None,
-                    })
-            } else {
-                None
-            },
             task_start: match &self.input_purpose {
                 crate::input::InputPurpose::TaskEntry { start, .. } => Some(start.clone()),
                 _ => None,
@@ -3712,7 +3669,7 @@ impl HarnessBroker {
                 now_ms,
             )?
         } else {
-            crate::task::Task::goal(title, Default::default(), false, now_ms)
+            crate::task::Task::goal(title, Default::default(), now_ms)
         };
         let current = self.task_controller.current()?;
         self.task_controller.change(
@@ -4279,8 +4236,7 @@ impl HarnessBroker {
                 .cloned()
                 .context("child cleanup obligation has no retained provider adapter")?;
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                provider.cancel_session(&owner.runtime_key()).await?;
-                provider.cleanup_execution(&owner.runtime_key()).await?;
+                provider.session_close_owner(&owner).await?;
                 provider.shutdown().await
             })
             .await
@@ -4906,10 +4862,11 @@ impl HarnessBroker {
     }
 
     async fn list_provider_model(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut model_list = self
+        let context = self
             .provider
-            .model_list(self.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?)
+            .query_context(&self.provider_catalog_request()?)
             .await?;
+        let mut model_list = self.provider.model_list(context).await?;
         let preference = self
             .store
             .load_preference(&self.session.workspace, &self.session.provider)?;
@@ -4958,7 +4915,6 @@ impl HarnessBroker {
     pub(crate) fn begin_prompt_submission(&mut self, params: &Value) -> Result<PromptSubmission> {
         let snapshot = PromptControlSnapshot {
             session: self.session_view()?,
-            goal: self.current_goal()?,
             execution: self.store.list_plan_execution(&self.session.id)?,
             plan: self.store.list_plan(&self.session.id)?,
         };
@@ -4987,10 +4943,7 @@ impl HarnessBroker {
     }
 
     /// Finalize admission and rollback state after the owned prompt workflow ends.
-    fn prepare_retracted_control_restore(
-        &mut self,
-        snapshot: PromptControlSnapshot,
-    ) -> Result<Option<foreground_failure::RetractionGoalJob>> {
+    fn prepare_retracted_control_restore(&mut self, snapshot: PromptControlSnapshot) -> Result<()> {
         let controller = self.task_controller.clone();
         controller
             .with_task_snapshot(|current| self.restore_retracted_host_snapshot(snapshot, current))
@@ -5001,7 +4954,7 @@ impl HarnessBroker {
         &mut self,
         snapshot: PromptControlSnapshot,
         current: Option<crate::task::Task>,
-    ) -> Result<Option<foreground_failure::RetractionGoalJob>> {
+    ) -> Result<()> {
         let unchanged = match (&current, &snapshot.session.active_task) {
             (Some(current), Some(original)) => {
                 current.revision == original.revision && current.same_contract(original)
@@ -5031,22 +4984,7 @@ impl HarnessBroker {
         self.session = snapshot.session;
         self.session.active_task = current;
         self.save_session()?;
-        if unchanged && self.capability.native_goal && self.session.provider_session_id.is_some() {
-            let request = self.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?;
-            let update = match snapshot.goal {
-                Some(goal) => crate::provider::native_goal_update(goal.objective, goal.state),
-                None => crate::provider::NativeGoalUpdate::Absent,
-            };
-            let registry = self.execution_registry();
-            return Ok(Some(foreground_failure::RetractionGoalJob::new(
-                self,
-                request,
-                update,
-                self.session.active_task.clone(),
-                registry,
-            )));
-        }
-        Ok(None)
+        Ok(())
     }
 
     fn answer_plan_question_choice(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -6497,7 +6435,33 @@ impl HarnessBroker {
         &mut self,
         transaction: &mut ForegroundTransaction,
         observation: ProviderEvent,
-    ) -> Result<ForegroundEventApplication> {
+    ) -> Result<PendingProviderDelivery> {
+        if let ProviderEvent::Execution { observation } = &observation
+            && let forge_provider_api::ExecutionUpdate::Finished {
+                result: forge_provider_api::ExecutionResult::Cancelled { completion },
+                ..
+            } = observation.update()
+        {
+            let completion: forge_provider_api::completion::ProviderCompletion =
+                completion.clone().into();
+            if let Some(boundary) = completion.provider_checkpoint_id {
+                transaction.retraction_boundary = Some((
+                    observation.scope().clone(),
+                    forge_provider_api::CheckpointId::new(boundary)?,
+                ));
+            }
+        }
+        if let Some(scope) = observation.scope().invocation()
+            && scope != &transaction.state.scope
+        {
+            anyhow::ensure!(
+                scope.owner == transaction.state.scope.owner
+                    && scope.exchange_id == transaction.state.scope.exchange_id
+                    && transaction.engine.admitted_invocation(scope)?,
+                "foreground successor has no owner-issued invocation admission"
+            );
+            transaction.state.scope = scope.clone();
+        }
         if transaction
             .finalization
             .as_ref()
@@ -6516,28 +6480,14 @@ impl HarnessBroker {
                 .context("idle continuation exchange disappeared")?;
             let mut delivery = self.prepare_provider_delivery(AppliedProviderEvent::None)?;
             delivery.events = events;
-            return Ok(ForegroundEventApplication::Publication(Box::new(
-                ForegroundJob::Publication(delivery),
-            )));
+            return Ok(delivery);
         }
         let (applied, mut events) =
             self.apply_owned_foreground(&mut transaction.state, observation)?;
-        match applied {
-            AppliedProviderEvent::NativeGoalContinuation(observation) => {
-                transaction.pending_goal_events.extend(events);
-                Ok(ForegroundEventApplication::NativeGoalContinuation(
-                    Box::new(observation),
-                ))
-            }
-            applied => {
-                let mut delivery = self.prepare_provider_delivery(applied)?;
-                events.append(&mut delivery.events);
-                delivery.events = events;
-                Ok(ForegroundEventApplication::Publication(Box::new(
-                    ForegroundJob::Publication(delivery),
-                )))
-            }
-        }
+        let mut delivery = self.prepare_provider_delivery(applied)?;
+        events.append(&mut delivery.events);
+        delivery.events = events;
+        Ok(delivery)
     }
 
     /// Route an admitted user input to an owned native steer or the retained queue.
@@ -6546,8 +6496,7 @@ impl HarnessBroker {
         transaction: &mut ForegroundTransaction,
         input: crate::provider::SteerCommand,
     ) -> ForegroundAction {
-        if self.provider.descriptor().capability.native_steer {
-            transaction.steering.refresh_readiness = true;
+        if self.capability.native_steer {
             ForegroundAction::Effect(ForegroundJob::UserSteering {
                 flight: transaction.steering.pending_deliveries.retain(),
                 engine: transaction.engine.clone(),
@@ -6560,55 +6509,7 @@ impl HarnessBroker {
         }
     }
 
-    /// Start an authorized native-goal continuation without waiting for checkpoint work.
-    pub(crate) fn begin_native_goal_transition(
-        &mut self,
-        transaction: &mut ForegroundTransaction,
-        observation: ProviderEvent,
-    ) -> Result<ForegroundAction> {
-        anyhow::ensure!(
-            transaction.native_goal.is_none(),
-            "a native-goal transition is already pending"
-        );
-        let runtime = transaction
-            .state
-            .runtime
-            .as_ref()
-            .context("foreground transaction already committed")?;
-        anyhow::ensure!(
-            self.native_goal_continuation_needed(
-                runtime,
-                &transaction.state.interaction,
-                &observation
-            )?,
-            "native-goal continuation is no longer authorized"
-        );
-        let previous = transaction
-            .state
-            .interaction
-            .turn
-            .last()
-            .context("native goal has no prior turn")?;
-        let crate::turn::TurnState::Finished { outcome } = previous.state() else {
-            anyhow::bail!("native goal prior turn is not settled");
-        };
-        let outcome = match outcome {
-            crate::turn::TurnOutcome::Completed => crate::exchange::ExchangeOutcome::Complete,
-            crate::turn::TurnOutcome::Cancelled => crate::exchange::ExchangeOutcome::Cancelled,
-            crate::turn::TurnOutcome::Interrupted => crate::exchange::ExchangeOutcome::Interrupted,
-            crate::turn::TurnOutcome::Failed => crate::exchange::ExchangeOutcome::Failed,
-        };
-        transaction.native_goal = Some(NativeGoalTransition::Initial {
-            observation,
-            outcome,
-        });
-        if runtime.checkpoint.is_some() {
-            return Ok(ForegroundAction::Wait);
-        }
-        self.prepare_native_goal_final(transaction)
-    }
-
-    /// Commit an initial checkpoint and advance any waiting goal transition.
+    /// Commit the initial checkpoint without opening a provider-scheduled successor.
     pub(crate) fn apply_foreground_checkpoint(
         &mut self,
         transaction: &mut ForegroundTransaction,
@@ -6620,249 +6521,7 @@ impl HarnessBroker {
             .as_mut()
             .context("foreground runtime is missing")?;
         self.finish_initial_checkpoint(runtime, &mut transaction.state.interaction, result)?;
-        match &transaction.native_goal {
-            Some(NativeGoalTransition::Initial { .. }) => {
-                self.prepare_native_goal_final(transaction)
-            }
-            Some(NativeGoalTransition::ContinuationInitial { .. }) => {
-                self.finish_native_goal_exchange(transaction)
-            }
-            Some(NativeGoalTransition::Final { .. }) => {
-                anyhow::bail!("unexpected baseline during final checkpoint capture")
-            }
-            None => Ok(ForegroundAction::Wait),
-        }
-    }
-
-    /// Record final checkpoint failure and release goal settlement ownership.
-    pub(crate) fn fail_native_goal_checkpoint(
-        &mut self,
-        transaction: &mut ForegroundTransaction,
-        error: anyhow::Error,
-    ) -> Result<ForegroundAction> {
-        anyhow::ensure!(
-            matches!(
-                &transaction.native_goal,
-                Some(NativeGoalTransition::Final { .. })
-            ),
-            "native-goal transition is not waiting for final checkpoint evidence"
-        );
-        transaction.native_goal = None;
-        let interaction = &mut transaction.state.interaction;
-        if let Some(scope) = interaction
-            .turn
-            .last()
-            .map(|turn| turn.provider().scope.clone())
-        {
-            self.reopened_execution.end_settlement(&scope);
-        }
-        interaction.finalization_error = Some(format!("{error:#}"));
-        self.store.save_exchange(interaction)?;
-        Err(error)
-    }
-
-    /// Begin final checkpoint capture after the original baseline is durable.
-    fn prepare_native_goal_final(
-        &mut self,
-        transaction: &mut ForegroundTransaction,
-    ) -> Result<ForegroundAction> {
-        let Some(NativeGoalTransition::Initial {
-            observation,
-            outcome,
-        }) = transaction.native_goal.take()
-        else {
-            anyhow::bail!("native-goal transition is not waiting for its baseline");
-        };
-        let interaction = &mut transaction.state.interaction;
-        interaction.begin_finalization(outcome, self.clock.now_ms())?;
-        self.store.save_exchange(interaction)?;
-        if let Some(scope) = interaction
-            .turn
-            .last()
-            .map(|turn| turn.provider().scope.clone())
-        {
-            self.reopened_execution.begin_settlement(&scope);
-        }
-        if self.checkpoint.is_none() {
-            let mut changes = crate::exchange::ProviderDiffBuilder::default();
-            self.visit_provider_exchanges(interaction, |exchange| changes.record(exchange))?;
-            interaction.attributed_diff_text = changes.finish();
-            interaction.attributed_matches_checkpoint = false;
-            interaction.finish(outcome, self.clock.now_ms())?;
-            self.store.save_exchange(interaction)?;
-            return self.start_native_goal_exchange(transaction, observation);
-        }
-        let job = match self.prepare_final_checkpoint(interaction, outcome) {
-            Ok(job) => job,
-            Err(error) => {
-                if let Some(scope) = interaction
-                    .turn
-                    .last()
-                    .map(|turn| turn.provider().scope.clone())
-                {
-                    self.reopened_execution.end_settlement(&scope);
-                }
-                interaction.finalization_error = Some(format!("{error:#}"));
-                self.store.save_exchange(interaction)?;
-                return Err(error);
-            }
-        };
-        transaction.native_goal = Some(NativeGoalTransition::Final {
-            observation,
-            outcome,
-        });
-        Ok(ForegroundAction::Effect(ForegroundJob::FinalCheckpoint(
-            Box::new(job),
-        )))
-    }
-
-    /// Commit native-goal checkpoint evidence or recapture after a stale revision.
-    pub(crate) fn complete_native_goal_checkpoint(
-        &mut self,
-        transaction: &mut ForegroundTransaction,
-        result: checkpoint_settlement::FinalCheckpointResult,
-    ) -> Result<ForegroundAction> {
-        let Some(NativeGoalTransition::Final {
-            observation,
-            outcome,
-        }) = transaction.native_goal.take()
-        else {
-            anyhow::bail!("native-goal transition is not waiting for final checkpoint evidence");
-        };
-        let committed =
-            match self.commit_final_checkpoint(&mut transaction.state.interaction, result) {
-                Ok(committed) => committed,
-                Err(error) => {
-                    let interaction = &mut transaction.state.interaction;
-                    if let Some(scope) = interaction
-                        .turn
-                        .last()
-                        .map(|turn| turn.provider().scope.clone())
-                    {
-                        self.reopened_execution.end_settlement(&scope);
-                    }
-                    interaction.finalization_error = Some(format!("{error:#}"));
-                    self.store.save_exchange(interaction)?;
-                    return Err(error);
-                }
-            };
-        match committed {
-            FinalCheckpointCommit::Stale => {
-                transaction.native_goal = Some(NativeGoalTransition::Initial {
-                    observation,
-                    outcome,
-                });
-                for event in self.observer.session_events().drain()? {
-                    transaction
-                        .pending_goal_events
-                        .extend(self.observe_session_event(event)?);
-                }
-                transaction.state.interaction = self
-                    .store
-                    .load_exchange(&transaction.state.interaction.id)?
-                    .context("native-goal exchange disappeared during checkpoint capture")?;
-                if transaction
-                    .state
-                    .interaction
-                    .turn
-                    .last()
-                    .is_some_and(|turn| self.reopened_execution.active(&turn.provider().scope))
-                {
-                    return Ok(ForegroundAction::Wait);
-                }
-                self.prepare_native_goal_final(transaction)
-            }
-            FinalCheckpointCommit::Committed(_) => {
-                self.start_native_goal_exchange(transaction, observation)
-            }
-        }
-    }
-
-    /// Admit the next goal exchange while its initial checkpoint worker runs independently.
-    fn start_native_goal_exchange(
-        &mut self,
-        transaction: &mut ForegroundTransaction,
-        observation: ProviderEvent,
-    ) -> Result<ForegroundAction> {
-        if let Some(scope) = transaction
-            .state
-            .interaction
-            .turn
-            .last()
-            .map(|turn| turn.provider().scope.clone())
-        {
-            self.reopened_execution.end_settlement(&scope);
-        }
-        let (mut continuation, _, events, effects) =
-            self.stage_interaction_for_turn("", true, self.clock.now_ms(), None)?;
-        continuation.origin = crate::exchange::ExchangeOrigin::task_continuation(
-            "The native goal requires another turn",
-        );
-        continuation
-            .checklist
-            .clone_from(&transaction.state.interaction.checklist);
-        self.begin_exchange_runtime(&mut continuation, self.clock.now_ms())?;
-        let runtime = self
-            .exchange_runtime
-            .take()
-            .context("continuation runtime is missing")?;
-        transaction.state.interaction = continuation;
-        transaction.state.runtime = Some(runtime);
-        transaction.pending_goal_events.extend(events);
-        transaction.pending_goal_effects.extend(effects);
-        transaction.native_goal = Some(NativeGoalTransition::ContinuationInitial { observation });
-        if transaction
-            .state
-            .runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.checkpoint.is_some())
-        {
-            return Ok(ForegroundAction::Wait);
-        }
-        self.finish_native_goal_exchange(transaction)
-    }
-
-    /// Bind the admitted native turn after the new goal baseline is durable.
-    fn finish_native_goal_exchange(
-        &mut self,
-        transaction: &mut ForegroundTransaction,
-    ) -> Result<ForegroundAction> {
-        let Some(NativeGoalTransition::ContinuationInitial { observation }) =
-            transaction.native_goal.take()
-        else {
-            anyhow::bail!("native-goal transition is not waiting for continuation admission");
-        };
-        let address = observation
-            .turn_address()
-            .context("native goal start has no turn address")?
-            .clone();
-        let interaction = &mut transaction.state.interaction;
-        interaction
-            .inherit_native_turn(address, observation.observed_at_ms(self.clock.now_ms()))?;
-        let runtime = transaction
-            .state
-            .runtime
-            .as_mut()
-            .context("continuation runtime is missing")?;
-        runtime.retraction_eligible = false;
-        self.store.save_exchange(interaction)?;
-        transaction.pending_goal_effects.push(
-            self.prepare_live_interaction(publication::LiveUpdate::StateChanged, interaction)?,
-        );
-        // The observation that opened the continuation still needs normal content
-        // handling after its native turn has been bound to the new exchange.
-        transaction
-            .pending_goal_effects
-            .push(self.apply_exchange_content(runtime, interaction, observation, false)?);
-        let effects =
-            AppliedProviderEvent::Effects(std::mem::take(&mut transaction.pending_goal_effects));
-        let mut delivery = self.prepare_provider_delivery(effects)?;
-        let mut events = std::mem::take(&mut transaction.pending_goal_events);
-        events.append(&mut delivery.events);
-        delivery.events = events;
-        Ok(ForegroundAction::Effect(ForegroundJob::Publication(
-            delivery,
-        )))
+        Ok(ForegroundAction::Wait)
     }
 
     /// Capture a plan scan as owned work that can run without the broker lock.
@@ -7046,7 +6705,7 @@ impl HarnessBroker {
         &self,
         transaction: &mut ForegroundTransaction,
     ) -> Result<ForegroundAction> {
-        if !self.provider.descriptor().capability.native_steer {
+        if !self.capability.native_steer {
             return Ok(ForegroundAction::Wait);
         }
         for task in self.agent_coordinator.unreported_result() {
@@ -8242,9 +7901,6 @@ impl HarnessBroker {
                     pending.extend(effects.into_iter().rev());
                     continue;
                 }
-                AppliedProviderEvent::NativeGoalContinuation(_) => {
-                    anyhow::bail!("native goal transition must finish before publication")
-                }
             };
             if let Some(update) = update {
                 if update.wakes_input()
@@ -8306,6 +7962,17 @@ impl HarnessBroker {
             return Ok(AppliedProviderEvent::None);
         }
         match provider_event {
+            ProviderEvent::CapabilitiesChanged { capabilities, .. } => {
+                self.apply_effective_capabilities(capabilities)?;
+                Ok(AppliedProviderEvent::None)
+            }
+            ProviderEvent::SessionIdentity {
+                scope,
+                provider_session_id,
+            } => {
+                self.retain_session_identity(scope.owner(), &provider_session_id)?;
+                Ok(AppliedProviderEvent::None)
+            }
             ProviderEvent::DirectoryAccess { grant, .. } => Ok(AppliedProviderEvent::Update(
                 self.apply_directory_access(grant)?,
             )),
@@ -8354,7 +8021,7 @@ impl HarnessBroker {
                     diagnostic,
                 }))
             }
-            content => self.apply_exchange_content(runtime, interaction, content, true),
+            content => self.apply_exchange_content(runtime, interaction, content),
         }
     }
 
@@ -8381,6 +8048,86 @@ impl HarnessBroker {
         Ok(SessionUpdate::ExecutionState {
             session: Box::new(self.session.clone()),
         })
+    }
+
+    /// Forget negotiated support only after the prior binding generation has been collected.
+    pub(crate) fn clear_effective_capabilities(&mut self) -> Result<()> {
+        let capability = self.provider.descriptor().capability;
+        let mut published = self
+            .observer
+            .metadata
+            .write()
+            .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?;
+        published.capability = capability.clone();
+        published.manifest = None;
+        self.capability = capability;
+        self.latest_manifest = None;
+        Ok(())
+    }
+
+    /// Apply an ordered negotiated snapshot before later input or configuration admission.
+    fn apply_effective_capabilities(
+        &mut self,
+        manifest: forge_provider_api::CapabilityManifest,
+    ) -> Result<()> {
+        use forge_provider_api::capability::{CapabilityId, Support};
+        anyhow::ensure!(
+            manifest.provider == self.provider.descriptor().kind,
+            "capability snapshot crosses provider ownership"
+        );
+        if self
+            .latest_manifest
+            .as_ref()
+            .is_some_and(|current| current.effective_revision > manifest.effective_revision)
+        {
+            return Ok(());
+        }
+        let supports = |id| {
+            manifest.capability.iter().any(|capability| {
+                capability.id == id
+                    && matches!(
+                        capability.support,
+                        Support::Supported | Support::Limited { .. }
+                    )
+            })
+        };
+        let mut capability = self.capability.clone();
+        capability.native_fork = supports(CapabilityId::NativeFork);
+        capability.native_compact = supports(CapabilityId::NativeCompact);
+        capability.native_steer = supports(CapabilityId::NativeSteer);
+        capability.native_turn_rollback = supports(CapabilityId::NativeTurnRollback);
+        capability.model_selection = supports(CapabilityId::ModelSelection);
+        capability.effort_selection = supports(CapabilityId::EffortSelection);
+        capability.fast_mode = supports(CapabilityId::FastMode);
+        capability.ultrafast_mode = supports(CapabilityId::UltrafastMode);
+        capability.os_sandbox = supports(CapabilityId::OsSandbox);
+        capability.background_terminals = supports(CapabilityId::BackgroundTerminals);
+        capability.permission_control = supports(CapabilityId::ApprovalRules);
+        capability.compaction.lifecycle = supports(CapabilityId::CompactionLifecycle);
+        capability.compaction.background = supports(CapabilityId::BackgroundCompaction);
+        capability.compaction.summary = supports(CapabilityId::CompactionSummary);
+        capability.compaction.metrics = supports(CapabilityId::CompactionMetrics);
+        capability.catalog.skill = supports(CapabilityId::SkillCatalog);
+        capability.catalog.mcp = supports(CapabilityId::McpCatalog);
+        let mut published = self
+            .observer
+            .metadata
+            .write()
+            .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?;
+        published.capability = capability.clone();
+        published.manifest = Some(manifest.clone());
+        let native_flags_changed = self.session.native_fork != capability.native_fork
+            || self.session.native_compact != capability.native_compact;
+        self.session.native_fork = capability.native_fork;
+        self.session.native_compact = capability.native_compact;
+        self.capability = capability;
+        self.latest_manifest = Some(manifest);
+        drop(published);
+        if native_flags_changed {
+            self.save_session()?;
+        }
+        self.observer.admission.changed.notify_one();
+        Ok(())
     }
 
     /// Persist resolved native identity and prepare its session update.
@@ -8514,12 +8261,6 @@ impl HarnessBroker {
         address: &crate::provider::TurnAddress,
         update: &crate::provider::TurnUpdate,
     ) -> Result<Option<SessionUpdate>> {
-        if matches!(update, crate::provider::TurnUpdate::Started { .. })
-            && self.session.provider_session_id.as_deref() != Some(address.thread_id.as_str())
-        {
-            self.session.provider_session_id = Some(address.thread_id.clone());
-            self.save_session()?;
-        }
         self.store.save_exchange(interaction)?;
         Ok(SessionUpdate::from_observation(&ProviderEvent::Turn {
             address: address.clone(),
@@ -8533,7 +8274,6 @@ impl HarnessBroker {
         runtime: &mut ExchangeRuntime,
         interaction: &mut Exchange,
         provider_event: ProviderEvent,
-        allow_goal_transition: bool,
     ) -> Result<AppliedProviderEvent> {
         let mut effects = Vec::new();
         self.prepare_provider_observation(interaction, &provider_event);
@@ -8553,11 +8293,6 @@ impl HarnessBroker {
         }
         if let Some(routed) = self.apply_settled_parent_event(interaction, &provider_event)? {
             return Ok(routed);
-        }
-        if allow_goal_transition
-            && self.native_goal_continuation_needed(runtime, interaction, &provider_event)?
-        {
-            return Ok(AppliedProviderEvent::NativeGoalContinuation(provider_event));
         }
         if !interaction.observe_turn(&provider_event, self.clock.now_ms())? {
             self.trace.record(&self.session.id, "provider.event.rejected",
@@ -8921,38 +8656,6 @@ impl HarnessBroker {
         let delivery = self.prepare_provider_delivery(applied)?;
         event.extend(delivery.deliver().await?);
         Ok(true)
-    }
-
-    /// Decide whether an observed start requires a native-goal checkpoint transition.
-    fn native_goal_continuation_needed(
-        &self,
-        runtime: &ExchangeRuntime,
-        interaction: &Exchange,
-        observation: &ProviderEvent,
-    ) -> Result<bool> {
-        let ProviderEvent::Turn {
-            address,
-            update: crate::provider::TurnUpdate::Started { .. },
-        } = observation
-        else {
-            return Ok(false);
-        };
-        let Some(previous) = interaction.turn.last() else {
-            return Ok(false);
-        };
-        Ok(previous.provider().thread_id == address.thread_id
-            && !interaction.turn.iter().any(|turn| {
-                turn.provider() == address || turn.state() == crate::turn::TurnState::Running
-            })
-            && runtime.task_permit.as_ref().is_some_and(|permit| {
-                permit
-                    .validate(self.task_controller.current().ok().flatten().as_ref())
-                    .is_ok()
-            })
-            && self
-                .current_goal()?
-                .is_some_and(|goal| goal.native && goal.state == GoalState::Active)
-            && matches!(previous.state(), crate::turn::TurnState::Finished { .. }))
     }
 
     /// Capture an ordered update and timeline patch without awaiting a presentation sink.
@@ -9433,12 +9136,11 @@ impl HarnessBroker {
     }
 
     #[cfg(test)]
-    fn create_goal(&mut self, objective: String, native: bool) -> Result<GoalRecord> {
+    fn create_goal(&mut self, objective: String) -> Result<GoalRecord> {
         let now_ms = self.clock.now_ms();
         let mut task = crate::task::Task::goal(
             objective,
             crate::session::continuation::ContinuationBudget::new(self.goal_max_turns, 5),
-            native,
             now_ms,
         );
         task.request_entry("Continue the active goal".into(), now_ms)?;
@@ -9484,7 +9186,6 @@ impl HarnessBroker {
             objective: observed.objective,
             state: observed.state,
             continuation: observed.continuation,
-            native: observed.native,
             created_at_ms: task.created_at_ms,
             updated_at_ms: self.clock.now_ms(),
         };
@@ -9507,8 +9208,7 @@ impl HarnessBroker {
             }
             ContinuationDecision::Complete
             | ContinuationDecision::Blocked
-            | ContinuationDecision::Stalled
-            | ContinuationDecision::Settled => {
+            | ContinuationDecision::Stalled => {
                 event.push(self.event("goal_changed", serde_json::to_value(&goal)?)?);
                 false
             }
@@ -9523,12 +9223,11 @@ impl HarnessBroker {
 
     fn current_goal(&self) -> Result<Option<GoalRecord>> {
         if let Some(task) = self.task_controller.current()? {
-            let (objective, state, continuation, native) = match &task.workflow {
+            let (objective, state, continuation) = match &task.workflow {
                 crate::task::WorkflowSnapshot::Goal { goal } => (
                     goal.objective.clone(),
                     goal.state,
                     goal.continuation.clone(),
-                    goal.native,
                 ),
                 crate::task::WorkflowSnapshot::Execute { execution } => (
                     execution.title.clone(),
@@ -9541,7 +9240,6 @@ impl HarnessBroker {
                         PlanExecutionState::Blocked => GoalState::Blocked,
                     },
                     execution.continuation.clone(),
-                    execution.native,
                 ),
                 crate::task::WorkflowSnapshot::Plan { .. } => return Ok(None),
             };
@@ -9551,89 +9249,11 @@ impl HarnessBroker {
                 objective,
                 state,
                 continuation,
-                native,
                 created_at_ms: task.created_at_ms,
                 updated_at_ms: task.updated_at_ms,
             }));
         }
         Ok(None)
-    }
-
-    async fn sync_native_goal(&mut self, goal: &GoalRecord, state: GoalState) -> Result<()> {
-        if !goal.native || self.session.provider_session_id.is_none() {
-            return Ok(());
-        }
-        let registry = self.execution_registry();
-        let owner = crate::provider::ExecutionOwner::root(&self.session.id);
-        let expected = self.task_controller.current()?;
-        let lane = self.task_controller.native_goal_lane();
-        let _lane =
-            match tokio::time::timeout(std::time::Duration::from_secs(30), lane.lock()).await {
-                Ok(guard) => guard,
-                Err(_) => {
-                    self.task_controller.mark_native_goal_uncertain();
-                    let error = anyhow::Error::new(ProviderError::DeliveryUncertain);
-                    return Err(match registry.fence(&owner).await {
-                        Ok(()) => error,
-                        Err(cleanup) => error.context(cleanup),
-                    });
-                }
-            };
-        self.task_controller.ensure_native_goal_certain()?;
-        anyhow::ensure!(
-            foreground_failure::same_retraction_task(
-                self.task_controller.current()?.as_ref(),
-                expected.as_ref()
-            ),
-            "task changed before native goal update"
-        );
-        let result = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.provider.goal_status(
-                self.provider_request(ProviderInput::from_text(""), PromptMode::GoalContinuation)?,
-                crate::provider::native_goal_update(goal.objective.clone(), state),
-            ),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                self.task_controller.mark_native_goal_uncertain();
-                Err(anyhow::Error::new(error).context(ProviderError::DeliveryUncertain))
-            }
-            Err(_) => {
-                self.task_controller.mark_native_goal_uncertain();
-                Err(ProviderError::DeliveryUncertain.into())
-            }
-        };
-        let epoch = match self.task_controller.native_goal_written() {
-            Ok(epoch) => epoch,
-            Err(error) => {
-                drop(_lane);
-                return Err(match registry.fence(&owner).await {
-                    Ok(()) => error,
-                    Err(cleanup) => error.context(cleanup),
-                });
-            }
-        };
-        let changed = !foreground_failure::same_retraction_task(
-            self.task_controller.current()?.as_ref(),
-            expected.as_ref(),
-        );
-        drop(_lane);
-        if let Err(uncertain) = self.task_controller.ensure_native_goal_certain() {
-            let error = result.err().unwrap_or(uncertain);
-            return Err(match registry.fence(&owner).await {
-                Ok(()) => error,
-                Err(cleanup) => error.context(cleanup),
-            });
-        }
-        let _ = epoch;
-        result?;
-        if changed {
-            return Err(ProviderError::DeliveryUncertain.into());
-        }
-        Ok(())
     }
 
     /// Capture the retained preview selected by a transport request.
@@ -9979,9 +9599,6 @@ impl HarnessBroker {
         };
         let mut session = self.session.clone();
         if let Some(task) = self.task_controller.current()? {
-            if let Some(goal) = self.current_goal()? {
-                self.sync_native_goal(&goal, GoalState::Cleared).await?;
-            }
             self.task_controller.change(
                 &mut self.store,
                 Some(&task.revision),
@@ -10161,7 +9778,7 @@ impl HarnessBroker {
             &self.data_root,
             &self.client_id,
             self.provider_launch.kind.as_str(),
-            self.provider.descriptor().capability.native_compact,
+            self.capability.native_compact,
             &self.session.id,
             &params,
             now_ms,
@@ -10230,7 +9847,6 @@ impl HarnessBroker {
         if goal.state != GoalState::Active {
             return Ok(());
         }
-        self.sync_native_goal(&goal, GoalState::Paused).await?;
         let task = self
             .task_controller
             .current()?
@@ -10272,10 +9888,6 @@ impl HarnessBroker {
             self.certify_candidate_reconcile(&mut candidate, result)?;
         }
         let committed = self.commit_configuration_candidate(candidate)?;
-        if let Some(job) = committed.cleanup {
-            let result = job.run().await?;
-            self.commit_configuration_reconcile(result)?;
-        }
         Ok((committed.value, committed.events))
     }
 
@@ -10356,6 +9968,26 @@ impl HarnessBroker {
         &mut self,
         event: ProviderEvent,
     ) -> Result<Vec<SessionEvent>> {
+        if let ProviderEvent::CapabilitiesChanged {
+            scope,
+            capabilities,
+        } = &event
+        {
+            anyhow::ensure!(
+                scope.owner() == &crate::provider::ExecutionOwner::root(&self.session.id),
+                "capability update crosses root ownership"
+            );
+            self.apply_effective_capabilities(capabilities.clone())?;
+            return Ok(Vec::new());
+        }
+        if let ProviderEvent::SessionIdentity {
+            scope,
+            provider_session_id,
+        } = &event
+        {
+            self.retain_session_identity(scope.owner(), provider_session_id)?;
+            return Ok(Vec::new());
+        }
         if let ProviderEvent::Execution { observation } = event {
             return self.observe_execution_lifecycle(observation);
         }
@@ -10750,7 +10382,8 @@ mod test {
         ProviderEvent::Compaction {
             scope: crate::provider::EventScope::SessionOperation {
                 owner: crate::provider::ExecutionOwner::root(session_id),
-                operation_id: compaction.id.clone(),
+                operation_id: forge_provider_api::OperationId::new(compaction.id.clone())
+                    .expect("fixture compaction identity is nonempty"),
             },
             update: Box::new(compaction),
         }
@@ -10825,7 +10458,7 @@ mod test {
                             .map_err(|_| {
                                 crate::provider::ProviderError::Failure(
                                     forge_provider_api::ProviderFailure::new(
-                                        forge_provider_api::ProviderOperation::NativeTransport,
+                                        forge_provider_api::ProviderOperation::InputSubmit,
                                         forge_provider_api::ProviderFailureKind::Unknown,
                                     ),
                                 )
@@ -11182,7 +10815,7 @@ mod test {
                             .map_err(|_| {
                                 crate::provider::ProviderError::Failure(
                                     forge_provider_api::ProviderFailure::new(
-                                        forge_provider_api::ProviderOperation::NativeTransport,
+                                        forge_provider_api::ProviderOperation::InputSubmit,
                                         forge_provider_api::ProviderFailureKind::Unknown,
                                     ),
                                 )
@@ -11241,7 +10874,7 @@ mod test {
                     if probe.fail || kind == forge_provider_api::ProviderFailureKind::Rejected {
                         return Err(crate::provider::ProviderError::Failure(
                             forge_provider_api::ProviderFailure::new(
-                                forge_provider_api::ProviderOperation::AdmitInput,
+                                forge_provider_api::ProviderOperation::InputSubmit,
                                 kind,
                             ),
                         ));
@@ -11254,7 +10887,7 @@ mod test {
             fixture.with_cleanup(|_| async {
                 Err(crate::provider::ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::CleanupExecution,
+                        forge_provider_api::ProviderOperation::Cancel,
                         forge_provider_api::ProviderFailureKind::Transport,
                     ),
                 ))
@@ -11467,7 +11100,7 @@ mod test {
                 matches!(report.cancellation(), [
             forge_provider_api::error::CleanupFailure::Failed(error)
         ] if matches!(error.as_ref(), crate::provider::ProviderError::Failure(failure)
-            if failure.operation() == forge_provider_api::ProviderOperation::CleanupExecution
+            if failure.operation() == forge_provider_api::ProviderOperation::Cancel
                 && failure.kind() == forge_provider_api::ProviderFailureKind::Transport)),
                 "{error:#}"
             );
@@ -11663,7 +11296,13 @@ mod test {
                 signals.started.notified().await;
                 if cleanup_before_completion {
                     cancellation.begin_cleanup(restore_prompt)?;
-                    provider.cleanup_execution(&session_id).await?;
+                    let scope = signals
+                        .scope
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .context("fixture invocation scope missing")?;
+                    provider.cancel_invocation(scope).await?;
                 } else {
                     signals.complete.notify_one();
                     signals.settled.notified().await;
@@ -12175,7 +11814,7 @@ mod test {
                     }
                 }
             });
-        let provider = provider.with_active_session_id(|_| async {
+        let provider = provider.with_session_identity(|_| async {
             Ok(Some(
                 "parent-history"
                     .to_owned()
@@ -12434,7 +12073,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let goal = broker.create_goal("Persist goal".into(), false)?;
+        let goal = broker.create_goal("Persist goal".into())?;
         broker.create_task(TaskKind::Goal, goal.objective.clone(), None, Some(goal.id))?;
         broker.pause_task(false).await?;
         let paused = broker.task_controller.current()?.unwrap();
@@ -12467,7 +12106,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let goal = broker.create_goal("Persist goal".into(), false).unwrap();
+        let goal = broker.create_goal("Persist goal".into()).unwrap();
         broker
             .create_task(TaskKind::Goal, goal.objective.clone(), None, Some(goal.id))
             .unwrap();
@@ -12788,7 +12427,6 @@ mod test {
             objective: "Run checks".into(),
             state: GoalState::Active,
             continuation: Default::default(),
-            native: false,
             created_at_ms: 1,
             updated_at_ms: 1,
         };
@@ -12814,7 +12452,6 @@ mod test {
             "Run checks".into(),
             execution,
             crate::session::continuation::ContinuationBudget::new(20, 2),
-            false,
             1,
         )
         .unwrap();
@@ -13516,10 +13153,10 @@ mod test {
 
     fn workflow_fixture_bridge(
         broker: &HarnessBroker,
-        native: std::sync::Arc<dyn forge_provider_api::provider::Provider>,
+        native: std::sync::Arc<crate::provider::test_support::EventFixtureProvider>,
     ) -> Arc<Provider> {
         Arc::new(Provider::new(
-            native,
+            native.registration(),
             broker.permission_coordinator.clone(),
             broker.trace.clone(),
             broker.data_root.clone(),
@@ -13546,7 +13183,6 @@ mod test {
                     thread_id: "workflow-fixture".into(),
                     turn_id: "turn-1".into(),
                 };
-                let sink = sink.invocation_sink(&request.scope)?;
                 sink.send_wait(ProviderEvent::Execution {
                     observation: ExecutionObservation::new(
                         request.scope.clone(),
@@ -13627,7 +13263,6 @@ mod test {
                         thread_id: "workflow-fixture".into(),
                         turn_id: "turn-1".into(),
                     };
-                    let sink = sink.invocation_sink(&request.scope)?;
                     sink.send_wait(ProviderEvent::Execution {
                         observation: ExecutionObservation::new(
                             request.scope.clone(),
@@ -13698,7 +13333,6 @@ mod test {
                         thread_id: "semantic-execution-fixture".into(),
                         turn_id: format!("phase-{index}").into(),
                     };
-                    let sink = sink.invocation_sink(&scope)?;
                     sink.send_wait(ProviderEvent::Execution {
                         observation: ExecutionObservation::new(
                             scope.clone(),
@@ -14279,7 +13913,6 @@ mod test {
                         thread_id: "delivery-fixture-session".into(),
                         turn_id: "delivery-fixture-turn".into(),
                     };
-                    let sink = sink.invocation_sink(&request.scope)?;
                     sink.send_wait(ProviderEvent::Execution {
                         observation: ExecutionObservation::new(
                             request.scope.clone(), ExecutionUpdate::Started { address: turn.clone() },
@@ -14544,6 +14177,7 @@ mod test {
 
     /// Coordinate the fixture's native completion and retryable cleanup barriers.
     struct CleanupSignals {
+        scope: std::sync::Mutex<Option<crate::provider::InvocationScope>>,
         started: Notify,
         complete: Notify,
         settled: Notify,
@@ -14560,9 +14194,13 @@ mod test {
             kind: forge_providers::registry::nonselectable_id()
                 .expect("fixture identity is available"),
             label: "Cleanup lifecycle fixture".into(),
-            capability: Default::default(),
+            capability: crate::provider::ProviderCapability {
+                native_turn_rollback: true,
+                ..Default::default()
+            },
         };
         let signals = Arc::new(CleanupSignals {
+            scope: std::sync::Mutex::new(None),
             started: Notify::new(),
             complete: Notify::new(),
             settled: Notify::new(),
@@ -14589,7 +14227,11 @@ mod test {
                         thread_id: "cleanup-fixture-session".into(),
                         turn_id: "cleanup-fixture-turn".into(),
                     };
-                    let sink = sink.invocation_sink(&request.scope)?;
+                    let checkpoint = format!(
+                        "cleanup-fixture:{}:{}",
+                        request.submission_id.as_str(),
+                        request.attempt_id.as_str()
+                    );
                     sink.send_wait(ProviderEvent::Execution {
                         observation: ExecutionObservation::new(
                             request.scope.clone(),
@@ -14612,6 +14254,7 @@ mod test {
                         })
                         .await?;
                     }
+                    *signals.scope.lock().unwrap() = Some(request.scope.clone());
                     signals.started.notify_one();
                     signals.complete.notified().await;
                     sink.send_wait(ProviderEvent::Execution {
@@ -14623,8 +14266,10 @@ mod test {
                                 completed_at_ms: 100,
                                 result: ExecutionResult::Cancelled {
                                     completion:
-                                        forge_provider_api::completion::ProviderCompletion::default(
-                                        )
+                                        forge_provider_api::completion::ProviderCompletion {
+                                            provider_checkpoint_id: Some(checkpoint),
+                                            ..Default::default()
+                                        }
                                         .into(),
                                 },
                             },
@@ -14643,7 +14288,7 @@ mod test {
                 if signals.attempt.fetch_add(1, Ordering::SeqCst) == 0 {
                     return Err(forge_provider_api::ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::CleanupExecution,
+                            forge_provider_api::ProviderOperation::Cancel,
                             forge_provider_api::ProviderFailureKind::Timeout,
                         ),
                     ));
@@ -14669,7 +14314,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker
-            .create_goal("Complete implementation".into(), false)
+            .create_goal("Complete implementation".into())
             .unwrap();
         let mut exchange = completed_interaction("paused-restart", &broker.session.id, Vec::new());
         exchange.phase = crate::exchange::ExchangePhase::Running;
@@ -14702,9 +14347,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker
-            .create_goal("Finish implementation".into(), false)
-            .unwrap();
+        broker.create_goal("Finish implementation".into()).unwrap();
         broker
             .task_controller
             .change(
@@ -14792,7 +14435,13 @@ mod test {
         let control = async {
             signals.started.notified().await;
             cancellation.begin_cleanup(false).unwrap();
-            let error = provider.cleanup_execution(&session_id).await.unwrap_err();
+            let scope = signals
+                .scope
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("fixture dispatched invocation");
+            let error = provider.cancel_invocation(scope.clone()).await.unwrap_err();
             cancellation.fail_cleanup(&error);
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
@@ -14810,7 +14459,7 @@ mod test {
             .await
             .expect("cleanup failure should persist without losing provider delivery");
             cancellation.begin_cleanup(false).unwrap();
-            provider.cleanup_execution(&session_id).await.unwrap();
+            provider.cancel_invocation(scope).await.unwrap();
             cancellation.request(false);
         };
         let execution = broker.run_interaction(
@@ -15144,7 +14793,7 @@ mod test {
                         .map_err(|_| {
                             crate::provider::ProviderError::Failure(
                                 forge_provider_api::ProviderFailure::new(
-                                    forge_provider_api::ProviderOperation::NativeTransport,
+                                    forge_provider_api::ProviderOperation::InputSubmit,
                                     forge_provider_api::ProviderFailureKind::Unknown,
                                 ),
                             )
@@ -15152,7 +14801,7 @@ mod test {
                     std::fs::write(&nested, "written before provider failure\n").map_err(|_| {
                         crate::provider::ProviderError::Failure(
                             forge_provider_api::ProviderFailure::new(
-                                forge_provider_api::ProviderOperation::NativeTransport,
+                                forge_provider_api::ProviderOperation::InputSubmit,
                                 forge_provider_api::ProviderFailureKind::Unknown,
                             ),
                         )
@@ -15472,7 +15121,7 @@ mod test {
         {
             return Err(forge_provider_api::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::AdmitInput,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     forge_provider_api::ProviderFailureKind::Authorization,
                 ),
             ));
@@ -15509,7 +15158,7 @@ mod test {
             if !request.tools.iter().any(|tool| tool.name == "plan_submit") {
                 return Err(forge_provider_api::ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::AdmitInput,
+                        forge_provider_api::ProviderOperation::InputSubmit,
                         forge_provider_api::ProviderFailureKind::Authorization,
                     ),
                 ));
@@ -15670,7 +15319,6 @@ mod test {
                         thread_id: "nested-write-fixture".into(),
                         turn_id: "turn-1".into(),
                     };
-                    let sink = sink.invocation_sink(&scope)?;
                     sink.send_wait(ProviderEvent::Execution {
                         observation: ExecutionObservation::new(
                             scope.clone(),
@@ -16383,9 +16031,9 @@ mod test {
 
     fn mutable_question_broker(repository: &Path, data_root: &Path) -> HarnessBroker {
         let mut broker = planning_question_broker(repository, data_root, false);
-        let native: Arc<dyn forge_provider_api::provider::Provider> = mutable_question_fixture();
+        let native = mutable_question_fixture();
         broker.provider = Arc::new(crate::provider::Provider::new(
-            native,
+            native.registration(),
             broker.permission_coordinator.clone(),
             broker.trace.clone(),
             broker.data_root.clone(),
@@ -16918,11 +16566,15 @@ mod test {
             .test_apply_provider_event(
                 &mut runtime,
                 &mut exchange,
-                crate::provider::ProviderRuntime {
-                    provider: "Fixture Provider".into(),
-                    model: Some("resolved-model".into()),
-                }
-                .resolved_event(fixture_scope),
+                crate::provider::ProviderEvent::Runtime {
+                    scope: fixture_scope,
+                    update: crate::provider::RuntimeUpdate::Resolved {
+                        runtime: crate::provider::ProviderRuntime {
+                            provider: "Fixture Provider".into(),
+                            model: Some("resolved-model".into()),
+                        },
+                    },
+                },
                 &mut events,
             )
             .await
@@ -17127,9 +16779,10 @@ mod test {
         assert_eq!(exchange.tools_for_turn(exchange.turn[0].id()).count(), 1);
     }
 
-    /// A continuation queued during finalization settles the original exchange before checkpoint commit.
+    /// Reject autonomous execution after settlement without reopening committed history.
     #[tokio::test]
-    async fn native_continuation_invalidates_pending_settlement() -> Result<()> {
+    async fn native_execution_after_settlement_fences_reuse_without_reopening_history() -> Result<()>
+    {
         use forge_provider_api::lifecycle::{
             ExecutionObservation, ExecutionResult, ExecutionUpdate,
         };
@@ -17137,58 +16790,114 @@ mod test {
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.checkpoint = None;
-        let mut exchange = completed_interaction("continued", &broker.session.id, Vec::new());
-        exchange.phase = crate::exchange::ExchangePhase::Running;
-        let scope = crate::provider::InvocationScope::new(
-            crate::provider::ExecutionOwner::root(&broker.session.id),
-            exchange.id.clone(),
+        let observed_scope = Arc::new(std::sync::Mutex::new(None));
+        let supplied_scope = observed_scope.clone();
+        let descriptor = forge_providers::registry::descriptor(
+            &forge_providers::registry::nonselectable_id().expect("fixture identity"),
+        )?;
+        let native = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor,
+            move |request, sink, _| {
+                *supplied_scope.lock().unwrap() = Some(request.scope.clone());
+                async move {
+                    let address =
+                        crate::provider::test_support::address(&request.scope, "native", "first");
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            request.scope.clone(),
+                            ExecutionUpdate::Started {
+                                address: address.clone(),
+                            },
+                        )?,
+                    })
+                    .await?;
+                    for event in completed_message(
+                        &address,
+                        "answer",
+                        crate::provider::MessageRole::Response,
+                        "Settled answer",
+                    ) {
+                        sink.send_wait(event).await?;
+                    }
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: ExecutionObservation::new(
+                            request.scope,
+                            ExecutionUpdate::Finished {
+                                address,
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: 40,
+                                result: ExecutionResult::Completed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion::default(
+                                        )
+                                        .into(),
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok(())
+                }
+            },
         );
-        let first = crate::provider::TurnAddress {
-            scope: scope.clone(),
-            thread_id: "native".into(),
-            turn_id: "first".into(),
-        };
-        exchange.start_turn(first.clone(), 10)?;
-        exchange
-            .turn_mut(&first)
-            .unwrap()
-            .finish(crate::turn::TurnOutcome::Completed, 20)?;
-        broker.store.save_exchange(&exchange)?;
-        let next = crate::provider::TurnAddress {
-            scope: scope.clone(),
-            thread_id: "native".into(),
-            turn_id: "second".into(),
-        };
-        for update in [
-            ExecutionUpdate::Started {
-                address: next.clone(),
-            },
-            ExecutionUpdate::Finished {
-                address: next,
-                covered_submissions: Vec::new(),
-                completed_at_ms: 40,
-                result: ExecutionResult::Completed {
-                    completion: forge_provider_api::completion::ProviderCompletion::default()
-                        .into(),
-                },
-            },
-        ] {
-            broker
-                .observer
-                .session_events()
-                .push(ProviderEvent::Execution {
-                    observation: ExecutionObservation::new(scope.clone(), update)?,
-                })?;
-        }
+        let provider =
+            crate::provider::test_support::ProviderTestSession::from_native(native.clone())?;
+        broker.set_provider_for_test(provider.provider_handle());
         broker
-            .capture_final_checkpoint(&mut exchange, crate::exchange::ExchangeOutcome::Complete)
+            .run_interaction(
+                "Finish one invocation".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Finish one invocation".into())),
+            )
             .await?;
-        assert_eq!(exchange.state(), ExchangeState::Complete);
-        assert_eq!(exchange.turn.len(), 2);
-        assert_eq!(broker.reopened_execution.revision(&scope), 1);
-        assert!(!broker.reopened_execution.active(&scope));
-        let saved = broker.store.load_exchange(&exchange.id)?.unwrap();
-        assert_eq!(saved.turn.len(), 2);
+        let scope = observed_scope
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("ordinary input supplied its scope");
+        let engine = broker
+            .execution_registry()
+            .existing_owner(&scope.owner)?
+            .expect("the settled owner remains observable");
+        let saved = broker
+            .store
+            .latest_exchange(&broker.session.id)?
+            .expect("completed exchange was saved");
+        let turn_count = saved.turn.len();
+        native
+            .invocation_sink(&scope)
+            .await?
+            .send_wait(ProviderEvent::Execution {
+                observation: ExecutionObservation::new(
+                    scope.clone(),
+                    ExecutionUpdate::Started {
+                        address: crate::provider::test_support::address(
+                            &scope,
+                            "native",
+                            "unrequested",
+                        ),
+                    },
+                )?,
+            })
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while engine.is_healthy().await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert!(matches!(
+            broker.observer.session_events().end(),
+            Some(crate::provider::session_execution::ObservationEnd::Lost(
+                forge_provider_api::ObservationFailure::OwnershipConflict
+            ))
+        ));
+        assert!(engine.invocation_active_snapshot(&scope).is_err());
+        let saved = broker
+            .store
+            .load_exchange(&saved.id)?
+            .expect("history survives rejected native work");
+        assert_eq!(saved.turn.len(), turn_count);
         assert_eq!(saved.state(), ExchangeState::Complete);
         Ok(())
     }
@@ -18435,7 +18144,7 @@ mod test {
             .collect::<Vec<_>>();
         let provider_fork = fork_controller
             .provider
-            .fork(preparation.provider_request)
+            .session_fork(preparation.provider_request)
             .await
             .unwrap();
         let mut child_initialize = initialize("fork-client", None);
@@ -18636,7 +18345,7 @@ mod test {
             |_request, _sink, _cancelled| async {
                 Err(crate::provider::ProviderError::Failure(
                     ProviderFailure::new(
-                        ProviderOperation::AdmitInput,
+                        ProviderOperation::InputSubmit,
                         ProviderFailureKind::Rejected,
                     ),
                 ))
@@ -19156,6 +18865,116 @@ mod test {
             .unwrap()
             .expect("persisted source session");
         assert_eq!(persisted.lease_owner.as_deref(), Some("foreign-client"));
+    }
+
+    #[tokio::test]
+    async fn resume_keeps_native_identity_without_complete_unconsumed_input_evidence() -> Result<()>
+    {
+        for boundary in [
+            "missing",
+            "sending",
+            "accepted",
+            "foreign_owner",
+            "native_checkpoint",
+            "missing_second_input",
+        ] {
+            let repository = repository();
+            let data = tempfile::tempdir()?;
+            let mut broker = planning_question_broker(repository.path(), data.path(), false);
+            let session_id = broker.session.id.clone();
+            broker.session.provider_session_id = Some("unused-native-history".into());
+            if boundary == "native_checkpoint" {
+                broker.session.provider_checkpoint_id = Some("native-checkpoint".into());
+            }
+            broker.store.save_session(&broker.session)?;
+            let (mut exchange, _, _) = broker
+                .test_stage_interaction_for_turn("Retain this input", true, 100)
+                .await?;
+            exchange.input_message_id = Some("retained-input".into());
+            exchange.checkpoint_before = Some("host-workspace-baseline".into());
+            exchange.finish(crate::exchange::ExchangeOutcome::Cancelled, 101)?;
+            broker.store.save_exchange(&exchange)?;
+            if boundary != "missing" {
+                let mut request = broker.input_submission_request(
+                    ProviderInput::from_text(&exchange.prompt),
+                    PromptMode::Chat,
+                )?;
+                if boundary == "foreign_owner" {
+                    request.execution_owner = Some(crate::provider::ExecutionOwner {
+                        session_id: session_id.clone().into(),
+                        agent_id: "other-agent".into(),
+                    });
+                }
+                let submission = broker.submission_store.prepare_input_request(
+                    &request,
+                    broker.provider.descriptor().kind,
+                    crate::provider::submission::SubmissionOrigin::QueuedInput(
+                        crate::exchange::command::InputId::new("retained-input")?,
+                    ),
+                )?;
+                match boundary {
+                    "sending" => {
+                        submission.sending(None)?;
+                        submission.failed("unknown transport outcome".into())?;
+                    }
+                    "accepted" => submission.accepted(None)?,
+                    _ => submission.cancel()?,
+                }
+            }
+            if boundary == "missing_second_input" {
+                let mut second = exchange.clone();
+                second.id = uuid::Uuid::new_v4().to_string();
+                second.input_message_id = Some("unjournaled-input".into());
+                second.ordinal += 1;
+                broker.store.save_exchange(&second)?;
+            }
+            broker.release_lease()?;
+            drop(broker);
+            let mut request = InitializeRequest {
+                background: None,
+                provider_launch_by_provider: Default::default(),
+                config_dir: None,
+                data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
+                workspace: repository.path().to_string_lossy().into_owned(),
+                client_id: "resumed-client".into(),
+                provider: ProviderLaunch {
+                    kind: forge_providers::registry::nonselectable_id().unwrap(),
+                    command: vec!["mock".into()],
+                },
+                model: "mock-model".into(),
+                effort: "low".into(),
+                session_id: Some(session_id.clone()),
+                new_session_name: None,
+                goal_max_turns: 20,
+                lease_conflict_action: None,
+            };
+            let resumed =
+                HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(200)))?;
+            assert_eq!(
+                resumed.session.provider_session_id.as_deref(),
+                Some("unused-native-history"),
+                "{boundary}"
+            );
+            assert_eq!(
+                resumed
+                    .store
+                    .load_exchange(&exchange.id)?
+                    .unwrap()
+                    .checkpoint_before,
+                exchange.checkpoint_before
+            );
+            // A second reopen must not turn retained uncertainty into positive evidence.
+            drop(resumed);
+            request.client_id = "resumed-again".into();
+            let resumed = HarnessBroker::initialize_with_clock(request, Box::new(FixedClock(300)))?;
+            assert_eq!(
+                resumed.session.provider_session_id.as_deref(),
+                Some("unused-native-history"),
+                "{boundary}"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -19712,7 +19531,7 @@ mod test {
                 }
             },
         );
-        let fixture = fixture.with_goal_status(|_owner, _update| async { Ok(()) });
+
         crate::provider::test_support::ProviderTestSession::from_native(fixture)
     }
 
@@ -19768,7 +19587,6 @@ mod test {
                 crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                     "Current task".into(),
                     Default::default(),
-                    false,
                     1,
                 ))),
                 1,

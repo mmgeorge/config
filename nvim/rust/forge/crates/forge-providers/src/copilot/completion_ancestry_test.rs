@@ -30,19 +30,6 @@ impl forge_provider_api::turn_control::TurnControl for CompletionControl {
     }
 }
 
-struct CompletionEffects;
-
-#[async_trait]
-impl forge_provider_api::ProviderHostEffects for CompletionEffects {
-    async fn settle_foreground(
-        &self,
-        _: &forge_provider_api::BindingId,
-        _: &forge_provider_api::InvocationScope,
-    ) -> Result<(), forge_provider_api::session::HostEffectFailure> {
-        Ok(())
-    }
-}
-
 /// Complete real SDK Chat and Background turns when live ancestry omits its durable usage node.
 #[tokio::test]
 async fn sdk_turn_completion_survives_omitted_ancestry_and_reused_zero_turn_id() {
@@ -65,14 +52,11 @@ async fn sdk_turn_completion_survives_omitted_ancestry_and_reused_zero_turn_id()
                 let submission_id = forge_provider_api::SubmissionId::try_from(format!("submission-{ordinal}")).unwrap();
                 let options = super::super::prompt::TurnOptions {
                     scope: scope.clone(),
-                    binding_id,
-                    host_effects: Arc::new(CompletionEffects),
                     workspace: std::env::temp_dir().to_string_lossy().into_owned(),
                     model: None,
                     capability: capability.clone(),
                     input: forge_provider_api::PromptInput::Text(format!("request {ordinal}")),
                     task: None,
-                    goal: None,
                     recovered: Vec::new(),
                     instructions: String::new(),
                     repair_caution: None,
@@ -114,7 +98,11 @@ async fn sdk_turn_completion_survives_omitted_ancestry_and_reused_zero_turn_id()
             assert_eq!(completed, [0, 1]);
             let methods = peer.methods.lock().unwrap().clone();
             assert_eq!(methods.iter().filter(|method| method.as_str() == "session.send").count(), 2);
-            assert!(!methods.iter().any(|method| method == "session.abort" || method == "session.eventLog.read"));
+            assert!(!methods.iter().any(|method| method == "session.abort"));
+            assert_eq!(methods.iter().filter(|method| method.as_str() == "session.eventLog.read").count(), 2, "completion unexpectedly read back output instead of using live ancestry");
+            for index in methods.iter().enumerate().filter_map(|(index, method)| (method == "session.send").then_some(index)) {
+                assert_eq!(&methods[index - 2..index], ["session.eventLog.tail", "session.eventLog.read"], "journal boundary was not captured before native input");
+            }
             sessions.retire(&owner.runtime_key()).await.unwrap();
             runtime.shutdown().await.unwrap();
             let _ = peer.stop.send(());

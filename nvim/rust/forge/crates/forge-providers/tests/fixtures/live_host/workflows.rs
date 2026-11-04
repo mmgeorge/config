@@ -13,7 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Own a production task coordinator and drain its client stream during each request.
-struct WorkflowService {
+pub(super) struct WorkflowService {
     service: forge_harness::service::HarnessService,
     session_id: String,
     sink: forge_protocol::outbound::MessageSender,
@@ -26,7 +26,7 @@ struct WorkflowService {
 
 impl WorkflowService {
     /// Open one isolated session with the production task execution supervisor.
-    async fn open(initialize: InitializeRequest) -> Result<Self> {
+    pub(super) async fn open(initialize: InitializeRequest) -> Result<Self> {
         let data_root = std::path::PathBuf::from(&initialize.data_root);
         let diff = forge_diff::engine::DiffEngine::new(Default::default(), 1);
         let syntax = forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool());
@@ -61,7 +61,7 @@ impl WorkflowService {
     }
 
     /// Await the correlated response while consuming provider progress without backpressure.
-    async fn request(
+    pub(super) async fn request(
         &mut self,
         method: &str,
         params: serde_json::Value,
@@ -258,7 +258,7 @@ impl WorkflowService {
     }
 
     /// Drain the service until the input lane and its persisted exchange have both settled.
-    async fn wait_idle(&mut self) -> Result<()> {
+    pub(super) async fn wait_idle(&mut self) -> Result<()> {
         loop {
             let input = self.request("session.input.get", json!({})).await?;
             self.assert_exchange_health()?;
@@ -290,8 +290,22 @@ impl WorkflowService {
         }
     }
 
+    /// Observe exact-binding terminals through the production presentation route.
+    pub(super) async fn terminal_snapshot(
+        &self,
+    ) -> Result<forge_provider_api::terminal::TerminalSnapshot> {
+        let snapshot = self
+            .service
+            .document(
+                Some(self.session_id.clone()),
+                forge_harness::buffer::session::PresentationRequest::BackgroundTerminals,
+            )
+            .await?;
+        Ok(serde_json::from_value(snapshot)?)
+    }
+
     /// Collect every provider and background task owned by this fixture.
-    async fn shutdown(&self) -> Result<()> {
+    pub(super) async fn shutdown(&self) -> Result<()> {
         self.service
             .shutdown(std::time::Duration::from_secs(10))
             .await
@@ -735,8 +749,9 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
     let provider_name = provider;
     let provider = create_provider(provider, &initialize, &request)?;
     let result: Result<()> = async {
-        request.provider_session_id = provider.initialize_session(request.clone()).await?;
-        let (sink, mut stream) = forge_harness::provider::events::channel(InvocationScope::new(request.owner()?, "cancel-tool"));
+        request.provider_session_id = provider.session_open(request.clone()).await?;
+        let scope = InvocationScope::new(request.owner()?, "cancel-tool");
+        let (sink, mut stream) = forge_harness::provider::events::channel(scope.clone());
         let execution = provider.session_prompt_and_wait(request.clone(), sink);
         tokio::pin!(execution);
         let mut observed = Vec::new();
@@ -759,9 +774,8 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
             }
         }
         let command_started_at = tokio::time::Instant::now();
-        let cancellation_session_id = request.harness_session_id.clone();
         let cancellation = async {
-            tokio::join!(provider.as_provider().cancel_session(&cancellation_session_id), &mut execution)
+            tokio::join!(provider.as_provider().cancel_invocation(scope), &mut execution)
         };
         tokio::pin!(cancellation);
         let mut stream_open = true;
@@ -777,7 +791,8 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
                 }
             }
         };
-        cancelled?;
+        let settlement = cancelled?;
+        ensure!(matches!(settlement.result, forge_provider_api::ExecutionResult::Cancelled { .. }), "interruption did not collect the exact invocation");
         while let Some(event) = stream.try_next()? {
             observed.push(event);
         }
@@ -794,7 +809,7 @@ async fn cancelled_tool_retry(provider: &str) -> Result<()> {
         // Observe past the command's scheduled write; a closed turn alone does not prove process cancellation.
         tokio::time::sleep_until(command_started_at + std::time::Duration::from_secs(5)).await;
         ensure!(!finished.exists(), "cancelled native command continued executing after turn settlement");
-        request.provider_session_id = provider.as_provider().active_session_id_for(&request.harness_session_id).await?;
+        request.provider_session_id = provider.as_provider().retained_session_id(&request.owner()?).await;
         request.input = ProviderInput::from_text("The previous command was intentionally cancelled. Use a tool to read input.txt, then reply with its exact token. Do not run another sleep.");
         let retried = provider.session_prompt_and_collect(request).await?;
         ensure!(retried.event.iter().any(|event| matches!(event, ProviderEvent::Tool { update: ToolUpdate::Finished { .. }, .. })), "retry did not execute a tool");

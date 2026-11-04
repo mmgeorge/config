@@ -104,7 +104,7 @@ impl RollbackRun {
                 self.transition
                     .as_mut()
                     .expect("rollback collection retains its transition")
-                    .next(foreground)
+                    .next(foreground.clone())
                     .await,
             ),
             RollbackStage::Prepare => RollbackEvent::Prepare,

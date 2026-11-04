@@ -538,8 +538,6 @@ impl BoundarySteeringProvider {
         };
         let initial_started = self.initial_started.clone();
         let initial_release = self.initial_release.clone();
-        let continuation_started = self.continuation_started.clone();
-        let continuation_accept = self.continuation_accept.clone();
         let continuation_release = self.continuation_release.clone();
         let input = self.input.clone();
         let fail_response = self.fail_response.clone();
@@ -549,8 +547,6 @@ impl BoundarySteeringProvider {
             move |request, sink, _cancelled| {
                 let initial_started = initial_started.clone();
                 let initial_release = initial_release.clone();
-                let continuation_started = continuation_started.clone();
-                let continuation_accept = continuation_accept.clone();
                 let continuation_release = continuation_release.clone();
                 let input = input.clone();
                 let fail_response = fail_response.clone();
@@ -567,10 +563,6 @@ impl BoundarySteeringProvider {
                     };
                     input.lock().unwrap().push(text.clone());
                     let continuation = text == "boundary correction";
-                    if continuation {
-                        continuation_started.add_permits(1);
-                        crate::provider::test_support::wait_gate(&continuation_accept).await?;
-                    }
                     let address = crate::provider::TurnAddress {
                         scope: request.scope.clone(),
                         thread_id: "boundary-thread".into(),
@@ -581,6 +573,10 @@ impl BoundarySteeringProvider {
                         }
                         .into(),
                     };
+                    sink.send_wait(ProviderEvent::SessionIdentity {
+                        scope: request.scope.clone().into(),
+                        provider_session_id: "boundary-history".to_owned().try_into().expect("fixture history is nonempty"),
+                    }).await?;
                     sink.send_wait(ProviderEvent::Execution {
                         observation: forge_provider_api::lifecycle::ExecutionObservation::new(
                             request.scope.clone(),
@@ -609,7 +605,7 @@ impl BoundarySteeringProvider {
                             forge_provider_api::lifecycle::ExecutionResult::Cancelled {
                                 completion: forge_provider_api::completion::ProviderCompletion {
                                     provider_session_id: Some(
-                                        "boundary-thread"
+                                        "boundary-history"
                                             .to_owned()
                                             .try_into()
                                             .expect("fixture ID is valid"),
@@ -634,7 +630,7 @@ impl BoundarySteeringProvider {
                             forge_provider_api::lifecycle::ExecutionResult::Completed {
                                 completion: forge_provider_api::completion::ProviderCompletion {
                                     provider_session_id: Some(
-                                        "boundary-thread"
+                                        "boundary-history"
                                             .to_owned()
                                             .try_into()
                                             .expect("fixture ID is valid"),
@@ -670,17 +666,25 @@ impl BoundarySteeringProvider {
                 }
             },
         );
+        let continuation_started = self.continuation_started.clone();
+        let continuation_accept = self.continuation_accept.clone();
+        provider.with_pre_dispatch(move |request| {
+            let continuation_started = continuation_started.clone();
+            let continuation_accept = continuation_accept.clone();
+            async move {
+                if matches!(&request.input, forge_provider_api::PromptInput::Text(text) if text == "boundary correction") {
+                    continuation_started.add_permits(1);
+                    crate::provider::test_support::wait_gate(&continuation_accept).await?;
+                }
+                Ok(())
+            }
+        });
         let deferred = self.steering_deferred.clone();
         provider.with_steering(move |_request| {
             let deferred = deferred.clone();
             async move {
                 deferred.add_permits(1);
-                Err(crate::provider::ProviderError::NotConsumed {
-                    continuation: forge_provider_api::ContinuationToken::new(
-                        uuid::Uuid::new_v4().as_bytes().to_vec(),
-                    )
-                    .expect("UUID is nonempty"),
-                })
+                Err(crate::provider::ProviderError::NotConsumed)
             }
         })
     }
@@ -709,7 +713,7 @@ async fn cancelled_terminal_releases_undispatched_steering_before_retention() ->
     let submission = broker.submission_store.prepare_input(
         &catalog,
         ProviderInput::from_text("Retain café 東京"),
-        forge_providers::registry::default_id(),
+        broker.provider.descriptor().kind,
         Some("cancelled-followup".into()),
     )?;
     let running = tokio::spawn(async move {
@@ -773,6 +777,7 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
                 provider.fixture(),
             )?;
             broker.provider = session.provider_handle();
+            let provider_id = broker.provider.descriptor().kind;
             let lane = broker.parent_input.clone();
             let catalog = broker.provider_catalog_request()?;
             let cancellation = broker.turn_cancellation();
@@ -795,7 +800,7 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
             let submission = journal.prepare_input(
                 &catalog,
                 ProviderInput::from_text("boundary correction"),
-                forge_providers::registry::default_id(),
+                provider_id,
                 Some("cancel-boundary-message".into()),
             )?;
             let mut steering = Box::pin(lane.steer(crate::provider::SteeringInput::User {
@@ -806,7 +811,7 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
             assert!(futures_util::poll!(steering.as_mut()).is_pending());
             await_boundary_barrier(&provider.steering_deferred, "native steering deferral").await?;
             provider.initial_release.add_permits(1);
-            await_boundary_barrier(&provider.continuation_started, "continuation dispatch").await?;
+            await_boundary_barrier(&provider.continuation_started, "continuation preparation").await?;
             if accept_before_cancel {
                 provider.continuation_accept.add_permits(1);
                 tokio::time::timeout(std::time::Duration::from_secs(3), &mut steering)
@@ -862,24 +867,31 @@ async fn assert_deferred_steering_delivery(fail_response: bool) -> Result<()> {
         provider.fail_response.store(fail_response, std::sync::atomic::Ordering::Release);
         let session = crate::provider::test_support::ProviderTestSession::from_native(provider.fixture())?;
         broker.provider = session.provider_handle();
+        let provider_id = broker.provider.descriptor().kind;
         let lane = broker.parent_input.clone();
         let catalog = broker.provider_catalog_request()?;
         let journal = crate::provider::submission::SubmissionStore::open(data.path(), broker.trace.clone())?;
-        let running = tokio::spawn(async move {
+        let mut running = tokio::spawn(async move {
             let result = broker.run_interaction("initial request".into(), PromptMode::Chat,
                 Some(ExchangeAdmission::chat("initial request".into()))).await;
             (broker, result)
         });
-        await_boundary_barrier(&provider.initial_started, "initial native start").await?;
+        tokio::select! {
+            started = await_boundary_barrier(&provider.initial_started, "initial native start") => started?,
+            finished = &mut running => {
+                let (_, result) = finished?;
+                anyhow::bail!("boundary foreground ended before initial native start: {result:?}");
+            }
+        }
         let submission = journal.prepare_input(&catalog,
-            ProviderInput::from_text("boundary correction"), forge_providers::registry::default_id(), Some("boundary-message".into()))?;
+            ProviderInput::from_text("boundary correction"), provider_id, Some("boundary-message".into()))?;
         let mut steering = Box::pin(lane.steer(crate::provider::SteeringInput::User {
             text: "boundary correction".into(), attachments: Vec::new(), submission: Some(submission.clone()),
         }));
         assert!(futures_util::poll!(steering.as_mut()).is_pending());
         await_boundary_barrier(&provider.steering_deferred, "native steering deferral").await?;
         provider.initial_release.add_permits(1);
-        await_boundary_barrier(&provider.continuation_started, "continuation dispatch").await?;
+        await_boundary_barrier(&provider.continuation_started, "continuation preparation").await?;
         assert!(matches!(submission.record()?.delivery, crate::provider::submission::SubmissionState::Prepared));
         assert!(futures_util::poll!(steering.as_mut()).is_pending(),
             "a continuation was acknowledged while its journal still allowed requeueing");
@@ -928,12 +940,13 @@ async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<
     });
     let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
     broker.provider = fixture.provider_handle();
+    let provider_id = broker.provider.descriptor().kind;
     let lane = broker.parent_input.clone();
     let catalog = broker.provider_catalog_request()?;
     let cancellation = broker.turn_cancellation();
     let journal =
         crate::provider::submission::SubmissionStore::open(data.path(), broker.trace.clone())?;
-    let running = tokio::spawn(async move {
+    let mut running = tokio::spawn(async move {
         broker
             .run_interaction(
                 "initial request".into(),
@@ -942,11 +955,16 @@ async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<
             )
             .await
     });
-    provider.inner.initial_started.acquire().await?.forget();
+    tokio::select! {
+        started = await_boundary_barrier(&provider.inner.initial_started, "initial native start") => started?,
+        finished = &mut running => {
+            anyhow::bail!("slow steering foreground ended before initial native start: {:?}", finished?);
+        }
+    }
     let submission = journal.prepare_input(
         &catalog,
         ProviderInput::from_text("keep working"),
-        forge_providers::registry::default_id(),
+        provider_id,
         Some("slow-steering".into()),
     )?;
     let mut steering = std::pin::pin!(lane.steer(crate::provider::SteeringInput::User {
@@ -955,7 +973,16 @@ async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<
         submission: Some(submission.clone()),
     }));
     assert!(futures_util::poll!(steering.as_mut()).is_pending());
-    provider.steering_started.acquire().await?.forget();
+    tokio::select! {
+        started = await_boundary_barrier(&provider.steering_started, "native steering admission") => started?,
+        finished = &mut running => {
+            anyhow::bail!("slow steering foreground ended before native steering admission: {:?}", finished?);
+        }
+    }
+    assert!(matches!(
+        submission.record()?.delivery,
+        crate::provider::submission::SubmissionState::Sending { .. }
+    ), "native steering admission did not preserve its unacknowledged transport boundary");
 
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(29)).await;

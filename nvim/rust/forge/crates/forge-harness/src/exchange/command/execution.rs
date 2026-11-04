@@ -137,6 +137,54 @@ struct StoredExecutionSelection {
     request: ExecuteSelection,
 }
 
+/// Bind pending approval to the exact committed question set and answer revision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PlanQuestionSetSelection {
+    id: ApprovalQuestionSetId,
+    revision: std::num::NonZeroU32,
+    answer_revision: u64,
+}
+
+impl PlanQuestionSetSelection {
+    /// Capture the committed question identity and revision without retargeting later answers.
+    pub(crate) fn capture(
+        elicitation: &crate::plan::PlanElicitation,
+    ) -> Result<Self, TaskCommandFailure> {
+        Ok(Self {
+            id: ApprovalQuestionSetId::new(elicitation.question_set.id.clone())
+                .map_err(|_| TaskCommandFailure::InvalidPlanSelection)?,
+            revision: std::num::NonZeroU32::new(elicitation.revision)
+                .ok_or(TaskCommandFailure::InvalidPlanSelection)?,
+            answer_revision: elicitation.answer_revision,
+        })
+    }
+
+    /// Require the same question content and answer revision before a continuation may apply.
+    pub(crate) fn validate(
+        &self,
+        elicitation: &crate::plan::PlanElicitation,
+    ) -> Result<(), TaskCommandFailure> {
+        if self.id.as_str() != elicitation.question_set.id
+            || self.revision.get() != elicitation.revision
+            || self.answer_revision != elicitation.answer_revision
+        {
+            return Err(TaskCommandFailure::PlanChanged);
+        }
+        Ok(())
+    }
+
+    /// Get the exact pending question set identity.
+    pub(crate) fn id(&self) -> &ApprovalQuestionSetId {
+        &self.id
+    }
+
+    /// Get the committed question and answer revision.
+    pub(crate) fn revision(&self) -> u32 {
+        self.revision.get()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,7 +195,7 @@ mod tests {
     fn question_selection_rejects_changed_answers_and_zero_content_revision() -> anyhow::Result<()>
     {
         let mut elicitation = crate::plan::PlanElicitation::new(
-            crate::plan::PlanQuestionSet::freeform("Decision?".into()),
+            crate::plan::PlanQuestionSet::freeform("Decision?".into()).normalize()?,
         );
         let selection = PlanQuestionSetSelection::capture(&elicitation)?;
         elicitation.answer_revision += 1;
@@ -208,53 +256,5 @@ mod tests {
             json!([{"start_line":0,"end_line":1,"body":"Invalid range"}]);
         assert!(serde_json::from_value::<PlanExecutionSelection>(invalid).is_err());
         Ok(())
-    }
-}
-
-/// Bind pending approval to the exact committed question set and answer revision.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct PlanQuestionSetSelection {
-    id: ApprovalQuestionSetId,
-    revision: std::num::NonZeroU32,
-    answer_revision: u64,
-}
-
-impl PlanQuestionSetSelection {
-    /// Capture the committed question identity and revision without retargeting later answers.
-    pub(crate) fn capture(
-        elicitation: &crate::plan::PlanElicitation,
-    ) -> Result<Self, TaskCommandFailure> {
-        Ok(Self {
-            id: ApprovalQuestionSetId::new(elicitation.question_set.id.clone())
-                .map_err(|_| TaskCommandFailure::InvalidPlanSelection)?,
-            revision: std::num::NonZeroU32::new(elicitation.revision)
-                .ok_or(TaskCommandFailure::InvalidPlanSelection)?,
-            answer_revision: elicitation.answer_revision,
-        })
-    }
-
-    /// Require the same question content and answer revision before a continuation may apply.
-    pub(crate) fn validate(
-        &self,
-        elicitation: &crate::plan::PlanElicitation,
-    ) -> Result<(), TaskCommandFailure> {
-        if self.id.as_str() != elicitation.question_set.id
-            || self.revision.get() != elicitation.revision
-            || self.answer_revision != elicitation.answer_revision
-        {
-            return Err(TaskCommandFailure::PlanChanged);
-        }
-        Ok(())
-    }
-
-    /// Get the exact pending question set identity.
-    pub(crate) fn id(&self) -> &ApprovalQuestionSetId {
-        &self.id
-    }
-
-    /// Get the committed question and answer revision.
-    pub(crate) fn revision(&self) -> u32 {
-        self.revision.get()
     }
 }

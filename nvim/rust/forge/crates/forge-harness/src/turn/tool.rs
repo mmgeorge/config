@@ -195,7 +195,7 @@ impl ToolStore {
         let id = address.tool_id.as_str();
         let protocol = |_message: &str| {
             crate::provider::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::CollectEventReader,
+                forge_provider_api::ProviderOperation::InputSubmit,
                 forge_provider_api::ProviderFailureKind::Protocol,
             ))
         };

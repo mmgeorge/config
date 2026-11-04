@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use forge_provider_api::terminal::{BackgroundTerminal, TerminalSnapshot};
+use forge_provider_api::terminal::{BackgroundTerminal, TerminalId, TerminalSnapshot};
 use serde_json::Value;
 
 /// Normalize a provider inventory while excluding agents and completed shell tasks.
@@ -26,6 +26,8 @@ pub fn parse_snapshot(value: &Value, copilot: bool) -> Result<TerminalSnapshot> 
             .get(if copilot { "id" } else { "processId" })
             .and_then(Value::as_str)
             .context("background terminal identity is missing")?;
+        let id = TerminalId::try_from(id.to_owned())
+            .context("background terminal identity is invalid")?;
         let command = row
             .get("command")
             .and_then(Value::as_str)
@@ -35,7 +37,7 @@ pub fn parse_snapshot(value: &Value, copilot: bool) -> Result<TerminalSnapshot> 
             .any(|item: &BackgroundTerminal| item.id == id)
         {
             terminal.push(BackgroundTerminal {
-                id: id.into(),
+                id,
                 command: forge_shell::command::display_command(
                     command,
                     forge_shell::shell::CommandShell::default(),
@@ -67,7 +69,10 @@ mod tests {
             .collect::<Vec<_>>();
         let snapshot = parse_snapshot(&json!({"data":rows}), false).unwrap();
         assert_eq!(snapshot.terminal.len(), 1025);
-        assert_eq!(snapshot.terminal[1024].id, "process-1024");
+        assert_eq!(
+            snapshot.terminal[1024].id,
+            TerminalId::new("process-1024").unwrap()
+        );
     }
 
     #[test]
@@ -115,6 +120,18 @@ mod tests {
         assert_eq!(snapshot.terminal[0].command, "cargo test");
         assert!(parse_snapshot(&json!({}), true).is_err());
         assert!(parse_snapshot(&json!({"data":[{"processId":"1"}]}), false).is_err());
+        for id in ["", "   "] {
+            let error = parse_snapshot(
+                &json!({"data":[{"processId":id,"command":"unused"}]}),
+                false,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<forge_provider_api::lifecycle::LifecycleError>()
+                    .is_some()
+            );
+        }
         assert!(
             parse_snapshot(&json!({"data":[]}), false)
                 .unwrap()

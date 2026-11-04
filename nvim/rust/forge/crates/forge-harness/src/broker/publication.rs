@@ -185,7 +185,11 @@ impl SessionUpdate {
             } => Some(Self::TurnStarted {
                 address: address.clone(),
             }),
-            ProviderEvent::Execution { .. }
+            ProviderEvent::Settled { .. }
+            | ProviderEvent::SettlementFailed { .. }
+            | ProviderEvent::CapabilitiesChanged { .. }
+            | ProviderEvent::SessionIdentity { .. }
+            | ProviderEvent::Execution { .. }
             | ProviderEvent::Message { .. }
             | ProviderEvent::Tool { .. }
             | ProviderEvent::Turn { .. }
@@ -383,6 +387,12 @@ impl SessionUpdateSink {
 }
 
 impl SessionUpdateStream {
+    /// Stop observation admission while retaining the accepted prefix for draining.
+    /// This closes only the publication receiver; native execution and cleanup keep their owners.
+    pub(crate) fn close(&mut self) {
+        self.0.close();
+    }
+
     pub async fn recv(&mut self) -> Result<Option<SessionUpdate>, std::io::Error> {
         loop {
             match self.0.recv().await {

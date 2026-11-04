@@ -372,7 +372,6 @@ mod tests {
             crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                 "Pause without an exchange".into(),
                 Default::default(),
-                false,
                 1,
             ))),
             1,

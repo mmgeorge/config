@@ -23,10 +23,12 @@ impl IdleOutcome {
     }
 }
 
-pub enum CopilotRetraction {
-    Unsent,
-    Event(String),
-    History(String),
+/// Retain the positively matched input and pre-dispatch history cursor for one rollback.
+pub struct CopilotRetraction {
+    pub cursor: String,
+    pub event_id: String,
+    pub message_id: String,
+    pub boundary: String,
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -67,7 +69,6 @@ struct IdleEvidence {
 pub struct CopilotTurnEvent {
     state: Mutex<CopilotTurnState>,
     sends_changed: Notify,
-    finished: Notify,
 }
 
 impl CopilotTurnEvent {
@@ -129,17 +130,39 @@ impl CopilotTurnEvent {
         }
     }
 
-    /// Admit a native send before polling it and retain its exact accepted message identity.
+    /// Exercise send accounting without a transport in deterministic native lifecycle fixtures.
+    #[cfg(test)]
     pub async fn steer(
         &self,
-        submission: Option<forge_provider_api::lifecycle::SubmissionId>,
+        submission: Option<forge_provider_api::SubmissionId>,
         send: impl std::future::Future<Output = Result<String>>,
     ) -> Result<()> {
+        self.steer_native(submission, |_| send).await
+    }
+
+    /// Retain steering and its exact synchronous transport-handoff authority through acknowledgement.
+    pub async fn steer_native<'a, F, Fut>(
+        &'a self,
+        submission: Option<forge_provider_api::SubmissionId>,
+        send: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(NativeSendAuthority<'a>) -> Fut,
+        Fut: std::future::Future<Output = Result<String>>,
+    {
         let pending = self.admit_send(submission)?;
-        match send.await {
+        match send(NativeSendAuthority(self)).await {
             Ok(message_id) => pending.complete(Some(message_id)),
             Err(error) => {
-                pending.failed();
+                if matches!(
+                    error.downcast_ref::<forge_provider_api::ProviderError>(),
+                    Some(forge_provider_api::ProviderError::NotConsumed)
+                ) || super::operation::current().is_some_and(|operation| !operation.dispatched())
+                {
+                    pending.reject();
+                } else {
+                    pending.failed();
+                }
                 Err(error)
             }
         }
@@ -212,16 +235,15 @@ impl CopilotTurnEvent {
         );
         let mut result = Vec::new();
         for (message, submission) in &state.accepted_submissions {
-            let input = state
+            let root = state
                 .input_turns
                 .get(message)
-                .ok_or_else(|| anyhow::anyhow!("Copilot input lacks consumed turn identity"))?;
-            let root = input_root(&idle.root_turns, input);
+                .and_then(|input| input_root(&idle.root_turns, input));
             let proven = covered.contains(message)
-                && root.is_some_and(|root| match idle.outcome {
+                && (root.is_some_and(|root| match idle.outcome {
                     IdleOutcome::Completed => matches!(root.phase, RootTurnPhase::Finished { .. }),
                     IdleOutcome::Aborted | IdleOutcome::HostHandoff => true,
-                });
+                }) || cancelled_before_start(&state, idle, message));
             anyhow::ensure!(
                 proven,
                 "Copilot idle {} does not cover the accepted input's completed turn",
@@ -257,6 +279,9 @@ impl CopilotTurnEvent {
             forge_provider_api::lifecycle::ExecutionResult,
         )> = Vec::new();
         for (message, submission) in &state.accepted_submissions {
+            if cancelled_before_start(&state, idle, message) {
+                continue;
+            }
             let input = state
                 .input_turns
                 .get(message)
@@ -340,6 +365,7 @@ impl CopilotTurnEvent {
                                         idle.outcome.interrupted()
                                             || matches!(root.phase, RootTurnPhase::Finished { .. })
                                     })
+                                    || cancelled_before_start(&state, idle, message)
                             })
                     })
                 {
@@ -348,6 +374,47 @@ impl CopilotTurnEvent {
             }
             changed.await;
         }
+    }
+
+    /// Get the positively correlated terminal idle after its delivery coverage settles.
+    pub fn terminal_outcome(&self) -> Result<IdleOutcome> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?
+            .terminal_event
+            .as_ref()
+            .map(|idle| idle.outcome)
+            .ok_or_else(|| anyhow::anyhow!("Copilot terminal outcome is absent"))
+    }
+
+    /// Preserve accepted coverage cancelled before a native execution started, without inventing a turn.
+    pub fn cancelled_without_execution(
+        &self,
+    ) -> Result<Option<Vec<forge_provider_api::SubmissionId>>> {
+        self.covered_submissions()?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
+        let idle = state
+            .terminal_event
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Copilot terminal idle is absent"))?;
+        if !state
+            .accepted_inputs
+            .iter()
+            .any(|message| cancelled_before_start(&state, idle, message))
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            state
+                .accepted_submissions
+                .iter()
+                .filter(|(message, _)| cancelled_before_start(&state, idle, message))
+                .map(|(_, submission)| submission.clone())
+                .collect(),
+        ))
     }
 
     /// Register dispatch under a short state lock; native responses never hold admission serialization.
@@ -362,13 +429,7 @@ impl CopilotTurnEvent {
         let delivery = match &state.delivery {
             TurnDelivery::Active(delivery) | TurnDelivery::Retained(delivery) => delivery,
             TurnDelivery::Idle => {
-                return Err(forge_provider_api::ProviderError::NotConsumed {
-                    continuation: forge_provider_api::ContinuationToken::new(
-                        uuid::Uuid::new_v4().as_bytes().to_vec(),
-                    )
-                    .expect("UUID continuation tokens are nonempty"),
-                }
-                .into());
+                return Err(forge_provider_api::ProviderError::NotConsumed.into());
             }
         };
         if state.cancelled
@@ -380,13 +441,7 @@ impl CopilotTurnEvent {
             return Err(forge_provider_api::error::TurnCancelled.into());
         }
         if delivery.admission == SendAdmission::Closed {
-            return Err(forge_provider_api::ProviderError::NotConsumed {
-                continuation: forge_provider_api::ContinuationToken::new(
-                    uuid::Uuid::new_v4().as_bytes().to_vec(),
-                )
-                .expect("UUID continuation tokens are nonempty"),
-            }
-            .into());
+            return Err(forge_provider_api::ProviderError::NotConsumed.into());
         }
         state.pending_sends += 1;
         Ok(PendingSend {
@@ -394,6 +449,26 @@ impl CopilotTurnEvent {
             submission,
             completed: false,
         })
+    }
+
+    /// Revoke handoff only if this operation still owns the exact retained native invocation.
+    pub fn request_stop_for(&self, scope: &forge_provider_api::InvocationScope) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
+        let matches = match &state.delivery {
+            TurnDelivery::Active(delivery) | TurnDelivery::Retained(delivery) => delivery
+                .event_sink
+                .as_ref()
+                .and_then(|sink| sink.invocation_scope().ok())
+                .is_some_and(|active| active == scope),
+            TurnDelivery::Idle => false,
+        };
+        if matches {
+            state.cancelled = true;
+        }
+        Ok(())
     }
 
     /// Fence new sends immediately; retained execution owns collection.
@@ -418,7 +493,7 @@ impl CopilotTurnEvent {
                 let state = self.state.lock().map_err(|_| {
                     forge_provider_api::ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::CancelSession,
+                            forge_provider_api::ProviderOperation::Cancel,
                             forge_provider_api::ProviderFailureKind::Runtime,
                         ),
                     )
@@ -432,18 +507,6 @@ impl CopilotTurnEvent {
                 }
             }
             changed.await;
-        }
-    }
-
-    pub async fn wait_finished(&self) {
-        loop {
-            let finished = self.finished.notified();
-            tokio::pin!(finished);
-            finished.as_mut().enable();
-            if !self.is_active() {
-                return;
-            }
-            finished.await;
         }
     }
 
@@ -564,6 +627,9 @@ impl CopilotTurnEvent {
                 .and_then(serde_json::Value::as_str)
             {
                 state.observed_inputs.insert(message_id.to_owned());
+                state
+                    .input_events
+                    .insert(message_id.to_owned(), event.id.clone());
                 if let Some(native_turn) = native_turn.clone() {
                     let placement = state
                         .root_turns
@@ -622,36 +688,99 @@ impl CopilotTurnEvent {
         Ok(())
     }
 
-    pub fn retraction_target(&self) -> Result<CopilotRetraction> {
+    /// Retain the normalized terminal payload independently of temporary foreground receivers.
+    pub fn retain_completion(
+        &self,
+        completion: &forge_provider_api::completion::ProviderCompletion,
+    ) -> Result<()> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?
+            .completion = completion.clone();
+        Ok(())
+    }
+
+    /// Get the same terminal payload for explicit cancellation and automatic settlement.
+    pub fn completion(&self) -> Result<forge_provider_api::completion::ProviderCompletion> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?
+            .completion
+            .clone())
+    }
+
+    /// Preserve the collected invocation's native cancellation outcome and complete payload.
+    pub fn settlement_result(&self) -> Result<forge_provider_api::ExecutionResult> {
+        let executions = self.terminal_executions()?;
+        let without_execution = self.cancelled_without_execution()?.is_some();
+        anyhow::ensure!(
+            !executions.is_empty() || without_execution,
+            "Copilot settlement has no positively observed native terminal"
+        );
+        let completion = self.completion()?.into();
+        Ok(
+            if without_execution
+                || executions.iter().any(|(_, _, result)| {
+                    matches!(
+                        result,
+                        forge_provider_api::ExecutionResult::Cancelled { .. }
+                    )
+                })
+            {
+                forge_provider_api::ExecutionResult::Cancelled { completion }
+            } else {
+                forge_provider_api::ExecutionResult::Completed { completion }
+            },
+        )
+    }
+
+    /// Match retraction only to the cancelled invocation's sole accepted input and exact boundary.
+    pub fn checked_retraction(
+        &self,
+        submission: &forge_provider_api::SubmissionId,
+        boundary: &str,
+    ) -> Result<Option<CopilotRetraction>> {
         let state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-        anyhow::ensure!(
-            !matches!(state.delivery, TurnDelivery::Active(_)),
-            "Copilot turn must stop before history rewind"
-        );
-        Ok(match &state.submission {
-            NativeSubmission::Unsent => CopilotRetraction::Unsent,
-            NativeSubmission::Sent {
-                user_event_id: Some(event_id),
-                ..
-            } => CopilotRetraction::Event(event_id.clone()),
-            NativeSubmission::Sent {
-                cursor,
-                user_event_id: None,
-                ..
-            } => CopilotRetraction::History(cursor.clone()),
-        })
-    }
-
-    pub fn finish_retraction(&self) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
-        state.submission = NativeSubmission::Unsent;
-        Ok(())
+        if matches!(state.delivery, TurnDelivery::Active(_))
+            || state.pending_sends != 0
+            || state.uncertain_send
+            || !state.cancelled
+        {
+            return Ok(None);
+        }
+        let NativeSubmission::Sent {
+            cursor,
+            user_event_id: Some(event_id),
+            message_id: Some(message_id),
+        } = &state.submission
+        else {
+            return Ok(None);
+        };
+        let boundary_matches = state.terminal_event.as_ref().is_some_and(|idle| {
+            idle.event_id == boundary
+                || state
+                    .event_parents
+                    .get(&idle.event_id)
+                    .and_then(Option::as_deref)
+                    == Some(boundary)
+        });
+        if !boundary_matches
+            || state.accepted_inputs.len() != 1
+            || state.accepted_submissions.len() != 1
+            || state.accepted_submissions.get(message_id) != Some(submission)
+        {
+            return Ok(None);
+        }
+        Ok(Some(CopilotRetraction {
+            cursor: cursor.clone(),
+            event_id: event_id.clone(),
+            message_id: message_id.clone(),
+            boundary: boundary.to_owned(),
+        }))
     }
 }
 
@@ -665,6 +794,7 @@ struct CopilotTurnState {
     accepted_inputs: HashSet<String>,
     accepted_submissions: HashMap<String, forge_provider_api::lifecycle::SubmissionId>,
     input_turns: HashMap<String, ConsumedInput>,
+    input_events: HashMap<String, String>,
     root_turns: Vec<RootTurnEvidence>,
     terminal_event: Option<IdleEvidence>,
     observed_idles: HashMap<String, IdleOutcome>,
@@ -674,6 +804,7 @@ struct CopilotTurnState {
     observed_inputs: HashSet<String>,
     terminal_inputs: Option<HashSet<String>>,
     uncertain_send: bool,
+    completion: forge_provider_api::completion::ProviderCompletion,
 }
 
 #[derive(Default)]
@@ -713,13 +844,28 @@ pub struct CopilotTurnEventGuard<'a> {
 }
 
 impl CopilotTurnEventGuard<'_> {
-    /// Preserve initial send ownership until native acceptance or failure settles.
+    /// Exercise initial send accounting with a deterministic transport fixture.
+    #[cfg(test)]
     pub async fn send(
         &self,
         cursor: String,
-        submission: Option<forge_provider_api::lifecycle::SubmissionId>,
+        submission: Option<forge_provider_api::SubmissionId>,
         send: impl std::future::Future<Output = Result<String>>,
     ) -> Result<()> {
+        self.send_native(cursor, submission, |_| send).await
+    }
+
+    /// Preserve initial send ownership until native acceptance or failure settles.
+    pub async fn send_native<'a, F, Fut>(
+        &'a self,
+        cursor: String,
+        submission: Option<forge_provider_api::lifecycle::SubmissionId>,
+        send: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(NativeSendAuthority<'a>) -> Fut,
+        Fut: std::future::Future<Output = Result<String>>,
+    {
         let pending = self.owner.admit_send(submission)?;
         {
             let mut state = self
@@ -733,7 +879,7 @@ impl CopilotTurnEventGuard<'_> {
                 message_id: None,
             };
         }
-        match send.await {
+        match send(NativeSendAuthority(self.owner)).await {
             Ok(message_id) => {
                 let mut state = self
                     .owner
@@ -750,10 +896,46 @@ impl CopilotTurnEventGuard<'_> {
                 pending.complete(Some(message_id))
             }
             Err(error) => {
-                pending.failed();
+                if matches!(
+                    error.downcast_ref::<forge_provider_api::ProviderError>(),
+                    Some(forge_provider_api::ProviderError::NotConsumed)
+                ) || super::operation::current().is_some_and(|operation| !operation.dispatched())
+                {
+                    pending.reject();
+                } else {
+                    pending.failed();
+                }
                 Err(error)
             }
         }
+    }
+}
+
+/// Serialize the writer handoff against exact invocation interruption.
+pub struct NativeSendAuthority<'a>(&'a CopilotTurnEvent);
+
+impl NativeSendAuthority<'_> {
+    /// Poll native writer admission while stop holds the same state boundary.
+    pub fn commit<T>(
+        &self,
+        handoff: impl FnOnce() -> T,
+    ) -> std::result::Result<T, forge_provider_api::ProviderError> {
+        let state = self.0.state.lock().map_err(|_| {
+            forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderFailureKind::Runtime,
+            ))
+        })?;
+        let open = match &state.delivery {
+            TurnDelivery::Active(delivery) | TurnDelivery::Retained(delivery) => {
+                delivery.admission == SendAdmission::Open
+            }
+            TurnDelivery::Idle => false,
+        };
+        if state.cancelled || !open {
+            return Err(forge_provider_api::ProviderError::NotConsumed);
+        }
+        Ok(handoff())
     }
 }
 
@@ -787,6 +969,19 @@ impl PendingSend<'_> {
         drop(state);
         self.owner.sends_changed.notify_waiters();
         Ok(())
+    }
+
+    /// Release positively rejected dispatch without manufacturing uncertain native delivery.
+    fn reject(mut self) {
+        let mut state = self
+            .owner
+            .state
+            .lock()
+            .expect("Copilot send accounting lock is not poisoned");
+        state.pending_sends -= 1;
+        self.completed = true;
+        drop(state);
+        self.owner.sends_changed.notify_waiters();
     }
 
     fn failed(mut self) {
@@ -844,7 +1039,35 @@ fn consumed_root<'a>(
         .find(|root| root.native_id == input.native_turn && &root.start_event == start_event)
 }
 
-/// Follow only known durable ancestry; missing links never prove input-to-start correlation.
+/// Prove cancelled consumption without a start only along the exact input-to-idle ancestry.
+fn cancelled_before_start(state: &CopilotTurnState, idle: &IdleEvidence, message: &str) -> bool {
+    if idle.outcome != IdleOutcome::Aborted
+        || state
+            .input_turns
+            .get(message)
+            .and_then(|input| input_root(&idle.root_turns, input))
+            .is_some()
+    {
+        return false;
+    }
+    let Some(input_event) = state.input_events.get(message) else {
+        return false;
+    };
+    let mut cursor = Some(idle.event_id.as_str());
+    let mut seen = HashSet::new();
+    while let Some(event) = cursor {
+        if event == input_event {
+            return true;
+        }
+        if !seen.insert(event) {
+            return false;
+        }
+        cursor = state.event_parents.get(event).and_then(Option::as_deref);
+    }
+    false
+}
+
+/// Preserve invocation accounting after its foreground reader has been collected.
 impl Drop for CopilotTurnEventGuard<'_> {
     fn drop(&mut self) {
         if let Ok(mut state) = self.owner.state.lock()
@@ -852,7 +1075,6 @@ impl Drop for CopilotTurnEventGuard<'_> {
         {
             state.delivery = TurnDelivery::Retained(active);
         }
-        self.owner.finished.notify_waiters();
     }
 }
 
@@ -1847,7 +2069,7 @@ mod tests {
                 .downcast_ref::<forge_provider_api::ProviderError>()
                 .is_some_and(|error| matches!(
                     error,
-                    forge_provider_api::ProviderError::NotConsumed { .. }
+                    forge_provider_api::ProviderError::NotConsumed
                 ))
         );
         assert!(!called.load(Ordering::Acquire));
@@ -1901,6 +2123,89 @@ mod tests {
         assert_eq!(turn.event_sink().unwrap().invocation_scope()?, &new);
         turn.steer(None, async { Ok("accepted".into()) }).await?;
         drop(guard);
+        Ok(())
+    }
+    /// Stop and transport handoff share a lock, so delayed preparation cannot write after abort.
+    #[tokio::test]
+    async fn native_handoff_rejects_prepared_input_after_stop_without_uncertainty() -> Result<()> {
+        let turn = CopilotTurnEvent::default();
+        let _guard = turn.activate(None, None)?;
+        let (release, prepared) = tokio::sync::oneshot::channel();
+        let wrote = AtomicBool::new(false);
+        let written = &wrote;
+        let sending = turn.steer_native(None, move |authority| async move {
+            prepared.await?;
+            authority.commit(|| written.store(true, Ordering::Release))?;
+            Ok("unexpected".into())
+        });
+        tokio::pin!(sending);
+        assert!(futures_util::poll!(sending.as_mut()).is_pending());
+        turn.request_stop()?;
+        release.send(()).unwrap();
+        assert!(matches!(
+            sending
+                .await
+                .unwrap_err()
+                .downcast_ref::<forge_provider_api::ProviderError>(),
+            Some(forge_provider_api::ProviderError::NotConsumed)
+        ));
+        assert!(!wrote.load(Ordering::Acquire));
+        turn.finish_pending_sends().await?;
+        Ok(())
+    }
+
+    /// Exact checked retraction cannot substitute a different input or stale terminal boundary.
+    #[tokio::test]
+    async fn retraction_requires_sole_cancelled_submission_and_current_boundary() -> Result<()> {
+        let turn = CopilotTurnEvent::default();
+        let guard = turn.activate(None, None)?;
+        let submission = forge_provider_api::SubmissionId::try_from("cancelled")?;
+        guard
+            .send("cursor".into(), Some(submission.clone()), async {
+                Ok("message".into())
+            })
+            .await?;
+        turn.observe(&live_event(
+            "user",
+            None,
+            "user.message",
+            serde_json::json!({"messageId":"message", "turnId":"0"}),
+        )?)?;
+        turn.observe(&live_event(
+            "start",
+            Some("user"),
+            "assistant.turn_start",
+            serde_json::json!({"turnId":"0"}),
+        )?)?;
+        let idle = live_event(
+            "idle",
+            Some("start"),
+            "session.idle",
+            serde_json::json!({"aborted":true}),
+        )?;
+        turn.observe(&idle)?;
+        turn.observe_idle_at(&idle, IdleOutcome::Aborted)?;
+        turn.request_stop()?;
+        drop(guard);
+        assert!(turn.checked_retraction(&submission, "idle")?.is_some());
+        assert!(turn.checked_retraction(&submission, "stale")?.is_none());
+        assert!(
+            turn.checked_retraction(
+                &forge_provider_api::SubmissionId::try_from("another")?,
+                "idle"
+            )?
+            .is_none()
+        );
+        let successor = turn.activate(None, None)?;
+        successor
+            .send(
+                "later-cursor".into(),
+                Some(forge_provider_api::SubmissionId::try_from("later")?),
+                async { Ok("later-message".into()) },
+            )
+            .await?;
+        drop(successor);
+        assert!(turn.checked_retraction(&submission, "idle")?.is_none());
         Ok(())
     }
 }

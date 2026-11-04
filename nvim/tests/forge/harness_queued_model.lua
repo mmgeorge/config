@@ -18,6 +18,12 @@ client.request = function(request_specification, callback)
 end
 state.session = { id = "queued-model", provider = "mock", model = "old" }
 state.capability = { model_selection = true, effort_selection = true }
+state.model_list = {
+  { id = "chosen", reasoning = { "xhigh" } },
+  { id = "another", reasoning = { "high" } },
+  { id = "settings-only", reasoning = { "high" } },
+  { id = "immediate", reasoning = { "high" } },
+}
 state.composer_buf = vim.api.nvim_create_buf(false, true)
 state.presentation = { follow_tail = function() end }
 state.queue = {}

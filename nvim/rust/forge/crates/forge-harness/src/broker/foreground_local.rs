@@ -100,7 +100,8 @@ impl HarnessBroker {
                 .replace(crate::provider::ExecutionOwner::root(&self.session.id))
                 .await?;
             self.observer.replace_session_events(observer);
-            self.task_controller.reset_native_goal_generation()?;
+            self.task_controller.reset_configuration_generation()?;
+            self.clear_effective_capabilities()?;
         }
         if let Some(job) = initial {
             let publication = job.is_publication();

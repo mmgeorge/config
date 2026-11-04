@@ -279,7 +279,8 @@ impl BackgroundManager {
         {
             let inbox = &runtime.retained.observer;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-            let mut pending: Option<crate::provider::Compaction> = None;
+            let mut pending: Option<(crate::provider::EventScope, crate::provider::Compaction)> =
+                None;
             loop {
                 let until = if pending.is_some() {
                     deadline
@@ -345,15 +346,15 @@ impl BackgroundManager {
                     Ok(Ok(Some(events))) => {
                         for event in events {
                             if let crate::provider::ProviderEvent::Compaction {
+                                scope,
                                 update: compaction,
-                                ..
                             } = &event
                             {
                                 native_compaction_observed = true;
                                 pending = if compaction.state
                                     == crate::provider::CompactionState::Running
                                 {
-                                    Some(*compaction.clone())
+                                    Some((scope.clone(), *compaction.clone()))
                                 } else {
                                     None
                                 };
@@ -374,7 +375,7 @@ impl BackgroundManager {
                         }
                     }
                     _ => {
-                        if let Some(mut compaction) = pending.take() {
+                        if let Some((scope, mut compaction)) = pending.take() {
                             compaction.state = crate::provider::CompactionState::Unconfirmed;
                             compaction.result.diagnostic =
                                 Some(forge_provider_api::ProviderDiagnostic {
@@ -387,10 +388,7 @@ impl BackgroundManager {
                                 });
                             let _ = broker.observe_session_event(
                                 crate::provider::ProviderEvent::Compaction {
-                                    scope: crate::provider::EventScope::SessionOperation {
-                                        owner: crate::provider::ExecutionOwner::root(&session_id),
-                                        operation_id: compaction.id.clone(),
-                                    },
+                                    scope,
                                     update: Box::new(compaction),
                                 },
                             );
@@ -1103,18 +1101,20 @@ mod tests {
         let owner = crate::provider::ExecutionOwner::root(&session_id);
         let registry = broker.execution_registry();
         let old_engine = registry.owner(owner.clone()).await?;
-        retained
-            .retained
-            .runtime
-            .provider_handle()
-            .reset_session(&owner)
-            .await?;
+        old_observer.fail(forge_provider_api::lifecycle::ObservationFailure::Disconnected);
+        registry.fence(&owner).await?;
         tokio::time::timeout(Duration::from_secs(2), async {
             while old_engine.is_healthy().await {
                 tokio::task::yield_now().await;
             }
         })
         .await?;
+        assert!(matches!(
+            old_observer.end(),
+            Some(crate::provider::session_execution::ObservationEnd::Lost(
+                forge_provider_api::lifecycle::ObservationFailure::Disconnected
+            ))
+        ));
         drop(retained);
         broker.release_lease()?;
         drop(broker);
@@ -1139,7 +1139,7 @@ mod tests {
             kind: crate::provider::session_execution::CleanupWorkKind::OwnerFence,
             source: crate::provider::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::ProviderOperation::SessionClose,
                     forge_provider_api::ProviderFailureKind::Runtime,
                 ),
             )
@@ -1150,7 +1150,7 @@ mod tests {
             kind: crate::provider::session_execution::CleanupWorkKind::OwnerFence,
             source: crate::provider::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::ProviderOperation::SessionClose,
                     forge_provider_api::ProviderFailureKind::Runtime,
                 ),
             )

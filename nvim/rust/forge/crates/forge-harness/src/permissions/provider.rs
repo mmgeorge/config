@@ -135,7 +135,7 @@ impl ProviderPermissions for ProviderPermissionContext {
             .map(|state| state.checkpoint.clone())
             .map_err(|_| {
                 ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::HostEffectPublication,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 ))
             })?;
@@ -148,7 +148,7 @@ impl ProviderPermissions for ProviderPermissionContext {
             };
             result.map_err(|_| {
                 ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::HostEffectPublication,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     forge_provider_api::ProviderFailureKind::Rejected,
                 ))
             })?;

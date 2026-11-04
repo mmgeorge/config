@@ -84,8 +84,6 @@ pub enum SuspensionReason {
         turn_count: u32,
         max_turn_count: u32,
     },
-    ProviderUsageLimited,
-    ProviderBudgetLimited,
     GoalReportedBlocked,
     ExecutionBlocked {
         findings: Vec<String>,
@@ -109,8 +107,6 @@ impl SuspensionReason {
             Self::Stopping => TaskStatus::Stopping,
             Self::NoProgress { .. }
             | Self::TurnBudget { .. }
-            | Self::ProviderUsageLimited
-            | Self::ProviderBudgetLimited
             | Self::GoalReportedBlocked
             | Self::ExecutionBlocked { .. } => TaskStatus::Blocked,
         }
@@ -435,9 +431,11 @@ fn suspension_reason(workflow: &WorkflowSnapshot, status: TaskStatus) -> Suspens
     match workflow {
         WorkflowSnapshot::Goal { goal } => match goal.state {
             crate::goal::GoalState::Stalled => stalled(&goal.continuation),
-            crate::goal::GoalState::UsageLimited => SuspensionReason::ProviderUsageLimited,
-            crate::goal::GoalState::BudgetLimited => SuspensionReason::ProviderBudgetLimited,
-            _ => SuspensionReason::GoalReportedBlocked,
+            crate::goal::GoalState::Active
+            | crate::goal::GoalState::Paused
+            | crate::goal::GoalState::Complete
+            | crate::goal::GoalState::Blocked
+            | crate::goal::GoalState::Cleared => SuspensionReason::GoalReportedBlocked,
         },
         WorkflowSnapshot::Plan { plan }
             if plan.artifact.generation.budget.turn_count
@@ -467,10 +465,9 @@ pub(super) fn snapshot_status(snapshot: &WorkflowSnapshot) -> TaskStatus {
             crate::goal::GoalState::Paused => TaskStatus::Paused,
             crate::goal::GoalState::Complete => TaskStatus::Completed,
             crate::goal::GoalState::Cleared => TaskStatus::Cancelled,
-            crate::goal::GoalState::Blocked
-            | crate::goal::GoalState::UsageLimited
-            | crate::goal::GoalState::BudgetLimited
-            | crate::goal::GoalState::Stalled => TaskStatus::Blocked,
+            crate::goal::GoalState::Blocked | crate::goal::GoalState::Stalled => {
+                TaskStatus::Blocked
+            }
         },
         WorkflowSnapshot::Plan { plan } if plan.paused => {
             if plan.artifact.generation.budget.turn_count

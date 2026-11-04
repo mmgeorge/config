@@ -34,18 +34,10 @@ pub(super) async fn answer(
             .await?;
             gate.wait().await?;
             let scope = ReviewAnswerScope::new(Arc::clone(&source.plan_review), document, question);
-            let (sink, mut updates) = crate::broker::publication::channel();
+            let (sink, updates) = crate::broker::publication::channel();
             let _generation = child.provider_lane.read().await;
             let catalog_job = if selection.model.is_some() {
-                Some(
-                    child
-                        .broker
-                        .lock()
-                        .await
-                        .prepare_configuration_catalog_for_mode(
-                            crate::provider::PromptMode::PlanQuestion,
-                        )?,
-                )
+                Some(child.broker.lock().await.prepare_configuration_catalog()?)
             } else {
                 None
             };
@@ -54,31 +46,25 @@ pub(super) async fn answer(
                 None => None,
             };
             drop(_generation);
-            let forwarder = tokio::spawn(async move {
-                while updates.recv().await?.is_some() {}
-                Ok::<(), anyhow::Error>(())
-            });
-            let result = child
-                .exchange_owner
-                .review_question(
+            let result = observe_answer(
+                child.exchange_owner.review_question(
                     scope,
                     selection,
                     catalog_result,
                     sink,
                     message_sink.clone(),
                     request_id,
-                )
-                .await;
-            forwarder
-                .await
-                .context("review publication worker failed")??;
-            let result = result?;
-            result.response.result().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "review question dispatch failed: {:?}",
-                    result.response.error()
-                )
-            })?;
+                ),
+                updates,
+            )
+            .await?;
+            if let Some(error) = result.response.error() {
+                anyhow::bail!(
+                    "review question dispatch failed ({}): {}",
+                    error.code,
+                    error.message
+                );
+            }
             Ok::<(), anyhow::Error>(())
         });
     }
@@ -98,4 +84,88 @@ pub(super) async fn answer(
         )?)
         .await?;
     Ok(())
+}
+
+/// Drain an answer's accepted publications at completion without awaiting producer destruction.
+async fn observe_answer(
+    answer: impl std::future::Future<Output = Result<crate::broker::DispatchResult>>,
+    mut updates: crate::broker::publication::SessionUpdateStream,
+) -> Result<crate::broker::DispatchResult> {
+    let (finished, mut completion) = tokio::sync::oneshot::channel();
+    let forwarder = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut completion => {
+                    updates.close();
+                    break;
+                }
+                update = updates.recv() => {
+                    if update?.is_none() { return Ok::<(), anyhow::Error>(()); }
+                }
+            }
+        }
+        while updates.recv().await?.is_some() {}
+        Ok(())
+    });
+    let result = answer.await;
+    let _ = finished.send(());
+    let forwarded = forwarder
+        .await
+        .context("review publication worker failed")
+        .and_then(|result| result);
+    match (result, forwarded) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(publication)) => {
+            Err(error.context(format!("review publication also failed: {publication:#}")))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Report failed child initialization after accepted updates drain even while its owner retains a sender.
+    #[tokio::test]
+    async fn failed_review_answer_settles_with_retained_publication_producer() -> Result<()> {
+        let (retained, updates) = crate::broker::publication::channel();
+        retained
+            .send_wait(crate::broker::publication::SessionUpdate::Diagnostic {
+                diagnostic: crate::provider::ProviderDiagnostic {
+                    kind: forge_provider_api::ProviderFailureKind::Rejected,
+                    message: forge_provider_api::SanitizedMessage::new("child open rejected")?,
+                    fatal: true,
+                },
+            })
+            .await?;
+        let mut flushed = std::pin::pin!(retained.flush());
+        assert!(futures_util::poll!(flushed.as_mut()).is_pending());
+        let failure =
+            crate::provider::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::SessionOpen,
+                forge_provider_api::ProviderFailureKind::Rejected,
+            ));
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            observe_answer(async { Err(failure.into()) }, updates),
+        )
+        .await
+        .context("failed child answer waited for retained producer destruction")?
+        .err()
+        .context("failed child initialization became a successful answer")?;
+        assert!(
+            matches!(error.downcast_ref::<crate::provider::ProviderError>(),
+                Some(crate::provider::ProviderError::Failure(failure))
+                    if failure.operation() == forge_provider_api::ProviderOperation::SessionOpen
+                        && failure.kind() == forge_provider_api::ProviderFailureKind::Rejected
+            )
+        );
+        flushed.await?;
+        assert_eq!(
+            retained.flush().await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+        Ok(())
+    }
 }

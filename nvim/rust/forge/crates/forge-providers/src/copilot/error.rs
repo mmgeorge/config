@@ -43,6 +43,34 @@ pub(crate) fn native_failure(
     ProviderError::Failure(ProviderFailure::new(operation, kind))
 }
 
+/// A committed input frame prevents a generic native failure from proving nonconsumption.
+/// Keep explicit no-consumption evidence and independent cleanup causes intact.
+pub(crate) fn after_input_dispatch(
+    error: ProviderError,
+    operation: ProviderOperation,
+) -> ProviderError {
+    match error {
+        ProviderError::Failure(failure)
+            if failure.disposition() == forge_provider_api::FailureDisposition::Unchanged
+                && matches!(
+                    failure.phase(),
+                    forge_provider_api::ProviderPhase::Admission
+                        | forge_provider_api::ProviderPhase::Preparation
+                ) =>
+        {
+            ProviderError::Failure(failure.for_operation(operation).at_phase(
+                forge_provider_api::ProviderPhase::Observation,
+                forge_provider_api::FailureDisposition::Uncertain,
+            ))
+        }
+        ProviderError::Combined { primary, secondary } => ProviderError::Combined {
+            primary: Box::new(after_input_dispatch(*primary, operation)),
+            secondary,
+        },
+        retained => retained,
+    }
+}
+
 /// Preserve an existing normalized category when recording nested adapter failures.
 pub(crate) fn trace_failure_kind(error: &ProviderError) -> ProviderFailureKind {
     match error {
@@ -56,7 +84,7 @@ pub(crate) fn trace_failure_kind(error: &ProviderError) -> ProviderFailureKind {
         | ProviderError::Unsupported(_)
         | ProviderError::Observation(_)
         | ProviderError::RuntimeVersion(_)
-        | ProviderError::NotConsumed { .. }
+        | ProviderError::NotConsumed
         | ProviderError::DeliveryUncertain
         | ProviderError::Cancelled
         | ProviderError::Retryable(_)
@@ -74,11 +102,11 @@ mod tests {
     fn native_codes_and_statuses_have_normalized_categories() {
         let nested = ProviderError::Combined {
             primary: Box::new(native_failure(
-                ProviderOperation::CancelSession,
+                ProviderOperation::Cancel,
                 ProviderFailureKind::Timeout,
             )),
             secondary: vec![native_failure(
-                ProviderOperation::CleanupExecution,
+                ProviderOperation::Cancel,
                 ProviderFailureKind::Rejected,
             )],
         };

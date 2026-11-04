@@ -8,6 +8,7 @@ use super::{ProviderCompletion, ProviderEvent, ProviderEventSink, ProviderReques
 use crate::trace::TraceStore;
 
 const RETRY_DELAY_SECONDS: [u64; 5] = [1, 5, 10, 30, 60];
+const CONTINUATION_PROMPT: &str = "Continue the previously accepted work from its current state. The preceding execution ended with a transient failure. Preserve completed work and tool effects; do not repeat the original user input or redo completed actions.";
 
 /// Rejects replay after tools, control results, or model output have been observed.
 pub(crate) fn replay_safe(output: &super::ProviderCompletion) -> bool {
@@ -32,7 +33,7 @@ pub(crate) struct RetryAdmission {
     source: tokio::sync::watch::Receiver<bool>,
     closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     changed: std::sync::Arc<tokio::sync::Notify>,
-    dispatch: std::sync::Arc<std::sync::Mutex<Option<super::DispatchObserver>>>,
+    scope: std::sync::Arc<std::sync::Mutex<Option<super::InvocationScope>>>,
 }
 
 impl RetryAdmission {
@@ -42,7 +43,7 @@ impl RetryAdmission {
             source,
             closed: Default::default(),
             changed: Default::default(),
-            dispatch: Default::default(),
+            scope: Default::default(),
         }
     }
 
@@ -53,28 +54,28 @@ impl RetryAdmission {
         self.changed.notify_waiters();
     }
 
-    /// Capture the currently admitted attempt so cancellation waits for its actual handoff before cleanup.
-    pub(crate) fn current_dispatch(&self) -> Option<super::DispatchObserver> {
-        self.dispatch
+    /// Get exact cancellation scope even while its transport handoff is still preparing.
+    pub(crate) fn current_scope(&self) -> Option<super::InvocationScope> {
+        self.scope
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
-    fn begin_attempt(&self, request: &ProviderRequest) -> Result<()> {
-        let mut dispatch = self
-            .dispatch
+    fn begin_attempt(&self, sink: &ProviderEventSink) -> Result<()> {
+        let mut scope = self
+            .scope
             .lock()
             .map_err(|_| anyhow::anyhow!("retry admission poisoned"))?;
         if self.is_closed() {
             return Err(crate::broker::TurnCancelled.into());
         }
-        *dispatch = Some(request.dispatch.observer());
+        *scope = Some(sink.invocation_scope()?.clone());
         Ok(())
     }
 
     fn finish_attempt(&self) {
-        self.dispatch
+        self.scope
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -114,7 +115,16 @@ pub(crate) async fn execute_cancellable(
         event_sink,
         trace,
         Some(admission),
-        |request, sink, _| async move { engine.run_once(request, sink, submission_store).await },
+        |mut request, sink, initial| async move {
+            if !initial {
+                request.submission = Some(
+                    submission_store
+                        .prepare_continuation(&request, engine.provider_id())
+                        .map_err(super::submission::journal_failure)?,
+                );
+            }
+            engine.run_once(request, sink, submission_store).await
+        },
     )
     .await
 }
@@ -130,9 +140,21 @@ pub(crate) async fn execute(
     trace: &TraceStore,
     submission_store: &std::sync::Arc<super::submission::SubmissionStore>,
 ) -> Result<ProviderCompletion> {
-    run_policy(request, event_sink, trace, |request, sink, _| async move {
-        engine.run_once(request, sink, submission_store).await
-    })
+    run_policy(
+        request,
+        event_sink,
+        trace,
+        |mut request, sink, initial| async move {
+            if !initial {
+                request.submission = Some(
+                    submission_store
+                        .prepare_continuation(&request, engine.provider_id())
+                        .map_err(super::submission::journal_failure)?,
+                );
+            }
+            engine.run_once(request, sink, submission_store).await
+        },
+    )
     .await
 }
 
@@ -231,13 +253,9 @@ pub(crate) async fn execute_until_ready(
             return Ok(RetryAttempt::Ready(Box::new(outcome)));
         };
         address = Some(failure.address.clone());
-        request
-            .control_context
-            .get_or_insert_with(|| crate::tools::ControlTurnContext::inactive(request.mode))
-            .provider_continuation = Some(failure.continuation.clone());
-        request.submission = None;
-        request.dispatch = super::DispatchTracker::default();
-        request.recovered_input.clear();
+        author_continuation(&mut request);
+        request.submission =
+            Some(submission_store.prepare_continuation(&request, engine.provider_id())?);
         progress.attempt += 1;
         progress.pending = true;
         let retry_at_ms =
@@ -287,7 +305,7 @@ where
 
 async fn run_policy_guarded<F, Fut>(
     mut request: ProviderRequest,
-    event_sink: ProviderEventSink,
+    mut event_sink: ProviderEventSink,
     trace: &TraceStore,
     mut admission: Option<RetryAdmission>,
     mut attempt: F,
@@ -309,7 +327,7 @@ where
             return Err(crate::broker::TurnCancelled.into());
         }
         if let Some(admission) = &admission {
-            admission.begin_attempt(&request)?;
+            admission.begin_attempt(&event_sink)?;
         }
         let result = attempt(request.clone(), event_sink.clone(), progress.attempt == 0).await;
         if let Some(admission) = &admission {
@@ -345,16 +363,16 @@ where
             return Err(error.into());
         };
         address = Some(failure.address.clone());
-        request
-            .control_context
-            .get_or_insert_with(|| crate::tools::ControlTurnContext::inactive(request.mode))
-            .provider_continuation = Some(failure.continuation.clone());
-        request.submission = None;
-        request.dispatch = super::DispatchTracker::default();
-        request.recovered_input.clear();
+        author_continuation(&mut request);
+        let previous_scope = event_sink.invocation_scope()?;
+        let scope = super::InvocationScope::new(
+            previous_scope.owner.clone(),
+            previous_scope.exchange_id.clone(),
+        );
+        let successor_sink = event_sink.successor_invocation_sink(&scope)?;
         progress.attempt += 1;
         progress.pending = true;
-        let retry_at_ms = now_ms().saturating_add((delay_seconds * 1000) as i64);
+        let retry_at_ms = now_ms().saturating_add(i64::try_from(delay_seconds * 1000)?);
         progress.record(
             "scheduled",
             json!({"delay_ms":delay_seconds * 1000,"retry_at_ms":retry_at_ms}),
@@ -389,6 +407,18 @@ where
             }),
         )
         .await?;
+        event_sink = successor_sink;
+    }
+}
+
+/// Author a new logical input while preserving effective configuration and existing task authority.
+fn author_continuation(request: &mut ProviderRequest) {
+    request.input = super::ProviderInput::from_text(CONTINUATION_PROMPT);
+    request.submission = None;
+    request.dispatch = super::DispatchTracker::default();
+    request.recovered_input.clear();
+    if let Some(context) = request.control_context.as_mut() {
+        context.task_start = None;
     }
 }
 
@@ -506,9 +536,6 @@ mod tests {
                 failure: ExecutionFailure::Retryable {
                     address: address.clone(),
                     category: RetryCategory::TemporaryCapacity,
-                    continuation: forge_provider_api::ContinuationToken::new(
-                        format!("retry-{attempt}").into_bytes(),
-                    )?,
                 },
             }
         } else {
@@ -532,7 +559,7 @@ mod tests {
             .await
             .map_err(|_| {
                 ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::HostEffectPublication,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     forge_provider_api::ProviderFailureKind::Runtime,
                 ))
             })?;
@@ -571,6 +598,13 @@ mod tests {
                 let log = initial_log.clone();
                 async move {
                     let attempt = log.prompt_count.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempt > 1 {
+                        log.continuation_count.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(
+                            request.input,
+                            forge_provider_api::PromptInput::Text(CONTINUATION_PROMPT.into())
+                        );
+                    }
                     *log.selected_model.lock().unwrap() = request.configuration.model.model.clone();
                     log.attempts
                         .lock()
@@ -589,27 +623,6 @@ mod tests {
                 }
             },
         );
-        let continuation_log = log.clone();
-        provider.with_continuation(move |scope, callbacks, sink, _cancelled| {
-            let log = continuation_log.clone();
-            async move {
-                let attempt = log.continuation_count.fetch_add(1, Ordering::SeqCst) + 2;
-                log.attempts
-                    .lock()
-                    .unwrap()
-                    .push((attempt, tokio::time::Instant::now()));
-                emit_attempt(
-                    scope,
-                    sink,
-                    attempt,
-                    failure_count,
-                    ending,
-                    Vec::new(),
-                    callbacks.host_effects,
-                )
-                .await
-            }
-        });
         (provider, log)
     }
 
@@ -720,10 +733,6 @@ mod tests {
                                 turn_id: "turn".into(),
                             },
                             category: RetryCategory::TemporaryCapacity,
-                            continuation: forge_provider_api::ContinuationToken::new(
-                                b"retry".to_vec(),
-                            )
-                            .unwrap(),
                         },
                     )))
                 }
@@ -809,7 +818,7 @@ mod tests {
             "{error:#}"
         );
         let attempts = log.attempts.lock().unwrap();
-        assert_eq!(log.prompt_count.load(Ordering::SeqCst), 1);
+        assert_eq!(log.prompt_count.load(Ordering::SeqCst), 6);
         assert_eq!(log.continuation_count.load(Ordering::SeqCst), 5);
         assert_eq!(attempts.len(), 6);
         for (index, delay) in RETRY_DELAY_SECONDS.iter().enumerate() {
@@ -856,8 +865,10 @@ mod tests {
         )
         .await?;
         let mut retries = Vec::new();
+        let mut retry_scopes = Vec::new();
         while let Some(event) = stream.try_next()? {
-            if let ProviderEvent::Retry { update, .. } = event {
+            if let ProviderEvent::Retry { scope, update } = event {
+                retry_scopes.push(scope);
                 retries.push(update);
             }
         }
@@ -871,6 +882,12 @@ mod tests {
                 .is_some_and(|retry| retry.retry_at_ms.is_none())
         );
         assert!(retries[2].is_none());
+        assert_eq!(retry_scopes[0], scope());
+        assert_eq!(retry_scopes[1], scope());
+        assert_ne!(retry_scopes[2].invocation_id, scope().invocation_id);
+        assert_eq!(retry_scopes[2].owner, scope().owner);
+        assert_eq!(retry_scopes[2].exchange_id, scope().exchange_id);
+        assert_eq!(recovered_log.prompt_count.load(Ordering::SeqCst), 2);
         assert_eq!(recovered_log.continuation_count.load(Ordering::SeqCst), 1);
         let (native, log) = provider(0, Ending::Rejected);
         let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
@@ -907,11 +924,13 @@ mod tests {
                 ),
                 "{error:#}"
             );
-            assert_eq!(log.prompt_count.load(Ordering::SeqCst), 1);
+            assert_eq!(log.prompt_count.load(Ordering::SeqCst), failure_count + 1);
             assert_eq!(log.continuation_count.load(Ordering::SeqCst), failure_count);
             let mut retry_updates = Vec::new();
+            let mut retry_scopes = Vec::new();
             while let Some(event) = stream.try_next()? {
-                if let ProviderEvent::Retry { update, .. } = event {
+                if let ProviderEvent::Retry { scope, update } = event {
+                    retry_scopes.push(scope);
                     retry_updates.push(update);
                 }
             }
@@ -922,6 +941,11 @@ mod tests {
                 assert!(retry_updates[0].as_ref().unwrap().retry_at_ms.is_some());
                 assert!(retry_updates[1].as_ref().unwrap().retry_at_ms.is_none());
                 assert!(retry_updates[2].is_none());
+                assert_eq!(retry_scopes[0], scope());
+                assert_eq!(retry_scopes[1], scope());
+                assert_ne!(retry_scopes[2].invocation_id, scope().invocation_id);
+                assert_eq!(retry_scopes[2].owner, scope().owner);
+                assert_eq!(retry_scopes[2].exchange_id, scope().exchange_id);
             }
         }
         Ok(())

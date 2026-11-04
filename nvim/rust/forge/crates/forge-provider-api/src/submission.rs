@@ -2,13 +2,11 @@ use crate::ProviderError;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-/// Distinguish journaled input from an authorized continuation without inventing a receipt.
+/// Identify the journaled input handed to native transport.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DispatchTarget {
     /// Input accountability remains with the identified durable journal entry.
     Input(crate::SubmissionId),
-    /// Opaque authorization identifies the provider-owned continuation being handed off.
-    Continuation(crate::ContinuationToken),
 }
 
 /// Identify a confirmed transport handoff, independently of native acceptance.
@@ -18,6 +16,7 @@ pub struct DispatchConfirmation {
     binding: crate::BindingId,
     scope: crate::InvocationScope,
     target: DispatchTarget,
+    attempt: crate::DeliveryAttemptId,
 }
 
 impl DispatchConfirmation {
@@ -31,6 +30,11 @@ impl DispatchConfirmation {
         &self.scope
     }
 
+    /// Get the immutable host-issued delivery attempt installed for this handoff.
+    pub fn attempt_id(&self) -> &crate::DeliveryAttemptId {
+        &self.attempt
+    }
+
     /// Get the typed handoff target without implying acceptance or inspecting opaque authorization.
     pub fn target(&self) -> &DispatchTarget {
         &self.target
@@ -41,6 +45,7 @@ impl DispatchConfirmation {
 /// Clones share the attempt; a retry must create a fresh tracker.
 #[derive(Clone, Debug)]
 pub struct DispatchTracker {
+    identity: Arc<()>,
     progress: tokio::sync::watch::Sender<DispatchProgress>,
 }
 
@@ -58,18 +63,9 @@ impl DispatchTracker {
         binding: crate::BindingId,
         scope: crate::InvocationScope,
         submission: crate::SubmissionId,
+        attempt: crate::DeliveryAttemptId,
     ) -> Result<DispatchReporter, DispatchBindingError> {
-        self.track(binding, scope, DispatchTarget::Input(submission))
-    }
-
-    /// Bind an authorized continuation without creating a new input acceptance obligation.
-    pub fn track_continuation(
-        &self,
-        binding: crate::BindingId,
-        scope: crate::InvocationScope,
-        authorization: crate::ContinuationToken,
-    ) -> Result<DispatchReporter, DispatchBindingError> {
-        self.track(binding, scope, DispatchTarget::Continuation(authorization))
+        self.track(binding, scope, DispatchTarget::Input(submission), attempt)
     }
 
     /// Mark an ended send observation as uncertain while preserving an already-confirmed handoff.
@@ -97,11 +93,13 @@ impl DispatchTracker {
         binding: crate::BindingId,
         scope: crate::InvocationScope,
         target: DispatchTarget,
+        attempt: crate::DeliveryAttemptId,
     ) -> Result<DispatchReporter, DispatchBindingError> {
         let confirmation = DispatchConfirmation {
             binding,
             scope,
             target,
+            attempt,
         };
         let installed = self.progress.send_if_modified(|state| match state {
             DispatchProgress::Preparing => {
@@ -116,6 +114,7 @@ impl DispatchTracker {
             return Err(DispatchBindingError);
         }
         Ok(DispatchReporter {
+            identity: self.identity.clone(),
             confirmation,
             progress: self.progress.clone(),
         })
@@ -126,6 +125,7 @@ impl Default for DispatchTracker {
     /// Create one unbound handoff attempt; it contains no native or persisted acceptance evidence.
     fn default() -> Self {
         Self {
+            identity: Arc::new(()),
             progress: tokio::sync::watch::channel(DispatchProgress::Preparing).0,
         }
     }
@@ -149,36 +149,55 @@ impl Drop for DispatchWorkerGuard {
 /// Clones retain one immutable target; they cannot confirm another attempt.
 #[derive(Clone, Debug)]
 pub struct DispatchReporter {
+    identity: Arc<()>,
     confirmation: DispatchConfirmation,
     progress: tokio::sync::watch::Sender<DispatchProgress>,
 }
 
+impl PartialEq for DispatchReporter {
+    /// Compare immutable handoff identity and the exact tracker channel, never its mutable progress.
+    fn eq(&self, other: &Self) -> bool {
+        self.confirmation == other.confirmation && Arc::ptr_eq(&self.identity, &other.identity)
+    }
+}
+impl Eq for DispatchReporter {}
+
+/// Preserve handoff identity for replay metadata without keeping a progress sender alive.
+#[derive(Clone)]
+pub(crate) struct DispatchIdentity {
+    confirmation: DispatchConfirmation,
+    identity: std::sync::Weak<()>,
+}
+impl PartialEq for DispatchIdentity {
+    /// Compare immutable target and tracker allocation identity after observers have been released.
+    fn eq(&self, other: &Self) -> bool {
+        self.confirmation == other.confirmation
+            && std::sync::Weak::ptr_eq(&self.identity, &other.identity)
+    }
+}
+impl Eq for DispatchIdentity {}
+
 impl DispatchReporter {
+    /// Snapshot exact immutable correlation without prolonging handoff observation lifetime.
+    pub(crate) fn identity(&self) -> DispatchIdentity {
+        DispatchIdentity {
+            confirmation: self.confirmation.clone(),
+            identity: Arc::downgrade(&self.identity),
+        }
+    }
+
     /// Create a bound journal-input handoff channel for an adapter request.
     pub fn channel(
         binding: crate::BindingId,
         scope: crate::InvocationScope,
         submission: crate::SubmissionId,
+        attempt: crate::DeliveryAttemptId,
     ) -> (Self, DispatchObserver) {
         let tracker = DispatchTracker::default();
         let observer = tracker.observer();
         let reporter = tracker
-            .track_input(binding, scope, submission)
+            .track_input(binding, scope, submission, attempt)
             .expect("a fresh dispatch tracker has no prior binding");
-        (reporter, observer)
-    }
-
-    /// Create a bound continuation handoff channel without a new input journal entry.
-    pub fn continuation_channel(
-        binding: crate::BindingId,
-        scope: crate::InvocationScope,
-        authorization: crate::ContinuationToken,
-    ) -> (Self, DispatchObserver) {
-        let tracker = DispatchTracker::default();
-        let observer = tracker.observer();
-        let reporter = tracker
-            .track_continuation(binding, scope, authorization)
-            .expect("a fresh continuation tracker has no prior binding");
         (reporter, observer)
     }
 
@@ -203,22 +222,12 @@ impl DispatchReporter {
         binding: &crate::BindingId,
         scope: &crate::InvocationScope,
         submission: &crate::SubmissionId,
+        attempt: &crate::DeliveryAttemptId,
     ) -> bool {
         self.confirmation.binding == *binding
             && self.confirmation.scope == *scope
             && self.confirmation.target == DispatchTarget::Input(submission.clone())
-    }
-
-    /// Validate opaque continuation authority and immutable request scope before admission.
-    pub fn matches_continuation(
-        &self,
-        binding: &crate::BindingId,
-        scope: &crate::InvocationScope,
-        authorization: &crate::ContinuationToken,
-    ) -> bool {
-        self.confirmation.binding == *binding
-            && self.confirmation.scope == *scope
-            && self.confirmation.target == DispatchTarget::Continuation(authorization.clone())
+            && self.confirmation.attempt == *attempt
     }
 }
 
@@ -286,10 +295,15 @@ enum DispatchProgress {
 }
 
 /// Commit host-owned delivery evidence around a native provider send.
+/// Each instance binds one immutable logical input and delivery attempt. A retry supplies
+/// a fresh instance; stale callbacks must validate that attempt atomically before journal writes.
 #[async_trait]
 pub trait InputReceipt: Send + Sync {
     /// Get the host-generated identity used for native input correlation.
     fn id(&self) -> &crate::SubmissionId;
+
+    /// Get this receipt's current immutable delivery attempt for native correlation.
+    fn attempt_id(&self) -> Result<crate::DeliveryAttemptId, ProviderError>;
 
     /// Commit opaque adapter recovery evidence before the provider receives input.
     async fn record_sending(
@@ -320,13 +334,29 @@ mod tests {
         let binding = crate::BindingId::new("binding").unwrap();
         let scope = crate::InvocationScope::new(crate::ExecutionOwner::root("session"), "exchange");
         let submission = crate::SubmissionId::try_from("input").unwrap();
-        let (reporter, mut observer) =
-            super::DispatchReporter::channel(binding.clone(), scope.clone(), submission.clone());
-        assert!(reporter.matches(&binding, &scope, &submission));
+        let (reporter, mut observer) = super::DispatchReporter::channel(
+            binding.clone(),
+            scope.clone(),
+            submission.clone(),
+            crate::DeliveryAttemptId::new("attempt").unwrap(),
+        );
+        assert!(reporter.matches(
+            &binding,
+            &scope,
+            &submission,
+            &crate::DeliveryAttemptId::new("attempt").unwrap()
+        ));
         assert!(!reporter.matches(
             &crate::BindingId::new("retired").unwrap(),
             &scope,
-            &submission
+            &submission,
+            &crate::DeliveryAttemptId::new("attempt").unwrap()
+        ));
+        assert!(!reporter.matches(
+            &binding,
+            &scope,
+            &submission,
+            &crate::DeliveryAttemptId::new("different-attempt").unwrap()
         ));
         drop(observer.clone());
         reporter.confirm();
@@ -348,47 +378,10 @@ mod tests {
             crate::BindingId::new("binding").unwrap(),
             crate::InvocationScope::new(crate::ExecutionOwner::root("session"), "exchange"),
             crate::SubmissionId::try_from("input").unwrap(),
+            crate::DeliveryAttemptId::new("attempt").unwrap(),
         );
         drop(reporter);
         assert_eq!(observer.wait().await, Err(super::DispatchObservationLost));
-    }
-
-    /// Observe handoff before binding and keep continuation authority distinct from an input receipt.
-    #[tokio::test]
-    async fn continuation_dispatch_is_observable_before_binding_and_requires_exact_authority() {
-        let tracker = super::DispatchTracker::default();
-        let mut observer = tracker.observer();
-        let binding = crate::BindingId::new("continuation-binding").unwrap();
-        let scope = crate::InvocationScope::new(crate::ExecutionOwner::root("session"), "exchange");
-        let authorization = crate::ContinuationToken::new(vec![8, 3, 1]).unwrap();
-        let reporter = tracker
-            .track_continuation(binding.clone(), scope.clone(), authorization.clone())
-            .unwrap();
-        assert!(reporter.matches_continuation(&binding, &scope, &authorization));
-        assert!(!reporter.matches_continuation(
-            &binding,
-            &scope,
-            &crate::ContinuationToken::new(vec![8, 3, 2]).unwrap()
-        ));
-        assert!(!reporter.matches(
-            &binding,
-            &scope,
-            &crate::SubmissionId::try_from("input").unwrap()
-        ));
-        assert!(
-            tracker
-                .track_continuation(binding, scope, authorization.clone())
-                .is_err()
-        );
-        reporter.confirm();
-        tracker.finish_observation();
-        let confirmation = observer.wait().await.unwrap();
-        assert_eq!(
-            confirmation.target(),
-            &super::DispatchTarget::Continuation(authorization)
-        );
-        let mut late = tracker.observer();
-        assert_eq!(late.wait().await.unwrap(), confirmation);
     }
 
     /// End worker observation without reviving it through a stale reporter or cancelling another attempt.
@@ -400,7 +393,12 @@ mod tests {
         let scope = crate::InvocationScope::new(crate::ExecutionOwner::root("session"), "exchange");
         let submission = crate::SubmissionId::try_from("input").unwrap();
         let stale = tracker
-            .track_input(binding.clone(), scope.clone(), submission.clone())
+            .track_input(
+                binding.clone(),
+                scope.clone(),
+                submission.clone(),
+                crate::DeliveryAttemptId::new("attempt").unwrap(),
+            )
             .unwrap();
         let worker = tracker.observe_worker();
         drop(worker);
@@ -408,10 +406,32 @@ mod tests {
         assert_eq!(observer.wait().await, Err(super::DispatchObservationLost));
         let next = super::DispatchTracker::default();
         let mut next_observer = next.observer();
-        let current = next.track_input(binding, scope, submission).unwrap();
+        let current = next
+            .track_input(
+                binding,
+                scope,
+                submission,
+                crate::DeliveryAttemptId::new("next-attempt").unwrap(),
+            )
+            .unwrap();
         drop(observer);
         current.confirm();
         assert!(next_observer.wait().await.is_ok());
+    }
+
+    /// Keep cached handoff identity from masking observation loss after its real reporter disappears.
+    #[tokio::test]
+    async fn cached_dispatch_identity_does_not_retain_progress_sender() {
+        let (reporter, mut observer) = super::DispatchReporter::channel(
+            crate::BindingId::new("weak-dispatch").unwrap(),
+            crate::InvocationScope::new(crate::ExecutionOwner::root("session"), "exchange"),
+            crate::SubmissionId::try_from("input").unwrap(),
+            crate::DeliveryAttemptId::new("attempt").unwrap(),
+        );
+        let retained_identity = reporter.identity();
+        drop(reporter);
+        assert_eq!(observer.wait().await, Err(super::DispatchObservationLost));
+        drop(retained_identity);
     }
 
     /// Persist opaque recovery evidence without exposing an adapter format to the host.

@@ -104,6 +104,11 @@ impl ClientGeneration {
         self.failure().is_some() || self.0.stopped.load(Ordering::Acquire)
     }
 
+    /// Get positive SDK collection evidence, independently of a transport failure fence.
+    pub(crate) fn is_collected(&self) -> bool {
+        self.0.stopped.load(Ordering::Acquire)
+    }
+
     /// Publish successful SDK collection without inventing observation loss.
     pub(crate) fn mark_stopped(&self) {
         self.0.stopped.store(true, Ordering::Release);
@@ -124,7 +129,7 @@ impl ClientGeneration {
         match self.failure() {
             Some(reason) => Err(ProviderError::Observation(reason)),
             None if self.0.stopped.load(Ordering::Acquire) => Err(native_failure(
-                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderOperation::InputSubmit,
                 forge_provider_api::error::ProviderFailureKind::SessionMissing,
             )),
             None => Ok(()),
@@ -174,7 +179,7 @@ impl ClientGeneration {
     ) -> Result<CollectedClient, ProviderError> {
         if !failed.matches(self) {
             return Err(native_failure(
-                forge_provider_api::error::ProviderOperation::RecoverSession,
+                forge_provider_api::error::ProviderOperation::InputReconcile,
                 forge_provider_api::error::ProviderFailureKind::Rejected,
             ));
         }
@@ -184,7 +189,7 @@ impl ClientGeneration {
             *collection = Collection::Running(tokio::spawn(async move {
                 client.stop().await.map_err(|_| {
                     Arc::new(native_failure(
-                        forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                        forge_provider_api::error::ProviderOperation::Shutdown,
                         forge_provider_api::error::ProviderFailureKind::Transport,
                     ))
                 })
@@ -203,7 +208,7 @@ impl ClientGeneration {
                 })?;
             *collection = Collection::Complete(result.unwrap_or_else(|_| {
                 Err(Arc::new(native_failure(
-                    forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::error::ProviderOperation::Shutdown,
                     forge_provider_api::error::ProviderFailureKind::Runtime,
                 )))
             }));
@@ -259,7 +264,7 @@ mod tests {
         *generation.0.collection.lock().await = Collection::Running(tokio::spawn(async move {
             released.await.map_err(|_| {
                 Arc::new(native_failure(
-                    forge_provider_api::error::ProviderOperation::CollectNativeRuntime,
+                    forge_provider_api::error::ProviderOperation::Shutdown,
                     forge_provider_api::error::ProviderFailureKind::Runtime,
                 ))
             })

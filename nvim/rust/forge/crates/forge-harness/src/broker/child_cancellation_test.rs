@@ -62,7 +62,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
         ChildCompletionFailure::ProviderFailed => (
             Err(anyhow::Error::new(crate::provider::ProviderError::from(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::AdmitInput,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     forge_provider_api::ProviderFailureKind::Unknown,
                 ),
             ))),
@@ -134,8 +134,7 @@ async fn assert_child_completion_failure(failure: ChildCompletionFailure) -> Res
                     .is_some()
             );
         }
-        ChildCompletionFailure::ProviderCancelled
-        | ChildCompletionFailure::ProviderFailed => {
+        ChildCompletionFailure::ProviderCancelled | ChildCompletionFailure::ProviderFailed => {
             assert_eq!(agent.state, AgentState::Ready);
             assert!(
                 broker

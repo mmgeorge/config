@@ -41,6 +41,16 @@ pub struct ConversationOptions {
     pub skills: Vec<String>,
 }
 
+/// Prepare the complete native target configuration for one durable fork.
+pub(super) struct ForkConfiguration<'a> {
+    pub workspace: &'a str,
+    pub mcp_servers: Vec<Value>,
+    pub skills: &'a [String],
+    pub profile: &'a std::path::Path,
+    pub model: Option<&'a str>,
+    pub effort: Option<&'a str>,
+}
+
 /// Own the connection, negotiated capabilities, and native session configuration.
 pub struct AcpConversation {
     id: String,
@@ -48,21 +58,24 @@ pub struct AcpConversation {
     state: Arc<AcpSessionState>,
     initialized: Value,
     configuration: tokio::sync::Mutex<Value>,
+    fork_targets:
+        tokio::sync::Mutex<std::collections::HashMap<forge_provider_api::OperationId, String>>,
 }
 
 impl AcpConversation {
     /// Negotiate and open native history without owning host tools or policy.
-    pub async fn open(
+    pub(super) async fn open(
         launch: AcpLaunch<'_>,
         state: Arc<AcpSessionState>,
         options: ConversationOptions,
+        cleanup: &super::connection::AcpCleanup,
     ) -> Result<Self, ProviderError> {
         let runtime = PathBuf::from(launch.command.first().map(String::as_str).unwrap_or("ACP"));
         let requirement = runtime_requirement(options.kind, runtime)?;
-        let transport = AcpConnection::launch(launch, state.clone())
+        let transport = AcpConnection::launch_retained(launch, state.clone(), cleanup)
             .await
             .map_err(|source| initialization_failure(&requirement, source))?;
-        let result: Result<Self> = async {
+        let result: Result<(String, Value, Value)> = async {
         let initialized = transport.request("initialize", json!({"protocolVersion":1,
             "clientInfo":{"name":"forge-harness","title":"Forge Harness","version":"0.1.0"},
             "clientCapabilities":{"session":{"compaction":{},"configOptions":{"boolean":{}}},"subagents":{}}})).await.map_err(|source| initialization_failure(&requirement, source))?;
@@ -120,13 +133,39 @@ impl AcpConversation {
         };
         let id = response["sessionId"]
             .as_str()
+            .filter(|id| !id.trim().is_empty())
             .map(str::to_owned)
-            .or(options.session_id)
+            .or_else(|| options.session_id.clone())
             .context("ACP session response has no conversation identity")?;
+        if let Some(expected) = &options.session_id { ensure!(&id == expected, "ACP loaded a different conversation identity"); }
         state.update_catalog(response.clone()).await;
-        Ok(Self { id, transport, state, initialized, configuration: tokio::sync::Mutex::new(parameter) })
+        Ok((id, initialized, parameter))
         }.await;
-        result.map_err(|_| acp_failure(forge_provider_api::ProviderFailureKind::Initialization))
+        match result {
+            Ok((id, initialized, configuration)) => Ok(Self {
+                id,
+                transport,
+                state,
+                initialized,
+                configuration: tokio::sync::Mutex::new(configuration),
+                fork_targets: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            }),
+            Err(_) => {
+                let cause = acp_failure(forge_provider_api::ProviderFailureKind::Initialization);
+                state.invalidate_binding(cause.clone()).await;
+                transport.retain_failure(cause.clone()).await;
+                match transport.shutdown().await {
+                    Ok(()) => Err(cause),
+                    Err(cleanup) => Err(ProviderError::PreparationCleanup {
+                        cause: Box::new(cause),
+                        cleanup: Box::new(crate::error::acp(
+                            cleanup,
+                            forge_provider_api::ProviderOperation::SessionOpen,
+                        )),
+                    }),
+                }
+            }
+        }
     }
 
     /// Get the negotiated provider conversation identity.
@@ -160,7 +199,12 @@ impl AcpConversation {
 
     /// Send a native operation while preserving its transport error category.
     pub async fn request(&self, method: &str, parameter: Value) -> Result<Value, ProviderError> {
-        Ok(self.transport.request(method, parameter).await?)
+        self.transport
+            .request(method, parameter)
+            .await
+            .map_err(|error| {
+                crate::error::acp(error, forge_provider_api::ProviderOperation::SessionCompact)
+            })
     }
 
     /// Reload retained history with the exact invocation-owned host MCP endpoint.
@@ -205,7 +249,92 @@ impl AcpConversation {
         let response = self
             .transport
             .request("session/load", configuration.clone())
-            .await?;
+            .await
+            .map_err(|error| {
+                crate::error::acp(error, forge_provider_api::ProviderOperation::InputSubmit)
+            })
+            .and_then(|response| {
+                if response["sessionId"].as_str() == Some(self.id.as_str()) {
+                    Ok(response)
+                } else {
+                    Err(ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderFailureKind::Protocol,
+                        ),
+                    ))
+                }
+            });
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let kind = match &error {
+                    ProviderError::Failure(failure) => failure.kind(),
+                    _ => forge_provider_api::ProviderFailureKind::Unknown,
+                };
+                // session/load may have installed this callback URL even when its response is lost or invalid.
+                let cause = ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::InputSubmit,
+                        kind,
+                    )
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Preparation,
+                        forge_provider_api::FailureDisposition::Invalidated,
+                    ),
+                );
+                self.state.invalidate_binding(cause.clone()).await;
+                self.transport.retain_failure(cause.clone()).await;
+                return Err(cause);
+            }
+        };
+        *self.configuration.lock().await = configuration;
+        self.state.update_catalog(response).await;
+        Ok(())
+    }
+
+    /// Reload the same durable history with a complete resource set and preserved host endpoint.
+    pub(super) async fn configure_resources(
+        &self,
+        servers: Vec<Value>,
+        skills: &[String],
+        profile: &std::path::Path,
+    ) -> Result<(), ProviderError> {
+        let mut configuration = self.configuration.lock().await.clone();
+        let endpoint = configuration["mcpServers"]
+            .as_array()
+            .and_then(|servers| {
+                servers
+                    .iter()
+                    .find(|server| server["name"] == "forge-harness-control")
+            })
+            .cloned();
+        let mut servers = servers;
+        if let Some(endpoint) = endpoint {
+            servers.insert(0, endpoint);
+        }
+        configuration["mcpServers"] = json!(servers);
+        configuration["sessionId"] = json!(self.id);
+        if let Some(options) = configuration.pointer_mut("/_meta/claudeCode/options") {
+            options["plugins"] = json!([{"type":"local","path":profile}]);
+            options["skills"] = json!(
+                skills
+                    .iter()
+                    .map(|name| format!("forge-managed:{name}"))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let _history_replay = self.state.suppress_history_replay()?;
+        let response = self
+            .transport
+            .request("session/load", configuration.clone())
+            .await
+            .map_err(|error| {
+                crate::error::acp(
+                    error,
+                    forge_provider_api::ProviderOperation::SessionConfigure,
+                )
+            })?;
         if response["sessionId"].as_str() != Some(self.id.as_str()) {
             return Err(acp_failure(
                 forge_provider_api::ProviderFailureKind::Protocol,
@@ -223,9 +352,16 @@ impl AcpConversation {
         parameter: Value,
         receipt: Option<Arc<dyn forge_provider_api::submission::InputReceipt>>,
         dispatch: &forge_provider_api::submission::DispatchReporter,
+        cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<Value, ProviderError> {
         self.transport
-            .submit(method, parameter, receipt, Some(dispatch))
+            .submit(
+                method,
+                parameter,
+                receipt,
+                Some(dispatch),
+                Some(cancellation),
+            )
             .await
     }
 
@@ -240,24 +376,32 @@ impl AcpConversation {
 
     /// Interrupt this conversation while retaining the outstanding prompt's terminal response.
     pub fn cancel(&self) -> Result<(), ProviderError> {
-        Ok(self.transport.cancel(&self.id)?)
+        self.transport.cancel(&self.id).map_err(|error| {
+            crate::error::acp(error, forge_provider_api::ProviderOperation::Cancel)
+        })
     }
 
     /// Stop and collect the owned native process.
     pub async fn shutdown(&self) -> Result<(), ProviderError> {
-        Ok(self.transport.shutdown().await?)
+        self.transport.shutdown().await.map_err(|error| {
+            crate::error::acp(error, forge_provider_api::ProviderOperation::SessionClose)
+        })
     }
 
     /// Fork the negotiated configuration and reject a reused source identity.
-    pub async fn fork(
+    pub(super) async fn fork(
         &self,
-        workspace: &str,
-        mcp_servers: Vec<Value>,
-        skills: &[String],
-        profile: &std::path::Path,
-        model: Option<&str>,
-        effort: Option<&str>,
+        operation_id: &forge_provider_api::OperationId,
+        target: ForkConfiguration<'_>,
     ) -> Result<String, ProviderError> {
+        let ForkConfiguration {
+            workspace,
+            mcp_servers,
+            skills,
+            profile,
+            model,
+            effort,
+        } = target;
         if self
             .initialized
             .pointer("/agentCapabilities/sessionCapabilities/fork")
@@ -285,7 +429,10 @@ impl AcpConversation {
             let response = self
                 .transport
                 .request("session/fork", configuration)
-                .await?;
+                .await
+                .map_err(|error| {
+                    crate::error::acp(error, forge_provider_api::ProviderOperation::SessionFork)
+                })?;
             let id = response["sessionId"]
                 .as_str()
                 .filter(|id| !id.trim().is_empty())
@@ -296,6 +443,10 @@ impl AcpConversation {
                     forge_provider_api::ProviderFailureKind::Protocol,
                 ));
             }
+            self.fork_targets
+                .lock()
+                .await
+                .insert(operation_id.clone(), id.clone());
             let catalog = self.state.catalog().await.clone();
             if let Some(model) = model {
                 if let Some(option) = find_option(&catalog, "model") {
@@ -306,11 +457,23 @@ impl AcpConversation {
                                 "sessionId":id,"configId":option["id"],"value":model
                             }),
                         )
-                        .await?;
+                        .await
+                        .map_err(|error| {
+                            crate::error::acp(
+                                error,
+                                forge_provider_api::ProviderOperation::SessionFork,
+                            )
+                        })?;
                 } else {
                     self.transport
                         .request("session/set_model", json!({"sessionId":id,"modelId":model}))
-                        .await?;
+                        .await
+                        .map_err(|error| {
+                            crate::error::acp(
+                                error,
+                                forge_provider_api::ProviderOperation::SessionFork,
+                            )
+                        })?;
                 }
             }
             if let Some(effort) = effort {
@@ -328,7 +491,10 @@ impl AcpConversation {
                             "sessionId":id,"configId":option["id"],"value":effort
                         }),
                     )
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        crate::error::acp(error, forge_provider_api::ProviderOperation::SessionFork)
+                    })?;
             }
             Ok(id)
         }
@@ -427,6 +593,30 @@ impl AcpConversation {
         capability
     }
 
+    /// Capture concrete native defaults before task-specific model overrides can replace them.
+    pub(super) async fn initial_model(&self) -> forge_provider_api::ModelSelection {
+        let catalog = self.state.catalog().await;
+        forge_provider_api::ModelSelection {
+            model: catalog
+                .pointer("/models/currentModelId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    find_option(&catalog, "model")
+                        .and_then(|option| option["currentValue"].as_str())
+                        .map(str::to_owned)
+                }),
+            reasoning: find_option(&catalog, "thought_level")
+                .or_else(|| find_option(&catalog, "effort"))
+                .and_then(|option| option["currentValue"].as_str())
+                .map(|effort| {
+                    forge_provider_api::generation::ReasoningSelection::Level(effort.to_owned())
+                })
+                .unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+
     /// Decode native model and reasoning choices for the host catalog.
     pub async fn models(&self) -> Result<Vec<ProviderModel>> {
         let catalog = self.state.catalog().await;
@@ -509,7 +699,8 @@ pub fn initialization_failure(
         | AcpConnectionError::Startup { .. }
         | AcpConnectionError::Protocol { .. }
         | AcpConnectionError::Remote { .. }
-        | AcpConnectionError::Callback(_) => requirement
+        | AcpConnectionError::Callback(_)
+        | AcpConnectionError::Collection { .. } => requirement
             .probe_failed(forge_provider_api::version::RuntimeProbeFailure::Unavailable)
             .into(),
     }
@@ -535,7 +726,7 @@ pub fn validate_initialization(
 
 fn acp_failure(kind: forge_provider_api::ProviderFailureKind) -> ProviderError {
     ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-        forge_provider_api::ProviderOperation::InitializeSession,
+        forge_provider_api::ProviderOperation::SessionOpen,
         kind,
     ))
 }

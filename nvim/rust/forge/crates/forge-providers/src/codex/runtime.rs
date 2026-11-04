@@ -44,9 +44,12 @@ impl Drop for CodexAppServer {
 /// Owns one Codex app-server shared by connections using the same resource configuration.
 pub struct CodexRuntime {
     command: Vec<String>,
+    isolated_home: Option<std::path::PathBuf>,
     server: Mutex<Option<CodexAppServer>>,
     start_count: AtomicU64,
     closed: AtomicBool,
+    #[cfg(test)]
+    fixture_endpoint: Option<String>,
 }
 
 impl CodexRuntime {
@@ -54,10 +57,28 @@ impl CodexRuntime {
     pub fn new(command: Vec<String>) -> Self {
         Self {
             command,
+            isolated_home: None,
             server: Mutex::new(None),
             start_count: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            #[cfg(test)]
+            fixture_endpoint: None,
         }
+    }
+
+    /// Create an exclusive runtime whose home cannot load the user's global instructions or hooks.
+    pub(super) fn isolated(command: Vec<String>, home: std::path::PathBuf) -> Self {
+        let mut runtime = Self::new(command);
+        runtime.isolated_home = Some(home);
+        runtime
+    }
+
+    /// Exercise connection replacement against an owned native wire fixture without starting a subprocess.
+    #[cfg(test)]
+    pub(super) fn fixture(endpoint: String) -> Self {
+        let mut runtime = Self::new(vec!["owned-native-fixture".into()]);
+        runtime.fixture_endpoint = Some(endpoint);
+        runtime
     }
 
     /// Connect one session channel without starting another app-server.
@@ -67,6 +88,12 @@ impl CodexRuntime {
             !self.closed.load(Ordering::Acquire),
             "shared Codex runtime is shut down"
         );
+        #[cfg(test)]
+        if let Some(endpoint) = &self.fixture_endpoint {
+            return CodexConnection::connect(endpoint)
+                .await
+                .map_err(anyhow::Error::from);
+        }
         let running = match server.as_mut() {
             Some(server) => server.child.try_wait()?.is_none(),
             None => false,
@@ -152,6 +179,9 @@ impl CodexRuntime {
             .split_first()
             .context("Codex provider launch command is empty")?;
         let mut command = process::command(program, argument_list);
+        if let Some(home) = &self.isolated_home {
+            command.env("CODEX_HOME", home);
+        }
         command
             .arg("--listen")
             .arg(&endpoint)

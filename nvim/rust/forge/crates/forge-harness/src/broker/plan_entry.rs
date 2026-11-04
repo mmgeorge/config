@@ -125,7 +125,6 @@ impl BrokerObserver {
                 let mut task = Task::goal(
                     text.clone(),
                     crate::session::continuation::ContinuationBudget::new(goal_max_turns, 5),
-                    self.native_goal_supported()?,
                     now_ms,
                 );
                 task.request_entry(format!("Goal: {text}\nContinue working until the goal is complete. Use goal_complete or goal_blocked to report terminal state."), now_ms)?;
@@ -535,7 +534,6 @@ mod tests {
                 "Resume fixture".into(),
                 record,
                 crate::session::continuation::ContinuationBudget::new(20, 2),
-                false,
                 1,
             );
             let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
@@ -655,7 +653,6 @@ mod tests {
                 TaskChange::Install(Box::new(Task::goal(
                     "Replacement task".into(),
                     Default::default(),
-                    false,
                     1,
                 ))),
                 1,

@@ -11,7 +11,7 @@ pub(super) fn mcp_launches(launches: &[McpLaunch]) -> Result<Vec<Value>, Provide
     launches.iter().map(|launch| {
         if launch.name == "forge-harness-control" || !names.insert(&launch.name) {
             return Err(ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::InitializeSession,
+                forge_provider_api::ProviderOperation::SessionOpen,
                 forge_provider_api::ProviderFailureKind::Rejected,
             )));
         }

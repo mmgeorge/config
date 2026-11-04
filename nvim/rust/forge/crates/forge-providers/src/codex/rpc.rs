@@ -21,14 +21,26 @@ pub(super) struct RpcHandle(Arc<tokio::sync::RwLock<Arc<NativeRpc>>>);
 pub(super) struct RpcGuard(Arc<NativeRpc>);
 
 impl RpcHandle {
+    #[cfg(test)]
     pub(super) fn new(rpc: NativeRpc) -> Self {
         Self(Arc::new(tokio::sync::RwLock::new(Arc::new(rpc))))
+    }
+    /// Retain an already shared native dispatcher through binding replacement.
+    pub(super) fn from_shared(rpc: Arc<NativeRpc>) -> Self {
+        Self(Arc::new(tokio::sync::RwLock::new(rpc)))
     }
     pub(super) async fn lock(&self) -> RpcGuard {
         RpcGuard(self.0.read().await.clone())
     }
-    pub(super) async fn replace(&self, rpc: NativeRpc) -> Arc<NativeRpc> {
-        std::mem::replace(&mut *self.0.write().await, Arc::new(rpc))
+    pub(super) async fn replace_shared(&self, rpc: Arc<NativeRpc>) -> Arc<NativeRpc> {
+        std::mem::replace(&mut *self.0.write().await, rpc)
+    }
+}
+
+impl RpcGuard {
+    /// Clone the dispatcher without exposing the replacement lock.
+    pub(super) fn shared(&self) -> Arc<NativeRpc> {
+        self.0.clone()
     }
 }
 
@@ -68,7 +80,7 @@ impl NativeRpc {
                 let received = match reader_connection.receive().await {
                     Ok(received) => received,
                     Err(error) => {
-                        let error = ProviderError::from(error);
+                        let error = crate::error::codex(error, ProviderOperation::InputSubmit);
                         let pending = std::mem::take(&mut *reader_waiters.lock().await);
                         for (_, waiter) in pending {
                             let _ = waiter.send(Err(error.clone()));
@@ -130,28 +142,27 @@ impl NativeRpc {
         operation: ProviderOperation,
     ) -> Result<Value, ProviderError> {
         let id = self.send_request(method, params).await?;
-        self.wait_response(id, operation).await
-    }
-
-    /// Retain a read-only observation until its response or transport closure proves completion.
-    pub(super) async fn request_observation(
-        &self,
-        method: &str,
-        params: Value,
-        operation: ProviderOperation,
-    ) -> Result<Value, ProviderError> {
-        let id = self.send_request(method, params).await?;
-        let receiver = self
-            .responses
-            .lock()
-            .await
-            .remove(&id)
-            .ok_or_else(|| failure(operation, ProviderFailureKind::Protocol))?;
-        let method = self.methods.lock().await.remove(&id).unwrap_or_default();
-        let response = receiver.await;
-        self.waiters.lock().await.remove(&id);
-        let result = response.map_err(|_| failure(operation, ProviderFailureKind::Transport))??;
-        decode_result(&result, operation, &method)
+        let response = self.wait_response(id, operation);
+        let context = super::operations::current();
+        if let Some(context) = context {
+            // These identity-addressed mutations retain late acknowledgement so an expired
+            // observer cannot authorize blind creation of another fork or terminal action.
+            if matches!(
+                method,
+                "thread/fork" | "thread/backgroundTerminals/terminate"
+            ) {
+                return response.await;
+            }
+            tokio::select! {
+                result = response => result,
+                reason = context.context.interrupted() => {
+                    self.abandon_response(id).await;
+                    Err(reason.failure(context.operation, forge_provider_api::ProviderPhase::Observation, if context.changed() { forge_provider_api::FailureDisposition::Uncertain } else { forge_provider_api::FailureDisposition::Unchanged }))
+                }
+            }
+        } else {
+            response.await
+        }
     }
 
     /// Await one request response without owning the native session reader lock.
@@ -175,18 +186,26 @@ impl NativeRpc {
         decode_result(&result, operation, &method)
     }
 
+    /// Release obsolete acknowledgement bookkeeping after positive native lifecycle admission.
+    /// Later replies remain correlated to this retired ID and cannot affect a successor request.
+    pub(super) async fn abandon_response(&self, id: u64) {
+        self.waiters.lock().await.remove(&id);
+        self.responses.lock().await.remove(&id);
+        self.methods.lock().await.remove(&id);
+    }
+
     /// Write one native notification without adding a JSON-RPC request identity.
     pub(super) async fn notify(&self, method: &str, params: Value) -> Result<(), ProviderError> {
         let encoded =
             serde_json::to_string(&json!({"method":method,"params":params})).map_err(|_| {
                 failure(
-                    ProviderOperation::NativeTransport,
+                    ProviderOperation::InputSubmit,
                     ProviderFailureKind::Protocol,
                 )
             })?;
         self.connection.send(encoded).await.map_err(|_| {
             failure(
-                ProviderOperation::NativeTransport,
+                ProviderOperation::InputSubmit,
                 ProviderFailureKind::Transport,
             )
         })
@@ -198,20 +217,32 @@ impl NativeRpc {
         method: &str,
         params: Value,
     ) -> Result<u64, ProviderError> {
+        if !matches!(
+            method,
+            "initialize"
+                | "config/read"
+                | "model/list"
+                | "skills/list"
+                | "getAuthStatus"
+                | "account/read"
+                | "thread/read"
+                | "thread/loaded/list"
+                | "thread/items/list"
+                | "mcpServerStatus/list"
+                | "thread/backgroundTerminals/list"
+        ) {
+            super::operations::mark_changed();
+        }
+        super::operations::check()?;
         let id = self
             .next_id
             .fetch_add(1, Ordering::Relaxed)
             .checked_add(1)
-            .ok_or_else(|| {
-                failure(
-                    ProviderOperation::NativeTransport,
-                    ProviderFailureKind::Unknown,
-                )
-            })?;
+            .ok_or_else(|| failure(ProviderOperation::InputSubmit, ProviderFailureKind::Unknown))?;
         let encoded = serde_json::to_string(&json!({"id":id,"method":method,"params":params}))
             .map_err(|_| {
                 failure(
-                    ProviderOperation::NativeTransport,
+                    ProviderOperation::InputSubmit,
                     ProviderFailureKind::Protocol,
                 )
             })?;
@@ -224,7 +255,7 @@ impl NativeRpc {
             self.responses.lock().await.remove(&id);
             self.methods.lock().await.remove(&id);
             return Err(failure(
-                ProviderOperation::NativeTransport,
+                ProviderOperation::InputSubmit,
                 ProviderFailureKind::Transport,
             ));
         }
@@ -233,30 +264,39 @@ impl NativeRpc {
 
     /// Receive the next unsolicited notification or server request in wire order.
     pub(super) async fn receive(&self) -> Result<Value, ProviderError> {
-        self.notifications
-            .lock()
-            .await
-            .recv()
-            .await
-            .ok_or_else(|| {
-                failure(
-                    ProviderOperation::NativeTransport,
-                    ProviderFailureKind::Transport,
-                )
-            })?
+        let receive = async {
+            self.notifications
+                .lock()
+                .await
+                .recv()
+                .await
+                .ok_or_else(|| {
+                    failure(
+                        ProviderOperation::InputSubmit,
+                        ProviderFailureKind::Transport,
+                    )
+                })?
+        };
+        match super::operations::current() {
+            Some(context) => tokio::select! {
+                result = receive => result,
+                reason = context.context.interrupted() => Err(reason.failure(context.operation, forge_provider_api::ProviderPhase::Observation, if context.changed() { forge_provider_api::FailureDisposition::Uncertain } else { forge_provider_api::FailureDisposition::Unchanged })),
+            },
+            None => receive.await,
+        }
     }
 
     /// Respond to a native server request without exposing its identity to Harness.
     pub(super) async fn respond(&self, id: &Value, result: Value) -> Result<(), ProviderError> {
         let encoded = serde_json::to_string(&json!({"id":id,"result":result})).map_err(|_| {
             failure(
-                ProviderOperation::NativeTransport,
+                ProviderOperation::InputSubmit,
                 ProviderFailureKind::Protocol,
             )
         })?;
         self.connection.send(encoded).await.map_err(|_| {
             failure(
-                ProviderOperation::NativeTransport,
+                ProviderOperation::InputSubmit,
                 ProviderFailureKind::Transport,
             )
         })
@@ -269,13 +309,13 @@ impl NativeRpc {
         }))
         .map_err(|_| {
             failure(
-                ProviderOperation::NativeTransport,
+                ProviderOperation::InputSubmit,
                 ProviderFailureKind::Protocol,
             )
         })?;
         self.connection.send(encoded).await.map_err(|_| {
             failure(
-                ProviderOperation::NativeTransport,
+                ProviderOperation::InputSubmit,
                 ProviderFailureKind::Transport,
             )
         })
@@ -283,12 +323,19 @@ impl NativeRpc {
 
     /// Collect the socket owner and dispatcher after native session work has settled.
     pub(super) async fn close(&self) -> Result<(), ProviderError> {
-        let connection = self.connection.close().await.map_err(|_| {
-            failure(
-                ProviderOperation::CollectNativeRuntime,
-                ProviderFailureKind::Transport,
-            )
-        });
+        // Observation owners must wake before the dispatcher is aborted, including explicit close.
+        let pending = std::mem::take(&mut *self.waiters.lock().await);
+        for (_, waiter) in pending {
+            let _ = waiter.send(Err(failure(
+                ProviderOperation::SessionClose,
+                ProviderFailureKind::BindingClosed,
+            )));
+        }
+        let connection = self
+            .connection
+            .close()
+            .await
+            .map_err(|_| failure(ProviderOperation::Shutdown, ProviderFailureKind::Transport));
         let mut reader = self.reader.lock().await;
         let collection = if let Some(running) = reader.as_mut() {
             running.abort();
@@ -296,7 +343,7 @@ impl NativeRpc {
                 Ok(()) => Ok(()),
                 Err(error) if error.is_cancelled() => Ok(()),
                 Err(_) => Err(failure(
-                    ProviderOperation::CollectEventReader,
+                    ProviderOperation::InputSubmit,
                     ProviderFailureKind::Runtime,
                 )),
             };
@@ -318,7 +365,7 @@ impl NativeRpc {
 fn decode_frame(received: ReceivedMessage) -> Result<Value, ProviderError> {
     received.value.map_err(|_| {
         failure(
-            ProviderOperation::NativeTransport,
+            ProviderOperation::InputSubmit,
             ProviderFailureKind::Protocol,
         )
     })
@@ -341,6 +388,18 @@ fn decode_result(
     }
     if message.get("error").is_some() {
         let error = &message["error"];
+        if matches!(method, "thread/resume" | "thread/fork")
+            && error.get("code").and_then(Value::as_i64) == Some(-32600)
+            && error
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| {
+                    message.starts_with("thread ")
+                        && message.ends_with(" already has an active writer")
+                })
+        {
+            return Err(failure(operation, ProviderFailureKind::ResourceConflict));
+        }
         if method == "thread/resume"
             && error.get("code").and_then(Value::as_i64) == Some(-32600)
             && error
@@ -372,7 +431,18 @@ fn decode_result(
 }
 
 fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderError {
-    ProviderError::Failure(ProviderFailure::new(operation, kind))
+    let disposition = if matches!(
+        kind,
+        ProviderFailureKind::Rejected | ProviderFailureKind::ResourceConflict
+    ) {
+        forge_provider_api::error::FailureDisposition::Unchanged
+    } else {
+        forge_provider_api::error::FailureDisposition::Uncertain
+    };
+    ProviderError::Failure(ProviderFailure::new(operation, kind).at_phase(
+        forge_provider_api::error::ProviderPhase::Observation,
+        disposition,
+    ))
 }
 
 #[cfg(test)]
@@ -382,6 +452,16 @@ mod tests {
     use serde_json::json;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    /// A known durable writer conflict retains a safe resource reason instead of native error text.
+    #[test]
+    fn active_writer_resume_rejection_is_a_normalized_resource_conflict() {
+        let error = decode_result(&json!({"error":{"code":-32600,"message":"thread private-thread-id already has an active writer"}}), ProviderOperation::SessionOpen, "thread/resume").unwrap_err();
+        assert!(
+            matches!(&error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionOpen && failure.kind() == ProviderFailureKind::ResourceConflict && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
+        );
+        assert!(!error.to_string().contains("private-thread-id"));
+    }
 
     /// Create a fully collected transport for isolated dispatcher-collection tests.
     async fn closed_rpc() -> NativeRpc {
@@ -404,6 +484,31 @@ mod tests {
         rpc.close().await.unwrap();
         peer.await.unwrap();
         rpc
+    }
+
+    /// Explicit close releases a status observation even when the native endpoint never replies.
+    #[tokio::test]
+    async fn close_releases_unanswered_observation_before_reader_collection() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (sent, received) = oneshot::channel();
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let _ = socket.next().await.unwrap().unwrap();
+                sent.send(()).unwrap();
+                while let Some(Ok(message)) = socket.next().await { if message.is_close() { break; } }
+            });
+            let rpc = Arc::new(NativeRpc::new(CodexConnection::connect(&format!("ws://{address}")).await.unwrap()));
+            let observed_rpc = rpc.clone();
+            let observation = tokio::spawn(async move { observed_rpc.request("thread/backgroundTerminals/list", json!({"threadId":"thread"}), ProviderOperation::TerminalList).await });
+            received.await.unwrap();
+            rpc.close().await.unwrap();
+            let error = observation.await.unwrap().unwrap_err();
+            assert!(matches!(error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::BindingClosed));
+            peer.await.unwrap();
+        }).await.unwrap();
     }
 
     /// Keep the original dispatcher owned when a cleanup waiter times out.
@@ -445,7 +550,7 @@ mod tests {
         *rpc.reader.lock().await = Some(task);
         let error = rpc.close().await.unwrap_err();
         assert!(matches!(&error, ProviderError::Failure(failure)
-            if failure.operation() == ProviderOperation::CollectEventReader
+            if failure.operation() == ProviderOperation::InputSubmit
             && failure.kind() == ProviderFailureKind::Runtime));
         assert!(!format!("{error:?} {error}").contains("private dispatcher panic marker"));
         let source = std::error::Error::source(&error).unwrap();
@@ -471,7 +576,7 @@ mod tests {
                 ProviderFailureKind::Rejected,
             ),
             (
-                "thread/goal/clear",
+                "thread/unsubscribe",
                 -32600,
                 "thread not found: private-native-id",
                 ProviderFailureKind::Rejected,
@@ -496,7 +601,7 @@ mod tests {
             ),
         ] {
             let error = decode_result(&json!({"id":17,"error":{"code":code,"message":message,"data":"private-native-payload"}}),
-                ProviderOperation::AdmitInput, method).unwrap_err();
+                ProviderOperation::InputSubmit, method).unwrap_err();
             assert!(
                 matches!(&error, ProviderError::Failure(failure) if failure.kind() == expected)
             );
@@ -513,7 +618,7 @@ mod tests {
         assert_eq!(
             decode_result(
                 &json!({"id":17,"result":null}),
-                ProviderOperation::AdmitInput,
+                ProviderOperation::InputSubmit,
                 "turn/start"
             )
             .unwrap(),
@@ -521,7 +626,7 @@ mod tests {
         );
         for malformed in [json!({"id":17}), json!({"id":17,"result":null,"error":{}})] {
             assert!(
-                matches!(decode_result(&malformed, ProviderOperation::AdmitInput, "turn/start"),
+                matches!(decode_result(&malformed, ProviderOperation::InputSubmit, "turn/start"),
                 Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::Protocol)
             );
         }
@@ -549,7 +654,7 @@ mod tests {
         );
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            rpc.request("turn/start", json!({}), ProviderOperation::AdmitInput),
+            rpc.request("turn/start", json!({}), ProviderOperation::InputSubmit),
         )
         .await
         .expect("malformed frame must release the request")
@@ -598,7 +703,7 @@ mod tests {
             .unwrap();
         let rpc = NativeRpc::new(connection);
         let result = rpc
-            .request("turn/start", json!({}), ProviderOperation::AdmitInput)
+            .request("turn/start", json!({}), ProviderOperation::InputSubmit)
             .await
             .unwrap();
         assert_eq!(result["turnId"], "turn");
@@ -623,7 +728,7 @@ mod tests {
             .unwrap();
         let rpc = NativeRpc::new(connection);
         let error = rpc
-            .request("turn/start", json!({}), ProviderOperation::AdmitInput)
+            .request("turn/start", json!({}), ProviderOperation::InputSubmit)
             .await
             .unwrap_err();
         assert!(

@@ -37,14 +37,18 @@ impl CompactionJob {
 
     pub(crate) async fn run(self) -> CompactionResult {
         use futures_util::FutureExt;
-        let output = std::panic::AssertUnwindSafe(self.provider.compact(self.request))
+        let output = std::panic::AssertUnwindSafe(self.provider.session_compact(self.request))
             .catch_unwind()
             .await
             .unwrap_or_else(|_| {
                 Err(crate::provider::ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::CompactSession,
+                        forge_provider_api::ProviderOperation::SessionCompact,
                         forge_provider_api::ProviderFailureKind::Runtime,
+                    )
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Observation,
+                        forge_provider_api::FailureDisposition::Uncertain,
                     ),
                 ))
             });
@@ -215,7 +219,7 @@ impl HarnessBroker {
                     state.compaction.completed_at_ms = Some(self.clock.now_ms());
                     state.compaction.result.diagnostic =
                         Some(crate::provider::lifecycle_error::diagnostic(
-                            forge_provider_api::ProviderOperation::HostEffectPublication,
+                            forge_provider_api::ProviderOperation::InputSubmit,
                             error.as_ref(),
                         ));
                     state.record.detail = SessionEventKind::Compaction {
@@ -255,7 +259,7 @@ impl HarnessBroker {
                 state.compaction.state = crate::provider::CompactionState::Failed;
                 state.compaction.result.diagnostic =
                     Some(crate::provider::lifecycle_error::diagnostic(
-                        forge_provider_api::ProviderOperation::CompactSession,
+                        forge_provider_api::ProviderOperation::SessionCompact,
                         &error,
                     ));
                 state.record.detail = SessionEventKind::Compaction {

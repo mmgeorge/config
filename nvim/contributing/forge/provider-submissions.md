@@ -10,7 +10,7 @@ This reference explains what counts as acceptance for each provider, and how to 
 
 Owner-targeted steering is registered with the shared session execution engine before dispatch. The adapter reports delivery separately from execution completion. Its 30-second acknowledgment deadline produces an uncertain-delivery error; it never silently queues another copy. Cancelling the owning turn still interrupts delivery.
 
-An explicit `NotConsumed` result carries a single-use opaque continuation token. The adapter binds it to the original request and waits for the prior native execution to close admission before continuation. Changing the input, scope, receipt, tools, attachments, or configuration invalidates that use without consuming the valid grant. An accepted result, disconnect, or unknown outcome does not permit resending. A terminal event must cover every accepted input before the host result waiter completes.
+An explicit `NotConsumed` result proves that the addressed delivery did not consume input; it carries no native continuation authority. The host may retain that input for a later explicitly owned admission after the previous invocation settles. That admission uses ordinary `input_submit`, a fresh invocation scope, and a fresh delivery attempt for the original journal entry. An accepted result, disconnect, or unknown outcome never permits replay. Native terminal coverage, native resource settlement, and host commit all precede the completed host result.
 
 | State | Meaning |
 | --- | --- |
@@ -21,7 +21,7 @@ An explicit `NotConsumed` result carries a single-use opaque continuation token.
 
 ## Recovery checkpoints
 
-A `Sending` record retains an opaque conversation identity and a versioned adapter checkpoint. The journal does not decode native thread, cursor, or prompt fields. Only the owning adapter recognizes the checkpoint format and exact version, then checks native history for positive acceptance evidence. Unknown versions remain uncertain and cannot authorize replay. Once reconciliation succeeds, the journal can restore the normalized conversation identity without matching a provider-specific variant.
+Each logical `SubmissionId` retains a separate `DeliveryAttemptId`, rotated only after positive rejection proves another attempt is eligible. A `Sending` record retains that exact attempt, an opaque conversation identity, and a versioned adapter checkpoint. The journal does not decode native thread, cursor, or prompt fields. Only the owning adapter recognizes the checkpoint format and exact version, then checks native history for positive acceptance evidence. Unknown versions remain uncertain and cannot authorize replay. `input_reconcile` observes the original submission and attempt without sending input or opening a writable recovery binding. Lookup failures retain typed causes; inconclusive evidence remains unknown. Once reconciliation succeeds, the journal can restore the normalized conversation identity without matching a provider-specific variant.
 
 Tracking and local acceptance are explicit integration capabilities. Mock declares local acceptance at its own boundary; real adapters declare tracking before dispatch. Adding a provider does not require a journal allowlist change.
 
@@ -33,14 +33,14 @@ A successful local write is not evidence of acceptance. Each adapter relies on w
 | --- | --- | --- |
 | Codex | Successful native `turn/start` or `turn/steer` response | Exact client UUID in fully paginated native history. |
 | Copilot | Native `session.send` message ID | One exact unclaimed primary user message after the saved history cursor. |
-| Claude ACP v1 | Valid prompt completion, or documented steering acceptance | Keep the uncertainty and block replay. Only documented idle steering rejection permits fallback. |
+| Claude ACP v1 | Valid prompt completion, or documented steering acceptance | Keep the uncertainty and block replay. Only documented idle steering rejection proves nonconsumption. |
 | Antigravity ACP v1 | Valid prompt completion | Keep the uncertainty and block replay. |
 
 Mock has no remote delivery boundary, and records local acceptance before processing.
 
 ### Codex
 
-Codex commits `Sending` before `turn/start` or `turn/steer`, and supplies the journal UUID as `clientUserMessageId`. Read-only reconciliation paginates `thread/items/list` for that exact `clientId`. A pre-admission JSON-RPC rejection (`-32600`, `-32601`, or `-32602`) returns the input to `Prepared`, and generic provider errors do not. Goal resume has no user-message correlation item, so its uncertain result stays uncertain.
+Codex commits `Sending` before `turn/start` or `turn/steer`, and supplies a correlation identity derived from both the journal entry and its delivery attempt as `clientUserMessageId`. Read-only reconciliation paginates `thread/items/list` for that exact attempt's `clientId`. A pre-admission JSON-RPC rejection (`-32600`, `-32601`, or `-32602`) returns the input to `Prepared`, and generic provider errors do not. Harness goal continuation is an ordinary separately journaled host input; adapters never invoke native goal continuation.
 
 The [Codex App Server reference](https://developers.openai.com/codex/app-server#turns) defines these responses. `clientId` correlates a message but is not evidence that duplicate sends are deduplicated.
 
@@ -66,7 +66,7 @@ Failure to reconcile blocks dispatch and reports the last error, keeping both th
 
 ## Add a provider
 
-Persist the opaque correlation token before the first possible write, and acknowledge only a successful native response. Implement `Provider::reconcile_submission` with read-only, fully paginated history. Return `SubmissionEvidence::Accepted` only for a positively identified input, `NotAccepted` only for proven non-delivery, and `Unknown` otherwise. Never turn a timeout, an empty history page, or a message substring into a rejection.
+Persist the opaque correlation token before the first possible write, and acknowledge only a successful native response. Implement `Provider::input_reconcile` with read-only, fully paginated history. Return `SubmissionEvidence::Accepted` only for a positively identified input, `NotAccepted` only when positive evidence proves that exact attempt cannot later be consumed, and `Unknown` otherwise. Never turn a timeout, an empty history page, or a message substring into a rejection.
 
 Test the write-before-acknowledge crash, acknowledgment commit failure, expired history, cancellation, attachments, and later queued input before enabling recovery.
 
@@ -76,4 +76,4 @@ Verify the journal and generic lifecycle fixtures in `forge-harness` and native 
 
 After rebuilding, run `nvim/rust/forge/crates/forge-providers/tests/fixtures/submission_host.lua` in fresh headless Neovim processes, with `vim.g.forge_acp_fixture_kind` set to `"claude"` and `"antigravity"`, and `vim.g.forge_acp_fixture_lost_ack` set to `false` and `true`. It asserts that uncertain delivery blocks the next native send and keeps the original error.
 
-With tracing enabled, `provider.submission` log entries record delivery transitions, input IDs, and owners. Native correlation tokens and receipt bytes remain private and are not logged.
+With tracing enabled, `provider.submission` log entries record delivery transitions, input IDs, attempt IDs, and owners. Native correlation tokens and receipt bytes remain private and are not logged.

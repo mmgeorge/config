@@ -6,7 +6,7 @@ use crate::session::ApprovalMode;
 #[derive(Clone, Copy)]
 enum BackgroundFinish {
     Shutdown,
-    IdentityLookup,
+    LateIdentityObservation,
     ForeignOwner,
     PriorTask,
     NoisyTimeout,
@@ -109,19 +109,37 @@ fn background_provider(
                         }
                     }
                 }
+                // Foreground completion and full binding retirement are independent evidence.
+                // Keep the background tool live until its native collection hook below.
+                sink.send_wait(ProviderEvent::Execution {
+                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                        scope,
+                        forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                            address: turn,
+                            covered_submissions: vec![request.submission_id],
+                            completed_at_ms: 1,
+                            result: forge_provider_api::lifecycle::ExecutionResult::Completed {
+                                completion:
+                                    forge_provider_api::completion::ProviderCompletion::default()
+                                        .into(),
+                            },
+                        },
+                    )?,
+                })
+                .await?;
                 Ok(())
             }
         },
     );
     let active_provider = Arc::downgrade(&provider);
     let active_pending = pending.clone();
-    provider.with_active_session_id(move |owner| {
+    provider.with_session_identity(move |owner| {
         let provider = active_provider
             .upgrade()
-            .expect("fixture remains alive during session lookup");
+            .expect("fixture remains alive during automatic identity publication");
         let pending = active_pending.clone();
         async move {
-            if matches!(finish, BackgroundFinish::IdentityLookup) {
+            if matches!(finish, BackgroundFinish::LateIdentityObservation) {
                 publish_background_terminal(
                     &provider,
                     &pending,
@@ -144,16 +162,14 @@ fn background_provider(
             ))
         }
     });
-    let shutdown_provider = Arc::downgrade(&provider);
-    let shutdown_pending = pending.clone();
-    provider.with_shutdown(move || {
-        let provider = shutdown_provider
+    let close_provider = Arc::downgrade(&provider);
+    let close_pending = pending.clone();
+    provider.with_session_close(move |_| {
+        let provider = close_provider
             .upgrade()
-            .expect("fixture remains alive during shutdown");
-        let pending = shutdown_pending.clone();
-        let shutdown_called = shutdown_called.clone();
+            .expect("fixture remains alive through full binding collection");
+        let pending = close_pending.clone();
         async move {
-            shutdown_called.store(true, std::sync::atomic::Ordering::Release);
             if matches!(
                 finish,
                 BackgroundFinish::Shutdown | BackgroundFinish::PriorTask
@@ -170,6 +186,13 @@ fn background_provider(
             if matches!(finish, BackgroundFinish::ForeignOwner) {
                 reject_foreign_background_scope(&provider, &pending).await?;
             }
+            Ok(())
+        }
+    });
+    provider.with_shutdown(move || {
+        let shutdown_called = shutdown_called.clone();
+        async move {
+            shutdown_called.store(true, std::sync::atomic::Ordering::Release);
             Ok(())
         }
     });
@@ -226,7 +249,7 @@ async fn reject_foreign_background_scope(
 
 fn fixture_provider_error(kind: forge_provider_api::ProviderFailureKind) -> ProviderError {
     ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-        forge_provider_api::ProviderOperation::NativeTransport,
+        forge_provider_api::ProviderOperation::InputSubmit,
         kind,
     ))
 }
@@ -333,7 +356,7 @@ async fn collect_background_child(
                         );
                         assert!(cleanup_error.is_none(), "{cleanup_error:?}");
                     } else {
-                        assert!(output.is_ok());
+                        assert!(output.is_ok(), "child foreground failed: {output:?}");
                         assert!(cleanup_error.is_none(), "{cleanup_error:?}");
                     }
                     return Ok::<_, anyhow::Error>(events);
@@ -434,10 +457,10 @@ async fn background_shutdown_settlement_precedes_child_completion() -> Result<()
     Ok(())
 }
 
-/// A natural completion during identity lookup remains successful through later shutdown.
+/// Natural tool completion during automatic identity publication survives later binding collection.
 #[tokio::test]
 async fn natural_background_completion_during_identity_lookup_is_preserved() -> Result<()> {
-    let events = collect_background_child(BackgroundFinish::IdentityLookup, 1).await?;
+    let events = collect_background_child(BackgroundFinish::LateIdentityObservation, 1).await?;
     assert_background_completion(&events, crate::provider::ToolOutcome::Succeeded, 1);
     Ok(())
 }
@@ -538,10 +561,38 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
         .expect("mock fixture descriptor");
         descriptor.capability.integration.tracked_submission = true;
         descriptor.capability.integration.local_acceptance = false;
-        let native =
-            crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
-                Err(ProviderError::Cancelled)
-            });
+        let dispatched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler_dispatches = dispatched.clone();
+        let native = crate::provider::test_support::EventFixtureProvider::new(
+            descriptor,
+            move |request, sink, _| {
+                handler_dispatches.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                async move {
+                    // This accepted native input was cancelled before execution; retain its coverage.
+                    sink.send_wait(ProviderEvent::Execution {
+                    observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                        request.scope,
+                        forge_provider_api::lifecycle::ExecutionUpdate::ResolvedWithoutExecution {
+                            covered_submissions: vec![request.submission_id], completed_at_ms: 1,
+                            result: forge_provider_api::lifecycle::ExecutionResult::Cancelled {
+                                completion: forge_provider_api::completion::ProviderCompletion::default().into(),
+                            },
+                        },
+                    )?,
+                }).await?;
+                    Ok(())
+                }
+            },
+        );
+        let collected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let close_collected = collected.clone();
+        native.with_session_close(move |_| {
+            let collected = close_collected.clone();
+            async move {
+                collected.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+        });
         if matches!(boundary, SubmissionBoundary::Prepared) {
             native.with_pre_dispatch(|_| async { Err(ProviderError::Cancelled) });
         }
@@ -579,36 +630,98 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
         match boundary {
             SubmissionBoundary::Prepared => assert_eq!(state, SubmissionState::Cancelled),
             SubmissionBoundary::Sending => {
-                assert!(matches!(state, SubmissionState::Sending { .. }))
+                assert!(
+                    matches!(state, SubmissionState::Sending { target: Some(_) }),
+                    "uncertain input lost its retained recovery receipt"
+                )
             }
             SubmissionBoundary::Accepted => {
                 assert!(matches!(state, SubmissionState::Accepted { .. }))
             }
         }
-        let command = coordinator
-            .try_receive()
-            .context("child completion was not published")?;
-        let AgentCommand::Completed {
-            output,
-            cleanup_error,
-            ..
-        } = command
-        else {
-            anyhow::bail!("unexpected child command")
+        let expected_owner = ExecutionOwner {
+            session_id: "session".into(),
+            agent_id: "child".into(),
         };
-        let error = (*output).unwrap_err();
+        let (output, cleanup_error) = loop {
+            match coordinator
+                .try_receive()
+                .context("child completion was not published")?
+            {
+                AgentCommand::Event {
+                    owner,
+                    task_id,
+                    event,
+                } => {
+                    assert_eq!(owner, expected_owner);
+                    assert_eq!(task_id, "child-task");
+                    assert_eq!(event.scope().owner(), &expected_owner);
+                    if let Some(invocation) = event.scope().invocation() {
+                        assert_eq!(invocation.exchange_id.as_str(), "child-task");
+                    }
+                }
+                AgentCommand::Completed {
+                    owner,
+                    task_id,
+                    output,
+                    cleanup_error,
+                } => {
+                    assert_eq!(owner, expected_owner);
+                    assert_eq!(task_id, "child-task");
+                    break (output, cleanup_error);
+                }
+                AgentCommand::Request { .. } => {
+                    anyhow::bail!("cancelled child unexpectedly requested host control")
+                }
+            }
+        };
         assert!(
-            error.chain().any(|cause| matches!(
-                cause.downcast_ref::<ProviderError>(),
-                Some(
-                    ProviderError::Observation(_)
-                        | ProviderError::DeliveryUncertain
-                        | ProviderError::Cancelled
-                )
-            )),
-            "an uncertified native cancellation must remain uncertain: {error:#}"
+            coordinator.try_receive().is_none(),
+            "observation followed child completion"
         );
-        assert!(cleanup_error.is_none());
+        let error = (*output).unwrap_err();
+        if matches!(boundary, SubmissionBoundary::Accepted) {
+            assert!(
+                error.is::<crate::broker::TurnCancelled>(),
+                "certified child cancellation lost its terminal proof: {error:#}"
+            );
+        } else {
+            assert!(
+                error.chain().any(|cause| matches!(
+                    cause.downcast_ref::<ProviderError>(),
+                    Some(
+                        ProviderError::Observation(_)
+                            | ProviderError::DeliveryUncertain
+                            | ProviderError::Cancelled
+                    )
+                )),
+                "an uncertified native cancellation must remain uncertain: {error:#}"
+            );
+        }
+        assert_eq!(
+            dispatched.load(std::sync::atomic::Ordering::Acquire),
+            usize::from(matches!(boundary, SubmissionBoundary::Accepted)),
+            "child cancellation dispatched another native input"
+        );
+        if matches!(boundary, SubmissionBoundary::Sending) {
+            assert!(
+                error.chain().any(|cause| matches!(
+                    cause.downcast_ref::<ProviderError>(),
+                    Some(
+                        ProviderError::DeliveryUncertain
+                            | ProviderError::Observation(
+                                forge_provider_api::ObservationFailure::DeliveryUncertain
+                            )
+                    )
+                )),
+                "resource collection replaced the primary input uncertainty: {error:#}"
+            );
+        }
+        assert!(
+            collected.load(std::sync::atomic::Ordering::Acquire),
+            "child completed before positive full-binding collection"
+        );
+        assert!(cleanup_error.is_none(), "{cleanup_error:?}");
     }
     Ok(())
 }

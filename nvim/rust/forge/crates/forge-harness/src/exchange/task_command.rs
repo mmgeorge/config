@@ -1,7 +1,9 @@
-//! Advance task control through owner collection, atomic task commits, and retained goal synchronization.
+//! Advance task control through owner collection, atomic task commits, and journaled input scheduling.
 
 use forge_protocol::message::SessionEvent;
-use tokio::sync::{OwnedSemaphorePermit, oneshot};
+use tokio::sync::OwnedSemaphorePermit;
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::{
@@ -11,7 +13,6 @@ use super::{
         TaskCommandOutcome, TaskSynchronizationFailure,
     },
     failure::OperationFailure,
-    native_goal::{NativeGoalError, NativeGoalReply, NativeGoalSelection},
     queue::QueuedCommand,
     services::OwnerServices,
     transition::{
@@ -79,18 +80,12 @@ impl TaskCommandRun {
             TaskStage::PreparingOperation { .. } | TaskStage::Commit(_) => {
                 self.transition.is_some()
             }
-            TaskStage::Goal { .. }
-            | TaskStage::AcquiringDelivery(_)
+            TaskStage::AcquiringDelivery(_)
             | TaskStage::AwaitingInput(_)
             | TaskStage::AwaitingDispatch { .. }
             | TaskStage::Ready(_)
             | TaskStage::Consumed => false,
         }
-    }
-
-    /// Get whether the active command has yielded its permits for internal goal synchronization.
-    pub(super) fn needs_goal_sync(&self) -> bool {
-        matches!(self.stage, TaskStage::Goal { .. })
     }
 
     /// Get committed task evidence for failures whose native resources require collection.
@@ -279,15 +274,10 @@ impl TaskCommandRun {
                 self.transition
                     .as_mut()
                     .expect("task collection retains its transition")
-                    .next(foreground)
+                    .next(foreground.clone())
                     .await,
             ),
             TaskStage::Commit(_) => TaskCommandEvent::Commit,
-            TaskStage::Goal { response, .. } => TaskCommandEvent::Goal(
-                response
-                    .await
-                    .unwrap_or(Err(NativeGoalError::ObservationLost)),
-            ),
             TaskStage::AcquiringDelivery(task) => TaskCommandEvent::Delivery(
                 task.await
                     .unwrap_or(Err(CommandFailure::OwnershipUnavailable)),
@@ -432,7 +422,7 @@ impl TaskCommandRun {
                 else {
                     unreachable!("task commit consumes its prepared mutation once")
                 };
-                // Couple the domain mutation to its complete result or its retained synchronization checkpoint.
+                // Commit task state with its finite result or journaled input checkpoint.
                 let mut store = crate::storage::SqliteStore::open(&services.root)
                     .map_err(OperationFailure::Domain)?;
                 let now = std::time::SystemTime::now()
@@ -463,7 +453,7 @@ impl TaskCommandRun {
                                 TaskCommandCheckpoint::Control { outcome } if finite => {
                                     TaskCommitResult::Complete(*outcome)
                                 }
-                                checkpoint => TaskCommitResult::Synchronize(checkpoint),
+                                checkpoint => TaskCommitResult::ScheduleInput(checkpoint),
                             })
                     }
                     TaskCommit::QuestionWait {
@@ -505,7 +495,7 @@ impl TaskCommandRun {
                                 TaskCommandCheckpoint::Control { outcome } => {
                                     TaskCommitResult::Complete(*outcome)
                                 }
-                                checkpoint => TaskCommitResult::Synchronize(checkpoint),
+                                checkpoint => TaskCommitResult::ScheduleInput(checkpoint),
                             })
                     }
                     TaskCommit::Execution(prepared) => {
@@ -540,7 +530,7 @@ impl TaskCommandRun {
                                 checkpoint @ (TaskCommandCheckpoint::InputPending { .. }
                                 | TaskCommandCheckpoint::WorkflowInputPending {
                                     ..
-                                }) => TaskCommitResult::Synchronize(checkpoint),
+                                }) => TaskCommitResult::ScheduleInput(checkpoint),
                             })
                     }
 
@@ -560,9 +550,7 @@ impl TaskCommandRun {
                             outcome @ (TaskCommandOutcome::Paused { .. }
                             | TaskCommandOutcome::Cleared { .. }
                             | TaskCommandOutcome::Unchanged { .. }) => {
-                                TaskCommitResult::Synchronize(TaskCommandCheckpoint::Control {
-                                    outcome: Box::new(outcome),
-                                })
+                                TaskCommitResult::Complete(outcome)
                             }
                             TaskCommandOutcome::PlanEdited { .. }
                             | TaskCommandOutcome::PlanChangesRequested { .. }
@@ -599,7 +587,7 @@ impl TaskCommandRun {
                                 prepared,
                                 now_ms,
                             )
-                            .map(TaskCommitResult::Synchronize)
+                            .map(TaskCommitResult::ScheduleInput)
                     }
                 }
                 .map_err(|error| {
@@ -613,7 +601,7 @@ impl TaskCommandRun {
                 self.control.take();
                 if matches!(
                     &committed,
-                    TaskCommitResult::Synchronize(
+                    TaskCommitResult::ScheduleInput(
                         TaskCommandCheckpoint::WorkflowInputPending { .. }
                     )
                 ) {
@@ -628,76 +616,44 @@ impl TaskCommandRun {
                         outcome: Ok(outcome),
                         events: Vec::new(),
                     }),
-                    TaskCommitResult::Synchronize(committed) => {
+                    TaskCommitResult::ScheduleInput(committed) => {
                         self.checkpoint = Some(committed.clone());
-                        let (reply, response) = oneshot::channel();
-                        self.stage = TaskStage::Goal {
-                            response,
-                            committed,
-                        };
-                        Ok(TaskCommandProgress::SynchronizeGoal {
-                            reply,
-                            events: Vec::new(),
-                        })
-                    }
-                }
-            }
-            TaskCommandEvent::Goal(result) => {
-                let TaskStage::Goal { committed, .. } =
-                    std::mem::replace(&mut self.stage, TaskStage::Consumed)
-                else {
-                    unreachable!("task goal completion retains its already-committed postcondition")
-                };
-                let postcondition = services
-                    .tasks
-                    .current()
-                    .map_err(|_| TaskSynchronizationFailure::StateUnavailable)
-                    .and_then(|current| match committed.task() {
-                        Some(task) => task
-                            .validate(current.as_ref())
-                            .map_err(|_| TaskSynchronizationFailure::TargetChanged),
-                        None if current.is_none() => Ok(()),
-                        None => Err(TaskSynchronizationFailure::TargetChanged),
-                    });
-                let failure = result
-                    .err()
-                    .map(goal_failure)
-                    .or_else(|| postcondition.err());
-                if let Some(failure) = failure {
-                    return Ok(TaskCommandProgress::Finished {
-                        outcome: Err(CommandFailure::TaskSynchronization { committed, failure }),
-                        events: Vec::new(),
-                    });
-                }
-                match committed {
-                    TaskCommandCheckpoint::Control { outcome } => {
-                        Ok(TaskCommandProgress::Finished {
-                            outcome: Ok(*outcome),
-                            events: Vec::new(),
-                        })
-                    }
-                    TaskCommandCheckpoint::InputPending { .. }
-                    | TaskCommandCheckpoint::WorkflowInputPending { .. } => {
-                        let services = services.clone();
-                        self.stage = TaskStage::AcquiringDelivery(tokio::spawn(async move {
-                            tokio::time::timeout(std::time::Duration::from_secs(60), async {
-                                let control = services
-                                    .control
-                                    .clone()
-                                    .acquire_owned()
-                                    .await
-                                    .map_err(|_| CommandFailure::OwnershipUnavailable)?;
-                                let execution = services
-                                    .execution
-                                    .acquire()
-                                    .await
-                                    .map_err(|_| CommandFailure::OwnershipUnavailable)?;
-                                Ok(TaskDeliveryCapabilities { execution, control })
-                            })
-                            .await
-                            .unwrap_or(Err(CommandFailure::OwnershipUnavailable))
-                        }));
-                        Ok(TaskCommandProgress::waiting())
+                        match committed {
+                            TaskCommandCheckpoint::Control { outcome } => {
+                                Ok(TaskCommandProgress::Finished {
+                                    outcome: Ok(*outcome),
+                                    events: Vec::new(),
+                                })
+                            }
+                            TaskCommandCheckpoint::InputPending { .. }
+                            | TaskCommandCheckpoint::WorkflowInputPending { .. } => {
+                                let services = services.clone();
+                                self.stage =
+                                    TaskStage::AcquiringDelivery(tokio::spawn(async move {
+                                        tokio::time::timeout(
+                                            std::time::Duration::from_secs(60),
+                                            async {
+                                                let control = services
+                                                    .control
+                                                    .clone()
+                                                    .acquire_owned()
+                                                    .await
+                                                    .map_err(|_| {
+                                                        CommandFailure::OwnershipUnavailable
+                                                    })?;
+                                                let execution =
+                                                    services.execution.acquire().await.map_err(
+                                                        |_| CommandFailure::OwnershipUnavailable,
+                                                    )?;
+                                                Ok(TaskDeliveryCapabilities { execution, control })
+                                            },
+                                        )
+                                        .await
+                                        .unwrap_or(Err(CommandFailure::OwnershipUnavailable))
+                                    }));
+                                Ok(TaskCommandProgress::waiting())
+                            }
+                        }
                     }
                 }
             }
@@ -781,7 +737,6 @@ impl TaskCommandRun {
             TaskStage::Preflight
             | TaskStage::Collecting(_)
             | TaskStage::Commit(_)
-            | TaskStage::Goal { .. }
             | TaskStage::AwaitingInput(_)
             | TaskStage::AwaitingDispatch { .. }
             | TaskStage::Ready(_)
@@ -1478,8 +1433,6 @@ pub(super) enum TaskCommandEvent {
     Transition(TransitionEvent),
     /// Required collection/preflight completed; the owner may attempt its task transaction.
     Commit,
-    /// Internal synchronization settled after the task checkpoint committed.
-    Goal(Result<Option<NativeGoalSelection>, NativeGoalError>),
     /// Local acquisition settled; only the owner may claim and install the task input.
     Delivery(Result<TaskDeliveryCapabilities, CommandFailure>),
     /// Initial foreground handoff did not settle within its bounded observation period.
@@ -1503,7 +1456,6 @@ impl TaskCommandEvent {
             | Self::PreparationDeadline
             | Self::Transition(_)
             | Self::Commit
-            | Self::Goal(_)
             | Self::Delivery(_)
             | Self::DispatchDeadline
             | Self::Ready => None,
@@ -1521,7 +1473,6 @@ impl TaskCommandEvent {
             Self::PreparationDeadline => "task_preparation_deadline",
             Self::Transition(_) => "task_collection",
             Self::Commit => "task_commit_ready",
-            Self::Goal(_) => "task_goal_synchronized",
             Self::Delivery(_) => "task_delivery_acquired",
             Self::DispatchDeadline => "task_dispatch_deadline",
             Self::Ready => "task_completion_ready",
@@ -1535,11 +1486,6 @@ pub(super) enum TaskCommandProgress {
     Waiting {
         events: Vec<SessionEvent>,
         input: Option<crate::input::InputUpdate>,
-    },
-    /// Request an internal effect whose receiver is retained by this task stage.
-    SynchronizeGoal {
-        reply: NativeGoalReply,
-        events: Vec<SessionEvent>,
     },
     /// Install this exact claimed input in the existing owner delivery pipeline before publication.
     DeliverInput(Box<TaskInputStart>),
@@ -1577,10 +1523,6 @@ enum TaskStage {
     },
     Collecting(TaskCollection),
     Commit(TaskCommit),
-    Goal {
-        response: oneshot::Receiver<Result<Option<NativeGoalSelection>, NativeGoalError>>,
-        committed: TaskCommandCheckpoint,
-    },
     AcquiringDelivery(JoinHandle<Result<TaskDeliveryCapabilities, CommandFailure>>),
     AwaitingInput(InputRevision),
     AwaitingDispatch {
@@ -1641,7 +1583,7 @@ enum TaskCreation {
 
 enum TaskCommitResult {
     Complete(TaskCommandOutcome),
-    Synchronize(TaskCommandCheckpoint),
+    ScheduleInput(TaskCommandCheckpoint),
 }
 
 /// Retain the captured workflow alongside its prepared reservation until one atomic commit.
@@ -2047,27 +1989,6 @@ fn rejected(failure: TaskCommandFailure) -> OperationFailure {
     OperationFailure::Transition(TransitionFailure::Rejected(CommandFailure::Task(failure)))
 }
 
-/// Reduce an internal goal failure to a persisted category without losing committed task evidence.
-fn goal_failure(error: NativeGoalError) -> TaskSynchronizationFailure {
-    match error {
-        NativeGoalError::OwnerClosed
-        | NativeGoalError::ObservationLost
-        | NativeGoalError::WorkerLost => TaskSynchronizationFailure::GoalObservationLost,
-        NativeGoalError::QueueFull => TaskSynchronizationFailure::GoalCapacity,
-        NativeGoalError::StateUnavailable => TaskSynchronizationFailure::GoalStateUnavailable,
-        NativeGoalError::Deadline => TaskSynchronizationFailure::GoalDeadline,
-        NativeGoalError::GenerationChanged => TaskSynchronizationFailure::GoalGenerationChanged,
-        NativeGoalError::Uncertain => TaskSynchronizationFailure::GoalUncertain,
-        NativeGoalError::Provider(error) => TaskSynchronizationFailure::GoalProvider {
-            kind: crate::provider::lifecycle_error::diagnostic(
-                forge_provider_api::ProviderOperation::NativeTransport,
-                &error,
-            )
-            .kind,
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2121,7 +2042,12 @@ mod tests {
         let binding = forge_provider_api::BindingId::new("binding")?;
         assert!(run.input_foreground(&input, work, receipt.clone()));
         let tracker = forge_provider_api::submission::DispatchTracker::default();
-        let reporter = tracker.track_input(binding.clone(), scope.clone(), receipt.clone())?;
+        let reporter = tracker.track_input(
+            binding.clone(),
+            scope.clone(),
+            receipt.clone(),
+            forge_provider_api::DeliveryAttemptId::new("original-attempt")?,
+        )?;
         reporter.confirm();
         let confirmed = tracker.observer().current()?.unwrap();
         run.observe_dispatch(uuid::Uuid::new_v4(), &confirmed);
@@ -2131,6 +2057,7 @@ mod tests {
             binding,
             scope.clone(),
             forge_provider_api::SubmissionId::try_from("other-receipt".to_owned())?,
+            forge_provider_api::DeliveryAttemptId::new("other-attempt")?,
         )?;
         wrong.confirm();
         run.observe_dispatch(work, &wrong_tracker.observer().current()?.unwrap());

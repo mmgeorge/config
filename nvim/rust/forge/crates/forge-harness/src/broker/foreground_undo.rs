@@ -11,27 +11,12 @@ pub(crate) struct UndoTeardown {
     replacement: Arc<Provider>,
     registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
     inbox: Arc<crate::provider::session_execution::SessionObservationInbox>,
-    goal: Option<foreground_failure::RetractionGoalJob>,
     goal_controller: Arc<crate::task::SessionTaskController>,
-    goal_lane: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl UndoTeardown {
-    /// Fence native goal authority, then collect both old-generation resources.
+    /// Collect the captured provider generation before restoring host history.
     pub(crate) async fn run(&mut self) -> Result<()> {
-        if let Some(goal) = self.goal.take() {
-            goal.run().await?;
-        }
-        let lane = self.goal_controller.native_goal_lane();
-        self.goal_lane = Some(
-            tokio::time::timeout(std::time::Duration::from_secs(30), lane.lock_owned())
-                .await
-                .map_err(|_| {
-                    self.goal_controller.mark_native_goal_uncertain();
-                    ProviderError::DeliveryUncertain
-                })?,
-        );
-        self.goal_controller.ensure_native_goal_certain()?;
         anyhow::ensure!(
             foreground_failure::same_retraction_task(
                 self.goal_controller.current()?.as_ref(),
@@ -103,20 +88,6 @@ impl HarnessBroker {
         self.store
             .require_settled_exchange_tree(&self.session.id, &ids)?;
         let expected_task = self.task_controller.current()?;
-        let goal = if let Some(goal) = self
-            .current_goal()?
-            .filter(|goal| goal.native && self.session.provider_session_id.is_some())
-        {
-            Some(foreground_failure::RetractionGoalJob::new(
-                self,
-                self.provider_request(ProviderInput::from_text(""), PromptMode::GoalContinuation)?,
-                crate::provider::native_goal_update(goal.objective, GoalState::Cleared),
-                expected_task.clone(),
-                self.execution_registry.clone(),
-            ))
-        } else {
-            None
-        };
         let replacement = crate::provider::build(
             self.provider_launch.clone(),
             self.permission_coordinator.clone(),
@@ -132,17 +103,15 @@ impl HarnessBroker {
             replacement,
             registry: self.execution_registry(),
             inbox: self.observer.session_events(),
-            goal,
             goal_controller: self.task_controller.clone(),
-            goal_lane: None,
         })
     }
 
     /// Publish a fresh observer and commit rollback only if the retired generation still owns it.
     pub(crate) fn commit_undo_teardown(
         &mut self,
-        mut teardown: UndoTeardown,
-    ) -> Result<(Vec<SessionEvent>, tokio::sync::OwnedMutexGuard<()>)> {
+        teardown: UndoTeardown,
+    ) -> Result<Vec<SessionEvent>> {
         anyhow::ensure!(
             self.session.id == teardown.session_id
                 && Arc::ptr_eq(&self.provider, &teardown.provider)
@@ -163,10 +132,6 @@ impl HarnessBroker {
         );
         self.store
             .require_settled_exchange_tree(&self.session.id, &teardown.exchanges)?;
-        let lane = teardown
-            .goal_lane
-            .take()
-            .context("undo goal generation lane was not collected")?;
         let mut session = self.session.clone();
         session.active_task = None;
         session.provider_session_id = None;
@@ -185,6 +150,7 @@ impl HarnessBroker {
         )?;
         self.session = session;
         self.provider = teardown.replacement;
+        self.clear_effective_capabilities()?;
         self.context_usage_fresh = false;
         self.observer
             .replace_session_events(Arc::new(Default::default()));
@@ -193,9 +159,9 @@ impl HarnessBroker {
             .load_exchange(&teardown.exchanges[0])?
             .filter(|exchange| exchange.session_id == self.session.id)
             .context("rolled-back interaction disappeared")?;
-        Ok((
-            vec![self.event("interaction_rolled_back", serde_json::to_value(exchange)?)?],
-            lane,
-        ))
+        Ok(vec![self.event(
+            "interaction_rolled_back",
+            serde_json::to_value(exchange)?,
+        )?])
     }
 }

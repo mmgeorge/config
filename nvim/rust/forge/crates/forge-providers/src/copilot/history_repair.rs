@@ -205,7 +205,7 @@ fn interrupted_turn(
 
 /// Classify a history recovery failure without exposing native history or SDK diagnostics.
 fn failure(kind: ProviderFailureKind) -> ProviderError {
-    super::error::native_failure(ProviderOperation::RecoverSession, kind)
+    super::error::native_failure(ProviderOperation::InputReconcile, kind)
 }
 
 #[cfg(test)]
@@ -317,7 +317,7 @@ mod tests {
         ];
         assert!(
             matches!(incomplete_suffix(&history), Err(ProviderError::Failure(error))
-            if error.operation() == ProviderOperation::RecoverSession
+            if error.operation() == ProviderOperation::InputReconcile
                 && error.kind() == ProviderFailureKind::Rejected)
         );
     }

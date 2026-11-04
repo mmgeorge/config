@@ -215,7 +215,7 @@ impl Turn {
         use crate::provider::{MessageClassification, MessageUpdate, ProviderError};
         let protocol = |_message: &str| {
             ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::CollectEventReader,
+                forge_provider_api::ProviderOperation::InputSubmit,
                 forge_provider_api::ProviderFailureKind::Protocol,
             ))
         };

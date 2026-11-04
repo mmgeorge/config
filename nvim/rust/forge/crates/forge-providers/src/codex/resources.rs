@@ -68,7 +68,7 @@ impl CodexResources {
             .request(
                 "config/read",
                 json!({"cwd":workspace,"includeLayers":false}),
-                ProviderOperation::ReconcileSettings,
+                ProviderOperation::SessionConfigure,
             )
             .await?;
         let servers = self.server_configuration(
@@ -81,7 +81,7 @@ impl CodexResources {
         for skill in self.selection.skills.iter().filter(|skill| skill.enabled) {
             if skill.path.is_none() {
                 return Err(failure(
-                    ProviderOperation::ReconcileSettings,
+                    ProviderOperation::SessionConfigure,
                     ProviderFailureKind::Rejected,
                 ));
             }
@@ -97,14 +97,14 @@ impl CodexResources {
         rpc.request(
             "skills/extraRoots/set",
             json!({"extraRoots":roots}),
-            ProviderOperation::ReconcileSettings,
+            ProviderOperation::SessionConfigure,
         )
         .await?;
         let discovered = rpc
             .request(
                 "skills/list",
                 json!({"cwd":workspace,"forceReload":true}),
-                ProviderOperation::ReconcileSettings,
+                ProviderOperation::SessionConfigure,
             )
             .await?;
         let mut skills = crate::codex::catalog::parse_skill_catalog(&discovered)
@@ -159,13 +159,13 @@ impl CodexResources {
         for resource in &self.selection.mcp {
             let native_name = self.native_name.get(&resource.name).ok_or_else(|| {
                 failure(
-                    ProviderOperation::ReconcileSettings,
+                    ProviderOperation::SessionConfigure,
                     ProviderFailureKind::Unknown,
                 )
             })?;
             if servers.contains_key(native_name) {
                 return Err(failure(
-                    ProviderOperation::ReconcileSettings,
+                    ProviderOperation::SessionConfigure,
                     ProviderFailureKind::Rejected,
                 ));
             }
@@ -210,14 +210,19 @@ impl CodexResources {
             .request(
                 "skills/list",
                 json!({"cwd":workspace,"forceReload":true}),
-                ProviderOperation::ReconcileSettings,
+                ProviderOperation::SessionConfigure,
             )
             .await?;
         crate::codex::catalog::parse_skill_catalog(&catalog)
             .into_iter()
             .find(|skill| skill.name == name && skill.enabled && skill.user_invocable)
             .and_then(|skill| skill.path)
-            .ok_or_else(|| failure(ProviderOperation::AdmitInput, ProviderFailureKind::Rejected))
+            .ok_or_else(|| {
+                failure(
+                    ProviderOperation::InputSubmit,
+                    ProviderFailureKind::Rejected,
+                )
+            })
     }
 
     /// Restore canonical names and hide inherited rows from normalized MCP discovery.
@@ -273,7 +278,7 @@ fn native_server(resource: &McpLaunch) -> Result<Value, ProviderError> {
         let seconds = timeout.as_secs_f64();
         if !seconds.is_finite() || seconds <= 0.0 {
             return Err(failure(
-                ProviderOperation::ReconcileSettings,
+                ProviderOperation::SessionConfigure,
                 ProviderFailureKind::Rejected,
             ));
         }

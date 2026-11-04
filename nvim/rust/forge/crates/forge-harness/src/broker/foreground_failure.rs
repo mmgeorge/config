@@ -30,7 +30,6 @@ enum FailureBaselinePhase {
 /// Collect a failed pre-baseline owner before optional cancellation rollback, without the broker lock.
 pub(crate) struct FailureBaselineJob {
     provider: Arc<Provider>,
-    session_id: String,
     exchange_id: String,
     baseline: AbortedBaseline,
     policy: FailureBaselinePolicy,
@@ -38,7 +37,14 @@ pub(crate) struct FailureBaselineJob {
 
 enum FailureBaselinePolicy {
     Retain,
-    RequestNativeRollback,
+    NeverConsumed {
+        submission: Arc<crate::provider::submission::Submission>,
+        attempt: forge_provider_api::DeliveryAttemptId,
+    },
+    Retract {
+        context: forge_provider_api::OperationContext,
+        request: forge_provider_api::InputRetractRequest,
+    },
 }
 
 enum BaselineDisposition {
@@ -121,17 +127,39 @@ impl FailureBaselineJob {
             self.baseline.collect().await?;
             match self.policy {
                 FailureBaselinePolicy::Retain => Ok(BaselineDisposition::Retained),
-                FailureBaselinePolicy::RequestNativeRollback => {
-                    let retracted = tokio::time::timeout(
+                FailureBaselinePolicy::NeverConsumed {
+                    submission,
+                    attempt,
+                } => {
+                    let record = submission.record()?;
+                    Ok(
+                        if record.attempt_id == attempt
+                            && record.delivery
+                                == crate::provider::submission::SubmissionState::Cancelled
+                        {
+                            BaselineDisposition::Retracted
+                        } else {
+                            BaselineDisposition::Retained
+                        },
+                    )
+                }
+                FailureBaselinePolicy::Retract { context, request } => {
+                    let owner = request.scope.owner.clone();
+                    let outcome = tokio::time::timeout(
                         std::time::Duration::from_secs(30),
-                        self.provider.rollback_cancelled_turn_for(&self.session_id),
+                        self.provider.input_retract(context, &owner, request),
                     )
                     .await
                     .context("native cancelled-turn rollback timed out")??;
-                    Ok(if retracted {
-                        BaselineDisposition::Retracted
-                    } else {
-                        BaselineDisposition::Retained
+                    Ok(match outcome {
+                        forge_provider_api::InputRetractOutcome::Retracted { .. }
+                        | forge_provider_api::InputRetractOutcome::NeverConsumed => {
+                            BaselineDisposition::Retracted
+                        }
+                        forge_provider_api::InputRetractOutcome::Unavailable(_)
+                        | forge_provider_api::InputRetractOutcome::Unknown => {
+                            BaselineDisposition::Retained
+                        }
                     })
                 }
             }
@@ -203,139 +231,6 @@ impl AdmissionCleanupJob {
         };
         let (engine, baseline) = tokio::join!(native, baseline);
         AdmissionCleanupResult { engine, baseline }
-    }
-}
-
-/// Own the native goal update required by a retracted host snapshot.
-pub(crate) struct RetractionGoalJob {
-    provider: Arc<Provider>,
-    request: ProviderRequest,
-    update: crate::provider::NativeGoalUpdate,
-    controller: Arc<crate::task::SessionTaskController>,
-    expected_task: Option<crate::task::Task>,
-    data_root: PathBuf,
-    reconcile: bool,
-    registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
-    owner: crate::provider::ExecutionOwner,
-}
-
-impl RetractionGoalJob {
-    pub(super) fn new(
-        broker: &HarnessBroker,
-        request: ProviderRequest,
-        update: crate::provider::NativeGoalUpdate,
-        expected_task: Option<crate::task::Task>,
-        registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
-    ) -> Self {
-        Self {
-            provider: broker.provider.clone(),
-            request,
-            update,
-            controller: broker.task_controller.clone(),
-            expected_task,
-            data_root: broker.data_root.clone(),
-            reconcile: broker.input_wakeup.is_some(),
-            registry,
-            owner: crate::provider::ExecutionOwner::root(&broker.session.id),
-        }
-    }
-
-    pub(crate) async fn run(self) -> Result<()> {
-        let lane = self.controller.native_goal_lane();
-        let guard =
-            match tokio::time::timeout(std::time::Duration::from_secs(30), lane.lock()).await {
-                Ok(guard) => guard,
-                Err(_) => {
-                    self.controller.mark_native_goal_uncertain();
-                    let error = anyhow::Error::new(ProviderError::DeliveryUncertain);
-                    return Err(match self.registry.fence(&self.owner).await {
-                        Ok(()) => error,
-                        Err(cleanup) => error.context(cleanup),
-                    });
-                }
-            };
-        self.controller.ensure_native_goal_certain()?;
-        anyhow::ensure!(
-            same_retraction_task(
-                self.controller.current()?.as_ref(),
-                self.expected_task.as_ref()
-            ),
-            "task changed before native retraction goal restore"
-        );
-        let session = crate::storage::SqliteStore::read_only(&self.data_root)?
-            .load_session(&self.request.harness_session_id)?
-            .context("retraction session is missing")?;
-        anyhow::ensure!(
-            session.provider_session_id.as_deref()
-                == self
-                    .request
-                    .provider_session_id
-                    .as_ref()
-                    .map(|id| id.as_str()),
-            "provider session changed before native retraction goal restore"
-        );
-        let result = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            self.provider.goal_status(self.request, self.update),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                self.controller.mark_native_goal_uncertain();
-                Err(anyhow::Error::new(error).context(ProviderError::DeliveryUncertain))
-            }
-            Err(_) => {
-                self.controller.mark_native_goal_uncertain();
-                Err(ProviderError::DeliveryUncertain.into())
-            }
-        };
-        let epoch = match self.controller.native_goal_written() {
-            Ok(epoch) => epoch,
-            Err(error) => {
-                drop(guard);
-                return Err(match self.registry.fence(&self.owner).await {
-                    Ok(()) => error,
-                    Err(cleanup) => error.context(cleanup),
-                });
-            }
-        };
-        let changed = !same_retraction_task(
-            self.controller.current()?.as_ref(),
-            self.expected_task.as_ref(),
-        );
-        drop(guard);
-        if let Err(uncertain) = self.controller.ensure_native_goal_certain() {
-            let error = result.err().unwrap_or(uncertain);
-            return Err(match self.registry.fence(&self.owner).await {
-                Ok(()) => error,
-                Err(cleanup) => error.context(cleanup),
-            });
-        }
-        if self.reconcile {
-            if tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                self.controller.wait_native_goal_acknowledged(epoch),
-            )
-            .await
-            .is_err()
-            {
-                self.controller.mark_native_goal_uncertain();
-                let error = anyhow::Error::new(ProviderError::DeliveryUncertain);
-                return Err(match self.registry.fence(&self.owner).await {
-                    Ok(()) => error,
-                    Err(cleanup) => error.context(cleanup),
-                });
-            }
-        } else if changed {
-            self.controller.mark_native_goal_uncertain();
-            let error = anyhow::Error::new(ProviderError::DeliveryUncertain);
-            return Err(match self.registry.fence(&self.owner).await {
-                Ok(()) => error,
-                Err(cleanup) => error.context(cleanup),
-            });
-        }
-        result
     }
 }
 
@@ -899,27 +794,6 @@ impl HarnessBroker {
                 baseline_cleanup: FailureBaselinePhase::Unexamined,
             });
         }
-        if transaction.native_goal.take().is_some() {
-            if let Some(scope) = transaction
-                .state
-                .interaction
-                .turn
-                .last()
-                .map(|turn| turn.provider().scope.clone())
-            {
-                self.reopened_execution.end_settlement(&scope);
-            }
-            transaction.state.interaction.finalization_error =
-                Some("native goal stopped during foreground cleanup".into());
-            if let Err(error) = self.store.save_exchange(&transaction.state.interaction) {
-                transaction
-                    .failure
-                    .as_mut()
-                    .unwrap()
-                    .secondary
-                    .push(format!("record interrupted native goal: {error:#}"));
-            }
-        }
         if let Err(error) = self.collect_foreground_observations(transaction) {
             transaction
                 .failure
@@ -982,11 +856,45 @@ impl HarnessBroker {
         if matches!(failure.baseline_cleanup, FailureBaselinePhase::Pending) {
             return Ok(ForegroundAction::Wait);
         }
+        let restoration_authorized = failure.original.is::<TurnCancelled>()
+            && failure.cleanup.is_none()
+            && transaction
+                .state
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.retraction_eligible)
+            && transaction
+                .native
+                .cancellation
+                .restore_prompt
+                .load(Ordering::Acquire)
+            && transaction
+                .native
+                .cancellation
+                .retraction_allowed
+                .load(Ordering::Acquire);
+        let never_consumed = if restoration_authorized
+            && matches!(failure.baseline_cleanup, FailureBaselinePhase::Unexamined)
+            && let Some(submission) = &transaction.request.submission
+        {
+            if matches!(
+                submission.retire_prepared()?,
+                crate::provider::submission::SubmissionRetirement::Prevented
+                    | crate::provider::submission::SubmissionRetirement::AlreadyCancelled
+            ) {
+                Some((submission.clone(), submission.record()?.attempt_id))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         if matches!(failure.baseline_cleanup, FailureBaselinePhase::Unexamined)
-            && transaction.state.runtime.as_ref().is_some_and(|runtime| {
-                runtime.tools_blocked()
-                    && (runtime.checkpoint.is_some() || failure.original.is::<TurnCancelled>())
-            })
+            && (never_consumed.is_some()
+                || transaction.state.runtime.as_ref().is_some_and(|runtime| {
+                    runtime.tools_blocked()
+                        && (runtime.checkpoint.is_some() || failure.original.is::<TurnCancelled>())
+                }))
         {
             let runtime = transaction
                 .state
@@ -994,32 +902,57 @@ impl HarnessBroker {
                 .as_mut()
                 .context("failed pre-baseline execution requires its checkpoint runtime")?;
             let cancelled = failure.original.is::<TurnCancelled>();
-            let retractable = cancelled
-                && failure.cleanup.is_none()
-                && runtime.retraction_eligible
-                && self.capability.native_turn_rollback
-                && transaction
-                    .native
-                    .cancellation
-                    .restore_prompt
-                    .load(Ordering::Acquire)
-                && transaction
-                    .native
-                    .cancellation
-                    .retraction_allowed
-                    .load(Ordering::Acquire);
+            let retractable = restoration_authorized && self.capability.native_turn_rollback;
             // This denied gate proves no provider tool could pass the baseline,
             // even when native collection reported failure. Collect its owned
             // worker independently; native cleanup failure still forbids rollback.
-            runtime
-                .tool_gate
-                .as_ref()
-                .context("blocked checkpoint gate is missing")?
-                .complete(Err(crate::checkpoint::CheckpointGateError::OwnerEnded));
-            // CleanupForeground has already joined and closed this execution owner.
-            // Replacement must collect registry cleanup before opening its successor.
+            if let Some(gate) = &runtime.tool_gate {
+                gate.complete(Err(crate::checkpoint::CheckpointGateError::OwnerEnded));
+            }
+            // Retain checkpoint collection even when journal retirement proves no native input was sent.
             let baseline =
                 AbortedBaseline::new(runtime.checkpoint.take(), self.execution_registry());
+            let local_proof = never_consumed.is_some();
+            let mut policy = match never_consumed {
+                Some((submission, attempt)) => FailureBaselinePolicy::NeverConsumed {
+                    submission,
+                    attempt,
+                },
+                None => FailureBaselinePolicy::Retain,
+            };
+            if !local_proof
+                && retractable
+                && let Some((scope, boundary)) = &transaction.retraction_boundary
+                && let Some(submission) = &transaction.request.submission
+                && let Some(handoff) = transaction.request.dispatch.observer().current()?
+            {
+                let record = submission.record()?;
+                if scope == &transaction.state.scope
+                    && handoff.scope() == scope
+                    && handoff.attempt_id() == &record.attempt_id
+                    && matches!(handoff.target(), forge_provider_api::submission::DispatchTarget::Input(id) if id == submission.receipt_id())
+                {
+                    let operation = crate::provider::operation::OperationControl::new(
+                        forge_provider_api::ProviderOperation::InputRetract,
+                        forge_provider_api::OperationId::new(format!(
+                            "retract:{}:{}",
+                            submission.id(),
+                            record.attempt_id.as_str()
+                        ))?,
+                    )?;
+                    policy = FailureBaselinePolicy::Retract {
+                        context: operation.context(),
+                        request: forge_provider_api::InputRetractRequest {
+                            scope: scope.clone(),
+                            submission_id: submission.receipt_id().clone(),
+                            attempt_id: record.attempt_id,
+                            boundary: boundary.clone(),
+                            authorization:
+                                forge_provider_api::RetractionAuthorization::OutputFreeCancellation,
+                        },
+                    };
+                }
+            }
             let interaction = &mut transaction.state.interaction;
             self.questions.cancel_chat(Some(&interaction.id))?;
             interaction.set_awaiting_input(false);
@@ -1044,14 +977,9 @@ impl HarnessBroker {
             return Ok(ForegroundAction::Effect(ForegroundJob::FailureBaseline(
                 FailureBaselineJob {
                     provider: self.provider.clone(),
-                    session_id: self.session.id.clone(),
                     exchange_id: interaction.id.clone(),
                     baseline,
-                    policy: if retractable {
-                        FailureBaselinePolicy::RequestNativeRollback
-                    } else {
-                        FailureBaselinePolicy::Retain
-                    },
+                    policy,
                 },
             )));
         }
@@ -1313,7 +1241,7 @@ impl HarnessBroker {
         self.advance_foreground_failure(dispatch)
     }
 
-    /// Join the baseline worker without triggering a native-goal transition during cleanup.
+    /// Join the baseline worker without admitting any successor during cleanup.
     pub(crate) fn apply_foreground_failure_checkpoint(
         &mut self,
         transaction: &mut ForegroundTransaction,
@@ -1481,14 +1409,13 @@ impl HarnessBroker {
                 .secondary
                 .push(format!("reject prompt admission: {error:#}")),
         }
-        let mut goal = None;
         if let Some(PromptSubmission {
             snapshot,
             submitted_prompt,
         }) = admission.submission.take()
         {
             match self.prepare_retracted_control_restore(snapshot) {
-                Ok(job) => goal = job,
+                Ok(()) => {}
                 Err(error) => admission
                     .failure
                     .as_mut()
@@ -1547,36 +1474,6 @@ impl HarnessBroker {
         failure.retraction_waiting = false;
         failure.retraction_prepared = true;
         failure.retraction_effects = Some(AppliedProviderEvent::Effects(effects));
-        match goal {
-            Some(job) => Ok(ForegroundAction::Effect(ForegroundJob::RetractionGoal(
-                Box::new(job),
-            ))),
-            None => self.prepare_foreground_failure_publication(admission),
-        }
-    }
-
-    /// Preserve the original retraction even if restoring the native goal fails.
-    pub(crate) fn complete_foreground_retraction_goal(
-        &mut self,
-        dispatch: &mut ForegroundDispatch,
-        result: Result<()>,
-    ) -> Result<ForegroundAction> {
-        let admission = match dispatch {
-            ForegroundDispatch::Admitting(admission)
-            | ForegroundDispatch::Running { admission, .. }
-            | ForegroundDispatch::Finalizing { admission, .. } => admission,
-            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => {
-                anyhow::bail!("retraction goal has no foreground owner")
-            }
-        };
-        if let Err(error) = result {
-            admission
-                .failure
-                .as_mut()
-                .context("failure state missing")?
-                .secondary
-                .push(format!("restore native goal: {error:#}"));
-        }
         self.prepare_foreground_failure_publication(admission)
     }
 
@@ -1768,7 +1665,6 @@ mod tests {
             ready.await?;
             let job = FailureBaselineJob {
                 provider: broker.provider.clone(),
-                session_id: broker.session.id.clone(),
                 exchange_id: "cancelled-baseline".into(),
                 baseline: AbortedBaseline::new(
                     Some(crate::checkpoint::CheckpointTask(task)),
@@ -1800,15 +1696,17 @@ mod tests {
     /// Cleanup failure must not replace the failure that caused the owner to close.
     #[test]
     fn report_retains_original_and_typed_cleanup_failure() {
+        let cleanup = forge_provider_api::ProviderFailure::new(
+            forge_provider_api::ProviderOperation::Cancel,
+            forge_provider_api::ProviderFailureKind::Protocol,
+        )
+        .at_phase(
+            forge_provider_api::ProviderPhase::Collection,
+            forge_provider_api::FailureDisposition::Uncertain,
+        );
         let report = anyhow::Error::new(TurnCancelled).context(ForegroundFailureContext {
             original_message: "turn cancelled".into(),
-            cleanup: Some(
-                forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::CleanupExecution,
-                    forge_provider_api::ProviderFailureKind::Protocol,
-                )
-                .into(),
-            ),
+            cleanup: Some(cleanup.into()),
             secondary: Vec::new(),
         });
         assert!(report.downcast_ref::<TurnCancelled>().is_some());
@@ -1816,34 +1714,32 @@ mod tests {
             report
                 .downcast_ref::<ForegroundFailureContext>()
                 .and_then(|context| context.cleanup.as_ref()),
-            Some(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Protocol
+            Some(ProviderError::Failure(failure)) if *failure == cleanup
         ));
-        assert!(
-            report
-                .to_string()
-                .contains("CleanupExecution failed: Protocol")
+        assert_eq!(
+            report.to_string(),
+            "turn cancelled: provider Cancel failed: Protocol"
         );
         let retracted = anyhow::Error::new(TurnRetracted {
             prompt: "retracted prompt".into(),
         })
         .context(ForegroundFailureContext {
             original_message: "Output-free turn retracted".into(),
-            cleanup: Some(
-                forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::CleanupExecution,
-                    forge_provider_api::ProviderFailureKind::Protocol,
-                )
-                .into(),
-            ),
+            cleanup: Some(cleanup.into()),
             secondary: Vec::new(),
         });
-        assert!(retracted.downcast_ref::<TurnRetracted>().is_some());
+        assert!(matches!(retracted.downcast_ref::<TurnRetracted>(),
+            Some(original) if original.prompt == "retracted prompt"));
         assert!(matches!(
             retracted
                 .downcast_ref::<ForegroundFailureContext>()
                 .and_then(|context| context.cleanup.as_ref()),
-            Some(ProviderError::Failure(failure)) if failure.kind() == forge_provider_api::ProviderFailureKind::Protocol
+            Some(ProviderError::Failure(failure)) if *failure == cleanup
         ));
+        assert_eq!(
+            retracted.to_string(),
+            "Output-free turn retracted: provider Cancel failed: Protocol"
+        );
     }
 
     /// A retracted submission restores its snapshot and is published before its typed error.
@@ -1926,60 +1822,160 @@ mod tests {
         Ok(())
     }
 
-    /// Native goal restore failure remains secondary to the original retraction.
+    /// Only positive journal retirement may restore an undispatched draft without native history proof.
     #[tokio::test]
-    async fn retraction_goal_failure_preserves_original_and_stages_retracted_publication()
+    async fn undispatched_cancellation_restores_exact_draft_but_unknown_sending_retains_history()
     -> Result<()> {
-        let workspace = super::super::test::repository();
-        let data = tempfile::tempdir()?;
-        let mut broker =
-            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        broker.capability.native_goal = true;
-        broker.session.provider_session_id = Some("native-session".into());
-        let (sink, _stream) = publication::channel();
-        let request = Request {
-            id: 2,
-            method: "session.prompt.submit".into(),
-            params: json!({"text":"retract me", "_prompt_admission":{"document":null,"token":18}}),
-        };
-        let mut dispatch = broker.begin_foreground_dispatch(request, sink)?;
-        assert!(matches!(
-            broker.fail_foreground_dispatch(
-                &mut dispatch,
-                TurnRetracted {
-                    prompt: "retract me".into()
+        use crate::provider::submission::{SubmissionRetirement, SubmissionState};
+        #[derive(Clone, Copy)]
+        enum Boundary {
+            Prepared,
+            AlreadyPrevented,
+            Sending,
+        }
+        for boundary in [
+            Boundary::Prepared,
+            Boundary::AlreadyPrevented,
+            Boundary::Sending,
+        ] {
+            let workspace = super::super::test::repository();
+            let data = tempfile::tempdir()?;
+            let mut broker =
+                super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+            broker.checkpoint = None;
+            broker.capability.native_turn_rollback = false;
+            broker.turn_cancellation.arm(true);
+            let original_model = broker.session.resolved_model.clone();
+            let prompt = "Keep this exact draft: α\nsecond line";
+            let (sink, _updates) = publication::channel();
+            let ForegroundDispatch::Admitting(admission) = broker.begin_foreground_dispatch(
+                Request {
+                    id: 19,
+                    method: "session.prompt.submit".into(),
+                    params: json!({"text":prompt,"_prompt_admission":{"document":null,"token":97}}),
+                },
+                sink,
+            )?
+            else {
+                anyhow::bail!("fixture admission is missing");
+            };
+            let mut staged = broker.stage_foreground_interaction(
+                prompt,
+                PromptMode::Chat,
+                Some(&ExchangeAdmission::chat(prompt.into())),
+                ProviderInput::from_text(prompt),
+            )?;
+            broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
+            let exchange_id = staged.exchange.id.clone();
+            let engine = broker
+                .execution_registry()
+                .owner(crate::provider::ExecutionOwner::root(&broker.session.id))
+                .await?;
+            let mut transaction =
+                broker.construct_foreground_transaction(&staged, engine.clone())?;
+            let submission = transaction
+                .request
+                .submission
+                .as_ref()
+                .context("prepared receipt is missing")?
+                .clone();
+            match boundary {
+                Boundary::Prepared => {}
+                Boundary::AlreadyPrevented => assert_eq!(
+                    submission.retire_prepared()?,
+                    SubmissionRetirement::Prevented
+                ),
+                Boundary::Sending => submission.sending(None)?,
+            }
+            assert!(transaction.retraction_boundary.is_none());
+            assert!(transaction.native.task.is_empty());
+            transaction.native.pending_submission.take();
+            transaction.native_open = false;
+            broker.session.resolved_model = Some("discard this temporary admission value".into());
+            broker.turn_cancellation.begin_cleanup(true)?;
+            broker.turn_cancellation.request(true);
+            let mut dispatch = ForegroundDispatch::Running {
+                transaction: Box::new(transaction),
+                admission,
+            };
+            let action =
+                broker.complete_foreground_cleanup(&mut dispatch, TurnCancelled.into(), Ok(()))?;
+            match boundary {
+                Boundary::Prepared | Boundary::AlreadyPrevented => {
+                    let ForegroundAction::Effect(ForegroundJob::FailureBaseline(job)) = action
+                    else {
+                        anyhow::bail!(
+                            "undispatched input did not retain its local collection proof"
+                        );
+                    };
+                    assert!(matches!(
+                        job.policy,
+                        FailureBaselinePolicy::NeverConsumed { .. }
+                    ));
+                    let result = job.run().await;
+                    assert!(matches!(
+                        &result.outcome,
+                        Ok(BaselineDisposition::Retracted)
+                    ));
+                    broker.complete_failure_baseline(&mut dispatch, result)?;
+                    assert!(broker.store.load_exchange(&exchange_id)?.is_none());
+                    assert!(matches!(
+                        broker.finish_foreground_failure(&mut dispatch)?,
+                        ForegroundAction::CancelJobsAndEffect(ForegroundJob::FailurePublication(_))
+                    ));
+                    assert_eq!(broker.session.resolved_model, original_model);
+                    let ForegroundDispatch::Running { admission, .. } = &dispatch else {
+                        anyhow::bail!("foreground owner disappeared");
+                    };
+                    let failure = admission
+                        .failure
+                        .as_ref()
+                        .context("retraction result missing")?;
+                    assert_eq!(
+                        failure
+                            .original
+                            .downcast_ref::<TurnRetracted>()
+                            .context("exact draft restoration missing")?
+                            .prompt,
+                        prompt
+                    );
+                    assert_eq!(submission.record()?.delivery, SubmissionState::Cancelled);
                 }
-                .into()
-            )?,
-            ForegroundAction::WaitForPublicationDrain
-        ));
-        assert!(matches!(
-            broker.finish_foreground_failure(&mut dispatch)?,
-            ForegroundAction::WaitForPublicationDrain
-        ));
-        assert!(matches!(
-            broker.finish_foreground_failure(&mut dispatch)?,
-            ForegroundAction::Effect(ForegroundJob::RetractionGoal(_))
-        ));
-        let action = broker.complete_foreground_retraction_goal(
-            &mut dispatch,
-            Err(anyhow::anyhow!("goal restore unavailable")),
-        )?;
-        assert!(matches!(
-            action,
-            ForegroundAction::CancelJobsAndEffect(ForegroundJob::FailurePublication(_))
-        ));
-        let ForegroundDispatch::Admitting(admission) = &dispatch else {
-            panic!("lost admission");
-        };
-        let failure = admission.failure.as_ref().context("missing failure")?;
-        assert!(failure.original.downcast_ref::<TurnRetracted>().is_some());
-        assert!(
-            failure
-                .secondary
-                .iter()
-                .any(|error| error.contains("goal restore unavailable"))
-        );
+                Boundary::Sending => {
+                    assert!(matches!(
+                        action,
+                        ForegroundAction::CancelJobsAndEffect(ForegroundJob::FailurePublication(_))
+                    ));
+                    let retained = broker
+                        .store
+                        .load_exchange(&exchange_id)?
+                        .context("uncertain input lost its history")?;
+                    assert!(retained.turn.is_empty());
+                    assert_eq!(retained.state(), ExchangeState::Cancelled);
+                    assert!(matches!(
+                        submission.record()?.delivery,
+                        SubmissionState::Sending { .. }
+                    ));
+                    assert_eq!(
+                        broker.session.resolved_model.as_deref(),
+                        Some("discard this temporary admission value")
+                    );
+                    let ForegroundDispatch::Running { admission, .. } = &dispatch else {
+                        anyhow::bail!("foreground owner disappeared");
+                    };
+                    assert!(
+                        admission
+                            .failure
+                            .as_ref()
+                            .unwrap()
+                            .original
+                            .downcast_ref::<TurnRetracted>()
+                            .is_none()
+                    );
+                }
+            }
+            engine.close().await?;
+        }
         Ok(())
     }
 

@@ -254,7 +254,7 @@ impl TryFrom<TimeoutFields> for InputTimeoutConfiguration {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "configuration", rename_all = "snake_case")]
 pub(crate) enum ConfigurationOutcome {
-    /// Session settings committed and any required replacement handoff was established.
+    /// Session settings committed and any required replacement was retained by the owner.
     Settings {
         disposition: InvocationDisposition,
         /// An explicitly committed override for future review questions; omission preserves it.
@@ -263,7 +263,7 @@ pub(crate) enum ConfigurationOutcome {
     },
     /// Effective session permission after applying the explicit selection.
     CheckEditing { enabled: bool },
-    /// Root execution policy committed and any required replacement handoff was established.
+    /// Root execution policy committed and any required replacement was retained by the owner.
     ExecutionPolicy { disposition: InvocationDisposition },
     /// Effective automatic-check admission policy; existing run evidence remains unchanged.
     CheckPreferences {
@@ -285,18 +285,12 @@ pub(crate) enum ConfigurationOutcome {
     },
 }
 
-/// Explain whether a configuration command required a new native invocation.
+/// Report the configuration milestone independently of subsequent native invocation progress.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "disposition", rename_all = "snake_case")]
 pub(crate) enum InvocationDisposition {
-    /// Policy committed while idle or awaiting a user decision; no invocation was started.
+    /// Policy committed and any continuation was retained by the owner for separate dispatch.
     Committed,
-    /// The identified replacement was handed off under the committed policy.
-    /// Binding identity is historical evidence of this completion, not future execution authority.
-    Dispatched {
-        scope: crate::provider::InvocationScope,
-        binding: forge_provider_api::BindingId,
-    },
 }
 
 /// Describe a rejected configuration without exposing adapter errors or native diagnostics.

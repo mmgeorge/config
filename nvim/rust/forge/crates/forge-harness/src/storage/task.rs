@@ -1138,7 +1138,7 @@ pub struct Owner;
         stale = owner.acquire_session_lease(&stale.id, "owner")?;
         let admission = owner.session_admission(&stale.id)?;
         let mut writer = SqliteStore::open(root.path())?;
-        let task = Task::goal("Finish".into(), ContinuationBudget::default(), false, 1);
+        let task = Task::goal("Finish".into(), ContinuationBudget::default(), 1);
         owner.commit_task_change(&stale.id, None, 1, |active| {
             *active = Some(task.clone());
             Ok(())
@@ -1164,12 +1164,7 @@ pub struct Owner;
         assert_eq!(saved.effort, "updated-effort");
         assert_eq!(saved.active_task.as_ref().unwrap().revision, task.revision);
 
-        let replacement = Task::goal(
-            "Replacement".into(),
-            ContinuationBudget::default(),
-            false,
-            2,
-        );
+        let replacement = Task::goal("Replacement".into(), ContinuationBudget::default(), 2);
         writer.commit_task_change(&stale.id, Some(&task.revision), 2, |active| {
             *active = Some(replacement.clone());
             Ok(())
@@ -1201,7 +1196,7 @@ pub struct Owner;
         store.save_session(&session)?;
         let admission = store.session_admission(&session.id)?;
         store.connection.execute_batch("CREATE TRIGGER reject_task BEFORE UPDATE ON session_record BEGIN SELECT RAISE(ABORT,'failed task commit'); END;")?;
-        let task = Task::goal("Finish".into(), ContinuationBudget::default(), false, 1);
+        let task = Task::goal("Finish".into(), ContinuationBudget::default(), 1);
         assert!(
             store
                 .commit_task_change(&session.id, None, 1, |active| {

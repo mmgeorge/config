@@ -53,7 +53,7 @@ pub(crate) fn diagnostic(
             | ProviderError::DeliveryUncertain
             | ProviderError::Retryable(_) => ProviderFailureKind::Transport,
             ProviderError::Unsupported(_)
-            | ProviderError::NotConsumed { .. }
+            | ProviderError::NotConsumed
             | ProviderError::Cancelled => ProviderFailureKind::Rejected,
             ProviderError::RuntimeVersion(_) => ProviderFailureKind::Initialization,
         }
@@ -149,11 +149,11 @@ mod tests {
             Box::new(forge_provider_api::deadline::InputTimeoutError::TimestampRange),
         ];
         for error in errors {
-            let normalized = classify_source(ProviderOperation::ReconcileSettings, error.as_ref());
+            let normalized = classify_source(ProviderOperation::SessionConfigure, error.as_ref());
             let ProviderError::Failure(failure) = &normalized else {
                 panic!("invalid configuration lost its normalized failure");
             };
-            assert_eq!(failure.operation(), ProviderOperation::ReconcileSettings);
+            assert_eq!(failure.operation(), ProviderOperation::SessionConfigure);
             assert_eq!(failure.kind(), ProviderFailureKind::Rejected);
             let rendered = format!("{normalized:?} {normalized}");
             assert!(!rendered.contains("private-directory"));
@@ -170,18 +170,18 @@ mod tests {
     fn lifecycle_boundary_preserves_identity_and_removes_native_sources() {
         assert!(matches!(
             classify(
-                ProviderOperation::CancelSession,
+                ProviderOperation::Cancel,
                 forge_provider_api::error::TurnCancelled.into()
             ),
             ProviderError::Cancelled
         ));
         let uncertain = ProviderError::DeliveryUncertain;
         assert!(matches!(
-            classify(ProviderOperation::InitializeSession, uncertain.into()),
+            classify(ProviderOperation::SessionOpen, uncertain.into()),
             ProviderError::DeliveryUncertain
         ));
         let error = classify(
-            ProviderOperation::InitializeSession,
+            ProviderOperation::SessionOpen,
             anyhow::Error::new(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
                 "native fixture",
@@ -191,7 +191,7 @@ mod tests {
         let ProviderError::Failure(failure) = &error else {
             panic!("native failure lost its operation");
         };
-        assert_eq!(failure.operation(), ProviderOperation::InitializeSession);
+        assert_eq!(failure.operation(), ProviderOperation::SessionOpen);
         assert_eq!(failure.kind(), ProviderFailureKind::Transport);
         assert!(!format!("{error:?} {error}").contains("native fixture"));
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);

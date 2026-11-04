@@ -2,7 +2,7 @@
 
 use forge_provider_api::{
     ProviderCapability, ProviderDescriptor, ProviderId, ProviderIntegration,
-    capability::{CapabilityId, FeatureLimitation, Support},
+    capability::{CapabilityId, CapabilityRestriction, FeatureLimitation, Support},
 };
 use forge_provider_api::{
     approval::ApprovalMode, catalog::CatalogCapability, compaction::CompactionCapability,
@@ -31,6 +31,46 @@ pub struct ProviderRegistration {
     pub background_generation: Option<BackgroundGenerationDefaults>,
 }
 
+/// Retain immutable registration metadata together with its adapter and fixture controls.
+#[derive(Clone)]
+pub struct RegisteredProvider {
+    descriptor: ProviderDescriptor,
+    adapter: Arc<dyn forge_provider_api::provider::Provider>,
+    test_control: Option<Arc<dyn forge_provider_api::testing::ProviderTestControl>>,
+}
+
+impl RegisteredProvider {
+    /// Create a registration, including explicit metadata overrides for generic fixtures.
+    pub fn new(
+        descriptor: ProviderDescriptor,
+        adapter: Arc<dyn forge_provider_api::provider::Provider>,
+        test_control: Option<Arc<dyn forge_provider_api::testing::ProviderTestControl>>,
+    ) -> Self {
+        Self {
+            descriptor,
+            adapter,
+            test_control,
+        }
+    }
+
+    /// Get immutable identity and baseline support without starting provider work.
+    pub fn descriptor(&self) -> &ProviderDescriptor {
+        &self.descriptor
+    }
+
+    /// Get the adapter installed for this registration.
+    pub fn adapter(&self) -> &Arc<dyn forge_provider_api::provider::Provider> {
+        &self.adapter
+    }
+
+    /// Get optional provider-neutral deterministic controls.
+    pub fn test_control(
+        &self,
+    ) -> Option<&Arc<dyn forge_provider_api::testing::ProviderTestControl>> {
+        self.test_control.as_ref()
+    }
+}
+
 /// Default model and reasoning settings for background generation.
 #[derive(Clone, Debug, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -53,14 +93,16 @@ pub enum ProviderResolutionError {
 pub fn create(
     launch: forge_provider_api::ProviderLaunch,
     runtime_root: PathBuf,
-) -> Result<Arc<dyn forge_provider_api::provider::Provider>, forge_provider_api::ProviderError> {
+) -> Result<RegisteredProvider, forge_provider_api::ProviderError> {
     let id = &launch.kind;
     resolve(id).map_err(|_| {
         forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-            forge_provider_api::ProviderOperation::InitializeSession,
+            forge_provider_api::ProviderOperation::SessionOpen,
             forge_provider_api::ProviderFailureKind::Initialization,
         ))
     })?;
+    let metadata = descriptor(id).expect("resolved identities have metadata");
+    let mut test_control = None;
     let provider: Arc<dyn forge_provider_api::provider::Provider> = match id.as_str() {
         "codex" => Arc::new(crate::codex::provider::CodexProvider::new(
             launch.command,
@@ -75,10 +117,14 @@ pub fn create(
             launch.command,
             runtime_root,
         )?),
-        "mock" => Arc::new(crate::mock::MockProvider::new()?),
+        "mock" => {
+            let provider = crate::mock::MockProvider::new()?;
+            test_control = Some(provider.fixture_control());
+            Arc::new(provider)
+        }
         _ => unreachable!("resolved registry identities have constructors"),
     };
-    Ok(provider)
+    Ok(RegisteredProvider::new(metadata, provider, test_control))
 }
 
 struct RegistryEntry {
@@ -230,7 +276,6 @@ fn capability(id: &str) -> ProviderCapability {
     let catalog = CatalogCapability {
         skill: true,
         mcp: true,
-        live_mcp_mutation: false,
     };
     match id {
         "codex" => ProviderCapability {
@@ -243,12 +288,12 @@ fn capability(id: &str) -> ProviderCapability {
                     forge_provider_api::model::IsolationMode { id: "unelevated".into(), label: "Unelevated".into(), description: "Restricted token for the current user without admin setup. Weaker network isolation; denied-read paths are unsupported.".into() },
                     forge_provider_api::model::IsolationMode { id: "mxc".into(), label: "MXC".into(), description: "Prefer Microsoft Execution Containers where supported; falls back to Elevated. Child processes stop when the command exits.".into() },
                 ],
-                limitations: vec![FeatureLimitation { id: CapabilityId::FilesystemAccess, support: Support::Limited, reason: "Scopes and write-off apply to reported file operations. Shell commands, MCP internals, and operations without permission callbacks retain provider-native restrictions. The selected read scope is not enforced as OS read confinement.".into() }],
+                limitations: vec![FeatureLimitation { id: CapabilityId::FilesystemAccess, support: Support::Limited { restrictions: vec![CapabilityRestriction::PermissionCallbacksOnly] }, reason: "Scopes and write-off apply to reported file operations. Shell commands, MCP internals, and operations without permission callbacks retain provider-native restrictions. The selected read scope is not enforced as OS read confinement.".into() }],
                 ..Default::default()
             },
             os_sandbox: true, native_fork: true, native_compact: true,
             compaction: CompactionCapability { lifecycle: true, background: false, summary: false, metrics: false },
-            native_steer: true, native_turn_rollback: true, native_goal: true,
+            native_steer: true, native_turn_rollback: true,
             model_selection: true, effort_selection: true, fast_mode: true, ultrafast_mode: true,
             permission_control: true, background_terminals: true, approval_mode_list: approvals,
             agent: Default::default(), catalog,
@@ -272,10 +317,10 @@ fn capability(id: &str) -> ProviderCapability {
                     native_agent_suppression: claude,
                     resource_target: Some(if claude { "claudecode" } else { "antigravity-cli" }.into()),
                     limitations: if claude { vec![] } else { vec![
-                        FeatureLimitation { id: CapabilityId::FileDiff, support: Support::Limited, reason: "Edit tools can complete without structured diffs; checkpoint review remains available".into() },
-                        FeatureLimitation { id: CapabilityId::ApprovalRules, support: Support::Limited, reason: "Enterprise terminal policy may execute without approval callbacks".into() },
-                        FeatureLimitation { id: CapabilityId::SkillCatalog, support: Support::Limited, reason: "Project-native skills cannot be excluded by this integration".into() },
-                        FeatureLimitation { id: CapabilityId::SkillMutation, support: Support::Limited, reason: "Project-native skills cannot be excluded by this integration".into() },
+                        FeatureLimitation { id: CapabilityId::FileDiff, support: Support::Limited { restrictions: vec![CapabilityRestriction::UnstructuredDiffs] }, reason: "Edit tools can complete without structured diffs; checkpoint review remains available".into() },
+                        FeatureLimitation { id: CapabilityId::ApprovalRules, support: Support::Limited { restrictions: vec![CapabilityRestriction::EnterpriseTerminalPolicy] }, reason: "Enterprise terminal policy may execute without approval callbacks".into() },
+                        FeatureLimitation { id: CapabilityId::SkillCatalog, support: Support::Limited { restrictions: vec![CapabilityRestriction::InheritedSkills] }, reason: "Project-native skills cannot be excluded by this integration".into() },
+                        FeatureLimitation { id: CapabilityId::SkillMutation, support: Support::Limited { restrictions: vec![CapabilityRestriction::InheritedSkills] }, reason: "Project-native skills cannot be excluded by this integration".into() },
                     ] }, ..Default::default()
                 },
                 native_fork: claude, native_compact: claude, native_steer: claude,

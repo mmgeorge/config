@@ -4,13 +4,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ExecutionOwner, InvocationScope, ProviderSessionId, SubmissionId};
 
-/// Identify one live provider binding independently of persisted conversation identity.
+/// Identify one adapter-issued live binding generation independently of durable history.
+/// Each open, including resume, allocates a fresh ID. Retired IDs never authorize work on
+/// replacements and cannot be used as a durable session ID or a resume credential.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct BindingId(String);
 
 impl BindingId {
-    /// Create a binding identity from a nonempty host or provider generated token.
+    /// Create a validated nonempty opaque token without granting authority to any binding.
     pub fn new(value: impl Into<String>) -> Result<Self, BindingIdError> {
         let value = value.into();
         if value.trim().is_empty() {
@@ -19,7 +21,7 @@ impl BindingId {
         Ok(Self(value))
     }
 
-    /// Get the opaque binding token for equality, routing, or persistence.
+    /// Get the opaque token for exact routing and diagnostics, never for durable resume.
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -54,7 +56,9 @@ impl std::fmt::Display for BindingIdError {
 
 impl std::error::Error for BindingIdError {}
 
-/// Identify a provider-issued history position without exposing its native format.
+/// Identify a provider-issued immutable history position within its owning durable session.
+/// The issuing adapter resolves the token; hosts must not interpret it or substitute the latest
+/// history item. It remains usable only while the adapter can prove that position's identity.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct CheckpointId(String);
@@ -77,12 +81,14 @@ impl CheckpointId {
 
 impl TryFrom<String> for CheckpointId {
     type Error = CheckpointIdError;
+    /// Validate deserialized history positions through the nonempty-token constructor.
     fn try_from(value: String) -> Result<Self, Self::Error> {
         Self::new(value)
     }
 }
 
 impl From<CheckpointId> for String {
+    /// Encode the opaque position for persistence or its issuing adapter.
     fn from(value: CheckpointId) -> Self {
         value.0
     }
@@ -100,25 +106,47 @@ impl std::fmt::Display for CheckpointIdError {
 
 impl std::error::Error for CheckpointIdError {}
 
-/// Fork a provider conversation while retaining the host's independent target owner.
-#[derive(Clone, Debug)]
-pub struct ConversationForkRequest {
-    pub source: crate::catalog::ProviderCatalogRequest,
+/// Fork stable provider history with a host-issued retry identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionForkRequest {
+    /// Select a settled binding or immutable provider checkpoint.
+    pub source: ForkSource,
+    /// Configure the separately retained target history.
     pub target: ForkTarget,
-    pub checkpoint: Option<CheckpointId>,
+}
+
+/// Select a positively stable source boundary before creating fork history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ForkSource {
+    /// Read the exact settled live generation.
+    Binding(BindingId),
+    /// Read an immutable history position independently of a live binding.
+    Checkpoint {
+        /// Durable provider-issued history which owns the immutable position.
+        provider_session_id: ProviderSessionId,
+        /// Provider-issued position whose contents must remain stable during fork.
+        checkpoint: CheckpointId,
+    },
 }
 
 /// Prepare durable target history without creating a live host callback binding.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForkTarget {
+    /// Independent host owner reserved for the staged target history.
     pub owner: ExecutionOwner,
+    /// Workspace resolving the target's admitted resources.
     pub workspace: String,
-    pub configuration: InvocationConfiguration,
-    pub resources: ResourceSelection,
+    /// Complete resolved defaults for the target; never a patch to the source.
+    pub configuration: SessionConfiguration,
+    /// Explicit host-prepared base instructions for the target history.
     pub system_instructions: String,
 }
 
-/// Describe the conversation and host capabilities needed to initialize a session.
+/// Own complete open inputs and binding-lifetime host resource authority.
+/// Transfer this request to the retained open operation. Its identity snapshot retains values
+/// and weak authority identity only, so cached replay metadata cannot prolong live leases.
+/// Isolated history excludes resume by construction; adapters also reject incompatible tools,
+/// inherited resources, or instructions before allocating native isolated work.
 #[derive(Clone)]
 pub struct SessionRequest {
     /// Own the live conversation and its callbacks.
@@ -127,16 +155,10 @@ pub struct SessionRequest {
     pub mode: SessionMode,
     /// Select the workspace used to resolve admitted resources.
     pub workspace: String,
-    /// Resume this persisted conversation when supported.
-    pub provider_session_id: Option<ProviderSessionId>,
-    /// Select the complete initial model configuration, including explicit standard service.
-    pub model: ModelSelection,
-    /// Apply the host's normalized access policy.
-    pub access: crate::access::AccessPolicy,
-    /// Apply the host's normalized approval policy.
-    pub approval: crate::approval::ApprovalMode,
-    /// Retain already-admitted resources for the binding lifetime.
-    pub resources: ResourceSelection,
+    /// Choose durable history or enforce fresh isolated temporary history.
+    pub history: SessionHistory,
+    /// Apply one complete initial configuration.
+    pub configuration: SessionConfiguration,
     /// Keep ephemeral host-owned resources alive for the binding lifetime.
     pub resource_lease: Option<std::sync::Arc<dyn ResourceLease>>,
     /// Advertise host-owned tools using normalized definitions.
@@ -148,6 +170,30 @@ pub struct SessionRequest {
     /// Record sanitized provider diagnostics.
     pub trace: std::sync::Arc<dyn crate::trace::ProviderTrace>,
 }
+
+impl SessionRequest {
+    /// Snapshot complete replay identity without retaining callback or resource ownership.
+    pub fn identity(&self) -> crate::SessionRequestIdentity {
+        self.into()
+    }
+}
+
+impl PartialEq for SessionRequest {
+    /// Compare the complete open request including immutable resource and diagnostic authority identities.
+    fn eq(&self, other: &Self) -> bool {
+        self.owner == other.owner
+            && self.mode == other.mode
+            && self.workspace == other.workspace
+            && self.history == other.history
+            && self.configuration == other.configuration
+            && same_lease(&self.resource_lease, &other.resource_lease)
+            && self.tools == other.tools
+            && self.tool_endpoint == other.tool_endpoint
+            && self.system_instructions == other.system_instructions
+            && std::sync::Arc::ptr_eq(&self.trace, &other.trace)
+    }
+}
+impl Eq for SessionRequest {}
 
 /// Describe the normalized endpoint of a retained host-owned tool service.
 #[derive(Clone, Eq, PartialEq)]
@@ -171,8 +217,11 @@ impl std::fmt::Debug for HostToolEndpoint {
 /// Identify the persistent conversation role independently of provider naming.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionMode {
+    /// The user's retained foreground conversation.
     Interactive,
+    /// A retained background conversation with its own host owner; not isolated temporary text work.
     Background,
+    /// A delegated conversation with independent host ownership and callback authority.
     Child,
 }
 
@@ -181,42 +230,93 @@ pub enum SessionMode {
 pub struct ModelSelection {
     /// None explicitly selects the provider's default model.
     pub model: Option<String>,
+    /// Explicit provider-default or selected normalized reasoning policy.
     pub reasoning: crate::generation::ReasoningSelection,
     /// None explicitly selects the model's default context-window tier.
     pub context_window: Option<String>,
+    /// Explicit normalized service policy, including standard service.
     pub service_tier: crate::ServiceTier,
 }
 
 /// Snapshot the model and permission configuration for one admitted invocation.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InvocationConfiguration {
+    /// Complete effective model controls for this invocation only.
     pub model: ModelSelection,
+    /// Filesystem and sandbox authority captured for this invocation.
     pub access: crate::access::AccessPolicy,
+    /// Approval policy captured for this invocation's callbacks.
     pub approval: crate::approval::ApprovalMode,
 }
 
 /// Retain one definitely-undelivered input without flattening its selected skill or question action.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecoveredInput {
+    /// Earlier host input backed by positive proof that its prior attempt was not consumed.
     pub input: crate::input::PromptInput,
+    /// Files admitted with that exact earlier input.
     pub attachments: Vec<crate::input::FileAttachment>,
+    /// Host-prepared workflow instructions retained with that input.
     pub instructions: String,
 }
 
-/// Configure normalized model and access choices for retained settings changes.
-#[derive(Clone, Debug, Default)]
-pub struct SessionSettings {
-    /// Replace all model choices; None preserves the retained selection.
-    pub model: Option<ModelSelection>,
-    /// Apply normalized access policy.
-    pub access: Option<crate::access::AccessPolicy>,
-    /// Apply normalized approval policy.
-    pub approval: Option<crate::approval::ApprovalMode>,
+/// Own complete resolved session defaults independently of per-invocation overrides.
+/// Resolve persisted preferences in Harness before calling configure. Every field replaces
+/// its previous value; provider defaults are explicit typed choices rather than missing patches.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionConfiguration {
+    /// Resolve model selection, including provider-default choices.
+    pub model: ModelSelection,
+    /// Enforce normalized filesystem and sandbox authority.
+    pub access: crate::access::AccessPolicy,
+    /// Enforce normalized permission approval policy.
+    pub approval: crate::approval::ApprovalMode,
+    /// Select the entire admitted skill and MCP resource set.
+    pub resources: ResourceSelection,
+}
+
+/// Select history lifetime independently of interactive, child, or background role.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionHistory {
+    /// Retain durable history; resuming always allocates a fresh binding generation.
+    Durable {
+        /// Durable provider-issued history to resume, or None for new retained history.
+        resume: Option<ProviderSessionId>,
+    },
+    /// Create fresh temporary history with the complete isolation guarantee.
+    IsolatedText(IsolatedTextPolicy),
+}
+
+impl SessionHistory {
+    /// Get the durable resume identity without confusing temporary history with a saved session.
+    pub fn resume_id(&self) -> Option<&ProviderSessionId> {
+        match self {
+            Self::Durable { resume } => resume.as_ref(),
+            Self::IsolatedText(_) => None,
+        }
+    }
+}
+
+/// Request fresh temporary history with only explicitly supplied instructions.
+/// Exclude inherited instructions, hooks, skills, and MCP; disable native and host tools,
+/// permission prompts, and autonomous goal work. This policy cannot contain a resume ID and
+/// is independent of session role. Adapters must enforce every guarantee or reject before
+/// dispatch; an empty host tool list alone is insufficient. Successful close removes the history.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct IsolatedTextPolicy {
+    _private: (),
+}
+
+impl IsolatedTextPolicy {
+    /// Create the complete isolated-text policy; no partial isolation mode is available.
+    pub fn new() -> Self {
+        Self { _private: () }
+    }
 }
 
 /// Select the complete resource set for one retained provider session.
 /// Empty selections exclude inherited resources rather than restoring native defaults.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ResourceSelection {
     /// Select portable skills by normalized definitions.
     pub skills: Vec<crate::catalog::SkillDefinition>,
@@ -224,11 +324,13 @@ pub struct ResourceSelection {
     pub mcp: Vec<McpLaunch>,
 }
 
-/// Keep host-owned temporary resources alive without exposing their storage layout.
+/// Keep host-owned temporary resources alive for the binding or invocation which received the lease.
+/// Native owners release strong lease copies after that scope is collected. Replay keys retain
+/// weak identity only; cached operation metadata must not keep temporary resources alive.
 pub trait ResourceLease: Send + Sync {}
 
 /// Describe a normalized MCP launch configuration with ephemeral credentials.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct McpLaunch {
     /// Stable normalized resource name.
     pub name: String,
@@ -245,7 +347,9 @@ pub struct McpLaunch {
 /// Select all MCP tools or an explicitly named subset without a wildcard sentinel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum McpToolSelection {
+    /// Admit all tools exposed by this explicitly selected MCP resource.
     All,
+    /// Admit exactly these validated names; an empty list admits none.
     Only(Vec<McpToolName>),
 }
 
@@ -277,6 +381,7 @@ impl McpToolName {
 impl TryFrom<String> for McpToolName {
     type Error = McpToolNameError;
 
+    /// Reject empty names and the all-tools wildcard before adapter transport encoding.
     fn try_from(name: String) -> Result<Self, Self::Error> {
         if name.trim().is_empty() {
             return Err(McpToolNameError::Empty);
@@ -291,26 +396,38 @@ impl TryFrom<String> for McpToolName {
 /// Reject malformed names without retaining external configuration text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum McpToolNameError {
+    /// A selected tool name is empty or whitespace-only.
     #[error("MCP tool name cannot be empty")]
     Empty,
+    /// The all-tools wildcard was mixed with named selections.
     #[error("MCP wildcard must be the entire tool selection")]
     Wildcard,
 }
 
 /// Select the normalized connection shape for one MCP resource.
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum McpTransport {
+    /// Launch an explicitly configured server over standard input and output.
     Stdio {
+        /// Host-resolved executable or command name.
         command: String,
+        /// Adapter arguments, potentially containing credentials; never log these values.
         arguments: Vec<String>,
+        /// Ephemeral environment values supplied only to the selected server.
         environment: std::collections::BTreeMap<String, String>,
     },
+    /// Connect to an explicitly selected HTTP server.
     Http {
+        /// Server address, potentially credential-bearing.
         url: String,
+        /// Ephemeral authentication and transport headers.
         headers: std::collections::BTreeMap<String, String>,
     },
+    /// Connect using the selected server-sent events transport.
     Sse {
+        /// Server address, potentially credential-bearing.
         url: String,
+        /// Ephemeral authentication and transport headers.
         headers: std::collections::BTreeMap<String, String>,
     },
 }
@@ -344,88 +461,11 @@ impl std::fmt::Debug for McpTransport {
     }
 }
 
-/// Authorize exactly one safe continuation after the provider proves non-consumption.
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "Vec<u8>", into = "Vec<u8>")]
-pub struct ContinuationToken(Vec<u8>);
-
-impl std::fmt::Debug for ContinuationToken {
-    /// Hide native continuation state from generic diagnostic formatting.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ContinuationToken([opaque])")
-    }
-}
-
-impl ContinuationToken {
-    /// Create an opaque, nonempty authorization token owned by the provider binding.
-    pub fn new(bytes: Vec<u8>) -> Result<Self, RecoveryTokenError> {
-        if bytes.is_empty() {
-            return Err(RecoveryTokenError);
-        }
-        Ok(Self(bytes))
-    }
-
-    /// Borrow the token for one operation routed to its issuing provider.
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl TryFrom<Vec<u8>> for ContinuationToken {
-    type Error = RecoveryTokenError;
-
-    /// Validate deserialized continuation authorization using the constructor invariant.
-    fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
-        Self::new(bytes)
-    }
-}
-
-impl From<ContinuationToken> for Vec<u8> {
-    /// Encode the opaque continuation authorization for the internal event transport.
-    fn from(token: ContinuationToken) -> Self {
-        token.0
-    }
-}
-
-/// Authorize one provider-owned continuation without exposing native retry state.
-#[derive(Clone)]
-pub enum ContinuationRequest {
-    /// Resubmit a request only after the provider proves its prior input was not consumed.
-    NotConsumed {
-        request: Box<PromptRequest>,
-        authorization: ContinuationToken,
-    },
-    /// Resume settled accepted history after a replay-safe transient execution failure.
-    RetryableExecution {
-        scope: InvocationScope,
-        authorization: ContinuationToken,
-        callbacks: Box<InvocationCallbacks>,
-        /// Confirm this authorized handoff independently of eventual native completion.
-        dispatch: Box<crate::submission::DispatchReporter>,
-    },
-}
-
-/// Supply fresh host authority when resuming accepted history under a new invocation.
-#[derive(Clone)]
-pub struct InvocationCallbacks {
-    /// Bind MCP callbacks to this invocation instead of a mutable session endpoint.
-    pub tool_endpoint: Option<HostToolEndpoint>,
-    /// Retain the endpoint and its transport resources for this invocation.
-    pub resource_lease: Option<std::sync::Arc<dyn ResourceLease>>,
-    pub permissions: std::sync::Arc<dyn crate::permissions::ProviderPermissions>,
-    pub provider_tools: std::sync::Arc<dyn crate::control::ProviderTools>,
-    pub turn_control: std::sync::Arc<dyn crate::turn_control::TurnControl>,
-    pub host_effects: std::sync::Arc<dyn ProviderHostEffects>,
-}
-
-/// Report the normalized result of a safe continuation operation.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ContinuationOutcome {
-    InputAccepted(InputAcceptance),
-    ExecutionResumed,
-}
-
-/// Carry one invocation's explicit workflow behavior and admitted inputs.
+/// Own one journaled delivery attempt and its immutable invocation authority.
+/// The host issues scope, submission, and attempt IDs. The adapter validates them together
+/// with the dispatch reporter and receipt before sending. All callbacks use this request's
+/// endpoints and authority; none may fall back to a previous invocation. Release strong
+/// callback/resource copies when their native scope is collected, keeping only weak replay identity.
 #[derive(Clone)]
 pub struct PromptRequest {
     /// Identify the admitted execution scope.
@@ -445,14 +485,14 @@ pub struct PromptRequest {
     pub tool_endpoint: Option<HostToolEndpoint>,
     /// Keep invocation-specific transport resources alive until callbacks are collected.
     pub resource_lease: Option<std::sync::Arc<dyn ResourceLease>>,
-    /// Request native goal behavior explicitly rather than encoding a control command in text.
-    pub goal: Option<crate::native_goal::NativeGoalCommand>,
     /// Identify the durable input journal entry.
     pub submission_id: SubmissionId,
+    /// Identify this immutable delivery attempt independently of logical input.
+    pub attempt_id: crate::DeliveryAttemptId,
     /// Carry prepared user input.
     pub input: crate::input::PromptInput,
     /// Confirm tracked transport handoff independently of eventual native acceptance.
-    /// Validate binding, scope, and submission before admission; confirm only after
+    /// Validate binding, scope, submission, and attempt before admission; confirm only after
     /// immutable configuration and cancellation/collection ownership are installed.
     pub dispatch: crate::submission::DispatchReporter,
     /// Carry previously saved input proven not to have reached the provider.
@@ -469,11 +509,46 @@ pub struct PromptRequest {
     pub provider_tools: std::sync::Arc<dyn crate::control::ProviderTools>,
     /// Coordinate turn controls for this invocation only.
     pub turn_control: std::sync::Arc<dyn crate::turn_control::TurnControl>,
-    /// Settle required foreground effects before terminal publication.
+    /// Retain separately host-owned publication authority; native settlement must not await host exchange jobs.
     pub host_effects: std::sync::Arc<dyn ProviderHostEffects>,
 }
 
-/// Identify one live binding and its optional durable conversation identity.
+impl PromptRequest {
+    /// Snapshot complete replay identity without retaining callback or resource ownership.
+    pub fn identity(&self) -> crate::PromptRequestIdentity {
+        self.into()
+    }
+}
+
+impl PartialEq for PromptRequest {
+    /// Compare every immutable input value, attempt, dispatch channel, and callback authority.
+    fn eq(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && self.mode == other.mode
+            && self.configuration == other.configuration
+            && self.task == other.task
+            && self.tools == other.tools
+            && self.tool_endpoint == other.tool_endpoint
+            && same_lease(&self.resource_lease, &other.resource_lease)
+            && self.submission_id == other.submission_id
+            && self.attempt_id == other.attempt_id
+            && self.input == other.input
+            && self.dispatch == other.dispatch
+            && self.recovered_inputs == other.recovered_inputs
+            && self.instructions == other.instructions
+            && self.attachments == other.attachments
+            && std::sync::Arc::ptr_eq(&self.receipt, &other.receipt)
+            && std::sync::Arc::ptr_eq(&self.permissions, &other.permissions)
+            && std::sync::Arc::ptr_eq(&self.provider_tools, &other.provider_tools)
+            && std::sync::Arc::ptr_eq(&self.turn_control, &other.turn_control)
+            && std::sync::Arc::ptr_eq(&self.host_effects, &other.host_effects)
+    }
+}
+impl Eq for PromptRequest {}
+
+/// Own the adapter-issued live generation and its separately provider-issued durable history ID.
+/// A resumed history receives a new live ID. If durable identity resolves later, publish a
+/// binding-scoped SessionIdentity observation before host persistence relies on that identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionBinding {
     /// Identify this exact live reader and callback generation.
@@ -482,7 +557,9 @@ pub struct SessionBinding {
     pub provider_session_id: Option<ProviderSessionId>,
 }
 
-/// Carry live steering input without exposing native turn placement.
+/// Own steering input targeted at one exact active host invocation.
+/// Journaled delivery has a fixed receipt/attempt identity; contextual notifications remain
+/// unjournaled. Neither form authorizes fallback to a later invocation or a new prompt.
 #[derive(Clone)]
 pub struct SteeringRequest {
     /// Identify the original execution owner and invocation.
@@ -495,27 +572,69 @@ pub struct SteeringRequest {
     pub attachments: Vec<crate::input::FileAttachment>,
     /// Preserve task entry semantics independently of its rendered text.
     pub task: Option<crate::input::TaskStart>,
-    /// Preserve explicit native goal changes when a new task enters an active invocation.
-    pub goal: Option<crate::NativeGoalCommand>,
 }
+
+impl SteeringRequest {
+    /// Snapshot complete replay identity without retaining callback or resource ownership.
+    pub fn identity(&self) -> crate::SteeringRequestIdentity {
+        self.into()
+    }
+}
+
+impl PartialEq for SteeringRequest {
+    /// Compare the exact invocation, journal authority, and independently delivered input.
+    fn eq(&self, other: &Self) -> bool {
+        self.scope == other.scope
+            && self.delivery == other.delivery
+            && self.input == other.input
+            && self.attachments == other.attachments
+            && self.task == other.task
+    }
+}
+impl Eq for SteeringRequest {}
 
 /// Preserve input accountability without inventing journal identities for host notifications.
 #[derive(Clone)]
 pub enum SteeringDelivery {
+    /// Deliver independently journaled user input under its immutable attempt receipt.
     Journaled {
+        /// Host journal authority bound to one immutable submission and delivery attempt.
         receipt: std::sync::Arc<dyn crate::submission::InputReceipt>,
     },
+    /// Deliver a host contextual notification without fabricating a submission identity.
     Context,
 }
+
+impl PartialEq for SteeringDelivery {
+    /// Compare journal authority identity while preserving explicitly unjournaled notifications.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Journaled { receipt: left }, Self::Journaled { receipt: right }) => {
+                std::sync::Arc::ptr_eq(left, right)
+            }
+            (Self::Context, Self::Context) => true,
+            (Self::Journaled { .. }, Self::Context) | (Self::Context, Self::Journaled { .. }) => {
+                false
+            }
+        }
+    }
+}
+impl Eq for SteeringDelivery {}
 
 /// Confirm the exact class of input incorporated by a steering operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SteeringAcceptance {
-    Journaled { submission_id: SubmissionId },
+    /// Positive native acceptance of the independently journaled input.
+    Journaled {
+        /// Host-issued logical input accepted by the targeted invocation.
+        submission_id: SubmissionId,
+    },
+    /// Positive native delivery of an explicitly unjournaled contextual notification.
     Context,
 }
 
 impl SteeringDelivery {
+    /// Get journal authority only for independently accountable user input.
     pub fn receipt(&self) -> Option<&std::sync::Arc<dyn crate::submission::InputReceipt>> {
         match self {
             Self::Journaled { receipt } => Some(receipt),
@@ -523,12 +642,15 @@ impl SteeringDelivery {
         }
     }
 
+    /// Get the host-issued logical input ID without inventing one for contextual notifications.
     pub fn submission_id(&self) -> Option<&SubmissionId> {
         self.receipt().map(|receipt| receipt.id())
     }
 }
 
-/// Acknowledge durable native acceptance without exposing a native message identifier.
+/// Prove acceptance of the request's exact journaled attempt without native message identifiers.
+/// The retained operation context and request bind this logical ID to its attempt. This value
+/// does not prove terminal execution or foreground collection; those arrive through observations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InputAcceptance {
     /// Identify the host journal entry accepted by the provider.
@@ -560,10 +682,12 @@ impl std::fmt::Display for HostEffectFailure {
 
 impl std::error::Error for HostEffectFailure {}
 
-/// Close foreground callback admission and settle effects already admitted for an invocation.
+/// Collect host-owned effects independently of native provider settlement.
+/// Harness invokes this barrier while it continues consuming native observations; adapters
+/// must not await it to prove their native worker and callback resources were collected.
 #[async_trait::async_trait]
 pub trait ProviderHostEffects: Send + Sync {
-    /// Wait for required foreground effects and receipt writes before terminal publication.
+    /// Wait for host-owned foreground effects and receipt writes at the host exchange barrier.
     async fn settle_foreground(
         &self,
         binding: &BindingId,
@@ -571,7 +695,10 @@ pub trait ProviderHostEffects: Send + Sync {
     ) -> Result<(), HostEffectFailure>;
 }
 
-/// Store adapter-owned recovery bytes without exposing or decoding their format.
+/// Own opaque adapter-issued evidence scoped to its history, logical input, and delivery attempt.
+/// Persist required evidence for post-binding recovery and return it only to its issuing adapter.
+/// A token is not replay permission, a continuation capability, or proof of successful retraction;
+/// its issuer determines whether the retained history still makes the evidence authoritative.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<u8>", into = "Vec<u8>")]
 pub struct RecoveryToken(Vec<u8>);
@@ -584,7 +711,7 @@ impl std::fmt::Debug for RecoveryToken {
 }
 
 impl RecoveryToken {
-    /// Capture an opaque checkpoint produced by its owning provider implementation.
+    /// Create nonempty opaque delivery evidence issued by its owning adapter.
     pub fn new(bytes: Vec<u8>) -> Result<Self, RecoveryTokenError> {
         if bytes.is_empty() {
             return Err(RecoveryTokenError);
@@ -592,7 +719,7 @@ impl RecoveryToken {
         Ok(Self(bytes))
     }
 
-    /// Borrow checkpoint bytes for persistence or return to the owning implementation.
+    /// Get opaque evidence bytes for persistence or return to the issuing adapter.
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -601,7 +728,7 @@ impl RecoveryToken {
 impl TryFrom<Vec<u8>> for RecoveryToken {
     type Error = RecoveryTokenError;
 
-    /// Validate deserialized checkpoint data using the same invariant as `new`.
+    /// Validate deserialized delivery evidence using the same invariant as `new`.
     fn try_from(bytes: Vec<u8>) -> Result<Self, Self::Error> {
         Self::new(bytes)
     }
@@ -630,8 +757,11 @@ impl std::error::Error for RecoveryTokenError {}
 /// Report whether a particular submission is proven present in recovered history.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubmissionEvidence {
+    /// Positive native evidence establishes acceptance of the queried delivery attempt.
     Accepted {
+        /// Adapter-issued accepted-input evidence available for durable recovery.
         receipt: Option<RecoveryToken>,
+        /// Durable history positively correlated with that acceptance, when resolved.
         provider_session_id: Option<ProviderSessionId>,
     },
     /// The adapter found positive, protocol-supported evidence of non-consumption.
@@ -640,15 +770,15 @@ pub enum SubmissionEvidence {
     Unknown,
 }
 
-/// Keep scope validation local to normalized request construction.
-pub fn validate_scope_owner(
-    owner: &ExecutionOwner,
-    scope: &InvocationScope,
-) -> Result<(), crate::lifecycle::LifecycleError> {
-    if &scope.owner == owner {
-        Ok(())
-    } else {
-        Err(crate::lifecycle::LifecycleError::OwnershipMismatch)
+/// Compare optional immutable resource ownership without interpreting an external lease.
+fn same_lease(
+    left: &Option<std::sync::Arc<dyn ResourceLease>>,
+    right: &Option<std::sync::Arc<dyn ResourceLease>>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => std::sync::Arc::ptr_eq(left, right),
+        (None, None) => true,
+        (Some(_), None) | (None, Some(_)) => false,
     }
 }
 

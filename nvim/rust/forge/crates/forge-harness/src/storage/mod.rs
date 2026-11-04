@@ -38,7 +38,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 60;
+const SESSION_FORMAT_VERSION: u32 = 61;
 const PREFERENCE_FORMAT_VERSION: u32 = 44;
 
 /// Keeps storage failures explicit at the host boundary, including the configured contention wait.
@@ -887,11 +887,22 @@ impl SqliteStore {
     }
 
     /// Check for local or inherited conversation history without decoding its payloads.
+    #[cfg(test)]
     pub(crate) fn has_conversation_history(&self, session_id: &str) -> Result<bool> {
         Ok(self.connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM exchange_record WHERE session_id=?1)
                 OR EXISTS(SELECT 1 FROM fork_history_record, json_tree(fork_history_record.payload) AS entry
                     WHERE session_id=?1 AND entry.key='kind' AND entry.value='exchange')",
+            [session_id], |row| row.get(0),
+        )?)
+    }
+
+    /// Preserve native identity whenever this session inherited content or a fork boundary.
+    pub(crate) fn has_fork_lineage(&self, session_id: &str) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fork_history_record WHERE session_id=?1)
+                OR EXISTS(SELECT 1 FROM session_event_record, json_tree(session_event_record.payload) AS entry
+                    WHERE session_id=?1 AND entry.key='kind' AND entry.value='forked')",
             [session_id], |row| row.get(0),
         )?)
     }
@@ -1299,6 +1310,10 @@ impl SessionStore for SqliteStore {
         match payload {
             Some(value) => {
                 let mut session = decode_current_session(&value)?;
+                anyhow::ensure!(
+                    session.is_some(),
+                    "This saved Harness session uses an unsupported session contract. Create a new session; saved history has been retained."
+                );
                 if let Some(session) = session.as_mut() {
                     validate_session_task_artifacts(&self.connection, session)?;
                 }
@@ -1366,6 +1381,48 @@ fn decode_current_session(value: &str) -> Result<Option<HarnessSession>> {
 mod test {
     use super::*;
 
+    /// Reject unsupported contracts before changed fields decode while preserving new-session resume.
+    #[test]
+    fn session_contract_rejects_old_payload_before_decode_and_resumes_new_history() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = SqliteStore::open(directory.path())?;
+        for (id, version) in [
+            ("older", Some(SESSION_FORMAT_VERSION - 1)),
+            ("missing", None),
+        ] {
+            let mut payload = serde_json::json!({"session":{"provider_session_id":17,"access":"invalid-old-shape"}});
+            if let Some(version) = version {
+                payload["format_version"] = version.into();
+            }
+            store.connection.execute(
+                "INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES(?1,'D:/work',1,?2)",
+                params![id, encode(&payload)?],
+            )?;
+            let message = store.load_session(id).unwrap_err().to_string();
+            assert!(message.contains("Create a new session"), "{message}");
+            assert!(
+                !message.contains("decode current"),
+                "old payload was decoded: {message}"
+            );
+        }
+        let mut current = session("current-contract", "D:/work");
+        current.provider_session_id = Some("new-contract-history".into());
+        store.save_session(&current)?;
+        drop(store);
+        let reopened = SqliteStore::open(directory.path())?;
+        let resumed = reopened
+            .load_session(&current.id)?
+            .expect("current session remains resumable");
+        assert_eq!(resumed.provider_session_id, current.provider_session_id);
+        assert_eq!(reopened.list_session(None)?.len(), 1);
+        let retained: i64 =
+            reopened
+                .connection
+                .query_row("SELECT COUNT(*) FROM session_record", [], |row| row.get(0))?;
+        assert_eq!(retained, 3);
+        Ok(())
+    }
+
     /// Count conversation content while excluding local and inherited rename metadata.
     #[test]
     fn conversation_history_distinguishes_metadata_local_and_inherited_exchanges() -> Result<()> {
@@ -1385,6 +1442,7 @@ mod test {
         };
         store.save_session_event(&renamed)?;
         assert!(!store.has_conversation_history(&source.id)?);
+        assert!(!store.has_fork_lineage(&source.id)?);
         let metadata_child = session("metadata-child", "D:/work");
         let metadata = TimelineEntry::Inherited {
             captured_at_ms: 2,
@@ -1406,6 +1464,7 @@ mod test {
         };
         store.save_fork_history(&metadata_child, &[metadata], &lineage(&metadata_child))?;
         assert!(!store.has_conversation_history(&metadata_child.id)?);
+        assert!(store.has_fork_lineage(&metadata_child.id)?);
         let exchange: Exchange = serde_json::from_value(serde_json::json!({
             "id":"prior-exchange","session_id":source.id,"agent_id":source.primary_agent_id,
             "ordinal":1,"prompt":"Retain this request","kind":"chat","state":"failed",
@@ -1428,6 +1487,7 @@ mod test {
         store.save_fork_history(&history_child, &[history], &lineage(&history_child))?;
         assert!(store.list_exchange(&history_child.id)?.is_empty());
         assert!(store.has_conversation_history(&history_child.id)?);
+        assert!(store.has_fork_lineage(&history_child.id)?);
         assert!(!store.has_conversation_history("unrelated")?);
         Ok(())
     }
@@ -1645,7 +1705,13 @@ mod test {
         assert_eq!(count("preference_record")?, 1);
         assert_eq!(count("prompt_history_record")?, 1);
         assert!(store.list_session(None)?.is_empty());
-        assert!(store.load_session("legacy")?.is_none());
+        assert!(
+            store
+                .load_session("legacy")
+                .unwrap_err()
+                .to_string()
+                .contains("Create a new session")
+        );
         Ok(())
     }
 
@@ -2290,9 +2356,15 @@ mod test {
         drop(store);
         let store = SqliteStore::open(temporary.path()).unwrap();
 
-        assert!(store.load_session("outdated").unwrap().is_none());
-        assert!(store.load_session("future").unwrap().is_none());
-        assert!(store.load_session("unversioned").unwrap().is_none());
+        for id in ["outdated", "future", "unversioned"] {
+            assert!(
+                store
+                    .load_session(id)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Create a new session")
+            );
+        }
         assert_eq!(
             store
                 .list_session(Some("D:/work"))
@@ -2404,7 +2476,13 @@ mod test {
         )?;
         store.save_session(&session("current-access", "D:/work"))?;
 
-        assert!(store.load_session("obsolete-access")?.is_none());
+        assert!(
+            store
+                .load_session("obsolete-access")
+                .unwrap_err()
+                .to_string()
+                .contains("Create a new session")
+        );
         assert!(store.load_preference("D:/work", "fixture-alpha")?.is_none());
         assert_eq!(store.list_session(Some("D:/work"))?.len(), 1);
         assert!(store.load_session("current-access")?.is_some());

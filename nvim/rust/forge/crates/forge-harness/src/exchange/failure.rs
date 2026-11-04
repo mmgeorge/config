@@ -72,7 +72,7 @@ impl OperationFailure {
         let reason = match self {
             Self::InputReconciliation(error) => {
                 let diagnostic = crate::provider::lifecycle_error::diagnostic(
-                    forge_provider_api::ProviderOperation::RecordInput,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     error,
                 );
                 format!(
@@ -94,7 +94,7 @@ impl OperationFailure {
             }
             Self::Reconciliation(error) => {
                 let diagnostic = crate::provider::lifecycle_error::diagnostic(
-                    forge_provider_api::ProviderOperation::ReconcileSettings,
+                    forge_provider_api::ProviderOperation::SessionConfigure,
                     error,
                 );
                 format!(

@@ -96,17 +96,11 @@ impl TryFrom<StoredTask> for Task {
 
 impl Task {
     /// Create a goal with its own stable identity and continuation allowance.
-    pub fn goal(
-        objective: String,
-        continuation: ContinuationBudget,
-        native: bool,
-        now_ms: i64,
-    ) -> Self {
+    pub fn goal(objective: String, continuation: ContinuationBudget, now_ms: i64) -> Self {
         Self {
             lifecycle: super::state::TaskLifecycle::from_snapshot(TaskSnapshot::goal(
                 objective,
                 continuation,
-                native,
                 now_ms,
             )),
         }
@@ -122,16 +116,9 @@ impl Task {
         title: String,
         record: PlanExecutionRecord,
         continuation: ContinuationBudget,
-        native: bool,
         now_ms: i64,
     ) -> Result<Self> {
-        Self::try_from(TaskSnapshot::execute(
-            title,
-            record,
-            continuation,
-            native,
-            now_ms,
-        ))
+        Self::try_from(TaskSnapshot::execute(title, record, continuation, now_ms))
     }
 
     /// Get the selected lifecycle without exposing mutation of its payload.
@@ -395,7 +382,6 @@ pub struct GoalSnapshot {
     pub objective: String,
     pub state: GoalState,
     pub continuation: ContinuationBudget,
-    pub native: bool,
     /// Compare actual workspace content instead of treating tool activity as progress.
     pub observed_checkpoint: Option<String>,
     /// Preserve the latest explicit explanation for a blocked logical goal.
@@ -414,7 +400,6 @@ pub struct ExecutionSnapshot {
     pub title: String,
     pub record: PlanExecutionRecord,
     pub continuation: ContinuationBudget,
-    pub native: bool,
 }
 
 /// Defines the next action after provider execution settles under the current task contract.
@@ -524,12 +509,7 @@ impl TaskPermit {
 }
 
 impl TaskSnapshot {
-    pub fn goal(
-        objective: String,
-        continuation: ContinuationBudget,
-        native: bool,
-        now_ms: i64,
-    ) -> Self {
+    pub fn goal(objective: String, continuation: ContinuationBudget, now_ms: i64) -> Self {
         Self {
             id: TaskId::fresh(),
             revision: TaskRevision::fresh(),
@@ -546,7 +526,6 @@ impl TaskSnapshot {
                     objective,
                     state: GoalState::Active,
                     continuation,
-                    native,
                     observed_checkpoint: None,
                     reported_status: None,
                 },
@@ -579,7 +558,6 @@ impl TaskSnapshot {
         title: String,
         record: PlanExecutionRecord,
         continuation: ContinuationBudget,
-        native: bool,
         now_ms: i64,
     ) -> Self {
         Self {
@@ -598,7 +576,6 @@ impl TaskSnapshot {
                     title,
                     record,
                     continuation,
-                    native,
                 }),
             },
         }
@@ -661,7 +638,6 @@ impl TaskSnapshot {
             (WorkflowSnapshot::Goal { goal }, WorkflowSnapshot::Goal { goal: other }) => {
                 goal.objective == other.objective
                     && goal.state == other.state
-                    && goal.native == other.native
                     && goal.continuation.max_turn_count == other.continuation.max_turn_count
                     && goal.continuation.max_consecutive_no_progress
                         == other.continuation.max_consecutive_no_progress
@@ -707,13 +683,13 @@ mod tests {
 
     #[test]
     fn task_replacement_rejects_stale_control_results() {
-        let mut task = Task::goal("First".into(), ContinuationBudget::default(), false, 1);
+        let mut task = Task::goal("First".into(), ContinuationBudget::default(), 1);
         let permit = task.permit();
         permit.validate(Some(&task)).unwrap();
         task.renew(2);
         assert!(permit.validate(Some(&task)).is_err());
         assert!(permit.validate(None).is_err());
-        let replacement = Task::goal("Second".into(), ContinuationBudget::default(), false, 3);
+        let replacement = Task::goal("Second".into(), ContinuationBudget::default(), 3);
         assert!(permit.validate(Some(&replacement)).is_err());
     }
 }

@@ -556,7 +556,7 @@ pub(crate) struct PlanAcceptancePolicy {
     pub(crate) enabled: bool,
 }
 
-/// Preserve the actual task postcondition independently of native synchronization or later work.
+/// Preserve the actual task postcondition independently of initial input scheduling or later work.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "disposition", rename_all = "snake_case")]
 pub(crate) enum TaskCommandOutcome {
@@ -622,7 +622,7 @@ pub(crate) enum TaskCommandOutcome {
     AutoAcceptChanged { task: TaskSelection, enabled: bool },
 }
 
-/// Keep task admission, stale targets, state failures, and native synchronization failures distinct.
+/// Keep task admission, stale targets, state failures, and initial input scheduling failures distinct.
 #[derive(Clone, Debug, Deserialize, Serialize, thiserror::Error)]
 #[serde(tag = "failure", rename_all = "snake_case")]
 pub(crate) enum TaskCommandFailure {
@@ -685,7 +685,7 @@ pub(crate) enum TaskCommandCheckpoint {
         task: Option<TaskSelection>,
         input: super::InputId,
     },
-    /// A finite control mutation committed; required synchronization is still observed separately.
+    /// A finite control mutation committed; its input scheduling result is observed separately.
     Control { outcome: Box<TaskCommandOutcome> },
     /// A new task and its original input identity committed before any dispatch claim was made.
     InputPending {
@@ -798,29 +798,6 @@ pub(crate) enum TaskSynchronizationFailure {
     /// The committed postcondition could not be read for final validation.
     #[error("committed task state is unavailable for synchronization validation")]
     StateUnavailable,
-    /// Native goal selection could not read its session/task/question authority.
-    #[error("native goal synchronization state is unavailable")]
-    GoalStateUnavailable,
-    /// Native work remains retained after its observation deadline.
-    #[error("native goal synchronization exceeded its observation deadline")]
-    GoalDeadline,
-    /// The owner or its effect observer ended without a certified synchronization result.
-    #[error("native goal synchronization observation was lost")]
-    GoalObservationLost,
-    /// Retirement replaced the provider generation selected for synchronization.
-    #[error("provider generation changed during native goal synchronization")]
-    GoalGenerationChanged,
-    /// Native delivery or cleanup remains unconfirmed and cannot be replayed.
-    #[error("native goal synchronization remains uncertain")]
-    GoalUncertain,
-    /// Bounded internal goal-observer intake rejected this observer.
-    #[error("native goal synchronization observer capacity is full")]
-    GoalCapacity,
-    /// Adapter conversion provided a normalized failure without native diagnostic text.
-    #[error("native goal synchronization failed ({kind:?})")]
-    GoalProvider {
-        kind: forge_provider_api::ProviderFailureKind,
-    },
 }
 
 impl TaskSynchronizationFailure {
@@ -832,13 +809,6 @@ impl TaskSynchronizationFailure {
             Self::Interrupted => "command_interrupted",
             Self::TargetChanged => "task_changed",
             Self::StateUnavailable => "task_state_unavailable",
-            Self::GoalStateUnavailable => "native_goal_state_unavailable",
-            Self::GoalDeadline => "native_goal_timeout",
-            Self::GoalObservationLost => "native_goal_observation_lost",
-            Self::GoalGenerationChanged => "native_goal_generation_changed",
-            Self::GoalUncertain => "native_goal_delivery_uncertain",
-            Self::GoalCapacity => "native_goal_observer_capacity",
-            Self::GoalProvider { .. } => "native_goal_provider_failed",
         }
     }
 }
@@ -953,8 +923,10 @@ mod tests {
             serde_json::to_value(command)?,
             serde_json::to_value(replay)?
         );
-        let mut selection = crate::task::command::ExecuteSelection::default();
-        selection.digest = Some("other".into());
+        let selection = crate::task::command::ExecuteSelection {
+            digest: Some("other".into()),
+            ..Default::default()
+        };
         assert!(matches!(
             TaskCommand::from_session_action(
                 &SessionAction::Execute { selection },

@@ -69,7 +69,7 @@ pub(crate) fn question_reply(
 /// Classify a fixture's host filesystem failure without leaking its raw payload into events.
 pub(crate) fn io_failure(error: std::io::Error) -> super::ProviderError {
     super::lifecycle_error::classify_source(
-        forge_provider_api::ProviderOperation::AdmitInput,
+        forge_provider_api::ProviderOperation::InputSubmit,
         &error,
     )
 }
@@ -80,7 +80,7 @@ pub(crate) async fn wait_gate(gate: &tokio::sync::Semaphore) -> Result<(), super
         .await
         .map_err(|_| {
             super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::AdmitInput,
+                forge_provider_api::ProviderOperation::InputSubmit,
                 forge_provider_api::ProviderFailureKind::Rejected,
             ))
         })?

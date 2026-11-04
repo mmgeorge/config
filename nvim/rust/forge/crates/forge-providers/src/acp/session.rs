@@ -15,13 +15,26 @@ use tokio::sync::{Mutex, RwLock};
 /// Owns native ACP events and conversation state, delegating policy to the host.
 pub struct AcpSessionState {
     kind: ProviderKind,
+    admission: AtomicBool,
+    admission_revocation: tokio_util::sync::CancellationToken,
+    collected: AtomicBool,
+    provider_admission: Option<Arc<AtomicBool>>,
+    first_failure: Mutex<Option<ProviderError>>,
     permission: Option<Arc<dyn ScopedPermissions>>,
     active: RwLock<Option<ActiveTurn>>,
     retained: RwLock<Option<ActiveTurn>>,
     history_replay: AtomicBool,
+    callback_work: RwLock<()>,
     operation: RwLock<Option<ActiveOperation>>,
     output: Mutex<forge_provider_api::completion::ProviderCompletion>,
     catalog: RwLock<Value>,
+    capabilities: RwLock<
+        Option<(
+            String,
+            ProviderEventSink,
+            forge_provider_api::capability::CapabilityManifest,
+        )>,
+    >,
     tool: Mutex<HashMap<(String, String), Value>>,
     tool_owner: Mutex<HashMap<(String, String), TurnAddress>>,
     finished_tool: Mutex<HashSet<(String, String)>>,
@@ -34,6 +47,7 @@ pub struct AcpSessionState {
 /// Captures immutable callback routing for the admitted provider turn.
 struct ActiveTurn {
     generation: Arc<()>,
+    revocation: tokio_util::sync::CancellationToken,
     sink: ProviderEventSink,
     permissions: Option<Arc<dyn forge_provider_api::permissions::ProviderPermissions>>,
     execution_started: bool,
@@ -73,16 +87,30 @@ impl AcpSessionState {
         Self::with_permission(kind, None)
     }
 
+    /// Create native callback state sharing the provider's immediate shutdown admission gate.
+    pub(super) fn new_binding(kind: ProviderKind, provider_admission: Arc<AtomicBool>) -> Self {
+        let mut state = Self::new_native(kind);
+        state.provider_admission = Some(provider_admission);
+        state
+    }
+
     fn with_permission(kind: ProviderKind, permission: Option<Arc<dyn ScopedPermissions>>) -> Self {
         Self {
             kind,
+            admission: AtomicBool::new(true),
+            admission_revocation: tokio_util::sync::CancellationToken::new(),
+            collected: AtomicBool::new(false),
+            provider_admission: None,
+            first_failure: Mutex::new(None),
             permission,
             active: RwLock::new(None),
             retained: RwLock::new(None),
             history_replay: AtomicBool::new(false),
+            callback_work: RwLock::new(()),
             operation: RwLock::new(None),
             output: Mutex::new(forge_provider_api::completion::ProviderCompletion::default()),
             catalog: RwLock::new(json!({})),
+            capabilities: RwLock::new(None),
             tool: Mutex::new(HashMap::new()),
             tool_owner: Mutex::new(HashMap::new()),
             finished_tool: Mutex::new(HashSet::new()),
@@ -109,8 +137,11 @@ impl AcpSessionState {
         self.finished_tool.lock().await.clear();
         self.message.lock().await.clear();
         *self.children.lock().await = super::children::AcpChildren::new(session_id.into(), scope);
-        *self.active.write().await = Some(ActiveTurn {
+        let mut active = self.active.write().await;
+        self.ensure_admission(ProviderOperation::InputSubmit)?;
+        *active = Some(ActiveTurn {
             generation: Arc::new(()),
+            revocation: tokio_util::sync::CancellationToken::new(),
             sink,
             permissions: None,
             execution_started: false,
@@ -127,6 +158,10 @@ impl AcpSessionState {
     ) -> Result<(), ProviderError> {
         self.begin(session_id, sink).await?;
         if let Some(active) = self.active.write().await.as_mut() {
+            self.ensure_admission(ProviderOperation::InputSubmit)?;
+            if active.revocation.is_cancelled() {
+                return Err(ProviderError::Cancelled);
+            }
             active.permissions = Some(permissions);
         }
         Ok(())
@@ -192,10 +227,110 @@ impl AcpSessionState {
                 .is_some_and(|retained| retained.execution_started)
     }
 
+    /// Get whether this native binding still permits new operations.
+    pub(super) fn is_admitting(&self) -> bool {
+        self.admission.load(Ordering::Acquire)
+            && self
+                .provider_admission
+                .as_ref()
+                .is_none_or(|admission| admission.load(Ordering::Acquire))
+    }
+
+    /// Close native admission before any asynchronous cleanup boundary.
+    pub(super) fn close_admission(&self) {
+        self.admission.store(false, Ordering::Release);
+        self.admission_revocation.cancel();
+    }
+
+    /// Get whether native failure revoked this binding before deliberate close.
+    pub(super) async fn is_invalidated(&self) -> bool {
+        self.first_failure.lock().await.is_some()
+    }
+
+    /// Retain the original typed binding failure across cleanup retries.
+    pub(super) async fn retain_failure(&self, cause: ProviderError) -> ProviderError {
+        self.first_failure.lock().await.get_or_insert(cause).clone()
+    }
+
+    /// Record positive full-resource collection separately from admission revocation.
+    pub(super) fn mark_collected(&self) {
+        self.collected.store(true, Ordering::Release);
+    }
+
+    /// Reject revoked work as invalidated until native owners prove full collection.
+    pub(super) fn ensure_admission(
+        &self,
+        operation: ProviderOperation,
+    ) -> Result<(), ProviderError> {
+        if self.is_admitting() {
+            return Ok(());
+        }
+        let (kind, disposition) = if self.collected.load(Ordering::Acquire) {
+            (
+                ProviderFailureKind::BindingClosed,
+                FailureDisposition::Closed,
+            )
+        } else {
+            (
+                ProviderFailureKind::BindingInvalidated,
+                FailureDisposition::Invalidated,
+            )
+        };
+        Err(ProviderError::Failure(
+            ProviderFailure::new(operation, kind).at_phase(ProviderPhase::Admission, disposition),
+        ))
+    }
+
+    /// Revoke a failed native binding without waiting on the callback currently reporting it.
+    pub(super) async fn invalidate_binding(&self, cause: ProviderError) {
+        self.close_admission();
+        self.retain_failure(cause).await;
+        self.revoke_authority().await;
+    }
+
+    /// Revoke authority locally without waiting for callback collection.
+    pub(super) async fn revoke_authority(&self) {
+        if let Some(active) = self.active.write().await.as_mut() {
+            active.revocation.cancel();
+            active.permissions = None;
+        }
+        if let Some(retained) = self.retained.write().await.as_mut() {
+            retained.revocation.cancel();
+            retained.permissions = None;
+        }
+    }
+
     /// Revoke invocation callback authority before a fenced process is collected.
     pub async fn revoke_callbacks(&self) {
-        if let Some(active) = self.active.write().await.as_mut() {
+        self.revoke_authority().await;
+        let _collected = self.callback_work.write().await;
+    }
+
+    /// Revoke only the named invocation when cancellation races with a successor.
+    pub(super) async fn revoke_invocation_callbacks(&self, scope: &InvocationScope) {
+        let mut revoked = false;
+        if let Some(active) = self.active.write().await.as_mut().filter(|active| {
+            active
+                .sink
+                .invocation_scope()
+                .is_ok_and(|current| current == scope)
+        }) {
+            active.revocation.cancel();
             active.permissions = None;
+            revoked = true;
+        }
+        if let Some(retained) = self.retained.write().await.as_mut().filter(|retained| {
+            retained
+                .sink
+                .invocation_scope()
+                .is_ok_and(|current| current == scope)
+        }) {
+            retained.revocation.cancel();
+            retained.permissions = None;
+            revoked = true;
+        }
+        if revoked {
+            let _collected = self.callback_work.write().await;
         }
     }
 
@@ -269,6 +404,9 @@ impl AcpSessionState {
     async fn is_root(&self, session_id: &str) -> bool {
         if let Some(operation) = self.operation.read().await.as_ref() {
             return operation.session_id == session_id;
+        }
+        if let Some((root, _, _)) = self.capabilities.read().await.as_ref() {
+            return root == session_id;
         }
         self.children.lock().await.is_root(session_id)
     }
@@ -464,114 +602,123 @@ impl AcpSessionState {
     }
 
     async fn authorize(&self, parameter: Value) -> Result<Value> {
+        if !self.is_admitting() {
+            return Ok(json!({"outcome":{"outcome":"cancelled"}}));
+        }
         let active = self
             .active
             .read()
             .await
             .clone()
             .context("ACP permission request has no active turn")?;
-        if let Some(permissions) = &active.permissions {
-            permissions
-                .before_tool(active.sink.invocation_scope()?)
-                .await?;
-        }
-        let session_id = parameter["sessionId"].as_str().unwrap_or_default();
-        let address = if let Some(id) = parameter["toolCall"]["toolCallId"].as_str() {
-            self.tool_owner
-                .lock()
-                .await
-                .get(&(session_id.to_owned(), id.to_owned()))
-                .cloned()
-        } else {
-            None
-        };
-        let address = match address {
-            Some(address) => address,
-            None => self
-                .address(session_id)
-                .await
-                .context("ACP permission request has no active session owner")?,
-        };
-        if active.sink.invocation_scope()? != &address.scope {
-            return Err(ProviderError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
-            )
-            .into());
-        }
-        let supplied = &parameter["toolCall"];
-        let item_id = supplied["toolCallId"].as_str();
-        let session_id = parameter["sessionId"].as_str().unwrap_or_default();
-        let observed_tool = if let Some(item_id) = item_id {
-            self.tool
-                .lock()
-                .await
-                .get(&(session_id.to_owned(), item_id.to_owned()))
-                .cloned()
-        } else {
-            None
-        };
-        let mut tool = observed_tool.clone().unwrap_or_else(|| json!({}));
-        if let Some(fields) = supplied.as_object() {
-            for (field, value) in fields {
-                if !value.is_null() {
-                    tool[field] = value.clone();
-                }
+        let authorizing = async {
+            if let Some(permissions) = &active.permissions {
+                permissions
+                    .before_tool(active.sink.invocation_scope()?)
+                    .await?;
             }
-        }
-        let request = super::permission::permission_request(self.kind, &tool)?;
-        let resolution = if let Some(permissions) = &active.permissions {
-            match permissions.authorize(&address.scope, request).await {
-                forge_provider_api::permissions::PermissionResponse::Allow => {
-                    PermissionResponse::Allow
-                }
-                forge_provider_api::permissions::PermissionResponse::Deny { reason } => {
-                    PermissionResponse::Deny { reason }
-                }
-                forge_provider_api::permissions::PermissionResponse::Cancelled => {
-                    PermissionResponse::Cancelled
-                }
+            let session_id = parameter["sessionId"].as_str().unwrap_or_default();
+            let address = if let Some(id) = parameter["toolCall"]["toolCallId"].as_str() {
+                self.tool_owner
+                    .lock()
+                    .await
+                    .get(&(session_id.to_owned(), id.to_owned()))
+                    .cloned()
+            } else {
+                None
+            };
+            let address = match address {
+                Some(address) => address,
+                None => self
+                    .address(session_id)
+                    .await
+                    .context("ACP permission request has no active session owner")?,
+            };
+            if active.sink.invocation_scope()? != &address.scope {
+                return Err(ProviderError::Observation(
+                    forge_provider_api::lifecycle::ObservationFailure::OwnershipConflict,
+                )
+                .into());
             }
-        } else if let Some(permission) = &self.permission {
-            permission.authorize(address, request).await?
-        } else {
-            return Err(
-                ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::AdmitInput,
-                    forge_provider_api::ProviderFailureKind::Rejected,
-                ))
-                .into(),
-            );
-        };
-        if !self
-            .active
-            .read()
-            .await
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(&current.generation, &active.generation))
-        {
-            return Ok(json!({"outcome":{"outcome":"cancelled"}}));
-        }
-        if matches!(resolution, PermissionResponse::Allow)
-            && let (Some(item_id), Some(observed)) = (item_id, &observed_tool)
-        {
-            let current = self.tool.lock().await;
-            ensure!(
-                current
+            let supplied = &parameter["toolCall"];
+            let item_id = supplied["toolCallId"].as_str();
+            let session_id = parameter["sessionId"].as_str().unwrap_or_default();
+            let observed_tool = if let Some(item_id) = item_id {
+                self.tool
+                    .lock()
+                    .await
                     .get(&(session_id.to_owned(), item_id.to_owned()))
-                    .is_some_and(|current| current == observed),
-                "ACP tool changed while approval was pending"
-            );
+                    .cloned()
+            } else {
+                None
+            };
+            let mut tool = observed_tool.clone().unwrap_or_else(|| json!({}));
+            if let Some(fields) = supplied.as_object() {
+                for (field, value) in fields {
+                    if !value.is_null() {
+                        tool[field] = value.clone();
+                    }
+                }
+            }
+            let request = super::permission::permission_request(self.kind, &tool)?;
+            let resolution = if let Some(permissions) = &active.permissions {
+                match permissions.authorize(&address.scope, request).await {
+                    forge_provider_api::permissions::PermissionResponse::Allow => {
+                        PermissionResponse::Allow
+                    }
+                    forge_provider_api::permissions::PermissionResponse::Deny { reason } => {
+                        PermissionResponse::Deny { reason }
+                    }
+                    forge_provider_api::permissions::PermissionResponse::Cancelled => {
+                        PermissionResponse::Cancelled
+                    }
+                }
+            } else if let Some(permission) = &self.permission {
+                permission.authorize(address, request).await?
+            } else {
+                return Err(
+                    ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::InputSubmit,
+                        forge_provider_api::ProviderFailureKind::Rejected,
+                    ))
+                    .into(),
+                );
+            };
+            if !self.active.read().await.as_ref().is_some_and(|current| {
+                Arc::ptr_eq(&current.generation, &active.generation)
+                    && !current.revocation.is_cancelled()
+                    && self.is_admitting()
+            }) {
+                return Ok(json!({"outcome":{"outcome":"cancelled"}}));
+            }
+            if matches!(resolution, PermissionResponse::Allow)
+                && let (Some(item_id), Some(observed)) = (item_id, &observed_tool)
+            {
+                let current = self.tool.lock().await;
+                ensure!(
+                    current
+                        .get(&(session_id.to_owned(), item_id.to_owned()))
+                        .is_some_and(|current| current == observed),
+                    "ACP tool changed while approval was pending"
+                );
+            }
+            if matches!(resolution, PermissionResponse::Cancelled) {
+                return Ok(json!({"outcome":{"outcome":"cancelled"}}));
+            }
+            let allow = matches!(resolution, PermissionResponse::Allow);
+            let kind = if allow { "allow_once" } else { "reject_once" };
+            let option = parameter["options"]
+                .as_array()
+                .and_then(|options| options.iter().find(|option| option["kind"] == kind))
+                .context("ACP agent did not advertise the required once-only permission choice")?;
+            Ok(json!({"outcome":{"outcome":"selected","optionId":option["optionId"]}}))
+        };
+        tokio::select! {
+            biased;
+            _ = self.admission_revocation.cancelled() => Ok(json!({"outcome":{"outcome":"cancelled"}})),
+            _ = active.revocation.cancelled() => Ok(json!({"outcome":{"outcome":"cancelled"}})),
+            result = authorizing => result,
         }
-        if matches!(resolution, PermissionResponse::Cancelled) {
-            return Ok(json!({"outcome":{"outcome":"cancelled"}}));
-        }
-        let allow = matches!(resolution, PermissionResponse::Allow);
-        let kind = if allow { "allow_once" } else { "reject_once" };
-        let option = parameter["options"]
-            .as_array()
-            .and_then(|options| options.iter().find(|option| option["kind"] == kind))
-            .context("ACP agent did not advertise the required once-only permission choice")?;
-        Ok(json!({"outcome":{"outcome":"selected","optionId":option["optionId"]}}))
     }
 }
 
@@ -709,14 +856,15 @@ impl AcpSessionState {
                 if !self.is_root(session_id).await {
                     return Ok(());
                 }
-                self.catalog.write().await["availableCommands"] =
-                    update["availableCommands"].clone();
+                self.update_catalog(json!({"availableCommands": update["availableCommands"]}))
+                    .await;
             }
             "config_option_update" => {
                 if !self.is_root(session_id).await {
                     return Ok(());
                 }
-                self.catalog.write().await["configOptions"] = update["configOptions"].clone();
+                self.update_catalog(json!({"configOptions": update["configOptions"]}))
+                    .await;
             }
             "agent_message_chunk" | "agent_thought_chunk" => {
                 let thought = update["sessionUpdate"] == "agent_thought_chunk";
@@ -941,6 +1089,7 @@ impl AcpSessionState {
     }
 
     async fn handle_request(&self, method: &str, parameter: Value) -> Result<Value> {
+        let _callback = self.callback_work.read().await;
         if self.history_replay.load(Ordering::Acquire) {
             return match method {
                 "session/request_permission" => Ok(json!({"outcome":{"outcome":"cancelled"}})),
@@ -956,7 +1105,7 @@ impl AcpSessionState {
 
 fn provider_failure(kind: ProviderFailureKind) -> ProviderError {
     ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-        forge_provider_api::ProviderOperation::NativeTransport,
+        forge_provider_api::ProviderOperation::InputSubmit,
         kind,
     ))
 }
@@ -1069,22 +1218,120 @@ fn normalize_compaction(update: &Value, session_id: &str) -> Option<Compaction> 
 #[async_trait]
 impl AcpHandler for AcpSessionState {
     async fn notification(&self, method: &str, parameter: Value) -> Result<(), AcpConnectionError> {
-        self.handle_notification(method, parameter)
-            .await
-            .map_err(|_| {
-                AcpConnectionError::Callback(Box::new(provider_failure(
-                    ProviderFailureKind::Protocol,
-                )))
-            })
+        match self.handle_notification(method, parameter).await {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                let cause = provider_failure(ProviderFailureKind::Protocol);
+                self.invalidate_binding(cause.clone()).await;
+                if let Some(sink) = self.publication_sink().await {
+                    sink.fail(events::EventDeliveryError::Observation(
+                        forge_provider_api::lifecycle::ObservationFailure::Protocol,
+                    ));
+                }
+                Err(AcpConnectionError::Callback(Box::new(cause)))
+            }
+        }
     }
     async fn request(&self, method: &str, parameter: Value) -> Result<Value, AcpConnectionError> {
-        self.handle_request(method, parameter).await.map_err(|_| {
-            AcpConnectionError::Callback(Box::new(provider_failure(ProviderFailureKind::Protocol)))
-        })
+        match self.handle_request(method, parameter).await {
+            Ok(response) => Ok(response),
+            Err(_) => {
+                let cause = provider_failure(ProviderFailureKind::Protocol);
+                self.invalidate_binding(cause.clone()).await;
+                Err(AcpConnectionError::Callback(Box::new(cause)))
+            }
+        }
     }
 }
 
 impl AcpSessionState {
+    /// Get the immutable registry identity for this native protocol owner.
+    pub(super) fn kind_id(&self) -> ProviderId {
+        self.kind.id()
+    }
+
+    /// Install the binding publisher independently of any foreground invocation.
+    pub(super) async fn install_capabilities(
+        &self,
+        session_id: &str,
+        sink: ProviderEventSink,
+        manifest: forge_provider_api::capability::CapabilityManifest,
+    ) {
+        *self.capabilities.write().await = Some((session_id.to_owned(), sink, manifest));
+    }
+
+    /// Get support already published on this binding's ordered stream.
+    pub(super) async fn effective_capabilities(
+        &self,
+    ) -> Option<forge_provider_api::capability::CapabilityManifest> {
+        self.capabilities
+            .read()
+            .await
+            .as_ref()
+            .map(|(_, _, manifest)| manifest.clone())
+    }
+
+    /// Publish support changes at the same boundary that replaces the native catalog.
+    async fn publish_capabilities(&self) {
+        if !self.is_admitting() {
+            return;
+        }
+        let catalog = self.catalog.read().await;
+        let effort = catalog["configOptions"].as_array().is_some_and(|options| {
+            options.iter().any(|option| {
+                matches!(
+                    option["category"]
+                        .as_str()
+                        .or_else(|| option["id"].as_str()),
+                    Some("thought_level" | "effort")
+                )
+            })
+        });
+        drop(catalog);
+        let publication = {
+            let mut capabilities = self.capabilities.write().await;
+            if !self.is_admitting() {
+                return;
+            }
+            let Some((_, sink, manifest)) = capabilities.as_mut() else {
+                return;
+            };
+            let Some(capability) = manifest.capability.iter_mut().find(|capability| {
+                capability.id == forge_provider_api::capability::CapabilityId::EffortSelection
+            }) else {
+                return;
+            };
+            let support = if effort {
+                forge_provider_api::capability::Support::Supported
+            } else {
+                forge_provider_api::capability::Support::Unsupported
+            };
+            if capability.support == support {
+                return;
+            }
+            capability.support = support;
+            manifest.effective_revision = manifest.effective_revision.saturating_add(1);
+            (sink.clone(), manifest.clone())
+        };
+        let (sink, capabilities) = publication;
+        if !self.is_admitting() {
+            return;
+        }
+        let event = ProviderEvent::CapabilitiesChanged {
+            scope: sink.scope().clone(),
+            capabilities,
+        };
+        let delivery = tokio::select! {
+            biased;
+            _ = self.admission_revocation.cancelled() => return,
+            delivery = sink.send_wait(event) => delivery,
+        };
+        if let Err(error) = delivery {
+            sink.fail(error.clone());
+            self.invalidate_binding(error.into()).await;
+        }
+    }
+
     pub async fn catalog(&self) -> Value {
         self.catalog.read().await.clone()
     }
@@ -1095,6 +1342,7 @@ impl AcpSessionState {
                 catalog[field] = value.clone();
             }
         }
+        self.publish_capabilities().await;
     }
     pub async fn take_completion(&self) -> forge_provider_api::completion::ProviderCompletion {
         std::mem::take(&mut *self.output.lock().await)
@@ -1104,6 +1352,202 @@ impl AcpSessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Admission revocation cannot claim full collection before native owners prove it.
+    #[test]
+    fn revoked_admission_requires_collection_proof_for_closed_disposition() {
+        let state = AcpSessionState::new_native(ProviderKind::Claude);
+        state.close_admission();
+        assert!(
+            matches!(state.ensure_admission(ProviderOperation::SessionConfigure), Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingInvalidated && failure.phase() == ProviderPhase::Admission && failure.disposition() == FailureDisposition::Invalidated)
+        );
+        state.mark_collected();
+        assert!(
+            matches!(state.ensure_admission(ProviderOperation::SessionConfigure), Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed && failure.disposition() == FailureDisposition::Closed)
+        );
+    }
+
+    /// A catalog publisher waiting on its manifest cannot publish support after revocation.
+    #[tokio::test]
+    async fn revoked_capability_update_cannot_publish_or_replace_effective_support() -> Result<()> {
+        let state = Arc::new(AcpSessionState::new_native(ProviderKind::Claude));
+        let (sink, mut stream) = events::channel(
+            BindingId::new("revoked-capability")?,
+            EventScope::Binding {
+                owner: ExecutionOwner::root("host"),
+            },
+        );
+        let mut manifest = forge_provider_api::capability::CapabilityManifest::from_descriptor(
+            crate::registry::descriptor(&ProviderKind::Claude.id()).unwrap(),
+        );
+        manifest
+            .capability
+            .iter_mut()
+            .find(|capability| {
+                capability.id == forge_provider_api::capability::CapabilityId::EffortSelection
+            })
+            .unwrap()
+            .support = forge_provider_api::capability::Support::Unsupported;
+        state.install_capabilities("native", sink, manifest).await;
+        let manifest_guard = state.capabilities.write().await;
+        let publisher = state.clone();
+        let pending = tokio::spawn(async move {
+            publisher
+                .update_catalog(json!({"configOptions":[{"id":"effort"}]}))
+                .await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while state.catalog().await["configOptions"].is_null() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        state.close_admission();
+        drop(manifest_guard);
+        pending.await?;
+        assert!(stream.try_next()?.is_none());
+        let manifest = state.effective_capabilities().await.unwrap();
+        assert_eq!(manifest.effective_revision, 0);
+        assert!(manifest.capability.iter().any(|capability| capability.id
+            == forge_provider_api::capability::CapabilityId::EffortSelection
+            && capability.support == forge_provider_api::capability::Support::Unsupported));
+        Ok(())
+    }
+
+    /// Keep a native permission waiter pending until adapter revocation cancels it.
+    struct PendingPermission {
+        started: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl forge_provider_api::permissions::ProviderPermissions for PendingPermission {
+        async fn authorize(
+            &self,
+            _: &InvocationScope,
+            _: forge_provider_api::permissions::PermissionRequest,
+        ) -> forge_provider_api::permissions::PermissionResponse {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+        async fn before_tool(&self, _: &InvocationScope) -> Result<(), ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// A pending native permission must release before the invocation can settle.
+    #[tokio::test]
+    async fn callback_revocation_collects_permission_wait_without_touching_successor() -> Result<()>
+    {
+        let state = Arc::new(AcpSessionState::new_native(ProviderKind::Claude));
+        let permission = Arc::new(PendingPermission {
+            started: tokio::sync::Notify::new(),
+        });
+        let scope = InvocationScope::new(ExecutionOwner::root("host"), "cancelled");
+        let (sink, _stream) = events::channel(BindingId::new("binding")?, scope.clone());
+        state
+            .begin_native("native", sink, permission.clone())
+            .await?;
+        state.notification("session/update", json!({"sessionId":"native","update":{"sessionUpdate":"tool_call","toolCallId":"edit","kind":"edit","rawInput":{"file_path":"test.rs"}}})).await?;
+        let callback_state = state.clone();
+        let callback = tokio::spawn(async move {
+            callback_state.handle_request("session/request_permission", json!({"sessionId":"native","toolCall":{"toolCallId":"edit"},"options":[{"kind":"allow_once","optionId":"allow"},{"kind":"reject_once","optionId":"deny"}]})).await
+        });
+        permission.started.notified().await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.revoke_invocation_callbacks(&scope),
+        )
+        .await?;
+        assert_eq!(callback.await??["outcome"]["outcome"], "cancelled");
+        state
+            .finish(forge_provider_api::turn::TurnOutcome::Cancelled)
+            .await?;
+        let successor = InvocationScope::new(scope.owner.clone(), "successor");
+        let (sink, _stream) = events::channel(BindingId::new("successor-binding")?, successor);
+        state.begin_native("native", sink, permission).await?;
+        state.revoke_invocation_callbacks(&scope).await;
+        assert!(
+            state
+                .active
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .permissions
+                .is_some()
+        );
+        Ok(())
+    }
+
+    /// Picker snapshots and pending admissions receive capability changes from the catalog boundary.
+    #[tokio::test]
+    async fn catalog_capability_updates_publish_binding_scope_before_dependent_admission()
+    -> Result<()> {
+        for active in [false, true] {
+            let state = AcpSessionState::new_native(ProviderKind::Claude);
+            let owner = ExecutionOwner::root("capability-host");
+            let (sink, mut stream) = events::channel(
+                BindingId::new("capability-binding")?,
+                EventScope::Binding {
+                    owner: owner.clone(),
+                },
+            );
+            let mut manifest = forge_provider_api::capability::CapabilityManifest::from_descriptor(
+                crate::registry::descriptor(&ProviderKind::Claude.id()).unwrap(),
+            );
+            manifest.task_steering = vec![TaskKind::Plan, TaskKind::Execute];
+            manifest
+                .capability
+                .iter_mut()
+                .find(|capability| {
+                    capability.id == forge_provider_api::capability::CapabilityId::EffortSelection
+                })
+                .unwrap()
+                .support = forge_provider_api::capability::Support::Unsupported;
+            state
+                .install_capabilities("native", sink.clone(), manifest)
+                .await;
+            if active {
+                state
+                    .begin(
+                        "native",
+                        sink.invocation_sink(&InvocationScope::new(
+                            owner.clone(),
+                            "pending-admission",
+                        ))?,
+                    )
+                    .await?;
+            }
+            state.notification("session/update", json!({"sessionId":"child","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"effort"}]}})).await?;
+            let unexpected = stream.try_next()?;
+            assert!(
+                unexpected.is_none(),
+                "child catalog update polluted the binding stream: {unexpected:?}"
+            );
+            state.notification("session/update", json!({"sessionId":"native","update":{"sessionUpdate":"config_option_update","configOptions":[{"id":"effort","options":[{"value":"high"}]}]}})).await?;
+            let event = stream.recv().await?.unwrap();
+            let ProviderEvent::CapabilitiesChanged {
+                scope,
+                capabilities,
+            } = event.event
+            else {
+                panic!("catalog change must publish effective capabilities");
+            };
+            assert_eq!(scope, EventScope::Binding { owner });
+            assert_eq!(capabilities.effective_revision, 1);
+            assert!(!capabilities.task_steering.contains(&TaskKind::Goal));
+            assert!(
+                capabilities
+                    .capability
+                    .iter()
+                    .any(|capability| capability.id
+                        == forge_provider_api::capability::CapabilityId::EffortSelection
+                        && capability.support
+                            == forge_provider_api::capability::Support::Supported)
+            );
+        }
+        Ok(())
+    }
 
     struct Deny;
 

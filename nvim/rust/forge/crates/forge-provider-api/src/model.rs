@@ -89,7 +89,6 @@ pub struct ProviderCapability {
     pub compaction: CompactionCapability,
     pub native_steer: bool,
     pub native_turn_rollback: bool,
-    pub native_goal: bool,
     pub model_selection: bool,
     pub effort_selection: bool,
     pub fast_mode: bool,

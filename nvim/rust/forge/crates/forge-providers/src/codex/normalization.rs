@@ -4,7 +4,6 @@ use forge_provider_api::agent::{
     AgentId as ProviderAgentId, AgentLifecycleEvent, AgentLifecycleKind,
 };
 use forge_provider_api::compaction::CompactionResult;
-use forge_provider_api::completion::GoalState;
 use forge_provider_api::completion::ProviderOutput;
 use forge_provider_api::*;
 use serde_json::Value;
@@ -12,7 +11,7 @@ use std::collections::HashMap;
 
 fn protocol_error() -> ProviderError {
     ProviderError::Failure(ProviderFailure::new(
-        ProviderOperation::NativeTransport,
+        ProviderOperation::InputSubmit,
         ProviderFailureKind::Protocol,
     ))
 }
@@ -800,15 +799,6 @@ impl CodexNormalization {
                 }
             }
         }
-        if let Some(state) = output
-            .completion
-            .provider_session_id
-            .as_ref()
-            .map(|id| id.as_str())
-            .and_then(|thread| native_goal_state(message, thread))
-        {
-            output.completion.evidence.native_state = Some(state);
-        }
         for event in events {
             if let Some(sink) = sink {
                 sink.send_wait(event).await?;
@@ -825,29 +815,6 @@ fn timestamp() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-}
-
-pub fn native_goal_state(message: &Value, thread_id: &str) -> Option<GoalState> {
-    if message.pointer("/params/threadId").and_then(Value::as_str) != Some(thread_id) {
-        return None;
-    }
-    match message.get("method").and_then(Value::as_str)? {
-        "thread/goal/cleared" => Some(GoalState::Cleared),
-        "thread/goal/updated" => match message
-            .pointer("/params/goal/status")
-            .or_else(|| message.pointer("/params/status"))?
-            .as_str()?
-        {
-            "active" => Some(GoalState::Active),
-            "complete" => Some(GoalState::Complete),
-            "paused" => Some(GoalState::Paused),
-            "blocked" => Some(GoalState::Blocked),
-            "usageLimited" => Some(GoalState::UsageLimited),
-            "budgetLimited" => Some(GoalState::BudgetLimited),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -1111,7 +1078,7 @@ mod test {
                 .await?;
             normalization.bind(Some(EventScope::SessionOperation {
                 owner: ExecutionOwner::root("session"),
-                operation_id: "catalog".into(),
+                operation_id: forge_provider_api::OperationId::new("catalog").unwrap(),
             }));
             normalization
                 .normalize(&message, &mut output, None, "")

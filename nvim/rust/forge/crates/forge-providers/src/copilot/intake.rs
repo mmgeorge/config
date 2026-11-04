@@ -101,7 +101,7 @@ impl SessionIntake {
                         command = receive.recv() => match command {
                             Some(Command::Attach { generation, context, scope, reply }) => {
                                 if matches!(state, IntakeState::Active { .. }) {
-                                    let _ = reply.send(Err(native_failure(forge_provider_api::ProviderOperation::AdmitInput, forge_provider_api::ProviderFailureKind::Rejected)));
+                                    let _ = reply.send(Err(native_failure(forge_provider_api::ProviderOperation::InputSubmit, forge_provider_api::ProviderFailureKind::Rejected)));
                                     continue;
                                 }
                                 let (sender, receiver) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
@@ -126,7 +126,7 @@ impl SessionIntake {
                             None => return Ok(()),
                         },
                         event = stream.recv() => {
-                            let event = event.map_err(|_| native_failure(ProviderOperation::CollectEventReader, ProviderFailureKind::Transport))?;
+                            let event = event.map_err(|error| error.downcast::<ProviderError>().unwrap_or_else(|_| native_failure(ProviderOperation::SessionClose, ProviderFailureKind::Transport)))?;
                             let mut original = None;
                             for retained in &retired {
                                 if retained.lock().await.decoder.owns_event(&event) {
@@ -170,7 +170,7 @@ impl SessionIntake {
             }.await;
             let result = result.and(stream.close().await.map_err(|_| {
                 native_failure(
-                    ProviderOperation::CollectEventReader,
+                    ProviderOperation::SessionClose,
                     ProviderFailureKind::Transport,
                 )
             }));
@@ -269,7 +269,7 @@ impl SessionIntake {
         }
         pending.await.map_err(|_error| {
             super::error::native_failure(
-                forge_provider_api::ProviderOperation::NativeTransport,
+                forge_provider_api::ProviderOperation::InputSubmit,
                 forge_provider_api::ProviderFailureKind::Protocol,
             )
         })?;

@@ -4,18 +4,25 @@ use super::{
     runtime::AcpRuntime,
     session::AcpSessionState,
 };
+use crate::pending_input::{PendingInput, PendingInputs};
 use async_trait::async_trait;
-use forge_provider_api::approval::ApprovalMode;
-use forge_provider_api::compaction::CompactionResult;
-use forge_provider_api::events::{self, ProviderEventSink, ProviderEventStream};
+use forge_provider_api::events::{self, ProviderEventSink};
+use forge_provider_api::retained_operation::{IdentityRegistry, Interruption, Store};
 use forge_provider_api::session::{
-    BindingId, InputAcceptance, PromptRequest, RecoveredInput, SessionBinding, SessionRequest,
-    SteeringRequest,
+    BindingId, InputAcceptance, PromptRequest, SessionBinding, SessionRequest, SteeringRequest,
 };
 use forge_provider_api::{ExecutionOwner, ProviderEvent};
+use forge_provider_api::{FailureDisposition, OperationContext, OperationId, ProviderPhase};
 use forge_provider_api::{ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation};
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use tokio::sync::Mutex;
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use tokio::sync::{Mutex, Notify, RwLock};
 
 struct AcpBinding {
     binding: SessionBinding,
@@ -23,283 +30,330 @@ struct AcpBinding {
     conversation: Arc<AcpConversation>,
     state: Arc<AcpSessionState>,
     sink: ProviderEventSink,
-    stream: Mutex<Option<ProviderEventStream>>,
-    resources: Mutex<Option<crate::profile::ResourceProfile>>,
-    _lease: Option<Arc<dyn forge_provider_api::session::ResourceLease>>,
-    selection: forge_provider_api::session::ResourceSelection,
-    settings: Mutex<AcpSettings>,
+    cleanup: super::connection::AcpCleanup,
+    profiles: Mutex<Vec<Arc<super::connection::AcpProfile>>>,
+    selection: Mutex<forge_provider_api::session::ResourceSelection>,
+    native_model: Mutex<forge_provider_api::ModelSelection>,
+    initial_model: forge_provider_api::ModelSelection,
     operation: Mutex<()>,
-    active: Mutex<Option<ActiveExecution>>,
-    rollback_cancelled: Mutex<bool>,
-    last_prompt: Mutex<Option<PromptBaseline>>,
-    continuations: Mutex<HashMap<Vec<u8>, ContinuationGrant>>,
+    steering: RwLock<()>,
+    covered_submissions: std::sync::Mutex<
+        HashMap<forge_provider_api::InvocationScope, Vec<forge_provider_api::SubmissionId>>,
+    >,
+    active: std::sync::Mutex<Option<ActiveExecution>>,
+    terminal_results:
+        Mutex<HashMap<forge_provider_api::InvocationScope, forge_provider_api::ExecutionResult>>,
+    settlements: std::sync::Mutex<
+        HashMap<
+            forge_provider_api::InvocationScope,
+            Arc<OperationRecord<forge_provider_api::InvocationSettlement>>,
+        >,
+    >,
+    close_task: Mutex<Option<Arc<crate::retained_task::RetainedTask>>>,
+    history_released: AtomicBool,
+    rejected_inputs: Mutex<
+        Vec<(
+            forge_provider_api::InvocationScope,
+            forge_provider_api::SubmissionId,
+            forge_provider_api::DeliveryAttemptId,
+        )>,
+    >,
 }
 
 impl AcpBinding {
     /// Check whether native input preparation or a prompt worker is still running.
-    async fn has_active_prompt(&self) -> bool {
+    fn has_active_prompt(&self) -> bool {
         self.active
             .lock()
-            .await
-            .as_ref()
-            .is_some_and(|active| active.task.as_ref().is_none_or(|task| !task.is_finished()))
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
     }
 
-    /// Join completed prompt work before admitting another operation.
-    async fn collect_finished_prompt(&self) -> Result<(), ProviderError> {
-        let finished = self
-            .active
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|active| active.task.as_ref())
-            .is_some_and(|task| task.is_finished());
-        if finished {
-            self.collect_prompt().await?;
+    /// Derive current binding support from the native handshake and retained catalog.
+    async fn capabilities(&self) -> forge_provider_api::capability::CapabilityManifest {
+        if let Some(manifest) = self.state.effective_capabilities().await {
+            return manifest;
         }
-        Ok(())
-    }
-
-    /// Preserve the active worker until its normalized result is available.
-    async fn collect_prompt(&self) -> Result<(), ProviderError> {
-        let retained = self.active.lock().await.as_ref().and_then(|active| {
-            active
-                .task
-                .as_ref()
-                .map(|task| (active.scope.clone(), task.clone()))
-        });
-        let Some((scope, task)) = retained else {
-            return Ok(());
+        let mut descriptor =
+            crate::registry::descriptor(&self.state.kind_id()).expect("ACP kind is registered");
+        descriptor.capability = self.conversation.capabilities(descriptor.capability).await;
+        let mut manifest =
+            forge_provider_api::capability::CapabilityManifest::from_descriptor(descriptor.clone());
+        manifest.provider_version = self.conversation.version();
+        manifest.task_steering = if descriptor.capability.native_steer {
+            vec![
+                forge_provider_api::TaskKind::Plan,
+                forge_provider_api::TaskKind::Execute,
+            ]
+        } else {
+            Vec::new()
         };
-        let result = task.join().await;
-        let mut active = self.active.lock().await;
-        if active.as_ref().is_some_and(|active| active.scope == scope) {
-            active.take();
-        }
-        result
-    }
-}
-
-pub(super) struct ContinuationGrant {
-    binding: BindingId,
-    scope: forge_provider_api::InvocationScope,
-    submission_id: Option<forge_provider_api::SubmissionId>,
-    receipt: Option<Arc<dyn forge_provider_api::submission::InputReceipt>>,
-    input: forge_provider_api::input::PromptInput,
-    attachments: Vec<forge_provider_api::input::FileAttachment>,
-    task: Option<forge_provider_api::input::TaskStart>,
-    goal: Option<forge_provider_api::NativeGoalCommand>,
-    mode: forge_provider_api::input::PromptMode,
-    configuration: forge_provider_api::session::InvocationConfiguration,
-    tools: Vec<forge_provider_api::control::ControlToolDefinition>,
-    tool_endpoint: Option<forge_provider_api::session::HostToolEndpoint>,
-    resource_lease: Option<Arc<dyn forge_provider_api::session::ResourceLease>>,
-    instructions: String,
-    recovered_inputs: Vec<RecoveredInput>,
-}
-
-#[derive(Clone)]
-pub(super) struct PromptBaseline {
-    scope: forge_provider_api::InvocationScope,
-    mode: forge_provider_api::input::PromptMode,
-    configuration: forge_provider_api::session::InvocationConfiguration,
-    tools: Vec<forge_provider_api::control::ControlToolDefinition>,
-    tool_endpoint: Option<forge_provider_api::session::HostToolEndpoint>,
-    resource_lease: Option<Arc<dyn forge_provider_api::session::ResourceLease>>,
-    instructions: String,
-    recovered_inputs: Vec<RecoveredInput>,
-}
-
-impl PromptBaseline {
-    pub(super) fn from_request(request: &PromptRequest) -> Self {
-        Self {
-            scope: request.scope.clone(),
-            mode: request.mode,
-            configuration: request.configuration.clone(),
-            tools: request.tools.clone(),
-            tool_endpoint: request.tool_endpoint.clone(),
-            resource_lease: request.resource_lease.clone(),
-            instructions: request.instructions.clone(),
-            recovered_inputs: request.recovered_inputs.clone(),
-        }
-    }
-}
-
-impl ContinuationGrant {
-    pub(super) fn from_steering(
-        binding: BindingId,
-        request: &SteeringRequest,
-        base: &PromptBaseline,
-    ) -> Self {
-        Self {
-            binding,
-            scope: request.scope.clone(),
-            submission_id: request.delivery.submission_id().cloned(),
-            receipt: request.delivery.receipt().cloned(),
-            input: request.input.clone(),
-            attachments: request.attachments.clone(),
-            task: request.task.clone(),
-            goal: request.goal.clone(),
-            mode: base.mode,
-            configuration: base.configuration.clone(),
-            tools: base.tools.clone(),
-            tool_endpoint: base.tool_endpoint.clone(),
-            resource_lease: base.resource_lease.clone(),
-            instructions: base.instructions.clone(),
-            recovered_inputs: base.recovered_inputs.clone(),
-        }
+        manifest
     }
 
-    fn matches(
+    /// Revoke new work before asynchronous transport collection begins.
+    async fn invalidate(&self, cause: ProviderError) {
+        self.state.invalidate_binding(cause).await;
+        self.state.revoke_callbacks().await;
+    }
+
+    /// Fence post-write results after the final await against interruption and pending collection.
+    fn ensure_current_result(
         &self,
-        binding: &BindingId,
-        owner: &ExecutionOwner,
-        request: &PromptRequest,
-    ) -> bool {
-        self.binding == *binding
-            && request.scope == self.scope
-            && request.scope.owner == *owner
-            && self
-                .submission_id
-                .as_ref()
-                .is_none_or(|id| id == &request.submission_id)
-            && request.receipt.id() == &request.submission_id
-            && self
-                .receipt
-                .as_ref()
-                .is_none_or(|receipt| Arc::ptr_eq(receipt, &request.receipt))
-            && same_input(&self.input, &request.input)
-            && same_attachments(&self.attachments, &request.attachments)
-            && self.task == request.task
-            && self.goal == request.goal
-            && self.mode == request.mode
-            && self.configuration.model == request.configuration.model
-            && self.configuration.access == request.configuration.access
-            && self.configuration.approval == request.configuration.approval
-            && self
-                .tools
-                .iter()
-                .map(|tool| tool.mcp_value())
-                .collect::<Vec<_>>()
-                == request
-                    .tools
-                    .iter()
-                    .map(|tool| tool.mcp_value())
-                    .collect::<Vec<_>>()
-            && same_tool_endpoint(self.tool_endpoint.as_ref(), request.tool_endpoint.as_ref())
-            && same_resource_lease(
-                self.resource_lease.as_ref(),
-                request.resource_lease.as_ref(),
-            )
-            && self.instructions == request.instructions
-            && same_recovered_inputs(&self.recovered_inputs, &request.recovered_inputs)
+        context: &OperationContext,
+        operation: ProviderOperation,
+    ) -> Result<(), ProviderError> {
+        if let Err(error) = context.check_admission(operation) {
+            self.state.close_admission();
+            return Err(operation_failure(
+                operation,
+                &error,
+                ProviderPhase::Observation,
+                FailureDisposition::Invalidated,
+            ));
+        }
+        match self.state.ensure_admission(operation) {
+            Ok(()) => Ok(()),
+            Err(ProviderError::Failure(failure)) => {
+                Err(ProviderFailure::new(operation, failure.kind())
+                    .at_phase(ProviderPhase::Observation, failure.disposition())
+                    .into())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Wait for exactly one retained invocation's collector without selecting current work.
+    async fn settlement(
+        &self,
+        scope: &forge_provider_api::InvocationScope,
+    ) -> Result<forge_provider_api::InvocationSettlement, ProviderError> {
+        let record = self
+            .settlements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(scope)
+            .cloned()
+            .ok_or_else(|| {
+                failure(
+                    ProviderOperation::Cancel,
+                    ProviderFailureKind::WrongInvocation,
+                )
+            })?;
+        record.wait().await
     }
 }
 
-fn same_tool_endpoint(
-    left: Option<&forge_provider_api::session::HostToolEndpoint>,
-    right: Option<&forge_provider_api::session::HostToolEndpoint>,
-) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => left.url == right.url && left.headers == right.headers,
-        _ => false,
+/// Retain one operation's immutable completion across dropped and repeated awaits.
+struct OperationRecord<T> {
+    result: Mutex<Option<Result<T, ProviderError>>>,
+    ready: Notify,
+}
+
+impl<T: Clone> OperationRecord<T> {
+    /// Create pending result storage before native mutation can begin.
+    fn new() -> Self {
+        Self {
+            result: Mutex::new(None),
+            ready: Notify::new(),
+        }
+    }
+    /// Publish one final result before waking every retrying observer.
+    async fn complete(&self, result: Result<T, ProviderError>) {
+        *self.result.lock().await = Some(result);
+        self.ready.notify_waiters();
+    }
+    /// Observe the retained operation without becoming its execution owner.
+    async fn wait(&self) -> Result<T, ProviderError> {
+        loop {
+            let ready = self.ready.notified();
+            if let Some(result) = self.result.lock().await.clone() {
+                return result;
+            }
+            ready.await;
+        }
     }
 }
 
-fn same_resource_lease(
-    left: Option<&Arc<dyn forge_provider_api::session::ResourceLease>>,
-    right: Option<&Arc<dyn forge_provider_api::session::ResourceLease>>,
-) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => Arc::ptr_eq(left, right),
-        _ => false,
-    }
-}
-
-pub(super) fn take_continuation_grant(
-    grants: &mut HashMap<Vec<u8>, ContinuationGrant>,
-    token: &[u8],
-    binding: &BindingId,
-    owner: &ExecutionOwner,
-    request: &PromptRequest,
-) -> bool {
-    if !grants
-        .get(token)
-        .is_some_and(|grant| grant.matches(binding, owner, request))
-    {
-        return false;
-    }
-    grants.remove(token);
-    true
-}
-
-fn same_input(
-    left: &forge_provider_api::input::PromptInput,
-    right: &forge_provider_api::input::PromptInput,
-) -> bool {
-    use forge_provider_api::input::PromptInput;
-    match (left, right) {
-        (PromptInput::Text(left), PromptInput::Text(right)) => left == right,
+/// Retain the provider's complete typed operation namespace independently of observers.
+struct AcpOperations {
+    identities: Arc<IdentityRegistry>,
+    open: Store<forge_provider_api::SessionRequestIdentity, forge_provider_api::OpenedSession>,
+    configure: Store<
+        (BindingId, forge_provider_api::SessionConfiguration),
+        forge_provider_api::ConfiguredSession,
+    >,
+    fork: Store<forge_provider_api::SessionForkRequest, forge_provider_api::ProviderForkResult>,
+    compact: Store<
+        (BindingId, forge_provider_api::CompactionRequest),
+        forge_provider_api::CompactionResult,
+    >,
+    close: Store<BindingId, ()>,
+    cancel: Store<
+        (BindingId, forge_provider_api::CancelRequest),
+        forge_provider_api::InvocationSettlement,
+    >,
+    submit: Store<(BindingId, forge_provider_api::PromptRequestIdentity), InputAcceptance>,
+    steer: Store<
+        (BindingId, forge_provider_api::SteeringRequestIdentity),
+        forge_provider_api::SteeringAcceptance,
+    >,
+    reconcile:
+        Store<forge_provider_api::InputReconcileRequest, forge_provider_api::SubmissionEvidence>,
+    retract: Store<
+        (BindingId, forge_provider_api::InputRetractRequest),
+        forge_provider_api::InputRetractOutcome,
+    >,
+    inspect:
+        Store<forge_provider_api::catalog::WorkspaceContext, forge_provider_api::ProviderSetup>,
+    authenticate: Store<
         (
-            PromptInput::Skill {
-                name: left_name,
-                arguments: left_arguments,
-            },
-            PromptInput::Skill {
-                name: right_name,
-                arguments: right_arguments,
-            },
-        ) => left_name == right_name && left_arguments == right_arguments,
-        (PromptInput::QuestionReply(left), PromptInput::QuestionReply(right)) => left == right,
-        _ => false,
+            forge_provider_api::catalog::WorkspaceContext,
+            forge_provider_api::provider::AuthenticationMethodId,
+        ),
+        (),
+    >,
+    shutdown: Store<(), ()>,
+    models:
+        Store<forge_provider_api::catalog::QueryContext, Vec<forge_provider_api::ProviderModel>>,
+    skills: Store<
+        forge_provider_api::catalog::QueryContext,
+        Vec<forge_provider_api::catalog::SkillDefinition>,
+    >,
+    mcp: Store<
+        forge_provider_api::catalog::McpQuery,
+        Vec<forge_provider_api::catalog::McpDefinition>,
+    >,
+    terminals: Store<BindingId, forge_provider_api::terminal::TerminalSnapshot>,
+    terminate: Store<(BindingId, forge_provider_api::terminal::TerminalId), ()>,
+}
+
+impl AcpOperations {
+    /// Create typed stores sharing one immutable operation identity ledger.
+    fn new() -> Self {
+        let identities = Arc::new(IdentityRegistry::new());
+        Self {
+            open: Store::registered(identities.clone()),
+            configure: Store::registered(identities.clone()),
+            fork: Store::registered(identities.clone()),
+            compact: Store::registered(identities.clone()),
+            close: Store::registered(identities.clone()),
+            cancel: Store::registered(identities.clone()),
+            submit: Store::registered(identities.clone()),
+            steer: Store::registered(identities.clone()),
+            reconcile: Store::registered(identities.clone()),
+            retract: Store::registered(identities.clone()),
+            inspect: Store::registered(identities.clone()),
+            authenticate: Store::registered(identities.clone()),
+            shutdown: Store::registered(identities.clone()),
+            models: Store::registered(identities.clone()),
+            skills: Store::registered(identities.clone()),
+            mcp: Store::registered(identities.clone()),
+            terminals: Store::registered(identities.clone()),
+            terminate: Store::registered(identities.clone()),
+            identities,
+        }
+    }
+
+    /// Close provider-wide operation admission while preserving retained exact replays.
+    fn close_admission(&self) {
+        self.identities.close_admission();
+    }
+
+    /// Join operation workers after native producers stop, excluding the owning shutdown operation.
+    async fn join_all_except(&self, id: &OperationId) -> Result<(), ProviderError> {
+        let mut failures = Vec::new();
+        if let Err(error) = self.open.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.configure.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.fork.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.compact.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.close.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.cancel.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.submit.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.steer.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.reconcile.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.retract.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.inspect.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.authenticate.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.models.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.skills.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.mcp.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.terminals.join_all_except(id).await {
+            failures.push(error);
+        }
+        if let Err(error) = self.terminate.join_all_except(id).await {
+            failures.push(error);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(combine_errors(failures))
+        }
     }
 }
 
-fn same_attachments(
-    left: &[forge_provider_api::input::FileAttachment],
-    right: &[forge_provider_api::input::FileAttachment],
-) -> bool {
-    left.len() == right.len()
-        && left.iter().zip(right).all(|(left, right)| {
-            left.path == right.path
-                && left.label == right.label
-                && left.media_type == right.media_type
-                && left.contents.as_ref() == right.contents.as_ref()
-                && left.context == right.context
-        })
-}
-
-fn same_recovered_inputs(left: &[RecoveredInput], right: &[RecoveredInput]) -> bool {
-    left.len() == right.len()
-        && left.iter().zip(right).all(|(left, right)| {
-            same_input(&left.input, &right.input)
-                && same_attachments(&left.attachments, &right.attachments)
-                && left.instructions == right.instructions
-        })
+/// Preserve known durable-history ownership while an open has not produced a public binding.
+#[derive(Clone)]
+struct HistoryReservation {
+    operation_id: OperationId,
+    owner: ExecutionOwner,
+    cleanup: super::connection::AcpCleanup,
 }
 
 struct ActiveExecution {
     scope: forge_provider_api::InvocationScope,
     cancelled: bool,
+    cancellation: tokio_util::sync::CancellationToken,
     task: Option<Arc<crate::retained_task::RetainedTask>>,
 }
 
-struct AcpSettings {
-    model: forge_provider_api::session::ModelSelection,
-    access: forge_provider_api::access::AccessPolicy,
-    approval: ApprovalMode,
-}
-
 /// Own ACP processes, retained conversations, native event decoding, and completion.
+#[derive(Clone)]
 pub struct AcpProvider {
     kind: AcpKind,
-    runtime: AcpRuntime,
+    runtime: Arc<AcpRuntime>,
+    cleanup: super::connection::AcpCleanup,
     runtime_root: PathBuf,
-    bindings: Mutex<HashMap<BindingId, Arc<AcpBinding>>>,
-    owners: Mutex<HashMap<ExecutionOwner, BindingId>>,
-    preparation: Mutex<HashMap<ExecutionOwner, Arc<Mutex<()>>>>,
+    bindings: Arc<std::sync::Mutex<HashMap<BindingId, Arc<AcpBinding>>>>,
+    owners: Arc<Mutex<HashMap<ExecutionOwner, BindingId>>>,
+    preparation: Arc<Mutex<HashMap<ExecutionOwner, Arc<Mutex<()>>>>>,
+    history_admission: Arc<Mutex<()>>,
+    history_reservations:
+        Arc<Mutex<HashMap<forge_provider_api::ProviderSessionId, Vec<HistoryReservation>>>>,
+    admission: Arc<AtomicBool>,
+    shutdown_task: Arc<Mutex<Option<Arc<crate::retained_task::RetainedTask>>>>,
+    operations: Arc<AcpOperations>,
+    pending_inputs: Arc<PendingInputs>,
 }
 
 impl AcpProvider {
@@ -314,761 +368,389 @@ impl AcpProvider {
             "antigravity" => AcpKind::Antigravity,
             _ => {
                 return Err(failure(
-                    ProviderOperation::InitializeSession,
+                    ProviderOperation::SessionOpen,
                     ProviderFailureKind::Rejected,
                 ));
             }
         };
         if command.is_empty() {
             return Err(failure(
-                ProviderOperation::InitializeSession,
+                ProviderOperation::SessionOpen,
                 ProviderFailureKind::Rejected,
             ));
         }
         Ok(Self {
             kind,
-            runtime: AcpRuntime::new(kind, command, &runtime_root),
+            runtime: Arc::new(AcpRuntime::new(kind, command, &runtime_root)),
+            cleanup: super::connection::AcpCleanup::default(),
             runtime_root,
-            bindings: Mutex::new(HashMap::new()),
-            owners: Mutex::new(HashMap::new()),
-            preparation: Mutex::new(HashMap::new()),
+            bindings: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            owners: Arc::new(Mutex::new(HashMap::new())),
+            preparation: Arc::new(Mutex::new(HashMap::new())),
+            history_admission: Arc::new(Mutex::new(())),
+            history_reservations: Arc::new(Mutex::new(HashMap::new())),
+            admission: Arc::new(AtomicBool::new(true)),
+            shutdown_task: Arc::new(Mutex::new(None)),
+            operations: Arc::new(AcpOperations::new()),
+            pending_inputs: Arc::new(PendingInputs::new()),
         })
     }
 
-    async fn binding(&self, id: &BindingId) -> Result<Arc<AcpBinding>, ProviderError> {
-        self.bindings.lock().await.get(id).cloned().ok_or_else(|| {
-            failure(
-                ProviderOperation::NativeTransport,
-                ProviderFailureKind::SessionMissing,
-            )
+    /// Revoke an exact binding before publishing interruption, then retain all close phases.
+    fn interrupt_binding(
+        self,
+        binding: BindingId,
+        operation: ProviderOperation,
+        interruption: forge_provider_api::OperationInterruption,
+        phase: ProviderPhase,
+    ) -> Interruption<impl std::future::Future<Output = Result<(), ProviderError>> + Send + 'static>
+    {
+        let provider = self.clone();
+        let observation = interruption.failure(operation, phase, FailureDisposition::Invalidated);
+        let cause = observation.clone();
+        if let Ok(session) = self.binding(&binding, operation) {
+            session.state.close_admission();
+        }
+        Interruption::new(observation, async move {
+            let session = provider.binding(&binding, operation)?;
+            session.invalidate(cause).await;
+            provider.close_session(&binding).await
         })
     }
 
-    async fn submit(
+    /// Revoke only a fork's live source before publishing uncertain native target disposition.
+    fn interrupt_fork(
+        self,
+        source: forge_provider_api::ForkSource,
+        interruption: forge_provider_api::OperationInterruption,
+    ) -> Interruption<impl std::future::Future<Output = Result<(), ProviderError>> + Send + 'static>
+    {
+        let provider = self.clone();
+        let binding = match source {
+            forge_provider_api::ForkSource::Binding(binding) => Some(binding),
+            forge_provider_api::ForkSource::Checkpoint { .. } => None,
+        };
+        let disposition = if binding.is_some() {
+            FailureDisposition::Invalidated
+        } else {
+            FailureDisposition::Unchanged
+        };
+        let observation = interruption.failure(
+            ProviderOperation::SessionFork,
+            ProviderPhase::Observation,
+            disposition,
+        );
+        let cause = observation.clone();
+        if let Some(binding) = &binding
+            && let Ok(session) = self.binding(binding, ProviderOperation::SessionFork)
+        {
+            session.state.close_admission();
+        }
+        Interruption::new(observation, async move {
+            if let Some(binding) = binding {
+                let session = provider.binding(&binding, ProviderOperation::SessionFork)?;
+                session.invalidate(cause).await;
+                provider.close_session(&binding).await
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    /// Revoke cancellation's exact invocation before cleanup without touching a settled target's successor.
+    fn interrupt_cancel(
+        self,
+        binding: BindingId,
+        scope: forge_provider_api::InvocationScope,
+        interruption: forge_provider_api::OperationInterruption,
+    ) -> Interruption<impl std::future::Future<Output = Result<(), ProviderError>> + Send + 'static>
+    {
+        let provider = self.clone();
+        let session = self.binding(&binding, ProviderOperation::Cancel).ok();
+        let owns_active = session.as_ref().is_some_and(|session| {
+            let active = session
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if active.as_ref().is_some_and(|active| active.scope == scope) {
+                session.state.close_admission();
+                true
+            } else {
+                false
+            }
+        });
+        let disposition = if owns_active {
+            FailureDisposition::Invalidated
+        } else {
+            FailureDisposition::Uncertain
+        };
+        let observation = interruption.failure(
+            ProviderOperation::Cancel,
+            ProviderPhase::Collection,
+            disposition,
+        );
+        let cause = observation.clone();
+        Interruption::new(observation, async move {
+            if owns_active {
+                if let Some(session) = session {
+                    session.invalidate(cause).await;
+                }
+                return provider.close_session(&binding).await;
+            }
+            match provider
+                .cancel_invocation(&binding, forge_provider_api::CancelRequest { scope })
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(ProviderError::Failure(failure))
+                    if failure.kind() == ProviderFailureKind::WrongInvocation =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    /// Cancel the exact delivery invocation, then force close only if that same invocation still owns native work.
+    async fn collect_interrupted_input(
         &self,
         binding: &BindingId,
+        scope: forge_provider_api::InvocationScope,
+    ) -> Result<(), ProviderError> {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.cancel_invocation(
+                binding,
+                forge_provider_api::CancelRequest {
+                    scope: scope.clone(),
+                },
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(ProviderError::Failure(failure)))
+                if failure.kind() == ProviderFailureKind::WrongInvocation =>
+            {
+                return Ok(());
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {}
+        }
+        let session = self.binding(binding, ProviderOperation::InputSubmit)?;
+        let owns_active = {
+            let active = session
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if active.as_ref().is_some_and(|active| active.scope == scope) {
+                session.state.close_admission();
+                true
+            } else {
+                false
+            }
+        };
+        if owns_active {
+            self.close_session(binding).await
+        } else {
+            session.settlement(&scope).await.map(|_| ())
+        }
+    }
+
+    /// Get immutable registry metadata without native work.
+    fn descriptor(&self) -> forge_provider_api::ProviderDescriptor {
+        crate::registry::descriptor(&self.kind.id()).expect("ACP kind is registered")
+    }
+
+    /// Get the exact retained binding generation without opening a replacement.
+    fn binding(
+        &self,
+        id: &BindingId,
+        operation: ProviderOperation,
+    ) -> Result<Arc<AcpBinding>, ProviderError> {
+        self.bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(id)
+            .cloned()
+            .ok_or_else(|| failure(operation, ProviderFailureKind::SessionMissing))
+    }
+
+    /// Install exact invocation collection ownership before submitting native input.
+    async fn submit(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
         request: PromptRequest,
+        pending: PendingInput,
     ) -> Result<InputAcceptance, ProviderError> {
-        let session = self.binding(binding).await?;
-        session.collect_finished_prompt().await?;
+        context.check_admission(ProviderOperation::InputSubmit)?;
+        let session = self.binding(binding, ProviderOperation::InputSubmit)?;
+        session
+            .state
+            .ensure_admission(ProviderOperation::InputSubmit)?;
+        pending.check_admission(ProviderOperation::InputSubmit)?;
+        if session.has_active_prompt() {
+            return Err(failure(
+                ProviderOperation::InputSubmit,
+                ProviderFailureKind::ExecutionActive,
+            ));
+        }
+        let admission = tokio::select! {
+            biased;
+            _ = pending.cancelled() => return Err(pending.check_admission(ProviderOperation::InputSubmit).expect_err("sticky pending prevention rejects admission")),
+            admission = session.operation.lock() => admission,
+        };
+        pending.check_admission(ProviderOperation::InputSubmit)?;
+        context.check_admission(ProviderOperation::InputSubmit)?;
+        session
+            .state
+            .ensure_admission(ProviderOperation::InputSubmit)?;
         if request.scope.owner != session.owner
             || request.receipt.id() != &request.submission_id
-            || !request
-                .dispatch
-                .matches(binding, &request.scope, &request.submission_id)
+            || request.receipt.attempt_id()? != request.attempt_id
+            || !request.dispatch.matches(
+                binding,
+                &request.scope,
+                &request.submission_id,
+                &request.attempt_id,
+            )
         {
             return Err(failure(
-                ProviderOperation::AdmitInput,
-                ProviderFailureKind::Rejected,
+                ProviderOperation::InputSubmit,
+                ProviderFailureKind::WrongInvocation,
             ));
         }
-        if session.stream.lock().await.is_some() {
-            return Err(failure(
-                ProviderOperation::CollectEventReader,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        let mut active = session.active.lock().await;
-        if active.is_some() {
-            return Err(failure(
-                ProviderOperation::AdmitInput,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        *active = Some(ActiveExecution {
-            scope: request.scope.clone(),
-            cancelled: false,
-            task: None,
-        });
-        drop(active);
-        *session.rollback_cancelled.lock().await = false;
-        if let Err(error) = request.turn_control.before_send(&request.scope).await {
-            let mut active = session.active.lock().await;
-            if active
-                .as_ref()
-                .is_some_and(|active| active.scope == request.scope)
-            {
-                active.take();
+        let (acceptance, scope, task, started) = {
+            let mut active = session
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            pending.check_admission(ProviderOperation::InputSubmit)?;
+            context.check_admission(ProviderOperation::InputSubmit)?;
+            if active.is_some() {
+                return Err(failure(
+                    ProviderOperation::InputSubmit,
+                    ProviderFailureKind::ExecutionActive,
+                ));
             }
-            return Err(reject_before_dispatch(&request.receipt, error).await);
-        }
-        let mut active = session.active.lock().await;
-        if active.as_ref().is_some_and(|active| active.cancelled) {
-            active.take();
-            drop(active);
-            *session.rollback_cancelled.lock().await = true;
-            return Err(reject_before_dispatch(&request.receipt, ProviderError::Cancelled).await);
-        }
-        let (started, start) = tokio::sync::oneshot::channel();
-        let (accepted, acceptance) = tokio::sync::oneshot::channel();
-        let session_for_task = session.clone();
-        let binding_for_task = binding.clone();
-        let task = tokio::spawn(async move {
-            let _ = start.await;
-            run_prompt(
-                session_for_task.clone(),
-                &binding_for_task,
-                request,
-                accepted,
-            )
-            .await
+            {
+                let mut settlements = session
+                    .settlements
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if settlements.contains_key(&request.scope) {
+                    return Err(failure(
+                        ProviderOperation::InputSubmit,
+                        ProviderFailureKind::WrongInvocation,
+                    ));
+                }
+                settlements.insert(request.scope.clone(), Arc::new(OperationRecord::new()));
+            }
+            session
+                .covered_submissions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(request.scope.clone(), vec![request.submission_id.clone()]);
+            *active = Some(ActiveExecution {
+                scope: request.scope.clone(),
+                cancelled: false,
+                cancellation: tokio_util::sync::CancellationToken::new(),
+                task: None,
+            });
+            let (started, start) = tokio::sync::oneshot::channel();
+            let (accepted, acceptance) = tokio::sync::oneshot::channel();
+            let scope = request.scope.clone();
+            let session_for_task = session.clone();
+            let task = tokio::spawn(async move {
+                let _ = start.await;
+                run_prompt(session_for_task.clone(), request, accepted).await
+            });
+            let task = Arc::new(crate::retained_task::RetainedTask::new(
+                ProviderOperation::InputSubmit,
+                task,
+            ));
+            active.as_mut().expect("active execution inserted").task = Some(task.clone());
+            (acceptance, scope, task, started)
+        };
+        let collected_session = session.clone();
+        tokio::spawn(async move {
+            collect_invocation(collected_session, scope, task).await;
         });
-        active.as_mut().expect("active execution inserted").task =
-            Some(Arc::new(crate::retained_task::RetainedTask::new(task)));
+        pending.registered();
         let _ = started.send(());
-        drop(active);
+        drop(admission);
         acceptance.await.map_err(|_| {
             failure(
-                ProviderOperation::AdmitInput,
+                ProviderOperation::InputSubmit,
                 ProviderFailureKind::Transport,
             )
         })?
     }
 
-    async fn initialize_handshake(
+    /// Open native history under retained admission and publish one owned reader.
+    async fn open_session(
         &self,
-        runtime: &super::runtime::RuntimeStatus,
-        workspace: &str,
-    ) -> Result<serde_json::Value, ProviderError> {
-        let profile = super::profile::create(self.kind, &self.runtime_root, &[])?;
-        let connection = super::AcpConnection::launch(
-            super::AcpLaunch {
-                command: &runtime.command,
-                environment: &runtime.environment,
-                workspace,
-                profile: (self.kind == AcpKind::Antigravity).then_some(profile.path()),
-            },
-            Arc::new(AcpSessionState::new_native(self.kind)),
-        )
-        .await
-        .map_err(|_| {
-            failure(
-                ProviderOperation::InitializeSession,
-                ProviderFailureKind::Transport,
-            )
-        })?;
-        let requirement = super::conversation::runtime_requirement(
-            self.kind,
-            runtime
-                .command
-                .first()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| "ACP".into()),
-        )?;
-        let result = async {
-            let initialized = connection
-                .request("initialize", initialize_params())
-                .await
-                .map_err(|_| {
-                    failure(
-                        ProviderOperation::InitializeSession,
-                        ProviderFailureKind::Protocol,
-                    )
-                })?;
-            super::conversation::validate_initialization(&requirement, &initialized)?;
-            Ok(initialized)
-        }
-        .await;
-        let collected = connection.shutdown().await.map_err(|_| {
-            failure(
-                ProviderOperation::CollectNativeRuntime,
-                ProviderFailureKind::Transport,
-            )
-        });
-        match (result, collected) {
-            (Ok(initialized), Ok(())) => Ok(initialized),
-            (Err(cause), Ok(())) => Err(cause),
-            (Ok(_), Err(cleanup)) => Err(cleanup),
-            (Err(cause), Err(cleanup)) => Err(ProviderError::PreparationCleanup {
-                cause: Box::new(cause),
-                cleanup: Box::new(cleanup),
-            }),
-        }
-    }
-}
-
-fn initialize_params() -> serde_json::Value {
-    serde_json::json!({
-        "protocolVersion":1,
-        "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
-        "clientCapabilities":{"auth":{"terminal":true},"session":{"compaction":{},"configOptions":{"boolean":{}}},"subagents":{}}
-    })
-}
-
-async fn run_prompt(
-    session: Arc<AcpBinding>,
-    binding: &BindingId,
-    request: PromptRequest,
-    accepted: tokio::sync::oneshot::Sender<Result<InputAcceptance, ProviderError>>,
-) -> Result<(), ProviderError> {
-    let mut accepted = Some(accepted);
-    let result = async {
-        let _operation = session.operation.lock().await;
-        if let Err(error) = session
-            .conversation
-            .bind_tool_endpoint(request.tool_endpoint.as_ref())
-            .await
-        {
-            return Err(reject_before_dispatch(&request.receipt, error).await);
-        }
-        let event_sink = session.sink.invocation_sink(&request.scope)?;
-        session
-            .state
-            .begin_native(
-                session.conversation.id(),
-                event_sink.clone(),
-                request.permissions.clone(),
-            )
-            .await?;
-        let address = session
-            .state
-            .address(session.conversation.id())
-            .await
-            .ok_or_else(|| failure(ProviderOperation::AdmitInput, ProviderFailureKind::Protocol))?;
-        let current_model = {
-            let settings = session.settings.lock().await;
-            settings.model.clone()
-        };
-        if request.goal.is_some() {
-            let error = forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::NativeGoal,
-            )
-            .into();
-            return Err(reject_before_dispatch(&request.receipt, error).await);
-        }
-        let prompt = match prompt_content(&request, session.conversation.supports_images()) {
-            Ok(prompt) => prompt,
-            Err(error) => return Err(reject_before_dispatch(&request.receipt, error).await),
-        };
-        if let Err(error) = configure_model(
-            &session,
-            &request.configuration.model,
-            &current_model,
-            request.mode,
-        )
-        .await
-        {
-            return Err(reject_before_dispatch(&request.receipt, error).await);
-        }
-        {
-            let mut settings = session.settings.lock().await;
-            settings.model = request.configuration.model.clone();
-            settings.access = request.configuration.access.clone();
-            settings.approval = request.configuration.approval;
-        }
-        let response = session
-            .conversation
-            .submit(
-                super::submission::AcpSubmission::Prompt,
-                serde_json::json!({"sessionId":session.conversation.id(),"prompt":prompt}),
-                Some(request.receipt.clone()),
-                &request.dispatch,
-            )
-            .await;
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                let started = session.state.execution_started().await;
-                let proven_unconsumed = match &error {
-                    ProviderError::NotConsumed { .. } | ProviderError::Cancelled => true,
-                    ProviderError::Failure(native) => {
-                        native.kind() == ProviderFailureKind::Rejected
-                    }
-                    _ => false,
-                };
-                let uncertain_delivery = !proven_unconsumed;
-                let mut cleanup = Vec::new();
-                if let Err(cleanup_error) = request.turn_control.close(&request.scope).await {
-                    cleanup.push(cleanup_error);
-                }
-                if let Err(cleanup_error) = request
-                    .host_effects
-                    .settle_foreground(binding, &request.scope)
-                    .await
-                {
-                    let kind = match cleanup_error {
-                        forge_provider_api::session::HostEffectFailure::Rejected => {
-                            ProviderFailureKind::Rejected
-                        }
-                        forge_provider_api::session::HostEffectFailure::Uncertain
-                        | forge_provider_api::session::HostEffectFailure::Retired => {
-                            ProviderFailureKind::Unknown
-                        }
-                    };
-                    cleanup.push(failure(ProviderOperation::HostEffectPublication, kind));
-                }
-                if started || uncertain_delivery {
-                    let native_failure = match &error {
-                        ProviderError::DeliveryUncertain => {
-                            forge_provider_api::lifecycle::ObservationFailure::DeliveryUncertain
-                        }
-                        ProviderError::Failure(native)
-                            if native.kind() == ProviderFailureKind::Protocol =>
-                        {
-                            forge_provider_api::lifecycle::ObservationFailure::Protocol
-                        }
-                        _ => forge_provider_api::lifecycle::ObservationFailure::Disconnected,
-                    };
-                    if let Err(cleanup_error) = session
-                        .state
-                        .finish(forge_provider_api::turn::TurnOutcome::Failed)
-                        .await
-                    {
-                        cleanup.push(cleanup_error);
-                    }
-                    let event = execution_observation(
-                        &request.scope,
-                        forge_provider_api::lifecycle::ExecutionUpdate::ObservationLost {
-                            failure: native_failure,
-                            completion: if started {
-                                Some(session.state.take_completion().await.into())
-                            } else {
-                                None
-                            },
-                        },
-                    );
-                    match event {
-                        Ok(event) => {
-                            if let Err(cleanup_error) = event_sink
-                                .send_wait(ProviderEvent::Execution { observation: event })
-                                .await
-                            {
-                                cleanup.push(cleanup_error.into());
-                            }
-                        }
-                        Err(cleanup_error) => cleanup.push(cleanup_error),
-                    }
-                } else {
-                    session.state.revoke_callbacks().await;
-                    if let Err(cleanup_error) = session
-                        .state
-                        .finish(forge_provider_api::turn::TurnOutcome::Failed)
-                        .await
-                    {
-                        cleanup.push(cleanup_error);
-                    }
-                }
-                return Err(with_cleanup(error, cleanup));
-            }
-        };
-        *session.last_prompt.lock().await = Some(PromptBaseline::from_request(&request));
-        if let Some(sender) = accepted.take() {
-            let _ = sender.send(Ok(InputAcceptance {
-                submission_id: request.submission_id.clone(),
-            }));
-        }
-        let native_outcome = match super::prompt_outcome(&response) {
-            Ok(super::PromptOutcome::Completed) => forge_provider_api::turn::TurnOutcome::Completed,
-            Ok(super::PromptOutcome::Cancelled) => forge_provider_api::turn::TurnOutcome::Cancelled,
-            Err(_) => {
-                return Err(failure(
-                    ProviderOperation::AdmitInput,
-                    ProviderFailureKind::Protocol,
-                ));
-            }
-        };
-        if let Err(error) = request.turn_control.close(&request.scope).await {
-            let publication = publish_publication_failed(
-                &session,
-                &request.scope,
-                &event_sink,
-                address,
-                &request.submission_id,
-                native_outcome,
-                forge_provider_api::session::HostEffectFailure::Uncertain,
-            )
-            .await;
-            return Err(match publication {
-                Ok(()) => error,
-                Err(cleanup) => with_cleanup(error, vec![cleanup]),
-            });
-        }
-        if let Err(host_failure) = request
-            .host_effects
-            .settle_foreground(binding, &request.scope)
-            .await
-        {
-            let publication = publish_publication_failed(
-                &session,
-                &request.scope,
-                &event_sink,
-                address,
-                &request.submission_id,
-                native_outcome,
-                host_failure,
-            )
-            .await;
-            let error = failure(
-                ProviderOperation::HostEffectPublication,
-                ProviderFailureKind::Unknown,
-            );
-            return Err(match publication {
-                Ok(()) => error,
-                Err(cleanup) => with_cleanup(error, vec![cleanup]),
-            });
-        }
-        let status = match request.turn_control.status(&request.scope).await {
-            Ok(status) => status,
-            Err(error) => {
-                let publication = publish_publication_failed(
-                    &session,
-                    &request.scope,
-                    &event_sink,
-                    address,
-                    &request.submission_id,
-                    native_outcome,
-                    forge_provider_api::session::HostEffectFailure::Uncertain,
-                )
-                .await;
-                return Err(match publication {
-                    Ok(()) => error,
-                    Err(cleanup) => with_cleanup(error, vec![cleanup]),
-                });
-            }
-        };
-        let outcome = if native_outcome == forge_provider_api::turn::TurnOutcome::Cancelled
-            || status.cancelled
-        {
-            forge_provider_api::turn::TurnOutcome::Cancelled
-        } else if status.error.is_some() {
-            forge_provider_api::turn::TurnOutcome::Failed
-        } else {
-            forge_provider_api::turn::TurnOutcome::Completed
-        };
-        let mut terminal_errors = Vec::new();
-        if let Err(error) = session.state.finish(outcome).await {
-            terminal_errors.push(error);
-        }
-        let completion = session.state.take_completion().await.into();
-        let result = match outcome {
-            forge_provider_api::turn::TurnOutcome::Completed => {
-                forge_provider_api::lifecycle::ExecutionResult::Completed { completion }
-            }
-            forge_provider_api::turn::TurnOutcome::Cancelled => {
-                forge_provider_api::lifecycle::ExecutionResult::Cancelled { completion }
-            }
-            forge_provider_api::turn::TurnOutcome::Failed
-            | forge_provider_api::turn::TurnOutcome::Interrupted => {
-                forge_provider_api::lifecycle::ExecutionResult::Failed {
-                    completion,
-                    failure: forge_provider_api::lifecycle::ExecutionFailure::Terminal {
-                        kind: ProviderFailureKind::Unknown,
-                    },
-                }
-            }
-        };
-        let update = if session.state.execution_started().await {
-            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
-                address,
-                covered_submissions: vec![request.submission_id.clone()],
-                completed_at_ms: super::children::timestamp(),
-                result,
-            }
-        } else {
-            forge_provider_api::lifecycle::ExecutionUpdate::ResolvedWithoutExecution {
-                covered_submissions: vec![request.submission_id.clone()],
-                completed_at_ms: super::children::timestamp(),
-                result,
-            }
-        };
-        match execution_observation(&request.scope, update) {
-            Ok(event) => {
-                if let Err(error) = event_sink
-                    .send_wait(ProviderEvent::Execution { observation: event })
-                    .await
-                {
-                    terminal_errors.push(error.into());
-                }
-            }
-            Err(error) => terminal_errors.push(error),
-        }
-        if terminal_errors.is_empty() {
-            Ok(())
-        } else {
-            Err(combine_errors(terminal_errors))
-        }
-    }
-    .await;
-    match result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let mut error = error;
-            if accepted.is_some() && session.state.has_active_work().await {
-                session.state.revoke_callbacks().await;
-                if let Err(cleanup) = session
-                    .state
-                    .finish(forge_provider_api::turn::TurnOutcome::Failed)
-                    .await
-                {
-                    error = with_cleanup(error, vec![cleanup]);
-                }
-            }
-            if let Some(sender) = accepted.take() {
-                // A delivered rejection already reports the operation failure to its caller.
-                return match sender.send(Err(error)) {
-                    Ok(()) => Ok(()),
-                    Err(result) => result.map(|_| ()),
-                };
-            }
-            // Accepted work must never disappear without a terminal observation or explicit loss.
-            session
-                .sink
-                .fail(events::EventDeliveryError::Observation(match &error {
-                    ProviderError::Failure(failure)
-                        if failure.kind() == ProviderFailureKind::Protocol =>
-                    {
-                        forge_provider_api::lifecycle::ObservationFailure::Protocol
-                    }
-                    _ => forge_provider_api::lifecycle::ObservationFailure::Disconnected,
-                }));
-            Err(error)
-        }
-    }
-}
-
-fn execution_observation(
-    scope: &forge_provider_api::InvocationScope,
-    update: forge_provider_api::lifecycle::ExecutionUpdate,
-) -> Result<forge_provider_api::lifecycle::ExecutionObservation, ProviderError> {
-    forge_provider_api::lifecycle::ExecutionObservation::new(scope.clone(), update)
-        .map_err(Into::into)
-}
-
-/// Apply one invocation's supported ACP model and reasoning choices before prompt dispatch.
-async fn configure_model(
-    session: &AcpBinding,
-    requested: &forge_provider_api::session::ModelSelection,
-    retained: &forge_provider_api::session::ModelSelection,
-    mode: forge_provider_api::PromptMode,
-) -> Result<(), ProviderError> {
-    use forge_provider_api::ServiceTier;
-    use forge_provider_api::generation::ReasoningSelection;
-
-    if requested.service_tier != ServiceTier::Standard {
-        return Err(forge_provider_api::capability::UnsupportedCapability(
-            forge_provider_api::capability::ProviderFeature::ServiceTier,
-        )
-        .into());
-    }
-    if requested.context_window.is_some() {
-        return Err(forge_provider_api::capability::UnsupportedCapability(
-            forge_provider_api::capability::ProviderFeature::ContextWindowSelection,
-        )
-        .into());
-    }
-    if requested.model.is_none() && retained.model.is_some() {
-        return Err(forge_provider_api::capability::UnsupportedCapability(
-            forge_provider_api::capability::ProviderFeature::ModelDefaultReset,
-        )
-        .into());
-    }
-    if requested.reasoning == ReasoningSelection::Default
-        && retained.reasoning != ReasoningSelection::Default
-    {
-        return Err(forge_provider_api::capability::UnsupportedCapability(
-            forge_provider_api::capability::ProviderFeature::ReasoningDefaultReset,
-        )
-        .into());
-    }
-
-    let models = session.conversation.models().await.map_err(|_| {
-        failure(
-            ProviderOperation::ReconcileSettings,
-            ProviderFailureKind::Protocol,
-        )
-    })?;
-    let selected_model = match requested.model.as_deref() {
-        Some(model) => {
-            if !models.iter().any(|candidate| candidate.id == model) {
-                return Err(failure(
-                    ProviderOperation::ReconcileSettings,
-                    ProviderFailureKind::Rejected,
-                ));
-            }
-            Some(model)
-        }
-        None => models
-            .iter()
-            .find(|model| model.is_default)
-            .map(|model| model.id.as_str()),
-    };
-    if let ReasoningSelection::Level(level) = &requested.reasoning
-        && !selected_model
-            .and_then(|id| models.iter().find(|model| model.id == id))
-            .is_some_and(|model| model.reasoning.contains(level))
-    {
-        return Err(forge_provider_api::capability::UnsupportedCapability(
-            forge_provider_api::capability::ProviderFeature::EffortSelection,
-        )
-        .into());
-    }
-    let effort = match &requested.reasoning {
-        ReasoningSelection::Default => "default",
-        ReasoningSelection::Level(level) => level.as_str(),
-        ReasoningSelection::Lowest => {
-            let reasoning = selected_model
-                .and_then(|id| models.iter().find(|model| model.id == id))
-                .and_then(|model| model.reasoning.first())
-                .ok_or({
-                    forge_provider_api::capability::UnsupportedCapability(
-                        forge_provider_api::capability::ProviderFeature::EffortSelection,
-                    )
-                })?;
-            reasoning.as_str()
-        }
-    };
-    session
-        .conversation
-        .configure(
-            requested.model.as_deref().unwrap_or("default"),
-            effort,
-            mode,
-        )
-        .await
-        .map_err(|_| {
-            failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Protocol,
-            )
-        })
-}
-
-/// Preserve the primary provider result when required cleanup also fails.
-fn with_cleanup(primary: ProviderError, cleanup: Vec<ProviderError>) -> ProviderError {
-    if cleanup.is_empty() {
-        primary
-    } else {
-        ProviderError::Combined {
-            primary: Box::new(primary),
-            secondary: cleanup,
-        }
-    }
-}
-
-/// Preserve the first failure and attach every independent publication cleanup failure.
-fn combine_errors(mut errors: Vec<ProviderError>) -> ProviderError {
-    let primary = errors.remove(0);
-    with_cleanup(primary, errors)
-}
-
-/// Record a definite no-send result while preserving an independent receipt failure.
-async fn reject_before_dispatch(
-    receipt: &Arc<dyn forge_provider_api::submission::InputReceipt>,
-    cause: ProviderError,
-) -> ProviderError {
-    match receipt.clone().record_rejected(cause.clone()).await {
-        Ok(()) => ProviderError::PreparationFailed(Box::new(cause)),
-        Err(cleanup) => ProviderError::PreparationCleanup {
-            cause: Box::new(cause),
-            cleanup: Box::new(cleanup),
-        },
-    }
-}
-
-async fn publish_publication_failed(
-    session: &AcpBinding,
-    scope: &forge_provider_api::InvocationScope,
-    sink: &ProviderEventSink,
-    address: forge_provider_api::TurnAddress,
-    submission: &forge_provider_api::SubmissionId,
-    outcome: forge_provider_api::turn::TurnOutcome,
-    failure: forge_provider_api::session::HostEffectFailure,
-) -> Result<(), ProviderError> {
-    let finish_error = session.state.finish(outcome).await.err();
-    let completion = session.state.take_completion().await.into();
-    let result = match outcome {
-        forge_provider_api::turn::TurnOutcome::Completed => {
-            forge_provider_api::lifecycle::ExecutionResult::Completed { completion }
-        }
-        forge_provider_api::turn::TurnOutcome::Cancelled => {
-            forge_provider_api::lifecycle::ExecutionResult::Cancelled { completion }
-        }
-        forge_provider_api::turn::TurnOutcome::Failed
-        | forge_provider_api::turn::TurnOutcome::Interrupted => {
-            forge_provider_api::lifecycle::ExecutionResult::Failed {
-                completion,
-                failure: forge_provider_api::lifecycle::ExecutionFailure::Terminal {
-                    kind: ProviderFailureKind::Unknown,
-                },
-            }
-        }
-    };
-    let observation = execution_observation(
-        scope,
-        forge_provider_api::lifecycle::ExecutionUpdate::PublicationFailed {
-            address,
-            covered_submissions: vec![submission.clone()],
-            completed_at_ms: super::children::timestamp(),
-            result,
-            failure,
-        },
-    );
-    let publication_result: Result<(), ProviderError> = match observation {
-        Ok(observation) => sink
-            .send_wait(ProviderEvent::Execution { observation })
-            .await
-            .map_err(Into::into),
-        Err(error) => Err(error),
-    };
-    match (finish_error, publication_result) {
-        (None, Ok(())) => Ok(()),
-        (Some(error), Ok(())) | (None, Err(error)) => Err(error),
-        (Some(primary), Err(secondary)) => Err(with_cleanup(primary, vec![secondary])),
-    }
-}
-
-struct AcpCheckpoint<'token> {
-    accepted: bool,
-    session_id: &'token str,
-}
-
-fn parse_checkpoint(
-    token: &forge_provider_api::RecoveryToken,
-) -> Result<AcpCheckpoint<'_>, ProviderError> {
-    let value = std::str::from_utf8(token.as_bytes()).map_err(|_| {
-        failure(
-            ProviderOperation::RecoverSession,
-            ProviderFailureKind::Protocol,
-        )
-    })?;
-    let mut fields = value.splitn(3, '\n');
-    let state = fields.next();
-    let method = fields.next();
-    let session_id = fields.next().filter(|id| !id.trim().is_empty());
-    let (Some(state), Some(method), Some(session_id)) = (state, method, session_id) else {
-        return Err(failure(
-            ProviderOperation::RecoverSession,
-            ProviderFailureKind::Protocol,
-        ));
-    };
-    if !matches!(method, "session/prompt" | "_session/steering") {
-        return Err(failure(
-            ProviderOperation::RecoverSession,
-            ProviderFailureKind::Protocol,
-        ));
-    }
-    let accepted = match state {
-        "accepted" => true,
-        "v1" => false,
-        _ => {
+        context: OperationContext,
+        mut request: SessionRequest,
+        cleanup: super::connection::AcpCleanup,
+    ) -> Result<forge_provider_api::OpenedSession, ProviderError> {
+        context.check_admission(ProviderOperation::SessionOpen)?;
+        if !self.admission.load(Ordering::Acquire) {
             return Err(failure(
-                ProviderOperation::RecoverSession,
-                ProviderFailureKind::Protocol,
+                ProviderOperation::SessionOpen,
+                ProviderFailureKind::BindingClosed,
             ));
         }
-    };
-    Ok(AcpCheckpoint {
-        accepted,
-        session_id,
-    })
-}
-
-#[async_trait]
-impl forge_provider_api::provider::Provider for AcpProvider {
-    async fn initialize_session(
-        &self,
-        request: SessionRequest,
-    ) -> Result<SessionBinding, ProviderError> {
+        if matches!(
+            request.history,
+            forge_provider_api::SessionHistory::IsolatedText(_)
+        ) {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::TextGeneration,
+            )
+            .into());
+        }
+        let _history_admission = self.history_admission.lock().await;
+        context.check_admission(ProviderOperation::SessionOpen)?;
+        if !self.admission.load(Ordering::Acquire) {
+            return Err(failure(
+                ProviderOperation::SessionOpen,
+                ProviderFailureKind::BindingClosed,
+            ));
+        }
+        if let Some(resume) = request.history.resume_id() {
+            let reservations = self
+                .history_reservations
+                .lock()
+                .await
+                .get(resume)
+                .cloned()
+                .unwrap_or_default();
+            if reservations.iter().any(|reservation| {
+                reservation.owner != request.owner && !reservation.cleanup.is_collected()
+            }) {
+                return Err(failure(
+                    ProviderOperation::SessionOpen,
+                    ProviderFailureKind::HistoryConflict,
+                ));
+            }
+            let bindings = self
+                .bindings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if bindings.values().any(|binding| {
+                binding.owner != request.owner
+                    && binding.binding.provider_session_id.as_ref() == Some(resume)
+                    && !binding.history_released.load(Ordering::Acquire)
+            }) {
+                return Err(failure(
+                    ProviderOperation::SessionOpen,
+                    ProviderFailureKind::HistoryConflict,
+                ));
+            }
+        }
         let preparation = self
             .preparation
             .lock()
@@ -1079,29 +761,54 @@ impl forge_provider_api::provider::Provider for AcpProvider {
         let _preparation = preparation.lock().await;
         let existing = self.owners.lock().await.get(&request.owner).cloned();
         if let Some(existing) = existing {
-            self.retire_session(&existing).await?;
+            self.close_session(&existing).await?;
         }
-        let runtime = self.runtime.resolve().map_err(|_| {
-            failure(
-                ProviderOperation::InitializeSession,
-                ProviderFailureKind::Runtime,
-            )
-        })?;
-        let binding_id = BindingId::new(uuid::Uuid::new_v4().to_string()).map_err(|_| {
-            failure(
-                ProviderOperation::InitializeSession,
-                ProviderFailureKind::Unknown,
-            )
-        })?;
-        let scope = forge_provider_api::EventScope::SessionOperation {
+        if let Some(resume) = request.history.resume_id() {
+            let reservations = self
+                .history_reservations
+                .lock()
+                .await
+                .get(resume)
+                .cloned()
+                .unwrap_or_default();
+            for reservation in reservations {
+                if !reservation.cleanup.is_collected() {
+                    reservation.cleanup.shutdown().await?;
+                }
+            }
+            self.history_reservations
+                .lock()
+                .await
+                .entry(resume.clone())
+                .or_default()
+                .push(HistoryReservation {
+                    operation_id: context.id().clone(),
+                    owner: request.owner.clone(),
+                    cleanup: cleanup.clone(),
+                });
+        }
+        context.check_admission(ProviderOperation::SessionOpen)?;
+        let runtime = self
+            .runtime
+            .resolve()
+            .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Runtime))?;
+        let binding_id = BindingId::new(uuid::Uuid::new_v4().to_string())
+            .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Unknown))?;
+        let scope = forge_provider_api::EventScope::Binding {
             owner: request.owner.clone(),
-            operation_id: binding_id.as_str().to_owned(),
         };
         let (sink, stream) = events::channel(binding_id.clone(), scope);
-        let profile =
-            super::profile::create(self.kind, &self.runtime_root, &request.resources.skills)?;
-        let selection = request.resources.clone();
-        let state = Arc::new(AcpSessionState::new_native(self.kind));
+        let profile = cleanup.retain_profile(super::profile::create(
+            self.kind,
+            &self.runtime_root,
+            &request.configuration.resources.skills,
+        )?);
+        cleanup.retain_lease(request.resource_lease.take());
+        let selection = request.configuration.resources.clone();
+        let state = Arc::new(AcpSessionState::new_binding(
+            self.kind,
+            self.admission.clone(),
+        ));
         let conversation = AcpConversation::open(
             super::AcpLaunch {
                 command: &runtime.command,
@@ -1113,15 +820,13 @@ impl forge_provider_api::provider::Provider for AcpProvider {
             ConversationOptions {
                 kind: self.kind,
                 workspace: request.workspace.clone(),
-                session_id: request
-                    .provider_session_id
-                    .as_ref()
-                    .map(ToString::to_string),
+                session_id: request.history.resume_id().map(ToString::to_string),
                 control_endpoint: request.tool_endpoint.clone(),
-                mcp_servers: super::resources::mcp_launches(&request.resources.mcp)?,
+                mcp_servers: super::resources::mcp_launches(&request.configuration.resources.mcp)?,
                 resources: mcp_definitions(&selection),
                 profile: profile.path().to_owned(),
                 skills: request
+                    .configuration
                     .resources
                     .skills
                     .iter()
@@ -1129,151 +834,574 @@ impl forge_provider_api::provider::Provider for AcpProvider {
                     .map(|skill| skill.name.clone())
                     .collect(),
             },
+            &cleanup,
         )
         .await?;
         let session_id: forge_provider_api::ProviderSessionId =
             conversation.id().to_owned().try_into().map_err(|_| {
                 failure(
-                    ProviderOperation::InitializeSession,
+                    ProviderOperation::SessionOpen,
                     ProviderFailureKind::Protocol,
                 )
             })?;
+        let conflict = {
+            let mut reservations = self.history_reservations.lock().await;
+            let entries = reservations.entry(session_id.clone()).or_default();
+            let conflict = entries.iter().any(|reservation| {
+                reservation.operation_id != *context.id()
+                    && reservation.owner != request.owner
+                    && !reservation.cleanup.is_collected()
+            });
+            if !entries
+                .iter()
+                .any(|reservation| reservation.operation_id == *context.id())
+            {
+                entries.push(HistoryReservation {
+                    operation_id: context.id().clone(),
+                    owner: request.owner.clone(),
+                    cleanup: cleanup.clone(),
+                });
+            }
+            conflict
+        };
+        if conflict {
+            let cause = failure(
+                ProviderOperation::SessionOpen,
+                ProviderFailureKind::HistoryConflict,
+            );
+            state.invalidate_binding(cause.clone()).await;
+            let collected = cleanup.shutdown().await;
+            return Err(match collected {
+                Ok(()) => cause,
+                Err(cleanup) => with_cleanup(cause, vec![cleanup]),
+            });
+        }
         let binding = SessionBinding {
             id: binding_id.clone(),
             provider_session_id: Some(session_id),
         };
+        let initial_model = conversation.initial_model().await;
+        let requested_model = request.configuration.model.clone();
         let retained = Arc::new(AcpBinding {
             binding: binding.clone(),
             owner: request.owner.clone(),
             conversation: Arc::new(conversation),
             state,
             sink,
-            stream: Mutex::new(Some(stream)),
-            resources: Mutex::new(Some(profile)),
-            _lease: request.resource_lease,
-            selection,
-            settings: Mutex::new(AcpSettings {
-                model: request.model,
-                access: request.access,
-                approval: request.approval,
-            }),
+            cleanup: cleanup.clone(),
+            profiles: Mutex::new(vec![profile]),
+            selection: Mutex::new(selection),
+            native_model: Mutex::new(forge_provider_api::ModelSelection::default()),
+            initial_model,
             operation: Mutex::new(()),
-            active: Mutex::new(None),
-            rollback_cancelled: Mutex::new(false),
-            last_prompt: Mutex::new(None),
-            continuations: Mutex::new(HashMap::new()),
+            steering: RwLock::new(()),
+            covered_submissions: std::sync::Mutex::new(HashMap::new()),
+            active: std::sync::Mutex::new(None),
+            terminal_results: Mutex::new(HashMap::new()),
+            settlements: std::sync::Mutex::new(HashMap::new()),
+            close_task: Mutex::new(None),
+            history_released: AtomicBool::new(false),
+            rejected_inputs: Mutex::new(Vec::new()),
         });
         self.bindings
             .lock()
-            .await
-            .insert(binding_id.clone(), retained);
-        self.owners.lock().await.insert(request.owner, binding_id);
-        Ok(binding)
-    }
-
-    async fn take_session_events(
-        &self,
-        binding: &BindingId,
-    ) -> Result<ProviderEventStream, ProviderError> {
-        self.binding(binding)
-            .await?
-            .stream
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(binding_id.clone(), retained.clone());
+        self.owners
             .lock()
             .await
-            .take()
-            .ok_or_else(|| {
-                failure(
-                    ProviderOperation::CollectEventReader,
-                    ProviderFailureKind::Rejected,
+            .insert(request.owner.clone(), binding_id.clone());
+        let configured = match context.check_admission(ProviderOperation::SessionOpen) {
+            Ok(()) => {
+                configure_model(
+                    &retained,
+                    &requested_model,
+                    &forge_provider_api::ModelSelection::default(),
+                    forge_provider_api::PromptMode::Chat,
                 )
-            })
-    }
-
-    async fn session_prompt(
-        &self,
-        binding: &BindingId,
-        request: PromptRequest,
-    ) -> Result<InputAcceptance, ProviderError> {
-        self.submit(binding, request).await
-    }
-
-    async fn continue_session(
-        &self,
-        binding: &BindingId,
-        request: forge_provider_api::session::ContinuationRequest,
-    ) -> Result<forge_provider_api::session::ContinuationOutcome, ProviderError> {
-        match request {
-            forge_provider_api::session::ContinuationRequest::NotConsumed {
-                request,
-                authorization,
-            } => {
-                let session = self.binding(binding).await?;
-                let mut grants = session.continuations.lock().await;
-                if !take_continuation_grant(
-                    &mut grants,
-                    authorization.as_bytes(),
-                    binding,
-                    &session.owner,
-                    &request,
-                ) {
-                    return Err(failure(
-                        ProviderOperation::AdmitInput,
-                        ProviderFailureKind::Rejected,
-                    ));
-                }
-                drop(grants);
-                let operation = session.operation.lock().await;
-                drop(operation);
-                session.collect_prompt().await?;
-                Ok(
-                    forge_provider_api::session::ContinuationOutcome::InputAccepted(
-                        self.submit(binding, *request).await?,
-                    ),
-                )
+                .await
             }
-            forge_provider_api::session::ContinuationRequest::RetryableExecution { .. } => Err(
-                failure(ProviderOperation::AdmitInput, ProviderFailureKind::Rejected),
-            ),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = configured {
+            let error = with_operation(ProviderOperation::SessionOpen, error);
+            retained.state.retain_failure(error.clone()).await;
+            let cleanup = self.close_session(&binding_id).await;
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => with_cleanup(error, vec![cleanup]),
+            });
         }
+        if let Err(error) = context.check_admission(ProviderOperation::SessionOpen) {
+            let error = operation_failure(
+                ProviderOperation::SessionOpen,
+                &error,
+                ProviderPhase::Observation,
+                FailureDisposition::Invalidated,
+            );
+            retained.state.retain_failure(error.clone()).await;
+            let cleanup = self.close_session(&binding_id).await;
+            return Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => with_cleanup(error, vec![cleanup]),
+            });
+        }
+        *retained.native_model.lock().await = requested_model;
+        let capabilities = retained.capabilities().await;
+        retained
+            .state
+            .install_capabilities(
+                retained.conversation.id(),
+                retained.sink.clone(),
+                capabilities.clone(),
+            )
+            .await;
+        if let Err(cause) = retained.ensure_current_result(&context, ProviderOperation::SessionOpen)
+        {
+            retained.state.retain_failure(cause.clone()).await;
+            let cleanup = self.close_session(&binding_id).await;
+            return Err(match cleanup {
+                Ok(()) => cause,
+                Err(cleanup) => with_cleanup(cause, vec![cleanup]),
+            });
+        }
+        Ok(forge_provider_api::OpenedSession {
+            binding,
+            capabilities,
+            events: stream,
+        })
     }
 
-    async fn session_steer(
+    /// Apply complete defaults to settled history while preserving its public binding.
+    async fn configure_session(
         &self,
+        context: OperationContext,
         binding: &BindingId,
-        request: SteeringRequest,
-    ) -> Result<forge_provider_api::session::SteeringAcceptance, ProviderError> {
+        configuration: forge_provider_api::SessionConfiguration,
+    ) -> Result<forge_provider_api::ConfiguredSession, ProviderError> {
+        context.check_admission(ProviderOperation::SessionConfigure)?;
+        let session = self.binding(binding, ProviderOperation::SessionConfigure)?;
+        session
+            .state
+            .ensure_admission(ProviderOperation::SessionConfigure)?;
+        if session.has_active_prompt() {
+            return Err(failure(
+                ProviderOperation::SessionConfigure,
+                ProviderFailureKind::ExecutionActive,
+            ));
+        }
+        let _operation = session.operation.lock().await;
+        context.check_admission(ProviderOperation::SessionConfigure)?;
+        session
+            .state
+            .ensure_admission(ProviderOperation::SessionConfigure)?;
+        if session.has_active_prompt() || session.state.has_active_work().await {
+            return Err(failure(
+                ProviderOperation::SessionConfigure,
+                ProviderFailureKind::ExecutionActive,
+            ));
+        }
+        let resources_changed =
+            !same_resources(&*session.selection.lock().await, &configuration.resources);
+        if resources_changed && self.kind == AcpKind::Antigravity {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::ResourceSelection,
+            )
+            .into());
+        }
+        let prepared_resources = if resources_changed {
+            let profile = session.cleanup.retain_profile(super::profile::create(
+                self.kind,
+                &self.runtime_root,
+                &configuration.resources.skills,
+            )?);
+            session.profiles.lock().await.push(profile.clone());
+            let servers = super::resources::mcp_launches(&configuration.resources.mcp)?;
+            let skills = configuration
+                .resources
+                .skills
+                .iter()
+                .filter(|skill| skill.enabled)
+                .map(|skill| skill.name.clone())
+                .collect::<Vec<_>>();
+            Some((profile, servers, skills))
+        } else {
+            None
+        };
+        let stored_model = session.native_model.lock().await.clone();
+        if let Err(error) = configure_model(
+            &session,
+            &configuration.model,
+            &stored_model,
+            forge_provider_api::PromptMode::Chat,
+        )
+        .await
+        {
+            if matches!(&error, ProviderError::Unsupported(_))
+                || matches!(&error, ProviderError::Failure(failure) if failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
+            {
+                return Err(error);
+            }
+            let error = operation_failure(
+                ProviderOperation::SessionConfigure,
+                &error,
+                forge_provider_api::ProviderPhase::Preparation,
+                forge_provider_api::FailureDisposition::Invalidated,
+            );
+            session.invalidate(error.clone()).await;
+            return Err(error);
+        }
+        if let Some((profile, servers, skills)) = prepared_resources {
+            if let Err(error) = session
+                .conversation
+                .configure_resources(servers, &skills, profile.path())
+                .await
+            {
+                let error = operation_failure(
+                    ProviderOperation::SessionConfigure,
+                    &error,
+                    forge_provider_api::ProviderPhase::Preparation,
+                    forge_provider_api::FailureDisposition::Invalidated,
+                );
+                session.invalidate(error.clone()).await;
+                return Err(error);
+            }
+            let profiles = session.profiles.lock().await.clone();
+            for previous in profiles {
+                if !Arc::ptr_eq(&previous, &profile)
+                    && let Err(error) = previous.close(ProviderOperation::SessionConfigure).await
+                {
+                    let cause = operation_failure(
+                        ProviderOperation::SessionConfigure,
+                        &error,
+                        ProviderPhase::Collection,
+                        FailureDisposition::Invalidated,
+                    );
+                    session.invalidate(cause.clone()).await;
+                    return Err(cause);
+                }
+            }
+            *session.selection.lock().await = configuration.resources.clone();
+        }
+        *session.native_model.lock().await = configuration.model.clone();
+        if let Err(cause) =
+            session.ensure_current_result(&context, ProviderOperation::SessionConfigure)
+        {
+            session.invalidate(cause.clone()).await;
+            return Err(cause);
+        }
+        let capabilities = session.capabilities().await;
+        if let Err(cause) =
+            session.ensure_current_result(&context, ProviderOperation::SessionConfigure)
+        {
+            session.invalidate(cause.clone()).await;
+            return Err(cause);
+        }
+        Ok(forge_provider_api::ConfiguredSession {
+            configuration,
+            capabilities,
+            watermark: session.sink.watermark(),
+        })
+    }
+
+    /// Create separate durable history only from an exact settled native source.
+    async fn fork_session(
+        &self,
+        context: OperationContext,
+        request: forge_provider_api::session::SessionForkRequest,
+    ) -> Result<forge_provider_api::ProviderForkResult, ProviderError> {
+        context.check_admission(ProviderOperation::SessionFork)?;
         if self.kind != AcpKind::Claude {
             return Err(failure(
-                ProviderOperation::AdmitInput,
+                ProviderOperation::SessionFork,
                 ProviderFailureKind::Rejected,
             ));
         }
-        let session = self.binding(binding).await?;
+        let binding = match &request.source {
+            forge_provider_api::ForkSource::Binding(binding) => binding.clone(),
+            forge_provider_api::ForkSource::Checkpoint { .. } => {
+                return Err(forge_provider_api::capability::UnsupportedCapability(
+                    forge_provider_api::capability::ProviderFeature::CheckpointFork,
+                )
+                .into());
+            }
+        };
+        let session = self.binding(&binding, ProviderOperation::SessionFork)?;
+        session
+            .state
+            .ensure_admission(ProviderOperation::SessionFork)?;
+        let source_owner = &session.owner;
+        if &request.target.owner == source_owner {
+            return Err(failure(
+                ProviderOperation::SessionFork,
+                ProviderFailureKind::WrongInvocation,
+            ));
+        }
+        if request.target.configuration.model.service_tier
+            != forge_provider_api::ServiceTier::Standard
+        {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::ServiceTier,
+            )
+            .into());
+        }
+        if request.target.configuration.model.context_window.is_some() {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::ContextWindowSelection,
+            )
+            .into());
+        }
+        if session.has_active_prompt() {
+            return Err(failure(
+                ProviderOperation::SessionFork,
+                ProviderFailureKind::ExecutionActive,
+            ));
+        }
+        let _operation = session.operation.lock().await;
+        context.check_admission(ProviderOperation::SessionFork)?;
+        session
+            .state
+            .ensure_admission(ProviderOperation::SessionFork)?;
+        if session.has_active_prompt() || session.state.has_active_work().await {
+            return Err(failure(
+                ProviderOperation::SessionFork,
+                ProviderFailureKind::ExecutionActive,
+            ));
+        }
+        let source_model = session.native_model.lock().await.clone();
+        let target_model =
+            resolve_native_model(&session, &request.target.configuration.model, &source_model)?;
+        let models = session.conversation.models().await.map_err(|_| {
+            failure(
+                ProviderOperation::SessionFork,
+                ProviderFailureKind::Protocol,
+            )
+        })?;
+        if let Some(model) = target_model.model.as_deref()
+            && !models.iter().any(|candidate| candidate.id == model)
+        {
+            return Err(failure(
+                ProviderOperation::SessionFork,
+                ProviderFailureKind::Rejected,
+            ));
+        }
+        let selected_model = target_model.model.as_deref().or_else(|| {
+            models
+                .iter()
+                .find(|model| model.is_default)
+                .map(|model| model.id.as_str())
+        });
+        let effort = match &target_model.reasoning {
+            forge_provider_api::generation::ReasoningSelection::Default => None,
+            forge_provider_api::generation::ReasoningSelection::Level(level) => {
+                if !selected_model
+                    .and_then(|id| models.iter().find(|model| model.id == id))
+                    .is_some_and(|model| model.reasoning.contains(level))
+                {
+                    return Err(forge_provider_api::capability::UnsupportedCapability(
+                        forge_provider_api::capability::ProviderFeature::EffortSelection,
+                    )
+                    .into());
+                }
+                Some(level.as_str())
+            }
+            forge_provider_api::generation::ReasoningSelection::Lowest => Some(
+                selected_model
+                    .and_then(|id| models.iter().find(|model| model.id == id))
+                    .and_then(|model| model.reasoning.first())
+                    .ok_or({
+                        forge_provider_api::capability::UnsupportedCapability(
+                            forge_provider_api::capability::ProviderFeature::EffortSelection,
+                        )
+                    })?
+                    .as_str(),
+            ),
+        };
+        let skills = request
+            .target
+            .configuration
+            .resources
+            .skills
+            .iter()
+            .filter(|skill| skill.enabled)
+            .map(|skill| skill.name.clone())
+            .collect::<Vec<_>>();
+        let profile = session.cleanup.retain_profile(super::profile::create(
+            self.kind,
+            &self.runtime_root,
+            &request.target.configuration.resources.skills,
+        )?);
+        let mcp = super::resources::mcp_launches(&request.target.configuration.resources.mcp)?;
+        let id = session
+            .conversation
+            .fork(
+                context.id(),
+                super::conversation::ForkConfiguration {
+                    workspace: &request.target.workspace,
+                    mcp_servers: mcp,
+                    skills: &skills,
+                    profile: profile.path(),
+                    model: target_model.model.as_deref(),
+                    effort,
+                },
+            )
+            .await
+            .map_err(|error| {
+                operation_failure(
+                    ProviderOperation::SessionFork,
+                    &error,
+                    forge_provider_api::ProviderPhase::Observation,
+                    forge_provider_api::FailureDisposition::Uncertain,
+                )
+            })?;
+        let id = id.try_into().map_err(|_| {
+            failure(
+                ProviderOperation::SessionFork,
+                ProviderFailureKind::Protocol,
+            )
+        })?;
+        Ok(forge_provider_api::ProviderForkResult::unprofiled(id))
+    }
+
+    /// Require positive native compaction completion within the requested operation.
+    async fn compact_session(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        request: forge_provider_api::CompactionRequest,
+    ) -> Result<forge_provider_api::CompactionResult, ProviderError> {
+        context.check_admission(ProviderOperation::SessionCompact)?;
+        request.validate_context(&context)?;
+        if self.kind != AcpKind::Claude {
+            return Err(failure(
+                ProviderOperation::SessionCompact,
+                ProviderFailureKind::Rejected,
+            ));
+        }
+        let session = self.binding(binding, ProviderOperation::SessionCompact)?;
+        session
+            .state
+            .ensure_admission(ProviderOperation::SessionCompact)?;
+        if session.has_active_prompt() {
+            return Err(failure(
+                ProviderOperation::SessionCompact,
+                ProviderFailureKind::ExecutionActive,
+            ));
+        }
+        let _operation = session.operation.lock().await;
+        context.check_admission(ProviderOperation::SessionCompact)?;
+        session
+            .state
+            .ensure_admission(ProviderOperation::SessionCompact)?;
+        if session.has_active_prompt() {
+            return Err(failure(
+                ProviderOperation::SessionCompact,
+                ProviderFailureKind::ExecutionActive,
+            ));
+        }
+        if request.scope.owner() != &session.owner {
+            return Err(failure(
+                ProviderOperation::SessionCompact,
+                ProviderFailureKind::WrongInvocation,
+            ));
+        }
+        let sink = session.sink.bind_scope(request.scope.clone())?;
+        session
+            .state
+            .begin_compaction(session.conversation.id(), sink)
+            .await?;
+        let result = session.conversation.request("session/prompt", serde_json::json!({
+            "sessionId":session.conversation.id(), "prompt":[{"type":"text","text":"/compact"}]
+        })).await;
+        session.state.finish_compaction().await;
+        let response = result?;
+        super::validate_prompt_response(response.clone()).map_err(|_| {
+            failure(
+                ProviderOperation::SessionCompact,
+                ProviderFailureKind::Protocol,
+            )
+        })?;
+        if response["stopReason"] == "cancelled" {
+            return Err(ProviderError::Cancelled);
+        }
+        let compaction = match session.state.latest_compaction().await {
+            Some(compaction)
+                if compaction.state == forge_provider_api::CompactionState::Completed =>
+            {
+                compaction
+            }
+            _ => {
+                let cause = ProviderError::Failure(
+                    ProviderFailure::new(
+                        ProviderOperation::SessionCompact,
+                        ProviderFailureKind::Protocol,
+                    )
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Observation,
+                        forge_provider_api::FailureDisposition::Invalidated,
+                    ),
+                );
+                session.invalidate(cause.clone()).await;
+                return Err(cause);
+            }
+        };
+        Ok(forge_provider_api::CompactionResult {
+            compaction,
+            watermark: session.sink.watermark(),
+        })
+    }
+
+    /// Deliver only negotiated steering into the exact invocation or report its disposition.
+    async fn steer_session(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        request: SteeringRequest,
+    ) -> Result<forge_provider_api::session::SteeringAcceptance, ProviderError> {
+        context.check_admission(ProviderOperation::InputSteer)?;
+        let session = self.binding(binding, ProviderOperation::InputSteer)?;
+        let _steering = session.steering.read().await;
+        session
+            .state
+            .ensure_admission(ProviderOperation::InputSteer)?;
         if request.scope.owner != session.owner {
             return Err(failure(
-                ProviderOperation::AdmitInput,
-                ProviderFailureKind::Rejected,
+                ProviderOperation::InputSteer,
+                ProviderFailureKind::WrongInvocation,
             ));
         }
         if session
             .active
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .is_none_or(|active| active.scope != request.scope)
         {
             return Err(failure(
-                ProviderOperation::AdmitInput,
-                ProviderFailureKind::Rejected,
+                ProviderOperation::InputSteer,
+                ProviderFailureKind::WrongInvocation,
             ));
         }
-        let base_prompt = session
-            .last_prompt
-            .lock()
-            .await
-            .clone()
-            .filter(|prompt| prompt.scope == request.scope)
-            .ok_or_else(|| failure(ProviderOperation::AdmitInput, ProviderFailureKind::Rejected))?;
+        if self.kind != AcpKind::Claude {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::NativeSteer,
+            )
+            .into());
+        }
+        let capabilities = session.capabilities().await;
+        if !capabilities.capability.iter().any(|capability| {
+            capability.id == forge_provider_api::capability::CapabilityId::NativeSteer
+                && capability.support == forge_provider_api::capability::Support::Supported
+        }) || request
+            .task
+            .as_ref()
+            .is_some_and(|task| !capabilities.task_steering.contains(&task.kind))
+        {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::NativeSteer,
+            )
+            .into());
+        }
         let input = prompt_input(&request.input);
         let text = request.task.as_ref().map_or(input.clone(), |task| {
             format!("{}\n\n{input}", task.heading())
@@ -1294,26 +1422,27 @@ impl forge_provider_api::provider::Provider for AcpProvider {
             .await
         {
             Ok(response) => response,
-            Err(ProviderError::NotConsumed { continuation }) => {
-                let grant =
-                    ContinuationGrant::from_steering(binding.clone(), &request, &base_prompt);
-                let mut grants = session.continuations.lock().await;
-                if grants.contains_key(continuation.as_bytes()) {
-                    return Err(failure(
-                        ProviderOperation::AdmitInput,
-                        ProviderFailureKind::Rejected,
-                    ));
-                }
-                grants.insert(continuation.as_bytes().to_vec(), grant);
-                return Err(ProviderError::NotConsumed { continuation });
-            }
             Err(error) => return Err(error),
         };
         if response == super::submission::SteeringAcceptance::UnobservableExecution {
-            self.fence_session(binding).await?;
+            session.invalidate(ProviderError::DeliveryUncertain).await;
+            let _ = session.conversation.shutdown().await;
+            session.sink.fail(events::EventDeliveryError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Disconnected,
+            ));
             return Err(ProviderError::Observation(
                 forge_provider_api::lifecycle::ObservationFailure::Disconnected,
             ));
+        }
+        if let Some(submission_id) = &submission_id
+            && let Some(covered) = session
+                .covered_submissions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get_mut(&request.scope)
+            && !covered.contains(submission_id)
+        {
+            covered.push(submission_id.clone());
         }
         Ok(match submission_id {
             Some(submission_id) => {
@@ -1323,9 +1452,11 @@ impl forge_provider_api::provider::Provider for AcpProvider {
         })
     }
 
-    async fn setup(
+    /// Inspect installation and authentication methods through a disposable native handshake.
+    async fn inspect_runtime(
         &self,
-        request: forge_provider_api::catalog::ProviderCatalogRequest,
+        request: forge_provider_api::catalog::WorkspaceContext,
+        cleanup: super::connection::AcpCleanup,
     ) -> Result<forge_provider_api::ProviderSetup, ProviderError> {
         let status = self.runtime.status();
         let provider_version = match status.provider_version().await {
@@ -1356,9 +1487,15 @@ impl forge_provider_api::provider::Provider for AcpProvider {
                 origin,
                 versions,
                 authentication: Vec::new(),
+                capabilities: forge_provider_api::capability::CapabilityManifest::from_descriptor(
+                    self.descriptor(),
+                ),
             });
         }
-        let initialized = match self.initialize_handshake(&status, &request.workspace).await {
+        let initialized = match self
+            .initialize_handshake(&status, &request.workspace, &cleanup)
+            .await
+        {
             Ok(initialized) => initialized,
             Err(ProviderError::RuntimeVersion(error)) => {
                 versions.adapter = match error {
@@ -1387,6 +1524,10 @@ impl forge_provider_api::provider::Provider for AcpProvider {
                     origin,
                     versions,
                     authentication: Vec::new(),
+                    capabilities:
+                        forge_provider_api::capability::CapabilityManifest::from_descriptor(
+                            self.descriptor(),
+                        ),
                 });
             }
             Err(_) => {
@@ -1395,6 +1536,10 @@ impl forge_provider_api::provider::Provider for AcpProvider {
                     origin,
                     versions,
                     authentication: Vec::new(),
+                    capabilities:
+                        forge_provider_api::capability::CapabilityManifest::from_descriptor(
+                            self.descriptor(),
+                        ),
                 });
             }
         };
@@ -1459,199 +1604,18 @@ impl forge_provider_api::provider::Provider for AcpProvider {
             origin,
             versions,
             authentication,
+            capabilities: forge_provider_api::capability::CapabilityManifest::from_descriptor(
+                self.descriptor(),
+            ),
         })
     }
 
-    async fn capabilities(
+    /// Authenticate through an explicitly advertised provider-managed method.
+    async fn authenticate_runtime(
         &self,
-        request: forge_provider_api::catalog::ProviderCatalogRequest,
-    ) -> Result<forge_provider_api::capability::CapabilityManifest, ProviderError> {
-        let owner = request.owner().map_err(|_| {
-            failure(
-                ProviderOperation::InitializeSession,
-                ProviderFailureKind::Rejected,
-            )
-        })?;
-        let Some(binding) = self.owners.lock().await.get(&owner).cloned() else {
-            return Ok(
-                forge_provider_api::capability::CapabilityManifest::from_descriptor(
-                    self.descriptor(),
-                ),
-            );
-        };
-        let session = self.binding(&binding).await?;
-        let mut descriptor = self.descriptor();
-        descriptor.capability = session
-            .conversation
-            .capabilities(descriptor.capability)
-            .await;
-        let mut manifest =
-            forge_provider_api::capability::CapabilityManifest::from_descriptor(descriptor);
-        manifest.provider_version = session.conversation.version();
-        Ok(manifest)
-    }
-
-    async fn reconcile_settings(
-        &self,
-        request: forge_provider_api::catalog::ProviderCatalogRequest,
-        settings: forge_provider_api::session::SessionSettings,
-        resources: forge_provider_api::session::ResourceSelection,
-    ) -> Result<(), ProviderError> {
-        let owner = request.owner().map_err(|_| {
-            failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            )
-        })?;
-        let binding = self
-            .owners
-            .lock()
-            .await
-            .get(&owner)
-            .cloned()
-            .ok_or_else(|| {
-                failure(
-                    ProviderOperation::ReconcileSettings,
-                    ProviderFailureKind::SessionMissing,
-                )
-            })?;
-        let session = self.binding(&binding).await?;
-        let _operation = session.operation.lock().await;
-        if session.has_active_prompt().await || session.state.has_active_work().await {
-            return Err(failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        if !same_resources(&session.selection, &resources) {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::ResourceSelection,
-            )
-            .into());
-        }
-        let stored_model = {
-            let current = session.settings.lock().await;
-            current.model.clone()
-        };
-        let model = settings.model.unwrap_or_else(|| stored_model.clone());
-        configure_model(
-            &session,
-            &model,
-            &stored_model,
-            forge_provider_api::PromptMode::Chat,
-        )
-        .await?;
-        let mut current = session.settings.lock().await;
-        current.model = model;
-        current.access = settings.access.unwrap_or_else(|| current.access.clone());
-        current.approval = settings.approval.unwrap_or(current.approval);
-        Ok(())
-    }
-
-    async fn model_list(
-        &self,
-        request: forge_provider_api::catalog::ProviderCatalogRequest,
-    ) -> Result<Vec<forge_provider_api::ProviderModel>, ProviderError> {
-        let owner = request.owner().map_err(|_| {
-            failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            )
-        })?;
-        let Some(binding) = self.owners.lock().await.get(&owner).cloned() else {
-            return Ok(Vec::new());
-        };
-        self.binding(&binding)
-            .await?
-            .conversation
-            .models()
-            .await
-            .map_err(|_| {
-                failure(
-                    ProviderOperation::ReconcileSettings,
-                    ProviderFailureKind::Protocol,
-                )
-            })
-    }
-
-    async fn skill_list(
-        &self,
-        request: forge_provider_api::catalog::ProviderCatalogRequest,
-    ) -> Result<Vec<forge_provider_api::catalog::SkillDefinition>, ProviderError> {
-        let owner = request.owner().map_err(|_| {
-            failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            )
-        })?;
-        let Some(binding) = self.owners.lock().await.get(&owner).cloned() else {
-            return Ok(Vec::new());
-        };
-        Ok(self.binding(&binding).await?.selection.skills.clone())
-    }
-
-    async fn mcp_configuration(
-        &self,
-        request: forge_provider_api::catalog::ProviderCatalogRequest,
-    ) -> Result<Vec<forge_provider_api::catalog::McpDefinition>, ProviderError> {
-        let owner = request.owner().map_err(|_| {
-            failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            )
-        })?;
-        let Some(binding) = self.owners.lock().await.get(&owner).cloned() else {
-            return Ok(Vec::new());
-        };
-        Ok(mcp_definitions(&self.binding(&binding).await?.selection))
-    }
-
-    async fn mcp_list(
-        &self,
-        request: forge_provider_api::catalog::ProviderCatalogRequest,
-    ) -> Result<Vec<forge_provider_api::catalog::McpDefinition>, ProviderError> {
-        let owner = request.owner().map_err(|_| {
-            failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            )
-        })?;
-        let Some(binding) = self.owners.lock().await.get(&owner).cloned() else {
-            return Ok(Vec::new());
-        };
-        let session = self.binding(&binding).await?;
-        let mut definitions = mcp_definitions(&session.selection);
-        let catalog = session.state.catalog().await;
-        if let Some(resources) = catalog["mcpResources"].as_array() {
-            for definition in &mut definitions {
-                if let Some(native) = resources
-                    .iter()
-                    .find(|resource| resource["name"] == definition.name)
-                {
-                    match native["state"].as_str() {
-                        Some("requested") => {
-                            definition.status = forge_provider_api::catalog::McpStatus::Loading
-                        }
-                        Some("disabled") => {
-                            definition.status = forge_provider_api::catalog::McpStatus::Disabled
-                        }
-                        Some("unavailable") => {
-                            definition.status = forge_provider_api::catalog::McpStatus::Unavailable;
-                            definition.status_detail =
-                                Some(normalized_mcp_reason(native["reason"].as_str()));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        Ok(definitions)
-    }
-
-    async fn authenticate(
-        &self,
-        request: forge_provider_api::catalog::ProviderCatalogRequest,
+        request: forge_provider_api::catalog::WorkspaceContext,
         method: forge_provider_api::provider::AuthenticationMethodId,
+        cleanup: super::connection::AcpCleanup,
     ) -> Result<(), ProviderError> {
         let status = self.runtime.status();
         if !status.available {
@@ -1660,9 +1624,13 @@ impl forge_provider_api::provider::Provider for AcpProvider {
                 ProviderFailureKind::Runtime,
             ));
         }
-        let profile = super::profile::create(self.kind, &self.runtime_root, &[])?;
-        let state = Arc::new(AcpSessionState::new_native(self.kind));
-        let connection = super::AcpConnection::launch(
+        let profile =
+            cleanup.retain_profile(super::profile::create(self.kind, &self.runtime_root, &[])?);
+        let state = Arc::new(AcpSessionState::new_binding(
+            self.kind,
+            self.admission.clone(),
+        ));
+        let connection = super::AcpConnection::launch_retained(
             super::AcpLaunch {
                 command: &status.command,
                 environment: &status.environment,
@@ -1670,6 +1638,7 @@ impl forge_provider_api::provider::Provider for AcpProvider {
                 profile: (self.kind == AcpKind::Antigravity).then_some(profile.path()),
             },
             state,
+            &cleanup,
         )
         .await
         .map_err(|_| {
@@ -1722,12 +1691,10 @@ impl forge_provider_api::provider::Provider for AcpProvider {
                 })
         }
         .await;
-        let collected = connection.shutdown().await.map_err(|_| {
-            failure(
-                ProviderOperation::CollectNativeRuntime,
-                ProviderFailureKind::Transport,
-            )
-        });
+        let collected = cleanup
+            .shutdown()
+            .await
+            .map_err(|error| with_operation(ProviderOperation::Authenticate, error));
         match (result, collected) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(cause), Ok(())) | (Ok(()), Err(cause)) => Err(cause),
@@ -1738,322 +1705,153 @@ impl forge_provider_api::provider::Provider for AcpProvider {
         }
     }
 
-    async fn fork(
-        &self,
-        request: forge_provider_api::session::ConversationForkRequest,
-    ) -> Result<forge_provider_api::ProviderForkResult, ProviderError> {
-        if self.kind != AcpKind::Claude {
-            return Err(failure(
-                ProviderOperation::InitializeSession,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        if request.checkpoint.is_some() {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::CheckpointFork,
-            )
-            .into());
-        }
-        let source_owner = request.source.owner().map_err(|_| {
-            failure(
-                ProviderOperation::InitializeSession,
-                ProviderFailureKind::Rejected,
-            )
-        })?;
-        if request.target.owner == source_owner {
-            return Err(failure(
-                ProviderOperation::InitializeSession,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        if request.target.configuration.model.service_tier
-            != forge_provider_api::ServiceTier::Standard
-        {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::ServiceTier,
-            )
-            .into());
-        }
-        if request.target.configuration.model.context_window.is_some() {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::ContextWindowSelection,
-            )
-            .into());
-        }
-        let binding = self
-            .owners
+    /// Close every producer before joining retained native operations and pending opens.
+    async fn shutdown_provider(&self, operation_id: OperationId) -> Result<(), ProviderError> {
+        self.admission.store(false, Ordering::Release);
+        self.operations.close_admission();
+        let mut errors = Vec::new();
+        let bindings = self
+            .bindings
             .lock()
-            .await
-            .get(&source_owner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for binding in bindings {
+            if let Err(error) = self.close_session(&binding).await {
+                errors.push(error);
+            }
+        }
+        if let Err(error) = self.cleanup.shutdown().await {
+            errors.push(error);
+        }
+        if let Err(error) = self.operations.join_all_except(&operation_id).await {
+            errors.push(error);
+        }
+        let bindings = self
+            .bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for binding in bindings {
+            if let Err(error) = self.close_session(&binding).await {
+                errors.push(error);
+            }
+        }
+        if let Err(error) = self.cleanup.shutdown().await {
+            errors.push(error);
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(ProviderError::Combined {
+                primary: Box::new(errors.remove(0)),
+                secondary: errors,
+            })
+        }
+    }
+
+    async fn close_session(&self, binding: &BindingId) -> Result<(), ProviderError> {
+        let session = self.binding(binding, ProviderOperation::SessionClose)?;
+        session.state.close_admission();
+        let pending = self.pending_inputs.fence_binding(binding);
+        session.state.revoke_authority().await;
+        pending.await;
+        let mut retained = session.close_task.lock().await;
+        if retained.as_ref().is_some_and(|task| task.is_finished()) {
+            if let Some(task) = retained.as_ref()
+                && task.join().await.is_ok()
+            {
+                return Ok(());
+            }
+            retained.take();
+        }
+        let task = retained
+            .get_or_insert_with(|| {
+                let session = session.clone();
+                Arc::new(crate::retained_task::RetainedTask::new(
+                    ProviderOperation::SessionClose,
+                    tokio::spawn(async move { close_binding(session).await }),
+                ))
+            })
+            .clone();
+        drop(retained);
+        let result = task.join().await;
+        if result.is_ok() {
+            let mut owners = self.owners.lock().await;
+            if owners.get(&session.owner) == Some(binding) {
+                owners.remove(&session.owner);
+            }
+        }
+        result
+    }
+
+    async fn cancel_invocation(
+        &self,
+        binding: &BindingId,
+        request: forge_provider_api::CancelRequest,
+    ) -> Result<forge_provider_api::InvocationSettlement, ProviderError> {
+        self.pending_inputs.cancel(binding, &request.scope).await;
+        let session = self.binding(binding, ProviderOperation::Cancel)?;
+        let record = session
+            .settlements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&request.scope)
             .cloned()
             .ok_or_else(|| {
                 failure(
-                    ProviderOperation::NativeTransport,
-                    ProviderFailureKind::SessionMissing,
+                    ProviderOperation::Cancel,
+                    ProviderFailureKind::WrongInvocation,
                 )
             })?;
-        let session = self.binding(&binding).await?;
-        let _operation = session.operation.lock().await;
-        if session.has_active_prompt().await || session.state.has_active_work().await {
-            return Err(failure(
-                ProviderOperation::NativeTransport,
-                ProviderFailureKind::Rejected,
-            ));
+        if let Some(result) = record.result.lock().await.clone() {
+            return result;
         }
-        let source_model = session.settings.lock().await.model.clone();
-        let target_model = &request.target.configuration.model;
-        if target_model.model.is_none() && source_model.model.is_some() {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::ModelDefaultReset,
-            )
-            .into());
-        }
-        if target_model.reasoning == forge_provider_api::generation::ReasoningSelection::Default
-            && source_model.reasoning != forge_provider_api::generation::ReasoningSelection::Default
         {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::ReasoningDefaultReset,
-            )
-            .into());
-        }
-        let models = session.conversation.models().await.map_err(|_| {
-            failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Protocol,
-            )
-        })?;
-        if let Some(model) = target_model.model.as_deref()
-            && !models.iter().any(|candidate| candidate.id == model)
-        {
-            return Err(failure(
-                ProviderOperation::ReconcileSettings,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        let selected_model = target_model.model.as_deref().or_else(|| {
-            models
-                .iter()
-                .find(|model| model.is_default)
-                .map(|model| model.id.as_str())
-        });
-        let effort = match &target_model.reasoning {
-            forge_provider_api::generation::ReasoningSelection::Default => None,
-            forge_provider_api::generation::ReasoningSelection::Level(level) => {
-                if !selected_model
-                    .and_then(|id| models.iter().find(|model| model.id == id))
-                    .is_some_and(|model| model.reasoning.contains(level))
-                {
-                    return Err(forge_provider_api::capability::UnsupportedCapability(
-                        forge_provider_api::capability::ProviderFeature::EffortSelection,
-                    )
-                    .into());
-                }
-                Some(level.as_str())
+            let mut active = session
+                .active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(active) = active
+                .as_mut()
+                .filter(|active| active.scope == request.scope)
+            {
+                active.cancelled = true;
+                active.cancellation.cancel();
             }
-            forge_provider_api::generation::ReasoningSelection::Lowest => Some(
-                selected_model
-                    .and_then(|id| models.iter().find(|model| model.id == id))
-                    .and_then(|model| model.reasoning.first())
-                    .ok_or({
-                        forge_provider_api::capability::UnsupportedCapability(
-                            forge_provider_api::capability::ProviderFeature::EffortSelection,
-                        )
-                    })?
-                    .as_str(),
-            ),
-        };
-        let skills = request
-            .target
-            .resources
-            .skills
-            .iter()
-            .filter(|skill| skill.enabled)
-            .map(|skill| skill.name.clone())
-            .collect::<Vec<_>>();
-        let profile = super::profile::create(
-            self.kind,
-            &self.runtime_root,
-            &request.target.resources.skills,
-        )?;
-        let mcp = super::resources::mcp_launches(&request.target.resources.mcp)?;
-        let id = session
-            .conversation
-            .fork(
-                &request.target.workspace,
-                mcp,
-                &skills,
-                profile.path(),
-                target_model.model.as_deref(),
-                effort,
-            )
-            .await?;
-        let id = id.try_into().map_err(|_| {
-            failure(
-                ProviderOperation::InitializeSession,
-                ProviderFailureKind::Protocol,
-            )
-        })?;
-        Ok(forge_provider_api::ProviderForkResult::unprofiled(id))
-    }
-
-    async fn compact(
-        &self,
-        binding: &BindingId,
-        request: forge_provider_api::CompactionRequest,
-    ) -> Result<forge_provider_api::Compaction, ProviderError> {
-        if self.kind != AcpKind::Claude {
-            return Err(failure(
-                ProviderOperation::NativeTransport,
-                ProviderFailureKind::Rejected,
-            ));
         }
-        let session = self.binding(binding).await?;
-        let _operation = session.operation.lock().await;
-        if session.has_active_prompt().await {
-            return Err(failure(
-                ProviderOperation::AdmitInput,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        if request.scope.owner() != &session.owner {
-            return Err(failure(
-                ProviderOperation::AdmitInput,
-                ProviderFailureKind::Rejected,
-            ));
-        }
-        let sink = session.sink.bind_scope(request.scope.clone())?;
         session
             .state
-            .begin_compaction(session.conversation.id(), sink)
-            .await?;
-        let result = session.conversation.request("session/prompt", serde_json::json!({
-            "sessionId":session.conversation.id(), "prompt":[{"type":"text","text":"/compact"}]
-        })).await;
-        session.state.finish_compaction().await;
-        let response = result?;
-        super::validate_prompt_response(response.clone()).map_err(|_| {
-            failure(
-                ProviderOperation::NativeTransport,
-                ProviderFailureKind::Protocol,
-            )
-        })?;
-        if response["stopReason"] == "cancelled" {
-            return Err(ProviderError::Cancelled);
-        }
-        Ok(session
-            .state
-            .latest_compaction()
-            .await
-            .unwrap_or(forge_provider_api::Compaction {
-                id: request.operation_id,
-                thread_id: session.conversation.id().to_owned(),
-                state: forge_provider_api::CompactionState::Unconfirmed,
-                manual: true,
-                started_at_ms: None,
-                completed_at_ms: None,
-                result: CompactionResult::default(),
-            }))
+            .revoke_invocation_callbacks(&request.scope)
+            .await;
+        session.settlement(&request.scope).await
     }
 
-    async fn cancel_session(&self, binding: &BindingId) -> Result<(), ProviderError> {
-        self.cleanup_execution(binding).await
-    }
-
-    async fn cleanup_execution(&self, binding: &BindingId) -> Result<(), ProviderError> {
-        let session = self.binding(binding).await?;
-        let running = {
-            let mut active = session.active.lock().await;
-            if let Some(active) = active.as_mut().filter(|active| active.task.is_none()) {
-                active.cancelled = true;
-            }
-            active
-                .as_ref()
-                .and_then(|active| active.task.as_ref())
-                .is_some_and(|task| !task.is_finished())
-        };
-        if (running || session.state.has_active_work().await)
-            && session.conversation.cancel().is_err()
-        {
-            return Err(failure(
-                ProviderOperation::CleanupExecution,
-                ProviderFailureKind::Transport,
-            ));
-        }
-        if let Err(error) = session.collect_prompt().await {
-            session.state.revoke_callbacks().await;
-            session.sink.fail(events::EventDeliveryError::Observation(
-                forge_provider_api::lifecycle::ObservationFailure::Disconnected,
-            ));
-            return Err(error);
-        }
-        let _operation = session.operation.lock().await;
-        Ok(())
-    }
-
-    async fn retire_session(&self, binding: &BindingId) -> Result<(), ProviderError> {
-        let session = self.binding(binding).await?;
-        self.cleanup_execution(binding).await?;
-        session.conversation.shutdown().await?;
-        let mut resources = session.resources.lock().await;
-        if let Some(profile) = resources.as_mut() {
-            profile
-                .close()
-                .map_err(|error| error.into_provider_error(ProviderOperation::RetireSession))?;
-        }
-        resources.take();
-        drop(resources);
-        self.bindings.lock().await.remove(binding);
-        self.owners.lock().await.remove(&session.owner);
-        Ok(())
-    }
-
-    async fn fence_session(&self, binding: &BindingId) -> Result<(), ProviderError> {
-        let session = self.binding(binding).await?;
-        session.state.revoke_callbacks().await;
-        session.sink.fail(events::EventDeliveryError::Observation(
-            forge_provider_api::lifecycle::ObservationFailure::Disconnected,
-        ));
-        self.cleanup_execution(binding).await
-    }
-
-    async fn recover_session(
+    async fn reconcile_input(
         &self,
-        mut request: SessionRequest,
-        token: Option<forge_provider_api::session::RecoveryToken>,
-    ) -> Result<SessionBinding, ProviderError> {
-        if let Some(token) = token.as_ref() {
-            let checkpoint = parse_checkpoint(token)?;
-            if request
-                .provider_session_id
-                .as_ref()
-                .is_some_and(|id| id.as_str() != checkpoint.session_id)
-            {
-                return Err(failure(
-                    ProviderOperation::RecoverSession,
-                    ProviderFailureKind::Rejected,
-                ));
-            }
-            request.provider_session_id =
-                Some(checkpoint.session_id.to_owned().try_into().map_err(|_| {
-                    failure(
-                        ProviderOperation::RecoverSession,
-                        ProviderFailureKind::Protocol,
-                    )
-                })?);
-        }
-        self.initialize_session(request).await
-    }
-
-    async fn reconcile_submission(
-        &self,
-        _submission_id: &forge_provider_api::SubmissionId,
-        token: Option<&forge_provider_api::RecoveryToken>,
-        accepted_receipts: &[forge_provider_api::RecoveryToken],
+        request: forge_provider_api::InputReconcileRequest,
     ) -> Result<forge_provider_api::SubmissionEvidence, ProviderError> {
+        let token = request.token.as_ref();
+        let accepted_receipts = &request.accepted_receipts;
         let Some(token) = token else {
             return Ok(forge_provider_api::SubmissionEvidence::Unknown);
         };
         let checkpoint = parse_checkpoint(token)?;
+        if checkpoint.submission_id != request.submission_id.as_str()
+            || checkpoint.attempt_id != request.attempt_id.as_str()
+            || request
+                .provider_session_id
+                .as_ref()
+                .is_some_and(|session| session.as_str() != checkpoint.session_id)
+        {
+            return Err(failure(
+                ProviderOperation::InputReconcile,
+                ProviderFailureKind::HistoryConflict,
+            ));
+        }
         if checkpoint.accepted
             && accepted_receipts
                 .iter()
@@ -2062,7 +1860,7 @@ impl forge_provider_api::provider::Provider for AcpProvider {
             let provider_session_id =
                 Some(checkpoint.session_id.to_owned().try_into().map_err(|_| {
                     failure(
-                        ProviderOperation::RecoverSession,
+                        ProviderOperation::InputReconcile,
                         ProviderFailureKind::Protocol,
                     )
                 })?);
@@ -2075,64 +1873,1501 @@ impl forge_provider_api::provider::Provider for AcpProvider {
         Ok(forge_provider_api::SubmissionEvidence::Unknown)
     }
 
-    async fn shutdown(&self) -> Result<(), ProviderError> {
-        let bindings = self
-            .bindings
+    async fn retract_input(
+        &self,
+        binding: &BindingId,
+        request: forge_provider_api::InputRetractRequest,
+    ) -> Result<forge_provider_api::InputRetractOutcome, ProviderError> {
+        let session = self.binding(binding, ProviderOperation::InputRetract)?;
+        session
+            .state
+            .ensure_admission(ProviderOperation::InputRetract)?;
+        if session.has_active_prompt() {
+            return Err(failure(
+                ProviderOperation::InputRetract,
+                ProviderFailureKind::ExecutionActive,
+            ));
+        }
+        if request.scope.owner != session.owner {
+            return Err(failure(
+                ProviderOperation::InputRetract,
+                ProviderFailureKind::WrongInvocation,
+            ));
+        }
+        let record = session
+            .settlements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&request.scope)
+            .cloned()
+            .ok_or_else(|| {
+                failure(
+                    ProviderOperation::InputRetract,
+                    ProviderFailureKind::WrongInvocation,
+                )
+            })?;
+        let settlement = record.result.lock().await.clone();
+        if !matches!(
+            settlement,
+            Some(Ok(forge_provider_api::InvocationSettlement {
+                result: forge_provider_api::ExecutionResult::Cancelled { .. },
+                ..
+            }))
+        ) {
+            return Ok(forge_provider_api::InputRetractOutcome::Unavailable(
+                forge_provider_api::InputRetractUnavailable::NotCancelled,
+            ));
+        }
+        if session
+            .rejected_inputs
             .lock()
             .await
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut errors = Vec::new();
-        for binding in bindings {
-            if let Err(error) = self.retire_session(&binding).await {
-                errors.push(error);
+            .iter()
+            .any(|(scope, submission, attempt)| {
+                scope == &request.scope
+                    && submission == &request.submission_id
+                    && attempt == &request.attempt_id
+            })
+        {
+            return Ok(forge_provider_api::InputRetractOutcome::NeverConsumed);
+        }
+        Ok(forge_provider_api::InputRetractOutcome::Unavailable(
+            forge_provider_api::InputRetractUnavailable::Unsupported,
+        ))
+    }
+
+    async fn list_models(
+        &self,
+        request: forge_provider_api::catalog::QueryContext,
+    ) -> Result<Vec<forge_provider_api::ProviderModel>, ProviderError> {
+        let binding = match request {
+            forge_provider_api::catalog::QueryContext::Binding(binding) => binding,
+            forge_provider_api::catalog::QueryContext::Workspace(_) => {
+                return Err(forge_provider_api::capability::UnsupportedCapability(
+                    forge_provider_api::capability::ProviderFeature::ModelSelection,
+                )
+                .into());
+            }
+        };
+        let session = self.binding(&binding, ProviderOperation::ModelList)?;
+        session
+            .state
+            .ensure_admission(ProviderOperation::ModelList)?;
+        session
+            .conversation
+            .models()
+            .await
+            .map_err(|_| failure(ProviderOperation::ModelList, ProviderFailureKind::Protocol))
+    }
+
+    async fn list_skills(
+        &self,
+        request: forge_provider_api::catalog::QueryContext,
+    ) -> Result<Vec<forge_provider_api::catalog::SkillDefinition>, ProviderError> {
+        let binding = match request {
+            forge_provider_api::catalog::QueryContext::Binding(binding) => binding,
+            forge_provider_api::catalog::QueryContext::Workspace(_) => {
+                return Err(forge_provider_api::capability::UnsupportedCapability(
+                    forge_provider_api::capability::ProviderFeature::SkillCatalog,
+                )
+                .into());
+            }
+        };
+        let session = self.binding(&binding, ProviderOperation::SkillList)?;
+        session
+            .state
+            .ensure_admission(ProviderOperation::SkillList)?;
+        let skills = session.selection.lock().await.skills.clone();
+        Ok(skills)
+    }
+
+    async fn list_mcp(
+        &self,
+        query: forge_provider_api::catalog::McpQuery,
+    ) -> Result<Vec<forge_provider_api::catalog::McpDefinition>, ProviderError> {
+        let (request, observed) = match query {
+            forge_provider_api::catalog::McpQuery::Configured(context) => (context, false),
+            forge_provider_api::catalog::McpQuery::Observed(context) => (context, true),
+        };
+        let binding = match request {
+            forge_provider_api::catalog::QueryContext::Binding(binding) => binding,
+            forge_provider_api::catalog::QueryContext::Workspace(_) => {
+                return Err(forge_provider_api::capability::UnsupportedCapability(
+                    forge_provider_api::capability::ProviderFeature::McpCatalog,
+                )
+                .into());
+            }
+        };
+        let session = self.binding(&binding, ProviderOperation::McpList)?;
+        session.state.ensure_admission(ProviderOperation::McpList)?;
+        let mut definitions = mcp_definitions(&*session.selection.lock().await);
+        if !observed {
+            return Ok(definitions);
+        }
+        let catalog = session.state.catalog().await;
+        if let Some(resources) = catalog["mcpResources"].as_array() {
+            for definition in &mut definitions {
+                if let Some(native) = resources
+                    .iter()
+                    .find(|resource| resource["name"] == definition.name)
+                {
+                    match native["state"].as_str() {
+                        Some("requested") => {
+                            definition.status = forge_provider_api::catalog::McpStatus::Loading
+                        }
+                        Some("disabled") => {
+                            definition.status = forge_provider_api::catalog::McpStatus::Disabled
+                        }
+                        Some("unavailable") => {
+                            definition.status = forge_provider_api::catalog::McpStatus::Unavailable;
+                            definition.status_detail =
+                                Some(normalized_mcp_reason(native["reason"].as_str()));
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(ProviderError::Combined {
-                primary: Box::new(errors.remove(0)),
-                secondary: errors,
+        Ok(definitions)
+    }
+
+    async fn shutdown_sessions(&self, operation_id: OperationId) -> Result<(), ProviderError> {
+        self.admission.store(false, Ordering::Release);
+        let mut retained = self.shutdown_task.lock().await;
+        if retained.as_ref().is_some_and(|task| task.is_finished()) {
+            if let Some(task) = retained.as_ref()
+                && task.join().await.is_ok()
+            {
+                return Ok(());
+            }
+            retained.take();
+        }
+        let task = retained
+            .get_or_insert_with(|| {
+                let provider = self.clone();
+                Arc::new(crate::retained_task::RetainedTask::new(
+                    ProviderOperation::Shutdown,
+                    tokio::spawn(async move { provider.shutdown_provider(operation_id).await }),
+                ))
             })
+            .clone();
+        drop(retained);
+        task.join().await
+    }
+
+    /// Inspect native initialization capabilities and always collect its temporary process.
+    async fn initialize_handshake(
+        &self,
+        runtime: &super::runtime::RuntimeStatus,
+        workspace: &str,
+        cleanup: &super::connection::AcpCleanup,
+    ) -> Result<serde_json::Value, ProviderError> {
+        let profile =
+            cleanup.retain_profile(super::profile::create(self.kind, &self.runtime_root, &[])?);
+        let connection = super::AcpConnection::launch_retained(
+            super::AcpLaunch {
+                command: &runtime.command,
+                environment: &runtime.environment,
+                workspace,
+                profile: (self.kind == AcpKind::Antigravity).then_some(profile.path()),
+            },
+            Arc::new(AcpSessionState::new_binding(
+                self.kind,
+                self.admission.clone(),
+            )),
+            cleanup,
+        )
+        .await
+        .map_err(|_| {
+            failure(
+                ProviderOperation::SessionOpen,
+                ProviderFailureKind::Transport,
+            )
+        })?;
+        let requirement = super::conversation::runtime_requirement(
+            self.kind,
+            runtime
+                .command
+                .first()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| "ACP".into()),
+        )?;
+        let result = async {
+            let initialized = connection
+                .request("initialize", initialize_params())
+                .await
+                .map_err(|_| {
+                    failure(
+                        ProviderOperation::SessionOpen,
+                        ProviderFailureKind::Protocol,
+                    )
+                })?;
+            super::conversation::validate_initialization(&requirement, &initialized)?;
+            Ok(initialized)
+        }
+        .await;
+        let collected = cleanup
+            .shutdown()
+            .await
+            .map_err(|error| with_operation(ProviderOperation::Inspect, error));
+        match (result, collected) {
+            (Ok(initialized), Ok(())) => Ok(initialized),
+            (Err(cause), Ok(())) => Err(cause),
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(cause), Err(cleanup)) => Err(ProviderError::PreparationCleanup {
+                cause: Box::new(cause),
+                cleanup: Box::new(cleanup),
+            }),
         }
     }
+}
 
-    fn descriptor(&self) -> forge_provider_api::ProviderDescriptor {
-        crate::registry::descriptor(&self.kind.id()).expect("ACP kind is registered")
-    }
-
-    async fn has_active_turn(&self, owner: &ExecutionOwner) -> bool {
-        let Some(binding) = self.owners.lock().await.get(owner).cloned() else {
-            return false;
-        };
-        let Ok(session) = self.binding(&binding).await else {
-            return false;
-        };
-        session.has_active_prompt().await
-    }
-
-    async fn active_session_id_for(
+#[async_trait]
+impl forge_provider_api::provider::Provider for AcpProvider {
+    async fn session_open(
         &self,
-        owner: &ExecutionOwner,
-    ) -> Result<Option<forge_provider_api::ProviderSessionId>, ProviderError> {
-        let Some(binding) = self.owners.lock().await.get(owner).cloned() else {
-            return Ok(None);
-        };
-        Ok(self
-            .binding(&binding)
-            .await?
-            .binding
-            .provider_session_id
-            .clone())
+        context: OperationContext,
+        request: SessionRequest,
+    ) -> Result<forge_provider_api::OpenedSession, ProviderError> {
+        let provider = self.clone();
+        let worker_context = context.clone();
+        let payload = request.identity();
+        let cleanup = self.cleanup.scope();
+        let interrupt_cleanup = cleanup.clone();
+        self.operations
+            .open
+            .take(
+                context,
+                ProviderOperation::SessionOpen,
+                payload,
+                async move {
+                    provider
+                        .open_session(worker_context, request, cleanup)
+                        .await
+                },
+                move |interruption| {
+                    interrupt_cleanup.close_admission();
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::SessionOpen,
+                            ProviderPhase::Preparation,
+                            FailureDisposition::Uncertain,
+                        ),
+                        async move { interrupt_cleanup.shutdown().await },
+                    )
+                },
+            )
+            .await
     }
 
-    async fn rollback_cancelled_turn(&self, binding: &BindingId) -> Result<bool, ProviderError> {
-        let session = self.binding(binding).await?;
-        let mut rollback = session.rollback_cancelled.lock().await;
-        Ok(std::mem::replace(&mut *rollback, false))
+    async fn session_configure(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        configuration: forge_provider_api::SessionConfiguration,
+    ) -> Result<forge_provider_api::ConfiguredSession, ProviderError> {
+        let provider = self.clone();
+        let cleanup_provider = self.clone();
+        let binding = binding.clone();
+        let cleanup_binding = binding.clone();
+        let payload = (binding.clone(), configuration.clone());
+        let worker_context = context.clone();
+        self.operations
+            .configure
+            .observe(
+                context,
+                ProviderOperation::SessionConfigure,
+                payload,
+                async move {
+                    provider
+                        .configure_session(worker_context, &binding, configuration)
+                        .await
+                },
+                move |interruption| {
+                    cleanup_provider.interrupt_binding(
+                        cleanup_binding,
+                        ProviderOperation::SessionConfigure,
+                        interruption,
+                        ProviderPhase::Preparation,
+                    )
+                },
+            )
+            .await
     }
+
+    async fn session_fork(
+        &self,
+        context: OperationContext,
+        request: forge_provider_api::SessionForkRequest,
+    ) -> Result<forge_provider_api::ProviderForkResult, ProviderError> {
+        let provider = self.clone();
+        let cleanup_provider = self.clone();
+        let source = request.source.clone();
+        let payload = request.clone();
+        let worker_context = context.clone();
+        self.operations
+            .fork
+            .observe(
+                context,
+                ProviderOperation::SessionFork,
+                payload,
+                async move { provider.fork_session(worker_context, request).await },
+                move |interruption| cleanup_provider.interrupt_fork(source, interruption),
+            )
+            .await
+    }
+
+    async fn session_compact(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        request: forge_provider_api::CompactionRequest,
+    ) -> Result<forge_provider_api::CompactionResult, ProviderError> {
+        let provider = self.clone();
+        let cleanup_provider = self.clone();
+        let binding = binding.clone();
+        let cleanup_binding = binding.clone();
+        let payload = (binding.clone(), request.clone());
+        let worker_context = context.clone();
+        self.operations
+            .compact
+            .observe(
+                context,
+                ProviderOperation::SessionCompact,
+                payload,
+                async move {
+                    provider
+                        .compact_session(worker_context, &binding, request)
+                        .await
+                },
+                move |interruption| {
+                    cleanup_provider.interrupt_binding(
+                        cleanup_binding,
+                        ProviderOperation::SessionCompact,
+                        interruption,
+                        ProviderPhase::Observation,
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn session_close(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+    ) -> Result<(), ProviderError> {
+        let provider = self.clone();
+        let cleanup_provider = self.clone();
+        let binding = binding.clone();
+        let cleanup_binding = binding.clone();
+        self.operations
+            .close
+            .observe(
+                context,
+                ProviderOperation::SessionClose,
+                binding.clone(),
+                async move { provider.close_session(&binding).await },
+                move |interruption| {
+                    cleanup_provider.interrupt_binding(
+                        cleanup_binding,
+                        ProviderOperation::SessionClose,
+                        interruption,
+                        ProviderPhase::Close,
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn cancel(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        request: forge_provider_api::CancelRequest,
+    ) -> Result<forge_provider_api::InvocationSettlement, ProviderError> {
+        let provider = self.clone();
+        let cleanup_provider = self.clone();
+        let binding = binding.clone();
+        let cleanup_binding = binding.clone();
+        let payload = (binding.clone(), request.clone());
+        let scope = request.scope.clone();
+        self.operations
+            .cancel
+            .observe(
+                context,
+                ProviderOperation::Cancel,
+                payload,
+                async move { provider.cancel_invocation(&binding, request).await },
+                move |interruption| {
+                    cleanup_provider.interrupt_cancel(cleanup_binding, scope, interruption)
+                },
+            )
+            .await
+    }
+
+    async fn input_submit(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        request: PromptRequest,
+    ) -> Result<InputAcceptance, ProviderError> {
+        let provider = self.clone();
+        let cleanup_provider = self.clone();
+        let binding = binding.clone();
+        let cleanup_binding = binding.clone();
+        let scope = request.scope.clone();
+        let payload = (binding.clone(), request.identity());
+        let worker_context = context.clone();
+        let pending = self.pending_inputs.register(&binding, &scope, context.id());
+        self.operations
+            .submit
+            .observe(
+                context,
+                ProviderOperation::InputSubmit,
+                payload,
+                async move {
+                    provider
+                        .submit(worker_context, &binding, request, pending)
+                        .await
+                },
+                move |interruption| {
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::InputSubmit,
+                            ProviderPhase::Dispatch,
+                            FailureDisposition::Uncertain,
+                        ),
+                        async move {
+                            cleanup_provider
+                                .collect_interrupted_input(&cleanup_binding, scope)
+                                .await
+                        },
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn input_steer(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        request: SteeringRequest,
+    ) -> Result<forge_provider_api::SteeringAcceptance, ProviderError> {
+        let provider = self.clone();
+        let cleanup_provider = self.clone();
+        let binding = binding.clone();
+        let cleanup_binding = binding.clone();
+        let payload = (binding.clone(), request.identity());
+        let worker_context = context.clone();
+        self.operations
+            .steer
+            .observe(
+                context,
+                ProviderOperation::InputSteer,
+                payload,
+                async move {
+                    provider
+                        .steer_session(worker_context, &binding, request)
+                        .await
+                },
+                move |interruption| {
+                    cleanup_provider.interrupt_binding(
+                        cleanup_binding,
+                        ProviderOperation::InputSteer,
+                        interruption,
+                        ProviderPhase::Observation,
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn input_reconcile(
+        &self,
+        context: OperationContext,
+        request: forge_provider_api::InputReconcileRequest,
+    ) -> Result<forge_provider_api::SubmissionEvidence, ProviderError> {
+        let provider = self.clone();
+        let payload = request.clone();
+        self.operations
+            .reconcile
+            .observe(
+                context,
+                ProviderOperation::InputReconcile,
+                payload,
+                async move { provider.reconcile_input(request).await },
+                move |interruption| {
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::InputReconcile,
+                            ProviderPhase::Observation,
+                            FailureDisposition::Unchanged,
+                        ),
+                        async { Ok(()) },
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn input_retract(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        request: forge_provider_api::InputRetractRequest,
+    ) -> Result<forge_provider_api::InputRetractOutcome, ProviderError> {
+        let provider = self.clone();
+        let binding = binding.clone();
+        let payload = (binding.clone(), request.clone());
+        self.operations
+            .retract
+            .observe(
+                context,
+                ProviderOperation::InputRetract,
+                payload,
+                async move { provider.retract_input(&binding, request).await },
+                move |interruption| {
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::InputRetract,
+                            ProviderPhase::Observation,
+                            FailureDisposition::Unchanged,
+                        ),
+                        async { Ok(()) },
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn inspect(
+        &self,
+        context: OperationContext,
+        workspace: forge_provider_api::catalog::WorkspaceContext,
+    ) -> Result<forge_provider_api::ProviderSetup, ProviderError> {
+        let provider = self.clone();
+        let payload = workspace.clone();
+        let cleanup = self.cleanup.scope();
+        let interrupt_cleanup = cleanup.clone();
+        self.operations
+            .inspect
+            .observe(
+                context,
+                ProviderOperation::Inspect,
+                payload,
+                async move { provider.inspect_runtime(workspace, cleanup).await },
+                move |interruption| {
+                    interrupt_cleanup.close_admission();
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::Inspect,
+                            ProviderPhase::Observation,
+                            FailureDisposition::Unchanged,
+                        ),
+                        async move { interrupt_cleanup.shutdown().await },
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn authenticate(
+        &self,
+        context: OperationContext,
+        workspace: forge_provider_api::catalog::WorkspaceContext,
+        method: forge_provider_api::provider::AuthenticationMethodId,
+    ) -> Result<(), ProviderError> {
+        let provider = self.clone();
+        let payload = (workspace.clone(), method.clone());
+        let cleanup = self.cleanup.scope();
+        let interrupt_cleanup = cleanup.clone();
+        self.operations
+            .authenticate
+            .observe(
+                context,
+                ProviderOperation::Authenticate,
+                payload,
+                async move {
+                    provider
+                        .authenticate_runtime(workspace, method, cleanup)
+                        .await
+                },
+                move |interruption| {
+                    interrupt_cleanup.close_admission();
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::Authenticate,
+                            ProviderPhase::Observation,
+                            FailureDisposition::Uncertain,
+                        ),
+                        async move { interrupt_cleanup.shutdown().await },
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn shutdown(&self, context: OperationContext) -> Result<(), ProviderError> {
+        let provider = self.clone();
+        let cleanup_provider = self.clone();
+        let operation = context.id().clone();
+        let cleanup_operation = operation.clone();
+        self.operations
+            .shutdown
+            .observe(
+                context,
+                ProviderOperation::Shutdown,
+                (),
+                async move { provider.shutdown_sessions(operation).await },
+                move |interruption| {
+                    cleanup_provider.admission.store(false, Ordering::Release);
+                    cleanup_provider.operations.close_admission();
+                    cleanup_provider.cleanup.close_admission();
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::Shutdown,
+                            ProviderPhase::Close,
+                            FailureDisposition::Invalidated,
+                        ),
+                        async move { cleanup_provider.shutdown_sessions(cleanup_operation).await },
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn model_list(
+        &self,
+        context: OperationContext,
+        query: forge_provider_api::catalog::QueryContext,
+    ) -> Result<Vec<forge_provider_api::ProviderModel>, ProviderError> {
+        let provider = self.clone();
+        let payload = query.clone();
+        self.operations
+            .models
+            .observe(
+                context,
+                ProviderOperation::ModelList,
+                payload,
+                async move { provider.list_models(query).await },
+                move |interruption| {
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::ModelList,
+                            ProviderPhase::Observation,
+                            FailureDisposition::Unchanged,
+                        ),
+                        async { Ok(()) },
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn skill_list(
+        &self,
+        context: OperationContext,
+        query: forge_provider_api::catalog::QueryContext,
+    ) -> Result<Vec<forge_provider_api::catalog::SkillDefinition>, ProviderError> {
+        let provider = self.clone();
+        let payload = query.clone();
+        self.operations
+            .skills
+            .observe(
+                context,
+                ProviderOperation::SkillList,
+                payload,
+                async move { provider.list_skills(query).await },
+                move |interruption| {
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::SkillList,
+                            ProviderPhase::Observation,
+                            FailureDisposition::Unchanged,
+                        ),
+                        async { Ok(()) },
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn mcp_list(
+        &self,
+        context: OperationContext,
+        query: forge_provider_api::catalog::McpQuery,
+    ) -> Result<Vec<forge_provider_api::catalog::McpDefinition>, ProviderError> {
+        let provider = self.clone();
+        let payload = query.clone();
+        self.operations
+            .mcp
+            .observe(
+                context,
+                ProviderOperation::McpList,
+                payload,
+                async move { provider.list_mcp(query).await },
+                move |interruption| {
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::McpList,
+                            ProviderPhase::Observation,
+                            FailureDisposition::Unchanged,
+                        ),
+                        async { Ok(()) },
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn terminal_list(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+    ) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
+        self.operations
+            .terminals
+            .observe(
+                context,
+                ProviderOperation::TerminalList,
+                binding.clone(),
+                async {
+                    Err(forge_provider_api::capability::UnsupportedCapability(
+                        forge_provider_api::capability::ProviderFeature::BackgroundTerminals,
+                    )
+                    .into())
+                },
+                move |interruption| {
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::TerminalList,
+                            ProviderPhase::Observation,
+                            FailureDisposition::Unchanged,
+                        ),
+                        async { Ok(()) },
+                    )
+                },
+            )
+            .await
+    }
+
+    async fn terminal_terminate(
+        &self,
+        context: OperationContext,
+        binding: &BindingId,
+        terminal: &forge_provider_api::terminal::TerminalId,
+    ) -> Result<(), ProviderError> {
+        self.operations
+            .terminate
+            .observe(
+                context,
+                ProviderOperation::TerminalTerminate,
+                (binding.clone(), terminal.clone()),
+                async {
+                    Err(forge_provider_api::capability::UnsupportedCapability(
+                        forge_provider_api::capability::ProviderFeature::BackgroundTermination,
+                    )
+                    .into())
+                },
+                move |interruption| {
+                    Interruption::new(
+                        interruption.failure(
+                            ProviderOperation::TerminalTerminate,
+                            ProviderPhase::Observation,
+                            FailureDisposition::Unchanged,
+                        ),
+                        async { Ok(()) },
+                    )
+                },
+            )
+            .await
+    }
+}
+
+/// Advertise only the ACP features implemented by this native adapter.
+fn initialize_params() -> serde_json::Value {
+    serde_json::json!({
+        "protocolVersion":1,
+        "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
+        "clientCapabilities":{"auth":{"terminal":true},"session":{"compaction":{},"configOptions":{"boolean":{}}},"subagents":{}}
+    })
+}
+
+/// Get all journaled input identities accepted under the exact retained invocation.
+fn covered_submissions(
+    session: &AcpBinding,
+    scope: &forge_provider_api::InvocationScope,
+) -> Vec<forge_provider_api::SubmissionId> {
+    session
+        .covered_submissions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(scope)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Join the native worker before publishing one retained foreground settlement.
+async fn collect_invocation(
+    session: Arc<AcpBinding>,
+    scope: forge_provider_api::InvocationScope,
+    task: Arc<crate::retained_task::RetainedTask>,
+) {
+    let joined = task.join().await;
+    let _steering_boundary = session.steering.write().await;
+    session.state.revoke_callbacks().await;
+    let _collection_boundary = session.operation.lock().await;
+    {
+        let mut active = session
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active.as_ref().is_some_and(|active| active.scope == scope) {
+            active.take();
+        }
+    }
+    let terminal = session.terminal_results.lock().await.remove(&scope);
+    let invalidated = session.state.is_invalidated().await;
+    let result = match (joined, terminal) {
+        (Ok(()), Some(result)) if !invalidated => {
+            let settlement = forge_provider_api::InvocationSettlement {
+                binding_id: session.binding.id.clone(),
+                scope: scope.clone(),
+                result,
+                watermark: session.sink.watermark(),
+            };
+            match session.sink.invocation_sink(&scope) {
+                Ok(sink) => match sink.send_settlement(settlement).await {
+                    Ok(settlement) => Ok(settlement),
+                    Err(error) => Err(error.into()),
+                },
+                Err(error) => Err(error.into()),
+            }
+        }
+        (Ok(()), Some(_)) => Err(failure(
+            ProviderOperation::InputSubmit,
+            ProviderFailureKind::BindingInvalidated,
+        )),
+        (Err(error), _) => Err(error),
+        (Ok(()), None) => Err(failure(
+            ProviderOperation::InputSubmit,
+            ProviderFailureKind::Unknown,
+        )),
+    };
+    if let Err(error) = &result {
+        session.invalidate(error.clone()).await;
+        let failure = ProviderFailure::new(
+            ProviderOperation::InputSubmit,
+            match error {
+                ProviderError::Failure(failure) => failure.kind(),
+                _ => ProviderFailureKind::Unknown,
+            },
+        )
+        .at_phase(
+            forge_provider_api::ProviderPhase::Collection,
+            forge_provider_api::FailureDisposition::Invalidated,
+        );
+        if let Ok(sink) = session.sink.invocation_sink(&scope) {
+            let _ = sink
+                .send_wait(ProviderEvent::SettlementFailed {
+                    scope: scope.clone(),
+                    failure,
+                })
+                .await;
+        }
+    }
+    let record = session
+        .settlements
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&scope)
+        .cloned()
+        .expect("admitted invocation retains its settlement record");
+    record.complete(result).await;
+}
+
+/// Attempt every binding cleanup phase while preserving the first failure for retry.
+async fn close_binding(session: Arc<AcpBinding>) -> Result<(), ProviderError> {
+    let mut errors = Vec::new();
+    session.state.revoke_callbacks().await;
+    let scope = {
+        let mut active = session
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        active.as_mut().map(|active| {
+            active.cancelled = true;
+            active.cancellation.cancel();
+            active.scope.clone()
+        })
+    };
+    if scope.is_some()
+        && let Err(error) = session.conversation.cancel()
+    {
+        errors.push(error);
+    }
+    let settled = if let Some(scope) = &scope {
+        tokio::time::timeout(std::time::Duration::from_secs(5), session.settlement(scope))
+            .await
+            .ok()
+    } else {
+        None
+    };
+    let collected = match session.cleanup.shutdown().await {
+        Ok(()) => true,
+        Err(error) => {
+            errors.push(with_operation(ProviderOperation::SessionClose, error));
+            false
+        }
+    };
+    if let Some(scope) = scope {
+        let result = match settled {
+            Some(result) => result,
+            None => session.settlement(&scope).await,
+        };
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    let _operation = session.operation.lock().await;
+    // A pending configuration may have registered more resources while native interruption ran.
+    if collected && let Err(error) = session.cleanup.shutdown().await {
+        errors.push(with_operation(ProviderOperation::SessionClose, error));
+    }
+    if errors.is_empty() && session.cleanup.is_collected() {
+        session.state.mark_collected();
+        session.history_released.store(true, Ordering::Release);
+        return Ok(());
+    }
+    if errors.is_empty() {
+        errors.push(failure(
+            ProviderOperation::SessionClose,
+            ProviderFailureKind::ResourceConflict,
+        ));
+    }
+    let error = combine_errors(errors);
+    session.state.retain_failure(error.clone()).await;
+    Err(error)
+}
+
+async fn run_prompt(
+    session: Arc<AcpBinding>,
+    request: PromptRequest,
+    accepted: tokio::sync::oneshot::Sender<Result<InputAcceptance, ProviderError>>,
+) -> Result<(), ProviderError> {
+    let mut accepted = Some(accepted);
+    let result = async {
+        let cancellation = session.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().filter(|active| active.scope == request.scope).map(|active| active.cancellation.clone()).ok_or_else(|| failure(ProviderOperation::InputSubmit, ProviderFailureKind::WrongInvocation))?;
+        let preparation = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => Err(ProviderError::Cancelled),
+            result = request.turn_control.before_send(&request.scope) => result,
+        };
+        if let Err(error) = preparation {
+            session.rejected_inputs.lock().await.push((request.scope.clone(), request.submission_id.clone(), request.attempt_id.clone()));
+            return Err(reject_before_dispatch(&request.receipt, error).await);
+        }
+        if !session.state.is_admitting() || session.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().is_some_and(|active| active.cancelled) {
+            session.rejected_inputs.lock().await.push((request.scope.clone(), request.submission_id.clone(), request.attempt_id.clone()));
+            return Err(reject_before_dispatch(&request.receipt, ProviderError::Cancelled).await);
+        }
+        let _operation = session.operation.lock().await;
+        if let Err(error) = session
+            .conversation
+            .bind_tool_endpoint(request.tool_endpoint.as_ref())
+            .await
+        {
+            let error = with_operation(ProviderOperation::InputSubmit, error);
+            if matches!(&error, ProviderError::Failure(failure) if matches!(failure.disposition(), FailureDisposition::Uncertain | FailureDisposition::Invalidated)) {
+                session.invalidate(error.clone()).await;
+            }
+            return Err(reject_before_dispatch(&request.receipt, error).await);
+        }
+        let event_sink = session.sink.invocation_sink(&request.scope)?;
+        if let Err(error) = session
+            .state
+            .begin_native(
+                session.conversation.id(),
+                event_sink.clone(),
+                request.permissions.clone(),
+            )
+            .await
+        {
+            let error = if cancellation.is_cancelled() { ProviderError::Cancelled } else { error };
+            if error.is_clean_cancellation() { session.rejected_inputs.lock().await.push((request.scope.clone(), request.submission_id.clone(), request.attempt_id.clone())); }
+            return Err(reject_before_dispatch(&request.receipt, error).await);
+        }
+        let address = session
+            .state
+            .address(session.conversation.id())
+            .await
+            .ok_or_else(|| failure(ProviderOperation::InputSubmit, ProviderFailureKind::Protocol))?;
+        let current_model = session.native_model.lock().await.clone();
+        let prompt = match prompt_content(&request, session.conversation.supports_images()) {
+            Ok(prompt) => prompt,
+            Err(error) => return Err(reject_before_dispatch(&request.receipt, error).await),
+        };
+        if let Err(error) = configure_model(
+            &session,
+            &request.configuration.model,
+            &current_model,
+            request.mode,
+        )
+        .await
+        {
+            let error = with_operation(ProviderOperation::InputSubmit, error);
+            if matches!(&error, ProviderError::Failure(failure) if failure.disposition() == forge_provider_api::FailureDisposition::Invalidated) { session.invalidate(error.clone()).await; }
+            return Err(reject_before_dispatch(&request.receipt, error).await);
+        }
+        *session.native_model.lock().await = request.configuration.model.clone();
+        let cancellation = session.active.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().filter(|active| active.scope == request.scope).map(|active| active.cancellation.clone()).ok_or_else(|| failure(ProviderOperation::InputSubmit, ProviderFailureKind::WrongInvocation))?;
+        if cancellation.is_cancelled() || !session.state.is_admitting() {
+            session.rejected_inputs.lock().await.push((request.scope.clone(), request.submission_id.clone(), request.attempt_id.clone()));
+            return Err(reject_before_dispatch(&request.receipt, ProviderError::Cancelled).await);
+        }
+        let response = session
+            .conversation
+            .submit(
+                super::submission::AcpSubmission::Prompt,
+                serde_json::json!({"sessionId":session.conversation.id(),"prompt":prompt}),
+                Some(request.receipt.clone()),
+                &request.dispatch,
+                &cancellation,
+            )
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                let started = session.state.execution_started().await;
+                let proven_unconsumed = match &error {
+                    ProviderError::NotConsumed => true,
+                    ProviderError::Failure(native) => {
+                        native.kind() == ProviderFailureKind::Rejected && native.disposition() == forge_provider_api::FailureDisposition::Unchanged
+                    }
+                    _ => false,
+                };
+                let uncertain_delivery = !proven_unconsumed;
+                if uncertain_delivery { session.invalidate(error.clone()).await; }
+                let mut cleanup = Vec::new();
+                if started || uncertain_delivery {
+                    let native_failure = match &error {
+                        ProviderError::DeliveryUncertain => {
+                            forge_provider_api::lifecycle::ObservationFailure::DeliveryUncertain
+                        }
+                        ProviderError::Failure(native)
+                            if native.kind() == ProviderFailureKind::Protocol =>
+                        {
+                            forge_provider_api::lifecycle::ObservationFailure::Protocol
+                        }
+                        _ => forge_provider_api::lifecycle::ObservationFailure::Disconnected,
+                    };
+                    if let Err(cleanup_error) = session
+                        .state
+                        .finish(forge_provider_api::turn::TurnOutcome::Failed)
+                        .await
+                    {
+                        cleanup.push(cleanup_error);
+                    }
+                    let event = execution_observation(
+                        &request.scope,
+                        forge_provider_api::lifecycle::ExecutionUpdate::ObservationLost {
+                            failure: native_failure,
+                            completion: if started {
+                                Some(session.state.take_completion().await.into())
+                            } else {
+                                None
+                            },
+                        },
+                    );
+                    match event {
+                        Ok(event) => {
+                            if let Err(cleanup_error) = event_sink
+                                .send_wait(ProviderEvent::Execution { observation: event })
+                                .await
+                            {
+                                cleanup.push(cleanup_error.into());
+                            }
+                        }
+                        Err(cleanup_error) => cleanup.push(cleanup_error),
+                    }
+                } else {
+                    session.state.revoke_callbacks().await;
+                    if let Err(cleanup_error) = session
+                        .state
+                        .finish(forge_provider_api::turn::TurnOutcome::Failed)
+                        .await
+                    {
+                        cleanup.push(cleanup_error);
+                    }
+                }
+                return Err(with_cleanup(error, cleanup));
+            }
+        };
+        if let Some(sender) = accepted.take() {
+            let _ = sender.send(Ok(InputAcceptance {
+                submission_id: request.submission_id.clone(),
+            }));
+        }
+        let _steering_boundary = session.steering.write().await;
+        let native_outcome = match super::prompt_outcome(&response) {
+            Ok(super::PromptOutcome::Completed) => forge_provider_api::turn::TurnOutcome::Completed,
+            Ok(super::PromptOutcome::Cancelled) => forge_provider_api::turn::TurnOutcome::Cancelled,
+            Err(_) => {
+                return Err(ProviderFailure::new(ProviderOperation::InputSubmit, ProviderFailureKind::Protocol)
+                    .at_phase(ProviderPhase::Observation, FailureDisposition::Uncertain).into());
+            }
+        };
+        let outcome = native_outcome;
+        let mut terminal_errors = Vec::new();
+        if let Err(error) = session.state.finish(outcome).await {
+            terminal_errors.push(error);
+        }
+        let completion = session.state.take_completion().await.into();
+        let result = match outcome {
+            forge_provider_api::turn::TurnOutcome::Completed => {
+                forge_provider_api::lifecycle::ExecutionResult::Completed { completion }
+            }
+            forge_provider_api::turn::TurnOutcome::Cancelled => {
+                forge_provider_api::lifecycle::ExecutionResult::Cancelled { completion }
+            }
+            forge_provider_api::turn::TurnOutcome::Failed
+            | forge_provider_api::turn::TurnOutcome::Interrupted => {
+                forge_provider_api::lifecycle::ExecutionResult::Failed {
+                    completion,
+                    failure: forge_provider_api::lifecycle::ExecutionFailure::Terminal {
+                        kind: ProviderFailureKind::Unknown,
+                    },
+                }
+            }
+        };
+        session.terminal_results.lock().await.insert(request.scope.clone(), result.clone());
+        let update = if session.state.execution_started().await {
+            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                address,
+                covered_submissions: covered_submissions(&session, &request.scope),
+                completed_at_ms: super::children::timestamp(),
+                result,
+            }
+        } else {
+            forge_provider_api::lifecycle::ExecutionUpdate::ResolvedWithoutExecution {
+                covered_submissions: covered_submissions(&session, &request.scope),
+                completed_at_ms: super::children::timestamp(),
+                result,
+            }
+        };
+        match execution_observation(&request.scope, update) {
+            Ok(event) => {
+                if let Err(error) = event_sink
+                    .send_wait(ProviderEvent::Execution { observation: event })
+                    .await
+                {
+                    terminal_errors.push(error.into());
+                }
+            }
+            Err(error) => terminal_errors.push(error),
+        }
+        if terminal_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(combine_errors(terminal_errors))
+        }
+    }
+    .await;
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let mut error = error;
+            if accepted.is_some() && session.state.has_active_work().await {
+                session.state.revoke_callbacks().await;
+                if let Err(cleanup) = session
+                    .state
+                    .finish(forge_provider_api::turn::TurnOutcome::Failed)
+                    .await
+                {
+                    error = with_cleanup(error, vec![cleanup]);
+                }
+            }
+            if accepted.is_some()
+                && !session
+                    .terminal_results
+                    .lock()
+                    .await
+                    .contains_key(&request.scope)
+            {
+                let completion = session.state.take_completion().await.into();
+                let result = if error.is_clean_cancellation() {
+                    forge_provider_api::ExecutionResult::Cancelled { completion }
+                } else {
+                    forge_provider_api::ExecutionResult::Failed {
+                        completion,
+                        failure: forge_provider_api::lifecycle::ExecutionFailure::Terminal {
+                            kind: ProviderFailureKind::Rejected,
+                        },
+                    }
+                };
+                session
+                    .terminal_results
+                    .lock()
+                    .await
+                    .insert(request.scope.clone(), result);
+            }
+            if let Some(sender) = accepted.take() {
+                let unchanged = matches!(&error, ProviderError::PreparationFailed(_))
+                    && !session.state.is_invalidated().await;
+                let _ = sender.send(Err(error.clone()));
+                return if unchanged { Ok(()) } else { Err(error) };
+            }
+            // Accepted work must never disappear without a terminal observation or explicit loss.
+            session
+                .sink
+                .fail(events::EventDeliveryError::Observation(match &error {
+                    ProviderError::Failure(failure)
+                        if failure.kind() == ProviderFailureKind::Protocol =>
+                    {
+                        forge_provider_api::lifecycle::ObservationFailure::Protocol
+                    }
+                    _ => forge_provider_api::lifecycle::ObservationFailure::Disconnected,
+                }));
+            Err(error)
+        }
+    }
+}
+
+/// Validate invocation ownership before publishing normalized execution evidence.
+fn execution_observation(
+    scope: &forge_provider_api::InvocationScope,
+    update: forge_provider_api::lifecycle::ExecutionUpdate,
+) -> Result<forge_provider_api::lifecycle::ExecutionObservation, ProviderError> {
+    forge_provider_api::lifecycle::ExecutionObservation::new(scope.clone(), update)
+        .map_err(Into::into)
+}
+
+/// Resolve provider-default resets from the native snapshot captured before task overrides.
+fn resolve_native_model(
+    session: &AcpBinding,
+    requested: &forge_provider_api::ModelSelection,
+    retained: &forge_provider_api::ModelSelection,
+) -> Result<forge_provider_api::ModelSelection, ProviderError> {
+    use forge_provider_api::generation::ReasoningSelection;
+    let mut resolved = requested.clone();
+    if requested.model.is_none() && retained.model.is_some() {
+        resolved.model = Some(session.initial_model.model.clone().ok_or(
+            forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::ModelDefaultReset,
+            ),
+        )?);
+    }
+    if requested.reasoning == ReasoningSelection::Default
+        && retained.reasoning != ReasoningSelection::Default
+    {
+        if session.initial_model.reasoning == ReasoningSelection::Default {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::ReasoningDefaultReset,
+            )
+            .into());
+        }
+        resolved.reasoning = session.initial_model.reasoning.clone();
+    }
+    Ok(resolved)
+}
+
+/// Apply one invocation's supported ACP model and reasoning choices before prompt dispatch.
+async fn configure_model(
+    session: &AcpBinding,
+    requested: &forge_provider_api::session::ModelSelection,
+    retained: &forge_provider_api::session::ModelSelection,
+    mode: forge_provider_api::PromptMode,
+) -> Result<(), ProviderError> {
+    use forge_provider_api::ServiceTier;
+    use forge_provider_api::generation::ReasoningSelection;
+
+    if requested.service_tier != ServiceTier::Standard {
+        return Err(forge_provider_api::capability::UnsupportedCapability(
+            forge_provider_api::capability::ProviderFeature::ServiceTier,
+        )
+        .into());
+    }
+    if requested.context_window.is_some() {
+        return Err(forge_provider_api::capability::UnsupportedCapability(
+            forge_provider_api::capability::ProviderFeature::ContextWindowSelection,
+        )
+        .into());
+    }
+    let resolved = resolve_native_model(session, requested, retained)?;
+    let requested = &resolved;
+
+    let models = session.conversation.models().await.map_err(|_| {
+        failure(
+            ProviderOperation::SessionConfigure,
+            ProviderFailureKind::Protocol,
+        )
+    })?;
+    let selected_model = match requested.model.as_deref() {
+        Some(model) => {
+            if !models.iter().any(|candidate| candidate.id == model) {
+                return Err(failure(
+                    ProviderOperation::SessionConfigure,
+                    ProviderFailureKind::Rejected,
+                ));
+            }
+            Some(model)
+        }
+        None => models
+            .iter()
+            .find(|model| model.is_default)
+            .map(|model| model.id.as_str()),
+    };
+    if let ReasoningSelection::Level(level) = &requested.reasoning
+        && !selected_model
+            .and_then(|id| models.iter().find(|model| model.id == id))
+            .is_some_and(|model| model.reasoning.contains(level))
+    {
+        return Err(forge_provider_api::capability::UnsupportedCapability(
+            forge_provider_api::capability::ProviderFeature::EffortSelection,
+        )
+        .into());
+    }
+    let effort = match &requested.reasoning {
+        ReasoningSelection::Default => "default",
+        ReasoningSelection::Level(level) => level.as_str(),
+        ReasoningSelection::Lowest => {
+            let reasoning = selected_model
+                .and_then(|id| models.iter().find(|model| model.id == id))
+                .and_then(|model| model.reasoning.first())
+                .ok_or({
+                    forge_provider_api::capability::UnsupportedCapability(
+                        forge_provider_api::capability::ProviderFeature::EffortSelection,
+                    )
+                })?;
+            reasoning.as_str()
+        }
+    };
+    session
+        .conversation
+        .configure(
+            requested.model.as_deref().unwrap_or("default"),
+            effort,
+            mode,
+        )
+        .await
+        .map_err(|_| {
+            ProviderError::Failure(
+                ProviderFailure::new(
+                    ProviderOperation::SessionConfigure,
+                    ProviderFailureKind::Protocol,
+                )
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Preparation,
+                    forge_provider_api::FailureDisposition::Invalidated,
+                ),
+            )
+        })
+}
+
+/// Preserve independent cleanup failures without recursively nesting combined reports.
+fn with_cleanup(primary: ProviderError, cleanup: Vec<ProviderError>) -> ProviderError {
+    let mut failures = Vec::new();
+    flatten_failures(primary, &mut failures);
+    for failure in cleanup {
+        flatten_failures(failure, &mut failures);
+    }
+    let primary = failures.remove(0);
+    if failures.is_empty() {
+        primary
+    } else {
+        ProviderError::Combined {
+            primary: Box::new(primary),
+            secondary: failures,
+        }
+    }
+}
+
+/// Preserve the first failure when several independent lifecycle phases failed.
+fn combine_errors(mut failures: Vec<ProviderError>) -> ProviderError {
+    let primary = failures.remove(0);
+    with_cleanup(primary, failures)
+}
+
+/// Flatten only aggregate reports while retaining each typed leaf cause and its order.
+fn flatten_failures(error: ProviderError, failures: &mut Vec<ProviderError>) {
+    match error {
+        ProviderError::Combined { primary, secondary } => {
+            flatten_failures(*primary, failures);
+            for failure in secondary {
+                flatten_failures(failure, failures);
+            }
+        }
+        error => failures.push(error),
+    }
+}
+
+/// Record positive local no-send evidence while retaining an independent journal failure.
+async fn reject_before_dispatch(
+    receipt: &Arc<dyn forge_provider_api::submission::InputReceipt>,
+    cause: ProviderError,
+) -> ProviderError {
+    match receipt.clone().record_rejected(cause.clone()).await {
+        Ok(()) => ProviderError::PreparationFailed(Box::new(cause)),
+        Err(cleanup) => ProviderError::PreparationCleanup {
+            cause: Box::new(cause),
+            cleanup: Box::new(cleanup),
+        },
+    }
+}
+
+struct AcpCheckpoint {
+    accepted: bool,
+    session_id: String,
+    submission_id: String,
+    attempt_id: String,
+}
+
+/// Decode only exact-attempt receipts issued under the current host session contract.
+fn parse_checkpoint(
+    token: &forge_provider_api::RecoveryToken,
+) -> Result<AcpCheckpoint, ProviderError> {
+    let value: serde_json::Value = serde_json::from_slice(token.as_bytes()).map_err(|_| {
+        failure(
+            ProviderOperation::InputReconcile,
+            ProviderFailureKind::Protocol,
+        )
+    })?;
+    if value["version"] != 2
+        || !matches!(
+            value["method"].as_str(),
+            Some("session/prompt" | "_session/steering")
+        )
+    {
+        return Err(failure(
+            ProviderOperation::InputReconcile,
+            ProviderFailureKind::Protocol,
+        ));
+    }
+    let field = |name: &str| {
+        value[name]
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                failure(
+                    ProviderOperation::InputReconcile,
+                    ProviderFailureKind::Protocol,
+                )
+            })
+    };
+    Ok(AcpCheckpoint {
+        accepted: value["accepted"].as_bool().ok_or_else(|| {
+            failure(
+                ProviderOperation::InputReconcile,
+                ProviderFailureKind::Protocol,
+            )
+        })?,
+        session_id: field("session")?,
+        submission_id: field("submission")?,
+        attempt_id: field("attempt")?,
+    })
 }
 
 pub(super) fn normalized_mcp_reason(
@@ -2351,4 +3586,721 @@ fn same_resources(
                     _ => false,
                 }
             })
+}
+
+/// Preserve a typed native cause while classifying the requested operation and authority effect.
+fn operation_failure(
+    operation: ProviderOperation,
+    error: &ProviderError,
+    phase: forge_provider_api::ProviderPhase,
+    disposition: forge_provider_api::FailureDisposition,
+) -> ProviderError {
+    let kind = match error {
+        ProviderError::Failure(failure) => failure.kind(),
+        ProviderError::Cancelled => ProviderFailureKind::Rejected,
+        _ => ProviderFailureKind::Unknown,
+    };
+    ProviderError::Failure(ProviderFailure::new(operation, kind).at_phase(phase, disposition))
+}
+
+/// Reclassify a normalized typed cause at the public operation that requested it.
+fn with_operation(operation: ProviderOperation, error: ProviderError) -> ProviderError {
+    match error {
+        ProviderError::Failure(failure) => ProviderError::Failure(
+            ProviderFailure::new(operation, failure.kind())
+                .at_phase(failure.phase(), failure.disposition()),
+        ),
+        error => error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_provider_api::provider::Provider;
+
+    /// Create a fresh bounded host operation whose dropped cancellation source stays inert.
+    fn operation_context() -> forge_provider_api::OperationContext {
+        let (_, cancellation) = forge_provider_api::OperationCancellation::channel();
+        forge_provider_api::OperationContext::new(
+            forge_provider_api::OperationId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            std::time::Duration::from_secs(10),
+            cancellation,
+        )
+        .unwrap()
+    }
+
+    /// Create a transport-free adapter for durable recovery-evidence decisions.
+    fn provider() -> AcpProvider {
+        AcpProvider::new(
+            forge_provider_api::ProviderId::new("claude").unwrap(),
+            vec!["must-not-launch".into()],
+            PathBuf::from("unused-acp-fixture"),
+        )
+        .unwrap()
+    }
+
+    /// Prepare a deterministic native peer whose open or initial configuration can fail.
+    fn failed_open_fixture(
+        missing_identity: bool,
+    ) -> (tempfile::TempDir, AcpProvider, SessionRequest) {
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("failed-open.cjs");
+        std::fs::write(&script, r#"
+const readline=require('node:readline');
+readline.createInterface({input:process.stdin}).on('line',line=>{
+ const request=JSON.parse(line);if(request.id===undefined)return;let result={};
+ if(request.method==='initialize')result={protocolVersion:1,agentInfo:{version:'99.0.0'},agentCapabilities:{loadSession:true}};
+ if(request.method==='session/load'&&process.argv[2]==='missing'){process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,error:{code:-32603,message:'injected load failure'}})+'\n');return;}
+ if(request.method==='session/new'||request.method==='session/load')result=process.argv[2]==='missing'?{}:{sessionId:'failed-open-history'};
+ process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result})+'\n');
+});
+"#).unwrap();
+        let node = forge_shell::process::executable("node")
+            .expect("Node.js is required by the ACP failure fixture");
+        let provider = AcpProvider::new(
+            forge_provider_api::ProviderId::new("antigravity").unwrap(),
+            vec![
+                node.to_string_lossy().into_owned(),
+                script.to_string_lossy().into_owned(),
+                if missing_identity {
+                    "missing".into()
+                } else {
+                    "valid".into()
+                },
+            ],
+            directory.path().join("runtime"),
+        )
+        .unwrap();
+        let request = SessionRequest {
+            owner: ExecutionOwner::root("failed-open"),
+            mode: forge_provider_api::SessionMode::Interactive,
+            workspace: directory.path().to_string_lossy().into_owned(),
+            history: forge_provider_api::SessionHistory::Durable { resume: None },
+            configuration: forge_provider_api::SessionConfiguration {
+                model: Default::default(),
+                access: Default::default(),
+                approval: forge_provider_api::approval::ApprovalMode::Ask,
+                resources: Default::default(),
+            },
+            resource_lease: None,
+            tools: Vec::new(),
+            tool_endpoint: None,
+            system_instructions: String::new(),
+            trace: Arc::new(IgnoreTrace),
+        };
+        (directory, provider, request)
+    }
+
+    /// Exact cancel must wait for queued native ownership to prove no future registration.
+    #[tokio::test]
+    async fn cancel_waits_for_queued_input_before_reporting_wrong_invocation() {
+        let (_directory, provider, request) = failed_open_fixture(false);
+        let opened = provider
+            .session_open(operation_context(), request)
+            .await
+            .unwrap();
+        let binding = opened.binding.id;
+        let scope = forge_provider_api::InvocationScope::new(
+            ExecutionOwner::root("failed-open"),
+            "queued-input",
+        );
+        let pending = provider
+            .pending_inputs
+            .register(&binding, &scope, operation_context().id());
+        let successor_scope =
+            forge_provider_api::InvocationScope::new(scope.owner.clone(), "successor");
+        let successor =
+            provider
+                .pending_inputs
+                .register(&binding, &successor_scope, operation_context().id());
+        let (cancel_seen, seen) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            pending.cancelled().await;
+            let _ = cancel_seen.send(());
+            let _ = released.await;
+            drop(pending);
+        });
+        let cancelling_provider = provider.clone();
+        let cancelling_binding = binding.clone();
+        let cancelling_scope = scope.clone();
+        let cancel = tokio::spawn(async move {
+            cancelling_provider
+                .cancel(
+                    operation_context(),
+                    &cancelling_binding,
+                    forge_provider_api::CancelRequest {
+                        scope: cancelling_scope,
+                    },
+                )
+                .await
+        });
+        seen.await.unwrap();
+        assert!(!cancel.is_finished());
+        assert!(!successor.is_cancelled());
+        release.send(()).unwrap();
+        worker.await.unwrap();
+        assert!(
+            matches!(cancel.await.unwrap(), Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation)
+        );
+        let late = provider
+            .pending_inputs
+            .register(&binding, &scope, operation_context().id());
+        assert!(late.is_cancelled());
+        drop(late);
+        drop(successor);
+        provider
+            .session_close(operation_context(), &binding)
+            .await
+            .unwrap();
+        provider.shutdown(operation_context()).await.unwrap();
+    }
+
+    /// An exact cancel which wins the wrapper race fences that scope before future registration.
+    #[tokio::test]
+    async fn absent_invocation_cancel_fences_late_input_without_touching_successor() {
+        let (_directory, provider, request) = failed_open_fixture(false);
+        let opened = provider
+            .session_open(operation_context(), request)
+            .await
+            .unwrap();
+        let binding = opened.binding.id;
+        let scope = forge_provider_api::InvocationScope::new(
+            ExecutionOwner::root("failed-open"),
+            "not-yet-polled",
+        );
+        assert!(
+            matches!(provider.cancel(operation_context(), &binding, forge_provider_api::CancelRequest { scope: scope.clone() }).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::WrongInvocation)
+        );
+        let late = provider
+            .pending_inputs
+            .register(&binding, &scope, operation_context().id());
+        assert!(late.is_cancelled());
+        let successor_scope = forge_provider_api::InvocationScope::new(scope.owner, "successor");
+        let successor =
+            provider
+                .pending_inputs
+                .register(&binding, &successor_scope, operation_context().id());
+        assert!(!successor.is_cancelled());
+        drop(late);
+        drop(successor);
+        provider
+            .session_close(operation_context(), &binding)
+            .await
+            .unwrap();
+        provider.shutdown(operation_context()).await.unwrap();
+    }
+
+    /// A post-write profile failure retains its cleanup phase and invalidates the binding.
+    #[tokio::test]
+    async fn configuration_profile_cleanup_failure_preserves_postwrite_disposition() {
+        let (directory, unused_provider, request) = failed_open_fixture(false);
+        let provider = AcpProvider::new(
+            forge_provider_api::ProviderId::new("claude").unwrap(),
+            unused_provider.runtime.status().command,
+            directory.path().join("claude-runtime"),
+        )
+        .unwrap();
+        let opened = provider
+            .session_open(operation_context(), request.clone())
+            .await
+            .unwrap();
+        let session = provider
+            .binding(&opened.binding.id, ProviderOperation::SessionConfigure)
+            .unwrap();
+        session.profiles.lock().await[0].fail_next_close(1);
+        let mut desired = request.configuration;
+        desired.resources.mcp.push(forge_provider_api::McpLaunch {
+            name: "changed-resource".into(),
+            transport: forge_provider_api::McpTransport::Http {
+                url: "http://resource.invalid".into(),
+                headers: Default::default(),
+            },
+            timeout: None,
+            working_directory: None,
+            tools: None,
+        });
+        let context = operation_context();
+        for _ in 0..2 {
+            let error = provider
+                .session_configure(context.clone(), &opened.binding.id, desired.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionConfigure && failure.kind() == ProviderFailureKind::Runtime && failure.phase() == ProviderPhase::Collection && failure.disposition() == FailureDisposition::Invalidated)
+            );
+        }
+        assert!(!session.history_released.load(Ordering::Acquire));
+        assert!(
+            matches!(session.ensure_current_result(&operation_context(), ProviderOperation::SessionConfigure), Err(ProviderError::Failure(failure)) if failure.phase() == ProviderPhase::Observation && failure.disposition() == FailureDisposition::Invalidated)
+        );
+        provider
+            .session_close(operation_context(), &opened.binding.id)
+            .await
+            .unwrap();
+        assert!(
+            matches!(session.ensure_current_result(&operation_context(), ProviderOperation::SessionConfigure), Err(ProviderError::Failure(failure)) if failure.phase() == ProviderPhase::Observation && failure.disposition() == FailureDisposition::Closed)
+        );
+        provider.shutdown(operation_context()).await.unwrap();
+    }
+
+    /// Late context cancellation must prevent a post-write success even before cleanup closes state.
+    #[tokio::test]
+    async fn postwrite_result_fence_revokes_interrupted_binding_before_success() {
+        let (_directory, provider, request) = failed_open_fixture(false);
+        let opened = provider
+            .session_open(operation_context(), request)
+            .await
+            .unwrap();
+        let session = provider
+            .binding(&opened.binding.id, ProviderOperation::SessionConfigure)
+            .unwrap();
+        let (cancellation, observer) = forge_provider_api::OperationCancellation::channel();
+        let context = OperationContext::new(
+            OperationId::new("postwrite-cancel").unwrap(),
+            std::time::Duration::from_secs(10),
+            observer,
+        )
+        .unwrap();
+        cancellation.cancel();
+        assert!(
+            matches!(session.ensure_current_result(&context, ProviderOperation::SessionConfigure), Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::Cancelled && failure.phase() == ProviderPhase::Observation && failure.disposition() == FailureDisposition::Invalidated)
+        );
+        assert!(!session.state.is_admitting());
+        assert!(!session.history_released.load(Ordering::Acquire));
+        provider
+            .session_close(operation_context(), &opened.binding.id)
+            .await
+            .unwrap();
+        assert!(session.history_released.load(Ordering::Acquire));
+        provider.shutdown(operation_context()).await.unwrap();
+    }
+
+    /// A failed initial configuration cannot drop its privately registered binding after cleanup failure.
+    #[tokio::test]
+    async fn failed_initial_configuration_retains_binding_until_shutdown_collects_it() {
+        let (_directory, provider, mut request) = failed_open_fixture(false);
+        provider.cleanup.fail_next_collection(1);
+        request.configuration.model.context_window = Some("unsupported-window".into());
+        assert!(
+            matches!(provider.session_open(operation_context(), request).await, Err(ProviderError::Combined { primary, .. }) if matches!(*primary, ProviderError::Unsupported(_)))
+        );
+        let bindings = provider
+            .bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(bindings.len(), 1);
+        assert!(!bindings[0].history_released.load(Ordering::Acquire));
+        assert_eq!(provider.cleanup.pending_count(), 1);
+        provider.shutdown(operation_context()).await.unwrap();
+        assert!(bindings[0].history_released.load(Ordering::Acquire));
+        assert_eq!(provider.cleanup.pending_count(), 0);
+    }
+
+    /// A failed native session open retains raw transport cleanup even before a binding exists.
+    #[tokio::test]
+    async fn failed_native_open_retains_transport_until_shutdown_retries_collection() {
+        let (_directory, provider, request) = failed_open_fixture(true);
+        provider.cleanup.fail_next_collection(1);
+        assert!(
+            matches!(provider.session_open(operation_context(), request).await, Err(ProviderError::PreparationCleanup { cause, .. }) if matches!(*cause, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::Initialization))
+        );
+        assert!(
+            provider
+                .bindings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        assert_eq!(provider.cleanup.pending_count(), 1);
+        provider.shutdown(operation_context()).await.unwrap();
+        assert_eq!(provider.cleanup.pending_count(), 0);
+    }
+
+    /// Failed recovery before binding creation still excludes another writable owner of that known history.
+    #[tokio::test]
+    async fn failed_resume_retains_history_reservation_until_transport_collection() {
+        let (_directory, provider, mut request) = failed_open_fixture(true);
+        request.history = forge_provider_api::SessionHistory::Durable {
+            resume: Some("failed-open-history".to_owned().try_into().unwrap()),
+        };
+        let mut competing = request.clone();
+        competing.owner = ExecutionOwner::root("competing-owner");
+        provider.cleanup.fail_next_collection(1);
+        assert!(
+            provider
+                .session_open(operation_context(), request)
+                .await
+                .is_err()
+        );
+        assert!(
+            provider
+                .bindings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        assert!(
+            matches!(provider.session_open(operation_context(), competing).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::HistoryConflict)
+        );
+        assert_eq!(provider.cleanup.pending_count(), 1);
+        provider.shutdown(operation_context()).await.unwrap();
+        assert_eq!(provider.cleanup.pending_count(), 0);
+    }
+
+    /// Build a complete retained fork request without launching a native runtime.
+    fn fork_request() -> forge_provider_api::SessionForkRequest {
+        forge_provider_api::SessionForkRequest {
+            source: forge_provider_api::ForkSource::Binding(
+                BindingId::new("source-binding").unwrap(),
+            ),
+            target: forge_provider_api::ForkTarget {
+                owner: ExecutionOwner::root("target-owner"),
+                workspace: "target-workspace".into(),
+                system_instructions: "target instructions".into(),
+                configuration: forge_provider_api::SessionConfiguration {
+                    model: Default::default(),
+                    access: Default::default(),
+                    approval: forge_provider_api::approval::ApprovalMode::Ask,
+                    resources: forge_provider_api::ResourceSelection {
+                        skills: Vec::new(),
+                        mcp: vec![forge_provider_api::McpLaunch {
+                            name: "resource".into(),
+                            transport: forge_provider_api::McpTransport::Http {
+                                url: "http://resource.invalid".into(),
+                                headers: std::collections::BTreeMap::from([(
+                                    "authorization".into(),
+                                    "first-secret".into(),
+                                )]),
+                            },
+                            timeout: Some(std::time::Duration::from_secs(1)),
+                            working_directory: None,
+                            tools: None,
+                        }],
+                    },
+                },
+            },
+        }
+    }
+
+    /// Reusing a fork operation cannot return cached evidence for a different destructive request.
+    #[tokio::test]
+    async fn fork_retries_validate_source_target_and_complete_configuration() {
+        let provider = provider();
+        let request = fork_request();
+        let context = operation_context();
+        assert!(
+            matches!(provider.session_fork(context.clone(), request.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::SessionMissing)
+        );
+        assert!(
+            matches!(provider.session_fork(context.clone(), request.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::SessionMissing)
+        );
+        let mut changed = Vec::new();
+        let mut next = request.clone();
+        next.source =
+            forge_provider_api::ForkSource::Binding(BindingId::new("other-source").unwrap());
+        changed.push(next);
+        let mut next = request.clone();
+        next.source = forge_provider_api::ForkSource::Checkpoint {
+            provider_session_id: "history".to_owned().try_into().unwrap(),
+            checkpoint: forge_provider_api::CheckpointId::new("checkpoint").unwrap(),
+        };
+        changed.push(next);
+        let mut next = request.clone();
+        next.target.owner = ExecutionOwner::root("other-target");
+        changed.push(next);
+        let mut next = request.clone();
+        next.target.workspace = "other-workspace".into();
+        changed.push(next);
+        let mut next = request.clone();
+        next.target.system_instructions = "other instructions".into();
+        changed.push(next);
+        let mut next = request.clone();
+        next.target.configuration.model.model = Some("other-model".into());
+        changed.push(next);
+        let mut next = request.clone();
+        next.target.configuration.access.sandbox = !next.target.configuration.access.sandbox;
+        changed.push(next);
+        let mut next = request.clone();
+        next.target.configuration.approval = forge_provider_api::approval::ApprovalMode::Deny;
+        changed.push(next);
+        let mut next = request.clone();
+        next.target.configuration.resources.mcp[0].timeout =
+            Some(std::time::Duration::from_secs(2));
+        changed.push(next);
+        let mut next = request.clone();
+        next.target.configuration.resources.mcp[0].transport =
+            forge_provider_api::McpTransport::Http {
+                url: "http://resource.invalid".into(),
+                headers: std::collections::BTreeMap::from([(
+                    "authorization".into(),
+                    "different-secret".into(),
+                )]),
+            };
+        changed.push(next);
+        let mut next = request.clone();
+        next.target.configuration.resources.mcp.clear();
+        changed.push(next);
+        for request in changed {
+            assert!(
+                matches!(provider.session_fork(context.clone(), request).await, Err(ProviderError::Failure(failure)) if failure.operation() == ProviderOperation::SessionFork && failure.kind() == ProviderFailureKind::OperationConflict)
+            );
+        }
+        provider.shutdown(operation_context()).await.unwrap();
+    }
+
+    /// Compaction retries cannot reuse a retained result from another generation or operation scope.
+    #[tokio::test]
+    async fn compaction_retries_validate_binding_and_operation_scope() {
+        let provider = provider();
+        let binding = BindingId::new("source-binding").unwrap();
+        let context = operation_context();
+        let operation_id = context.id().clone();
+        let request = forge_provider_api::CompactionRequest {
+            scope: forge_provider_api::EventScope::SessionOperation {
+                owner: ExecutionOwner::root("source-owner"),
+                operation_id: operation_id.clone(),
+            },
+        };
+        assert!(
+            matches!(provider.session_compact(context.clone(), &binding, request.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::SessionMissing)
+        );
+        assert!(
+            matches!(provider.session_compact(context.clone(), &BindingId::new("other-binding").unwrap(), request.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::OperationConflict)
+        );
+        let mut changed = request;
+        changed.scope = forge_provider_api::EventScope::SessionOperation {
+            owner: ExecutionOwner::root("other-owner"),
+            operation_id,
+        };
+        assert!(
+            matches!(provider.session_compact(context.clone(), &binding, changed).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::OperationConflict)
+        );
+        provider.shutdown(operation_context()).await.unwrap();
+    }
+
+    /// Workspace-only discovery cannot claim an empty native catalog when no live binding can negotiate it.
+    #[tokio::test]
+    async fn workspace_catalog_queries_report_unsupported_without_native_effects() {
+        use forge_provider_api::capability::{ProviderFeature, UnsupportedCapability};
+        use forge_provider_api::catalog::{McpQuery, QueryContext, WorkspaceContext};
+        let provider = provider();
+        let query = QueryContext::Workspace(WorkspaceContext {
+            workspace: "must-not-inspect".into(),
+        });
+        assert!(matches!(
+            provider
+                .model_list(operation_context(), query.clone())
+                .await,
+            Err(ProviderError::Unsupported(UnsupportedCapability(
+                ProviderFeature::ModelSelection
+            )))
+        ));
+        assert!(matches!(
+            provider
+                .skill_list(operation_context(), query.clone())
+                .await,
+            Err(ProviderError::Unsupported(UnsupportedCapability(
+                ProviderFeature::SkillCatalog
+            )))
+        ));
+        for query in [
+            McpQuery::Configured(query.clone()),
+            McpQuery::Observed(query),
+        ] {
+            assert!(matches!(
+                provider.mcp_list(operation_context(), query).await,
+                Err(ProviderError::Unsupported(UnsupportedCapability(
+                    ProviderFeature::McpCatalog
+                )))
+            ));
+        }
+        assert!(
+            provider
+                .bindings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
+        assert_eq!(provider.cleanup.pending_count(), 0);
+        provider.shutdown(operation_context()).await.unwrap();
+    }
+
+    /// Build adapter-issued opaque evidence for a single stored delivery attempt.
+    fn checkpoint(
+        accepted: bool,
+        submission: &str,
+        attempt: &str,
+    ) -> forge_provider_api::RecoveryToken {
+        forge_provider_api::RecoveryToken::new(serde_json::to_vec(&serde_json::json!({"version":2,"accepted":accepted,"method":"session/prompt","session":"history","submission":submission,"attempt":attempt})).unwrap()).unwrap()
+    }
+
+    /// Build a recovery query that never opens or writes native history.
+    fn reconciliation(
+        token: forge_provider_api::RecoveryToken,
+    ) -> forge_provider_api::InputReconcileRequest {
+        forge_provider_api::InputReconcileRequest {
+            submission_id: "input".try_into().unwrap(),
+            attempt_id: forge_provider_api::DeliveryAttemptId::new("attempt").unwrap(),
+            provider_session_id: Some("history".to_owned().try_into().unwrap()),
+            token: Some(token),
+            accepted_receipts: Vec::new(),
+        }
+    }
+
+    /// An inconclusive read cannot authorize replay after a delayed native acceptance.
+    #[tokio::test]
+    async fn reconciliation_remains_unknown_without_an_exact_accepted_receipt() {
+        let provider = provider();
+        for accepted in [false, true] {
+            let request = reconciliation(checkpoint(accepted, "input", "attempt"));
+            assert!(matches!(
+                provider
+                    .input_reconcile(operation_context(), request)
+                    .await
+                    .unwrap(),
+                forge_provider_api::SubmissionEvidence::Unknown
+            ));
+        }
+    }
+
+    /// Cached native dispositions win expiry, while changed contexts and payloads cannot reuse them.
+    #[tokio::test(start_paused = true)]
+    async fn retained_fork_context_replays_after_expiry_and_rejects_changed_tuple() {
+        let provider = provider();
+        let request = fork_request();
+        let (_, cancellation) = forge_provider_api::OperationCancellation::channel();
+        let context = OperationContext::new(
+            OperationId::new("retained-fork").unwrap(),
+            std::time::Duration::from_millis(10),
+            cancellation,
+        )
+        .unwrap();
+        assert!(
+            matches!(provider.session_fork(context.clone(), request.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::SessionMissing)
+        );
+        tokio::time::advance(std::time::Duration::from_millis(10)).await;
+        assert!(tokio::time::Instant::now() >= context.deadline());
+        assert!(
+            matches!(provider.session_fork(context.clone(), request.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::SessionMissing)
+        );
+        let (_, cancellation) = forge_provider_api::OperationCancellation::channel();
+        let changed_context = OperationContext::new(
+            context.id().clone(),
+            std::time::Duration::from_secs(10),
+            cancellation,
+        )
+        .unwrap();
+        assert!(
+            matches!(provider.session_fork(changed_context, request).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::OperationConflict)
+        );
+        provider.shutdown(operation_context()).await.unwrap();
+    }
+
+    struct LeaseProbe(Arc<std::sync::atomic::AtomicUsize>);
+    impl forge_provider_api::ResourceLease for LeaseProbe {}
+    impl Drop for LeaseProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Replay identities cannot retain native callback/profile leases after successful close.
+    #[tokio::test]
+    async fn retained_open_identity_does_not_keep_resource_lease_alive_after_close() {
+        let (_directory, provider, mut request) = failed_open_fixture(false);
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let lease = Arc::new(LeaseProbe(drops.clone()));
+        let weak = Arc::downgrade(&lease);
+        request.resource_lease = Some(lease);
+        let opened = provider
+            .session_open(operation_context(), request)
+            .await
+            .unwrap();
+        provider
+            .session_close(operation_context(), &opened.binding.id)
+            .await
+            .unwrap();
+        assert!(weak.upgrade().is_none());
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        provider.shutdown(operation_context()).await.unwrap();
+    }
+
+    /// Identical text or history does not let another delivery attempt claim an accepted input.
+    #[tokio::test]
+    async fn reconciliation_rejects_receipts_from_another_input_or_attempt() {
+        let provider = provider();
+        for (input, attempt) in [("other-input", "attempt"), ("input", "other-attempt")] {
+            let token = checkpoint(true, input, attempt);
+            let mut request = reconciliation(token.clone());
+            request.accepted_receipts.push(token);
+            assert!(
+                matches!(provider.input_reconcile(operation_context(), request).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::HistoryConflict)
+            );
+        }
+    }
+
+    struct IgnoreTrace;
+    impl forge_provider_api::trace::ProviderTrace for IgnoreTrace {
+        fn record(&self, _: forge_provider_api::trace::ProviderTraceRecord) {}
+    }
+
+    /// Unsupported native isolation must fail before an invalid launch command can run.
+    #[tokio::test]
+    async fn isolated_text_is_rejected_before_native_runtime_dispatch() {
+        let provider = provider();
+        let result = provider
+            .session_open(
+                operation_context(),
+                forge_provider_api::SessionRequest {
+                    owner: forge_provider_api::ExecutionOwner::root("isolated"),
+                    mode: forge_provider_api::SessionMode::Background,
+                    workspace: "must-not-inspect".into(),
+                    history: forge_provider_api::SessionHistory::IsolatedText(
+                        forge_provider_api::IsolatedTextPolicy::new(),
+                    ),
+                    configuration: forge_provider_api::SessionConfiguration {
+                        model: Default::default(),
+                        access: Default::default(),
+                        approval: forge_provider_api::approval::ApprovalMode::Ask,
+                        resources: Default::default(),
+                    },
+                    resource_lease: None,
+                    tools: Vec::new(),
+                    tool_endpoint: None,
+                    system_instructions: "supplied only".into(),
+                    trace: Arc::new(IgnoreTrace),
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(ProviderError::Unsupported(
+                forge_provider_api::capability::UnsupportedCapability(
+                    forge_provider_api::capability::ProviderFeature::TextGeneration
+                )
+            ))
+        ));
+        provider.shutdown(operation_context()).await.unwrap();
+    }
+
+    /// Persisted exact evidence resolves acceptance after losing the original live binding.
+    #[tokio::test]
+    async fn reconciliation_recovers_exact_acceptance_without_a_live_binding() {
+        let provider = provider();
+        let token = checkpoint(true, "input", "attempt");
+        let mut request = reconciliation(token.clone());
+        request.accepted_receipts.push(token);
+        assert!(matches!(
+            provider
+                .input_reconcile(operation_context(), request)
+                .await
+                .unwrap(),
+            forge_provider_api::SubmissionEvidence::Accepted { .. }
+        ));
+    }
 }

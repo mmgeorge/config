@@ -204,7 +204,7 @@ pub(super) async fn execute(
 pub(in crate::tools) enum PreparedQuestionWait {
     Owner {
         events: crate::exchange::QuestionEvents,
-        creation: crate::exchange::QuestionCreation,
+        creation: Box<crate::exchange::QuestionCreation>,
     },
     #[cfg(test)]
     Local(crate::question::OwnedQuestionWait),
@@ -216,7 +216,7 @@ impl PreparedQuestionWait {
         self,
     ) -> crate::tools::ToolResult<crate::question::OwnedQuestionWait> {
         match self {
-            Self::Owner { events, creation } => Ok(events.begin_wait(creation).await?),
+            Self::Owner { events, creation } => Ok(events.begin_wait(*creation).await?),
             #[cfg(test)]
             Self::Local(wait) => Ok(wait),
         }
@@ -255,7 +255,7 @@ pub(in crate::tools) fn prepare_wait(
     if let Some(events) = &runtime.context.question_events {
         return Ok(PreparedQuestionWait::Owner {
             events: events.clone(),
-            creation: crate::exchange::QuestionCreation::from_tool(
+            creation: Box::new(crate::exchange::QuestionCreation::from_tool(
                 super::state::tool_call(runtime, invocation)?
                     .context("question creation has no authenticated tool call")?,
                 exchange.into(),
@@ -267,7 +267,7 @@ pub(in crate::tools) fn prepare_wait(
                     crate::exchange::QuestionCreationOrigin::Workflow
                 },
                 authority.context("question creation has no captured tool authority")?,
-            )?,
+            )?),
         });
     }
     #[cfg(test)]

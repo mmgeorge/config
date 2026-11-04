@@ -11,12 +11,33 @@ pub struct GoalRecord {
     pub state: GoalState,
     #[serde(flatten)]
     pub continuation: ContinuationBudget,
-    pub native: bool,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
 
-pub use forge_provider_api::completion::{GoalState, TurnEvidence};
+pub use forge_provider_api::completion::TurnEvidence;
+
+/// Track the Harness-owned lifecycle of one durable goal.
+///
+/// Harness applies total-turn and no-progress limits through [`ContinuationBudget`].
+/// Provider execution failures pause the task through the ordinary failure path;
+/// adapters do not publish native goal states or token-budget transitions.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalState {
+    /// Continue while progress and turn limits permit.
+    Active,
+    /// Await an explicit user resume request.
+    Paused,
+    /// Retain a goal whose completion gates passed.
+    Complete,
+    /// Await resolution of a reported constraint.
+    Blocked,
+    /// Await intervention after progress or continuation limits stop work.
+    Stalled,
+    /// Retain history after the user clears the goal.
+    Cleared,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GoalTermination {
@@ -39,7 +60,6 @@ pub enum ContinuationDecision {
     Complete,
     Blocked,
     Stalled,
-    Settled,
     Stop,
 }
 
@@ -49,12 +69,7 @@ impl GoalRecord {
         if self.state == GoalState::Active {
             self.updated_at_ms = now_ms;
         }
-        observe(
-            &mut self.state,
-            &mut self.continuation,
-            self.native,
-            evidence,
-        )
+        observe(&mut self.state, &mut self.continuation, evidence)
     }
 
     /// Resume goal execution with a fresh continuation budget.
@@ -68,19 +83,10 @@ impl GoalRecord {
 pub(crate) fn observe(
     state: &mut GoalState,
     continuation: &mut ContinuationBudget,
-    native: bool,
     evidence: TurnEvidence,
 ) -> ContinuationDecision {
     if *state != GoalState::Active {
         return ContinuationDecision::Stop;
-    }
-    if native
-        && let Some(native_state) = evidence
-            .native_state
-            .filter(|state| *state != GoalState::Active)
-    {
-        *state = native_state;
-        return ContinuationDecision::Settled;
     }
     if evidence.structured_complete {
         *state = GoalState::Complete;
@@ -108,8 +114,8 @@ mod test {
 
     #[test]
     fn goal_control_keeps_its_outcome_with_the_admitted_revision() {
-        let previous = crate::task::Task::goal("Previous".into(), Default::default(), false, 1);
-        let current = crate::task::Task::goal("Current".into(), Default::default(), false, 2);
+        let previous = crate::task::Task::goal("Previous".into(), Default::default(), 1);
+        let current = crate::task::Task::goal("Current".into(), Default::default(), 2);
         for termination in [GoalTermination::Complete, GoalTermination::Blocked] {
             let output = crate::provider::ProviderOutput {
                 event: Vec::new(),
@@ -155,7 +161,6 @@ mod test {
             objective: "finish".into(),
             state: GoalState::Active,
             continuation: ContinuationBudget::default(),
-            native: false,
             created_at_ms: 0,
             updated_at_ms: 0,
         }
@@ -208,68 +213,6 @@ mod test {
     }
 
     #[test]
-    fn native_settlement_overrides_progress_and_freezes_continuation() {
-        for state in [
-            GoalState::Paused,
-            GoalState::Complete,
-            GoalState::Blocked,
-            GoalState::UsageLimited,
-            GoalState::BudgetLimited,
-            GoalState::Cleared,
-        ] {
-            let mut record = goal();
-            record.native = true;
-            let evidence = TurnEvidence {
-                native_state: Some(state),
-                workspace_changed: true,
-                structured_complete: true,
-                ..TurnEvidence::default()
-            };
-            assert_eq!(record.observe(evidence, 20), ContinuationDecision::Settled);
-            assert_eq!(record.state, state);
-            assert_eq!(record.continuation.turn_count, 0);
-            assert_eq!(record.observe(evidence, 40), ContinuationDecision::Stop);
-            assert_eq!(record.updated_at_ms, 20);
-            if matches!(
-                state,
-                GoalState::Paused
-                    | GoalState::Blocked
-                    | GoalState::UsageLimited
-                    | GoalState::BudgetLimited
-            ) {
-                record.resume(50);
-                assert_eq!(
-                    record.observe(
-                        TurnEvidence {
-                            workspace_changed: true,
-                            ..TurnEvidence::default()
-                        },
-                        60
-                    ),
-                    ContinuationDecision::Continue
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn native_settlement_cannot_stop_harness_owned_plan_execution() {
-        let mut record = goal();
-        assert_eq!(
-            record.observe(
-                TurnEvidence {
-                    native_state: Some(GoalState::Cleared),
-                    workspace_changed: true,
-                    ..TurnEvidence::default()
-                },
-                20
-            ),
-            ContinuationDecision::Continue
-        );
-        assert_eq!(record.state, GoalState::Active);
-    }
-
-    #[test]
     fn inactive_goals_preserve_state_and_time_until_explicit_resume() {
         for state in [
             GoalState::Paused,
@@ -283,10 +226,6 @@ mod test {
             record.updated_at_ms = 10;
             for evidence in [
                 TurnEvidence::default(),
-                TurnEvidence {
-                    native_state: Some(GoalState::Complete),
-                    ..TurnEvidence::default()
-                },
                 TurnEvidence {
                     structured_complete: true,
                     ..TurnEvidence::default()

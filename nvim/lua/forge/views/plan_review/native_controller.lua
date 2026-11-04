@@ -205,9 +205,12 @@ local function submit(review, method, params)
   if review.plan.historical_revision then return end
   if session.harness.busy then notifications.info("A Harness request is already running", "ForgePlanReview") return end
   session.harness.busy = true
+  local submitted_state = session.harness
   local controller = require("forge.views.harness.controller")
   controller.refresh_winbar()
   local queued = review.owner.submit(method, params, function(result, failure)
+    if session.harness ~= submitted_state or not submitted_state.session
+      or submitted_state.session.id ~= review.session_id then return end
     session.harness.busy = false
     controller.refresh_winbar()
     if failure then
@@ -221,7 +224,7 @@ local function submit(review, method, params)
       and current.plan.review_digest == review.plan.review_digest
       and current.plan.historical_revision == review.plan.historical_revision and current or review
     if not completed.owner.closed then close_review(completed) end
-    if result then controller.activate_snapshot(result) end
+    controller.synchronize_state()
     controller.render()
   end)
   if queued and (review.owner.submission_pending or review.owner.pending_operation) then hide_review(review) end

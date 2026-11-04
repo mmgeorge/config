@@ -6,7 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 use super::command::{Command, CommandFailure, InputCommand, InputRevision};
 use super::queue::QueuedCommand;
 use crate::input::{InputDelivery, InputUpdate};
-use crate::provider::submission::{Submission, SubmissionRecord, SubmissionState};
+use crate::provider::submission::{Submission, SubmissionReconciliation, SubmissionState};
 
 /// Hold a command's active stage and resolver ownership in the persistent driver.
 pub(super) struct InputCommandRun {
@@ -92,7 +92,7 @@ pub(super) enum PreparedInput {
     Reconciled {
         input: InputRevision,
         submission: Arc<Submission>,
-        record: Box<SubmissionRecord>,
+        observation: Box<SubmissionReconciliation>,
     },
 }
 
@@ -152,14 +152,14 @@ fn prepare_retry(input: &InputRevision, services: &OwnerServices) -> InputStage 
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        let record = submission
-            .reconcile(provider.as_ref())
+        let observation = submission
+            .observe_reconciliation(provider.as_ref())
             .await
             .map_err(|_| CommandFailure::DeliveryUncertain)?;
         Ok(PreparedInput::Reconciled {
             input,
             submission,
-            record: Box::new(record),
+            observation: Box::new(observation),
         })
     }))
 }
@@ -207,7 +207,7 @@ pub(super) fn apply_input(
         PreparedInput::Reconciled {
             input,
             submission,
-            record,
+            observation,
         } => {
             let snapshot = services
                 .input
@@ -227,6 +227,9 @@ pub(super) fn apply_input(
                     crate::input::InputRejection::RevisionChanged.into(),
                 ));
             }
+            let record = submission
+                .apply_reconciliation(*observation)
+                .map_err(InputCommandFailure::Domain)?;
             match &record.delivery {
                 SubmissionState::Accepted { .. } => services
                     .input

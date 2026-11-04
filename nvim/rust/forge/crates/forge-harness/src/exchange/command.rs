@@ -719,11 +719,11 @@ pub(crate) enum CommandFailure {
     /// Restore authority or application failed without silently retargeting the journal.
     #[error(transparent)]
     Rollback(#[from] RollbackFailure),
-    /// Task authority, its commit, or required native-goal synchronization failed.
+    /// Task authority, its commit, or journaled input scheduling failed.
     #[error(transparent)]
     Task(#[from] TaskCommandFailure),
-    /// Task state committed, but required goal synchronization did not establish completion.
-    #[error("task change committed, but native synchronization failed: {failure}")]
+    /// Task state committed, but initial journaled input scheduling failed.
+    #[error("task change committed, but journaled input scheduling failed: {failure}")]
     TaskSynchronization {
         committed: TaskCommandCheckpoint,
         failure: TaskSynchronizationFailure,
@@ -833,9 +833,9 @@ pub(crate) enum CommandOutcome {
     Agent(AgentOutcome),
     /// The captured restore operation committed its finite result.
     Rollback(RollbackOutcome),
-    /// Task policy or lifecycle committed and any required native synchronization settled.
+    /// Task policy or lifecycle committed and any required journaled input was scheduled.
     Task(TaskCommandOutcome),
-    /// Context replacement was confirmed and any required continuation handoff completed.
+    /// Context replacement was confirmed and any required continuation was retained by the owner.
     Compacted(ContextCompactionOutcome),
     /// Owned work settled or the owner established that there was no current work.
     Cancelled(CancellationOutcome),

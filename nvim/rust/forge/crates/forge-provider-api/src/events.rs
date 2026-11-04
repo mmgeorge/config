@@ -14,14 +14,15 @@ pub struct ProviderEventSink {
     sender: MessageSender,
     failure: std::sync::Arc<std::sync::Mutex<Option<EventDeliveryError>>>,
     delivery: std::sync::Arc<tokio::sync::Mutex<()>>,
+    published: std::sync::Arc<std::sync::atomic::AtomicU64>,
     observer: Vec<std::sync::Arc<dyn EventObserver>>,
 }
 
 pub struct ProviderEventStream {
     binding_id: BindingId,
     input: EventReceiver,
-    pending: Option<ProviderEvent>,
-    queued: Option<ProviderEvent>,
+    pending: Option<BoundProviderEvent>,
+    queued: Option<BoundProviderEvent>,
     deadline: tokio::time::Instant,
     deferred_error: Option<EventDeliveryError>,
 }
@@ -30,6 +31,8 @@ struct EventReceiver {
     receiver: MessageReceiver,
     failure: std::sync::Arc<std::sync::Mutex<Option<EventDeliveryError>>>,
     transfer: Option<(usize, usize, usize, String)>,
+    binding_id: BindingId,
+    received: crate::EventSequence,
 }
 
 #[derive(Clone, Debug)]
@@ -119,14 +122,17 @@ pub fn channel(
             sender,
             failure: failure.clone(),
             delivery: Default::default(),
+            published: Default::default(),
             observer: Vec::new(),
         },
         ProviderEventStream {
-            binding_id,
+            binding_id: binding_id.clone(),
             input: EventReceiver {
                 receiver,
                 failure,
                 transfer: None,
+                binding_id,
+                received: crate::EventSequence::default(),
             },
             pending: None,
             queued: None,
@@ -142,6 +148,26 @@ impl ProviderEventSink {
         &self.binding_id
     }
 
+    /// Get the final successfully published sequence, independently of owner consumption.
+    pub fn watermark(&self) -> crate::EventSequence {
+        crate::EventSequence::new(self.published.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Create the next envelope while the shared delivery lock serializes publishers.
+    fn envelope(&self, event: ProviderEvent) -> Result<BoundProviderEvent, EventDeliveryError> {
+        let sequence = self
+            .watermark()
+            .successor()
+            .ok_or(EventDeliveryError::Observation(
+                crate::ObservationFailure::Protocol,
+            ))?;
+        Ok(BoundProviderEvent {
+            binding_id: self.binding_id.clone(),
+            sequence,
+            event,
+        })
+    }
+
     /// Attach a host observer while retaining the same ordered delivery channel.
     pub fn with_observer(mut self, observer: std::sync::Arc<dyn EventObserver>) -> Self {
         self.observer.push(observer);
@@ -155,7 +181,7 @@ impl ProviderEventSink {
     pub fn invocation_scope(&self) -> Result<&InvocationScope, ProviderError> {
         self.scope.invocation().ok_or_else(|| {
             ProviderError::Failure(crate::error::ProviderFailure::new(
-                crate::error::ProviderOperation::AdmitInput,
+                crate::error::ProviderOperation::InputSubmit,
                 crate::error::ProviderFailureKind::Rejected,
             ))
         })
@@ -169,9 +195,38 @@ impl ProviderEventSink {
         self.bind_scope(EventScope::from(invocation.clone()))
     }
 
+    /// Route host output for a successor invocation within the same owner and exchange.
+    /// This creates no dispatch or callback authority. Native invocation sinks remain exact;
+    /// the host uses this only after it owns admission of a fresh ordinary retry input.
+    pub fn successor_invocation_sink(
+        &self,
+        invocation: &InvocationScope,
+    ) -> Result<Self, EventDeliveryError> {
+        let original =
+            self.scope
+                .invocation()
+                .ok_or_else(|| EventDeliveryError::OwnershipMismatch {
+                    expected: Box::new(self.scope.clone()),
+                    received: Box::new(invocation.clone().into()),
+                })?;
+        if original.owner != invocation.owner
+            || original.exchange_id != invocation.exchange_id
+            || original.invocation_id == invocation.invocation_id
+        {
+            return Err(EventDeliveryError::OwnershipMismatch {
+                expected: Box::new(self.scope.clone()),
+                received: Box::new(invocation.clone().into()),
+            });
+        }
+        Ok(Self {
+            scope: invocation.clone().into(),
+            ..self.clone()
+        })
+    }
+
     /// Bind an owner-wide session publisher to an original event scope.
     pub fn bind_scope(&self, received: EventScope) -> Result<Self, EventDeliveryError> {
-        if !matches!(self.scope, EventScope::SessionOperation { .. })
+        if !matches!(self.scope, EventScope::Binding { .. })
             || self.scope.owner() != received.owner()
         {
             return Err(EventDeliveryError::OwnershipMismatch {
@@ -192,6 +247,14 @@ impl ProviderEventSink {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
         {
+            return Err(error);
+        }
+        if let ProviderEvent::Settled { settlement } = event
+            && settlement.binding_id != self.binding_id
+        {
+            let error =
+                EventDeliveryError::Observation(crate::ObservationFailure::OwnershipConflict);
+            self.fail(error.clone());
             return Err(error);
         }
         let received = event.scope();
@@ -227,24 +290,74 @@ impl ProviderEventSink {
         Ok(())
     }
 
+    /// Publish successful collection with its exact stream position under the shared delivery lock.
+    /// The returned receipt and event carry the same watermark, even with concurrent publishers.
+    pub async fn send_settlement(
+        &self,
+        mut settlement: crate::InvocationSettlement,
+    ) -> Result<crate::InvocationSettlement, EventDeliveryError> {
+        let _delivery = self.delivery.lock().await;
+        settlement.watermark =
+            self.watermark()
+                .successor()
+                .ok_or(EventDeliveryError::Observation(
+                    crate::ObservationFailure::Protocol,
+                ))?;
+        let event = ProviderEvent::Settled {
+            settlement: Box::new(settlement.clone()),
+        };
+        self.validate(&event)?;
+        let mut additional = Vec::new();
+        for observer in &self.observer {
+            observer
+                .before_delivery(&event)
+                .inspect_err(|error| self.fail(error.clone()))?;
+            additional.extend(
+                observer
+                    .additional_events(&event)
+                    .inspect_err(|error| self.fail(error.clone()))?,
+            );
+        }
+        self.send_encoded(event).await?;
+        for event in additional {
+            self.send_encoded(event).await?;
+        }
+        Ok(settlement)
+    }
+
+    /// Encode and publish an event under the shared delivery lock before advancing its watermark.
     async fn send_encoded(&self, event: ProviderEvent) -> Result<(), EventDeliveryError> {
+        let event = self.envelope(event)?;
         let transfer = forge_protocol::transfer::JsonTransfer::new(&event).map_err(|error| {
             self.sender.record_failure(&error);
             EventDeliveryError::transport(error)
         })?;
         if transfer.total_bytes() < forge_protocol::MAX_FRAME_BYTES / 2 {
-            return self
-                .sender
-                .send_wait(event)
-                .await
-                .map_err(EventDeliveryError::queue);
-        }
-        for part in transfer {
             self.sender
-                .send_wait(serde_json::json!({"forge_event_part": part}))
+                .send_wait(&event)
                 .await
                 .map_err(EventDeliveryError::queue)?;
+        } else {
+            for part in transfer {
+                self.sender
+                    .send_wait(serde_json::json!({"forge_event_part": part}))
+                    .await
+                    .map_err(EventDeliveryError::queue)?;
+            }
         }
+        self.published
+            .store(event.sequence.get(), std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Publish a bounded envelope synchronously while preserving the same sequence protocol.
+    fn send_immediate(&self, event: ProviderEvent) -> Result<(), EventDeliveryError> {
+        let event = self.envelope(event)?;
+        self.sender
+            .send(&event)
+            .map_err(EventDeliveryError::queue)?;
+        self.published
+            .store(event.sequence.get(), std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -268,9 +381,9 @@ impl ProviderEventSink {
                 self.fail(error.clone());
             })?);
         }
-        self.sender.send(event).map_err(EventDeliveryError::queue)?;
+        self.send_immediate(event)?;
         for event in additional {
-            self.sender.send(event).map_err(EventDeliveryError::queue)?;
+            self.send_immediate(event)?;
         }
         Ok(())
     }
@@ -296,7 +409,7 @@ impl ProviderEventSink {
 }
 
 impl EventReceiver {
-    fn accept(&mut self, bytes: &[u8]) -> Result<Option<ProviderEvent>, EventDeliveryError> {
+    fn accept(&mut self, bytes: &[u8]) -> Result<Option<BoundProviderEvent>, EventDeliveryError> {
         let value: serde_json::Value =
             serde_json::from_slice(bytes).map_err(EventDeliveryError::transport)?;
         let Some(part) = value.get("forge_event_part") else {
@@ -308,9 +421,8 @@ impl EventReceiver {
                     expected_bytes: *bytes,
                 });
             }
-            return serde_json::from_value(value)
-                .map(Some)
-                .map_err(EventDeliveryError::transport);
+            let event = serde_json::from_value(value).map_err(EventDeliveryError::transport)?;
+            return self.accept_envelope(event).map(Some);
         };
         let part: forge_protocol::transfer::JsonPart =
             serde_json::from_value(part.clone()).map_err(EventDeliveryError::transport)?;
@@ -353,12 +465,26 @@ impl EventReceiver {
                 expected_bytes: length,
             });
         }
-        serde_json::from_str(&payload)
-            .map(Some)
-            .map_err(EventDeliveryError::transport)
+        let event = serde_json::from_str(&payload).map_err(EventDeliveryError::transport)?;
+        self.accept_envelope(event).map(Some)
     }
 
-    fn closed(&self) -> Result<Option<ProviderEvent>, EventDeliveryError> {
+    /// Reject foreign bindings and gaps before exposing an event to the owner.
+    fn accept_envelope(
+        &mut self,
+        event: BoundProviderEvent,
+    ) -> Result<BoundProviderEvent, EventDeliveryError> {
+        if event.binding_id != self.binding_id || self.received.successor() != Some(event.sequence)
+        {
+            return Err(EventDeliveryError::Observation(
+                crate::ObservationFailure::Protocol,
+            ));
+        }
+        self.received = event.sequence;
+        Ok(event)
+    }
+
+    fn closed(&self) -> Result<Option<BoundProviderEvent>, EventDeliveryError> {
         if let Some((sequence, count, bytes, payload)) = &self.transfer {
             return Err(EventDeliveryError::IncompleteTransfer {
                 received_parts: *sequence,
@@ -379,7 +505,7 @@ impl EventReceiver {
             .unwrap_or(error)
     }
 
-    async fn receive(&mut self) -> Result<Option<ProviderEvent>, EventDeliveryError> {
+    async fn receive(&mut self) -> Result<Option<BoundProviderEvent>, EventDeliveryError> {
         loop {
             let frame = match self.receiver.try_drain() {
                 Ok(frame) => Some(frame),
@@ -402,7 +528,7 @@ impl EventReceiver {
         }
     }
 
-    fn try_receive(&mut self) -> Result<ProviderEvent, EventDeliveryError> {
+    fn try_receive(&mut self) -> Result<BoundProviderEvent, EventDeliveryError> {
         loop {
             let frame = match self.receiver.try_drain() {
                 Ok(frame) => frame,
@@ -424,6 +550,11 @@ impl EventReceiver {
 }
 
 impl ProviderEventStream {
+    /// Get the exact live generation whose events this stream consumes.
+    pub fn binding_id(&self) -> &BindingId {
+        &self.binding_id
+    }
+
     pub fn try_next(&mut self) -> Result<Option<BoundProviderEvent>, EventDeliveryError> {
         match self.try_recv() {
             Ok(event) => Ok(Some(event)),
@@ -454,7 +585,7 @@ impl ProviderEventStream {
             self.deadline = tokio::time::Instant::now() + Duration::from_millis(16);
         }
         while let Some(pending) = self.pending.as_mut() {
-            if !batchable(pending) || output_bytes(pending) >= 64 * 1024 {
+            if !batchable(&pending.event) || output_bytes(&pending.event) >= 64 * 1024 {
                 break;
             }
             let event = match tokio::time::timeout_at(self.deadline, self.input.receive()).await {
@@ -465,15 +596,13 @@ impl ProviderEventStream {
                 }
                 Ok(Ok(Some(event))) => event,
             };
-            if !merge_output(pending, &event) {
+            if !merge_output(&mut pending.event, &event.event) {
                 self.queued = Some(event);
                 break;
             }
+            pending.sequence = event.sequence;
         }
-        Ok(self.pending.take().map(|event| BoundProviderEvent {
-            binding_id: self.binding_id.clone(),
-            event,
-        }))
+        Ok(self.pending.take())
     }
 
     pub fn try_recv(&mut self) -> Result<BoundProviderEvent, EventDeliveryError> {
@@ -487,7 +616,7 @@ impl ProviderEventStream {
             Some(event) => event,
             None => self.input.try_receive()?,
         };
-        while batchable(&event) && output_bytes(&event) < 64 * 1024 {
+        while batchable(&event.event) && output_bytes(&event.event) < 64 * 1024 {
             let next = match self.input.try_receive() {
                 Ok(event) => event,
                 Err(EventDeliveryError::Empty | EventDeliveryError::Closed) => break,
@@ -496,15 +625,13 @@ impl ProviderEventStream {
                     break;
                 }
             };
-            if !merge_output(&mut event, &next) {
+            if !merge_output(&mut event.event, &next.event) {
                 self.queued = Some(next);
                 break;
             }
+            event.sequence = next.sequence;
         }
-        Ok(BoundProviderEvent {
-            binding_id: self.binding_id.clone(),
-            event,
-        })
+        Ok(event)
     }
 }
 
@@ -643,6 +770,118 @@ mod tests {
         Ok(())
     }
 
+    /// Preserve emitted watermark evidence when output batching combines many stream positions.
+    #[tokio::test]
+    async fn batched_events_preserve_published_watermark_and_lifecycle_barriers()
+    -> anyhow::Result<()> {
+        let (sink, mut stream) = channel(binding(), scope());
+        assert_eq!(sink.watermark(), crate::EventSequence::new(0));
+        sink.send_wait(message("one", MessageUpdate::Delta { text: "a".into() }))
+            .await?;
+        let sibling = sink.clone();
+        sibling
+            .send_wait(message("one", MessageUpdate::Delta { text: "b".into() }))
+            .await?;
+        sink.send_wait(ProviderEvent::Runtime {
+            scope: scope(),
+            update: crate::RuntimeUpdate::ForegroundIdle,
+        })
+        .await?;
+        assert_eq!(sink.watermark(), crate::EventSequence::new(3));
+        let output = stream.recv().await?.unwrap();
+        assert_eq!(output.sequence, crate::EventSequence::new(2));
+        assert_eq!(output.event.message_delta(), Some("ab"));
+        let barrier = stream.recv().await?.unwrap();
+        assert_eq!(barrier.sequence, sink.watermark());
+        assert!(matches!(
+            barrier.event,
+            ProviderEvent::Runtime {
+                update: crate::RuntimeUpdate::ForegroundIdle,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    /// Correlate the settlement result with its actual envelope under concurrent publication.
+    #[tokio::test]
+    async fn settlement_receipt_matches_envelope_under_concurrent_publication() -> anyhow::Result<()>
+    {
+        let (sink, mut stream) = channel(binding(), scope());
+        let publishing = async {
+            for received_bytes in 0..8 {
+                sink.send_wait(ProviderEvent::Runtime {
+                    scope: scope(),
+                    update: crate::RuntimeUpdate::Progress { received_bytes },
+                })
+                .await?;
+            }
+            Ok::<(), EventDeliveryError>(())
+        };
+        let settlement = crate::InvocationSettlement {
+            binding_id: binding(),
+            scope: scope(),
+            result: crate::ExecutionResult::Completed {
+                completion: crate::completion::ProviderCompletion::default().into(),
+            },
+            watermark: crate::EventSequence::default(),
+        };
+        let (published, receipt) = tokio::join!(publishing, sink.send_settlement(settlement));
+        published?;
+        let receipt = receipt?;
+        let mut observed = None;
+        for _ in 0..9 {
+            let envelope = stream
+                .recv()
+                .await?
+                .expect("all nine envelopes were published");
+            if let ProviderEvent::Settled { settlement } = envelope.event {
+                assert_eq!(settlement.watermark, envelope.sequence);
+                observed = Some(settlement.watermark);
+            }
+        }
+        assert_eq!(observed, Some(receipt.watermark));
+        Ok(())
+    }
+
+    /// Rebind host output only within one exchange while keeping native invocation sinks immutable.
+    #[test]
+    fn successor_output_scope_rejects_same_invocation_and_other_exchanges() {
+        let original = scope();
+        let (sink, _stream) = channel(binding(), original.clone());
+        assert!(sink.successor_invocation_sink(&original).is_err());
+        let mut successor = original.clone();
+        successor.invocation_id = "successor".into();
+        assert!(sink.successor_invocation_sink(&successor).is_ok());
+        assert!(sink.invocation_sink(&successor).is_err());
+        successor.exchange_id = "unrelated".into();
+        assert!(sink.successor_invocation_sink(&successor).is_err());
+    }
+
+    /// Reject a missing normalized event instead of satisfying a lifecycle watermark falsely.
+    #[tokio::test]
+    async fn sequence_gap_is_observation_failure_before_owner_consumption() {
+        let (sink, mut stream) = channel(binding(), scope());
+        sink.sender
+            .send(BoundProviderEvent {
+                binding_id: binding(),
+                sequence: crate::EventSequence::new(2),
+                event: message(
+                    "missing-first",
+                    MessageUpdate::Delta {
+                        text: "unsafe".into(),
+                    },
+                ),
+            })
+            .unwrap();
+        assert!(matches!(
+            stream.recv().await,
+            Err(EventDeliveryError::Observation(
+                crate::ObservationFailure::Protocol
+            ))
+        ));
+    }
+
     /// Preserve host observations immediately after their native event on the same channel.
     #[tokio::test]
     async fn host_observer_preserves_native_event_order() -> anyhow::Result<()> {
@@ -776,9 +1015,8 @@ mod tests {
         let original = scope();
         let (session_sink, mut stream) = channel(
             binding(),
-            EventScope::SessionOperation {
+            EventScope::Binding {
                 owner: original.owner.clone(),
-                operation_id: "session-observer".into(),
             },
         );
         let retained_sink = session_sink.invocation_sink(&original)?;

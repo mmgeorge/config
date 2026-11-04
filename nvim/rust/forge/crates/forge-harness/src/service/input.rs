@@ -113,35 +113,19 @@ impl SessionController {
         let sink = sink.clone();
         *task = Some(tokio::spawn(async move {
             let mut jobs = JoinSet::new();
-            let mut native_error_reported = false;
             loop {
                 let notified = input.changed.notified();
                 let state_changed = admission_changed.notified();
                 let Some(controller) = owner.upgrade() else {
                     break;
                 };
-                if controller.input_stopping.load(Ordering::Acquire) {
+                if controller.input_stopping.load(Ordering::Acquire)
+                    || controller.coordinator.execution.is_closed()
+                {
                     while jobs.join_next().await.is_some() {}
                     break;
                 }
-                let native_result = controller.synchronize_native_goal().await;
-                let native_retry = native_result.is_err();
-                if let Err(error) = &native_result {
-                    if !native_error_reported {
-                        let _ = sink.send_event(SessionEvent {
-                            session_id: controller.observer.session_id().into(), event: "provider_event".into(),
-                            payload: json!({"kind":"error","code":error.code(),"text":error.to_string()}),
-                        }).await;
-                    }
-                    native_error_reported = true;
-                } else {
-                    native_error_reported = false;
-                }
-                let progress = if native_retry {
-                    Ok(InputProgress::Waiting)
-                } else {
-                    controller.admit_input(&sink, &mut jobs).await
-                };
+                let progress = controller.admit_input(&sink, &mut jobs).await;
                 let wait_execution = match progress {
                     Ok(InputProgress::Started) => continue,
                     Ok(InputProgress::WaitExecution) => true,
@@ -158,7 +142,6 @@ impl SessionController {
                 let admission = controller.coordinator.execution.clone();
                 drop(controller);
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(1)), if native_retry => {},
                     _ = notified => {},
                     _ = state_changed => {},
                     result = jobs.join_next_with_id(), if !jobs.is_empty() => {
@@ -181,34 +164,6 @@ impl SessionController {
             }
         }));
         self.coordinator.submissions.changed.notify_one();
-        Ok(())
-    }
-
-    /// Request owner-controlled synchronization after provider startup has become observable.
-    async fn synchronize_native_goal(
-        &self,
-    ) -> Result<Option<crate::exchange::NativeGoalSelection>, crate::exchange::NativeGoalError>
-    {
-        if !self
-            .observer
-            .native_goal_supported()
-            .map_err(|_| crate::exchange::NativeGoalError::StateUnavailable)?
-            || !self.provider_ready().await
-        {
-            return Ok(None);
-        }
-        self.exchange_owner.synchronize_native_goal().await
-    }
-
-    /// Retain the previous fixture observation while synchronization authority lives in the owner.
-    #[cfg(test)]
-    pub(super) async fn reconcile_native_goal(
-        &self,
-        applied: &mut Option<crate::exchange::NativeGoalSelection>,
-    ) -> Result<()> {
-        if let Some(selection) = self.synchronize_native_goal().await? {
-            *applied = Some(selection);
-        }
         Ok(())
     }
 
@@ -237,13 +192,19 @@ impl SessionController {
             return Ok(InputProgress::Waiting);
         };
         let snapshot = self.observer.input_readiness()?;
+        let engine = self
+            .broker
+            .lock()
+            .await
+            .execution_registry()
+            .existing_owner(&crate::provider::ExecutionOwner::root(&snapshot.session.id))?;
+        let native_active = engine
+            .map(|engine| engine.active_invocation_scope())
+            .transpose()?
+            .flatten()
+            .is_some();
         let steering_available = self.coordinator.execution.available_permits() == 0
-            && (self.parent_input.is_active()
-                || snapshot.native_steer
-                    && self
-                        .provider_handle()
-                        .has_active_turn(&snapshot.session.id)
-                        .await);
+            && (self.parent_input.is_active() || snapshot.native_steer && native_active);
         let policy = if steering_available {
             crate::exchange::InputQueuePolicy::AllowSteering
         } else {
@@ -422,4 +383,42 @@ enum InputProgress {
     Started,
     WaitExecution,
     Waiting,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stop readiness after fatal admission closure without draining or dispatching queued input.
+    #[tokio::test]
+    async fn closed_execution_admission_stops_input_readiness_without_dispatch() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let controller =
+            SessionController::new(HarnessBroker::initialize(serde_json::from_value(json!({
+                "workspace":root.path(),"data_root":root.path().join("data"),
+                "client_id":"closed-readiness","provider":{"kind":"mock","command":[]},
+            }))?)?)?;
+        controller
+            .coordinator
+            .submissions
+            .apply(serde_json::from_value(json!({
+                "id":"queued-before-failure", "action":{"kind":"submit", "message":{
+                    "id":"preserved-input","text":"Keep this input for recovery","intent":"queue",
+                }},
+            }))?)?;
+        let before = controller.coordinator.submissions.snapshot()?;
+        controller.coordinator.execution.close();
+        let (messages, _output) = forge_protocol::outbound::channel();
+        controller.attach_input(&messages).await?;
+        let task = controller.input_task.lock().await.take().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), task).await??;
+        let after = controller.coordinator.submissions.snapshot()?;
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.messages.len(), 1);
+        assert_eq!(after.messages[0].id, "preserved-input");
+        assert_eq!(after.messages[0].delivery, InputDelivery::Queued);
+        assert!(controller.coordinator.execution.is_closed());
+        controller.finish_exchange_owner().await?;
+        Ok(())
+    }
 }

@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-/// Owns bounded provider-turn accounting for broker-controlled continuation loops.
+/// Own bounded turn and no-progress accounting for Harness continuation loops.
+///
+/// Exhausting either configured limit stops automatic continuation before another
+/// input is scheduled. Native goal state and provider token budgets do not alter
+/// this host-owned accounting.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContinuationBudget {
     pub turn_count: u32,

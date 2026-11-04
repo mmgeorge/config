@@ -85,7 +85,7 @@ impl AgentRuntime {
                         retry_admission.close();
                         engine.close_admission();
                         let collected = collect_interrupted_attempt(
-                            self.provider.as_ref(), &self.request, retry_admission.current_dispatch(), prompt.as_mut(),
+                            engine.as_ref(), retry_admission.current_scope().unwrap_or_else(|| scope.clone()), prompt.as_mut(),
                         );
                         let (settled, observation_error) = events.forward_until(&self, &owner,
                             tokio::time::timeout(std::time::Duration::from_secs(30), collected)).await;
@@ -105,7 +105,7 @@ impl AgentRuntime {
                             engine.close_admission();
                             // Keep the original readiness waiter alive until its interrupted native turn is settled.
                             let collected = collect_interrupted_attempt(
-                                self.provider.as_ref(), &self.request, retry_admission.current_dispatch(), prompt.as_mut(),
+                                engine.as_ref(), retry_admission.current_scope().unwrap_or_else(|| scope.clone()), prompt.as_mut(),
                             );
                             let (settled, observation_error) = events.forward_until(
                                 &self, &owner,
@@ -157,35 +157,8 @@ impl AgentRuntime {
         };
         drop(event_sink);
         drop(self.lsp_lease.take());
-        // Resolve native identity without stopping delivery from a bounded provider channel.
-        let runtime_key = self.request.runtime_key()?;
-        let (retained, observation_error) = events
-            .forward_until(
-                &self,
-                &owner,
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    self.provider.active_session_id_for(&runtime_key),
-                ),
-            )
-            .await;
-        if let Some(error) = observation_error {
-            preserve_child_failure(&mut output, error);
-        }
-        let retained = match retained {
-            Ok(Ok(retained)) => retained,
-            Ok(Err(error)) => {
-                preserve_child_failure(&mut output, error.into());
-                None
-            }
-            Err(_) => {
-                preserve_child_failure(
-                    &mut output,
-                    anyhow::anyhow!("child provider identity lookup exceeded 2 seconds"),
-                );
-                None
-            }
-        };
+        // Read identity already published by open or the ordered binding stream.
+        let retained = self.provider.retained_session_id(&owner).await;
         if let Err(error) = events.drain(&self, &owner).await {
             preserve_child_failure(&mut output, error);
         }
@@ -209,14 +182,6 @@ impl AgentRuntime {
             let (failure, observation_error) = events
                 .forward_until(&self, &owner, async {
                     let mut failure = Vec::new();
-                    if cancelled || output.is_err() {
-                        if let Err(error) = self.provider.cancel_session(&runtime_key).await {
-                            failure.push(format!("cancel: {error:#}"));
-                        }
-                        if let Err(error) = self.provider.cleanup_execution(&runtime_key).await {
-                            failure.push(format!("cleanup: {error:#}"));
-                        }
-                    }
                     if let Err(error) = self.execution_registry.begin_orderly_shutdown().await {
                         failure.push(format!("execution shutdown fence: {error:#}"));
                     }
@@ -288,28 +253,14 @@ impl AgentRuntime {
 
 /// Collect only an actually dispatched attempt; closed retry admission cannot start a later one.
 async fn collect_interrupted_attempt<Attempt>(
-    provider: &Provider,
-    request: &ProviderRequest,
-    dispatch: Option<crate::provider::DispatchObserver>,
-    mut attempt: std::pin::Pin<&mut Attempt>,
+    engine: &crate::provider::session_execution::SessionExecution,
+    scope: crate::provider::InvocationScope,
+    attempt: std::pin::Pin<&mut Attempt>,
 ) -> Result<ProviderCompletion>
 where
     Attempt: Future<Output = Result<ProviderCompletion>>,
 {
-    let handed_off = if let Some(mut dispatch) = dispatch {
-        tokio::select! {
-            biased;
-            output = attempt.as_mut() => return output,
-            evidence = dispatch.wait() => evidence.is_ok(),
-        }
-    } else {
-        false
-    };
-    if handed_off {
-        let key = request.runtime_key()?;
-        provider.cancel_session(&key).await?;
-        provider.cleanup_execution(&key).await?;
-    }
+    engine.cancel_exchange(scope).await?;
     attempt.await
 }
 

@@ -3,27 +3,11 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Represents the lifecycle state of one persistent harness goal.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GoalState {
-    Active,
-    Paused,
-    Complete,
-    Blocked,
-    UsageLimited,
-    BudgetLimited,
-    Stalled,
-    Cleared,
-}
-
 /// Represents observable evidence produced by one provider turn.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct TurnEvidence {
     pub workspace_changed: bool,
     pub tool_called: bool,
-    #[serde(default)]
-    pub native_state: Option<GoalState>,
     pub structured_complete: bool,
     pub structured_blocked: bool,
 }

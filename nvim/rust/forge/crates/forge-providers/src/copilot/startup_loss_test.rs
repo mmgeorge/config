@@ -1,6 +1,5 @@
 /// Observe producer failure independently of the startup RPC held by the peer.
-struct StartupOverflowTrace {
-}
+struct StartupOverflowTrace {}
 
 impl ProviderTrace for StartupOverflowTrace {
     fn record(&self, _: forge_provider_api::trace::ProviderTraceRecord) {}
@@ -26,7 +25,8 @@ async fn startup_notification(
 }
 
 const _: () = assert!(
-    github_copilot_sdk::session::DEFAULT_EVENT_BUFFER_CAPACITY > forge_protocol::MAX_PENDING_FRAMES + 1,
+    github_copilot_sdk::session::DEFAULT_EVENT_BUFFER_CAPACITY
+        > forge_protocol::MAX_PENDING_FRAMES + 1,
     "fixture must overflow Forge's queue before the public SDK buffer"
 );
 
@@ -34,7 +34,6 @@ const _: () = assert!(
 #[tokio::test]
 async fn startup_overflow_fails_generation_before_create_or_resume_response() {
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
-
         for _ in 0..10 {
             for resumed in [false, true] {
                 let runtime =
@@ -87,15 +86,13 @@ async fn startup_overflow_fails_generation_before_create_or_resume_response() {
                 });
                 let client = runtime.client(".").await.unwrap();
                 let observed_generation = client.generation.clone();
-                let trace = Arc::new(StartupOverflowTrace {
-                });
+                let trace = Arc::new(StartupOverflowTrace {});
                 let sessions = Arc::new(CopilotSessions::<tempfile::TempDir>::new(trace.clone()));
                 let owner = forge_provider_api::ExecutionOwner::root("startup-overflow");
                 let (sink, mut source) = forge_provider_api::events::channel(
                     forge_provider_api::BindingId::new("startup-loss").unwrap(),
-                    forge_provider_api::EventScope::SessionOperation {
+                    forge_provider_api::EventScope::Binding {
                         owner: owner.clone(),
-                        operation_id: "startup-source".into(),
                     },
                 );
                 sessions.subscribe(owner.runtime_key(), sink).await;
@@ -122,6 +119,7 @@ async fn startup_overflow_fails_generation_before_create_or_resume_response() {
                             || async move {
                                 Ok(PreparedSession {
                                     options: SessionOptions {
+                                        isolated_text: false,
                                         session_id: None,
                                         model: None,
                                         reasoning_effort: None,

@@ -202,7 +202,7 @@ async fn question_input_owner_does_not_revive_a_cancelled_answer() -> Result<()>
 async fn task_input_producer_reuses_original_entry_without_dispatch() -> Result<()> {
     let root = tempfile::tempdir()?;
     let controller = receipt_test_controller(root.path())?;
-    let mut task = crate::task::Task::goal("Produce once".into(), Default::default(), false, 1);
+    let mut task = crate::task::Task::goal("Produce once".into(), Default::default(), 1);
     task.request_entry("Original task instruction".into(), 1)?;
     let input = task.entry.as_ref().unwrap().id.clone();
     controller.task_controller.change(
@@ -341,7 +341,6 @@ async fn plan_source_rejection_precedes_collection_and_task_mutation() -> Result
             crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                 "Keep current work".into(),
                 Default::default(),
-                false,
                 1,
             ))),
             1,
@@ -476,7 +475,6 @@ async fn waiting_plan_attachment_completes_without_dispatch_and_preserves_decisi
         crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
             "Displaced task".into(),
             Default::default(),
-            false,
             1,
         ))),
         1,
@@ -694,7 +692,6 @@ async fn task_control_rejects_replaced_task_before_suspending_or_collecting_work
             crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                 "Original".into(),
                 Default::default(),
-                false,
                 1,
             ))),
             1,
@@ -708,7 +705,6 @@ async fn task_control_rejects_replaced_task_before_suspending_or_collecting_work
             crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                 "Replacement".into(),
                 Default::default(),
-                false,
                 2,
             ))),
             2,
@@ -756,7 +752,6 @@ async fn task_controls_replay_original_target_after_clear_without_nested_admissi
             crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                 "Pause and clear once".into(),
                 Default::default(),
-                false,
                 1,
             ))),
             1,
@@ -928,104 +923,202 @@ async fn input_readiness_does_not_steer_through_closed_execution_admission() -> 
 /// Steering remains owner-controlled after its offer waiter drops, and handoff precedes acknowledgment.
 #[tokio::test]
 async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff() -> Result<()> {
-    let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
-    let input = queued_offer_input(
-        &controller,
-        "owned-steering",
-        "Keep the captured target",
-        None,
-    )?;
-    let execution = controller.coordinator.execution.acquire().await?;
-    let mut active = controller.parent_input.activate(None)?;
-    let ordering = Arc::new(tokio::sync::Semaphore::new(1));
-    let control = controller
-        .coordinator
-        .control
-        .clone()
-        .acquire_owned()
-        .await?;
-    let order = ordering.clone().acquire_owned().await?;
-    let (sink, _output) = forge_protocol::outbound::channel();
-    let mut offered = Box::pin(controller.exchange_owner.offer_steering(
-        crate::exchange::SteeringDeliveryOffer {
-            input,
-            control,
-            order,
-        },
-        sink,
-    ));
-    assert!(futures_util::poll!(offered.as_mut()).is_pending());
-    drop(offered);
-    let command = tokio::time::timeout(Duration::from_secs(5), active.receive())
-        .await?
-        .context("owned steering was not delivered")?;
-    let receipt = command
-        .submission
-        .as_ref()
-        .context("steering has no durable receipt")?
-        .clone();
-    assert_eq!(
-        receipt.record()?.input_message_id.as_deref(),
-        Some("owned-steering")
-    );
-    let handoff =
-        tokio::time::timeout(Duration::from_secs(5), ordering.clone().acquire_owned()).await??;
-    assert_eq!(
-        receipt.record()?.delivery,
-        crate::provider::submission::SubmissionState::Prepared
-    );
-    drop(handoff);
-    receipt.sending(None)?;
-    receipt.accepted(None)?;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let changed = controller.coordinator.submissions.changed.notified();
-            if controller
-                .coordinator
-                .submissions
-                .snapshot()?
-                .messages
-                .iter()
-                .any(|message| {
-                    message.id == "owned-steering"
-                        && message.delivery == crate::input::InputDelivery::Accepted
-                })
-            {
-                return Ok::<(), anyhow::Error>(());
+    #[derive(Debug)]
+    enum ControlChange {
+        Unchanged,
+        Cancellation,
+    }
+    for change in [ControlChange::Unchanged, ControlChange::Cancellation] {
+        let root = tempfile::tempdir()?;
+        let controller = receipt_test_controller(root.path())?;
+        let input_id = "owned-steering";
+        let input = queued_offer_input(&controller, input_id, "Keep the captured target", None)?;
+        let execution = controller.coordinator.execution.acquire().await?;
+        let mut active = controller.parent_input.activate(None)?;
+        let ordering = Arc::new(tokio::sync::Semaphore::new(1));
+        let control = controller
+            .coordinator
+            .control
+            .clone()
+            .acquire_owned()
+            .await?;
+        let order = ordering.clone().acquire_owned().await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let mut offered = Box::pin(controller.exchange_owner.offer_steering(
+            crate::exchange::SteeringDeliveryOffer {
+                input,
+                control,
+                order,
+            },
+            sink.clone(),
+        ));
+        assert!(futures_util::poll!(offered.as_mut()).is_pending());
+        drop(offered);
+        let command = tokio::time::timeout(Duration::from_secs(5), active.receive())
+            .await
+            .with_context(|| format!("{change:?}: receive original steering"))?
+            .context("owned steering was not delivered")?;
+        let receipt = command
+            .submission
+            .as_ref()
+            .context("steering has no durable receipt")?
+            .clone();
+        assert_eq!(
+            receipt.record()?.input_message_id.as_deref(),
+            Some(input_id)
+        );
+        let handoff =
+            tokio::time::timeout(Duration::from_secs(5), ordering.clone().acquire_owned())
+                .await
+                .with_context(|| format!("{change:?}: release original handoff ordering"))??;
+        assert_eq!(
+            receipt.record()?.delivery,
+            crate::provider::submission::SubmissionState::Prepared
+        );
+        drop(handoff);
+        receipt.sending(None)?;
+        receipt.accepted(None)?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = controller.coordinator.submissions.changed.notified();
+                if controller
+                    .coordinator
+                    .submissions
+                    .snapshot()?
+                    .messages
+                    .iter()
+                    .any(|message| {
+                        message.id == input_id
+                            && message.delivery == crate::input::InputDelivery::Accepted
+                    })
+                {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                changed.await;
             }
-            changed.await;
+        })
+        .await
+        .with_context(|| format!("{change:?}: observe original receipt acceptance"))??;
+        // The original receipt remains observable after dispatch authority changes.
+        match change {
+            ControlChange::Unchanged => {}
+            ControlChange::Cancellation => controller.cancellation.request_native_cancel(false),
         }
-    })
-    .await??;
-    command.complete(Ok(())).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let changed = controller.coordinator.submissions.changed.notified();
-            if controller
-                .coordinator
-                .submissions
-                .snapshot()?
-                .messages
-                .is_empty()
-            {
-                return Ok::<(), anyhow::Error>(());
+        command.complete(Ok(())).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = controller.coordinator.submissions.changed.notified();
+                let snapshot = controller.coordinator.submissions.snapshot()?;
+                assert!(
+                    snapshot
+                        .messages
+                        .iter()
+                        .all(|message| message.delivery != crate::input::InputDelivery::Failed),
+                    "accepted receipt completion failed its input"
+                );
+                if snapshot.messages.is_empty() {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                changed.await;
             }
-            changed.await;
+        })
+        .await
+        .with_context(|| format!("{change:?}: settle original accepted receipt"))??;
+        controller.cancellation.arm(false);
+
+        // Reuse the same captured lane after receipt settlement, rather than recovering a fenced owner.
+        let input = queued_offer_input(
+            &controller,
+            "reused-steering",
+            "Use the same owner again",
+            None,
+        )?;
+        assert!(
+            controller
+                .exchange_owner
+                .offer_steering(
+                    crate::exchange::SteeringDeliveryOffer {
+                        input,
+                        control: controller
+                            .coordinator
+                            .control
+                            .clone()
+                            .acquire_owned()
+                            .await?,
+                        order: ordering.clone().acquire_owned().await?,
+                    },
+                    sink.clone()
+                )
+                .await?
+        );
+        let reused = tokio::time::timeout(Duration::from_secs(5), active.receive())
+            .await
+            .with_context(|| format!("{change:?}: receive successor steering"))?
+            .context("receipt settlement fenced subsequent steering")?;
+        let reused_receipt = reused
+            .submission
+            .as_ref()
+            .context("reused steering has no receipt")?
+            .clone();
+        reused_receipt.sending(None)?;
+        reused_receipt.accepted(None)?;
+        controller
+            .exchange_owner
+            .observe_input_receipt(
+                crate::exchange::InputReceiptFact::Acceptance {
+                    submission: reused_receipt.receipt_id().clone(),
+                },
+                None,
+            )
+            .await?;
+        reused.complete(Ok(())).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = controller.coordinator.submissions.changed.notified();
+                let snapshot = controller.coordinator.submissions.snapshot()?;
+                assert!(
+                    snapshot
+                        .messages
+                        .iter()
+                        .all(|message| message.delivery != crate::input::InputDelivery::Failed)
+                );
+                if snapshot.messages.is_empty() {
+                    return Ok::<(), anyhow::Error>(());
+                }
+                changed.await;
+            }
+        })
+        .await
+        .with_context(|| format!("{change:?}: settle successor accepted receipt"))??;
+        controller
+            .exchange_owner
+            .command_status(crate::exchange::command::CommandId::new(
+                "settled-receipt-barrier",
+            )?)
+            .await?;
+        while let Ok(frame) = output.try_recv() {
+            if let forge_protocol::message::Message::Event(event) =
+                serde_json::from_slice(frame.bytes())?
+            {
+                assert!(
+                    !(event.event == "provider_event" && event.payload["kind"] == "error"),
+                    "successful receipt completion published failure: {:?}",
+                    event.payload
+                );
+            }
         }
-    })
-    .await??;
-    assert!(
-        SqliteStore::read_only(&controller.data_root)?
-            .latest_exchange(controller.observer.session_id())?
-            .is_none(),
-        "steering must not manufacture a new foreground exchange"
-    );
-    drop(active);
-    drop(execution);
-    controller.finish_exchange_owner().await?;
-    let registry = controller.broker.lock().await.execution_registry();
-    registry.close().await?;
+        assert!(
+            SqliteStore::read_only(&controller.data_root)?
+                .latest_exchange(controller.observer.session_id())?
+                .is_none(),
+            "steering must not manufacture a new foreground exchange"
+        );
+        drop(active);
+        drop(execution);
+        controller.finish_exchange_owner().await?;
+        let registry = controller.broker.lock().await.execution_registry();
+        registry.close().await?;
+    }
     Ok(())
 }
 
@@ -1116,7 +1209,10 @@ async fn legacy_steering_uses_durable_input_command_without_direct_dispatch() ->
         stored.messages[0].delivery,
         crate::input::InputDelivery::Queued
     );
-    assert!(futures_util::poll!(Box::pin(active.receive()).as_mut()).is_pending());
+    {
+        let mut receiving = std::pin::pin!(active.receive());
+        assert!(futures_util::poll!(receiving.as_mut()).is_pending());
+    }
 
     let rejected = controller
         .input_request(
@@ -1145,7 +1241,7 @@ async fn legacy_steering_uses_durable_input_command_without_direct_dispatch() ->
     Ok(())
 }
 
-/// Activate a task only when the owner applies durable receipt evidence.
+/// Activate a task from durable receipt evidence and settle that receipt after the task is cleared.
 #[tokio::test]
 async fn receipt_owner_activates_task_before_exposing_acceptance() -> Result<()> {
     let root = tempfile::tempdir()?;
@@ -1153,7 +1249,6 @@ async fn receipt_owner_activates_task_before_exposing_acceptance() -> Result<()>
     let mut task = crate::task::Task::goal(
         "Receipt owner".into(),
         crate::session::continuation::ContinuationBudget::new(20, 2),
-        false,
         1,
     );
     task.request_entry("Begin owned work".into(), 1)?;
@@ -1205,7 +1300,19 @@ async fn receipt_owner_activates_task_before_exposing_acceptance() -> Result<()>
             .unwrap()
             .entry_accepted()
     );
-    controller
+    // Task control may supersede dispatch authority after the original receipt was accepted.
+    let accepted_task = controller
+        .task_controller
+        .current()?
+        .context("accepted task disappeared")?;
+    controller.task_controller.change(
+        &mut SqliteStore::open(&controller.data_root)?,
+        Some(&accepted_task.revision),
+        crate::task::TaskChange::Clear,
+        2,
+    )?;
+    assert!(controller.task_controller.current()?.is_none());
+    let settled = controller
         .exchange_owner
         .observe_input_receipt(
             crate::exchange::InputReceiptFact::Settled {
@@ -1215,7 +1322,22 @@ async fn receipt_owner_activates_task_before_exposing_acceptance() -> Result<()>
             },
             None,
         )
-        .await?;
+        .await?
+        .context("accepted receipt settlement produced no input update")?;
+    assert!(
+        settled.error.is_none(),
+        "task replacement failed accepted receipt settlement: {:?}",
+        settled.error
+    );
+    assert!(settled.error_code.is_none());
+    assert!(
+        controller.task_controller.current()?.is_none(),
+        "old receipt revived a cleared task"
+    );
+    assert!(matches!(
+        submission.record()?.delivery,
+        crate::provider::submission::SubmissionState::Accepted { .. }
+    ));
     assert!(
         controller
             .coordinator

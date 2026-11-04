@@ -106,10 +106,16 @@ impl CopilotEventDecoder {
     }
 
     fn protocol(_message: impl Into<String>) -> ProviderError {
-        ProviderError::Failure(forge_provider_api::error::ProviderFailure::new(
-            forge_provider_api::error::ProviderOperation::NativeTransport,
-            forge_provider_api::error::ProviderFailureKind::Protocol,
-        ))
+        ProviderError::Failure(
+            forge_provider_api::error::ProviderFailure::new(
+                forge_provider_api::error::ProviderOperation::InputSubmit,
+                forge_provider_api::error::ProviderFailureKind::Protocol,
+            )
+            .at_phase(
+                forge_provider_api::ProviderPhase::Observation,
+                forge_provider_api::FailureDisposition::Uncertain,
+            ),
+        )
     }
 
     fn thread(

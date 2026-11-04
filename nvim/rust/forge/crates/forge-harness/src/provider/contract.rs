@@ -7,20 +7,6 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const HARNESS_SYSTEM_MESSAGE: &str = include_str!("../plan/prompts/system.md");
 
-/// Preserve native lifecycle states and suspend Harness-only stalled goals.
-pub fn native_goal_update(objective: String, state: crate::goal::GoalState) -> NativeGoalUpdate {
-    use crate::goal::GoalState;
-    let status = match state {
-        GoalState::Active => NativeGoalStatus::Active,
-        GoalState::Paused | GoalState::Stalled => NativeGoalStatus::Paused,
-        GoalState::UsageLimited => NativeGoalStatus::UsageLimited,
-        GoalState::BudgetLimited => NativeGoalStatus::BudgetLimited,
-        GoalState::Complete => NativeGoalStatus::Complete,
-        GoalState::Blocked => NativeGoalStatus::Blocked,
-        GoalState::Cleared => return NativeGoalUpdate::Absent,
-    };
-    NativeGoalUpdate::Present { objective, status }
-}
 /// Represents one prompt sent across a provider boundary.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderRequest {
@@ -208,10 +194,6 @@ impl ProviderCompletion {
         native.evidence.workspace_changed |= self.native.evidence.workspace_changed;
         native.evidence.structured_complete |= self.native.evidence.structured_complete;
         native.evidence.structured_blocked |= self.native.evidence.structured_blocked;
-        native.evidence.native_state = native
-            .evidence
-            .native_state
-            .or(self.native.evidence.native_state);
         self.native = native;
     }
     pub(crate) fn goal_evidence(&self) -> (TurnEvidence, Option<crate::task::TaskPermit>) {
@@ -428,8 +410,8 @@ mod test {
             )
             .await?;
         let owner = crate::provider::ExecutionOwner::root("harness-session");
-        assert!(provider.has_active_turn(&owner.runtime_key()).await);
-        test_provider.steer_current(owner, steering).await?;
+        assert!(test_provider.active_invocation_scope(&owner)?.is_some());
+        test_provider.steer_current(owner.clone(), steering).await?;
         assert!(
             !prompt.is_finished(),
             "steering must not release the held response"
@@ -441,7 +423,7 @@ mod test {
             )
             .await?;
         let output = prompt.await??;
-        assert!(!provider.has_active_turn("harness-session").await);
+        assert!(test_provider.active_invocation_scope(&owner)?.is_none());
         assert!(matches!(
             submission.record()?.delivery,
             crate::provider::submission::SubmissionState::Accepted { .. }

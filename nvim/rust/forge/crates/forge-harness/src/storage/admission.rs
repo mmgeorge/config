@@ -59,54 +59,28 @@ pub(crate) struct RuntimeSnapshot {
 /// Read capability for a committed session projection. It cannot mutate session state.
 pub(crate) struct SessionAdmission {
     task_mutation: Mutex<()>,
-    native_goal_lane: Arc<tokio::sync::Mutex<()>>,
-    native_goal_epoch: std::sync::atomic::AtomicU64,
-    native_goal_acknowledged: std::sync::atomic::AtomicU64,
-    native_goal_uncertain: std::sync::atomic::AtomicBool,
-    native_goal_reconciled: tokio::sync::Notify,
+    configuration_lane: Arc<tokio::sync::Mutex<()>>,
+    configuration_uncertain: std::sync::atomic::AtomicBool,
     state: Mutex<PublishedAdmission>,
     pub changed: Arc<tokio::sync::Notify>,
 }
 
 impl SessionAdmission {
-    /// Share one native goal transport lane among all controllers of this session.
-    pub(crate) fn native_goal_lane(&self) -> Arc<tokio::sync::Mutex<()>> {
-        self.native_goal_lane.clone()
+    /// Share one configuration write lane among all controllers of this session.
+    pub(crate) fn configuration_lane(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.configuration_lane.clone()
     }
 
-    /// Invalidate any cached native goal acknowledgment after a transport write.
-    pub(crate) fn native_goal_written(&self) -> Result<u64> {
-        let previous = match self.native_goal_epoch.try_update(
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-            |epoch| epoch.checked_add(1),
-        ) {
-            Ok(previous) => previous,
-            Err(_) => {
-                self.mark_native_goal_uncertain();
-                return Err(crate::provider::ProviderError::DeliveryUncertain.into());
-            }
-        };
-        let epoch = previous + 1;
-        self.changed.notify_one();
-        Ok(epoch)
-    }
-
-    pub(crate) fn native_goal_epoch(&self) -> u64 {
-        self.native_goal_epoch
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Block native goal writes until the old provider generation is explicitly replaced.
-    pub(crate) fn mark_native_goal_uncertain(&self) {
-        self.native_goal_uncertain
+    /// Block configuration writes until the old provider generation is explicitly replaced.
+    pub(crate) fn mark_configuration_uncertain(&self) {
+        self.configuration_uncertain
             .store(true, std::sync::atomic::Ordering::Release);
         self.changed.notify_one();
     }
 
-    pub(crate) fn ensure_native_goal_certain(&self) -> Result<()> {
+    pub(crate) fn ensure_configuration_certain(&self) -> Result<()> {
         if self
-            .native_goal_uncertain
+            .configuration_uncertain
             .load(std::sync::atomic::Ordering::Acquire)
         {
             return Err(crate::provider::ProviderError::DeliveryUncertain.into());
@@ -114,41 +88,19 @@ impl SessionAdmission {
         Ok(())
     }
 
-    pub(crate) fn native_goal_is_uncertain(&self) -> bool {
-        self.native_goal_uncertain
+    pub(crate) fn configuration_is_uncertain(&self) -> bool {
+        self.configuration_uncertain
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Call only after provider reset and owner generation replacement have completed.
-    pub(crate) fn reset_native_goal_generation(&self) -> Result<()> {
-        self.native_goal_uncertain
+    pub(crate) fn reset_configuration_generation(&self) -> Result<()> {
+        self.configuration_uncertain
             .store(false, std::sync::atomic::Ordering::Release);
-        self.native_goal_written()?;
+        self.changed.notify_one();
         Ok(())
     }
 
-    /// Publish a canonical provider acknowledgment only after the task has been rechecked.
-    pub(crate) fn acknowledge_native_goal(&self, epoch: u64) {
-        self.native_goal_acknowledged
-            .fetch_max(epoch, std::sync::atomic::Ordering::AcqRel);
-        self.native_goal_reconciled.notify_waiters();
-    }
-
-    pub(crate) async fn wait_native_goal_acknowledged(&self, epoch: u64) {
-        loop {
-            let notified = self.native_goal_reconciled.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self
-                .native_goal_acknowledged
-                .load(std::sync::atomic::Ordering::Acquire)
-                >= epoch
-            {
-                return;
-            }
-            notified.await;
-        }
-    }
     /// Serialize task authority changes with their dependent filesystem commits.
     ///
     /// Acquire this gate before SQLite write admission and retain it through publication.
@@ -285,11 +237,8 @@ impl AdmissionRegistry {
         })?;
         let created = Arc::new(SessionAdmission {
             task_mutation: Mutex::new(()),
-            native_goal_lane: Arc::new(tokio::sync::Mutex::new(())),
-            native_goal_epoch: std::sync::atomic::AtomicU64::new(0),
-            native_goal_acknowledged: std::sync::atomic::AtomicU64::new(0),
-            native_goal_uncertain: std::sync::atomic::AtomicBool::new(false),
-            native_goal_reconciled: tokio::sync::Notify::new(),
+            configuration_lane: Arc::new(tokio::sync::Mutex::new(())),
+            configuration_uncertain: std::sync::atomic::AtomicBool::new(false),
             state: Mutex::new(PublishedAdmission {
                 snapshot: Ok(Arc::new(snapshot)),
                 exchange,
@@ -502,49 +451,6 @@ mod tests {
     };
 
     /// Independent controllers share the goal lane, and stale acknowledgments cannot clear a newer write.
-    #[tokio::test]
-    async fn native_goal_lane_fences_poison_and_requires_current_acknowledgment() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        let mut store = SqliteStore::open(root.path())?;
-        let session = super::super::test::session("goal-lane", "workspace");
-        store.save_session(&session)?;
-        let first = store.session_admission(&session.id)?;
-        let second = SqliteStore::open(root.path())?.session_admission(&session.id)?;
-        let first_lane = first.native_goal_lane();
-        let second_lane = second.native_goal_lane();
-        let held = first_lane.lock().await;
-        assert!(second_lane.try_lock().is_err());
-        drop(held);
-        assert!(second_lane.try_lock().is_ok());
-        let old = first.native_goal_written()?;
-        first.acknowledge_native_goal(old);
-        let current = second.native_goal_written()?;
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                second.wait_native_goal_acknowledged(current)
-            )
-            .await
-            .is_err()
-        );
-        second.acknowledge_native_goal(current);
-        second.wait_native_goal_acknowledged(current).await;
-        first.mark_native_goal_uncertain();
-        let error = second.ensure_native_goal_certain().unwrap_err();
-        assert!(matches!(
-            error.downcast_ref::<crate::provider::ProviderError>(),
-            Some(crate::provider::ProviderError::DeliveryUncertain)
-        ));
-        second.reset_native_goal_generation()?;
-        first.ensure_native_goal_certain()?;
-        first
-            .native_goal_epoch
-            .store(u64::MAX, std::sync::atomic::Ordering::Release);
-        assert!(first.native_goal_written().is_err());
-        assert!(first.native_goal_is_uncertain());
-        Ok(())
-    }
-
     #[test]
     fn committed_admission_tracks_independent_writers_and_preserves_failed_writes() -> Result<()> {
         let root = tempfile::tempdir()?;
@@ -557,7 +463,7 @@ mod tests {
             &admission,
             &writer.session_admission(&session.id)?
         ));
-        let mut task = Task::goal("task".into(), Default::default(), false, 1);
+        let mut task = Task::goal("task".into(), Default::default(), 1);
         writer.commit_task_change(&session.id, None, 1, |active| {
             *active = Some(task.clone());
             Ok(())

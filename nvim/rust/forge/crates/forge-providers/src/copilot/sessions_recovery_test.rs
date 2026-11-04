@@ -60,7 +60,10 @@ async fn recovery_notification(
         "params":{"sessionId":session_id,"event":event},
     });
     let bytes = serde_json::to_vec(&frame).unwrap();
-    writer.write_all(format!("Content-Length: {}\r\n\r\n", bytes.len()).as_bytes()).await.unwrap();
+    writer
+        .write_all(format!("Content-Length: {}\r\n\r\n", bytes.len()).as_bytes())
+        .await
+        .unwrap();
     writer.write_all(&bytes).await.unwrap();
     writer.flush().await.unwrap();
 }
@@ -107,29 +110,86 @@ impl RecoveryPeer {
                     "session.options.update" | "session.detach" => {
                         serde_json::json!({"success":true})
                     }
-                    "session.plan.readSqlTodosWithDependencies" => serde_json::json!({"rows":[],"dependencies":[]} ),
-                    "session.eventLog.tail" => serde_json::json!({"cursor":format!("before-{send_count}")}),
+                    "session.plan.readSqlTodosWithDependencies" => {
+                        serde_json::json!({"rows":[],"dependencies":[]} )
+                    }
+                    "session.eventLog.tail" => {
+                        serde_json::json!({"cursor":format!("before-{send_count}")})
+                    }
+                    "session.eventLog.read" => {
+                        // Journal admission captures only the latest durable anchor, never output recovery.
+                        assert_eq!(request["params"]["direction"], "backward");
+                        assert_eq!(request["params"]["max"], 1);
+                        assert_eq!(request["params"]["includeEphemeral"], false);
+                        assert_eq!(request["params"]["agentScope"], "primary");
+                        assert_eq!(request["params"]["waitMs"], 0);
+                        assert!(request["params"].get("cursor").is_none());
+                        let events = if send_count == 0 {
+                            Vec::new()
+                        } else {
+                            let ordinal = send_count - 1;
+                            vec![serde_json::json!({
+                                "id":format!("end-{ordinal}"), "parentId":format!("answer-{ordinal}"),
+                                "type":"assistant.turn_end", "timestamp":"2026-11-02T00:00:00Z",
+                                "data":{"turnId":"0"}
+                            })]
+                        };
+                        serde_json::json!({"cursor":format!("anchor-{send_count}"),"cursorStatus":"ok","hasMore":send_count > 0,"events":events})
+                    }
                     "session.send" => {
                         let ordinal = send_count;
                         send_count += 1;
                         let message_id = format!("accepted-{ordinal}");
                         if emit_turns {
                             for (event_id, parent_id, event_type, data) in [
-                                (format!("user-{ordinal}"), None, "user.message", serde_json::json!({
-                                    "messageId":message_id,"parentAgentTaskId":"root-task","turnId":"0"
-                                })),
-                                (format!("start-{ordinal}"), Some(format!("user-{ordinal}")), "assistant.turn_start", serde_json::json!({"turnId":"0"})),
-                                (format!("answer-{ordinal}"), Some("omitted-usage-record".to_owned()), "assistant.message", serde_json::json!({
-                                    "messageId":format!("answer-{ordinal}"),"content":format!("full answer {ordinal}"),"phase":"final_answer","turnId":"0"
-                                })),
-                                (format!("end-{ordinal}"), Some(format!("answer-{ordinal}")), "assistant.turn_end", serde_json::json!({"turnId":"0"})),
-                                (format!("idle-{ordinal}"), Some("ephemeral-idle-parent".to_owned()), "session.idle", serde_json::json!({"mode":"interactive"})),
+                                (
+                                    format!("user-{ordinal}"),
+                                    None,
+                                    "user.message",
+                                    serde_json::json!({
+                                        "messageId":message_id,"parentAgentTaskId":"root-task","turnId":"0"
+                                    }),
+                                ),
+                                (
+                                    format!("start-{ordinal}"),
+                                    Some(format!("user-{ordinal}")),
+                                    "assistant.turn_start",
+                                    serde_json::json!({"turnId":"0"}),
+                                ),
+                                (
+                                    format!("answer-{ordinal}"),
+                                    Some("omitted-usage-record".to_owned()),
+                                    "assistant.message",
+                                    serde_json::json!({
+                                        "messageId":format!("answer-{ordinal}"),"content":format!("full answer {ordinal}"),"phase":"final_answer","turnId":"0"
+                                    }),
+                                ),
+                                (
+                                    format!("end-{ordinal}"),
+                                    Some(format!("answer-{ordinal}")),
+                                    "assistant.turn_end",
+                                    serde_json::json!({"turnId":"0"}),
+                                ),
+                                (
+                                    format!("idle-{ordinal}"),
+                                    Some("ephemeral-idle-parent".to_owned()),
+                                    "session.idle",
+                                    serde_json::json!({"mode":"interactive"}),
+                                ),
                             ] {
-                                recovery_notification(&mut peer_write, &request["params"]["sessionId"], &event_id, parent_id.as_deref(), event_type, data).await;
+                                recovery_notification(
+                                    &mut peer_write,
+                                    &request["params"]["sessionId"],
+                                    &event_id,
+                                    parent_id.as_deref(),
+                                    event_type,
+                                    data,
+                                )
+                                .await;
                             }
                         }
                         serde_json::json!({"messageId":message_id})
-                    },
+                    }
                     "session.tasks.refresh" | "session.mcp.listConfigured" => continue,
                     other => panic!("unexpected recovery fixture RPC: {other}"),
                 };
@@ -215,6 +275,7 @@ async fn failed_mcp_configuration_collects_provisional_session_without_dead_deta
                     || async move {
                         Ok(PreparedSession {
                             options: SessionOptions {
+                                isolated_text: false,
                                 session_id: None,
                                 model: None,
                                 reasoning_effort: None,
@@ -300,7 +361,13 @@ async fn recovery_session(
     client: CopilotClient,
     owner: &forge_provider_api::ExecutionOwner,
 ) -> Arc<CopilotSession> {
-    recovery_session_mode(sessions, client, owner, forge_provider_api::PromptMode::Chat).await
+    recovery_session_mode(
+        sessions,
+        client,
+        owner,
+        forge_provider_api::PromptMode::Chat,
+    )
+    .await
 }
 
 /// Prepare one real SDK session in a selected native interaction mode.
@@ -328,6 +395,7 @@ async fn recovery_session_mode(
             || async {
                 Ok(PreparedSession {
                     options: SessionOptions {
+                        isolated_text: false,
                         session_id: None,
                         model: None,
                         reasoning_effort: None,
@@ -364,9 +432,8 @@ async fn failed_shared_generation_collects_all_sessions_before_revalidating_repl
             let owner = forge_provider_api::ExecutionOwner::root(id);
             let (sink, stream) = forge_provider_api::events::channel(
                 forge_provider_api::BindingId::new("recovery-owner").unwrap(),
-                forge_provider_api::EventScope::SessionOperation {
+                forge_provider_api::EventScope::Binding {
                     owner: owner.clone(),
-                    operation_id: "generation-observation".into(),
                 },
             );
             if id != "catalog-owner" {
@@ -376,7 +443,10 @@ async fn failed_shared_generation_collects_all_sessions_before_revalidating_repl
             owned.push((owner, session, stream));
         }
         let scope = forge_provider_api::InvocationScope::new(owned[1].0.clone(), "active-exchange");
-        let (sink, _active_events) = forge_provider_api::events::channel(forge_provider_api::BindingId::new("recovery-active").unwrap(), scope.clone());
+        let (sink, _active_events) = forge_provider_api::events::channel(
+            forge_provider_api::BindingId::new("recovery-active").unwrap(),
+            scope.clone(),
+        );
         let context = Arc::new(Mutex::new(super::super::intake::TurnContext {
             decoder: super::super::event_decoder::CopilotEventDecoder::new(scope, ".".into()),
             output: Default::default(),

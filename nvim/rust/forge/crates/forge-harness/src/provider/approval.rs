@@ -138,15 +138,15 @@ impl PermissionCoordinator {
         self: &Arc<Self>,
         root: Option<&Path>,
         request: &crate::provider::ProviderRequest,
-        provider: crate::provider::ProviderId,
+        descriptor: &crate::provider::ProviderDescriptor,
     ) -> Result<crate::skill::SkillExecution> {
-        let declaration = forge_providers::registry::resolve(&provider)?.capability;
-        let target = declaration
+        let target = descriptor
+            .capability
             .integration
             .resource_target
             .as_deref()
             .context("provider has no managed resource target")?;
-        let provider = provider.as_str();
+        let provider = descriptor.kind.as_str();
         let selected = if request.mode == crate::provider::PromptMode::Background {
             Vec::new()
         } else if let Some(root) = root {
@@ -1797,6 +1797,55 @@ mod test {
         Ok(())
     }
 
+    /// Bind and revoke declared skill authority without requiring a second global provider registration.
+    #[test]
+    fn skill_scope_uses_supplied_descriptor_without_global_relookup() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let coordinator = PermissionCoordinator::transient(directory.path())?;
+        let id =
+            forge_providers::registry::nonselectable_id().expect("fixture provider is registered");
+        let mut descriptor =
+            forge_providers::registry::descriptor(&id).expect("fixture metadata exists");
+        descriptor.kind = crate::provider::ProviderId::new("unregistered-skill-fixture")?;
+        assert!(forge_providers::registry::descriptor(&descriptor.kind).is_err());
+        let request = crate::provider::ProviderRequest {
+            dispatch: Default::default(),
+            execution_owner: None,
+            harness_session_id: "descriptor-skill-session".into(),
+            workspace: directory.path().to_string_lossy().into_owned(),
+            input: crate::provider::ProviderInput::from_text("Read declared skills"),
+            mode: crate::provider::PromptMode::Chat,
+            model: "default".into(),
+            effort: "default".into(),
+            context_window: None,
+            service_tier: Default::default(),
+            access: Default::default(),
+            approval_mode: ApprovalMode::Ask,
+            provider_session_id: None,
+            submission: None,
+            recovered_input: Vec::new(),
+            control_context: None,
+        };
+        let owner = request.owner()?;
+        let skills = coordinator.skills(None, &request, &descriptor)?;
+        assert!(
+            coordinator
+                .skill_by_owner
+                .lock()
+                .unwrap()
+                .contains_key(&owner)
+        );
+        drop(skills);
+        assert!(
+            !coordinator
+                .skill_by_owner
+                .lock()
+                .unwrap()
+                .contains_key(&owner)
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn skill_runtime_grants_preserve_denials_selection_compounds_and_revocation() -> Result<()>
     {
@@ -1848,7 +1897,8 @@ mod test {
         let skills = coordinator.skills(
             Some(directory.path()),
             &request,
-            forge_providers::registry::default_id(),
+            &forge_providers::registry::descriptor(&forge_providers::registry::default_id())
+                .expect("default provider is registered"),
         )?;
         let original = store.read().unwrap().open().1;
         let source = bundle.join("SKILL.md").display().to_string();
@@ -2008,7 +2058,8 @@ mod test {
         let disabled = coordinator.skills(
             Some(directory.path()),
             &request,
-            forge_providers::registry::default_id(),
+            &forge_providers::registry::descriptor(&forge_providers::registry::default_id())
+                .expect("default provider is registered"),
         )?;
         assert!(
             tokio::time::timeout(

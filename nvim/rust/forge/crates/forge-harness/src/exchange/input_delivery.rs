@@ -31,7 +31,9 @@ use crate::{
     },
     command::ExecutionPermit,
     input::{InputDelivery, InputDeliveryGuard, InputMessage, InputUpdate},
-    provider::submission::{Submission, SubmissionOrigin, SubmissionRecord, SubmissionState},
+    provider::submission::{
+        Submission, SubmissionOrigin, SubmissionReconciliation, SubmissionState,
+    },
 };
 
 /// Retain owner-acquired root capabilities until a queue claim installs its delivery stages.
@@ -123,7 +125,7 @@ impl SteeringDispatchTarget {
         if !self.registry.matches(generation.provider()) {
             return Err(crate::provider::ProviderError::Failure(
                 forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::AdmitInput,
+                    forge_provider_api::ProviderOperation::InputSubmit,
                     forge_provider_api::ProviderFailureKind::Protocol,
                 ),
             ));
@@ -146,6 +148,38 @@ enum InputDestination {
         target: SteeringDispatchTarget,
         order: Option<OwnedSemaphorePermit>,
     },
+}
+
+impl InputDestination {
+    /// Query exact activity only when a prepared receipt could safely reenter the queue.
+    fn receipt_activity(
+        &self,
+        delivery: &SubmissionState,
+    ) -> Result<InputDispatchActivity, OperationFailure> {
+        if !matches!(delivery, SubmissionState::Prepared) {
+            return Ok(InputDispatchActivity::Active);
+        }
+        Ok(match self {
+            Self::Foreground => InputDispatchActivity::Active,
+            Self::Steering { target, .. } => match &target.route {
+                SteeringRoute::Parent(parent) if parent.is_open() => InputDispatchActivity::Active,
+                SteeringRoute::Parent(_) => InputDispatchActivity::Idle,
+                SteeringRoute::Native(scope) => {
+                    let active = target
+                        .engine
+                        .get()
+                        .ok_or(OperationFailure::ExecutionUnavailable)?
+                        .invocation_active_snapshot(scope)
+                        .map_err(OperationFailure::InputReconciliation)?;
+                    if active {
+                        InputDispatchActivity::Active
+                    } else {
+                        InputDispatchActivity::Idle
+                    }
+                }
+            },
+        })
+    }
 }
 
 /// Retain one claimed input from preparation through its final receipt application.
@@ -727,22 +761,6 @@ impl InputDeliveryRun {
                         crate::input::InputPurpose::TaskEntry { start, .. } => {
                             crate::provider::SteeringInput::TaskEntry {
                                 start: start.clone(),
-                                goal: services
-                                    .tasks
-                                    .current()
-                                    .map_err(OperationFailure::Domain)?
-                                    .and_then(|task| match &task.workflow {
-                                        crate::task::WorkflowSnapshot::Goal { goal }
-                                            if goal.native =>
-                                        {
-                                            Some(forge_provider_api::NativeGoalCommand::Set {
-                                                objective: goal.objective.clone(),
-                                            })
-                                        }
-                                        crate::task::WorkflowSnapshot::Goal { .. }
-                                        | crate::task::WorkflowSnapshot::Plan { .. }
-                                        | crate::task::WorkflowSnapshot::Execute { .. } => None,
-                                    }),
                                 text: message.text,
                                 submission: submission.clone(),
                             }
@@ -946,12 +964,22 @@ impl InputDeliveryRun {
                 else {
                     unreachable!("receipt reconciliation belongs to settled input work")
                 };
-                let ReconciledInput { record, activity } = (*result)
+                let ReconciledInput { observation } = (*result)
                     .map_err(OperationFailure::JobObservationLost)?
                     .map_err(OperationFailure::InputReconciliation)?;
                 if !can_commit {
                     return Err(OperationFailure::StorageUncommitted);
                 }
+                // Receipt observation can follow acceptance, cancellation, or a task revision change.
+                // Reconcile the original attempt and let the receipt guard authorize the queue commit.
+                let record = submission
+                    .apply_reconciliation(observation)
+                    .map_err(|error| {
+                        OperationFailure::InputReconciliation(
+                            crate::provider::submission::journal_failure(error),
+                        )
+                    })?;
+                let activity = self.destination.receipt_activity(&record.delivery)?;
                 if let Some(error) = steering_failure
                     && !(matches!(record.delivery, SubmissionState::Prepared)
                         && matches!(activity, InputDispatchActivity::Idle))
@@ -1194,7 +1222,7 @@ impl InputDeliveryRun {
             || *services.cancellation.subscribe().borrow()
             || ready.has_approval
             || ready.checks_running
-            || services.tasks.native_goal_is_uncertain())
+            || services.tasks.configuration_is_uncertain())
         .then_some(InputAbandonment::Paused))
     }
 
@@ -1321,42 +1349,17 @@ impl InputDeliveryRun {
         let reconciliation = submission.clone();
         let observation = services.clone();
         let retained_generation = self.generation.clone();
-        let steering = match &self.destination {
-            InputDestination::Foreground => None,
-            InputDestination::Steering { target, .. } => Some(target.clone()),
-        };
         self.stage = DeliveryStage::Reconcile {
             task: tokio::spawn(async move {
                 let generation = match retained_generation {
                     Some(generation) => generation,
                     None => observation.observe_provider_generation().await,
                 };
-                let record = reconciliation
-                    .reconcile(generation.provider())
+                let observation = reconciliation
+                    .observe_reconciliation(generation.provider())
                     .await
-                    .map_err(|error| {
-                        crate::provider::lifecycle_error::classify(
-                            forge_provider_api::ProviderOperation::RecordInput,
-                            error,
-                        )
-                    })?;
-                let activity = match steering {
-                    None => InputDispatchActivity::Active,
-                    Some(target) => {
-                        let parent = matches!(&target.route, SteeringRoute::Parent(parent) if parent.is_open());
-                        if parent
-                            || generation
-                                .provider()
-                                .has_active_turn(&record.request.harness_session_id)
-                                .await
-                        {
-                            InputDispatchActivity::Active
-                        } else {
-                            InputDispatchActivity::Idle
-                        }
-                    }
-                };
-                Ok(ReconciledInput { record, activity })
+                    .map_err(crate::provider::submission::journal_failure)?;
+                Ok(ReconciledInput { observation })
             }),
             submission,
             result,
@@ -1539,8 +1542,7 @@ struct SteeringFlight {
 
 /// Reconcile native evidence separately from the activity that permits safe steering requeue.
 pub(super) struct ReconciledInput {
-    record: SubmissionRecord,
-    activity: InputDispatchActivity,
+    observation: SubmissionReconciliation,
 }
 
 enum DeliveryStage {
@@ -1602,6 +1604,59 @@ mod tests {
     use crate::provider::ProviderError;
     use futures_util::FutureExt;
 
+    /// Preserve receipt evidence after native owner retirement without authorizing prepared replay.
+    #[tokio::test]
+    async fn accepted_receipt_does_not_query_retired_native_target() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut broker = HarnessBroker::initialize(serde_json::from_value(serde_json::json!({
+            "workspace":root.path(), "data_root":root.path().join("data"), "client_id":"retired-receipt",
+            "provider":{"kind":"mock", "command":[]},
+        }))?)?;
+        let catalog = broker.provider_catalog_request()?;
+        let provider = broker.provider_handle();
+        let receipt = broker.submission_store.prepare_input(
+            &catalog,
+            crate::provider::ProviderInput::from_text("Already accepted"),
+            provider.descriptor().kind,
+            Some("accepted-before-retirement".into()),
+        )?;
+        receipt.sending(None)?;
+        receipt.accepted(None)?;
+        let owner = crate::provider::ExecutionOwner::root(broker.observer().session_id());
+        let scope = crate::provider::InvocationScope::new(owner.clone(), "original");
+        let registry = broker.execution_registry();
+        registry.close().await?;
+        let target = SteeringDispatchTarget::native(scope, registry.clone());
+        assert!(target.engine.get().is_none());
+        let destination = InputDestination::Steering {
+            target,
+            order: None,
+        };
+
+        assert!(matches!(
+            destination.receipt_activity(&receipt.record()?.delivery)?,
+            InputDispatchActivity::Active
+        ));
+        for delivery in [
+            SubmissionState::Sending { target: None },
+            SubmissionState::Cancelled,
+        ] {
+            assert!(matches!(
+                destination.receipt_activity(&delivery)?,
+                InputDispatchActivity::Active
+            ));
+        }
+        assert!(
+            destination
+                .receipt_activity(&SubmissionState::Prepared)
+                .is_err(),
+            "retirement must not manufacture safe requeue authority"
+        );
+        registry.close().await?;
+        provider.shutdown().await?;
+        Ok(())
+    }
+
     /// Retain a completed worker across the owner's buffered-wake preflight without repolling it.
     #[tokio::test]
     async fn input_delivery_buffers_completed_worker_until_owner_update() {
@@ -1646,16 +1701,16 @@ mod tests {
             destination: InputDestination::Foreground,
         };
         // Cancelling an unready observation must leave the worker observable.
-        assert!(run.next(ForegroundStatus::Active).now_or_never().is_none());
+        assert!(run.next(ForegroundStatus::Local).now_or_never().is_none());
         release.send(()).unwrap();
         let event = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            run.next(ForegroundStatus::Active),
+            run.next(ForegroundStatus::Local),
         )
         .await
         .expect("released worker should complete");
         assert!(matches!(event, InputDeliveryEvent::Attachments(Ok(Ok(_)))));
-        assert!(run.next(ForegroundStatus::Active).now_or_never().is_none());
+        assert!(run.next(ForegroundStatus::Local).now_or_never().is_none());
         assert!(
             run.next(ForegroundStatus::Unavailable)
                 .now_or_never()

@@ -267,14 +267,8 @@ impl HarnessBroker {
             ));
         }
         let events = if let Some(teardown) = result.teardown {
-            let (events, lane) = self
-                .commit_undo_teardown(teardown)
-                .map_err(|_| RollbackFailure::RecoveryRequired)?;
-            self.task_controller
-                .native_goal_written()
-                .map_err(|_| RollbackFailure::RecoveryRequired)?;
-            drop(lane);
-            events
+            self.commit_undo_teardown(teardown)
+                .map_err(|_| RollbackFailure::RecoveryRequired)?
         } else {
             Vec::new()
         };

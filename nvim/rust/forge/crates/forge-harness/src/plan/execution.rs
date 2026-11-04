@@ -1002,7 +1002,6 @@ mod revision_policy_tests {
                     "Execute plan".into(),
                     record.clone(),
                     Default::default(),
-                    false,
                     2,
                 )?)),
                 2,
@@ -1055,7 +1054,6 @@ mod revision_policy_tests {
             crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
                 "Replacement".into(),
                 Default::default(),
-                false,
                 5,
             ))),
             5,

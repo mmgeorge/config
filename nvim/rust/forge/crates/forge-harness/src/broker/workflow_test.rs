@@ -286,7 +286,6 @@ async fn workflow_goal_progress_uses_workspace_content_without_a_check_phase() -
         crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
             "Repair the workspace".into(),
             Default::default(),
-            false,
             1,
         ))),
         1,

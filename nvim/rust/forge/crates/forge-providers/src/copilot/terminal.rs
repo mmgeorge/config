@@ -2,6 +2,57 @@ use super::event_stream;
 use anyhow::Context;
 use std::sync::Arc;
 
+/// Issue opaque terminal handles within one exact live binding.
+#[derive(Default)]
+pub(super) struct TerminalRegistry {
+    native: std::collections::HashMap<forge_provider_api::terminal::TerminalId, String>,
+}
+
+impl TerminalRegistry {
+    /// Replace native identities with issued handles and retire handles missing from this snapshot.
+    pub(super) fn issue(
+        &mut self,
+        snapshot: &mut forge_provider_api::terminal::TerminalSnapshot,
+    ) -> Result<(), forge_provider_api::ProviderError> {
+        let present = snapshot
+            .terminal
+            .iter()
+            .map(|terminal| terminal.id.as_str().to_owned())
+            .collect::<std::collections::HashSet<_>>();
+        self.native.retain(|_, native| present.contains(native));
+        for terminal in &mut snapshot.terminal {
+            let native = terminal.id.as_str().to_owned();
+            let issued = self
+                .native
+                .iter()
+                .find_map(|(issued, target)| (target == &native).then(|| issued.clone()));
+            terminal.id = if let Some(issued) = issued {
+                issued
+            } else {
+                let issued = forge_provider_api::terminal::TerminalId::new(
+                    uuid::Uuid::new_v4().to_string(),
+                )?;
+                self.native.insert(issued.clone(), native);
+                issued
+            };
+        }
+        Ok(())
+    }
+
+    /// Resolve only a handle previously issued by this binding, without native-ID fallback.
+    pub(super) fn resolve(
+        &self,
+        terminal: &forge_provider_api::terminal::TerminalId,
+    ) -> Option<String> {
+        self.native.get(terminal).cloned()
+    }
+
+    /// Retire a successfully stopped occurrence before a native task ID can be reused.
+    pub(super) fn retire(&mut self, terminal: &forge_provider_api::terminal::TerminalId) {
+        self.native.remove(terminal);
+    }
+}
+
 /// Retains terminal observations after the prompt event subscription ends.
 pub struct CopilotTerminalMonitor {
     session: std::sync::Weak<github_copilot_sdk::session::Session>,
@@ -105,7 +156,7 @@ impl CopilotTerminalMonitor {
             tokio::select! { _ = closing => {}, _ = observe => {} }
             event.close().await.map_err(|_| {
                 native_failure(
-                    forge_provider_api::ProviderOperation::CollectEventReader,
+                    forge_provider_api::ProviderOperation::SessionClose,
                     forge_provider_api::ProviderFailureKind::Runtime,
                 )
             })
@@ -144,7 +195,7 @@ impl CopilotTerminalMonitor {
         };
         let result = task.await.map_err(|_| {
             native_failure(
-                forge_provider_api::ProviderOperation::CollectEventReader,
+                forge_provider_api::ProviderOperation::SessionClose,
                 forge_provider_api::ProviderFailureKind::Runtime,
             )
         });
@@ -215,5 +266,35 @@ mod tests {
             .unwrap()
             .unwrap();
         monitor.shutdown().await.unwrap();
+    }
+    /// A reused native task ID cannot turn an old selection into authority over another binding.
+    #[test]
+    fn issued_terminal_handles_reject_other_bindings_and_reused_native_tasks() {
+        let snapshot = || forge_provider_api::terminal::TerminalSnapshot {
+            supported: true,
+            starting: false,
+            terminal: vec![forge_provider_api::terminal::BackgroundTerminal {
+                id: forge_provider_api::terminal::TerminalId::new("native-reused").unwrap(),
+                command: "fixture".into(),
+            }],
+        };
+        let mut first = TerminalRegistry::default();
+        let mut original = snapshot();
+        first.issue(&mut original).unwrap();
+        let old = original.terminal[0].id.clone();
+        let mut replacement = TerminalRegistry::default();
+        let mut current = snapshot();
+        replacement.issue(&mut current).unwrap();
+        assert!(replacement.resolve(&old).is_none());
+        assert_ne!(old, current.terminal[0].id);
+        first
+            .issue(&mut forge_provider_api::terminal::TerminalSnapshot::default())
+            .unwrap();
+        original = snapshot();
+        first.issue(&mut original).unwrap();
+        assert!(
+            first.resolve(&old).is_none(),
+            "a retired terminal handle resolved to a newer occurrence"
+        );
     }
 }

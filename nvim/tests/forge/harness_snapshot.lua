@@ -15,6 +15,10 @@ local response = vim.json.decode([[{
   "agent": {"run": [], "definition": [], "exchange": []},
   "timeline": [], "timeline_revision": 3, "prompt_history": null
 }]])
+local before_invalid = vim.deepcopy(state)
+local valid, failure = pcall(snapshot.apply, state, { id = "plan-command", outcome = { outcome = "task" } })
+assert(not valid and tostring(failure):find("session identity", 1, true), "command receipt passed snapshot validation")
+assert(vim.deep_equal(state, before_invalid), "invalid snapshot corrupted the current session")
 response.access_preference = { sandbox = true, isolation_mode = "mxc" }
 snapshot.apply(state, response)
 assert(state.access_preference.sandbox and state.access_preference.isolation_mode == "mxc")

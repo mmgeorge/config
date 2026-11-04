@@ -10,8 +10,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct ControlTurnContext {
     pub(crate) provider_completion: Arc<crate::provider::CompletionSlot>,
-    /// One-use provider authorization to resume accepted history without resubmitting input.
-    pub(crate) provider_continuation: Option<forge_provider_api::ContinuationToken>,
+    /// Session-owned questions visible through this invocation's control tools.
     pub(crate) questions: Option<Arc<crate::question::QuestionController>>,
     /// Submit scoped question mutations without retaining the session owner through callbacks.
     pub(crate) question_events: Option<crate::exchange::QuestionEvents>,
@@ -27,7 +26,6 @@ pub struct ControlTurnContext {
     pub(crate) task_generation: Option<u64>,
     pub(crate) permission_snapshot: Option<super::authority::PermissionAuthoritySnapshot>,
     pub(crate) permission_required: bool,
-    pub(crate) native_goal: Option<forge_provider_api::NativeGoalCommand>,
     pub(crate) task_start: Option<forge_provider_api::input::TaskStart>,
     pub(crate) submission_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub checkpoint: Option<crate::checkpoint::ToolGate>,
@@ -53,7 +51,6 @@ impl std::fmt::Debug for ControlTurnContext {
         formatter
             .debug_struct("ControlTurnContext")
             .field("mode", &self.mode)
-            .field("native_goal", &self.native_goal)
             .field("planning_feedback", &self.planning_feedback)
             .field("plan_state", &self.plan_state)
             .field("plan_document", &self.plan_document)
@@ -159,27 +156,22 @@ impl ControlTurnContext {
             ExecutionResult::Failed { failure, .. } => match failure {
                 ExecutionFailure::Rejected => Err(ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::AdmitInput,
+                        forge_provider_api::ProviderOperation::InputSubmit,
                         forge_provider_api::ProviderFailureKind::Rejected,
                     ),
                 )),
                 ExecutionFailure::Terminal { kind } => Err(ProviderError::Failure(
                     forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::AdmitInput,
+                        forge_provider_api::ProviderOperation::InputSubmit,
                         *kind,
                     ),
                 )),
-                ExecutionFailure::Retryable {
-                    address,
-                    category,
-                    continuation,
-                } => Err(ProviderError::Retryable(Box::new(
-                    forge_provider_api::retry::RetryableFailure {
+                ExecutionFailure::Retryable { address, category } => Err(ProviderError::Retryable(
+                    Box::new(forge_provider_api::retry::RetryableFailure {
                         address: address.clone(),
                         category: *category,
-                        continuation: continuation.clone(),
-                    },
-                ))),
+                    }),
+                )),
             },
         }
     }
@@ -188,7 +180,6 @@ impl ControlTurnContext {
     pub fn inactive(mode: PromptMode) -> Self {
         Self {
             provider_completion: Default::default(),
-            provider_continuation: None,
             questions: None,
             question_events: None,
             live_host_effects: None,
@@ -201,7 +192,6 @@ impl ControlTurnContext {
             task_generation: None,
             permission_snapshot: None,
             permission_required: false,
-            native_goal: None,
             task_start: None,
             submission_cancelled: None,
             checkpoint: None,
@@ -592,7 +582,6 @@ mod test {
                 TaskChange::Install(Box::new(Task::goal(
                     "Promoted goal".into(),
                     Default::default(),
-                    false,
                     3,
                 ))),
                 3,
@@ -618,7 +607,6 @@ mod test {
                 TaskChange::Install(Box::new(Task::goal(
                     "Replacement goal".into(),
                     Default::default(),
-                    false,
                     4,
                 ))),
                 4,
@@ -915,14 +903,12 @@ mod test {
         crate::checks::configure_fixture(&workspace);
         ControlTurnContext {
             provider_completion: Default::default(),
-            provider_continuation: None,
             questions: None,
             question_events: None,
             live_host_effects: None,
             question_exchange_id: None,
             question_invocation: None,
             question_discussion: false,
-            native_goal: None,
             task_start: None,
             submission_cancelled: None,
             checkpoint: None,

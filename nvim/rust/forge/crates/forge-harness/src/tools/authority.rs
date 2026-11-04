@@ -176,7 +176,7 @@ impl TaskAuthority {
         // authority layer's own legacy validation failures cross its adapter.
         self.commit(|| Ok(commit())).map_err(|source| {
             crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::AdmitInput,
+                forge_provider_api::error::ProviderOperation::InputSubmit,
                 source,
             )
         })?
@@ -314,7 +314,7 @@ mod test {
         };
         assert_eq!(
             failure.operation(),
-            forge_provider_api::error::ProviderOperation::AdmitInput
+            forge_provider_api::error::ProviderOperation::InputSubmit
         );
         Ok(())
     }
@@ -331,7 +331,7 @@ mod test {
         context.task_generation = Some(controller.callback_snapshot()?.0);
         let authority = TaskAuthority::capture(&context).unwrap();
         authority.validate()?;
-        let mut replacement = Task::goal("Replacement".into(), Default::default(), false, 2);
+        let mut replacement = Task::goal("Replacement".into(), Default::default(), 2);
         replacement.request_entry("New instructions".into(), 2)?;
         let replacement = controller
             .change(
@@ -366,12 +366,7 @@ mod test {
     fn dispatched_callback_preserves_pending_receipt_and_rejects_revocation() -> Result<()> {
         let (_root, mut store, controller) = SessionTaskController::test_goal();
         let original = controller.current()?.unwrap();
-        let mut pending = Task::goal(
-            "Pending native receipt".into(),
-            Default::default(),
-            false,
-            2,
-        );
+        let mut pending = Task::goal("Pending native receipt".into(), Default::default(), 2);
         pending.request_entry("Run the admitted task".into(), 2)?;
         let pending = controller
             .change(
@@ -430,7 +425,6 @@ mod test {
                 TaskChange::Install(Box::new(Task::goal(
                     "new goal".into(),
                     Default::default(),
-                    false,
                     3,
                 ))),
                 3,

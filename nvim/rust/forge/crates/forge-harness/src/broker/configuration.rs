@@ -43,7 +43,7 @@ pub(crate) struct PermissionConfigurationResult {
 /// Capture provider catalog work without retaining the broker across I/O.
 pub(crate) struct ConfigurationCatalogJob {
     provider: Arc<Provider>,
-    request: ProviderRequest,
+    request: ProviderCatalogRequest,
     authority: Box<ConfigurationAuthority>,
 }
 
@@ -55,7 +55,7 @@ pub(crate) struct ConfigurationCatalogResult {
 /// Own a provider settings reconciliation independently of the broker lock.
 pub(crate) struct ConfigurationReconcileJob {
     provider: Arc<Provider>,
-    request: ProviderCatalogRequest,
+    request: ProviderRequest,
     selection: crate::settings::PortableSettings,
     authority: Box<ConfigurationAuthority>,
     completed: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -68,6 +68,7 @@ pub(crate) struct ConfigurationReconcileResult {
     authority: Box<ConfigurationAuthority>,
     completed: Option<Arc<std::sync::atomic::AtomicBool>>,
     uncertainty: Option<ConfigurationWriteGuard>,
+    receipt: crate::provider::ConfigureReceipt,
 }
 
 /// Fence an owner if an in-flight provider settings write loses its completion.
@@ -83,7 +84,7 @@ impl Drop for ConfigurationWriteGuard {
         if !self.armed {
             return;
         }
-        self.controller.mark_native_goal_uncertain();
+        self.controller.mark_configuration_uncertain();
         let registry = Arc::clone(&self.registry);
         let owner = self.owner.clone();
         if let Err(error) = self.registry.retain_cleanup(
@@ -97,24 +98,6 @@ impl Drop for ConfigurationWriteGuard {
         ) {
             self.registry.record_cleanup_failure(error);
         }
-    }
-}
-
-/// Retire provider-side execution registrations after configuration changes.
-pub(crate) struct ConfigurationCleanupJob {
-    provider: Arc<Provider>,
-    session_id: String,
-    authority: Box<ConfigurationAuthority>,
-}
-
-impl ConfigurationCleanupJob {
-    pub(crate) async fn run(self) -> Result<ConfigurationReconcileResult> {
-        self.provider.cleanup_execution(&self.session_id).await?;
-        Ok(ConfigurationReconcileResult {
-            authority: self.authority,
-            completed: None,
-            uncertainty: None,
-        })
     }
 }
 
@@ -143,6 +126,7 @@ pub(crate) struct ConfigurationCandidate {
     resource_selection: Option<crate::settings::PortableSettings>,
     reconciled: Arc<std::sync::atomic::AtomicBool>,
     uncertainty: Option<ConfigurationWriteGuard>,
+    receipt: Option<crate::provider::ConfigureReceipt>,
 }
 
 pub(crate) struct ConfigurationPreparation {
@@ -208,7 +192,6 @@ impl ConfigurationCandidate {
 pub(crate) struct ConfigurationCommit {
     pub(crate) value: Value,
     pub(crate) events: Vec<SessionEvent>,
-    pub(crate) cleanup: Option<ConfigurationCleanupJob>,
 }
 
 pub(crate) struct ConfigurationMcpNotices {
@@ -219,7 +202,8 @@ pub(crate) struct ConfigurationMcpNotices {
 
 impl ConfigurationCatalogJob {
     pub(crate) async fn run(self) -> Result<ConfigurationCatalogResult> {
-        let models = self.provider.model_list(self.request).await?;
+        let context = self.provider.query_context(&self.request).await?;
+        let models = self.provider.model_list(context).await?;
         Ok(ConfigurationCatalogResult {
             authority: self.authority,
             models,
@@ -229,8 +213,8 @@ impl ConfigurationCatalogJob {
 
 impl ConfigurationReconcileJob {
     pub(crate) async fn run(self) -> Result<ConfigurationReconcileResult> {
-        let lane = self.controller.native_goal_lane().lock_owned().await;
-        self.controller.ensure_native_goal_certain()?;
+        let lane = self.controller.configuration_lane().lock_owned().await;
+        self.controller.ensure_configuration_certain()?;
         let guard = ConfigurationWriteGuard {
             registry: self.registry,
             owner: self.owner,
@@ -239,14 +223,23 @@ impl ConfigurationReconcileJob {
         };
         // The spawned worker retains the transport lane even if its caller is
         // cancelled, so generation recovery cannot race a late provider write.
+        let receipt = Arc::new(std::sync::Mutex::new(None));
+        let retained_receipt = receipt.clone();
         let worker = guard.registry.retain_cleanup(
             crate::provider::session_execution::CleanupWorkKind::ConfigurationWrite,
             async move {
                 let _lane = lane;
-                self.provider
-                    .reconcile_settings(self.request, &self.selection)
+                let configured = self
+                    .provider
+                    .session_configure(self.request, &self.selection)
                     .await
-                    .map_err(crate::provider::session_execution::CleanupWorkFailure::Provider)
+                    .map_err(crate::provider::session_execution::CleanupWorkFailure::Provider)?;
+                *retained_receipt.lock().map_err(|_| {
+                    crate::provider::session_execution::CleanupWorkFailure::Provider(
+                        crate::provider::ProviderError::DeliveryUncertain,
+                    )
+                })? = Some(configured);
+                Ok(())
             },
         )?;
         worker
@@ -260,10 +253,16 @@ impl ConfigurationReconcileJob {
         guard.registry.collect_cleanup().await.map_err(|error| {
             anyhow::Error::new(error).context(crate::provider::ProviderError::DeliveryUncertain)
         })?;
+        let receipt = receipt
+            .lock()
+            .map_err(|_| anyhow::anyhow!("configuration receipt lock poisoned"))?
+            .take()
+            .context("configuration worker did not retain its binding receipt")?;
         Ok(ConfigurationReconcileResult {
             authority: self.authority,
             completed: self.completed,
             uncertainty: Some(guard),
+            receipt,
         })
     }
 }
@@ -782,6 +781,7 @@ impl HarnessBroker {
             resource_selection,
             reconciled,
             uncertainty: None,
+            receipt: None,
         }))
     }
 
@@ -790,33 +790,48 @@ impl HarnessBroker {
         candidate: &ConfigurationCandidate,
     ) -> Result<Option<ConfigurationReconcileJob>> {
         self.validate_configuration_authority(&candidate.authority)?;
-        if candidate.resource_selection.is_some() {
-            self.validate_native_configuration_authority(&candidate.authority)?;
+        if matches!(candidate.effect(), ConfigurationEffect::Local) {
+            return Ok(None);
         }
-        candidate
-            .resource_selection
-            .as_ref()
-            .map(|selection| {
-                let mut job = self.prepare_configuration_reconcile(
-                    ProviderCatalogRequest {
-                        execution_owner: None,
-                        harness_session_id: candidate.configured.id.clone(),
-                        workspace: candidate.configured.workspace.clone(),
-                        access: candidate.configured.access.clone(),
-                        approval_mode: candidate.configured.approval_mode,
-                        provider_session_id: candidate
-                            .configured
-                            .provider_session_id
-                            .clone()
-                            .map(TryInto::try_into)
-                            .transpose()?,
-                    },
-                    selection.clone(),
-                )?;
-                job.completed = Some(Arc::clone(&candidate.reconciled));
-                Ok(job)
-            })
-            .transpose()
+        self.validate_native_configuration_authority(&candidate.authority)?;
+        let configured = &candidate.configured;
+        let selection = match &candidate.resource_selection {
+            Some(selection) => selection.clone(),
+            None => {
+                crate::settings::SettingsStore::open(&self.data_root)?
+                    .get(&configured.workspace, &configured.id, &configured.provider)?
+                    .desired
+            }
+        };
+        let request = ProviderRequest {
+            dispatch: Default::default(),
+            execution_owner: None,
+            harness_session_id: configured.id.clone(),
+            workspace: configured.workspace.clone(),
+            input: ProviderInput::from_text(""),
+            mode: if configured.background.is_some() {
+                PromptMode::Background
+            } else {
+                PromptMode::Chat
+            },
+            model: configured.model.clone(),
+            effort: configured.effort.clone(),
+            context_window: configured.context_window.clone(),
+            service_tier: configured.service_tier,
+            access: configured.access.clone(),
+            approval_mode: configured.approval_mode,
+            provider_session_id: configured
+                .provider_session_id
+                .clone()
+                .map(TryInto::try_into)
+                .transpose()?,
+            submission: None,
+            recovered_input: Vec::new(),
+            control_context: None,
+        };
+        let mut job = self.prepare_configuration_reconcile(request, selection)?;
+        job.completed = Some(Arc::clone(&candidate.reconciled));
+        Ok(Some(job))
     }
 
     pub(crate) fn commit_configuration_candidate(
@@ -834,7 +849,13 @@ impl HarnessBroker {
             return Err(error);
         }
         if candidate.uncertainty.is_some() {
-            self.validate_native_configuration_authority(&candidate.authority)?;
+            self.validate_reconciled_configuration_authority(
+                &candidate.authority,
+                candidate
+                    .receipt
+                    .as_ref()
+                    .context("configuration has no binding receipt")?,
+            )?;
         }
         if candidate.params.get("auto_compaction").is_some() {
             candidate
@@ -843,6 +864,17 @@ impl HarnessBroker {
                 .validate(self.session.context_usage.as_ref())?;
         }
         candidate.rebase(&self.session);
+        if let Some(crate::provider::ConfigureReceipt::Applied(receipt)) = &candidate.receipt {
+            candidate.configured.provider_session_id =
+                receipt.after_history().map(|id| id.as_str().to_owned());
+        }
+        let identity_receipt = candidate
+            .receipt
+            .as_ref()
+            .and_then(|receipt| match receipt {
+                crate::provider::ConfigureReceipt::Applied(receipt) => Some(receipt.clone()),
+                crate::provider::ConfigureReceipt::Deferred => None,
+            });
         let refresh_check_policy =
             candidate.automatic_checks.is_some() || candidate.resource_selection.is_some();
         let mut uncertainty = candidate.uncertainty.take();
@@ -956,12 +988,10 @@ impl HarnessBroker {
         anyhow::ensure!(foreground_failure::same_retraction_task(current.as_ref(), expected_task.as_ref()), "configuration task authority changed before commit");
         settings.commit_configuration(expected_revision, target, changed.then_some(&portable), provider_setting.as_ref().map(|value| (provider_id.as_str(), value)), Some(&intent), || {
         let ConfigurationCandidate {
-            params,
             configured,
             subagent_tools,
             lsp_tools,
             status_thoughts,
-            delegation_registry_changed,
             update_model_preference,
             ..
         } = *candidate;
@@ -997,10 +1027,10 @@ impl HarnessBroker {
                 .status_thoughts
                 .store(enabled, Ordering::Relaxed);
         }
-        Ok((serde_json::to_value(self.session_view()?)?, vec![self.event("session_configured", json!({"session": self.session_view()?, "access_abbreviation": self.session.access.abbreviation()}))?], delegation_registry_changed && params.get("settings_revision").is_none()))
+        Ok((serde_json::to_value(self.session_view()?)?, vec![self.event("session_configured", json!({"session": self.session_view()?, "access_abbreviation": self.session.access.abbreviation()}))?]))
         })
         });
-        let (value, events, needs_cleanup) = match committed {
+        let (value, events) = match committed {
             Ok(value) => value,
             Err(error) => {
                 if self
@@ -1008,7 +1038,7 @@ impl HarnessBroker {
                     .pending_configuration_intent(&session_id)?
                     .is_some()
                 {
-                    self.task_controller.mark_native_goal_uncertain();
+                    self.task_controller.mark_configuration_uncertain();
                     let registry = self.execution_registry.clone();
                     let owner = crate::provider::ExecutionOwner::root(&session_id);
                     if let Err(cleanup) = self.execution_registry.retain_cleanup(
@@ -1027,7 +1057,7 @@ impl HarnessBroker {
             }
         };
         if let Err(error) = self.store.clear_configuration_intent(&intent) {
-            self.task_controller.mark_native_goal_uncertain();
+            self.task_controller.mark_configuration_uncertain();
             let registry = self.execution_registry.clone();
             let owner = crate::provider::ExecutionOwner::root(&session_id);
             if let Err(cleanup) = self.execution_registry.retain_cleanup(
@@ -1051,19 +1081,13 @@ impl HarnessBroker {
         {
             self.observer.completion_queue.finish()?;
         }
-        let cleanup = if needs_cleanup {
-            Some(self.prepare_configuration_cleanup()?)
-        } else {
-            None
-        };
         if let Some(guard) = uncertainty.as_mut() {
             guard.armed = false;
         }
-        Ok(ConfigurationCommit {
-            value,
-            events,
-            cleanup,
-        })
+        if let Some(receipt) = identity_receipt {
+            self.configuration_identity = Some(receipt);
+        }
+        Ok(ConfigurationCommit { value, events })
     }
 
     fn validate_configuration_executor(
@@ -1102,16 +1126,9 @@ impl HarnessBroker {
 impl HarnessBroker {
     /// Capture catalog work and the authority that must still own its result.
     pub(crate) fn prepare_configuration_catalog(&self) -> Result<ConfigurationCatalogJob> {
-        self.prepare_configuration_catalog_for_mode(PromptMode::Chat)
-    }
-
-    pub(crate) fn prepare_configuration_catalog_for_mode(
-        &self,
-        mode: PromptMode,
-    ) -> Result<ConfigurationCatalogJob> {
         Ok(ConfigurationCatalogJob {
             provider: Arc::clone(&self.provider),
-            request: self.provider_request(ProviderInput::from_text(""), mode)?,
+            request: self.provider_catalog_request()?,
             authority: self.capture_configuration_authority()?,
         })
     }
@@ -1127,10 +1144,10 @@ impl HarnessBroker {
 
     pub(crate) fn prepare_configuration_reconcile(
         &self,
-        request: ProviderCatalogRequest,
+        request: ProviderRequest,
         selection: crate::settings::PortableSettings,
     ) -> Result<ConfigurationReconcileJob> {
-        self.task_controller.ensure_native_goal_certain()?;
+        self.task_controller.ensure_configuration_certain()?;
         Ok(ConfigurationReconcileJob {
             provider: Arc::clone(&self.provider),
             request,
@@ -1143,35 +1160,18 @@ impl HarnessBroker {
         })
     }
 
-    pub(crate) fn commit_configuration_reconcile(
-        &self,
-        mut result: ConfigurationReconcileResult,
-    ) -> Result<()> {
-        if let Err(error) = self.validate_native_configuration_authority(&result.authority) {
-            if result.uncertainty.is_some() {
-                return Err(error.context(crate::provider::ProviderError::DeliveryUncertain));
-            }
-            return Err(error);
-        }
-        if let Some(completed) = result.completed.take() {
-            completed.store(true, Ordering::Release);
-        }
-        if let Some(guard) = result.uncertainty.as_mut() {
-            guard.armed = false;
-        }
-        Ok(())
-    }
-
     /// Hold a successful provider write fenced until the corresponding host commit succeeds.
     pub(crate) fn certify_candidate_reconcile(
         &self,
         candidate: &mut ConfigurationCandidate,
         mut result: ConfigurationReconcileResult,
     ) -> Result<()> {
-        if let Err(error) = self.validate_native_configuration_authority(&result.authority) {
+        if let Err(error) =
+            self.validate_reconciled_configuration_authority(&result.authority, &result.receipt)
+        {
             return Err(error.context(crate::provider::ProviderError::DeliveryUncertain));
         }
-        self.validate_native_configuration_authority(&candidate.authority)
+        self.validate_reconciled_configuration_authority(&candidate.authority, &result.receipt)
             .map_err(|error| error.context(crate::provider::ProviderError::DeliveryUncertain))?;
         anyhow::ensure!(
             result.uncertainty.is_some(),
@@ -1187,15 +1187,8 @@ impl HarnessBroker {
         );
         completed.store(true, Ordering::Release);
         candidate.uncertainty = result.uncertainty.take();
+        candidate.receipt = Some(result.receipt);
         Ok(())
-    }
-
-    pub(crate) fn prepare_configuration_cleanup(&self) -> Result<ConfigurationCleanupJob> {
-        Ok(ConfigurationCleanupJob {
-            provider: Arc::clone(&self.provider),
-            session_id: self.session.id.clone(),
-            authority: self.capture_configuration_authority()?,
-        })
     }
 
     pub(super) fn capture_configuration_authority(&self) -> Result<Box<ConfigurationAuthority>> {
@@ -1260,6 +1253,54 @@ impl HarnessBroker {
             self.session.provider_session_id == authority.session.provider_session_id,
             "native configuration binding changed during provider work"
         );
+        Ok(())
+    }
+
+    /// Admit an ordered history change only through this exact live binding's configuration receipt.
+    fn validate_reconciled_configuration_authority(
+        &self,
+        authority: &ConfigurationAuthority,
+        receipt: &crate::provider::ConfigureReceipt,
+    ) -> Result<()> {
+        self.validate_configuration_authority(authority)?;
+        let crate::provider::ConfigureReceipt::Applied(receipt) = receipt else {
+            return self.validate_native_configuration_authority(authority);
+        };
+        receipt.validate(&crate::provider::ExecutionOwner::root(&self.session.id))?;
+        let before = receipt.before_history().map(|id| id.as_str());
+        let after = receipt.after_history().map(|id| id.as_str());
+        let captured = authority.session.provider_session_id.as_deref();
+        let current = self.session.provider_session_id.as_deref();
+        anyhow::ensure!(
+            captured.is_none() || captured == before,
+            "configuration receipt belongs to another native history"
+        );
+        anyhow::ensure!(
+            current == captured || current == after || captured.is_none() && current == before,
+            "native history changed outside the configured binding receipt"
+        );
+        Ok(())
+    }
+
+    /// Persist only the latest consumed identity while a configured binding's weak proof remains live.
+    pub(super) fn retain_session_identity(
+        &mut self,
+        owner: &crate::provider::ExecutionOwner,
+        identity: &forge_provider_api::ProviderSessionId,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            owner == &crate::provider::ExecutionOwner::root(&self.session.id),
+            "session identity crosses root ownership"
+        );
+        if let Some(receipt) = &self.configuration_identity {
+            match receipt.observed_history(owner) {
+                Ok(current) if current.as_ref() != Some(identity) => return Ok(()),
+                Ok(_) => {}
+                Err(_) => self.configuration_identity = None,
+            }
+        }
+        self.session.provider_session_id = Some(identity.as_str().to_owned());
+        self.save_session()?;
         Ok(())
     }
     /// Capture a permission change without mutating provider or session state.
@@ -1676,6 +1717,214 @@ impl HarnessBroker {
 mod owned_tests {
     use super::*;
 
+    /// Select whether a completed binding receipt still authorizes the pending host commit.
+    #[derive(Clone, Copy)]
+    enum IdentityReceiptBoundary {
+        InboxPending,
+        ForeignHistory,
+        RetiredBinding,
+    }
+
+    /// Persist ordered identity before inbox delivery, while rejecting foreign histories and retired receipts.
+    #[tokio::test]
+    async fn configuration_identity_receipt_preserves_ordered_history_and_rejects_stale_authority()
+    -> Result<()> {
+        for boundary in [
+            IdentityReceiptBoundary::InboxPending,
+            IdentityReceiptBoundary::ForeignHistory,
+            IdentityReceiptBoundary::RetiredBinding,
+        ] {
+            let workspace = super::super::test::repository();
+            let data = tempfile::tempdir()?;
+            let mut broker =
+                super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+            let owner = crate::provider::ExecutionOwner::root(&broker.session.id);
+            let descriptor = forge_providers::registry::descriptor(
+                &forge_providers::registry::nonselectable_id().unwrap(),
+            )
+            .unwrap();
+            let native = crate::provider::test_support::EventFixtureProvider::new(
+                descriptor,
+                |_, _, _| async { Ok(()) },
+            );
+            native.with_session_configure({
+                let native = Arc::downgrade(&native);
+                let owner = owner.clone();
+                let configured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                move |_, _| {
+                    let native = native
+                        .upgrade()
+                        .expect("configuration keeps its adapter alive");
+                    let owner = owner.clone();
+                    let history = format!(
+                        "configured-history-{}",
+                        configured.fetch_add(1, Ordering::AcqRel)
+                    );
+                    async move {
+                        native
+                            .event_sink(&owner)
+                            .await?
+                            .send_wait(ProviderEvent::SessionIdentity {
+                                scope: crate::provider::EventScope::Binding { owner },
+                                provider_session_id: history.try_into().unwrap(),
+                            })
+                            .await?;
+                        Ok(())
+                    }
+                }
+            });
+            let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+            broker.set_provider_for_test(fixture.provider_handle());
+            let registry = broker.execution_registry();
+            let engine = registry.owner(owner.clone()).await?;
+            broker
+                .provider
+                .session_open(
+                    broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
+                )
+                .await?;
+            let preparation = broker.prepare_configuration(json!({"session_tools":false}))?;
+            let mut candidate = broker.build_configuration_candidate(preparation, &[])?;
+            let result = broker
+                .prepare_candidate_reconcile(&candidate)?
+                .context("tool change has no native reconciliation")?
+                .run()
+                .await?;
+            assert!(
+                broker.session.provider_session_id.is_none(),
+                "fixture consumed its inbox before receipt certification"
+            );
+            match boundary {
+                IdentityReceiptBoundary::InboxPending => {
+                    broker.certify_candidate_reconcile(&mut candidate, result)?;
+                    broker.commit_configuration_candidate(candidate)?;
+                    assert_eq!(
+                        broker.session.provider_session_id.as_deref(),
+                        Some("configured-history-0")
+                    );
+                    let preparation =
+                        broker.prepare_configuration(json!({"session_tools":true}))?;
+                    let mut candidate = broker.build_configuration_candidate(preparation, &[])?;
+                    let result = broker
+                        .prepare_candidate_reconcile(&candidate)?
+                        .context("second tool change has no reconciliation")?
+                        .run()
+                        .await?;
+                    broker.certify_candidate_reconcile(&mut candidate, result)?;
+                    broker.commit_configuration_candidate(candidate)?;
+                    assert_eq!(
+                        broker.session.provider_session_id.as_deref(),
+                        Some("configured-history-1")
+                    );
+                    broker.observe_session_event(ProviderEvent::SessionIdentity {
+                        scope: crate::provider::EventScope::Binding {
+                            owner: owner.clone(),
+                        },
+                        provider_session_id: "configured-history-0".to_owned().try_into().unwrap(),
+                    })?;
+                    assert_eq!(
+                        broker.session.provider_session_id.as_deref(),
+                        Some("configured-history-1")
+                    );
+                    assert_eq!(
+                        broker
+                            .store
+                            .load_session(&broker.session.id)?
+                            .unwrap()
+                            .provider_session_id
+                            .as_deref(),
+                        Some("configured-history-1")
+                    );
+                    broker.drain_session_events()?;
+                    assert_eq!(
+                        broker.session.provider_session_id.as_deref(),
+                        Some("configured-history-1")
+                    );
+                    broker.observe_session_event(ProviderEvent::SessionIdentity {
+                        scope: crate::provider::EventScope::Binding {
+                            owner: owner.clone(),
+                        },
+                        provider_session_id: "configured-history-1".to_owned().try_into().unwrap(),
+                    })?;
+                    let (mut exchange, _, _) = broker
+                        .test_stage_interaction_for_turn("Preserve configured identity", true, 100)
+                        .await?;
+                    for identity in [
+                        None,
+                        Some("configured-history-0"),
+                        Some("configured-history-1"),
+                    ] {
+                        let completion = crate::provider::ProviderCompletion {
+                            native: forge_provider_api::completion::ProviderCompletion {
+                                provider_session_id: identity
+                                    .map(|id| id.to_owned().try_into().unwrap()),
+                                capability: broker.capability.clone(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        };
+                        broker.stage_host_completion(
+                            &mut exchange,
+                            completion,
+                            PromptMode::Chat,
+                        )?;
+                        assert_eq!(
+                            broker.session.provider_session_id.as_deref(),
+                            Some("configured-history-1"),
+                            "terminal identity {identity:?} replaced the current configured history"
+                        );
+                        assert_eq!(
+                            broker
+                                .store
+                                .load_session(&broker.session.id)?
+                                .unwrap()
+                                .provider_session_id
+                                .as_deref(),
+                            Some("configured-history-1")
+                        );
+                    }
+                    assert_eq!(
+                        broker.session.provider_session_id.as_deref(),
+                        Some("configured-history-1")
+                    );
+                    assert!(!broker.task_controller.configuration_is_uncertain());
+                }
+                IdentityReceiptBoundary::ForeignHistory => {
+                    broker.session.provider_session_id = Some("unrelated-history".into());
+                    assert!(
+                        broker
+                            .certify_candidate_reconcile(&mut candidate, result)
+                            .is_err()
+                    );
+                    assert_eq!(
+                        broker.session.provider_session_id.as_deref(),
+                        Some("unrelated-history")
+                    );
+                    assert!(broker.task_controller.configuration_is_uncertain());
+                }
+                IdentityReceiptBoundary::RetiredBinding => {
+                    registry
+                        .retire(
+                            &owner,
+                            crate::provider::session_execution::OwnerCloseReason::Shutdown,
+                        )
+                        .await?;
+                    assert!(
+                        broker
+                            .certify_candidate_reconcile(&mut candidate, result)
+                            .is_err()
+                    );
+                    assert!(broker.session.provider_session_id.is_none());
+                    assert!(broker.task_controller.configuration_is_uncertain());
+                }
+            }
+            registry.collect_cleanup().await?;
+            engine.close().await?;
+            fixture.provider_handle().shutdown().await?;
+        }
+        Ok(())
+    }
+
     /// Preserve context observations that arrive between settings preparation and host commit.
     #[tokio::test]
     async fn configuration_commit_preserves_newer_context_observations() -> Result<()> {
@@ -1736,7 +1985,7 @@ mod owned_tests {
                 .pending_configuration_intent(&broker.session.id)?
                 .is_some()
         );
-        assert!(broker.task_controller.native_goal_is_uncertain());
+        assert!(broker.task_controller.configuration_is_uncertain());
         assert!(
             broker
                 .store
@@ -1896,7 +2145,7 @@ mod owned_tests {
             armed: true,
         };
         drop(guard);
-        assert!(broker.task_controller.native_goal_is_uncertain());
+        assert!(broker.task_controller.configuration_is_uncertain());
         Ok(())
     }
 

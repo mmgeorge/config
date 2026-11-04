@@ -1,7 +1,5 @@
 use anyhow::{Context, Result};
-use forge_provider_api::catalog::{
-    CatalogMutation, McpDefinition, McpStatus, McpToolDefinition, SkillDefinition,
-};
+use forge_provider_api::catalog::{McpDefinition, McpStatus, McpToolDefinition, SkillDefinition};
 use forge_provider_api::input::MessageInput;
 use forge_provider_api::submission::InputReceipt;
 use forge_provider_api::{Compaction, CompactionState, ProviderError, ProviderModel, ServiceTier};
@@ -9,7 +7,7 @@ use github_copilot_sdk::rpc::*;
 use github_copilot_sdk::session_events::ReasoningSummary;
 use github_copilot_sdk::types::ContextTier;
 use github_copilot_sdk::{DeliveryMode, SessionId, SetModelOptions};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -102,7 +100,7 @@ impl CopilotClient {
         .await;
         result.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderOperation::InputSubmit,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
         })
@@ -157,7 +155,7 @@ impl CopilotClient {
         .await;
         result.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderOperation::InputSubmit,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
         })
@@ -168,6 +166,7 @@ impl CopilotClient {
         checkpoint: Option<String>,
     ) -> Result<String, ProviderError> {
         let result: Result<String> = async {
+            super::operation::dispatch_for(forge_provider_api::ProviderOperation::SessionFork)?;
             Ok(self
                 .inner
                 .rpc()
@@ -183,11 +182,13 @@ impl CopilotClient {
                 .to_string())
         }
         .await;
-        result.map_err(|_| {
-            native_failure(
-                forge_provider_api::error::ProviderOperation::NativeTransport,
-                forge_provider_api::error::ProviderFailureKind::Transport,
-            )
+        result.map_err(|error| {
+            error.downcast::<ProviderError>().unwrap_or_else(|_| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::SessionFork,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                )
+            })
         })
     }
 }
@@ -210,7 +211,7 @@ impl CopilotSession {
     ) -> Result<(), ProviderError> {
         if !self.belongs_to(proof.failed_generation()) {
             return Err(native_failure(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                forge_provider_api::error::ProviderOperation::Cancel,
                 forge_provider_api::error::ProviderFailureKind::Rejected,
             ));
         }
@@ -230,6 +231,10 @@ impl CopilotSession {
     }
     pub async fn disconnect(&self) -> Result<(), ProviderError> {
         let intake = self.events.close().await;
+        if self.generation.is_collected() {
+            self.inner.stop_event_loop().await;
+            return intake;
+        }
         if self.events.client_stopped() {
             // A stopped transport is not proof that its process and resources were collected.
             // Keep cleanup ownership until the runtime supplies a CollectedClient witness.
@@ -237,7 +242,7 @@ impl CopilotSession {
         }
         let native = self.inner.disconnect().await.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
+                forge_provider_api::error::ProviderOperation::Cancel,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
         });
@@ -250,79 +255,90 @@ impl CopilotSession {
             (Ok(()), Ok(())) => Ok(()),
         }
     }
-    /// Abort foreground generation and stop this session's detached shell tasks.
+    /// Interrupt foreground generation while preserving independently owned shell tasks.
     pub async fn abort(&self) -> Result<(), ProviderError> {
-        if self.events.client_stopped() {
-            return Ok(());
+        self.ensure_healthy()?;
+        let result = self
+            .inner
+            .rpc()
+            .abort(AbortRequest::default())
+            .await
+            .map_err(|_| {
+                ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::Cancel,
+                        forge_provider_api::ProviderFailureKind::Transport,
+                    )
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Interruption,
+                        forge_provider_api::FailureDisposition::Uncertain,
+                    ),
+                )
+            })?;
+        if !result.success {
+            return Err(ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::Cancel,
+                    forge_provider_api::ProviderFailureKind::Rejected,
+                )
+                .at_phase(
+                    forge_provider_api::ProviderPhase::Interruption,
+                    forge_provider_api::FailureDisposition::Uncertain,
+                ),
+            ));
         }
-        let foreground = self.inner.abort().await.map_err(|_| {
+        Ok(())
+    }
+
+    /// Inspect native tasks before allowing a destructive SDK refresh of the binding.
+    pub async fn terminal_snapshot(
+        &self,
+    ) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
+        self.ensure_healthy()?;
+        self.inner.rpc().tasks().refresh().await.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::CancelSession,
-                forge_provider_api::error::ProviderFailureKind::Transport,
+                forge_provider_api::ProviderOperation::TerminalList,
+                forge_provider_api::ProviderFailureKind::Transport,
             )
-        });
-        // Native abort acknowledges model interruption without stopping detached shell tasks.
-        let shells = async {
-            self.inner.rpc().tasks().refresh().await.map_err(|_| {
-                native_failure(
-                    forge_provider_api::ProviderOperation::CancelSession,
-                    forge_provider_api::ProviderFailureKind::Transport,
-                )
-            })?;
-            let tasks = self.inner.rpc().tasks().list().await.map_err(|_| {
-                native_failure(
-                    forge_provider_api::ProviderOperation::CancelSession,
-                    forge_provider_api::ProviderFailureKind::Transport,
-                )
-            })?;
-            let encoded = serde_json::to_value(tasks).map_err(|_| {
-                native_failure(
-                    forge_provider_api::ProviderOperation::CancelSession,
-                    forge_provider_api::ProviderFailureKind::Protocol,
-                )
-            })?;
-            let inventory = crate::terminal::parse_snapshot(&encoded, true).map_err(|_| {
-                native_failure(
-                    forge_provider_api::ProviderOperation::CancelSession,
-                    forge_provider_api::ProviderFailureKind::Protocol,
-                )
-            })?;
-            for terminal in inventory.terminal {
-                let result = self
-                    .inner
-                    .rpc()
-                    .tasks()
-                    .cancel(TasksCancelRequest { id: terminal.id })
-                    .await
-                    .map_err(|_| {
-                        native_failure(
-                            forge_provider_api::ProviderOperation::CancelSession,
-                            forge_provider_api::ProviderFailureKind::Transport,
-                        )
-                    })?;
-                if !result.cancelled {
-                    return Err(native_failure(
-                        forge_provider_api::ProviderOperation::CancelSession,
-                        forge_provider_api::ProviderFailureKind::Rejected,
-                    ));
-                }
-            }
-            Ok::<(), ProviderError>(())
+        })?;
+        let tasks = self.inner.rpc().tasks().list().await.map_err(|_| {
+            native_failure(
+                forge_provider_api::ProviderOperation::TerminalList,
+                forge_provider_api::ProviderFailureKind::Transport,
+            )
+        })?;
+        let encoded = serde_json::to_value(tasks).map_err(|_| {
+            native_failure(
+                forge_provider_api::ProviderOperation::TerminalList,
+                forge_provider_api::ProviderFailureKind::Protocol,
+            )
+        })?;
+        let inventory = crate::terminal::parse_snapshot(&encoded, true).map_err(|_| {
+            native_failure(
+                forge_provider_api::ProviderOperation::TerminalList,
+                forge_provider_api::ProviderFailureKind::Protocol,
+            )
+        })?;
+        Ok(inventory)
+    }
+
+    /// Stop every detached shell before closing the entire binding.
+    pub async fn terminate_all(&self) -> Result<(), ProviderError> {
+        for terminal in self.terminal_snapshot().await?.terminal {
+            self.terminate_terminal(terminal.id.as_str()).await?;
         }
-        .await;
-        match (foreground, shells) {
-            (Ok(()), result) | (result, Ok(())) => result,
-            (Err(primary), Err(secondary)) => Err(ProviderError::Combined {
-                primary: Box::new(primary),
-                secondary: vec![secondary],
-            }),
-        }
+        Ok(())
     }
 
     /// Report whether this binding belongs to a stopped native process.
     pub fn client_stopped(&self) -> bool {
         self.events.client_stopped()
     }
+    /// Get positive collection proof for this exact SDK process, without treating failure as stop.
+    pub fn client_collected(&self) -> bool {
+        self.generation.is_collected()
+    }
+
     pub async fn set_model(
         &self,
         model: &str,
@@ -335,7 +351,7 @@ impl CopilotSession {
             .map(|_| ())
             .map_err(|_| {
                 native_failure(
-                    forge_provider_api::error::ProviderOperation::ReconcileSettings,
+                    forge_provider_api::error::ProviderOperation::SessionConfigure,
                     forge_provider_api::error::ProviderFailureKind::Transport,
                 )
             })
@@ -371,42 +387,7 @@ impl CopilotSession {
         .await;
         result.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::NativeTransport,
-                forge_provider_api::error::ProviderFailureKind::Transport,
-            )
-        })
-    }
-    pub async fn set_skill_enabled(
-        &self,
-        name: &str,
-        enabled: bool,
-    ) -> Result<CatalogMutation, ProviderError> {
-        let result: Result<CatalogMutation> = async {
-            if enabled {
-                self.inner
-                    .rpc()
-                    .skills()
-                    .enable(SkillsEnableRequest { name: name.into() })
-                    .await
-                    .with_context(|| format!("enable Copilot skill ${name}"))?;
-            } else {
-                self.inner
-                    .rpc()
-                    .skills()
-                    .disable(SkillsDisableRequest { name: name.into() })
-                    .await
-                    .with_context(|| format!("disable Copilot skill ${name}"))?;
-            }
-            Ok(CatalogMutation {
-                name: name.to_owned(),
-                enabled,
-                restart_required: false,
-            })
-        }
-        .await;
-        result.map_err(|_| {
-            native_failure(
-                forge_provider_api::error::ProviderOperation::ReconcileSettings,
+                forge_provider_api::error::ProviderOperation::InputSubmit,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
         })
@@ -564,46 +545,7 @@ impl CopilotSession {
         .await;
         result.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::NativeTransport,
-                forge_provider_api::error::ProviderFailureKind::Transport,
-            )
-        })
-    }
-    pub async fn set_mcp_enabled(
-        &self,
-        name: &str,
-        enabled: bool,
-    ) -> Result<CatalogMutation, ProviderError> {
-        let result: Result<CatalogMutation> = async {
-            if enabled {
-                self.inner
-                    .rpc()
-                    .mcp()
-                    .enable(McpEnableRequest {
-                        server_name: name.into(),
-                    })
-                    .await
-                    .with_context(|| format!("enable Copilot MCP {name}"))?;
-            } else {
-                self.inner
-                    .rpc()
-                    .mcp()
-                    .disable(McpDisableRequest {
-                        server_name: name.into(),
-                    })
-                    .await
-                    .with_context(|| format!("disable Copilot MCP {name}"))?;
-            }
-            Ok(CatalogMutation {
-                name: name.to_owned(),
-                enabled,
-                restart_required: false,
-            })
-        }
-        .await;
-        result.map_err(|_| {
-            native_failure(
-                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderOperation::InputSubmit,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
         })
@@ -615,9 +557,15 @@ impl CopilotSession {
             let inventory =
                 crate::terminal::parse_snapshot(&serde_json::to_value(inventory)?, true)?;
             anyhow::ensure!(
-                inventory.terminal.iter().any(|terminal| terminal.id == id),
+                inventory
+                    .terminal
+                    .iter()
+                    .any(|terminal| terminal.id.as_str() == id),
                 "Background terminal is no longer running"
             );
+            super::operation::dispatch_for(
+                forge_provider_api::ProviderOperation::TerminalTerminate,
+            )?;
             let result = self
                 .inner
                 .rpc()
@@ -632,53 +580,92 @@ impl CopilotSession {
             Ok(())
         }
         .await;
-        result.map_err(|_| {
-            native_failure(
-                forge_provider_api::error::ProviderOperation::NativeTransport,
-                forge_provider_api::error::ProviderFailureKind::Transport,
-            )
+        result.map_err(|error| {
+            error.downcast::<ProviderError>().unwrap_or_else(|_| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::TerminalTerminate,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                )
+            })
         })
     }
-    /// Reconcile a persisted cursor using only root input events and opaque accepted receipts.
+    /// Capture a durable event anchor before sending, independently of process-local cursors.
+    pub async fn delivery_boundary(&self) -> Result<(String, Option<String>), ProviderError> {
+        let tail = self.inner.rpc().event_log().tail().await.map_err(|_| {
+            native_failure(
+                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderFailureKind::Transport,
+            )
+        })?;
+        let history = self
+            .inner
+            .rpc()
+            .event_log()
+            .read(EventLogReadRequest {
+                agent_ids: None,
+                direction: Some(EventsReadDirection::Backward),
+                include_ephemeral: Some(false),
+                cursor: None,
+                agent_scope: Some(EventsAgentScope::Primary),
+                types: None,
+                max: Some(1),
+                wait_ms: Some(0),
+            })
+            .await
+            .map_err(|_| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                )
+            })?;
+        if history.cursor_status != EventsCursorStatus::Ok {
+            return Err(native_failure(
+                forge_provider_api::ProviderOperation::InputSubmit,
+                forge_provider_api::ProviderFailureKind::Protocol,
+            ));
+        }
+        Ok((
+            tail.cursor,
+            history.events.last().map(|event| event.id.clone()),
+        ))
+    }
+
+    /// Read one pinned durable snapshot without creating, resuming, or activating native history.
     pub async fn find_unclaimed_submission_in(
-        session: &github_copilot_sdk::session::Session,
-        cursor: &str,
+        client: &github_copilot_sdk::Client,
+        session_id: &str,
+        anchor: Option<&str>,
         known_receipts: &HashSet<String>,
         content_digest: Option<&str>,
     ) -> std::result::Result<SubmissionReconciliation, ProviderError> {
-        let mut cursor = cursor.to_owned();
-        let mut seen = std::collections::HashSet::new();
+        let mut cursor = None;
         let mut candidates = Vec::new();
+        let mut after_boundary = anchor.is_none();
         loop {
-            let history = session
+            let history = client
                 .rpc()
-                .event_log()
-                .read(EventLogReadRequest {
-                    agent_ids: None,
-                    direction: None,
-                    include_ephemeral: Some(false),
-                    cursor: Some(cursor.clone()),
-                    agent_scope: Some(EventsAgentScope::Primary),
-                    types: Some(json!(["user.message"])),
+                .sessions()
+                .read_persisted_events(SessionsReadPersistedEventsRequest {
+                    session_id: SessionId::new(session_id),
+                    cursor,
+                    direction: Some(EventsReadDirection::Forward),
                     max: Some(100),
-                    wait_ms: Some(0),
                 })
                 .await
                 .map_err(|_| {
-                    ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::RecoverSession,
+                    native_failure(
+                        forge_provider_api::ProviderOperation::InputReconcile,
                         forge_provider_api::ProviderFailureKind::Transport,
-                    ))
+                    )
                 })?;
             if history.cursor_status != EventsCursorStatus::Ok {
-                return Err(ProviderError::Failure(
-                    forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::RecoverSession,
-                        forge_provider_api::ProviderFailureKind::Protocol,
-                    ),
-                ));
+                return Ok(SubmissionReconciliation::Ambiguous);
             }
             for event in history.events {
+                if !after_boundary {
+                    after_boundary = Some(event.id.as_str()) == anchor;
+                    continue;
+                }
                 if event.agent_id.is_some()
                     || event.event_type != "user.message"
                     || event
@@ -706,21 +693,13 @@ impl CopilotSession {
                 ));
             }
             if !history.has_more {
-                return Ok(resolve_unclaimed_submissions(
-                    &candidates,
-                    known_receipts,
-                    content_digest,
-                ));
+                return Ok(if after_boundary {
+                    resolve_unclaimed_submissions(&candidates, known_receipts, content_digest)
+                } else {
+                    SubmissionReconciliation::Ambiguous
+                });
             }
-            if history.cursor == cursor || !seen.insert(history.cursor.clone()) {
-                return Err(ProviderError::Failure(
-                    forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::RecoverSession,
-                        forge_provider_api::ProviderFailureKind::Protocol,
-                    ),
-                ));
-            }
-            cursor = history.cursor;
+            cursor = Some(history.cursor);
         }
     }
     pub async fn rewind(
@@ -728,45 +707,64 @@ impl CopilotSession {
         target: super::turn::CopilotRetraction,
     ) -> Result<(), ProviderError> {
         let result: Result<()> = async {
-            let event_id = match target {
-                super::turn::CopilotRetraction::Event(event_id) => event_id,
-                super::turn::CopilotRetraction::History(mut cursor) => loop {
-                    let history = self
-                        .inner
-                        .rpc()
-                        .event_log()
-                        .read(EventLogReadRequest {
-                            agent_ids: None,
-                            direction: None,
-                            include_ephemeral: Some(false),
-                            cursor: Some(cursor.clone()),
-                            agent_scope: Some(EventsAgentScope::Primary),
-                            types: Some(json!(["user.message"])),
-                            max: Some(1),
-                            wait_ms: Some(0),
-                        })
-                        .await
-                        .context("verify cancelled Copilot submission in native history")?;
-                    anyhow::ensure!(
-                        history.cursor_status == EventsCursorStatus::Ok,
-                        "Copilot rewind history boundary expired"
-                    );
-                    if let Some(event) = history.events.into_iter().find(|event| {
-                        event.agent_id.is_none() && event.event_type == "user.message"
-                    }) {
-                        break event.id;
+            let super::turn::CopilotRetraction {
+                mut cursor,
+                event_id,
+                message_id,
+                boundary,
+            } = target;
+            let mut found = false;
+            let mut last_event = None;
+            let mut seen = HashSet::new();
+            loop {
+                let history = self
+                    .inner
+                    .rpc()
+                    .event_log()
+                    .read(EventLogReadRequest {
+                        agent_ids: None,
+                        direction: None,
+                        include_ephemeral: Some(false),
+                        cursor: Some(cursor.clone()),
+                        agent_scope: Some(EventsAgentScope::Primary),
+                        types: None,
+                        max: Some(100),
+                        wait_ms: Some(0),
+                    })
+                    .await
+                    .context("check exact cancelled input before native truncation")?;
+                anyhow::ensure!(
+                    history.cursor_status == EventsCursorStatus::Ok,
+                    "Copilot retraction boundary expired"
+                );
+                for event in history.events {
+                    last_event = Some(event.id.clone());
+                    if event.agent_id.is_some() || event.event_type != "user.message" {
+                        continue;
                     }
-                    if !history.has_more {
-                        return Ok(());
-                    }
                     anyhow::ensure!(
-                        history.cursor != cursor,
-                        "Copilot rewind history cursor did not advance"
+                        !found
+                            && event.id == event_id
+                            && event.data.get("messageId").and_then(Value::as_str)
+                                == Some(message_id.as_str()),
+                        "Copilot retraction would remove another input"
                     );
-                    cursor = history.cursor;
-                },
-                super::turn::CopilotRetraction::Unsent => unreachable!(),
-            };
+                    found = true;
+                }
+                if !history.has_more {
+                    break;
+                }
+                anyhow::ensure!(
+                    history.cursor != cursor && seen.insert(history.cursor.clone()),
+                    "Copilot history cursor did not advance"
+                );
+                cursor = history.cursor;
+            }
+            anyhow::ensure!(
+                found && last_event.as_deref() == Some(boundary.as_str()),
+                "Copilot retraction history boundary changed"
+            );
+            super::operation::dispatch_for(forge_provider_api::ProviderOperation::InputRetract)?;
             let result = self
                 .inner
                 .rpc()
@@ -782,15 +780,18 @@ impl CopilotSession {
             Ok(())
         }
         .await;
-        result.map_err(|_| {
-            native_failure(
-                forge_provider_api::error::ProviderOperation::NativeTransport,
-                forge_provider_api::error::ProviderFailureKind::Transport,
-            )
+        result.map_err(|error| {
+            error.downcast::<ProviderError>().unwrap_or_else(|_| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::InputRetract,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                )
+            })
         })
     }
     pub async fn compact(&self, id: String) -> Result<Compaction, ProviderError> {
         let result: Result<Compaction> = async {
+            super::operation::dispatch_for(forge_provider_api::ProviderOperation::SessionCompact)?;
             let result = self
                 .inner
                 .rpc()
@@ -814,11 +815,13 @@ impl CopilotSession {
             })
         }
         .await;
-        result.map_err(|_| {
-            native_failure(
-                forge_provider_api::error::ProviderOperation::NativeTransport,
-                forge_provider_api::error::ProviderFailureKind::Transport,
-            )
+        result.map_err(|error| {
+            error.downcast::<ProviderError>().unwrap_or_else(|_| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::SessionCompact,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                )
+            })
         })
     }
     pub async fn steer(
@@ -827,40 +830,48 @@ impl CopilotSession {
         receipt: Option<Arc<dyn InputReceipt>>,
         scope: &forge_provider_api::InvocationScope,
         workspace: &str,
+        authority: super::turn::NativeSendAuthority<'_>,
     ) -> Result<String, ProviderError> {
         self.ensure_healthy()?;
         let message = super::input::message(input).with_mode(DeliveryMode::Immediate);
         if let Some(receipt) = &receipt {
-            let history = self.inner.rpc().event_log().tail().await.map_err(|_| {
-                ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                    forge_provider_api::ProviderOperation::AdmitInput,
-                    forge_provider_api::ProviderFailureKind::Transport,
-                ))
-            })?;
+            let (cursor, anchor) = self.delivery_boundary().await?;
             self.ensure_healthy()?;
             receipt
                 .clone()
                 .record_sending(Some(super::prompt::sending_recovery_token(
                     scope.owner.clone(),
                     receipt.id().clone(),
+                    receipt.attempt_id()?,
+                    super::prompt::NativeDeliveryBoundary {
+                        session_id: self.id(),
+                        cursor,
+                        anchor,
+                    },
                     workspace.to_owned(),
-                    self.id(),
-                    history.cursor,
                     hex::encode(Sha256::digest(message.prompt.as_bytes())),
                 )?))
                 .await?;
         }
         self.ensure_healthy()?;
-        let accepted = self
-            .inner
-            .send(message)
-            .await
-            .map_err(|_| ProviderError::DeliveryUncertain)?;
+        let accepted = match super::input::send(&self.inner, message, None, authority).await {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                if super::operation::current().is_some_and(|operation| !operation.dispatched())
+                    && let Some(receipt) = &receipt
+                {
+                    receipt.clone().record_rejected(error.clone()).await?;
+                }
+                return Err(error);
+            }
+        };
         if let Some(receipt) = receipt {
             let receipt_id = receipt.id().clone();
+            let attempt_id = receipt.attempt_id()?;
             receipt
                 .record_accepted(Some(super::prompt::accepted_recovery_token(
                     receipt_id,
+                    attempt_id,
                     scope.owner.clone(),
                     self.id(),
                     accepted.clone(),
@@ -928,7 +939,7 @@ impl CopilotSession {
         .await;
         result.map_err(|_| {
             native_failure(
-                forge_provider_api::error::ProviderOperation::NativeTransport,
+                forge_provider_api::error::ProviderOperation::InputSubmit,
                 forge_provider_api::error::ProviderFailureKind::Transport,
             )
         })

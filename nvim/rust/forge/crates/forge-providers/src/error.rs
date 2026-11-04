@@ -3,53 +3,100 @@ use crate::codex::CodexConnectionError;
 use forge_provider_api::ProviderError;
 use forge_provider_api::error::{ProviderFailureKind, ProviderOperation};
 
-impl From<CodexConnectionError> for ProviderError {
-    /// Classify native failures without retaining a provider error or source chain.
-    fn from(error: CodexConnectionError) -> Self {
-        let kind = match &error {
-            CodexConnectionError::Overflow => {
-                return Self::Observation(
-                    forge_provider_api::lifecycle::ObservationFailure::Overflow,
-                );
-            }
-            CodexConnectionError::Encoding(_) => ProviderFailureKind::Protocol,
-            CodexConnectionError::Transport { .. } | CodexConnectionError::Closed(_) => {
-                ProviderFailureKind::Transport
-            }
-        };
-        Self::Failure(forge_provider_api::ProviderFailure::new(
-            ProviderOperation::NativeTransport,
-            kind,
-        ))
-    }
+/// Normalize a Codex transport failure at its requested operation boundary.
+pub(crate) fn codex(error: CodexConnectionError, operation: ProviderOperation) -> ProviderError {
+    let kind = match error {
+        CodexConnectionError::Overflow => {
+            return ProviderError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::Overflow,
+            );
+        }
+        CodexConnectionError::Encoding(_) => ProviderFailureKind::Protocol,
+        CodexConnectionError::Transport { .. } | CodexConnectionError::Closed(_) => {
+            ProviderFailureKind::Transport
+        }
+    };
+    ProviderError::Failure(
+        forge_provider_api::ProviderFailure::new(operation, kind).at_phase(
+            forge_provider_api::ProviderPhase::Observation,
+            forge_provider_api::FailureDisposition::Uncertain,
+        ),
+    )
 }
-impl From<AcpConnectionError> for ProviderError {
-    /// Normalize ACP failures without exposing provider text, codes, payloads, or source chains.
-    fn from(error: AcpConnectionError) -> Self {
-        let kind = match error {
-            AcpConnectionError::Protocol { .. } => ProviderFailureKind::Protocol,
-            AcpConnectionError::Remote { failure, .. } => match failure {
+
+/// Normalize an ACP transport failure without retaining native diagnostics or inventing delivery proof.
+pub(crate) fn acp(error: AcpConnectionError, operation: ProviderOperation) -> ProviderError {
+    let (kind, phase, disposition) = match error {
+        AcpConnectionError::Protocol { .. } => (
+            ProviderFailureKind::Protocol,
+            forge_provider_api::ProviderPhase::Observation,
+            forge_provider_api::FailureDisposition::Uncertain,
+        ),
+        AcpConnectionError::Remote { failure, .. } => {
+            let kind = match failure {
                 Some(AcpRemoteFailure::AuthenticationRequired) => {
                     ProviderFailureKind::Authentication
                 }
-                Some(AcpRemoteFailure::RequestCancelled) => return Self::Cancelled,
+                Some(AcpRemoteFailure::RequestCancelled | AcpRemoteFailure::Rejected) => {
+                    ProviderFailureKind::Rejected
+                }
                 Some(AcpRemoteFailure::ResourceNotFound) => ProviderFailureKind::SessionMissing,
-                Some(AcpRemoteFailure::Rejected) => ProviderFailureKind::Rejected,
                 Some(AcpRemoteFailure::Protocol) => ProviderFailureKind::Protocol,
                 None => ProviderFailureKind::Unknown,
-            },
-            AcpConnectionError::Callback(_) => ProviderFailureKind::Unknown,
-            AcpConnectionError::Configuration(_) => ProviderFailureKind::Rejected,
-            AcpConnectionError::Process { .. } | AcpConnectionError::Startup { .. } => {
-                ProviderFailureKind::Runtime
-            }
-            AcpConnectionError::Timeout { .. } => ProviderFailureKind::Timeout,
-        };
-        Self::Failure(forge_provider_api::ProviderFailure::new(
-            ProviderOperation::NativeTransport,
-            kind,
-        ))
-    }
+            };
+            (
+                kind,
+                forge_provider_api::ProviderPhase::Observation,
+                forge_provider_api::FailureDisposition::Uncertain,
+            )
+        }
+        AcpConnectionError::Callback(_) => (
+            ProviderFailureKind::Unknown,
+            forge_provider_api::ProviderPhase::Observation,
+            forge_provider_api::FailureDisposition::Uncertain,
+        ),
+        AcpConnectionError::Configuration(_) => (
+            ProviderFailureKind::Rejected,
+            forge_provider_api::ProviderPhase::Admission,
+            forge_provider_api::FailureDisposition::Unchanged,
+        ),
+        AcpConnectionError::Process { .. } | AcpConnectionError::Startup { .. } => (
+            ProviderFailureKind::Runtime,
+            forge_provider_api::ProviderPhase::Preparation,
+            forge_provider_api::FailureDisposition::Unchanged,
+        ),
+        AcpConnectionError::Timeout { .. } => (
+            ProviderFailureKind::Timeout,
+            forge_provider_api::ProviderPhase::Observation,
+            forge_provider_api::FailureDisposition::Uncertain,
+        ),
+        AcpConnectionError::Collection { process, reader } => {
+            let normalized = |disposition| {
+                ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        operation,
+                        ProviderFailureKind::Runtime,
+                    )
+                    .at_phase(forge_provider_api::ProviderPhase::Collection, disposition),
+                )
+            };
+            return match (process, reader) {
+                (Some(_), Some(_)) => ProviderError::Combined {
+                    primary: Box::new(normalized(
+                        forge_provider_api::FailureDisposition::Invalidated,
+                    )),
+                    secondary: vec![normalized(forge_provider_api::FailureDisposition::Closed)],
+                },
+                (Some(_), None) => normalized(forge_provider_api::FailureDisposition::Invalidated),
+                (None, Some(_)) | (None, None) => {
+                    normalized(forge_provider_api::FailureDisposition::Closed)
+                }
+            };
+        }
+    };
+    ProviderError::Failure(
+        forge_provider_api::ProviderFailure::new(operation, kind).at_phase(phase, disposition),
+    )
 }
 
 #[cfg(test)]
@@ -64,47 +111,60 @@ mod tests {
                 .expect_err("a zero-duration timeout must expire");
         let failures = [
             (
-                ProviderError::from(CodexConnectionError::Closed(
-                    "native-secret-code-payload".into(),
-                )),
+                codex(
+                    CodexConnectionError::Closed("native-secret-code-payload".into()),
+                    ProviderOperation::InputSubmit,
+                ),
                 ProviderFailureKind::Transport,
             ),
             (
-                ProviderError::from(AcpConnectionError::Remote {
-                    method: "native-secret-method".into(),
-                    failure: None,
-                    source: Box::new(std::io::Error::other("native-secret-code-payload")),
-                }),
+                acp(
+                    AcpConnectionError::Remote {
+                        method: "native-secret-method".into(),
+                        failure: None,
+                        source: Box::new(std::io::Error::other("native-secret-code-payload")),
+                    },
+                    ProviderOperation::InputSubmit,
+                ),
                 ProviderFailureKind::Unknown,
             ),
             (
-                ProviderError::from(AcpConnectionError::Timeout {
-                    method: "native-secret-method".into(),
-                    seconds: 1,
-                    source: timeout_source,
-                }),
+                acp(
+                    AcpConnectionError::Timeout {
+                        method: "native-secret-method".into(),
+                        seconds: 1,
+                        source: timeout_source,
+                    },
+                    ProviderOperation::InputSubmit,
+                ),
                 ProviderFailureKind::Timeout,
             ),
             (
-                ProviderError::from(AcpConnectionError::Remote {
-                    method: "authenticate".into(),
-                    failure: Some(AcpRemoteFailure::AuthenticationRequired),
-                    source: Box::new(std::io::Error::other("native auth detail")),
-                }),
+                acp(
+                    AcpConnectionError::Remote {
+                        method: "authenticate".into(),
+                        failure: Some(AcpRemoteFailure::AuthenticationRequired),
+                        source: Box::new(std::io::Error::other("native auth detail")),
+                    },
+                    ProviderOperation::InputSubmit,
+                ),
                 ProviderFailureKind::Authentication,
             ),
             (
-                ProviderError::from(AcpConnectionError::Remote {
-                    method: "session/prompt".into(),
-                    failure: Some(AcpRemoteFailure::Rejected),
-                    source: Box::new(std::io::Error::other("native rejection detail")),
-                }),
+                acp(
+                    AcpConnectionError::Remote {
+                        method: "session/prompt".into(),
+                        failure: Some(AcpRemoteFailure::Rejected),
+                        source: Box::new(std::io::Error::other("native rejection detail")),
+                    },
+                    ProviderOperation::InputSubmit,
+                ),
                 ProviderFailureKind::Rejected,
             ),
         ];
         for (error, expected) in failures {
             assert!(
-                matches!(&error, ProviderError::Failure(failure) if failure.kind() == expected)
+                matches!(&error, ProviderError::Failure(failure) if failure.kind() == expected && failure.operation() == ProviderOperation::InputSubmit)
             );
             let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
             while let Some(cause) = source {
@@ -115,12 +175,36 @@ mod tests {
             assert!(!format!("{error:?}").contains("native-secret"));
         }
         assert!(matches!(
-            ProviderError::from(AcpConnectionError::Remote {
+            acp(AcpConnectionError::Remote {
                 method: "session/prompt".into(),
                 failure: Some(AcpRemoteFailure::RequestCancelled),
                 source: Box::new(std::io::Error::other("native cancellation detail")),
-            }),
-            ProviderError::Cancelled
+            }, ProviderOperation::InputSubmit),
+            ProviderError::Failure(failure) if failure.disposition() == forge_provider_api::FailureDisposition::Uncertain
         ));
+    }
+    /// Preserve process retry ownership independently of a reader which has already joined.
+    #[tokio::test]
+    async fn native_collection_preserves_independent_failures_without_payloads() {
+        let reader = tokio::spawn(async { panic!("native-secret-reader-panic") })
+            .await
+            .unwrap_err();
+        let error = acp(
+            AcpConnectionError::Collection {
+                process: Some(std::io::Error::other("native-secret-process-stop")),
+                reader: Some(reader),
+            },
+            ProviderOperation::SessionClose,
+        );
+        let ProviderError::Combined { primary, secondary } = &error else {
+            panic!("independent cleanup failures were collapsed")
+        };
+        assert_eq!(secondary.len(), 1);
+        assert!(matches!(primary.as_ref(), ProviderError::Failure(failure)
+            if failure.operation() == ProviderOperation::SessionClose && failure.phase() == forge_provider_api::ProviderPhase::Collection
+                && failure.disposition() == forge_provider_api::FailureDisposition::Invalidated));
+        assert!(matches!(&secondary[0], ProviderError::Failure(failure)
+            if failure.phase() == forge_provider_api::ProviderPhase::Collection && failure.disposition() == forge_provider_api::FailureDisposition::Closed));
+        assert!(!format!("{error:?} {error}").contains("native-secret"));
     }
 }

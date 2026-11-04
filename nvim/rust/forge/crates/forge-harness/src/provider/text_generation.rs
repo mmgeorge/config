@@ -3,6 +3,9 @@ use crate::timeline::TimelineEntry;
 use crate::turn::{MessageKind, TurnItem};
 use anyhow::{Result, ensure};
 
+mod isolated;
+pub(crate) use isolated::TextGenerationJobs;
+
 /// Keep shared Background conversations independent of any earlier task's output format.
 pub const BACKGROUND_SYSTEM_MESSAGE: &str = "Generate only the text the current Background task asks for, using its supplied evidence and response requirements. Each request sets its own output format. Earlier requests and drafts are context, not current instructions or proof of repository changes. Work quickly with minimal reasoning. Do not use tools, continue earlier tasks, or add anything outside the requested output.";
 
@@ -26,7 +29,7 @@ impl forge_provider_api::TextValidator for TextGeneration {
     ) -> std::result::Result<String, forge_provider_api::ProviderError> {
         TextGeneration::validate(*self, text).map_err(|_| {
             forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::GenerateText,
+                forge_provider_api::ProviderOperation::InputSubmit,
                 forge_provider_api::ProviderFailureKind::Rejected,
             ))
         })

@@ -19,7 +19,7 @@ pub(crate) enum CommandState {
     /// The owner started the command and retains its asynchronous stage.
     Active {
         revision: u64,
-        /// Task state already committed while required native synchronization remains outstanding.
+        /// Task state already committed while journaled input preparation remains outstanding.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task_commit: Option<super::command::TaskCommandCheckpoint>,
     },
@@ -268,7 +268,7 @@ impl CommandJournal {
     }
 }
 
-/// Preserve committed task evidence before resolving its command or beginning native synchronization.
+/// Preserve committed task evidence before resolving its command or scheduling ordinary input.
 pub(crate) enum TaskCommandCommit {
     /// Reserve one workflow input and its command checkpoint in the domain transaction.
     WorkflowInput {
@@ -281,15 +281,9 @@ pub(crate) enum TaskCommandCommit {
         command: CommandId,
         task: super::command::TaskSelection,
         source: super::command::PlanSelection,
-        completion: TaskAttachmentCompletion,
     },
     /// Local policy mutation and command completion are one atomic commit.
     Complete {
-        command: CommandId,
-        outcome: super::command::TaskCommandOutcome,
-    },
-    /// Task state committed; native-goal synchronization must still settle before success.
-    AwaitGoal {
         command: CommandId,
         outcome: super::command::TaskCommandOutcome,
     },
@@ -303,16 +297,7 @@ pub(crate) enum TaskCommandCommit {
     },
 }
 
-/// Distinguish confirmation of existing plan ownership from installation requiring goal reconciliation.
-#[derive(Clone, Copy)]
-pub(crate) enum TaskAttachmentCompletion {
-    /// Existing ownership and the finite command result commit in one transaction.
-    Complete,
-    /// New ownership commits before internal goal synchronization can settle.
-    AwaitGoal,
-}
-
-/// Couple a task mutation to its result or synchronization checkpoint in the same SQL transaction.
+/// Couple a task mutation to its result or input checkpoint in the same SQL transaction.
 pub(crate) fn commit_task_command(
     transaction: &rusqlite::Transaction<'_>,
     session: &str,
@@ -355,7 +340,6 @@ pub(crate) fn commit_task_command(
         command,
         task,
         source,
-        completion,
     } = &commit
     {
         let mut record = read_record(transaction, session, command.as_str())?
@@ -381,22 +365,12 @@ pub(crate) fn commit_task_command(
             task: task.clone(),
             plan: source.id().clone(),
         };
-        return match completion {
-            TaskAttachmentCompletion::Complete => finish_record(
-                transaction,
-                session,
-                &mut record,
-                Ok(CommandOutcome::Task(outcome)),
-            ),
-            TaskAttachmentCompletion::AwaitGoal => checkpoint_task_command(
-                transaction,
-                session,
-                &record,
-                super::command::TaskCommandCheckpoint::Control {
-                    outcome: Box::new(outcome),
-                },
-            ),
-        };
+        return finish_record(
+            transaction,
+            session,
+            &mut record,
+            Ok(CommandOutcome::Task(outcome)),
+        );
     }
     if let TaskCommandCommit::AwaitInput {
         command,
@@ -443,9 +417,8 @@ pub(crate) fn commit_task_command(
             },
         );
     }
-    let (id, outcome, complete) = match commit {
-        TaskCommandCommit::Complete { command, outcome } => (command, outcome, true),
-        TaskCommandCommit::AwaitGoal { command, outcome } => (command, outcome, false),
+    let (id, outcome) = match commit {
+        TaskCommandCommit::Complete { command, outcome } => (command, outcome),
         TaskCommandCommit::AwaitInput { .. } => {
             unreachable!("input checkpoints were committed above")
         }
@@ -484,21 +457,11 @@ pub(crate) fn commit_task_command(
     if !accepted {
         return Err(CommandJournalError::IdentityConflict);
     }
-    if complete {
-        return finish_record(
-            transaction,
-            session,
-            &mut record,
-            Ok(CommandOutcome::Task(outcome)),
-        );
-    }
-    checkpoint_task_command(
+    finish_record(
         transaction,
         session,
-        &record,
-        super::command::TaskCommandCheckpoint::Control {
-            outcome: Box::new(outcome),
-        },
+        &mut record,
+        Ok(CommandOutcome::Task(outcome)),
     )
 }
 
@@ -745,9 +708,9 @@ mod tests {
         Ok(())
     }
 
-    /// Recover an interrupted native-goal wait with its committed task evidence and no task replay.
+    /// Recover a committed pause receipt without replaying its task mutation.
     #[test]
-    fn task_recovery_preserves_committed_state_before_goal_synchronization() -> anyhow::Result<()> {
+    fn task_recovery_preserves_committed_pause_receipt() -> anyhow::Result<()> {
         use super::super::command::{InputControl, TaskCommand, TaskCommandOutcome, TaskSelection};
         let (root, mut store, tasks) = crate::task::SessionTaskController::test_goal();
         let task = tasks.current()?.unwrap();
@@ -763,10 +726,10 @@ mod tests {
         tasks.apply_owner_command(&mut store, &request.id, &intent, &task.permit(), 2)?;
         assert!(matches!(
             journal.lookup(&request.id)?.unwrap().state,
-            CommandState::Active {
-                task_commit: Some(super::super::command::TaskCommandCheckpoint::Control { outcome }),
+            CommandState::Finished {
+                outcome: Ok(CommandOutcome::Task(TaskCommandOutcome::Paused { .. })),
                 ..
-            } if matches!(outcome.as_ref(), TaskCommandOutcome::Paused { .. })
+            }
         ));
         let paused = tasks.current()?.unwrap();
         assert_eq!(paused.status(), crate::task::TaskStatus::Paused);
@@ -776,10 +739,10 @@ mod tests {
         let record = recovered.admit(&request)?;
         assert!(matches!(
             record.completion().unwrap(),
-            Err(CommandFailure::TaskSynchronization {
-                committed: super::super::command::TaskCommandCheckpoint::Control { outcome },
+            Ok(CommandResult {
+                outcome: CommandOutcome::Task(TaskCommandOutcome::Paused { .. }),
                 ..
-            }) if matches!(outcome.as_ref(), TaskCommandOutcome::Paused { .. })
+            })
         ));
         assert_eq!(tasks.current()?.unwrap().revision, paused.revision);
         Ok(())
@@ -794,8 +757,7 @@ mod tests {
         };
         let (root, mut store, tasks) = crate::task::SessionTaskController::test_goal();
         let original = tasks.current()?.unwrap();
-        let mut replacement =
-            crate::task::Task::goal("Replace once".into(), Default::default(), false, 2);
+        let mut replacement = crate::task::Task::goal("Replace once".into(), Default::default(), 2);
         replacement.request_entry("Begin original task input".into(), 2)?;
         let input = replacement.entry.as_ref().unwrap().id.clone();
         let request = CommandRequest {

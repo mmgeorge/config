@@ -4,12 +4,6 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderTraceEvent {
-    SessionInitialized,
-    SessionRecovered,
-    SubmissionPrepared,
-    SubmissionAccepted,
-    ExecutionStarted,
-    ExecutionFinished,
     /// Begin interruption of a retained provider binding.
     CancellationStarted,
     /// Record the cancellation request's native acknowledgement or normalized failure.
@@ -18,9 +12,6 @@ pub enum ProviderTraceEvent {
     ExecutionCollectionStarted,
     /// Record the worker collection outcome without native payloads.
     ExecutionCollectionFinished,
-    ObservationLost,
-    CallbackSettled,
-    SessionRetired,
 }
 
 /// Carry sanitized provider activity using only normalized correlation identities.

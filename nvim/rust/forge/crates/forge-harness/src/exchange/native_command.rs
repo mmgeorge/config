@@ -1,4 +1,4 @@
-//! Apply native configuration through owner-controlled validation, collection, and replacement handoff.
+//! Apply native configuration through owner-controlled validation, collection, and replacement scheduling.
 
 use super::command::{
     Command, CommandFailure, CommandOutcome, ConfigurationChange, ConfigurationOutcome,
@@ -21,7 +21,7 @@ use crate::command::ExecutionPermit;
 use crate::provider::ExchangeId;
 use forge_protocol::message::SessionEvent;
 
-/// Retain one configuration command through validation, collection, commit, and replacement handoff.
+/// Retain one configuration command through validation, collection, commit, and replacement scheduling.
 pub(super) struct NativeCommandRun {
     /// Durable command identity and every attached completion observer.
     pub(super) command: QueuedCommand,
@@ -37,7 +37,7 @@ pub(super) struct NativeCommandRun {
 impl NativeCommandRun {
     /// Authorize only the replacement foreground prepared by this active command's current stage.
     pub(super) fn authorizes_foreground(&self, work: uuid::Uuid) -> bool {
-        matches!(self.stage, NativeCommandStage::AwaitingDispatch { work: expected, .. } if expected == work)
+        matches!(self.stage, NativeCommandStage::Scheduled { work: expected } if expected == work)
     }
     /// Transfer collection decisions to the owner-held foreground in source order.
     pub(super) fn take_collection_signal(&mut self) -> Option<crate::broker::ForegroundSignal> {
@@ -63,6 +63,7 @@ impl NativeCommandRun {
             NativeCommandEvent::Control(_)
                 | NativeCommandEvent::Observation(_)
                 | NativeCommandEvent::Execution(_)
+                | NativeCommandEvent::ReplacementAuthorized { .. }
         ) {
             self.stage = NativeCommandStage::Consumed;
         }
@@ -156,44 +157,25 @@ impl NativeCommandRun {
                 self.transition
                     .as_mut()
                     .expect("collection retains its transition")
-                    .next(foreground)
+                    .next(foreground.clone())
                     .await,
             ),
             NativeCommandStage::AcquiringExecution(task) => NativeCommandEvent::Execution(
                 task.await
                     .unwrap_or(Err(CommandFailure::OwnershipUnavailable)),
             ),
+            NativeCommandStage::AuthorizingReplacement { task, prompt } => {
+                NativeCommandEvent::ReplacementAuthorized {
+                    result: task
+                        .await
+                        .unwrap_or(Err(crate::provider::ProviderError::DeliveryUncertain)),
+                    prompt: prompt.clone(),
+                }
+            }
             NativeCommandStage::PreparingReplacement { .. }
             | NativeCommandStage::Ready(_)
-            | NativeCommandStage::DispatchLost => NativeCommandEvent::Ready,
-            NativeCommandStage::AwaitingDispatch { deadline, .. } => {
-                tokio::time::sleep_until(*deadline).await;
-                NativeCommandEvent::DispatchDeadline
-            }
+            | NativeCommandStage::Scheduled { .. } => NativeCommandEvent::Ready,
             NativeCommandStage::Consumed => std::future::pending().await,
-        }
-    }
-
-    /// Consume a confirmed handoff only for this command's exact replacement work item.
-    pub(super) fn observe_dispatch(
-        &mut self,
-        work: uuid::Uuid,
-        confirmation: &forge_provider_api::submission::DispatchConfirmation,
-    ) {
-        if matches!(&self.stage, NativeCommandStage::AwaitingDispatch { work: expected, .. } if *expected == work)
-        {
-            self.stage = NativeCommandStage::Ready(InvocationDisposition::Dispatched {
-                scope: confirmation.scope().clone(),
-                binding: confirmation.binding().clone(),
-            });
-        }
-    }
-
-    /// Preserve uncertainty if its replacement ends without a confirmed handoff.
-    pub(super) fn dispatch_lost(&mut self, work: uuid::Uuid) {
-        if matches!(&self.stage, NativeCommandStage::AwaitingDispatch { work: expected, .. } if *expected == work)
-        {
-            self.stage = NativeCommandStage::DispatchLost;
         }
     }
 
@@ -356,18 +338,22 @@ impl NativeCommandRun {
                     updates: Vec::new(),
                 })
             }
-            NativeCommandEvent::DispatchDeadline => {
-                if matches!(self.stage, NativeCommandStage::Ready(_)) {
-                    return Ok(NativeCommandProgress::Waiting {
-                        events: Vec::new(),
-                        updates: Vec::new(),
-                    });
-                }
-                Err(OperationFailure::DispatchUnconfirmed)
+            NativeCommandEvent::ReplacementAuthorized { result, prompt } => {
+                result.map_err(|error| OperationFailure::Domain(error.into()))?;
+                self.stage = NativeCommandStage::PreparingReplacement {
+                    prompt: Some(prompt),
+                };
+                Ok(NativeCommandProgress::Waiting {
+                    events: Vec::new(),
+                    updates: Vec::new(),
+                })
             }
             NativeCommandEvent::Ready => {
                 if !can_commit {
                     return Err(OperationFailure::StorageUncommitted);
+                }
+                if matches!(self.stage, NativeCommandStage::Scheduled { .. }) {
+                    self.stage = NativeCommandStage::Ready(InvocationDisposition::Committed);
                 }
                 let stage = std::mem::replace(&mut self.stage, NativeCommandStage::Consumed);
                 match stage {
@@ -405,11 +391,7 @@ impl NativeCommandRun {
                             });
                         };
                         let work = uuid::Uuid::new_v4();
-                        self.stage = NativeCommandStage::AwaitingDispatch {
-                            work,
-                            deadline: tokio::time::Instant::now()
-                                + std::time::Duration::from_secs(30),
-                        };
+                        self.stage = NativeCommandStage::Scheduled { work };
                         Ok(NativeCommandProgress::Replacement(NativeCommandReplacement {
                             id: work, transaction, updates,
                             execution: self.execution.take().expect("collected policy changes acquired exclusive execution before commit"),
@@ -460,13 +442,13 @@ impl NativeCommandRun {
                         };
                         Ok(NativeCommandProgress::Finished(outcome))
                     }
-                    NativeCommandStage::DispatchLost => Err(OperationFailure::DispatchUnconfirmed),
                     NativeCommandStage::AcquiringControl(_)
                     | NativeCommandStage::AcquiringObservation(_)
                     | NativeCommandStage::Work
                     | NativeCommandStage::Collecting
                     | NativeCommandStage::AcquiringExecution(_)
-                    | NativeCommandStage::AwaitingDispatch { .. }
+                    | NativeCommandStage::AuthorizingReplacement { .. }
+                    | NativeCommandStage::Scheduled { .. }
                     | NativeCommandStage::Consumed => {
                         unreachable!("only owner-ready permission phases produce a ready event")
                     }
@@ -517,8 +499,20 @@ impl NativeCommandRun {
             )
             .map_err(OperationFailure::Domain)?;
         updates.extend(completed.delivery.into_updates());
-        self.stage = NativeCommandStage::PreparingReplacement {
-            prompt: completed.resume,
+        self.stage = match (
+            completed.resume,
+            self.selected.as_ref(),
+            self.transition.as_ref(),
+        ) {
+            (Some(prompt), Some(selected), Some(transition)) => {
+                match transition.authorize_replacement(selected)? {
+                    Some(task) => NativeCommandStage::AuthorizingReplacement { task, prompt },
+                    None => NativeCommandStage::PreparingReplacement {
+                        prompt: Some(prompt),
+                    },
+                }
+            }
+            (prompt, _, _) => NativeCommandStage::PreparingReplacement { prompt },
         };
         Ok(NativeCommandProgress::Waiting {
             events: Vec::new(),
@@ -555,12 +549,14 @@ impl NativeCommandRun {
                         .map_err(|_| crate::provider::ProviderError::DeliveryUncertain)
                 }))
             }
+            NativeCommandStage::AuthorizingReplacement { task, .. } => {
+                transition.retain_job(task);
+            }
             NativeCommandStage::Work
             | NativeCommandStage::Collecting
             | NativeCommandStage::PreparingReplacement { .. }
-            | NativeCommandStage::AwaitingDispatch { .. }
+            | NativeCommandStage::Scheduled { .. }
             | NativeCommandStage::Ready(_)
-            | NativeCommandStage::DispatchLost
             | NativeCommandStage::Consumed => {}
         }
         match self.work {
@@ -584,8 +580,11 @@ pub(super) enum NativeCommandEvent {
     Compaction(CompactionEvent),
     Transition(TransitionEvent),
     Execution(Result<ExecutionPermit, CommandFailure>),
+    ReplacementAuthorized {
+        result: Result<(), crate::provider::ProviderError>,
+        prompt: String,
+    },
     Ready,
-    DispatchDeadline,
 }
 
 impl NativeCommandEvent {
@@ -598,8 +597,8 @@ impl NativeCommandEvent {
             Self::Compaction(event) => event.name(),
             Self::Transition(event) => event.name(),
             Self::Execution(_) => "execution_acquired",
+            Self::ReplacementAuthorized { .. } => "configuration_replacement_authorized",
             Self::Ready => "configuration_ready",
-            Self::DispatchDeadline => "dispatch_deadline",
         }
     }
 }
@@ -630,15 +629,17 @@ enum NativeCommandStage {
     Work,
     Collecting,
     AcquiringExecution(tokio::task::JoinHandle<Result<ExecutionPermit, CommandFailure>>),
+    AuthorizingReplacement {
+        task: tokio::task::JoinHandle<Result<(), crate::provider::ProviderError>>,
+        prompt: String,
+    },
     PreparingReplacement {
         prompt: Option<String>,
     },
-    AwaitingDispatch {
+    Scheduled {
         work: uuid::Uuid,
-        deadline: tokio::time::Instant,
     },
     Ready(InvocationDisposition),
-    DispatchLost,
     Consumed,
 }
 

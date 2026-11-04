@@ -29,8 +29,6 @@ pub struct RetryableFailure {
     pub address: TurnAddress,
     /// Normalized retry class selected by the provider adapter.
     pub category: RetryCategory,
-    /// Authorize one provider-owned continuation after settled transient failure.
-    pub continuation: crate::ContinuationToken,
 }
 
 impl fmt::Display for RetryableFailure {

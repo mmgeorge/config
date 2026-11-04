@@ -12,7 +12,8 @@ state.transcript_win = vim.api.nvim_get_current_win()
 local original_controller = package.loaded["forge.views.harness.controller"]
 local activated, execution
 package.loaded["forge.views.harness.controller"] = { refresh_winbar = function() end, render = function() end,
-  activate_snapshot = function(value) activated = value end, present_plan_question = function() end,
+  activate_snapshot = function() error("Plan command receipt is not a session snapshot") end,
+  synchronize_state = function() activated = true end, present_plan_question = function() end,
   task_transition = function(action) execution = action end }
 local path = vim.fn.tempname() .. ".md"
 vim.fn.writefile({ "# Physical plan" }, path)
@@ -191,8 +192,7 @@ local success, failure = xpcall(function()
   assert(pending and pending.params.comment == "Approved after review"
     and pending.params.review.document == review.owner.document and pending.params.digest == nil)
   assert(state.plan_review == review and not review.owner.closed, "approval closed before its capture completed")
-  pending.callback({ session = { id = "plan-session" }, active_plan = { review = {} },
-    command_result = { outcome = { outcome = "task", result = { disposition = "awaiting_input" } } } })
+  pending.callback({ command_result = { outcome = { outcome = "task", result = { disposition = "awaiting_input" } } } })
   assert(activated and state.plan_review == nil and not state.busy)
   assert(execution == nil, "approval issued a second execution command")
   assert(vim.api.nvim_get_current_win() == state.transcript_win, "approval did not return to Harness")
