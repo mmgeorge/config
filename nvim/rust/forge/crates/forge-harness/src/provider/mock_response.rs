@@ -90,10 +90,4 @@ impl MockResponseControl {
             TestControlResult::Scripted => Ok(json!({"scripted": true})),
         }
     }
-
-    /// Cancel matching holds during owner cleanup or provider shutdown.
-    pub(crate) fn cancel_session(&self, session_id: Option<&str>) {
-        let owner = session_id.map(ExecutionOwner::root);
-        self.control.cancel_owner(owner.as_ref());
-    }
 }

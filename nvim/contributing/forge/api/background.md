@@ -4,6 +4,16 @@ The background service owns persisted generation conversations independently of 
 
 All calls inherit the [request lifecycle and failure contract](lua-client.md#requestspec-callback-progress). Method failures do not select another session or close an otherwise valid connection.
 
+## Generation and automatic compaction
+
+Opening ForgeStatus can request its About text through repository generation. That generation uses a persistent background conversation, independent of the interactive Harness exchange. The background defaults enable automatic compaction at 128,000 tokens. Saved settings can override that policy.
+
+The threshold uses fresh provider-reported context usage after a completed turn. Input evidence and retained conversation history contribute to that usage; the reply length and cumulative billing total do not determine eligibility. Commit evidence allows up to 500,000 bytes, which is a byte limit rather than a token guarantee. A large input or repeated generations can therefore make compaction due even when the reply is short.
+
+Generated text is delivered before optional maintenance completes. A later compaction failure does not retract that text. Maintenance requires successful continuation settlement, runs at most once per completed native turn, and skips a turn that already observed native compaction. Failed settlement retires the retained runtime instead of attempting further maintenance on it.
+
+The `compaction.started` trace records the operation ID, manual/automatic origin, background flag, reported context tokens and capacity, and configured threshold. Codex adapter compaction errors identify `CompactSession`; native codes and unsanitized messages remain inside the adapter.
+
 ## `background.session.document`
 
 Read or operate on a persisted background conversation.

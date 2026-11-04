@@ -116,6 +116,20 @@ impl From<crate::broker::TurnCancelled> for ToolError {
     }
 }
 
+impl From<crate::exchange::QuestionEventError> for ToolError {
+    /// Preserve owner-event failures as typed tool causes for normalized response classification.
+    fn from(error: crate::exchange::QuestionEventError) -> Self {
+        Self::Operation(Box::new(error))
+    }
+}
+
+impl From<crate::question::QuestionWaitError> for ToolError {
+    /// Preserve owner retirement and observation failures without flattening their cause.
+    fn from(error: crate::question::QuestionWaitError) -> Self {
+        Self::Operation(Box::new(error))
+    }
+}
+
 /// Add operation context while preserving typed tool errors and domain causes.
 pub(in crate::tools) trait ToolContext<T> {
     fn context(self, message: impl Into<String>) -> ToolResult<T>;

@@ -254,12 +254,12 @@ function Checks.open(state, host)
       overrides.auto = overrides.auto or {}
       overrides.auto[check.id] = not automatic
     end
-    request("session.check.override", overrides, function(result) adopt(result) picker.update(build_spec()) end)
+    request("session.check.override", overrides, function() refresh() end)
   end
 
   build_spec = function()
     local rows = {}
-    if type(catalog.active_run) == "string" then rows[#rows + 1] = { id = "cancel", label = "Cancel active checks", wrap_label = true } end
+    if type(catalog.active_run) == "string" then rows[#rows + 1] = { id = "cancel", label = "Cancel current work (including checks)", wrap_label = true } end
     if load_error or (catalog.configured and type(catalog.error) == "string") then
       rows[#rows + 1] = { id = "error", label = "Fix checks: " .. (load_error or catalog.error), wrap_label = true }
     end
@@ -306,7 +306,7 @@ function Checks.open(state, host)
       on_cancel = function() closed = true stop_poll() end,
       on_confirm = function(result)
         local option = result.option
-        if option.id == "cancel" then request("session.check.cancel", { run_id = catalog.active_run }) return false end
+        if option.id == "cancel" then request("session.turn.cancel", {}) return false end
         return false
       end,
       action_list = {

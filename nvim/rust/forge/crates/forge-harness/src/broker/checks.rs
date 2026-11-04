@@ -444,7 +444,7 @@ impl HarnessBroker {
         self.task_controller.apply(
             &mut self.store,
             &task.permit(),
-            crate::task::TaskEvent::ExecutionUpdated(execution.clone()),
+            crate::task::TaskEvent::ExecutionUpdated(Box::new(execution.clone())),
             self.clock.now_ms(),
         )
     }

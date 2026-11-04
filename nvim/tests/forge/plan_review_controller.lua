@@ -25,7 +25,7 @@ client.request = function(request_specification, callback)
 
   callback = encode_delivery(callback)
   assert(session_id == "plan-session")
-  if method == "session.plan.acceptance.begin" or method == "session.plan.changes.request" then
+  if method == "session.plan.accept" or method == "session.plan.changes.request" then
     pending = { method = method, params = params, callback = callback } return
   end
   assert(method == "session.document")
@@ -191,9 +191,10 @@ local success, failure = xpcall(function()
   assert(pending and pending.params.comment == "Approved after review"
     and pending.params.review.document == review.owner.document and pending.params.digest == nil)
   assert(state.plan_review == review and not review.owner.closed, "approval closed before its capture completed")
-  pending.callback({ session = { id = "plan-session" }, active_plan = { acceptance = {} } })
+  pending.callback({ session = { id = "plan-session" }, active_plan = { review = {} },
+    command_result = { outcome = { outcome = "task", result = { disposition = "awaiting_input" } } } })
   assert(activated and state.plan_review == nil and not state.busy)
-  assert(execution.action == "execute" and execution.plan_id == "plan" and execution.digest == "canonical")
+  assert(execution == nil, "approval issued a second execution command")
   assert(vim.api.nvim_get_current_win() == state.transcript_win, "approval did not return to Harness")
   assert(vim.api.nvim_buf_is_valid(review.buf), "closing PlanReview deleted its physical buffer")
   assert(vim.deep_equal(vim.fn.readfile(path), { "# Physical plan" }))
@@ -203,7 +204,7 @@ local success, failure = xpcall(function()
   review = state.plan_review
   review.command_set.action_by_id.accept.run({})
   answer_decision("", "<CR>")
-  pending.callback({ session = { id = "plan-session" }, active_plan = { state = "accepted", acceptance = vim.NIL },
+  pending.callback({ session = { id = "plan-session" }, active_plan = { state = "accepted", review = vim.NIL },
     goal_execution = { state = "paused" } })
   assert(execution == nil and state.plan_review == nil,
     "revision approval overrode the provider pause with an execute request")

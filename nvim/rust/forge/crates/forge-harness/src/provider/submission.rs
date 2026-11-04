@@ -32,6 +32,19 @@ pub enum SubmissionState {
     Cancelled,
 }
 
+/// Certify the journal state at the atomic attempt to prevent prepared input dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SubmissionRetirement {
+    /// Prepared input was durably cancelled before dispatch could begin.
+    Prevented,
+    /// An earlier cancellation already excluded this input from dispatch.
+    AlreadyCancelled,
+    /// Dispatch may already have happened; retirement does not authorize replay.
+    Sending,
+    /// Durable native acceptance already proves delivery.
+    Accepted,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum SubmissionPhase {
@@ -58,6 +71,9 @@ pub struct SubmissionRecord {
     format_version: u32,
     #[serde(default)]
     pub input_message_id: Option<String>,
+    /// Exact task observation authority captured before this input can dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) task_receipt: Option<crate::task::TaskReceiptPermit>,
     /// Host-generated UUID, also used for native input correlation.
     pub id: String,
     /// Original request, including typed input and durable attachment references.
@@ -80,6 +96,8 @@ impl<'de> Deserialize<'de> for SubmissionRecord {
             format_version: Option<u32>,
             #[serde(default)]
             input_message_id: Option<String>,
+            #[serde(default)]
+            task_receipt: Option<crate::task::TaskReceiptPermit>,
             id: String,
             request: ProviderRequest,
             delivery: serde_json::Value,
@@ -134,6 +152,7 @@ impl<'de> Deserialize<'de> for SubmissionRecord {
         Ok(Self {
             format_version: SUBMISSION_FORMAT_VERSION,
             input_message_id: stored.input_message_id,
+            task_receipt: stored.task_receipt,
             id: stored.id,
             request: stored.request,
             delivery,
@@ -154,6 +173,14 @@ enum PreparationIdentity {
     Unidentified,
     Task,
     EditableInput,
+}
+
+/// Bind native receipt identity to the host input whose content must survive retries.
+pub(crate) enum SubmissionOrigin {
+    /// Editable queued input; changed content may replace only a provably unsent receipt.
+    QueuedInput(crate::exchange::command::InputId),
+    /// Task-owned input with immutable content at its stable task input identity.
+    TaskInput(crate::task::TaskInputId),
 }
 
 /// SQLite delivery journal. Commits complete before any corresponding provider write.
@@ -198,8 +225,8 @@ impl SubmissionStore {
             record: Mutex::new(record),
             acceptance: tokio::sync::watch::channel(accepted).0,
             steering_queued: tokio::sync::watch::channel(false).0,
+            dispatch_observer: Mutex::new(None),
             dispatch: Mutex::new(None),
-            accepted_action: Mutex::new(None),
         });
         live.retain(|_, entry| entry.strong_count() > 0);
         live.insert(id.to_owned(), Arc::downgrade(&submission));
@@ -301,8 +328,9 @@ impl SubmissionStore {
         let record = SubmissionRecord {
             format_version: SUBMISSION_FORMAT_VERSION,
             input_message_id,
+            task_receipt: None,
             id: uuid::Uuid::new_v4().to_string(),
-            request: request.clone(),
+            request: request.invocation_snapshot(),
             delivery: SubmissionState::Prepared,
             included: Vec::new(),
             error: None,
@@ -326,7 +354,10 @@ impl SubmissionStore {
                 let mut existing: SubmissionRecord = serde_json::from_str(&payload)?;
                 ensure!(
                     existing_provider == provider,
-                    "input identity changed provider"
+                    super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::RecordInput,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    ))
                 );
                 let same_input = serde_json::to_value(&existing.request.input)?
                     == serde_json::to_value(&request.input)?;
@@ -337,7 +368,10 @@ impl SubmissionStore {
                                 existing.delivery,
                                 SubmissionState::Prepared | SubmissionState::Cancelled
                             ),
-                        "input identity was reused for different provider content"
+                        super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::RecordInput,
+                            forge_provider_api::ProviderFailureKind::Protocol,
+                        ))
                     );
                     existing.delivery = SubmissionState::Cancelled;
                     transaction.execute(
@@ -384,8 +418,8 @@ impl SubmissionStore {
             record: Mutex::new(record),
             acceptance: tokio::sync::watch::channel(false).0,
             steering_queued: tokio::sync::watch::channel(false).0,
+            dispatch_observer: Mutex::new(None),
             dispatch: Mutex::new(None),
-            accepted_action: Mutex::new(None),
         });
         let mut live = self
             .live
@@ -424,7 +458,45 @@ impl SubmissionStore {
             .collect()
     }
 
-    /// Saves steering before it enters an active turn's queue.
+    /// Persist identified input with the actual invocation preferences selected by its owner.
+    pub(crate) fn prepare_input_request(
+        self: &Arc<Self>,
+        request: &ProviderRequest,
+        provider: super::ProviderId,
+        origin: SubmissionOrigin,
+    ) -> std::result::Result<Arc<Submission>, super::ProviderError> {
+        let (input_message_id, identity) = match origin {
+            SubmissionOrigin::QueuedInput(id) => {
+                (Some(id.as_str().into()), PreparationIdentity::EditableInput)
+            }
+            SubmissionOrigin::TaskInput(id) => {
+                (Some(id.as_str().into()), PreparationIdentity::Task)
+            }
+        };
+        self.prepare_record(request, provider, input_message_id, identity)
+            .map_err(journal_failure)
+    }
+
+    /// Persist a complete invocation snapshot off the owner loop with typed receipt failures.
+    pub(crate) async fn persist_input_request(
+        self: &Arc<Self>,
+        request: ProviderRequest,
+        provider: super::ProviderId,
+        origin: SubmissionOrigin,
+    ) -> std::result::Result<Arc<Submission>, super::ProviderError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || store.prepare_input_request(&request, provider, origin))
+            .await
+            .map_err(|_| {
+                super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::RecordInput,
+                    forge_provider_api::ProviderFailureKind::Persistence,
+                ))
+            })?
+    }
+
+    /// Construct legacy catalog-only steering receipts for journal and transport fixtures.
+    #[cfg(test)]
     pub(crate) fn prepare_steering(
         self: &Arc<Self>,
         catalog: &super::ProviderCatalogRequest,
@@ -434,6 +506,8 @@ impl SubmissionStore {
         self.prepare_input(catalog, input, provider, None)
     }
 
+    /// Construct catalog-only input for fixtures that do not select an invocation profile.
+    #[cfg(test)]
     pub(crate) fn prepare_input(
         self: &Arc<Self>,
         catalog: &super::ProviderCatalogRequest,
@@ -449,6 +523,8 @@ impl SubmissionStore {
         )
     }
 
+    /// Construct catalog-only task receipts for existing recovery fixtures.
+    #[cfg(test)]
     pub(crate) fn prepare_task_input(
         self: &Arc<Self>,
         catalog: &super::ProviderCatalogRequest,
@@ -464,11 +540,14 @@ impl SubmissionStore {
         )
     }
 
+    /// Build a test request without adding invocation choices to discovery contracts.
+    #[cfg(test)]
     fn input_request(
         catalog: &super::ProviderCatalogRequest,
         input: super::ProviderInput,
     ) -> ProviderRequest {
         ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: catalog.execution_owner.clone(),
             harness_session_id: catalog.harness_session_id.clone(),
             workspace: catalog.workspace.clone(),
@@ -548,8 +627,8 @@ pub struct Submission {
     record: Mutex<SubmissionRecord>,
     acceptance: tokio::sync::watch::Sender<bool>,
     steering_queued: tokio::sync::watch::Sender<bool>,
+    dispatch_observer: Mutex<Option<forge_provider_api::submission::DispatchObserver>>,
     dispatch: Mutex<Option<SubmissionDispatch>>,
-    accepted_action: Mutex<Option<AcceptedAction>>,
 }
 
 /// Distinguish the worker retaining input from its independently owned native prompt.
@@ -600,15 +679,137 @@ impl Drop for SubmissionFlight {
     }
 }
 
-struct AcceptedAction(Arc<dyn Fn() -> Result<()> + Send + Sync>);
-
-impl std::fmt::Debug for AcceptedAction {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("AcceptedAction")
-    }
-}
-
 impl Submission {
+    /// Bind receipt authority once while native delivery is still provably unstarted.
+    pub(crate) fn bind_task_receipt(&self, permit: crate::task::TaskReceiptPermit) -> Result<()> {
+        self.update(|record| {
+            if let Some(existing) = &record.task_receipt {
+                ensure!(
+                    existing == &permit,
+                    "submission task receipt authority changed"
+                );
+                return Ok(());
+            }
+            ensure!(
+                record.delivery == SubmissionState::Prepared,
+                "task receipt authority must be bound before dispatch"
+            );
+            record.task_receipt = Some(permit);
+            Ok(())
+        })
+    }
+
+    /// Commit final invocation preferences while delivery is still provably prepared.
+    /// Preserve the original input used for journal identity and never retain live capabilities.
+    pub(crate) fn seal_request(
+        &self,
+        request: ProviderRequest,
+    ) -> std::result::Result<(), super::ProviderError> {
+        self.update(move |record| {
+            ensure!(
+                record.request.owner()? == request.owner()?
+                    && record.request.harness_session_id == request.harness_session_id
+                    && record.request.workspace == request.workspace,
+                super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::RecordInput,
+                    forge_provider_api::ProviderFailureKind::Protocol,
+                ))
+            );
+            match &record.delivery {
+                SubmissionState::Prepared => {}
+                SubmissionState::Sending { .. } => {
+                    return Err(super::ProviderError::DeliveryUncertain.into());
+                }
+                SubmissionState::Accepted { .. } => {
+                    return Err(super::ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::RecordInput,
+                            forge_provider_api::ProviderFailureKind::Rejected,
+                        ),
+                    )
+                    .into());
+                }
+                SubmissionState::Cancelled => return Err(super::ProviderError::Cancelled.into()),
+            }
+            let ProviderRequest {
+                dispatch: _,
+                execution_owner,
+                harness_session_id: _,
+                workspace: _,
+                input: _,
+                mode,
+                model,
+                effort,
+                context_window,
+                service_tier,
+                access,
+                approval_mode,
+                provider_session_id,
+                submission: _,
+                recovered_input: _,
+                control_context: _,
+            } = request;
+            record.request.execution_owner = execution_owner;
+            record.request.mode = mode;
+            record.request.model = model;
+            record.request.effort = effort;
+            record.request.context_window = context_window;
+            record.request.service_tier = service_tier;
+            record.request.access = access;
+            record.request.approval_mode = approval_mode;
+            record.request.provider_session_id = provider_session_id;
+            Ok(())
+        })
+        .map_err(journal_failure)
+    }
+
+    /// Install a scoped handoff observer without changing durable delivery evidence.
+    /// Restoring accepted input never manufactures a live dispatch confirmation.
+    pub(crate) fn prepare_dispatch(
+        &self,
+        tracker: &forge_provider_api::submission::DispatchTracker,
+        binding: forge_provider_api::BindingId,
+        scope: forge_provider_api::InvocationScope,
+    ) -> Result<forge_provider_api::submission::DispatchReporter, forge_provider_api::ProviderError>
+    {
+        let invalid = || {
+            forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::AdmitInput,
+                forge_provider_api::ProviderFailureKind::Protocol,
+            ))
+        };
+        let record = self.record().map_err(|_| invalid())?;
+        if record.request.owner()? != scope.owner {
+            return Err(invalid());
+        }
+        let reporter = tracker
+            .track_input(binding, scope, self.receipt_id.clone())
+            .map_err(|_| invalid())?;
+        *self.dispatch_observer.lock().map_err(|_| invalid())? = Some(tracker.observer());
+        Ok(reporter)
+    }
+
+    /// Get this live attempt's handoff observation separately from native acceptance.
+    #[cfg(test)]
+    pub(crate) fn dispatch_observer(
+        &self,
+    ) -> Result<
+        Option<forge_provider_api::submission::DispatchObserver>,
+        forge_provider_api::ProviderError,
+    > {
+        self.dispatch_observer
+            .lock()
+            .map(|observer| observer.clone())
+            .map_err(|_| {
+                forge_provider_api::ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::AdmitInput,
+                        forge_provider_api::ProviderFailureKind::Protocol,
+                    ),
+                )
+            })
+    }
+
     /// Own this live steering attempt without authorizing replay of uncertain input.
     pub(crate) fn begin_steering(self: &Arc<Self>) -> Result<SubmissionFlight> {
         let flight = self.begin_dispatch(DispatchOperation::Steering)?;
@@ -671,34 +872,9 @@ impl Submission {
         self.steering_queued.send_replace(true);
     }
 
-    /// Runs committed-state activation before acceptance becomes visible to consumers.
-    pub(crate) fn on_accepted(
-        &self,
-        action: impl Fn() -> Result<()> + Send + Sync + 'static,
-    ) -> Result<()> {
-        *self
-            .accepted_action
-            .lock()
-            .map_err(|_| anyhow::anyhow!("submission acceptance action lock poisoned"))? =
-            Some(AcceptedAction(Arc::new(action)));
-        if matches!(self.record()?.delivery, SubmissionState::Accepted { .. }) {
-            self.notify_accepted()?;
-        }
-        Ok(())
-    }
-
-    fn notify_accepted(&self) -> Result<()> {
-        let action = self
-            .accepted_action
-            .lock()
-            .map_err(|_| anyhow::anyhow!("submission acceptance action lock poisoned"))?
-            .as_ref()
-            .map(|action| action.0.clone());
-        if let Some(action) = action {
-            action()?;
-        }
+    /// Publish durable native evidence; host task activation belongs to the exchange owner.
+    fn notify_accepted(&self) {
         self.acceptance.send_replace(true);
-        Ok(())
     }
     pub(crate) fn acceptance(&self) -> tokio::sync::watch::Receiver<bool> {
         self.acceptance.subscribe()
@@ -709,8 +885,7 @@ impl Submission {
     ) -> Result<SubmissionRecord> {
         let record = self.record()?;
         if matches!(record.delivery, SubmissionState::Accepted { .. }) {
-            self.persist(|submission| submission.notify_accepted())
-                .await?;
+            self.notify_accepted();
             return Ok(record);
         }
         if matches!(record.delivery, SubmissionState::Sending { .. }) {
@@ -756,6 +931,11 @@ impl Submission {
         &self.id
     }
 
+    /// Get the validated host receipt identity used by owner observation events.
+    pub(crate) fn receipt_id(&self) -> &SubmissionId {
+        &self.receipt_id
+    }
+
     /// Returns the in-memory evidence published after the last successful journal commit.
     pub fn record(&self) -> Result<SubmissionRecord> {
         Ok(self
@@ -799,7 +979,7 @@ impl Submission {
         if matches!(record.delivery, SubmissionState::Accepted { .. }) {
             drop(transaction);
             drop(connection);
-            self.notify_accepted()?;
+            self.notify_accepted();
             return Ok(());
         }
         ensure!(
@@ -853,7 +1033,7 @@ impl Submission {
                 .get(&changed.id)
                 .and_then(Weak::upgrade);
             if let Some(submission) = live {
-                submission.notify_accepted()?;
+                submission.notify_accepted();
             }
         }
         for changed in &changed {
@@ -888,15 +1068,37 @@ impl Submission {
 
     /// Excludes explicitly cancelled input from automatic recovery.
     pub fn cancel(&self) -> Result<()> {
+        self.retire_prepared().map(drop).map_err(Into::into)
+    }
+
+    /// Prevent prepared dispatch and report evidence from the same durable journal transaction.
+    pub(crate) fn retire_prepared(
+        &self,
+    ) -> std::result::Result<SubmissionRetirement, super::ProviderError> {
         self.update(|record| {
-            if record.delivery == SubmissionState::Prepared {
-                record.delivery = SubmissionState::Cancelled;
-            }
-            Ok(())
+            Ok(match record.delivery {
+                SubmissionState::Prepared => {
+                    record.delivery = SubmissionState::Cancelled;
+                    SubmissionRetirement::Prevented
+                }
+                SubmissionState::Cancelled => SubmissionRetirement::AlreadyCancelled,
+                SubmissionState::Sending { .. } => SubmissionRetirement::Sending,
+                SubmissionState::Accepted { .. } => SubmissionRetirement::Accepted,
+            })
+        })
+        .map_err(|_| {
+            super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                forge_provider_api::ProviderOperation::RecordInput,
+                forge_provider_api::ProviderFailureKind::Persistence,
+            ))
         })
     }
 
-    fn update(&self, change: impl FnOnce(&mut SubmissionRecord) -> Result<()>) -> Result<()> {
+    /// Commit a receipt change and expose its result only after durable publication.
+    fn update<Output>(
+        &self,
+        change: impl FnOnce(&mut SubmissionRecord) -> Result<Output>,
+    ) -> Result<Output> {
         let mut connection = self
             .store
             .connection
@@ -906,7 +1108,7 @@ impl Submission {
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let mut record = self.record()?;
         let was_prepared = record.delivery == SubmissionState::Prepared;
-        change(&mut record)?;
+        let output = change(&mut record)?;
         if was_prepared && matches!(record.delivery, SubmissionState::Sending { .. }) {
             let mut statement = transaction.prepare(
                 "SELECT other.id FROM submission AS other JOIN submission AS current ON current.id=?1 WHERE other.id<>current.id AND other.runtime=current.runtime AND other.provider=current.provider AND json_extract(other.payload,'$.delivery.state')='sending'",
@@ -951,7 +1153,7 @@ impl Submission {
         self.store.publish(&record)?;
         drop(connection);
         self.store.log(&record);
-        Ok(())
+        Ok(output)
     }
 
     /// Reconciles prior uncertain input, then attaches only definitely undelivered context.
@@ -1004,17 +1206,7 @@ impl forge_provider_api::submission::InputReceipt for Submission {
     ) -> Result<(), forge_provider_api::ProviderError> {
         self.persist(move |submission| submission.sending(target))
             .await
-            .map_err(
-                |error| match error.downcast::<forge_provider_api::ProviderError>() {
-                    Ok(error) => error,
-                    Err(_) => forge_provider_api::ProviderError::Failure(
-                        forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::RecordInput,
-                            forge_provider_api::ProviderFailureKind::Persistence,
-                        ),
-                    ),
-                },
-            )
+            .map_err(journal_failure)
     }
 
     async fn record_accepted(
@@ -1023,17 +1215,7 @@ impl forge_provider_api::submission::InputReceipt for Submission {
     ) -> Result<(), forge_provider_api::ProviderError> {
         self.persist(move |submission| submission.accepted(receipt))
             .await
-            .map_err(
-                |error| match error.downcast::<forge_provider_api::ProviderError>() {
-                    Ok(error) => error,
-                    Err(_) => forge_provider_api::ProviderError::Failure(
-                        forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::RecordInput,
-                            forge_provider_api::ProviderFailureKind::Persistence,
-                        ),
-                    ),
-                },
-            )
+            .map_err(journal_failure)
     }
 
     async fn record_rejected(
@@ -1042,17 +1224,7 @@ impl forge_provider_api::submission::InputReceipt for Submission {
     ) -> Result<(), forge_provider_api::ProviderError> {
         self.persist(move |submission| submission.rejected(reason.to_string()))
             .await
-            .map_err(
-                |error| match error.downcast::<forge_provider_api::ProviderError>() {
-                    Ok(error) => error,
-                    Err(_) => forge_provider_api::ProviderError::Failure(
-                        forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::RecordInput,
-                            forge_provider_api::ProviderFailureKind::Persistence,
-                        ),
-                    ),
-                },
-            )
+            .map_err(journal_failure)
     }
 
     async fn record_failure(
@@ -1061,17 +1233,22 @@ impl forge_provider_api::submission::InputReceipt for Submission {
     ) -> Result<(), forge_provider_api::ProviderError> {
         self.persist(move |submission| submission.failed(reason.to_string()))
             .await
-            .map_err(
-                |error| match error.downcast::<forge_provider_api::ProviderError>() {
-                    Ok(error) => error,
-                    Err(_) => forge_provider_api::ProviderError::Failure(
-                        forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::RecordInput,
-                            forge_provider_api::ProviderFailureKind::Persistence,
-                        ),
-                    ),
-                },
-            )
+            .map_err(journal_failure)
+    }
+}
+
+/// Preserve normalized receipt failures at the legacy persistence boundary.
+pub(crate) fn journal_failure(error: anyhow::Error) -> super::ProviderError {
+    match error.downcast::<super::ProviderError>() {
+        Ok(error) => error,
+        Err(error) => super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+            forge_provider_api::ProviderOperation::RecordInput,
+            if error.is::<forge_provider_api::execution::ExecutionOwnerError>() {
+                forge_provider_api::ProviderFailureKind::Protocol
+            } else {
+                forge_provider_api::ProviderFailureKind::Persistence
+            },
+        )),
     }
 }
 
@@ -1087,6 +1264,45 @@ mod tests {
 
     fn fixture_provider_id() -> super::super::ProviderId {
         forge_providers::registry::nonselectable_id().expect("registry supplies fixture identity")
+    }
+
+    /// Keep handoff separate from durable acceptance and reject a foreign owner.
+    #[tokio::test]
+    async fn dispatch_confirmation_preserves_unconfirmed_delivery() -> Result<()> {
+        use forge_provider_api::submission::InputReceipt;
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let request = request("pending input");
+        let scope = forge_provider_api::InvocationScope::new(request.owner()?, "exchange");
+        let input = store.prepare(&request, fixture_provider_id())?;
+        let binding = forge_provider_api::BindingId::new("binding")?;
+        assert!(
+            input
+                .prepare_dispatch(
+                    &forge_provider_api::submission::DispatchTracker::default(),
+                    binding.clone(),
+                    forge_provider_api::InvocationScope::new(
+                        forge_provider_api::ExecutionOwner::root("foreign"),
+                        "exchange",
+                    )
+                )
+                .is_err()
+        );
+        let reporter = input.prepare_dispatch(&request.dispatch, binding.clone(), scope.clone())?;
+        let mut observer = input
+            .dispatch_observer()?
+            .expect("prepared dispatch has an observer");
+        input.clone().record_sending(None).await?;
+        reporter.confirm();
+        let confirmation = observer.wait().await?;
+        assert_eq!(confirmation.binding(), &binding);
+        assert_eq!(confirmation.scope(), &scope);
+        assert!(matches!(
+            input.record()?.delivery,
+            SubmissionState::Sending { .. }
+        ));
+        assert!(!*input.acceptance().borrow());
+        Ok(())
     }
 
     /// Preserve old input and delivery state while wrapping native evidence without decoding it.
@@ -1486,6 +1702,7 @@ mod tests {
 
     fn request(text: &str) -> ProviderRequest {
         ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: None,
             harness_session_id: "submission-test".into(),
             workspace: "workspace".into(),
@@ -1502,6 +1719,175 @@ mod tests {
             recovered_input: Vec::new(),
             control_context: None,
         }
+    }
+
+    /// Seal late execution choices without changing stable input identity or retaining live receipts.
+    #[test]
+    fn sealed_request_preserves_input_identity_and_releases_capabilities() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let original = request("stored input");
+        let receipt = store.prepare_input_request(
+            &original,
+            fixture_provider_id(),
+            SubmissionOrigin::QueuedInput(crate::exchange::command::InputId::new("input")?),
+        )?;
+        let weak = Arc::downgrade(&receipt);
+        let id = receipt.id().to_owned();
+        let mut final_request = original.clone();
+        final_request.model = "selected-model".into();
+        final_request.effort = "medium".into();
+        final_request.mode = PromptMode::ExecutePlan;
+        final_request.input = ProviderInput::from_text("decorated execution prompt");
+        final_request.submission = Some(receipt.clone());
+        receipt.seal_request(final_request)?;
+        drop(receipt);
+        assert!(
+            weak.upgrade().is_none(),
+            "journal snapshots must not retain live receipt capabilities"
+        );
+
+        let restored = store.prepare_input_request(
+            &original,
+            fixture_provider_id(),
+            SubmissionOrigin::QueuedInput(crate::exchange::command::InputId::new("input")?),
+        )?;
+        assert_eq!(restored.id(), id);
+        let record = restored.record()?;
+        assert_eq!(record.request.model, "selected-model");
+        assert_eq!(record.request.effort, "medium");
+        assert_eq!(record.request.mode, PromptMode::ExecutePlan);
+        assert_eq!(record.request.input.text(), original.input.text());
+        assert!(record.request.submission.is_none());
+        assert_eq!(record.delivery, SubmissionState::Prepared);
+        Ok(())
+    }
+
+    /// Refuse late metadata changes once dispatch, acceptance, or cancellation has been committed.
+    #[test]
+    fn sealed_request_cannot_rewrite_delivery_evidence_or_owner() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        for phase in [
+            SubmissionPhase::Sending,
+            SubmissionPhase::Accepted,
+            SubmissionPhase::Cancelled,
+        ] {
+            let original = request("input");
+            let receipt = store.prepare(&original, fixture_provider_id())?;
+            match phase {
+                SubmissionPhase::Sending => receipt.sending(Some(token("target")))?,
+                SubmissionPhase::Accepted => receipt.accepted(Some(token("receipt")))?,
+                SubmissionPhase::Cancelled => receipt.cancel()?,
+                SubmissionPhase::Prepared => {
+                    unreachable!("fixture only uses settled or uncertain evidence")
+                }
+            }
+            let before = serde_json::to_value(receipt.record()?)?;
+            let mut changed = original;
+            changed.model = "must-not-rewrite".into();
+            let error = receipt.seal_request(changed).unwrap_err();
+            match phase {
+                SubmissionPhase::Sending => assert!(matches!(
+                    error,
+                    super::super::ProviderError::DeliveryUncertain
+                )),
+                SubmissionPhase::Accepted => assert!(
+                    matches!(error, super::super::ProviderError::Failure(ref failure)
+                    if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)
+                ),
+                SubmissionPhase::Cancelled => {
+                    assert!(matches!(error, super::super::ProviderError::Cancelled))
+                }
+                SubmissionPhase::Prepared => {
+                    unreachable!("fixture only uses settled or uncertain evidence")
+                }
+            }
+            assert_eq!(serde_json::to_value(receipt.record()?)?, before);
+        }
+        let original = request("scoped input");
+        let receipt = store.prepare(&original, fixture_provider_id())?;
+        let mut foreign = original.clone();
+        foreign.harness_session_id = "other-session".into();
+        let error = receipt.seal_request(foreign).unwrap_err();
+        assert!(
+            matches!(error, super::super::ProviderError::Failure(ref failure)
+            if failure.kind() == forge_provider_api::ProviderFailureKind::Protocol)
+        );
+        assert_eq!(
+            receipt.record()?.request.harness_session_id,
+            original.harness_session_id
+        );
+        assert_eq!(receipt.record()?.delivery, SubmissionState::Prepared);
+        Ok(())
+    }
+
+    /// Carry the final invocation configuration through production preparation into the durable receipt.
+    #[tokio::test]
+    async fn dispatch_seals_selected_configuration_before_native_acceptance() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let trace = Arc::new(TraceStore::open(root.path())?);
+        let store = SubmissionStore::open(root.path(), trace.clone())?;
+        let (native, control) = receipt_provider();
+        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+        let original = request("original input");
+        let receipt = store.prepare_input_request(
+            &original,
+            fixture_provider_id(),
+            SubmissionOrigin::QueuedInput(crate::exchange::command::InputId::new("input")?),
+        )?;
+        let mut invocation = original;
+        invocation.model = "selected-model".into();
+        invocation.effort = "medium".into();
+        invocation.submission = Some(receipt.clone());
+        provider
+            .session_prompt_with_retry(invocation, None, &trace, &store)
+            .await?;
+        assert_eq!(control.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(receipt.record()?.request.model, "selected-model");
+        assert_eq!(receipt.record()?.request.effort, "medium");
+        assert!(matches!(
+            receipt.record()?.delivery,
+            SubmissionState::Accepted { .. }
+        ));
+        Ok(())
+    }
+
+    /// Refuse native dispatch when the receipt's final invocation configuration cannot be committed.
+    #[tokio::test]
+    async fn failed_request_seal_prevents_native_dispatch() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let trace = Arc::new(TraceStore::open(root.path())?);
+        let store = SubmissionStore::open(root.path(), trace.clone())?;
+        let (native, control) = receipt_provider();
+        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+        let mut invocation = request("input");
+        let receipt = store.prepare_input_request(
+            &invocation,
+            fixture_provider_id(),
+            SubmissionOrigin::QueuedInput(crate::exchange::command::InputId::new("input")?),
+        )?;
+        invocation.model = "selected-model".into();
+        invocation.submission = Some(receipt.clone());
+        store.connection.lock().unwrap().execute_batch(
+            "CREATE TRIGGER fail_request_seal BEFORE UPDATE ON submission
+             WHEN json_extract(NEW.payload,'$.request.model') <> json_extract(OLD.payload,'$.request.model')
+             BEGIN SELECT RAISE(FAIL,'fixture storage failure'); END;",
+        )?;
+        let error = provider
+            .session_prompt_with_retry(invocation, None, &trace, &store)
+            .await
+            .unwrap_err();
+        let error = anyhow::Error::new(error);
+        assert!(error.chain().any(
+            |cause| matches!(cause.downcast_ref::<super::super::ProviderError>(),
+            Some(super::super::ProviderError::Failure(failure))
+                if failure.kind() == forge_provider_api::ProviderFailureKind::Persistence)
+        ));
+        assert_eq!(control.send_count.load(Ordering::SeqCst), 0);
+        assert_eq!(receipt.record()?.request.model, "model");
+        assert_eq!(receipt.record()?.delivery, SubmissionState::Prepared);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1591,19 +1977,31 @@ mod tests {
             &request("not sent"),
             forge_providers::registry::default_id(),
         )?;
+        assert_eq!(prepared.retire_prepared()?, SubmissionRetirement::Prevented);
+        assert_eq!(
+            prepared.retire_prepared()?,
+            SubmissionRetirement::AlreadyCancelled
+        );
         prepared.cancel()?;
         assert_eq!(prepared.record()?.delivery, SubmissionState::Cancelled);
         let dispatched = store.prepare(
             &request("dispatched"),
             forge_providers::registry::default_id(),
         )?;
+        let stale = dispatched.record()?;
+        assert_eq!(stale.delivery, SubmissionState::Prepared);
         dispatched.sending(Some(token("target")))?;
+        assert_eq!(dispatched.retire_prepared()?, SubmissionRetirement::Sending);
         dispatched.cancel()?;
         assert!(matches!(
             dispatched.record()?.delivery,
             SubmissionState::Sending { .. }
         ));
         dispatched.accepted(Some(token("receipt")))?;
+        assert_eq!(
+            dispatched.retire_prepared()?,
+            SubmissionRetirement::Accepted
+        );
         dispatched.cancel()?;
         assert!(matches!(
             dispatched.record()?.delivery,
@@ -1613,7 +2011,7 @@ mod tests {
     }
 
     #[test]
-    fn task_entry_identity_reuses_durable_delivery_and_activates_before_notification() -> Result<()>
+    fn task_entry_identity_reuses_durable_delivery_and_notifies_after_receipt_commit() -> Result<()>
     {
         let directory = tempfile::tempdir()?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
@@ -1626,15 +2024,13 @@ mod tests {
         )?;
         let id = first.id().to_owned();
         let accepted = first.acceptance();
-        let activated = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let activation = activated.clone();
-        first.on_accepted(move || {
-            activation.store(true, Ordering::SeqCst);
-            Ok(())
-        })?;
         first.sending(Some(token("target")))?;
         first.accepted(Some(token("receipt")))?;
-        assert!(*accepted.borrow() && activated.load(Ordering::SeqCst));
+        assert!(*accepted.borrow());
+        assert!(matches!(
+            first.record()?.delivery,
+            SubmissionState::Accepted { .. }
+        ));
         let duplicate = store.prepare_record(
             &request("entry"),
             forge_providers::registry::default_id(),
@@ -1671,9 +2067,9 @@ mod tests {
         Ok(())
     }
 
+    /// Native acceptance is evidence only; reconciling it does not run host task callbacks.
     #[tokio::test]
-    async fn task_entry_activation_failure_keeps_receipt_and_retries_before_notifying() -> Result<()>
-    {
+    async fn accepted_receipt_reconciliation_preserves_notification_and_identity() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let store = SubmissionStore::open(
             directory.path(),
@@ -1682,26 +2078,14 @@ mod tests {
         let submission =
             store.prepare(&request("entry"), forge_providers::registry::default_id())?;
         let accepted = submission.acceptance();
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let activation = attempts.clone();
-        submission.on_accepted(move || {
-            if activation.fetch_add(1, Ordering::SeqCst) == 0 {
-                anyhow::bail!("activation unavailable");
-            }
-            Ok(())
-        })?;
-        assert!(submission.accepted(Some(token("receipt"))).is_err());
-        assert!(matches!(
-            submission.record()?.delivery,
-            SubmissionState::Accepted { .. }
-        ));
-        assert!(!*accepted.borrow());
-        let (native, control) = receipt_provider();
-        control.history_accepts.store(true, Ordering::SeqCst);
+        submission.accepted(Some(token("receipt")))?;
+        let before = submission.record()?;
+        let (native, _) = receipt_provider();
         let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
-        submission.reconcile(provider.as_provider()).await?;
+        let after = submission.reconcile(provider.as_provider()).await?;
         assert!(*accepted.borrow());
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.delivery, before.delivery);
         Ok(())
     }
 

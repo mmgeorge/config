@@ -139,7 +139,7 @@ impl HarnessBroker {
         );
         plan.document_version = document.version;
         plan.review_digest = Some(checksum);
-        plan.acceptance = None;
+        plan.review = None;
         plan.manual_changes.push(format!(
             "Updated plan checks: {}",
             changes

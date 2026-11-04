@@ -400,6 +400,8 @@ pub enum ContinuationRequest {
         scope: InvocationScope,
         authorization: ContinuationToken,
         callbacks: Box<InvocationCallbacks>,
+        /// Confirm this authorized handoff independently of eventual native completion.
+        dispatch: Box<crate::submission::DispatchReporter>,
     },
 }
 
@@ -449,6 +451,10 @@ pub struct PromptRequest {
     pub submission_id: SubmissionId,
     /// Carry prepared user input.
     pub input: crate::input::PromptInput,
+    /// Confirm tracked transport handoff independently of eventual native acceptance.
+    /// Validate binding, scope, and submission before admission; confirm only after
+    /// immutable configuration and cancellation/collection ownership are installed.
+    pub dispatch: crate::submission::DispatchReporter,
     /// Carry previously saved input proven not to have reached the provider.
     pub recovered_inputs: Vec<RecoveredInput>,
     /// Carry prepared instructions.

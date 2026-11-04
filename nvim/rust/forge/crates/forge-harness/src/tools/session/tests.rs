@@ -62,6 +62,7 @@ impl Fixture {
 
     fn invoke(&self, name: &str, args: Value) -> Result<Value> {
         crate::tools::validate_arguments(&crate::tools::ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: name.into(),
             arguments: args.clone(),

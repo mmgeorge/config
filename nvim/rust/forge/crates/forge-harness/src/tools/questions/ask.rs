@@ -1,4 +1,3 @@
-use crate::provider::PromptMode;
 use crate::tools::ControlToolDefinition;
 use crate::tools::error::ToolContext;
 use serde_json::Value;
@@ -61,26 +60,19 @@ pub fn plan_question_input_schema() -> Value {
     })
 }
 
-/// Decode the tool's replayable completion fields.
-pub(super) fn record(
-    invocation: &crate::tools::ControlToolInvocation,
-    output: &mut crate::provider::ProviderCompletion,
-) -> crate::tools::ToolResult<()> {
-    output.plan_question = Some(
-        crate::tools::invocation::decode_arguments::<crate::plan::PlanQuestionSet>(invocation)?
-            .normalize()?,
-    );
-    output.plan_submit = None;
-    Ok(())
-}
-
-/// Ask a persistent question or retain the legacy conversational result.
+/// Ask persistent questions through their owner before returning a result.
 pub(super) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
     invocation: crate::tools::ControlToolInvocation,
-    output: crate::provider::ProviderCompletion,
+    _output: crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<crate::tools::ControlToolResult> {
-    if let Some(controller) = runtime.context.questions.clone() {
+    if runtime.context.questions.is_some() {
+        #[cfg(test)]
+        let controller = runtime
+            .context
+            .questions
+            .clone()
+            .expect("the question controller was checked above");
         let task = super::state::current_task(runtime)?;
 
         let mut drafts: Vec<crate::question::QuestionDraft> =
@@ -93,7 +85,12 @@ pub(super) async fn execute(
                 crate::question::QuestionRequirement::Optional
             };
         }
-        let operation_id = uuid::Uuid::new_v4().to_string();
+        let call = super::state::tool_call(runtime, &invocation)?;
+        #[cfg(test)]
+        let operation_id = call
+            .as_ref()
+            .map(|call| call.operation_id().as_str().to_owned())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let authority = crate::tools::TaskAuthority::capture(&runtime.context);
         let exchange_id = runtime
             .context
@@ -101,41 +98,96 @@ pub(super) async fn execute(
             .as_deref()
             .context("question has no originating exchange")?;
         if wait {
-            let answers = controller
-                .ask_wait_authorized(
-                    &operation_id,
-                    exchange_id,
-                    task.as_ref(),
+            let waiting = if let Some(events) = &runtime.context.question_events {
+                let creation = crate::exchange::QuestionCreation::from_tool(
+                    call.clone()
+                        .context("question creation has no authenticated tool call")?,
+                    exchange_id.into(),
+                    task,
                     drafts,
-                    authority.as_ref(),
-                )
-                .await?;
+                    if runtime.context.question_discussion {
+                        crate::exchange::QuestionCreationOrigin::Discussion
+                    } else {
+                        crate::exchange::QuestionCreationOrigin::Workflow
+                    },
+                    authority
+                        .as_ref()
+                        .context("question creation has no captured tool authority")?
+                        .clone(),
+                )?;
+                events.begin_wait(creation).await?
+            } else {
+                #[cfg(test)]
+                {
+                    controller
+                        .prepare_tool_wait(
+                            &operation_id,
+                            exchange_id,
+                            task.as_ref(),
+                            drafts,
+                            authority.as_ref(),
+                        )?
+                        .into_test_owned()
+                }
+                #[cfg(not(test))]
+                {
+                    return Err(crate::tools::ToolError::MissingState(
+                        "question creation owner is missing".into(),
+                    ));
+                }
+            };
+            let answers = waiting.answers().await?;
             if let Some(authority) = &authority {
                 authority.validate_scope()?;
             }
             return Ok(crate::tools::ControlToolResult {
                 invocation: None,
-                message: serde_json::json!({"answers": answers}).to_string(),
+                message: serde_json::json!({"answers":answers}).to_string(),
             });
         }
-        let publish = || {
-            controller.ask(
-                &operation_id,
-                exchange_id,
-                if runtime.context.question_discussion {
-                    crate::question::QuestionOrigin::Discussion(task.as_ref())
-                } else {
-                    task.as_ref().map_or(
-                        crate::question::QuestionOrigin::Chat,
-                        crate::question::QuestionOrigin::Task,
-                    )
-                },
+        let ids = if let Some(events) = &runtime.context.question_events {
+            let creation = crate::exchange::QuestionCreation::from_tool(
+                call.context("question creation has no authenticated tool call")?,
+                exchange_id.into(),
+                task,
                 drafts,
-            )
-        };
-        let ids = match authority {
-            Some(authority) => authority.commit(publish)?,
-            None => publish()?,
+                if runtime.context.question_discussion {
+                    crate::exchange::QuestionCreationOrigin::Discussion
+                } else {
+                    crate::exchange::QuestionCreationOrigin::Workflow
+                },
+                authority.context("question creation has no captured tool authority")?,
+            )?;
+            events.ask(creation).await?
+        } else {
+            #[cfg(test)]
+            {
+                let publish = || {
+                    controller.ask(
+                        &operation_id,
+                        exchange_id,
+                        if runtime.context.question_discussion {
+                            crate::question::QuestionOrigin::Discussion(task.as_ref())
+                        } else {
+                            task.as_ref().map_or(
+                                crate::question::QuestionOrigin::Chat,
+                                crate::question::QuestionOrigin::Task,
+                            )
+                        },
+                        drafts,
+                    )
+                };
+                match authority {
+                    Some(authority) => authority.commit(publish)?,
+                    None => publish()?,
+                }
+            }
+            #[cfg(not(test))]
+            {
+                return Err(crate::tools::ToolError::MissingState(
+                    "question creation owner is missing".into(),
+                ));
+            }
         };
         return Ok(crate::tools::ControlToolResult {
             invocation: None,
@@ -143,49 +195,51 @@ pub(super) async fn execute(
         });
     }
 
-    let question = output
-        .plan_question
-        .as_ref()
-        .context("question ask did not produce questions")?;
-    if question.questions.iter().all(|item| {
-        runtime
-            .context
-            .resolved_question_digest_set
-            .contains(&item.content_digest())
-    }) {
-        runtime.terminal = true;
-        return Ok(crate::tools::ControlToolResult { invocation: None, message: "Those questions were already consumed. Continue planning without reopening feedback.".into() });
-    }
-    crate::tools::error::ensure!(
-        !runtime.context.has_active_elicitation
-            || (matches!(
-                runtime.context.mode,
-                PromptMode::Chat | PromptMode::PlanDiscussion
-            ) && !runtime.context.planning_feedback),
-        "a Harness question set is already pending"
-    );
-    runtime.terminal = true;
-    Ok(crate::tools::ControlToolResult {
-        invocation: Some(invocation),
-        message: "Question set accepted".into(),
-    })
+    Err(crate::tools::ToolError::MissingState(
+        "question creation owner is missing".into(),
+    ))
 }
 
-/// Publish a required question synchronously so its answer wait can outlive the runtime lock.
-pub(crate) fn begin_wait(
+/// Retain a prepared wait without holding the tool runtime lock across owner intake or user input.
+pub(in crate::tools) enum PreparedQuestionWait {
+    Owner {
+        events: crate::exchange::QuestionEvents,
+        creation: crate::exchange::QuestionCreation,
+    },
+    #[cfg(test)]
+    Local(crate::question::OwnedQuestionWait),
+}
+
+impl PreparedQuestionWait {
+    /// Publish through the owner before releasing the ordered tool mutation barrier.
+    pub(in crate::tools) async fn publish(
+        self,
+    ) -> crate::tools::ToolResult<crate::question::OwnedQuestionWait> {
+        match self {
+            Self::Owner { events, creation } => Ok(events.begin_wait(creation).await?),
+            #[cfg(test)]
+            Self::Local(wait) => Ok(wait),
+        }
+    }
+}
+
+/// Capture the exact question scope while the tool runtime is held; publication happens after release.
+pub(in crate::tools) fn prepare_wait(
     runtime: &crate::tools::runtime::ControlToolRuntime,
     invocation: &crate::tools::ControlToolInvocation,
-) -> crate::tools::ToolResult<crate::question::OwnedQuestionWait> {
+) -> crate::tools::ToolResult<PreparedQuestionWait> {
     crate::tools::validate_arguments(invocation)?;
-    let controller = runtime
+    runtime
         .context
         .questions
         .as_ref()
         .context("waiting questions require the session question controller")?;
-    crate::tools::error::ensure!(
-        runtime.context.question_discussion || !controller.snapshot()?.required_pending(),
-        "required questions must be resolved before continuing task work"
-    );
+    #[cfg(test)]
+    let controller = runtime
+        .context
+        .questions
+        .as_ref()
+        .expect("the question controller was validated above");
     let task = super::state::current_task(runtime)?;
     let mut drafts: Vec<crate::question::QuestionDraft> =
         serde_json::from_value(invocation.arguments["questions"].clone())?;
@@ -198,11 +252,42 @@ pub(crate) fn begin_wait(
         .question_exchange_id
         .as_deref()
         .context("question has no originating exchange")?;
-    Ok(controller.begin_owned_wait(
-        &uuid::Uuid::new_v4().to_string(),
-        exchange,
-        task.as_ref(),
-        drafts,
-        authority.as_ref(),
-    )?)
+    if let Some(events) = &runtime.context.question_events {
+        return Ok(PreparedQuestionWait::Owner {
+            events: events.clone(),
+            creation: crate::exchange::QuestionCreation::from_tool(
+                super::state::tool_call(runtime, invocation)?
+                    .context("question creation has no authenticated tool call")?,
+                exchange.into(),
+                task,
+                drafts,
+                if runtime.context.question_discussion {
+                    crate::exchange::QuestionCreationOrigin::Discussion
+                } else {
+                    crate::exchange::QuestionCreationOrigin::Workflow
+                },
+                authority.context("question creation has no captured tool authority")?,
+            )?,
+        });
+    }
+    #[cfg(test)]
+    {
+        Ok(PreparedQuestionWait::Local(
+            controller
+                .prepare_tool_wait(
+                    &uuid::Uuid::new_v4().to_string(),
+                    exchange,
+                    task.as_ref(),
+                    drafts,
+                    authority.as_ref(),
+                )?
+                .into_test_owned(),
+        ))
+    }
+    #[cfg(not(test))]
+    {
+        Err(crate::tools::ToolError::MissingState(
+            "question creation owner is missing".into(),
+        ))
+    }
 }

@@ -22,7 +22,7 @@ end
 
 begin({ action = "configure", config = { model = "model-a" } })
 local changing = requests[#requests]
-changing.reply({ state = "applying", revision = 3 })
+task.receive(state, { id = changing.params.operation_id, state = "applying", revision = 3 })
 begin({ action = "configure", config = { effort = "high" } })
 local rejected = requests[#requests]
 task.receive(state, { id = changing.params.operation_id, state = "resuming", revision = 5 })
@@ -40,29 +40,29 @@ settled, admitted = 0, 0
 begin({ action = "plan", text = "Create a plan" })
 local first = requests[1]
 assert(first.method == "session.command.apply" and first.params.operation_id)
-first.reply({ id = first.params.operation_id, state = "accepted" })
+task.receive(state, { id = first.params.operation_id, state = "active" })
 assert(admitted == 1 and settled == 0)
 begin({ action = "pause" })
 local pause = requests[2]
 task.receive(state, { id = first.params.operation_id, state = "completed" })
 assert(settled == 0, "completion from superseded task must not settle the latest intent")
-pause.reply({ id = pause.params.operation_id, state = "accepted" })
-task.receive(state, { id = pause.params.operation_id, state = "completed" })
+task.receive(state, { id = pause.params.operation_id, state = "active" })
+pause.reply({ id = pause.params.operation_id, state = "completed" })
 assert(settled == 1 and state.task_operation == nil)
 
 begin({ action = "resume" })
 local original = requests[#requests]
-timers[#timers]()
-local query = requests[#requests]
-assert(query.method == "session.command.operation.get" and query.params.operation_id == original.params.operation_id,
-  "uncertain acknowledgement must query the original operation instead of replaying")
-query.reply({ state = "outcome_unknown", error = "Provider acknowledgement lost" })
+local pending_request_count = #requests
+assert(#timers == 0, "task control created a status-poll timer while shared command recovery owns observation")
+-- The shared client owns any status recovery and reports its final finite observation here.
+original.reply({ state = "outcome_unknown", error = "Provider acknowledgement lost" })
+assert(#requests == pending_request_count, "task control issued a duplicate status query or replay")
 assert(settled == 2 and state.execution_notice:find("Provider acknowledgement lost", 1, true))
 assert(#failures == 0, "uncertain acknowledgement was displayed as a failed operation")
 
 begin({ action = "plan", text = "Retain this pending task" })
 local retained = requests[#requests]
-retained.reply({ state = "accepted" })
+task.receive(state, { id = retained.params.operation_id, state = "active" })
 begin({ action = "permission", mode = "invalid" })
 requests[#requests].reply(nil, "setting rejected", { code = "request_failed" })
 assert(state.task_operation.id == retained.params.operation_id and settled == 2,
@@ -71,19 +71,16 @@ task.receive(state, { id = retained.params.operation_id, state = "completed" })
 assert(settled == 3)
 
 begin({ action = "resume" })
-local polled = requests[#requests]
-polled.reply({ state = "running" })
-timers[#timers]()
-requests[#requests].reply(nil, "Forge request admission is full", { code = "not_admitted" })
+local observed = requests[#requests]
+local observed_request_count = #requests
+task.receive(state, { id = observed.params.operation_id, state = "running", revision = 2 })
 assert(state.task_operation.state == "running" and settled == 3,
-  "a failed status read changed the admitted operation outcome")
-assert(state.execution_notice:find("Retrying task status", 1, true))
+  "task progress settled the command before its finite completion")
+assert(#timers == 0 and #requests == observed_request_count,
+  "task progress created a second status observer")
 assert(not require("forge.views.harness.health").notice(state),
-  "task-control polling diagnostic replaced canonical execution status")
-timers[#timers]()
-requests[#requests].reply({ state = "running" })
-assert(state.execution_notice == nil, "a successful status read retained the transient failure")
-task.receive(state, { id = polled.params.operation_id, state = "completed" })
+  "task progress replaced canonical execution status")
+observed.reply({ state = "completed", revision = 3 })
 assert(settled == 4)
 
 begin({ action = "resume" })
@@ -105,12 +102,11 @@ task.transition(state, { action = "configure", selected = { "import:fixture" } }
   function() settled = settled + 1 end, nil, "settings.import.apply")
 local imported = requests[#requests]
 assert(imported.method == "settings.import.apply", "import bypassed its durable mutation route")
-imported.reply(nil, "acknowledgement unavailable", { code = "outcome_unknown" })
-timers[#timers]()
-local inspection = requests[#requests]
-assert(inspection.method == "session.command.operation.get" and inspection.params.operation_id == imported.params.operation_id,
-  "unknown import acknowledgement replayed the settings mutation")
-inspection.reply({ state = "completed" })
+local import_request_count = #requests
+assert(#timers == 0, "import added task-owned recovery polling")
+-- Transport uncertainty is resolved by the shared client; the task layer receives only completion.
+imported.reply({ state = "completed" })
+assert(#requests == import_request_count, "import recovery replayed the settings mutation")
 assert(settled == 6 and state.task_operation == nil)
 begin({ action = "pause" })
 local queued_control = requests[#requests]

@@ -46,16 +46,12 @@ for _, acknowledged_first in ipairs({ true, false }) do
   if not acknowledged_first then change.reply({ state = "accepted", revision = 1 }) end
   assert(state.task_operation.state == "running", "late acknowledgement regressed execution")
   controller.cancel_turn()
-  local pause = last("session.command.apply")
-  assert(pause.params.action == "pause")
+  local cancellation = last("session.turn.cancel")
+  assert(cancellation.params.restore_prompt_if_no_output)
   controller.cancel_turn()
-  assert(last("session.command.apply") == pause, "duplicate stop intent")
+  assert(last("session.turn.cancel") == cancellation, "duplicate stop intent")
   task.receive(state, { id = change.params.operation_id, state = "completed" })
-  assert(state.busy and state.task_operation.id == pause.params.operation_id)
-  task.receive(state, { id = pause.params.operation_id, state = "completed" })
   assert(not state.busy and not state.task_operation)
-  local cancellation = requests[#requests - 1]
-  assert(cancellation.method == "session.turn.cancel" and cancellation.params.restore_prompt_if_no_output)
   cancellation.reply({ cancel_requested = true })
   assert(last("session.state.get") and #failures == 0)
 end

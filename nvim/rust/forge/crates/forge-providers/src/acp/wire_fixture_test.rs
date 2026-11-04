@@ -133,12 +133,19 @@ impl forge_provider_api::session::ProviderHostEffects for TestHostEffects {
 }
 
 fn prompt_request(
+    binding: &forge_provider_api::BindingId,
     scope: forge_provider_api::InvocationScope,
     receipt: Arc<FixtureReceipt>,
     input: forge_provider_api::input::PromptInput,
 ) -> forge_provider_api::session::PromptRequest {
+    let (dispatch, _) = forge_provider_api::submission::DispatchReporter::channel(
+        binding.clone(),
+        scope.clone(),
+        receipt.id.clone(),
+    );
     forge_provider_api::session::PromptRequest {
         scope,
+        dispatch,
         mode: forge_provider_api::input::PromptMode::Chat,
         configuration: forge_provider_api::session::InvocationConfiguration {
             model: forge_provider_api::session::ModelSelection::default(),
@@ -232,12 +239,15 @@ impl WireFixture {
             r#"
 const fs=require('node:fs');const readline=require('node:readline');
 const write=value=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',...value})+'\n');
+let heldPrompt;
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const request=JSON.parse(line);if(request.id===undefined)return;let result={};
+ if(request.method==='fixture/release'&&heldPrompt){write({id:heldPrompt,result:{stopReason:'end_turn'}});heldPrompt=undefined;}
  if(request.method==='initialize')result={protocolVersion:1,agentInfo:{version:'99.0.0'},agentCapabilities:{loadSession:true}};
  if(request.method==='session/new')result={sessionId:'fixture'};
  if(request.method==='session/prompt'||request.method==='_session/steering'){
   const mode=fs.readFileSync(process.argv[2],'utf8');
+  if(mode==='held'&&request.method==='session/prompt'){heldPrompt=request.id;return;}
   if(mode==='remote_error'){write({id:request.id,error:{code:-32603,message:'private native error'}});return;}
   if(mode==='invalid_request'){write({id:request.id,error:{code:-32600,message:'private invalid request detail'}});return;}
   if(request.method==='_session/steering')result=mode==='promptRequired'?{outcome:'promptRequired',reason:'noRunningTurn'}:{outcome:mode};
@@ -343,6 +353,7 @@ async fn accepted_prompt_retains_publication_failure_until_collection() {
     let mut stream = provider.take_session_events(&binding.id).await.unwrap();
     let rejected_receipt = receipt("rejected-submission");
     let mut rejected = prompt_request(
+        &binding.id,
         InvocationScope::new(owner.clone(), "rejected-exchange"),
         rejected_receipt.clone(),
         forge_provider_api::PromptInput::Text("test".into()),
@@ -357,6 +368,7 @@ async fn accepted_prompt_retains_publication_failure_until_collection() {
     stream.check().unwrap();
     let receipt = FixtureReceipt::new();
     let mut request = prompt_request(
+        &binding.id,
         InvocationScope::new(owner, "exchange"),
         receipt.clone(),
         forge_provider_api::PromptInput::Text("test".into()),
@@ -394,6 +406,7 @@ async fn prompt_terminal_response_commits_native_acceptance_and_normalizes_cance
                 AcpSubmission::Prompt,
                 json!({"sessionId":"fixture","prompt":[{"type":"text","text":"prompt"}]}),
                 Some(receipt.clone()),
+                None,
             )
             .await;
         assert!(result.is_ok());
@@ -403,6 +416,51 @@ async fn prompt_terminal_response_commits_native_acceptance_and_normalizes_cance
         }
         fixture.connection.shutdown().await.unwrap();
     }
+}
+
+/// Confirm tracked transport handoff while ACP's terminal-only receipt is pending.
+#[tokio::test]
+async fn prompt_dispatch_does_not_wait_for_terminal_acceptance() {
+    let fixture = WireFixture::start("held").await.unwrap();
+    fixture.ready().await.unwrap();
+    let receipt = FixtureReceipt::new();
+    let (dispatch, mut observer) = forge_provider_api::submission::DispatchReporter::channel(
+        forge_provider_api::BindingId::new("binding").unwrap(),
+        forge_provider_api::InvocationScope::new(
+            forge_provider_api::ExecutionOwner::root("session"),
+            "invocation",
+        ),
+        receipt.id.clone(),
+    );
+    let prompt = fixture.connection.submit(
+        AcpSubmission::Prompt,
+        json!({"sessionId":"fixture","prompt":[{"type":"text","text":"prompt"}]}),
+        Some(receipt.clone()),
+        Some(&dispatch),
+    );
+    tokio::pin!(prompt);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::select! {
+            confirmation = observer.wait() => {
+                assert_eq!(confirmation.unwrap().target(), &forge_provider_api::submission::DispatchTarget::Input(receipt.id.clone()));
+            }
+            result = &mut prompt => panic!("held prompt completed before release: {result:?}"),
+        }
+    })
+    .await
+    .expect("transport handoff must not wait for terminal response");
+    {
+        let state = receipt.state.lock().unwrap();
+        assert!(state.sending && !state.accepted);
+    }
+    fixture
+        .connection
+        .request("fixture/release", json!({}))
+        .await
+        .unwrap();
+    prompt.await.unwrap();
+    assert!(receipt.state.lock().unwrap().accepted);
+    fixture.connection.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -436,6 +494,7 @@ async fn native_remote_errors_are_redacted_and_recorded_as_failures() {
             AcpSubmission::Prompt,
             json!({"sessionId":"fixture","prompt":[{"type":"text","text":"prompt"}]}),
             Some(receipt.clone()),
+            None,
         )
         .await
         .unwrap_err();
@@ -486,6 +545,7 @@ fn steering_continuation_grant_binds_attempted_input_and_is_single_use() {
     let resource_lease: Arc<dyn forge_provider_api::session::ResourceLease> =
         Arc::new(FixtureResourceLease);
     let original = prompt_request(
+        &binding,
         scope.clone(),
         base_receipt,
         forge_provider_api::input::PromptInput::Text("original".into()),
@@ -509,6 +569,7 @@ fn steering_continuation_grant_binds_attempted_input_and_is_single_use() {
     let mut grants = std::collections::HashMap::from([(b"opaque-token".to_vec(), grant)]);
 
     let mut altered = prompt_request(
+        &binding,
         scope.clone(),
         steering_receipt.clone(),
         forge_provider_api::input::PromptInput::Text("different payload".into()),

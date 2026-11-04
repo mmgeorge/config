@@ -79,4 +79,10 @@ generation = 2
 requests[3].callback(nil, "host stopped")
 assert(#requests == 3 and outcome[2].failure:find("Host restarted", 1, true),
   "host replacement replayed an unresolved mutation")
+command.dispatch(transport, "session", "session.question.answer", {
+  command = { operation_id = "question-intent", question_id = "question", revision = 1,
+    action = { kind = "skip" } },
+}, function() end)
+assert(requests[#requests].params._command.id == "question-intent",
+  "question command introduced a second recovery identity")
 client.host_get_generation, vim.defer_fn, notifications.error = original_generation, original_defer, original_error

@@ -25,6 +25,11 @@ impl HarnessBroker {
         } = self.prepare_foreground_provider_context(staged)?;
         let scope =
             crate::provider::InvocationScope::new(request.owner()?, staged.exchange.id.clone());
+        let (live_host_sender, live_host_receiver) =
+            crate::provider::LiveHostEffectSender::channel();
+        if let Some(context) = request.control_context.as_mut() {
+            context.live_host_effects = Some(live_host_sender);
+        }
         let attached_results = self.agent_coordinator.unreported_result();
         if !attached_results.is_empty() {
             let message = attached_results
@@ -48,6 +53,11 @@ impl HarnessBroker {
             }
         }
 
+        // Every scoped callback must share the same owner-confirmed revision handle,
+        // including scopes captured before the provider bridge clones this context.
+        if let Some(context) = &mut request.control_context {
+            context.bind_task_authority_progress();
+        }
         // Acquire all fallible tool scopes before transferring the exchange runtime or dispatching.
         let (agent_scope, agent_lease) = crate::agent::AgentToolScope::new(
             scope.owner.clone(),
@@ -101,6 +111,10 @@ impl HarnessBroker {
         {
             context.execution = Some(crate::plan::execution::ExecutionControlSender {
                 task_controller: self.task_controller.clone(),
+                task_permit: context
+                    .task_permit
+                    .clone()
+                    .context("execution callback has no dispatched task permit")?,
                 phase: execution.phase,
                 execution_id: execution.id.clone(),
                 generation: execution.generation,
@@ -150,6 +164,9 @@ impl HarnessBroker {
         let state = self.begin_owned_foreground(staged.exchange.clone(), scope)?;
         let settlement = Arc::new(crate::provider::session_execution::SettlementCell::default());
         self.pending_host_settlement = Some(settlement.clone());
+        // Prior-turn usage remains useful for display but cannot authorize maintenance
+        // for a new submission until that submission reports fresh context usage.
+        self.context_usage_fresh = false;
         let native = ForegroundWait::start(
             stream,
             ProviderSubmission {
@@ -174,6 +191,8 @@ impl HarnessBroker {
         let mut agent_revision = self.agent_coordinator.subscribe();
         agent_revision.mark_changed();
         Ok(ForegroundTransaction {
+            live_host_receiver,
+            live_host: None,
             state,
             request,
             mode: staged.mode,
@@ -187,12 +206,15 @@ impl HarnessBroker {
             _lsp_lease: lsp_lease,
             native,
             native_open: true,
+            collection: None,
             idle_native_active: false,
             provider_event_sink,
             engine,
             steering: ProviderSteering {
                 active,
                 deferred: std::collections::VecDeque::new(),
+                pending_deliveries: Arc::new(SteeringDeliveries::default()),
+                refresh_readiness: false,
             },
             agent_revision,
             question_changes: self.questions.changed.subscribe(),

@@ -24,7 +24,6 @@ client.request = function(request_specification, callback)
   local params = request_specification.params or {}
 
   if method == "session.question.continue" then continuation = callback
-  elseif method == "session.question.ask" then question_requests = callback
   elseif method == "session.state.get" then
     snapshot_requests = snapshot_requests + 1
     state_reply = callback

@@ -21,6 +21,8 @@ mod concurrency_tests;
 mod efficiency_tests;
 #[cfg(test)]
 mod reliability_tests;
+#[cfg(test)]
+mod rollback_atomicity_test;
 
 use crate::agent::Agent;
 use crate::checkpoint::CheckpointRecord;
@@ -742,33 +744,36 @@ impl SqliteStore {
         self.save_scoped_payload(table, id, session_id, &payload)
     }
 
-    pub(crate) fn pending_policy_predecessor(
-        &self,
-        session_id: &str,
-        operation_id: &str,
-    ) -> Result<bool> {
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM task_operation WHERE session_id=?1 AND rowid < (SELECT rowid FROM task_operation WHERE session_id=?1 AND id=?2) AND json_extract(payload,'$.action.action') IN ('configure','permission') AND json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running','applying','verifying'))",
-            params![session_id, operation_id], |row| row.get(0),
-        )?)
-    }
-
     /// Write a plan lifecycle record.
     pub fn save_plan(&mut self, plan: &PlanRecord) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut payload = serde_json::to_value(plan)?;
-        payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
-        let payload =
-            question::preserve_answers(&transaction, "plan_record", &plan.id, encode(&payload)?)?;
-        let written = transaction.execute(
-            "INSERT INTO plan_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE plan_record.session_id=excluded.session_id",
-            params![plan.id, plan.session_id, payload],
-        )?;
-        anyhow::ensure!(written == 1, "plan cannot change its owning session");
-
-        transaction.commit()?;
+        // Acquire the file gate before opening SQLite's write transaction.
+        let artifacts = crate::plan::PlanFileStore::new(&self.data_root, std::path::PathBuf::new());
+        let owns_artifacts = artifacts.claim_plan_artifacts(plan)?;
+        let committed = (|| -> Result<()> {
+            let transaction = self
+                .connection
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let mut payload = serde_json::to_value(plan)?;
+            payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+            let payload = question::preserve_answers(
+                &transaction,
+                "plan_record",
+                &plan.id,
+                encode(&payload)?,
+            )?;
+            let written = transaction.execute(
+                "INSERT INTO plan_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE plan_record.session_id=excluded.session_id",
+                params![plan.id, plan.session_id, payload],
+            )?;
+            anyhow::ensure!(written == 1, "plan cannot change its owning session");
+            transaction.commit()?;
+            Ok(())
+        })();
+        // Reconcile only after the transaction has released its database lock.
+        if owns_artifacts && let Some(persisted) = self.load_plan(&plan.id)? {
+            artifacts.reconcile_plan_artifacts(&persisted)?;
+        }
+        committed?;
         self.publish_admission(&plan.session_id)
     }
 

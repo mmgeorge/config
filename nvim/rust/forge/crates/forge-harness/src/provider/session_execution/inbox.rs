@@ -734,6 +734,7 @@ mod tests {
         );
         provider
             .initialize_session(crate::provider::ProviderRequest {
+                dispatch: forge_provider_api::submission::DispatchTracker::default(),
                 execution_owner: Some(scope.owner.clone()),
                 harness_session_id: scope.owner.session_id.to_string(),
                 workspace: data.path().to_string_lossy().into_owned(),

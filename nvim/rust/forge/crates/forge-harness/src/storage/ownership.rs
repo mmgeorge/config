@@ -3,6 +3,60 @@ use crate::exchange::{Exchange, ExchangeNode};
 use anyhow::{Context, Result, ensure};
 use std::collections::{HashMap, HashSet};
 
+/// Freeze the exact history and replacement session for an atomic rollback commit.
+pub(crate) struct PreparedRollback {
+    session: crate::session::HarnessSession,
+    expected_session: String,
+    expected_exchanges: Vec<(String, String)>,
+    updates: Vec<Exchange>,
+}
+
+impl PreparedRollback {
+    pub(super) fn apply(&self, transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+        use rusqlite::params;
+        let payload: String = transaction.query_row(
+            "SELECT payload FROM session_record WHERE id=?1",
+            [&self.session.id],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            payload == self.expected_session,
+            "rollback session changed before commit"
+        );
+        let count: i64 = transaction.query_row(
+            "SELECT count(*) FROM exchange_record WHERE session_id=?1",
+            [&self.session.id],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            usize::try_from(count)? == self.expected_exchanges.len(),
+            "rollback history changed before commit"
+        );
+        for (id, expected) in &self.expected_exchanges {
+            let current: String = transaction.query_row(
+                "SELECT payload FROM exchange_record WHERE id=?1 AND session_id=?2",
+                params![id, self.session.id],
+                |row| row.get(0),
+            )?;
+            ensure!(
+                &current == expected,
+                "rollback exchange changed before commit"
+            );
+        }
+        for exchange in &self.updates {
+            transaction.execute(
+                "UPDATE exchange_record SET payload=?2 WHERE id=?1",
+                params![exchange.id, serde_json::to_string(exchange)?],
+            )?;
+        }
+        transaction.execute(
+            "UPDATE session_record SET payload=json_set(?2,'$.session.name',json_extract(payload,'$.session.name'),'$.session.active_task',json_extract(payload,'$.session.active_task')),updated_at_ms=?3 WHERE id=?1",
+            params![self.session.id, super::encode_session(&self.session)?, self.session.updated_at_ms],
+        )?;
+        Ok(())
+    }
+}
+
 impl SqliteStore {
     /// Reject restoration until every affected exchange and descendant has settled.
     pub(crate) fn require_settled_exchange_tree(
@@ -54,15 +108,30 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Commit rollback history and the replacement provider identity together.
-    pub(crate) fn record_rollback(
-        &mut self,
+    /// Capture rollback evidence without changing task or conversation state.
+    pub(crate) fn prepare_rollback(
+        &self,
         session: &crate::session::HarnessSession,
         roots: &[String],
-    ) -> Result<()> {
+    ) -> Result<PreparedRollback> {
         use crate::exchange::HistoryDisposition;
-        use rusqlite::{TransactionBehavior, params};
         let session_id = &session.id;
+        let expected_session: String = self.connection.query_row(
+            "SELECT payload FROM session_record WHERE id=?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        let stored = super::decode_current_session(&expected_session)?
+            .context("rollback session is unavailable")?;
+        ensure!(
+            stored.lease_owner == session.lease_owner,
+            "Harness session lease ownership changed"
+        );
+        let expected_exchanges = self
+            .connection
+            .prepare("SELECT id,payload FROM exchange_record WHERE session_id=?1")?
+            .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<(String, String)>>>()?;
         self.require_settled_exchange_tree(session_id, roots)?;
         let records: Vec<Exchange> = self.list_payload(
             "SELECT payload FROM exchange_record WHERE session_id=?1",
@@ -93,36 +162,27 @@ impl SqliteStore {
                 updates.push(exchange);
             }
         }
+        Ok(PreparedRollback {
+            session: session.clone(),
+            expected_session,
+            expected_exchanges,
+            updates,
+        })
+    }
+
+    /// Commit rollback history and the replacement provider identity together.
+    pub(crate) fn record_rollback(
+        &mut self,
+        session: &crate::session::HarnessSession,
+        roots: &[String],
+    ) -> Result<()> {
+        let prepared = self.prepare_rollback(session, roots)?;
         let transaction = self
             .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let payload: String = transaction.query_row(
-            "SELECT payload FROM session_record WHERE id=?1",
-            [session_id],
-            |row| row.get(0),
-        )?;
-        let stored =
-            super::decode_current_session(&payload)?.context("rollback session is unavailable")?;
-        ensure!(
-            stored.lease_owner == session.lease_owner,
-            "Harness session lease ownership changed"
-        );
-        for exchange in updates {
-            transaction.execute(
-                "UPDATE exchange_record SET payload=?2 WHERE id=?1",
-                params![exchange.id, serde_json::to_string(&exchange)?],
-            )?;
-        }
-        transaction.execute(
-            "UPDATE session_record SET payload=json_set(?2,'$.session.name',json_extract(payload,'$.session.name'),'$.session.active_task',json_extract(payload,'$.session.active_task')),updated_at_ms=?3 WHERE id=?1",
-            params![
-                session.id,
-                super::encode_session(session)?,
-                session.updated_at_ms
-            ],
-        )?;
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        prepared.apply(&transaction)?;
         transaction.commit()?;
-        self.refresh_admission_membership(session_id)
+        self.refresh_admission_membership(&session.id)
     }
 
     /// Resolve a child selection to the primary exchange that owns its checkpoint.

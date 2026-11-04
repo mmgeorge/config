@@ -154,6 +154,7 @@ pub fn prepare_provider_fork(
 
     let provider_request = ProviderForkRequest {
         source: ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: None,
             harness_session_id: source.id,
             workspace: source.workspace,

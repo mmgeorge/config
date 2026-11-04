@@ -200,6 +200,12 @@ impl GitCheckpoint {
         preview: RestorePreview,
         resume: bool,
     ) -> Result<RestoreJournal> {
+        // Capture journal progress before waiting for repository serialization.
+        // A queued restore must never inherit a different recovery operation.
+        let expected_progress = RestoreJournal::progress(&objects, &preview.session_id)?
+            .map(|progress| serde_json::to_vec(&progress))
+            .transpose()?;
+        let expected_preview = serde_json::to_vec(&preview)?;
         let repository = repositories
             .open(self.workspace.clone())
             .await?
@@ -219,6 +225,19 @@ impl GitCheckpoint {
         };
         let result = tokio::task::spawn_blocking(move || {
             let result = (|| {
+                let current_progress = RestoreJournal::progress(&objects, &preview.session_id)?
+                    .map(|progress| serde_json::to_vec(&progress))
+                    .transpose()?;
+                anyhow::ensure!(
+                    current_progress == expected_progress,
+                    "restore journal changed while waiting for repository ownership"
+                );
+                let retained_preview =
+                    RestorePreview::load(&objects, &preview.session_id, &preview.id)?;
+                anyhow::ensure!(
+                    serde_json::to_vec(&retained_preview)? == expected_preview,
+                    "restore preview changed while waiting for repository ownership"
+                );
                 let mut journal = if resume {
                     let journal = RestoreJournal::load(&objects, &preview.session_id)?
                         .context("restore journal is missing")?;

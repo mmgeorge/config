@@ -103,6 +103,34 @@ struct SteeringSender {
     interrupt: Arc<Semaphore>,
 }
 
+/// Retain one admitted receiver so delayed preparation cannot select a later active turn.
+#[derive(Clone)]
+pub(crate) struct SteeringTarget {
+    sender: SteeringSender,
+}
+
+impl SteeringTarget {
+    /// Get whether the exact captured turn still accepts queued steering.
+    pub(crate) fn is_open(&self) -> bool {
+        !self.sender.sender.is_closed()
+    }
+
+    /// Deliver only to the captured receiver, preserving normalized admission and receipt errors.
+    pub(crate) async fn steer(
+        &self,
+        input: SteeringInput,
+    ) -> std::result::Result<(), ProviderError> {
+        SteeringLane::submit_to(self.sender.clone(), ActiveTurnOperation::Steer, Some(input))
+            .await
+            .map_err(|error| {
+                super::lifecycle_error::classify(
+                    forge_provider_api::ProviderOperation::AdmitInput,
+                    error,
+                )
+            })
+    }
+}
+
 /// Owns one active turn's steering receiver and clears it when that turn ends.
 pub struct ActiveSteering {
     lane: SteeringLane,
@@ -137,6 +165,16 @@ pub enum ActiveTurnOperation {
 }
 
 impl SteeringLane {
+    /// Capture the current receiver without deferring turn selection until an asynchronous send.
+    pub(crate) fn capture(&self) -> Option<SteeringTarget> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .sender
+            .clone()
+            .map(|sender| SteeringTarget { sender })
+    }
+
     /// Maximum number of ordinary controls owned by an active turn.
     pub(crate) const CAPACITY: usize = MAX_STEERING_REQUESTS;
 
@@ -174,6 +212,7 @@ impl SteeringLane {
     }
 
     /// Delivers input to the active turn and publishes only acknowledged user additions.
+    #[cfg(test)]
     pub async fn steer(&self, input: SteeringInput) -> Result<()> {
         self.submit(ActiveTurnOperation::Steer, Some(input)).await
     }
@@ -185,6 +224,7 @@ impl SteeringLane {
             .await
     }
 
+    #[cfg(test)]
     async fn submit(
         &self,
         operation: ActiveTurnOperation,
@@ -203,6 +243,15 @@ impl SteeringLane {
             }
             return Err(not_admitted().into());
         };
+        Self::submit_to(sender, operation, input).await
+    }
+
+    /// Admit a control to one captured receiver without consulting the lane's later generation.
+    async fn submit_to(
+        sender: SteeringSender,
+        operation: ActiveTurnOperation,
+        input: Option<SteeringInput>,
+    ) -> Result<()> {
         let admission = match operation {
             ActiveTurnOperation::Steer => sender.ordinary,
             #[cfg(test)]
@@ -498,6 +547,29 @@ fn not_admitted() -> ProviderError {
 mod test {
     use super::SteeringLane;
     use crate::provider::{ExecutionOwner, InputAcknowledgement, InvocationScope, ProviderEvent};
+
+    /// A captured sender must reject retirement instead of delivering to the replacement turn.
+    #[tokio::test]
+    async fn captured_steering_target_does_not_retarget_replacement_turn() -> anyhow::Result<()> {
+        let lane = SteeringLane::default();
+        let original = lane.activate(None)?;
+        let captured = lane
+            .capture()
+            .expect("active receiver has a capture capability");
+        drop(original);
+        let mut replacement = lane.activate(None)?;
+        assert!(!captured.is_open());
+        assert!(
+            captured
+                .steer(crate::provider::SteeringInput::AgentResult(
+                    "old target".into()
+                ))
+                .await
+                .is_err()
+        );
+        assert!(replacement.try_receive().is_none());
+        Ok(())
+    }
 
     fn scope() -> InvocationScope {
         InvocationScope {

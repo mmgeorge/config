@@ -31,7 +31,12 @@ pub(super) async fn execute(
         .checks
         .as_ref()
         .context("check tools require an authenticated root interaction")?;
-    let message = scope.invoke(NAME, invocation.arguments).await?;
+    let identity = invocation
+        .call_id
+        .context("check_run requires authenticated tool-call identity")?;
+    let message = scope
+        .invoke_with_identity(NAME, invocation.arguments, identity)
+        .await?;
     Ok(crate::tools::ControlToolResult {
         invocation: None,
         message,

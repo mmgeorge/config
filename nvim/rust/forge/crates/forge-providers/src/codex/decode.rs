@@ -10,6 +10,8 @@ use std::{path::Path, time::Duration};
 
 #[derive(serde::Deserialize)]
 struct DynamicToolCall {
+    #[serde(rename = "callId")]
+    id: forge_provider_api::control::ToolCallId,
     tool: String,
     arguments: Value,
 }
@@ -20,6 +22,7 @@ pub(super) fn dynamic_tool_call(
 ) -> Result<forge_provider_api::control::ToolCall, serde_json::Error> {
     let call: DynamicToolCall = serde_json::from_value(value.clone())?;
     Ok(forge_provider_api::control::ToolCall {
+        id: call.id,
         name: call.tool,
         arguments: call.arguments,
     })
@@ -914,6 +917,24 @@ pub fn first_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// Accumulated billing and a small reply must not substitute for retained context usage.
+    #[test]
+    fn context_usage_uses_last_request_including_input_not_cumulative_total() {
+        let usage = super::context_usage(&serde_json::json!({"tokenUsage":{
+            "last":{"inputTokens":149900,"outputTokens":100,"totalTokens":150000},
+            "total":{"totalTokens":9000000},"modelContextWindow":258000
+        }}))
+        .unwrap();
+        assert_eq!(usage.used, 150000);
+        assert_eq!(usage.size, 258000);
+        let small = super::context_usage(&serde_json::json!({"tokenUsage":{
+            "last":{"totalTokens":20000},"total":{"totalTokens":9000000},
+            "modelContextWindow":258000
+        }}))
+        .unwrap();
+        assert_eq!(small.used, 20000);
+    }
+
     /// Match the installed app-server schema rather than an MCP response envelope.
     #[test]
     fn dynamic_tool_wire_contract_uses_tool_and_content_items() {
@@ -923,6 +944,13 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(call.name, "repository_status");
+        assert_eq!(call.id.as_str(), "call");
+        assert!(
+            super::dynamic_tool_call(&serde_json::json!({
+                "tool":"repository_status", "arguments":{}, "callId":""
+            }))
+            .is_err()
+        );
         assert_eq!(call.arguments, serde_json::json!({"offset":0}));
         assert!(
             super::dynamic_tool_call(&serde_json::json!({

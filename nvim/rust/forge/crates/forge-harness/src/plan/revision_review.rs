@@ -1,10 +1,13 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
+#[cfg(test)]
 use forge_protocol::message::SessionEvent;
+#[cfg(test)]
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
+#[cfg(test)]
 use crate::protocol::RuntimeMethod;
 
 /// Routes review reads and decisions to the broker retaining a provider tool call.
@@ -65,6 +68,7 @@ impl RevisionReview {
     }
 
     /// Commit one explicit decision through the waiting turn's persistence owner.
+    #[cfg(test)]
     pub(crate) async fn decide(
         &self,
         method: RuntimeMethod,
@@ -116,6 +120,7 @@ pub(crate) enum RevisionReviewRequest {
         revision: Option<u32>,
         response: oneshot::Sender<Result<super::review_source::PlanReviewSource>>,
     },
+    #[cfg(test)]
     Decide {
         method: RuntimeMethod,
         params: Value,

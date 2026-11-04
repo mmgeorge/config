@@ -38,7 +38,7 @@ impl AcpConnection {
         receipt: Option<Arc<dyn InputReceipt>>,
     ) -> Result<SteeringAcceptance, ProviderError> {
         let response = self
-            .submit(AcpSubmission::Steering, parameter, receipt)
+            .submit(AcpSubmission::Steering, parameter, receipt, None)
             .await?;
         match response["outcome"].as_str() {
             Some("injected") => Ok(SteeringAcceptance::Injected),
@@ -56,6 +56,7 @@ impl AcpConnection {
         kind: AcpSubmission,
         parameter: Value,
         receipt: Option<Arc<dyn InputReceipt>>,
+        dispatch: Option<&forge_provider_api::submission::DispatchReporter>,
     ) -> Result<Value, ProviderError> {
         let method = kind.method();
         let session_id = parameter["sessionId"]
@@ -69,7 +70,7 @@ impl AcpConnection {
         }
         let mut rejected_without_consumption = false;
         let result = async {
-            let response = self.request(method, parameter).await?;
+            let response = self.request_tracked(method, parameter, dispatch).await?;
             if kind == AcpSubmission::Prompt {
                 // ACP v1 acknowledges a prompt only after the native turn has ended.
                 super::prompt_outcome(&response).map_err(|_| {

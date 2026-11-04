@@ -24,6 +24,9 @@ pub fn native_goal_update(objective: String, state: crate::goal::GoalState) -> N
 /// Represents one prompt sent across a provider boundary.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ProviderRequest {
+    /// Observe this live attempt's handoff; restoring saved requests starts a fresh tracker.
+    #[serde(skip, default)]
+    pub dispatch: super::DispatchTracker,
     /// Separates the agent runtime from its visible root session and settings scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_owner: Option<ExecutionOwner>,
@@ -51,6 +54,46 @@ pub struct ProviderRequest {
 }
 
 impl ProviderRequest {
+    /// Capture persisted invocation values without retaining dispatch, receipt, or tool capabilities.
+    pub(crate) fn invocation_snapshot(&self) -> Self {
+        let Self {
+            dispatch: _,
+            execution_owner,
+            harness_session_id,
+            workspace,
+            input,
+            mode,
+            model,
+            effort,
+            context_window,
+            service_tier,
+            access,
+            approval_mode,
+            provider_session_id,
+            submission: _,
+            recovered_input,
+            control_context: _,
+        } = self;
+        Self {
+            dispatch: Default::default(),
+            execution_owner: execution_owner.clone(),
+            harness_session_id: harness_session_id.clone(),
+            workspace: workspace.clone(),
+            input: input.clone(),
+            mode: *mode,
+            model: model.clone(),
+            effort: effort.clone(),
+            context_window: context_window.clone(),
+            service_tier: *service_tier,
+            access: access.clone(),
+            approval_mode: *approval_mode,
+            provider_session_id: provider_session_id.clone(),
+            submission: None,
+            recovered_input: recovered_input.clone(),
+            control_context: None,
+        }
+    }
+
     /// Retain admitted attachment references from recovered input and the newest input.
     #[cfg(test)]
     pub(crate) fn input_attachments(&self) -> Vec<crate::attachment::InputAttachment> {
@@ -357,6 +400,7 @@ mod test {
         let prompt = tokio::spawn(async move {
             prompt_provider
                 .session_prompt_and_collect(ProviderRequest {
+                    dispatch: forge_provider_api::submission::DispatchTracker::default(),
                     execution_owner: None,
                     harness_session_id: "harness-session".into(),
                     workspace,

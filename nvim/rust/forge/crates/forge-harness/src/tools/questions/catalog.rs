@@ -36,14 +36,10 @@ pub(in crate::tools) async fn execute(
     }
 }
 
-/// Record questions completion fields for provider-neutral replay.
+/// Question mutations commit through their owner rather than deferred completion fields.
 pub(in crate::tools) fn record(
-    invocation: &crate::tools::ControlToolInvocation,
-    output: &mut crate::provider::ProviderCompletion,
+    _invocation: &crate::tools::ControlToolInvocation,
+    _output: &mut crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<()> {
-    match invocation.name.as_str() {
-        super::ask::NAME => super::ask::record(invocation, output),
-        super::withdraw::NAME => super::withdraw::record(invocation, output),
-        _ => Ok(()),
-    }
+    Ok(())
 }

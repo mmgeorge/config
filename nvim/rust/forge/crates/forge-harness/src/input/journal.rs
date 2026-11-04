@@ -1,5 +1,5 @@
 use super::{InputSnapshot, InputState, InputUpdate};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
 /// Persist active input separately from immutable idempotency receipts.
@@ -15,7 +15,12 @@ impl InputJournal {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        for table in ["input_session", "input_operation", "input_submitted"] {
+        for table in [
+            "input_session",
+            "input_operation",
+            "input_submitted",
+            "owner_command",
+        ] {
             transaction.execute(
                 &format!("DELETE FROM {table} WHERE session_id=?1"),
                 [&self.session_id],
@@ -28,19 +33,13 @@ impl InputJournal {
     /// Open the queue journal using the same durable SQLite policy as provider submissions.
     pub(super) fn open(root: &std::path::Path, session_id: &str) -> Result<Self> {
         std::fs::create_dir_all(root)?;
-        let connection = Connection::open(root.join("input-queue.sqlite3"))?;
+        // Bootstrap the shared schema before opening this domain's independent handle.
+        // Input receipt and owner-command completion now commit in the same database.
+        drop(crate::storage::SqliteStore::open(root)?);
+        let mut connection = Connection::open(root.join("harness.sqlite3"))?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        let _bootstrap = crate::storage::bootstrap_lock(root, "input-queue")?;
-        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        ensure!(
-            matches!(version, 0 | 1),
-            "unsupported input journal version {version}"
-        );
-        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-            CREATE TABLE IF NOT EXISTS input_session(session_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS input_operation(session_id TEXT NOT NULL,id TEXT NOT NULL,request TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(session_id,id));
-            CREATE TABLE IF NOT EXISTS input_submitted(session_id TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(session_id,id));
-            PRAGMA user_version=1;")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        migrate_legacy(&mut connection, root, session_id)?;
         Ok(Self {
             connection,
             session_id: session_id.into(),
@@ -236,6 +235,12 @@ impl InputJournal {
         for (id, (request, outcome)) in &next.operation {
             if !previous.operation.contains_key(id) {
                 transaction.execute("INSERT INTO input_operation(session_id,id,request,payload) VALUES(?1,?2,?3,?4)",params![self.session_id,id,request,serde_json::to_string(outcome)?])?;
+                crate::exchange::journal::commit_input_command(
+                    &transaction,
+                    &self.session_id,
+                    id,
+                    outcome,
+                )?;
             }
         }
         for id in next.submitted.difference(&previous.submitted) {
@@ -245,6 +250,259 @@ impl InputJournal {
             )?;
         }
         transaction.commit()?;
+        Ok(())
+    }
+}
+
+/// Reserve a workflow input in the transaction that commits its source and owner checkpoint.
+pub(crate) fn reserve_workflow_input(
+    transaction: &rusqlite::Transaction<'_>,
+    session: &str,
+    message: &super::InputMessage,
+) -> Result<()> {
+    ensure!(
+        !message.id.is_empty() && !message.text.trim().is_empty(),
+        "workflow input identity and text are required"
+    );
+    let payload: Option<String> = transaction
+        .query_row(
+            "SELECT payload FROM input_session WHERE session_id=?1",
+            [session],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut snapshot: super::InputSnapshot = payload
+        .map(|payload| serde_json::from_str(&payload))
+        .transpose()?
+        .unwrap_or_default();
+    ensure!(
+        !snapshot.messages.iter().any(|input| input.id == message.id),
+        "workflow input was already reserved"
+    );
+    let mut message = message.clone();
+    message.revision = 1;
+    snapshot.messages.push(message.clone());
+    snapshot.revision = snapshot
+        .revision
+        .checked_add(1)
+        .context("input revision exhausted")?;
+    transaction.execute("INSERT INTO input_session(session_id,payload) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET payload=excluded.payload", params![session, serde_json::to_string(&snapshot)?])?;
+    let operation = super::InputOperation {
+        id: message.id.clone(),
+        control_revision: snapshot.control_revision,
+        after_control: None,
+        action: super::InputAction::Submit {
+            message: Box::new(message.clone()),
+        },
+    };
+    let receipt = super::InputUpdate {
+        operation_id: Some(operation.id.clone()),
+        revision: snapshot.revision,
+        upsert: vec![message.clone()],
+        suspended: snapshot.suspended,
+        control_revision: snapshot.control_revision,
+        ..Default::default()
+    };
+    transaction.execute(
+        "INSERT INTO input_operation(session_id,id,request,payload) VALUES(?1,?2,?3,?4)",
+        params![
+            session,
+            operation.id,
+            serde_json::to_string(&operation)?,
+            serde_json::to_string(&receipt)?
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO input_submitted(session_id,id) VALUES(?1,?2)",
+        params![session, message.id],
+    )?;
+    Ok(())
+}
+
+/// Copy one legacy session once, retaining the source for rollback and inspection.
+/// The migration marker commits with all records, preventing old queues from returning
+/// after deletion or a later host restart. Existing shared-database input wins.
+fn migrate_legacy(
+    connection: &mut Connection,
+    root: &std::path::Path,
+    session: &str,
+) -> Result<()> {
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let migrated: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM input_migration WHERE session_id=?1)",
+        [session],
+        |row| row.get(0),
+    )?;
+    if migrated {
+        return Ok(());
+    }
+    let present: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM input_session WHERE session_id=?1)",
+        [session],
+        |row| row.get(0),
+    )?;
+    let legacy_path = root.join("input-queue.sqlite3");
+    if !present && legacy_path.is_file() {
+        let legacy =
+            Connection::open_with_flags(legacy_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        legacy.busy_timeout(std::time::Duration::from_secs(5))?;
+        let version: i64 = legacy.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        ensure!(
+            matches!(version, 0 | 1),
+            "unsupported legacy input journal version {version}"
+        );
+        let snapshot: Option<String> = legacy
+            .query_row(
+                "SELECT payload FROM input_session WHERE session_id=?1",
+                [session],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(snapshot) = snapshot {
+            transaction.execute(
+                "INSERT INTO input_session(session_id,payload) VALUES(?1,?2)",
+                params![session, snapshot],
+            )?;
+        }
+        let mut query =
+            legacy.prepare("SELECT id,request,payload FROM input_operation WHERE session_id=?1")?;
+        for row in query.query_map([session], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (id, request, payload) = row?;
+            transaction.execute(
+                "INSERT INTO input_operation(session_id,id,request,payload) VALUES(?1,?2,?3,?4)",
+                params![session, id, request, payload],
+            )?;
+        }
+        let mut query = legacy.prepare("SELECT id FROM input_submitted WHERE session_id=?1")?;
+        for row in query.query_map([session], |row| row.get::<_, String>(0))? {
+            transaction.execute(
+                "INSERT INTO input_submitted(session_id,id) VALUES(?1,?2)",
+                params![session, row?],
+            )?;
+        }
+    }
+    transaction.execute(
+        "INSERT INTO input_migration(session_id) VALUES(?1)",
+        [session],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Copy legacy state once and retain the import tombstone across explicit deletion.
+    #[test]
+    fn legacy_queue_migrates_once_and_cannot_resurrect_after_delete() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let legacy = Connection::open(root.path().join("input-queue.sqlite3"))?;
+        legacy.execute_batch("CREATE TABLE input_session(session_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
+            CREATE TABLE input_operation(session_id TEXT NOT NULL,id TEXT NOT NULL,request TEXT NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(session_id,id));
+            CREATE TABLE input_submitted(session_id TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(session_id,id)); PRAGMA user_version=1;")?;
+        let input = crate::input::SessionInputQueue::default();
+        let operation = crate::input::InputOperation {
+            id: "legacy-submit".into(),
+            control_revision: 0,
+            after_control: None,
+            action: crate::input::InputAction::Submit {
+                message: Box::new(crate::input::InputMessage {
+                    id: "legacy-input".into(),
+                    revision: 0,
+                    text: "saved draft".into(),
+                    purpose: crate::input::InputPurpose::User,
+                    attachments: Vec::new(),
+                    config: None,
+                    intent: crate::input::InputIntent::Queue,
+                    delivery: crate::input::InputDelivery::Queued,
+                    route: None,
+                    reservation: None,
+                    submission_id: None,
+                    error: None,
+                }),
+            },
+        };
+        let mut update = input.apply(operation.clone())?;
+        update.snapshot = None;
+        legacy.execute(
+            "INSERT INTO input_session(session_id,payload) VALUES('session',?1)",
+            [serde_json::to_string(&input.snapshot()?)?],
+        )?;
+        legacy.execute(
+            "INSERT INTO input_operation(session_id,id,request,payload) VALUES('session',?1,?2,?3)",
+            params![
+                operation.id,
+                serde_json::to_string(&operation)?,
+                serde_json::to_string(&update)?
+            ],
+        )?;
+        legacy.execute(
+            "INSERT INTO input_submitted(session_id,id) VALUES('session','legacy-input')",
+            [],
+        )?;
+        let mut current = InputJournal::open(root.path(), "session")?;
+        let (state, restored) = current.load()?;
+        assert!(restored);
+        assert_eq!(state.snapshot.messages[0].text, "saved draft");
+        assert!(state.operation.contains_key("legacy-submit"));
+        current.delete()?;
+        drop(current);
+        let (state, restored) = InputJournal::open(root.path(), "session")?.load()?;
+        assert!(!restored);
+        assert!(state.snapshot.messages.is_empty() && state.operation.is_empty());
+        assert_eq!(
+            legacy.query_row("SELECT count(*) FROM input_session", [], |row| row
+                .get::<_, i64>(0))?,
+            1
+        );
+        Ok(())
+    }
+    /// Rolling back a workflow transaction must remove its input and immutable receipt together.
+    #[test]
+    fn workflow_reservation_rolls_back_and_recovers_its_original_receipt() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut journal = InputJournal::open(root.path(), "session")?;
+        let message = super::super::InputMessage {
+            id: "workflow-input".into(),
+            revision: 0,
+            text: "Continue the captured request".into(),
+            purpose: super::super::InputPurpose::User,
+            attachments: Vec::new(),
+            config: None,
+            intent: super::super::InputIntent::Auto,
+            delivery: super::super::InputDelivery::Queued,
+            route: None,
+            reservation: None,
+            submission_id: None,
+            error: None,
+        };
+        {
+            let transaction = journal.connection.transaction()?;
+            reserve_workflow_input(&transaction, "session", &message)?;
+            transaction.rollback()?;
+        }
+        let (state, _) = journal.load()?;
+        assert!(state.snapshot.messages.is_empty());
+        assert!(state.operation.is_empty());
+        {
+            let transaction = journal.connection.transaction()?;
+            reserve_workflow_input(&transaction, "session", &message)?;
+            transaction.commit()?;
+        }
+        let (state, _) = journal.load()?;
+        assert_eq!(state.snapshot.messages[0].text, message.text);
+        let (_, receipt) = state.operation.get(&message.id).unwrap();
+        assert_eq!(receipt.upsert[0].id, message.id);
+        assert_eq!(receipt.upsert[0].revision, 1);
+        assert!(receipt.snapshot.is_none());
         Ok(())
     }
 }

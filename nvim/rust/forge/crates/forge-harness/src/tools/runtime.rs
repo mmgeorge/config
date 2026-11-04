@@ -13,10 +13,17 @@ pub struct ControlTurnContext {
     /// One-use provider authorization to resume accepted history without resubmitting input.
     pub(crate) provider_continuation: Option<forge_provider_api::ContinuationToken>,
     pub(crate) questions: Option<Arc<crate::question::QuestionController>>,
+    /// Submit scoped question mutations without retaining the session owner through callbacks.
+    pub(crate) question_events: Option<crate::exchange::QuestionEvents>,
+    /// Commit live callback effects before acknowledging the native tool call.
+    pub(crate) live_host_effects: Option<crate::provider::LiveHostEffectSender>,
     pub(crate) question_exchange_id: Option<String>,
+    /// Authenticated provider invocation bound by the host control endpoint.
+    pub(crate) question_invocation: Option<crate::provider::InvocationScope>,
     pub(crate) question_discussion: bool,
     pub(crate) task_controller: Option<Arc<crate::task::SessionTaskController>>,
     pub(crate) task_permit: Option<crate::task::TaskPermit>,
+    pub(crate) task_authority_progress: Option<Arc<super::TaskAuthorityProgress>>,
     pub(crate) task_generation: Option<u64>,
     pub(crate) permission_snapshot: Option<super::authority::PermissionAuthoritySnapshot>,
     pub(crate) permission_required: bool,
@@ -69,6 +76,24 @@ pub(crate) struct ProviderExecutionPreview {
 }
 
 impl ControlTurnContext {
+    /// Install one shared revision handle before permission and tool contexts are cloned.
+    pub(crate) fn bind_task_authority_progress(&mut self) {
+        if self.task_authority_progress.is_none() {
+            self.task_authority_progress = self
+                .task_permit
+                .clone()
+                .map(|permit| Arc::new(super::TaskAuthorityProgress::new(permit)));
+        }
+    }
+
+    pub(crate) fn current_task_permit(&self) -> anyhow::Result<Option<crate::task::TaskPermit>> {
+        self.task_authority_progress
+            .as_ref()
+            .map(|progress| progress.permit())
+            .transpose()
+            .map(|permit| permit.or_else(|| self.task_permit.clone()))
+    }
+
     #[cfg(test)]
     pub(crate) fn bind_test_task_controller(
         &mut self,
@@ -165,10 +190,14 @@ impl ControlTurnContext {
             provider_completion: Default::default(),
             provider_continuation: None,
             questions: None,
+            question_events: None,
+            live_host_effects: None,
             question_exchange_id: None,
+            question_invocation: None,
             question_discussion: false,
             task_controller: None,
             task_permit: None,
+            task_authority_progress: None,
             task_generation: None,
             permission_snapshot: None,
             permission_required: false,
@@ -226,6 +255,7 @@ impl ControlToolRuntime {
     /// Validate a control invocation and await broker persistence for execution controls.
     pub async fn invoke(&mut self, invocation: ControlToolInvocation) -> Result<ControlToolResult> {
         self.ensure_submission_active()?;
+        self.context.task_permit = self.context.current_task_permit()?;
         if let Some(authority) = super::TaskAuthority::capture(&self.context) {
             authority.validate_scope()?;
         }
@@ -282,6 +312,10 @@ impl ControlToolRuntime {
         output: ProviderCompletion,
     ) -> Result<ControlToolResult> {
         self.ensure_submission_active()?;
+        self.context.task_permit = self.context.current_task_permit()?;
+        if let Some(authority) = super::TaskAuthority::capture(&self.context) {
+            authority.validate_scope()?;
+        }
         invocation.admit_turn_control(
             self.context.task_controller.as_deref(),
             self.context.task_permit.as_ref(),
@@ -465,6 +499,7 @@ mod test {
         let mut runtime = ControlToolRuntime::new(context);
         let error = runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "unreachable_control".into(),
                 arguments: json!({}),
@@ -493,7 +528,7 @@ mod test {
             let mut runtime = ControlToolRuntime::new(context);
             let mut returned_ids = Vec::new();
             for _ in 0..2 {
-                let result = runtime.invoke(ControlToolInvocation { task_permit: None, name: "question_ask".into(), arguments: serde_json::json!({
+                let result = runtime.invoke(ControlToolInvocation { call_id: None, task_permit: None, name: "question_ask".into(), arguments: serde_json::json!({
                     "questions": [{"header":"Layout", "question":"Choose a layout", "options":[]}]
                 }) }).await?;
                 let result: serde_json::Value = serde_json::from_str(&result.message)?;
@@ -502,7 +537,7 @@ mod test {
             }
             assert_eq!(controller.snapshot()?.questions.len(), 2);
             assert_ne!(returned_ids[0], returned_ids[1]);
-            let mut pending = Box::pin(runtime.invoke(ControlToolInvocation { task_permit: None, name: "question_ask".into(), arguments: serde_json::json!({
+            let mut pending = Box::pin(runtime.invoke(ControlToolInvocation { call_id: None, task_permit: None, name: "question_ask".into(), arguments: serde_json::json!({
                 "wait":true, "questions":[{"header":"Target", "question":"Choose the target", "options":[]}]
             }) }));
             assert!(futures_util::poll!(pending.as_mut()).is_pending());
@@ -544,6 +579,7 @@ mod test {
         context.bind_test_task_controller(controller.clone());
         let mut runtime = ControlToolRuntime::new(context);
         let invocation = |name: &str| ControlToolInvocation {
+            call_id: None,
             name: name.into(),
             arguments: json!({"summary":"Finished the requested work"}),
             task_permit: None,
@@ -609,9 +645,14 @@ mod test {
         let decoded: ControlToolInvocation = serde_json::from_value(json!({
             "name":"goal_complete", "arguments":{"summary":"untrusted"},
             "task_permit":{"revision":replacement.revision},
+            "call_id":"forged-model-identity",
         }))
         .unwrap();
         assert!(decoded.task_permit.is_none());
+        assert!(
+            decoded.call_id.is_none(),
+            "model JSON forged an authenticated tool-call identity"
+        );
     }
 
     #[tokio::test]
@@ -625,6 +666,7 @@ mod test {
         let initial = context.plan_document.clone().unwrap();
         let mut runtime = ControlToolRuntime::new(context);
         let invocation = |version, ids| ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "plan_overview_edit".into(),
             arguments: json!({"plan_id":"plan","expected_version":version,"checks":ids}),
@@ -710,6 +752,7 @@ mod test {
         let initial = context.plan_document.clone().unwrap();
         let mut runtime = ControlToolRuntime::new(context);
         let read = ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "plan_file_read".into(),
             arguments: json!({"plan_id":"plan","path":"Foo.rs"}),
@@ -718,6 +761,7 @@ mod test {
         assert!(inspected.message.contains("Source digest:"));
         assert_eq!(runtime.plan_document(), Some(&initial));
         let edit = ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "plan_file_edit".into(),
             arguments: json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: Foo.rs\n@@\n-pub struct Foo;\n+pub struct Revised;\n*** End Patch"}),
@@ -775,6 +819,7 @@ mod test {
         let mut runtime = ControlToolRuntime::new(context);
         let edited = runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_overview_edit".into(),
                 arguments: json!({"plan_id":"plan", "expected_version":1,
@@ -808,6 +853,7 @@ mod test {
 
         let read = runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_overview_read".into(),
                 arguments: json!({"plan_id":"plan"}),
@@ -821,26 +867,31 @@ mod test {
 
         for invocation in [
             ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_overview_edit".into(),
                 arguments: json!({"plan_id":"plan","expected_version":1,"objective":"Stale"}),
             },
             ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_overview_edit".into(),
                 arguments: json!({"plan_id":"plan","expected_version":2,"title":""}),
             },
             ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_overview_edit".into(),
                 arguments: json!({"plan_id":"plan","expected_version":2,"patch":"ignored"}),
             },
             ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_file_read".into(),
                 arguments: json!({"plan_id":"plan","path":"plan.json"}),
             },
             ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_file_edit".into(),
                 arguments: json!({"plan_id":"plan","expected_version":2,"patch":"*** Begin Patch\n*** Add File: other.rs\n+pub struct Other;\n*** Update File: plan.json\n@@\n*** End Patch"}),
@@ -849,7 +900,7 @@ mod test {
             assert!(runtime.invoke(invocation).await.is_err());
             assert_eq!(runtime.plan_document(), Some(&saved));
         }
-        let unchanged = runtime.invoke(ControlToolInvocation {
+        let unchanged = runtime.invoke(ControlToolInvocation { call_id: None,
             task_permit: None, name:"plan_overview_edit".into(),
             arguments:json!({"plan_id":"plan","expected_version":2,"objective":"Revised objective"}),
         }).await.unwrap();
@@ -866,7 +917,10 @@ mod test {
             provider_completion: Default::default(),
             provider_continuation: None,
             questions: None,
+            question_events: None,
+            live_host_effects: None,
             question_exchange_id: None,
+            question_invocation: None,
             question_discussion: false,
             native_goal: None,
             task_start: None,
@@ -885,6 +939,7 @@ mod test {
             task_controller: None,
             workspace_root: Some(workspace),
             task_permit: None,
+            task_authority_progress: None,
             task_generation: None,
             permission_snapshot: None,
             permission_required: false,
@@ -934,6 +989,7 @@ mod test {
         assert!(
             runtime
                 .invoke(ControlToolInvocation {
+                    call_id: None,
                     task_permit: None,
                     name: "plan_submit".into(),
                     arguments: json!({"plan_id":"plan","expected_version":1})
@@ -942,6 +998,7 @@ mod test {
                 .is_err()
         );
         let change = |version, patch: &str| ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "plan_file_edit".into(),
             arguments: json!({"plan_id":"plan","expected_version":version,"patch":patch}),
@@ -959,6 +1016,7 @@ mod test {
         assert_eq!(runtime.plan_document().unwrap().version, 1);
         let inventory = runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_overview_read".into(),
                 arguments: json!({"plan_id":"plan"}),
@@ -968,6 +1026,7 @@ mod test {
         assert!(!inventory.message.contains("plan.json"));
         runtime.invoke(change(1, patch)).await.unwrap();
         let overview_edit = |version| ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "plan_overview_edit".into(),
             arguments: json!({"plan_id":"plan","expected_version":version,"design":"Introduce an owner for private state."}),
@@ -975,6 +1034,7 @@ mod test {
         runtime.invoke(overview_edit(2)).await.unwrap();
         let metadata = runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_overview_read".into(),
                 arguments: json!({"plan_id":"plan"}),
@@ -987,6 +1047,7 @@ mod test {
         runtime.invoke(change(3,"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub struct Owner;\n+pub struct Owner { private: u64 }\n*** End Patch")).await.unwrap();
         let read = runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_file_read".into(),
                 arguments: json!({"plan_id":"plan","path":"src/lib.rs"}),
@@ -997,6 +1058,7 @@ mod test {
         let draft = runtime.plan_document().unwrap().clone();
         let error = runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_submit".into(),
                 arguments: json!({"plan_id":"plan","expected_version":4}),
@@ -1019,6 +1081,7 @@ mod test {
         runtime.invoke(change(4, &repair_patch)).await.unwrap();
         runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_submit".into(),
                 arguments: json!({"plan_id":"plan","expected_version":5}),
@@ -1028,6 +1091,7 @@ mod test {
         assert!(!runtime.terminal);
         runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_overview_read".into(),
                 arguments: json!({"plan_id":"plan"}),
@@ -1062,6 +1126,7 @@ mod test {
         let mut runtime = ControlToolRuntime::new(context);
         let mut output = ProviderCompletion::default();
         let submit = |version| ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "plan_submit".into(),
             arguments: json!({"plan_id":"plan","expected_version":version}),
@@ -1072,6 +1137,7 @@ mod test {
         }
         let read = runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_file_read".into(),
                 arguments: json!({"plan_id":"plan","path":"api.rs"}),
@@ -1079,7 +1145,7 @@ mod test {
             .await
             .unwrap();
         assert!(read.message.contains("return 0"));
-        let accepted = runtime.invoke(ControlToolInvocation { task_permit: None,
+        let accepted = runtime.invoke(ControlToolInvocation { call_id: None, task_permit: None,
             name: "plan_file_edit".into(), arguments: json!({"plan_id":"plan","expected_version":1,
                 "patch":"*** Begin Patch\n*** Update File: api.rs\n@@\n-  return 0\n+  return 1\n*** End Patch"}),
         }).await.unwrap();
@@ -1138,6 +1204,7 @@ mod test {
         context.plan_document.as_mut().unwrap().design = Some(design);
         let mut runtime = ControlToolRuntime::new(context);
         let read = |arguments| ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "plan_file_read".into(),
             arguments,
@@ -1160,7 +1227,7 @@ mod test {
         ] {
             assert!(runtime.invoke(read(arguments)).await.is_err());
         }
-        let result = runtime.invoke(ControlToolInvocation { task_permit: None, name:"plan_file_edit".into(), arguments:json!({"plan_id":"plan", "expected_version":1, "patch":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn collectible_count() -> u32;\n+pub fn get_collectable_count() -> u32;\n+Algorithm\n+  return count(targets)\n*** End Patch"}) }).await.unwrap();
+        let result = runtime.invoke(ControlToolInvocation { call_id: None, task_permit: None, name:"plan_file_edit".into(), arguments:json!({"plan_id":"plan", "expected_version":1, "patch":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn collectible_count() -> u32;\n+pub fn get_collectable_count() -> u32;\n+Algorithm\n+  return count(targets)\n*** End Patch"}) }).await.unwrap();
         assert!(
             result.message.contains("version is 2")
                 && result.message.contains(
@@ -1174,6 +1241,7 @@ mod test {
         );
         let submitted = runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_submit".into(),
                 arguments: json!({"plan_id":"plan", "expected_version":2}),
@@ -1221,6 +1289,7 @@ mod test {
         let mut runtime = ControlToolRuntime::new(context);
         let result = runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_submit".into(),
                 arguments: json!({"plan_id":"plan","expected_version":1}),
@@ -1262,7 +1331,7 @@ mod test {
             .map(|line| format!("+{line}\n"))
             .collect::<String>();
         let mut runtime = ControlToolRuntime::new(context);
-        let confirmed = runtime.invoke(ControlToolInvocation { task_permit: None, name:"plan_file_edit".into(), arguments:json!({"plan_id":"plan","expected_version":1,"patch":format!("*** Begin Patch\n*** Add File: src/response.rs\n{added}*** End Patch")}) }).await.unwrap();
+        let confirmed = runtime.invoke(ControlToolInvocation { call_id: None, task_permit: None, name:"plan_file_edit".into(), arguments:json!({"plan_id":"plan","expected_version":1,"patch":format!("*** Begin Patch\n*** Add File: src/response.rs\n{added}*** End Patch")}) }).await.unwrap();
         assert!(!confirmed.message.contains("Applied diff truncated"));
         assert!(confirmed.message.len() > 17 * 1024);
         assert!(confirmed.message.contains("response_499"));
@@ -1300,6 +1369,7 @@ mod test {
         context.plan_document.as_mut().unwrap().design = Some(design);
         let mut runtime = ControlToolRuntime::new(context);
         let submit = |version| ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "plan_submit".into(),
             arguments: serde_json::json!({"plan_id":"plan","expected_version":version}),
@@ -1316,7 +1386,7 @@ mod test {
                 .unwrap()
                 .starts_with("api.ts:")
         );
-        runtime.invoke(ControlToolInvocation { task_permit: None, name:"plan_file_edit".into(),arguments:serde_json::json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: api.ts\n@@\n-import { Missing } from './model';\n-export interface Api { item: Missing; }\n+import { Item } from './model';\n+export interface Api { item: Item; }\n*** End Patch"}) }).await.unwrap();
+        runtime.invoke(ControlToolInvocation { call_id: None, task_permit: None, name:"plan_file_edit".into(),arguments:serde_json::json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: api.ts\n@@\n-import { Missing } from './model';\n-export interface Api { item: Missing; }\n+import { Item } from './model';\n+export interface Api { item: Item; }\n*** End Patch"}) }).await.unwrap();
         runtime.invoke(submit(2)).await.unwrap();
         assert!(
             runtime
@@ -1363,6 +1433,7 @@ mod test {
 
         let result = runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_submit".into(),
                 arguments: json!({ "plan_id": "plan", "expected_version": 1 }),
@@ -1410,6 +1481,7 @@ mod test {
 
         let result = runtime
             .invoke(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "plan_submit".into(),
                 arguments: json!({ "plan_id": "plan", "expected_version": 1 }),
@@ -1431,48 +1503,39 @@ mod test {
     }
 
     #[tokio::test]
-    async fn consumes_a_repeated_question_by_content_digest() {
-        let question = crate::plan::PlanQuestion {
-            id: "first_id".into(),
-            header: "Scope".into(),
-            question: "Which scope?".into(),
-            options: vec![
-                crate::plan::PlanQuestionOption {
-                    recommended: false,
-                    label: "Narrow".into(),
-                    description: "Keep it narrow.".into(),
-                },
-                crate::plan::PlanQuestionOption {
-                    recommended: false,
-                    label: "Broad".into(),
-                    description: "Expand it.".into(),
-                },
-            ],
-            allow_freeform: false,
-        };
-        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
-        context
-            .resolved_question_digest_set
-            .insert(question.content_digest());
-        let mut runtime = ControlToolRuntime::new(context);
-        let result = runtime
-            .invoke(ControlToolInvocation {
+    async fn question_mutations_without_owner_reject_without_deferred_effects() {
+        for (name, arguments) in [
+            (
+                "question_ask",
+                json!({"questions":[{
+                    "header":"Scope", "question":"Which scope?", "allow_freeform":false,
+                    "options":[{"label":"Narrow","description":"Keep it narrow."},
+                        {"label":"Broad","description":"Expand it."}]
+                }]}),
+            ),
+            (
+                "question_withdraw",
+                json!({"question_id":"question", "revision":1, "reason":"Resolved"}),
+            ),
+        ] {
+            let mut runtime =
+                ControlToolRuntime::new(ControlTurnContext::inactive(PromptMode::Chat));
+            let invocation = ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
-                name: "question_ask".into(),
-                arguments: json!({
-                    "questions": [{
-                    "header": "Scope", "question": "Which scope?",
-                    "allow_freeform": false,
-                    "options": [
-                        { "label": "Narrow", "description": "Keep it narrow." },
-                        { "label": "Broad", "description": "Expand it." }
-                    ]
-                    }]
-                }),
-            })
-            .await
-            .unwrap();
-        assert!(result.invocation.is_none());
-        assert!(result.message.contains("already consumed"));
+                name: name.into(),
+                arguments,
+            };
+            let mut output = ProviderCompletion::default();
+            apply_invocation(&invocation, &mut output).unwrap();
+            assert!(output.plan_question.is_none());
+            assert!(output.question_withdrawal.is_none());
+            let result = runtime.invoke(invocation).await;
+            assert!(
+                matches!(result, Err(crate::tools::ToolError::MissingState(_))),
+                "{name} must not claim success without a question owner"
+            );
+            assert!(!runtime.terminal);
+        }
     }
 }

@@ -53,4 +53,5 @@ pub(super) async fn execute(
         invocation,
         crate::question::QuestionAction::Revise { draft },
     )
+    .await
 }

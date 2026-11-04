@@ -84,6 +84,7 @@ fn catalog_request(workspace: &Path, session_id: &str) -> ProviderCatalogRequest
 
 fn prompt_request(request: &ProviderCatalogRequest) -> ProviderRequest {
     ProviderRequest {
+        dispatch: forge_provider_api::submission::DispatchTracker::default(),
         execution_owner: request.execution_owner.clone(),
         harness_session_id: request.harness_session_id.clone(),
         workspace: request.workspace.clone(),

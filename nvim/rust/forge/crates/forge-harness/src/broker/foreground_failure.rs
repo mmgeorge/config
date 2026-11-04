@@ -149,12 +149,19 @@ pub(crate) struct AdmissionCleanupJob {
     registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
     owner: crate::provider::ExecutionOwner,
     baseline: AdmissionBaseline,
+    native: AdmissionNativeCollection,
 }
 
 /// Carry native collection and the staged baseline's exact disposition to its host owner.
 pub(crate) struct AdmissionCleanupResult {
     engine: Result<(), ProviderError>,
     baseline: AdmissionBaselineResult,
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionNativeCollection {
+    Required,
+    OwnerCollected,
 }
 
 enum AdmissionBaseline {
@@ -188,7 +195,13 @@ impl AdmissionCleanupJob {
                 }
             }
         };
-        let (engine, baseline) = tokio::join!(self.registry.fence(&self.owner), baseline);
+        let native = async {
+            match self.native {
+                AdmissionNativeCollection::Required => self.registry.fence(&self.owner).await,
+                AdmissionNativeCollection::OwnerCollected => Ok(()),
+            }
+        };
+        let (engine, baseline) = tokio::join!(native, baseline);
         AdmissionCleanupResult { engine, baseline }
     }
 }
@@ -373,6 +386,7 @@ impl HarnessBroker {
         transaction: &mut ForegroundTransaction,
         error: anyhow::Error,
     ) -> Result<ForegroundAction> {
+        transaction.fail_live_host_observer(&self.trace, &self.session.id);
         if transaction.failure_cleanup_active {
             let message = format!("additional foreground failure: {error:#}");
             if let Some(failure) = &mut transaction.failure {
@@ -434,9 +448,23 @@ impl HarnessBroker {
         dispatch: &mut ForegroundDispatch,
         error: anyhow::Error,
     ) -> Result<ForegroundAction> {
+        dispatch.fail_live_host_observer(&self.trace, &self.session.id);
         match dispatch {
             ForegroundDispatch::Admitting(admission) => {
+                let error = if (admission.owner_collection_pending()
+                    || admission.owner_collection_complete())
+                    && error
+                        .downcast_ref::<ProviderError>()
+                        .is_some_and(ProviderError::is_clean_cancellation)
+                {
+                    TurnCancelled.into()
+                } else {
+                    error
+                };
                 if let Some(failure) = &mut admission.failure {
+                    if failure.original.is::<TurnCancelled>() && error.is::<TurnCancelled>() {
+                        return Ok(ForegroundAction::Wait);
+                    }
                     failure
                         .secondary
                         .push(format!("additional admission failure: {error:#}"));
@@ -487,6 +515,14 @@ impl HarnessBroker {
         &mut self,
         admission: &mut ForegroundAdmission,
     ) -> Result<ForegroundAction> {
+        if admission.owner_collection_pending() {
+            return Ok(ForegroundAction::Wait);
+        }
+        let native = if admission.owner_collection_complete() {
+            AdmissionNativeCollection::OwnerCollected
+        } else {
+            AdmissionNativeCollection::Required
+        };
         let failure = admission
             .failure
             .as_mut()
@@ -554,6 +590,7 @@ impl HarnessBroker {
                 registry,
                 owner: crate::provider::ExecutionOwner::root(&self.session.id),
                 baseline,
+                native,
             },
         )))
     }
@@ -1353,7 +1390,10 @@ impl HarnessBroker {
                     .failure
                     .as_ref()
                     .context("failure state missing")?;
-                if failure.original.downcast_ref::<TurnRetracted>().is_some() {
+                if failure.original.downcast_ref::<TurnRetracted>().is_some()
+                    || (failure.original.is::<TurnCancelled>()
+                        && admission.owner_collection_restarts())
+                {
                     effects
                 } else {
                     let diagnostic = crate::provider::ProviderDiagnostic {
@@ -1643,6 +1683,38 @@ impl HarnessBroker {
         if admission.automatic_check_owner.is_none() {
             self.event_sink = None;
         }
+        self.trace.record(
+            &self.session.id,
+            "exchange.foreground.failure_settled",
+            json!({
+                "reason": format!("{:#}", failure.original),
+                "cleanup": failure.cleanup.as_ref().map(ToString::to_string),
+                "secondary": failure.secondary,
+                "owner_collected": admission.owner_collection_complete(),
+            }),
+        );
+        // Positive owner collection makes admission cancellation a settled result.
+        // Sending it through fatal recovery would fence an already-quiescent session.
+        if admission.owner_collection_complete()
+            && failure.original.is::<TurnCancelled>()
+            && failure.cleanup.is_none()
+            && failure.secondary.is_empty()
+        {
+            let result = DispatchResult {
+                response: Response::failure(
+                    admission.request.id,
+                    if admission.owner_collection_restarts() {
+                        "turn_reconfigured"
+                    } else {
+                        "turn_cancelled"
+                    },
+                    failure.original.to_string(),
+                ),
+                event: std::mem::take(&mut admission.events),
+            };
+            *dispatch = ForegroundDispatch::Done(result);
+            return Ok(ForegroundAction::Finish);
+        }
         let error = if failure.cleanup.is_some() || !failure.secondary.is_empty() {
             let original_message = format!("{:#}", failure.original);
             failure.original.context(ForegroundFailureContext {
@@ -1908,6 +1980,133 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("goal restore unavailable"))
         );
+        Ok(())
+    }
+
+    /// Collection during provider preparation waits for the owner and never starts a second native fence.
+    #[tokio::test]
+    async fn staged_admission_collection_retains_owner_until_positive_completion() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.checkpoint = None;
+        let (sink, _stream) = publication::channel();
+        let mut dispatch = broker.begin_foreground_dispatch(
+            Request {
+                id: 3,
+                method: "session.prompt.submit".into(),
+                params: json!({"text":"staged"}),
+            },
+            sink,
+        )?;
+        let staged = broker.stage_foreground_interaction(
+            "staged",
+            PromptMode::Chat,
+            Some(&ExchangeAdmission::chat("staged".into())),
+            ProviderInput::from_text("staged"),
+        )?;
+        let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
+            unreachable!()
+        };
+        admission.staged_interaction = Some(staged);
+        broker.activate_staged_runtime(admission)?;
+        assert!(matches!(
+            broker.step_foreground(
+                &mut dispatch,
+                ForegroundSignal::CollectionStarted(ForegroundCollection::Restart)
+            )?,
+            ForegroundAction::Wait
+        ));
+        assert!(matches!(
+            broker.step_foreground(
+                &mut dispatch,
+                ForegroundSignal::EffectFailed(TurnCancelled.into()),
+            )?,
+            ForegroundAction::WaitForPublicationDrain
+        ));
+        assert!(matches!(
+            broker.step_foreground(
+                &mut dispatch,
+                ForegroundSignal::EffectFailed(
+                    ProviderError::PreparationFailed(Box::new(ProviderError::Cancelled)).into(),
+                ),
+            )?,
+            ForegroundAction::Wait
+        ));
+        let ForegroundDispatch::Admitting(admission) = &dispatch else {
+            unreachable!()
+        };
+        assert!(admission.failure.as_ref().unwrap().secondary.is_empty());
+        assert!(matches!(
+            broker.finish_foreground_failure(&mut dispatch)?,
+            ForegroundAction::Wait
+        ));
+        assert!(matches!(
+            broker.step_foreground(
+                &mut dispatch,
+                ForegroundSignal::CollectionCompleted(ForegroundCollection::Restart)
+            )?,
+            ForegroundAction::WaitForPublicationDrain
+        ));
+        let ForegroundAction::Effect(ForegroundJob::AdmissionCleanup(job)) =
+            broker.finish_foreground_failure(&mut dispatch)?
+        else {
+            anyhow::bail!("positive owner collection must release retained baseline cleanup")
+        };
+        assert!(matches!(
+            job.native,
+            AdmissionNativeCollection::OwnerCollected
+        ));
+        let result = job.run().await;
+        assert!(result.engine.is_ok());
+        let ForegroundDispatch::Admitting(admission) = &dispatch else {
+            unreachable!()
+        };
+        assert!(
+            admission
+                .failure
+                .as_ref()
+                .unwrap()
+                .original
+                .to_string()
+                .contains("cancelled")
+        );
+        Ok(())
+    }
+
+    /// A clean collected admission cancellation releases the owner without fatal recovery.
+    #[test]
+    fn collected_admission_cancellation_finishes_without_fencing() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let (sink, _stream) = publication::channel();
+        let mut dispatch = broker.begin_foreground_dispatch(
+            Request {
+                id: 3,
+                method: "session.prompt.submit".into(),
+                params: json!({"text":"staged"}),
+            },
+            sink,
+        )?;
+        broker.fail_foreground_dispatch(&mut dispatch, TurnCancelled.into())?;
+        let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
+            unreachable!()
+        };
+        admission.complete_owner_collection(ForegroundCollection::Restart)?;
+        admission
+            .failure
+            .as_mut()
+            .unwrap()
+            .admission_cleanup_waiting = false;
+        assert!(matches!(
+            broker.finish_foreground_failure(&mut dispatch)?,
+            ForegroundAction::Finish
+        ));
+        let result = broker.finish_foreground(dispatch)?;
+        assert_eq!(result.response.error().unwrap().code, "turn_reconfigured");
         Ok(())
     }
 

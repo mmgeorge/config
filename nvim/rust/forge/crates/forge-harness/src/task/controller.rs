@@ -10,6 +10,13 @@ use crate::{
 
 use super::{Task, TaskKind, TaskPermit, TaskRevision, TaskStatus, WorkflowSnapshot};
 
+/// Durable command identity and task authority captured for one owner commit.
+pub(crate) struct OwnerTaskCommit<'command> {
+    pub id: &'command crate::exchange::command::CommandId,
+    pub permit: Option<&'command TaskPermit>,
+    pub now_ms: i64,
+}
+
 pub(crate) enum TaskChange {
     Install(Box<Task>),
     Update(Box<Task>),
@@ -143,7 +150,7 @@ impl SessionTaskController {
                         && artifact.model_revision >= plan.artifact.model_revision,
                     "planning observation cannot roll back the canonical artifact"
                 );
-                plan.artifact = artifact;
+                plan.artifact = *artifact;
             }
             super::TaskEvent::PlanGenerationFailed => {
                 let WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
@@ -172,7 +179,7 @@ impl SessionTaskController {
                     "execution observations cannot resume suspended work"
                 );
                 validate_execution_update(&execution.record, &record)?;
-                execution.record = record;
+                execution.record = *record;
             }
             super::TaskEvent::ExecutionBaselineCaptured(checkpoint) => {
                 let WorkflowSnapshot::Execute { execution } = &mut task.workflow else {
@@ -318,6 +325,30 @@ impl SessionTaskController {
     ) -> Result<Output> {
         self.admission
             .with_task_mutation(|| restore(self.current()?))
+    }
+
+    /// Clear task authority and replace rollback history in one durable transaction.
+    pub(crate) fn clear_for_rollback(
+        &self,
+        store: &mut SqliteStore,
+        expected: Option<&TaskRevision>,
+        replacement: &crate::session::HarnessSession,
+        roots: &[String],
+        now_ms: i64,
+    ) -> Result<()> {
+        ensure!(
+            replacement.id == self.session_id,
+            "rollback belongs to another session"
+        );
+        let rollback = store.prepare_rollback(replacement, roots)?;
+        store
+            .commit_task_effects(&self.session_id, expected, now_ms, None, |active| {
+                let mut effects = clear_effect(&self.session_id, active.as_ref(), None, now_ms);
+                effects.rollback = Some(Box::new(rollback));
+                *active = None;
+                Ok(((), effects))
+            })?
+            .context("rollback task commit unexpectedly reused a command")
     }
 
     /// Applies a task-specific mutation atomically against its admitted contract.
@@ -516,6 +547,8 @@ impl SessionTaskController {
             .context("task completion unexpectedly reused a command")
     }
 
+    /// Exercise strict unscoped admission independently of dispatched callback authority.
+    #[cfg(test)]
     pub(crate) fn admit(&self, kind: TaskKind) -> Result<TaskPermit> {
         let task = self.current()?.context("session has no active task")?;
         ensure!(
@@ -533,6 +566,73 @@ impl SessionTaskController {
         Ok(task.permit())
     }
 
+    /// Admit a callback from the task permit already captured for its dispatched invocation.
+    /// Native receipt acceptance remains a separate fact committed by the exchange owner.
+    pub(crate) fn admit_dispatched(
+        &self,
+        kind: TaskKind,
+        permit: &TaskPermit,
+    ) -> Result<TaskPermit> {
+        let task = self.current()?.context("session has no active task")?;
+        permit.validate(Some(&task))?;
+        ensure!(
+            task.kind() == kind,
+            "operation does not belong to the dispatched task"
+        );
+        ensure!(
+            matches!(task.status(), TaskStatus::Running | TaskStatus::Waiting),
+            "dispatched task does not currently admit control operations"
+        );
+        Ok(permit.clone())
+    }
+
+    /// Validate goal controls from an authenticated invocation without fabricating input acceptance.
+    pub(crate) fn admit_dispatched_goal(
+        &self,
+        permit: &TaskPermit,
+        completing: bool,
+    ) -> Result<TaskPermit> {
+        let task = self.current()?.context("session has no active task")?;
+        permit.validate(Some(&task))?;
+        ensure!(
+            task.status() == TaskStatus::Running
+                && task.next_action() == super::TaskNextAction::Model
+                && matches!(task.kind(), TaskKind::Goal | TaskKind::Execute),
+            "goal control requires the dispatched active goal"
+        );
+        ensure!(
+            !completing || task.kind() == TaskKind::Goal,
+            "plan execution completes only through plan_phase_done in Verify"
+        );
+        Ok(permit.clone())
+    }
+
+    /// Commit explicit blockage under dispatched authority without marking native work complete.
+    pub(crate) fn block_dispatched_goal(
+        &self,
+        store: &mut SqliteStore,
+        permit: &TaskPermit,
+        reason: String,
+        now_ms: i64,
+    ) -> Result<()> {
+        self.admit_dispatched_goal(permit, false)?;
+        self.update_with_effects(store, permit, now_ms, |task| {
+            match &mut task.workflow {
+                WorkflowSnapshot::Goal { goal } => {
+                    goal.state = GoalState::Blocked;
+                    goal.reported_status = Some(reason);
+                }
+                WorkflowSnapshot::Execute { execution } => {
+                    execution.record.state = PlanExecutionState::Blocked;
+                    execution.record.findings.push(reason);
+                }
+                WorkflowSnapshot::Plan { .. } => return Err(super::StaleTask.into()),
+            }
+            Ok(((), crate::storage::TaskEffects::default()))
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn admit_goal_control(&self, completing: bool) -> Result<TaskPermit> {
         let task = self.current()?.context("session has no active task")?;
         ensure!(
@@ -577,6 +677,53 @@ impl SessionTaskController {
         match result {
             Err(error) if error.is::<super::StaleTask>() => Ok(false),
             result => result,
+        }
+    }
+
+    /// Apply a real native receipt after the same invocation's logical effects advance task state.
+    pub(crate) fn acknowledge_dispatched_input(
+        &self,
+        store: &mut SqliteStore,
+        receipt: &super::TaskReceiptPermit,
+        id: &super::TaskInputId,
+        kind: super::TaskReceiptInput,
+        now_ms: i64,
+    ) -> Result<bool> {
+        let Some(current) = self.current()? else {
+            return Ok(false);
+        };
+        let permit = match receipt.permit_for(&current) {
+            Ok(permit) => permit,
+            Err(error) if error.is::<super::StaleTask>() => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let result = store.commit_task_observation(&self.session_id, &permit, now_ms, |active| {
+            let task = active.as_mut().context("dispatched task disappeared")?;
+            let acknowledged = task.edit(|task| {
+                let input = match kind {
+                    super::TaskReceiptInput::Continuation => task
+                        .turn
+                        .as_mut()
+                        .and_then(|turn| turn.continuation.as_mut())
+                        .map(|input| (&input.id, &mut input.delivery)),
+                    super::TaskReceiptInput::Entry => task
+                        .entry
+                        .as_mut()
+                        .map(|entry| (&entry.id, &mut entry.delivery)),
+                };
+                let Some((_, delivery)) = input.filter(|(identity, _)| *identity == id) else {
+                    return Ok(false);
+                };
+                *delivery = super::TaskInputDelivery::Accepted;
+                task.updated_at_ms = now_ms;
+                Ok(true)
+            })?;
+            Ok((acknowledged, crate::storage::TaskEffects::default()))
+        });
+        match result {
+            Ok(result) => Ok(result.unwrap_or(false)),
+            Err(error) if error.is::<super::StaleTask>() => Ok(false),
+            Err(error) => Err(error),
         }
     }
 
@@ -814,6 +961,53 @@ impl SessionTaskController {
         }
     }
 
+    /// Cancel only the observed pending continuation under its original task and input guards.
+    pub(crate) fn cancel_pending_continuation(
+        &self,
+        store: &mut SqliteStore,
+        permit: &TaskPermit,
+        input: &super::TaskInputId,
+        now_ms: i64,
+    ) -> std::result::Result<bool, crate::exchange::command::TaskCommandFailure> {
+        use crate::exchange::command::TaskCommandFailure;
+        store
+            .commit_task_change(
+                &self.session_id,
+                Some(permit.revision()),
+                now_ms,
+                |active| {
+                    permit.validate(active.as_ref())?;
+                    let task = active.as_mut().ok_or(TaskCommandFailure::MissingTask)?;
+                    task.edit(|draft| {
+                        let Some(continuation) = draft
+                            .turn
+                            .as_mut()
+                            .and_then(|turn| turn.continuation.as_mut())
+                        else {
+                            return Ok(false);
+                        };
+                        if &continuation.id != input
+                            || continuation.delivery != super::TaskInputDelivery::Pending
+                        {
+                            return Ok(false);
+                        }
+                        continuation.delivery = super::TaskInputDelivery::Cancelled;
+                        draft.updated_at_ms = now_ms;
+                        Ok(true)
+                    })
+                },
+            )
+            .map_err(|error| {
+                if error.is::<super::StaleTask>() {
+                    TaskCommandFailure::Changed
+                } else {
+                    error
+                        .downcast::<TaskCommandFailure>()
+                        .unwrap_or(TaskCommandFailure::StateUnavailable)
+                }
+            })
+    }
+
     /// Invalidates an unacknowledged continuation while preserving the completed-turn watermark.
     pub(crate) fn cancel_continuation(&self, store: &mut SqliteStore, now_ms: i64) -> Result<()> {
         let Some(current) = self.current()? else {
@@ -881,6 +1075,763 @@ impl SessionTaskController {
             )
             .unwrap();
         (root, store, controller)
+    }
+
+    /// Commit owner task control and its durable result/checkpoint under the same task fence.
+    pub(crate) fn apply_owner_command(
+        &self,
+        store: &mut SqliteStore,
+        id: &crate::exchange::command::CommandId,
+        command: &crate::exchange::command::TaskCommand,
+        permit: &TaskPermit,
+        now_ms: i64,
+    ) -> std::result::Result<
+        crate::exchange::command::TaskCommandOutcome,
+        crate::exchange::command::TaskCommandFailure,
+    > {
+        use crate::exchange::command::{
+            TaskCommand, TaskCommandFailure, TaskCommandOutcome, TaskSelection,
+        };
+        let committed = store.commit_task_observation(&self.session_id, permit, now_ms, |active| {
+            let current = active.as_ref().ok_or(TaskCommandFailure::MissingTask)?;
+            let previous = current.clone();
+            let change = match command {
+                TaskCommand::EditPlan(_)
+                | TaskCommand::Resume(_)
+                | TaskCommand::RequestPlanChanges(_)
+                | TaskCommand::CancelPlan(_)
+                | TaskCommand::ExecutePlan(_)
+                | TaskCommand::StartGoal(_)
+                | TaskCommand::StartPlan(_)
+                | TaskCommand::AttachPlan(_)
+                | TaskCommand::ForkPlan(_)
+                | TaskCommand::Replan(_) => {
+                    unreachable!("task creation commits its prepared replacement")
+                }
+                TaskCommand::Pause(_) if current.status().terminal() => TaskChange::Preserve,
+                TaskCommand::Pause(_) => TaskChange::Pause,
+                TaskCommand::Clear(_) => TaskChange::Clear,
+                TaskCommand::SetAutoAccept(policy) => {
+                    policy.target.validate(Some(current))?;
+                    if !matches!(current.kind(), TaskKind::Plan | TaskKind::Execute) {
+                        return Err(TaskCommandFailure::InvalidPolicyTask.into());
+                    }
+                    TaskChange::SetPlanAcceptance(policy.enabled)
+                }
+            };
+            Self::apply_change(active, change, now_ms)?;
+            let outcome = match command {
+                TaskCommand::EditPlan(_)
+                | TaskCommand::Resume(_)
+                | TaskCommand::RequestPlanChanges(_)
+                | TaskCommand::CancelPlan(_)
+                | TaskCommand::ExecutePlan(_)
+                | TaskCommand::StartGoal(_)
+                | TaskCommand::StartPlan(_)
+                | TaskCommand::AttachPlan(_)
+                | TaskCommand::ForkPlan(_)
+                | TaskCommand::Replan(_) => {
+                    unreachable!("task creation commits its prepared replacement")
+                }
+                TaskCommand::Pause(_) => {
+                    let task = active.as_ref().ok_or(TaskCommandFailure::MissingTask)?;
+                    if previous.status().terminal() {
+                        TaskCommandOutcome::Unchanged {
+                            task: TaskSelection::capture(task),
+                        }
+                    } else {
+                        TaskCommandOutcome::Paused {
+                            task: TaskSelection::capture(task),
+                        }
+                    }
+                }
+                TaskCommand::Clear(target) => TaskCommandOutcome::Cleared {
+                    task: target.id().clone(),
+                },
+                TaskCommand::SetAutoAccept(policy) => TaskCommandOutcome::AutoAcceptChanged {
+                    task: TaskSelection::capture(
+                        active.as_ref().ok_or(TaskCommandFailure::MissingTask)?,
+                    ),
+                    enabled: policy.enabled,
+                },
+            };
+            let mut effects =
+                clear_effect(&self.session_id, Some(&previous), active.as_ref(), now_ms);
+            effects.retire_questions = matches!(command, TaskCommand::Clear(_));
+            effects.owner_task_commit = Some(match command {
+                TaskCommand::EditPlan(_)
+                | TaskCommand::Resume(_)
+                | TaskCommand::RequestPlanChanges(_)
+                | TaskCommand::CancelPlan(_)
+                | TaskCommand::ExecutePlan(_)
+                | TaskCommand::StartGoal(_)
+                | TaskCommand::StartPlan(_)
+                | TaskCommand::AttachPlan(_)
+                | TaskCommand::ForkPlan(_)
+                | TaskCommand::Replan(_) => {
+                    unreachable!("task creation commits its prepared replacement")
+                }
+                TaskCommand::SetAutoAccept(_) => {
+                    crate::exchange::journal::TaskCommandCommit::Complete {
+                        command: id.clone(),
+                        outcome: outcome.clone(),
+                    }
+                }
+                TaskCommand::Pause(_) | TaskCommand::Clear(_) => {
+                    crate::exchange::journal::TaskCommandCommit::AwaitGoal {
+                        command: id.clone(),
+                        outcome: outcome.clone(),
+                    }
+                }
+            });
+            Ok((outcome, effects))
+        });
+        committed
+            .map_err(|error| {
+                if error.is::<super::StaleTask>() {
+                    return TaskCommandFailure::Changed;
+                }
+                error
+                    .downcast::<TaskCommandFailure>()
+                    .unwrap_or(TaskCommandFailure::StateUnavailable)
+            })?
+            .ok_or(TaskCommandFailure::StateUnavailable)
+    }
+
+    /// Confirm current plan ownership without changing the task, its questions, or existing native work.
+    pub(crate) fn confirm_owner_attachment(
+        &self,
+        store: &mut SqliteStore,
+        id: &crate::exchange::command::CommandId,
+        permit: &TaskPermit,
+        source: &crate::exchange::command::PlanSelection,
+        now_ms: i64,
+    ) -> std::result::Result<
+        crate::exchange::command::TaskCommandOutcome,
+        crate::exchange::command::TaskCommandFailure,
+    > {
+        use crate::exchange::command::{
+            PlanSourceGuard, TaskCommandFailure, TaskCommandOutcome, TaskSelection,
+        };
+        source.validate_attachment()?;
+        store
+            .commit_task_observation(&self.session_id, permit, now_ms, |active| {
+                let task = active.as_ref().ok_or(TaskCommandFailure::MissingTask)?;
+                let WorkflowSnapshot::Plan { plan } = &task.workflow else {
+                    return Err(TaskCommandFailure::Changed.into());
+                };
+                source.validate(&plan.artifact)?;
+                let selected = TaskSelection::capture(task);
+                let outcome = TaskCommandOutcome::Attached {
+                    task: selected.clone(),
+                    plan: source.id().clone(),
+                };
+                let effects = crate::storage::TaskEffects {
+                    source_plan: vec![PlanSourceGuard::Working(source.clone())],
+                    owner_task_commit: Some(
+                        crate::exchange::journal::TaskCommandCommit::Attachment {
+                            command: id.clone(),
+                            task: selected,
+                            source: source.clone(),
+                            completion:
+                                crate::exchange::journal::TaskAttachmentCompletion::Complete,
+                        },
+                    ),
+                    ..Default::default()
+                };
+                Ok((outcome, effects))
+            })
+            .map_err(|error| {
+                if error.is::<super::StaleTask>() {
+                    TaskCommandFailure::Changed
+                } else if matches!(
+                    error.downcast_ref::<crate::exchange::journal::CommandJournalError>(),
+                    Some(crate::exchange::journal::CommandJournalError::IdentityConflict)
+                ) {
+                    TaskCommandFailure::IdentityConflict
+                } else {
+                    error
+                        .downcast::<TaskCommandFailure>()
+                        .unwrap_or(TaskCommandFailure::StateUnavailable)
+                }
+            })?
+            .ok_or(TaskCommandFailure::StateUnavailable)
+    }
+
+    /// Install a prepared task and checkpoint its initial input or waiting-plan ownership atomically.
+    pub(crate) fn apply_owner_creation(
+        &self,
+        store: &mut SqliteStore,
+        id: &crate::exchange::command::CommandId,
+        permit: Option<&TaskPermit>,
+        prepared: super::TaskInstallation,
+        now_ms: i64,
+    ) -> std::result::Result<
+        crate::exchange::command::TaskCommandCheckpoint,
+        crate::exchange::command::TaskCommandFailure,
+    > {
+        use crate::exchange::command::{TaskCommandCheckpoint, TaskCommandFailure, TaskSelection};
+        let (task, work, mut effects) = prepared.into_parts();
+        let commit = |active: &mut Option<Task>| -> anyhow::Result<_> {
+            if let Some(permit) = permit {
+                permit.validate_observation(active.as_ref())?;
+            } else if active.is_some() {
+                return Err(TaskCommandFailure::Changed.into());
+            }
+            let previous = active.clone();
+            Self::apply_change(active, TaskChange::Install(Box::new(task)), now_ms)?;
+            let task = active
+                .as_ref()
+                .ok_or(TaskCommandFailure::StateUnavailable)?;
+            let selected = TaskSelection::capture(task);
+            let kind = task.kind();
+            let source = match effects.source_plan.as_slice() {
+                [] => None,
+                [source] => Some(source.clone()),
+                _ => return Err(TaskCommandFailure::IdentityConflict.into()),
+            };
+            let terminal =
+                clear_effect(&self.session_id, previous.as_ref(), active.as_ref(), now_ms);
+            effects.event.extend(terminal.event);
+            effects.plan.extend(terminal.plan);
+            effects.execution.extend(terminal.execution);
+            effects.retire_questions = true;
+            let checkpoint = match work {
+                super::TaskInstallationWork::Model(input) => {
+                    effects.owner_task_commit =
+                        Some(crate::exchange::journal::TaskCommandCommit::AwaitInput {
+                            command: id.clone(),
+                            task: selected.clone(),
+                            input: input.clone(),
+                            kind,
+                            source,
+                        });
+                    TaskCommandCheckpoint::InputPending {
+                        task: selected,
+                        input,
+                    }
+                }
+                super::TaskInstallationWork::Waiting(plan) => {
+                    let source = match source {
+                        Some(crate::exchange::command::PlanSourceGuard::Working(source))
+                            if source.id() == &plan =>
+                        {
+                            source
+                        }
+                        Some(
+                            crate::exchange::command::PlanSourceGuard::Working(_)
+                            | crate::exchange::command::PlanSourceGuard::Historical(_),
+                        )
+                        | None => return Err(TaskCommandFailure::IdentityConflict.into()),
+                    };
+                    effects.owner_task_commit =
+                        Some(crate::exchange::journal::TaskCommandCommit::Attachment {
+                            command: id.clone(),
+                            task: selected.clone(),
+                            source,
+                            completion:
+                                crate::exchange::journal::TaskAttachmentCompletion::AwaitGoal,
+                        });
+                    TaskCommandCheckpoint::Control {
+                        outcome: Box::new(crate::exchange::command::TaskCommandOutcome::Attached {
+                            task: selected,
+                            plan,
+                        }),
+                    }
+                }
+            };
+            Ok((checkpoint, effects))
+        };
+        let result = match permit {
+            Some(permit) => store.commit_task_observation(&self.session_id, permit, now_ms, commit),
+            None => store.commit_task_effects(&self.session_id, None, now_ms, None, commit),
+        };
+        result
+            .map_err(|error| {
+                if error.is::<super::StaleTask>() {
+                    TaskCommandFailure::Changed
+                } else if matches!(
+                    error.downcast_ref::<crate::exchange::journal::CommandJournalError>(),
+                    Some(crate::exchange::journal::CommandJournalError::IdentityConflict)
+                ) {
+                    TaskCommandFailure::IdentityConflict
+                } else {
+                    error
+                        .downcast::<TaskCommandFailure>()
+                        .unwrap_or(TaskCommandFailure::StateUnavailable)
+                }
+            })?
+            .ok_or(TaskCommandFailure::StateUnavailable)
+    }
+
+    /// Commit captured execution effects and their finite result or input checkpoint atomically.
+    pub(crate) fn apply_owner_execution(
+        &self,
+        store: &mut SqliteStore,
+        context: OwnerTaskCommit<'_>,
+        selection: &crate::exchange::command::PlanExecutionSelection,
+        prepared: crate::broker::plan_entry::PreparedTaskChange,
+        question_set: Option<crate::exchange::command::PlanQuestionSetSelection>,
+    ) -> std::result::Result<
+        crate::exchange::command::TaskCommandCheckpoint,
+        crate::exchange::command::TaskCommandFailure,
+    > {
+        let OwnerTaskCommit { id, permit, now_ms } = context;
+        use crate::exchange::command::{
+            PlanSourceGuard, TaskCommandCheckpoint, TaskCommandFailure, TaskCommandOutcome,
+            TaskSelection,
+        };
+        let crate::broker::plan_entry::PreparedTaskChange {
+            change,
+            mut effects,
+        } = prepared;
+        effects
+            .source_plan
+            .push(PlanSourceGuard::Working(selection.source().clone()));
+        let commit = |active: &mut Option<Task>| -> anyhow::Result<_> {
+            if let Some(permit) = permit {
+                permit.validate_observation(active.as_ref())?;
+            } else if active.is_some() {
+                return Err(TaskCommandFailure::Changed.into());
+            }
+            let installing = matches!(&change, TaskChange::Install(_));
+            let previous = active.clone();
+            Self::apply_change(active, change, now_ms)?;
+            if installing {
+                let terminal =
+                    clear_effect(&self.session_id, previous.as_ref(), active.as_ref(), now_ms);
+                effects.event.extend(terminal.event);
+                effects.plan.extend(terminal.plan);
+                effects.execution.extend(terminal.execution);
+                effects.retire_questions = true;
+            }
+            let checkpoint = if let Some(question_set) = question_set {
+                let selected = active
+                    .as_ref()
+                    .filter(|task| match &task.workflow {
+                        WorkflowSnapshot::Plan { plan } => {
+                            plan.artifact.id == selection.source().id().as_str()
+                        }
+                        WorkflowSnapshot::Execute { execution } => {
+                            execution.record.plan_id == selection.source().id().as_str()
+                        }
+                        WorkflowSnapshot::Goal { .. } => false,
+                    })
+                    .map(TaskSelection::capture);
+                let outcome = TaskCommandOutcome::AwaitingInput {
+                    task: selected,
+                    source: selection.source().clone(),
+                    question_set,
+                };
+                effects.owner_task_commit =
+                    Some(crate::exchange::journal::TaskCommandCommit::Complete {
+                        command: id.clone(),
+                        outcome: outcome.clone(),
+                    });
+                TaskCommandCheckpoint::Control {
+                    outcome: Box::new(outcome),
+                }
+            } else {
+                let task = active.as_ref().ok_or(TaskCommandFailure::MissingTask)?;
+                let selected = TaskSelection::capture(task);
+                if let Some(entry) = task.entry.as_ref().filter(|entry| {
+                    entry.delivery == super::TaskInputDelivery::Pending
+                        && task.next_action() == super::TaskNextAction::Model
+                }) {
+                    effects.owner_task_commit =
+                        Some(crate::exchange::journal::TaskCommandCommit::AwaitInput {
+                            command: id.clone(),
+                            task: selected.clone(),
+                            input: entry.id.clone(),
+                            kind: task.kind(),
+                            source: Some(PlanSourceGuard::Working(selection.source().clone())),
+                        });
+                    TaskCommandCheckpoint::InputPending {
+                        task: selected,
+                        input: entry.id.clone(),
+                    }
+                } else {
+                    let outcome = TaskCommandOutcome::ExecutionUpdated {
+                        task: selected,
+                        source: selection.source().clone(),
+                    };
+                    effects.owner_task_commit =
+                        Some(crate::exchange::journal::TaskCommandCommit::Complete {
+                            command: id.clone(),
+                            outcome: outcome.clone(),
+                        });
+                    TaskCommandCheckpoint::Control {
+                        outcome: Box::new(outcome),
+                    }
+                }
+            };
+            Ok((checkpoint, effects))
+        };
+        let result = match permit {
+            Some(permit) => store.commit_task_observation(&self.session_id, permit, now_ms, commit),
+            None => store.commit_task_effects(&self.session_id, None, now_ms, None, commit),
+        };
+        result
+            .map_err(|error| {
+                if error.is::<super::StaleTask>() {
+                    TaskCommandFailure::Changed
+                } else if matches!(
+                    error.downcast_ref::<crate::exchange::journal::CommandJournalError>(),
+                    Some(crate::exchange::journal::CommandJournalError::IdentityConflict)
+                ) {
+                    TaskCommandFailure::IdentityConflict
+                } else {
+                    error
+                        .downcast::<TaskCommandFailure>()
+                        .unwrap_or(TaskCommandFailure::StateUnavailable)
+                }
+            })?
+            .ok_or(TaskCommandFailure::StateUnavailable)
+    }
+
+    /// Commit a prepared resume or review mutation with its task checkpoint and immutable source guard.
+    pub(crate) fn apply_owner_mutation(
+        &self,
+        store: &mut SqliteStore,
+        id: &crate::exchange::command::CommandId,
+        intent: &crate::exchange::command::TaskCommand,
+        permit: Option<&TaskPermit>,
+        prepared: crate::broker::plan_entry::PreparedTaskChange,
+        now_ms: i64,
+    ) -> std::result::Result<
+        crate::exchange::command::TaskCommandCheckpoint,
+        crate::exchange::command::TaskCommandFailure,
+    > {
+        use crate::exchange::command::{
+            TaskCommand, TaskCommandCheckpoint, TaskCommandFailure, TaskCommandOutcome,
+            TaskSelection,
+        };
+        let crate::broker::plan_entry::PreparedTaskChange {
+            change,
+            mut effects,
+        } = prepared;
+        if let Some(source) = intent.plan_source() {
+            effects.source_plan.push(source);
+        }
+        let commit = |active: &mut Option<Task>| -> anyhow::Result<_> {
+            match permit {
+                Some(permit) => permit.validate_observation(active.as_ref())?,
+                None if active.is_none() => {}
+                None => return Err(TaskCommandFailure::Changed.into()),
+            }
+            let previous = active.clone();
+            let finite = matches!(intent, TaskCommand::EditPlan(_))
+                || matches!(intent, TaskCommand::CancelPlan(_))
+                    && matches!(&change, TaskChange::Preserve);
+            let installing = matches!(&change, TaskChange::Install(_));
+            Self::apply_change(active, change, now_ms)?;
+            if installing {
+                let terminal =
+                    clear_effect(&self.session_id, previous.as_ref(), active.as_ref(), now_ms);
+                effects.event.extend(terminal.event);
+                effects.plan.extend(terminal.plan);
+                effects.execution.extend(terminal.execution);
+                effects.retire_questions = true;
+            }
+            let task = active.as_ref();
+            if matches!(
+                intent,
+                TaskCommand::Resume(_) | TaskCommand::RequestPlanChanges(_)
+            ) && let Some(task) = task
+                && task.next_action() == super::TaskNextAction::Model
+            {
+                let input = task
+                    .entry
+                    .as_ref()
+                    .filter(|entry| entry.delivery == super::TaskInputDelivery::Pending)
+                    .map(|entry| entry.id.clone())
+                    .or_else(|| {
+                        task.turn
+                            .as_ref()
+                            .and_then(|turn| turn.continuation.as_ref())
+                            .filter(|input| {
+                                input.delivery == super::TaskInputDelivery::Pending
+                                    && !input.work.is_checks()
+                            })
+                            .map(|input| input.id.clone())
+                    });
+                if let Some(input) = input {
+                    let selected = TaskSelection::capture(task);
+                    effects.owner_task_commit =
+                        Some(crate::exchange::journal::TaskCommandCommit::AwaitInput {
+                            command: id.clone(),
+                            task: selected.clone(),
+                            input: input.clone(),
+                            kind: task.kind(),
+                            source: intent.plan_source(),
+                        });
+                    return Ok((
+                        TaskCommandCheckpoint::InputPending {
+                            task: selected,
+                            input,
+                        },
+                        effects,
+                    ));
+                }
+            }
+            let outcome = match intent {
+                TaskCommand::Resume(_) => TaskCommandOutcome::Resumed {
+                    task: TaskSelection::capture(task.ok_or(TaskCommandFailure::MissingTask)?),
+                },
+                TaskCommand::EditPlan(request) => {
+                    let plan = effects
+                        .plan
+                        .iter()
+                        .find(|plan| plan.id == request.source().id().as_str())
+                        .cloned()
+                        .ok_or(TaskCommandFailure::StateUnavailable)?;
+                    TaskCommandOutcome::PlanEdited {
+                        source: crate::exchange::command::PlanSelection::capture(&plan)?,
+                        plan: Box::new(plan),
+                        task: task
+                            .filter(|task| match &task.workflow {
+                                WorkflowSnapshot::Plan { plan } => {
+                                    plan.artifact.id == request.source().id().as_str()
+                                }
+                                WorkflowSnapshot::Execute { execution } => {
+                                    execution.record.plan_id == request.source().id().as_str()
+                                }
+                                WorkflowSnapshot::Goal { .. } => false,
+                            })
+                            .map(TaskSelection::capture),
+                    }
+                }
+                TaskCommand::RequestPlanChanges(request) => {
+                    TaskCommandOutcome::PlanChangesRequested {
+                        source: request.selection().source().clone(),
+                        task: task.map(TaskSelection::capture),
+                    }
+                }
+                TaskCommand::CancelPlan(request) => TaskCommandOutcome::PlanCancelled {
+                    source: request.selection().source().clone(),
+                    task: if finite {
+                        None
+                    } else {
+                        task.map(TaskSelection::capture)
+                    },
+                },
+                _ => return Err(TaskCommandFailure::IdentityConflict.into()),
+            };
+            effects.owner_task_commit = Some(if finite {
+                crate::exchange::journal::TaskCommandCommit::Complete {
+                    command: id.clone(),
+                    outcome: outcome.clone(),
+                }
+            } else {
+                crate::exchange::journal::TaskCommandCommit::AwaitGoal {
+                    command: id.clone(),
+                    outcome: outcome.clone(),
+                }
+            });
+            Ok((
+                TaskCommandCheckpoint::Control {
+                    outcome: Box::new(outcome),
+                },
+                effects,
+            ))
+        };
+        let result = match permit {
+            Some(permit) => store.commit_task_observation(&self.session_id, permit, now_ms, commit),
+            None => store.commit_task_effects(&self.session_id, None, now_ms, None, commit),
+        };
+        result
+            .map_err(|error| {
+                if error.is::<super::StaleTask>() {
+                    TaskCommandFailure::Changed
+                } else {
+                    error
+                        .downcast::<TaskCommandFailure>()
+                        .unwrap_or(TaskCommandFailure::StateUnavailable)
+                }
+            })?
+            .ok_or(TaskCommandFailure::StateUnavailable)
+    }
+
+    /// Reserve exactly one captured workflow continuation and its input in the same commit.
+    pub(crate) fn apply_owner_continuation(
+        &self,
+        store: &mut SqliteStore,
+        context: OwnerTaskCommit<'_>,
+        request: &crate::exchange::command::WorkflowContinuationRequest,
+        prepared: crate::broker::plan_entry::PreparedTaskChange,
+        instruction: String,
+    ) -> std::result::Result<
+        crate::exchange::command::TaskCommandCheckpoint,
+        crate::exchange::command::TaskCommandFailure,
+    > {
+        let OwnerTaskCommit { id, permit, now_ms } = context;
+        use crate::exchange::command::{
+            InputId, TaskCommandCheckpoint, TaskCommandFailure, TaskSelection,
+        };
+        let crate::broker::plan_entry::PreparedTaskChange {
+            change,
+            mut effects,
+        } = prepared;
+        effects.continuation_guard.push(request.clone());
+        let commit = |active: &mut Option<Task>| -> anyhow::Result<_> {
+            match permit {
+                Some(permit) => permit.validate_observation(active.as_ref())?,
+                None if active.is_none() => {}
+                None => return Err(TaskCommandFailure::Changed.into()),
+            }
+            Self::apply_change(active, change, now_ms)?;
+            let selected = active.as_ref().map(TaskSelection::capture);
+            let (input, purpose) = match active.as_ref() {
+                Some(task) => {
+                    let turn = task
+                        .turn
+                        .as_ref()
+                        .ok_or(TaskCommandFailure::PreparationUnavailable)?;
+                    let continuation = turn
+                        .continuation
+                        .as_ref()
+                        .filter(|input| input.delivery == super::TaskInputDelivery::Pending)
+                        .ok_or(TaskCommandFailure::PreparationUnavailable)?;
+                    if continuation.work.is_checks() {
+                        let outcome =
+                            crate::exchange::command::TaskCommandOutcome::ContinuationReserved {
+                                task: TaskSelection::capture(task),
+                            };
+                        effects.owner_task_commit =
+                            Some(crate::exchange::journal::TaskCommandCommit::Complete {
+                                command: id.clone(),
+                                outcome: outcome.clone(),
+                            });
+                        return Ok((
+                            TaskCommandCheckpoint::Control {
+                                outcome: Box::new(outcome),
+                            },
+                            effects,
+                        ));
+                    }
+                    (
+                        InputId::new(continuation.id.as_str())
+                            .map_err(|_| TaskCommandFailure::PreparationUnavailable)?,
+                        crate::input::InputPurpose::TaskContinuation {
+                            revision: task.revision.clone(),
+                            id: continuation.id.clone(),
+                            completed_turn_id: turn.id.clone(),
+                            reason: continuation.reason.clone(),
+                        },
+                    )
+                }
+                None => {
+                    let exchange = match &request.target {
+                        crate::exchange::command::WorkflowContinuationTarget::Exchange(
+                            exchange,
+                        ) => exchange,
+                        crate::exchange::command::WorkflowContinuationTarget::Questions(
+                            crate::exchange::command::QuestionContinuationSelection {
+                                workflow:
+                                    crate::exchange::command::QuestionWorkflow::Exchange(exchange),
+                                ..
+                            },
+                        ) => exchange,
+                        _ => return Err(TaskCommandFailure::IdentityConflict.into()),
+                    };
+                    (
+                        InputId::new(uuid::Uuid::new_v4().to_string())
+                            .map_err(|_| TaskCommandFailure::PreparationUnavailable)?,
+                        crate::input::InputPurpose::WorkflowContinuation {
+                            exchange: exchange.clone(),
+                        },
+                    )
+                }
+            };
+            let message = crate::input::InputMessage {
+                id: input.as_str().into(),
+                revision: 1,
+                text: instruction,
+                purpose,
+                attachments: Vec::new(),
+                config: None,
+                intent: crate::input::InputIntent::Auto,
+                delivery: crate::input::InputDelivery::Queued,
+                route: None,
+                reservation: None,
+                submission_id: None,
+                error: None,
+            };
+            effects.owner_task_commit =
+                Some(crate::exchange::journal::TaskCommandCommit::WorkflowInput {
+                    command: id.clone(),
+                    task: selected.clone(),
+                    message: Box::new(message),
+                });
+            Ok((
+                TaskCommandCheckpoint::WorkflowInputPending {
+                    task: selected,
+                    input,
+                },
+                effects,
+            ))
+        };
+        let result = match permit {
+            Some(permit) => store.commit_task_observation(&self.session_id, permit, now_ms, commit),
+            None => store.commit_task_effects(&self.session_id, None, now_ms, None, commit),
+        };
+        result
+            .map_err(|error| {
+                if error.is::<super::StaleTask>() {
+                    TaskCommandFailure::Changed
+                } else {
+                    error
+                        .downcast::<TaskCommandFailure>()
+                        .unwrap_or(TaskCommandFailure::StateUnavailable)
+                }
+            })?
+            .ok_or(TaskCommandFailure::StateUnavailable)
+    }
+
+    /// Complete unresolved question continuation without creating input or changing its workflow.
+    pub(crate) fn apply_owner_question_wait(
+        &self,
+        store: &mut SqliteStore,
+        id: &crate::exchange::command::CommandId,
+        request: &crate::exchange::command::WorkflowContinuationRequest,
+        permit: Option<&TaskPermit>,
+        questions: crate::exchange::command::PlanQuestionSetSelection,
+        now_ms: i64,
+    ) -> std::result::Result<
+        crate::exchange::command::TaskCommandOutcome,
+        crate::exchange::command::TaskCommandFailure,
+    > {
+        use crate::exchange::command::{TaskCommandFailure, TaskCommandOutcome, TaskSelection};
+        let commit = |active: &mut Option<Task>| -> anyhow::Result<_> {
+            let outcome = TaskCommandOutcome::WorkflowAwaitingInput {
+                task: active.as_ref().map(TaskSelection::capture),
+                question_set: questions,
+            };
+            Ok((
+                outcome.clone(),
+                crate::storage::TaskEffects {
+                    continuation_guard: vec![request.clone()],
+                    owner_task_commit: Some(
+                        crate::exchange::journal::TaskCommandCommit::Complete {
+                            command: id.clone(),
+                            outcome,
+                        },
+                    ),
+                    ..Default::default()
+                },
+            ))
+        };
+        let result = match permit {
+            Some(permit) => store.commit_task_observation(&self.session_id, permit, now_ms, commit),
+            None => store.commit_task_effects(&self.session_id, None, now_ms, None, commit),
+        };
+        result
+            .map_err(|error| {
+                error
+                    .downcast::<TaskCommandFailure>()
+                    .unwrap_or(TaskCommandFailure::StateUnavailable)
+            })?
+            .ok_or(TaskCommandFailure::StateUnavailable)
     }
 
     pub(crate) fn change(
@@ -1208,19 +2159,27 @@ pub(super) fn validate_execution_update(
     Ok(())
 }
 
+/// Archive displaced live task work without changing completed history or a same-task phase transition.
 fn clear_effect(
     session_id: &str,
     previous: Option<&Task>,
     active: Option<&Task>,
     now_ms: i64,
 ) -> crate::storage::TaskEffects {
-    if let Some(task) = previous.filter(|_| active.is_none()) {
+    if let Some(task) = previous.filter(|previous| {
+        !previous.status().terminal() && active.is_none_or(|current| current.id != previous.id)
+    }) {
         let outcome = super::TaskOutcome {
             id: task.id.clone(),
             kind: task.kind(),
             title: task.title().into(),
             state: super::TaskOutcomeState::Cancelled,
-            summary: "Task cleared".into(),
+            summary: if active.is_some() {
+                "Task replaced"
+            } else {
+                "Task cleared"
+            }
+            .into(),
         };
         outcome_effect(session_id, task, outcome, now_ms)
     } else {
@@ -1285,6 +2244,7 @@ fn goal_view(task: &super::active::TaskSnapshot) -> Result<super::GoalSnapshot> 
             continuation: execution.continuation.clone(),
             native: false,
             observed_checkpoint: execution.record.observed_checkpoint.clone(),
+            reported_status: None,
         },
         WorkflowSnapshot::Plan { .. } => anyhow::bail!("goal evidence requires Goal or Execute"),
     })
@@ -1293,6 +2253,91 @@ fn goal_view(task: &super::active::TaskSnapshot) -> Result<super::GoalSnapshot> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An observed continuation cannot cancel its successor or a replacement task's continuation.
+    #[test]
+    fn pending_continuation_cancellation_requires_original_task_and_input() -> Result<()> {
+        let (_root, mut store, controller) = SessionTaskController::test_goal();
+        let original = controller.current()?.unwrap();
+        controller.reserve_continuation(
+            &mut store,
+            &original.permit(),
+            super::super::TaskTurnId {
+                exchange_ordinal: 1,
+                turn_ordinal: 1,
+            },
+            "Continue".into(),
+            "Remaining work".into(),
+            2,
+        )?;
+        let observed = controller.current()?.unwrap();
+        let old = observed
+            .turn
+            .as_ref()
+            .unwrap()
+            .continuation
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        let mut successor = observed.clone();
+        let next = super::super::TaskInputId::fresh();
+        successor.edit(|draft| {
+            draft
+                .turn
+                .as_mut()
+                .unwrap()
+                .continuation
+                .as_mut()
+                .unwrap()
+                .id = next.clone();
+            Ok(())
+        })?;
+        let successor = controller
+            .change(
+                &mut store,
+                Some(&observed.revision),
+                TaskChange::Update(Box::new(successor)),
+                3,
+            )?
+            .unwrap();
+        assert!(matches!(
+            controller.cancel_pending_continuation(&mut store, &observed.permit(), &old, 4),
+            Ok(false) | Err(crate::exchange::command::TaskCommandFailure::Changed)
+        ));
+        assert_eq!(
+            controller
+                .current()?
+                .unwrap()
+                .turn
+                .as_ref()
+                .unwrap()
+                .continuation
+                .as_ref()
+                .unwrap()
+                .delivery,
+            super::super::TaskInputDelivery::Pending
+        );
+        assert!(!controller.cancel_pending_continuation(
+            &mut store,
+            &successor.permit(),
+            &old,
+            5
+        )?);
+        assert!(controller.cancel_pending_continuation(
+            &mut store,
+            &successor.permit(),
+            &next,
+            6
+        )?);
+        assert!(!controller.cancel_pending_continuation(
+            &mut store,
+            &successor.permit(),
+            &next,
+            7
+        )?);
+        Ok(())
+    }
     use crate::session::{HarnessSession, SessionStore, continuation::ContinuationBudget};
 
     /// Reject task and artifact publication when an equal-version working document changed.
@@ -1331,7 +2376,7 @@ mod tests {
                 &mut store,
                 &task.permit(),
                 files.guard_working_document(&original),
-                super::super::TaskEvent::PlanArtifactUpdated(observed.clone()),
+                super::super::TaskEvent::PlanArtifactUpdated(Box::new(observed.clone())),
                 Default::default(),
                 3,
             )
@@ -1344,7 +2389,7 @@ mod tests {
             &mut store,
             &task.permit(),
             files.guard_working_document(&intervening),
-            super::super::TaskEvent::PlanArtifactUpdated(observed),
+            super::super::TaskEvent::PlanArtifactUpdated(Box::new(observed)),
             Default::default(),
             4,
         )?;
@@ -1507,7 +2552,6 @@ mod tests {
             error: None,
             exchange_id: None,
             created_at_ms: 2,
-            resume_after_transition: false,
         };
         let installed = controller
             .command(

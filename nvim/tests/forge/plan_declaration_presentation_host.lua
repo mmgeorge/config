@@ -758,7 +758,7 @@ local success, failure = xpcall(function()
   local method = request_specification.method
   local params = request_specification.params or {}
 
-    if method == "session.plan.acceptance.begin" then pending_approval = { request_specification, callback } return end
+    if method == "session.plan.accept" then pending_approval = { request_specification, callback } return end
     return original_request(request_specification, callback)
   end
   state.plan_review.command_set.action_by_id.accept.run({})

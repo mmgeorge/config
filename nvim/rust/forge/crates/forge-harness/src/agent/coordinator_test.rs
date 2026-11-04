@@ -531,3 +531,26 @@ fn overlapping_policy_transitions_close_new_admission_and_preserve_durable_repla
             .is_ok()
     );
 }
+
+/// Captured user commands cannot silently select a later child task.
+#[test]
+fn captured_target_rejects_newer_followup() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let first = admit(&coordinator, "first", "worker");
+    let captured = coordinator.capture_target(&first.agent.id).unwrap();
+    assert!(coordinator.validate_target(&captured).is_ok());
+    let request = AgentRequest {
+        operation_id: "next".into(),
+        source: AgentSource::User,
+        operation: AgentOperation::Followup {
+            target: first.agent.id.clone(),
+            message: "next task".into(),
+        },
+    };
+    let next = coordinator
+        .reserve_followup(&request, &first.agent.id, "next task", "parent", 2)
+        .unwrap();
+    next.commit().unwrap();
+    assert!(coordinator.validate_target(&captured).is_err());
+    assert!(coordinator.target_collected(&captured).is_err());
+}

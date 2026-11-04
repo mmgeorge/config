@@ -53,19 +53,20 @@ local success, failure = xpcall(function()
   local changed = request("session.plan.check.update", { plan_id = plan.id, digest = plan.review_digest,
     expected_version = plan.document_version, enabled = { verify = true } })
   plan = changed.plan
-  local acceptance = request("session.plan.acceptance.begin", { plan_id = plan.id, digest = plan.review_digest,
+  local acceptance = request("session.plan.accept", { plan_id = plan.id, digest = plan.review_digest,
     operation_id = "example-acceptance" })
   assert(acceptance.active_elicitation and acceptance.active_elicitation ~= vim.NIL)
-  local cancelled = request("session.plan.acceptance.cancel", { plan_id = plan.id, operation_id = "example-cancel-acceptance" })
-  assert(cancelled.active_elicitation == nil or cancelled.active_elicitation == vim.NIL)
-  plan = request("session.state.get").active_plan
+  assert(acceptance.command_result.outcome.result.disposition == "awaiting_input")
+  local retained = request("session.state.get")
+  assert(vim.deep_equal(retained.active_elicitation, acceptance.active_elicitation), "reading review state discarded questions")
+  plan = retained.active_plan
   local revision = plan.model_revision
   request("session.plan.changes.request", { plan_id = plan.id, digest = plan.review_digest,
     comment = "Clarify the fixture behavior", operation_id = "example-request-changes" })
   plan = reviewed_plan(revision)
   local stopped = request("session.plan.cancel", { plan_id = plan.id, digest = plan.review_digest,
     operation_id = "example-cancel-plan" })
-  assert(stopped.task_operation.state == "completed")
+  assert(stopped.command_result.outcome.outcome == "task")
 end, debug.traceback)
 client.host_stop()
 local stopped = vim.wait(6000, function() return client._client.process == nil end, 10)

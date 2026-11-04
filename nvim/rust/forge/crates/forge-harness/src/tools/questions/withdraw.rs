@@ -1,4 +1,3 @@
-use crate::provider::PromptMode;
 use crate::tools::ControlToolDefinition;
 use crate::tools::error::ToolContext;
 use crate::tools::schema::strict_object_input_schema;
@@ -31,17 +30,6 @@ pub fn question_withdraw_input_schema() -> Value {
     )
 }
 
-/// Decode the tool's replayable completion fields.
-pub(super) fn record(
-    invocation: &crate::tools::ControlToolInvocation,
-    output: &mut crate::provider::ProviderCompletion,
-) -> crate::tools::ToolResult<()> {
-    output.question_withdrawal = Some(crate::tools::invocation::decode_arguments::<
-        crate::plan::PlanQuestionWithdrawal,
-    >(invocation)?);
-    Ok(())
-}
-
 /// Withdraw a pending question under its recorded revision.
 pub(super) async fn execute(
     runtime: &mut crate::tools::runtime::ControlToolRuntime,
@@ -57,23 +45,11 @@ pub(super) async fn execute(
             runtime,
             invocation,
             crate::question::QuestionAction::Withdraw { reason },
-        );
+        )
+        .await;
     }
 
-    crate::tools::error::ensure!(
-        matches!(
-            runtime.context.mode,
-            PromptMode::Chat | PromptMode::PlanDiscussion
-        ) && !runtime.context.planning_feedback,
-        "question resolution is unavailable during planning feedback"
-    );
-    crate::tools::error::ensure!(
-        runtime.context.has_active_elicitation,
-        "no Harness question set is pending"
-    );
-    runtime.terminal = true;
-    Ok(crate::tools::ControlToolResult {
-        invocation: Some(invocation),
-        message: "Question resolution accepted".into(),
-    })
+    Err(crate::tools::ToolError::MissingState(
+        "question mutation owner is missing".into(),
+    ))
 }

@@ -70,6 +70,10 @@ pub enum SessionUpdate {
     ContextUsage {
         usage: crate::session::ContextUsage,
     },
+    /// Publish the committed snapshot after confirmed model-context replacement.
+    ContextCompacted {
+        snapshot: Box<super::BrokerSnapshot>,
+    },
     TurnStarted {
         address: crate::provider::TurnAddress,
     },
@@ -202,7 +206,7 @@ impl SessionUpdate {
     }
 }
 
-pub fn encode_session_update(update: &SessionUpdate) -> anyhow::Result<Value> {
+pub fn encode_session_update(update: &SessionUpdate) -> Result<Value, serde_json::Error> {
     let (kind, text, data) = match update {
         SessionUpdate::ExecutionState { session } => {
             ("execution_state", None, json!({"session":session}))
@@ -234,6 +238,9 @@ pub fn encode_session_update(update: &SessionUpdate) -> anyhow::Result<Value> {
         ),
         SessionUpdate::ContextUsage { usage } => {
             ("context_usage", None, serde_json::to_value(usage)?)
+        }
+        SessionUpdate::ContextCompacted { snapshot } => {
+            ("context_compacted", None, serde_json::to_value(snapshot)?)
         }
         SessionUpdate::TurnStarted { address } => {
             ("turn_started", None, serde_json::to_value(address)?)
@@ -286,6 +293,36 @@ pub fn encode_session_update(update: &SessionUpdate) -> anyhow::Result<Value> {
         ),
     };
     Ok(json!({"kind":kind,"text":text,"data":data}))
+}
+
+/// Translate one committed update into its client event without parsing its encoded kind.
+pub(crate) fn encode_session_event(
+    session: &str,
+    update: &SessionUpdate,
+) -> Result<forge_protocol::message::SessionEvent, serde_json::Error> {
+    let payload = encode_session_update(update)?;
+    let (event, payload) = match update {
+        SessionUpdate::ContextCompacted { .. } => ("context_compacted", payload["data"].clone()),
+        SessionUpdate::Configuration { .. } => ("session_configured", payload["data"].clone()),
+        SessionUpdate::DocumentChanged { .. } => ("document_changed", payload),
+        SessionUpdate::ExecutionState { .. }
+        | SessionUpdate::Submission { .. }
+        | SessionUpdate::Approval { .. }
+        | SessionUpdate::Agent { .. }
+        | SessionUpdate::Runtime { .. }
+        | SessionUpdate::ContextUsage { .. }
+        | SessionUpdate::TurnStarted { .. }
+        | SessionUpdate::Timeline { .. }
+        | SessionUpdate::PlanProgress { .. }
+        | SessionUpdate::ConfigurationProgress { .. }
+        | SessionUpdate::Diagnostic { .. }
+        | SessionUpdate::CheckFailure { .. } => ("provider_event", payload),
+    };
+    Ok(forge_protocol::message::SessionEvent {
+        session_id: session.to_owned(),
+        event: event.to_owned(),
+        payload,
+    })
 }
 
 #[derive(Clone)]

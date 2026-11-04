@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(super) const VERSION: i64 = 5;
+pub(super) const VERSION: i64 = 7;
 const APPLICATION: i64 = 0x464f5247;
 
 /// Serializes bootstrap pragmas across processes before SQLite can acquire its own write lock.
@@ -74,6 +74,8 @@ pub(super) fn initialize(
         }
         initialize_query_indexes(&transaction)?;
         super::tool_output::initialize_positions(&transaction)?;
+        initialize_owner_commands(&transaction)?;
+        initialize_plan_reviews(&transaction)?;
         transaction.pragma_update(None, "user_version", VERSION)?;
         transaction.commit()?;
         return Ok(());
@@ -251,9 +253,76 @@ pub(super) fn initialize(
     initialize_query_indexes(&transaction)?;
     super::archive::migrate(&transaction, objects)?;
     initialize_commands(&transaction)?;
+    initialize_owner_commands(&transaction)?;
+    initialize_plan_reviews(&transaction)?;
     transaction.pragma_update(None, "application_id", APPLICATION)?;
     transaction.pragma_update(None, "user_version", VERSION)?;
     transaction.commit()?;
+    Ok(())
+}
+
+/// Convert live legacy review data without changing task/plan state or immutable history receipts.
+fn initialize_plan_reviews(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    for (table, pointer, path) in [
+        ("plan_record", "", "$.acceptance"),
+        (
+            "session_record",
+            "/session/active_task/plan/artifact",
+            "$.session.active_task.plan.artifact.acceptance",
+        ),
+        (
+            "task_record",
+            "/plan/artifact",
+            "$.plan.artifact.acceptance",
+        ),
+    ] {
+        loop {
+            // Bound conversion memory while the schema transaction owns every affected record.
+            let rows: Vec<(String, String)> = {
+                let mut query = transaction.prepare(&format!("SELECT id,payload FROM {table} WHERE json_type(payload,?1) IS NOT NULL ORDER BY id LIMIT 64"))?;
+                query
+                    .query_map([path], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            if rows.is_empty() {
+                break;
+            }
+            for (id, encoded) in rows {
+                let mut payload: serde_json::Value = serde_json::from_str(&encoded)?;
+                let artifact = payload
+                    .pointer_mut(pointer)
+                    .and_then(serde_json::Value::as_object_mut)
+                    .context("legacy review artifact is not an object")?;
+                let previous = artifact
+                    .remove("acceptance")
+                    .context("legacy review field disappeared during migration")?;
+                // Reject conflicting evidence before replacing the live storage path.
+                if !previous.is_null() {
+                    if let Some(current) = artifact.get("review").filter(|value| !value.is_null()) {
+                        ensure!(
+                            current == &previous,
+                            "conflicting review evidence in {table} record {id}"
+                        );
+                    } else {
+                        artifact.insert("review".into(), previous);
+                    }
+                }
+                if let Some(questions) = artifact
+                    .get_mut("review")
+                    .and_then(|review| review.get_mut("elicitation"))
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    // A recovered review keeps its decisions but cannot acquire timeout authority.
+                    questions.insert("purpose".into(), serde_json::json!("plan_review"));
+                    questions.insert("deadline".into(), serde_json::Value::Null);
+                }
+                transaction.execute(
+                    &format!("UPDATE {table} SET payload=?2 WHERE id=?1"),
+                    rusqlite::params![id, serde_json::to_string(&payload)?],
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -277,6 +346,42 @@ fn initialize_commands(connection: &Connection) -> Result<()> {
         result TEXT NOT NULL,
         PRIMARY KEY(session_id,id)
     );",
+    )?;
+    Ok(())
+}
+
+/// Keep command outcomes and accepted input in one SQLite commit boundary.
+fn initialize_owner_commands(connection: &Connection) -> Result<()> {
+    connection.execute_batch(
+        "CREATE TABLE IF NOT EXISTS owner_command (
+            session_id TEXT NOT NULL,
+            id TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK(sequence > 0),
+            request TEXT NOT NULL,
+            state TEXT NOT NULL,
+            PRIMARY KEY(session_id,id),
+            UNIQUE(session_id,sequence)
+        );
+        CREATE TABLE IF NOT EXISTS owner_publication(
+            session_id TEXT NOT NULL REFERENCES session_record(id) ON DELETE CASCADE,
+            sequence INTEGER NOT NULL CHECK(sequence > 0),
+            event TEXT NOT NULL,state TEXT NOT NULL,
+            PRIMARY KEY(session_id,sequence)
+        );
+        CREATE TABLE IF NOT EXISTS owner_publication_origin(
+            session_id TEXT NOT NULL,origin TEXT NOT NULL,sequence INTEGER NOT NULL,
+            PRIMARY KEY(session_id,origin),
+            FOREIGN KEY(session_id,sequence) REFERENCES owner_publication(session_id,sequence) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS input_session(session_id TEXT PRIMARY KEY,payload TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS input_operation(
+            session_id TEXT NOT NULL,id TEXT NOT NULL,request TEXT NOT NULL,payload TEXT NOT NULL,
+            PRIMARY KEY(session_id,id)
+        );
+        CREATE TABLE IF NOT EXISTS input_submitted(
+            session_id TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(session_id,id)
+        );
+        CREATE TABLE IF NOT EXISTS input_migration(session_id TEXT PRIMARY KEY);",
     )?;
     Ok(())
 }

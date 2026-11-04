@@ -535,6 +535,7 @@ impl EventFixtureProvider {
             result
         });
         *session.active.lock().await = Some(task);
+        request.dispatch.confirm();
         Ok(acceptance)
     }
 }
@@ -641,8 +642,17 @@ impl Provider for EventFixtureProvider {
                 ))
             }
             session::ContinuationRequest::RetryableExecution {
-                scope, callbacks, ..
+                scope,
+                callbacks,
+                authorization,
+                dispatch,
             } => {
+                if !dispatch.matches_continuation(binding, &scope, &authorization) {
+                    return Err(fixture_error(
+                        ProviderOperation::AdmitInput,
+                        ProviderFailureKind::Protocol,
+                    ));
+                }
                 let callbacks = *callbacks;
                 let session = self.session(binding).await?;
                 let _admission = session.admission.lock().await;
@@ -667,6 +677,7 @@ impl Provider for EventFixtureProvider {
                 *session.active.lock().await = Some(tokio::spawn(async move {
                     handler(scope, callbacks, sink, cancel_receiver).await
                 }));
+                dispatch.confirm();
                 Ok(ContinuationOutcome::ExecutionResumed)
             }
         }
@@ -1096,6 +1107,8 @@ pub async fn call_tool(
         .call(
             &request.scope,
             forge_provider_api::control::ToolCall {
+                id: forge_provider_api::control::ToolCallId::new(uuid::Uuid::new_v4().to_string())
+                    .expect("fixture call identity is nonempty"),
                 name: name.to_owned(),
                 arguments,
             },

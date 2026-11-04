@@ -208,7 +208,7 @@ async fn workflow_execution_transition_matrix_preserves_the_gate_graph() -> Resu
             let result = broker.task_controller.apply(
                 &mut broker.store,
                 &before.permit(),
-                crate::task::TaskEvent::ExecutionUpdated(next),
+                crate::task::TaskEvent::ExecutionUpdated(Box::new(next)),
                 11,
             );
             let allowed = original == target
@@ -320,7 +320,7 @@ async fn workflow_resolution_reuses_only_current_passing_checks() -> Result<()> 
         broker.task_controller.apply(
             &mut broker.store,
             &task.permit(),
-            crate::task::TaskEvent::ExecutionUpdated(record.clone()),
+            crate::task::TaskEvent::ExecutionUpdated(Box::new(record.clone())),
             3,
         )?;
         if changed {

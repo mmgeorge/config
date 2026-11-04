@@ -222,8 +222,11 @@ impl AcpConversation {
         method: super::submission::AcpSubmission,
         parameter: Value,
         receipt: Option<Arc<dyn forge_provider_api::submission::InputReceipt>>,
+        dispatch: &forge_provider_api::submission::DispatchReporter,
     ) -> Result<Value, ProviderError> {
-        self.transport.submit(method, parameter, receipt).await
+        self.transport
+            .submit(method, parameter, receipt, Some(dispatch))
+            .await
     }
 
     /// Submit steering and retain the adapter's typed lifecycle limitation.

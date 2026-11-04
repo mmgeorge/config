@@ -50,6 +50,8 @@ impl AgentRuntime {
         };
         let mut request = self.request.clone();
         let mut cancelled = *self.cancellation.borrow();
+        let retry_admission =
+            crate::provider::retry::RetryAdmission::new(self.cancellation.clone());
         // Run foreground work while consuming the owner's single ordered stream.
         let mut output = {
             loop {
@@ -60,7 +62,7 @@ impl AgentRuntime {
                     );
                 }
                 let result = async {
-            let prompt = crate::provider::retry::execute(engine.as_ref(), request.clone(), event_sink.clone(), &self.trace, &self.submission_store);
+            let prompt = crate::provider::retry::execute_cancellable(engine.as_ref(), request.clone(), event_sink.clone(), &self.trace, &self.submission_store, retry_admission.clone());
             tokio::pin!(prompt);
             loop {
                 if cancelled {break Err(anyhow::anyhow!("child task interrupted before dispatch"));}
@@ -80,13 +82,42 @@ impl AgentRuntime {
                                 },
                             },
                         }).await?;
-                        break Err(expired.into());
+                        retry_admission.close();
+                        engine.close_admission();
+                        let collected = collect_interrupted_attempt(
+                            self.provider.as_ref(), &self.request, retry_admission.current_dispatch(), prompt.as_mut(),
+                        );
+                        let (settled, observation_error) = events.forward_until(&self, &owner,
+                            tokio::time::timeout(std::time::Duration::from_secs(30), collected)).await;
+                        let mut failure = Err(expired.into());
+                        if let Err(error) = settled.context("timed-out child did not settle within 30 seconds").and_then(|result| result)
+                            && !error.is::<crate::broker::TurnCancelled>() {
+                            preserve_child_failure(&mut failure, error);
+                        }
+                        if let Some(error) = observation_error { preserve_child_failure(&mut failure, error); }
+                        break failure;
                     }
                     changed = self.cancellation.changed() => {
                         changed.context("child cancellation owner closed")?;
                         if *self.cancellation.borrow_and_update() {
                             cancelled = true;
-                            break Err(anyhow::anyhow!("child task interrupted"));
+                            retry_admission.close();
+                            engine.close_admission();
+                            // Keep the original readiness waiter alive until its interrupted native turn is settled.
+                            let collected = collect_interrupted_attempt(
+                                self.provider.as_ref(), &self.request, retry_admission.current_dispatch(), prompt.as_mut(),
+                            );
+                            let (settled, observation_error) = events.forward_until(
+                                &self, &owner,
+                                tokio::time::timeout(std::time::Duration::from_secs(30), collected),
+                            ).await;
+                            let mut settled = settled
+                                .context("child interruption did not settle within 30 seconds")
+                                .and_then(|result| result);
+                            if let Some(error) = observation_error {
+                                preserve_child_failure(&mut settled, error);
+                            }
+                            break settled;
                         }
                     }
                     event = events.next(), if events.is_open() => {
@@ -253,6 +284,33 @@ impl AgentRuntime {
             })
             .await
     }
+}
+
+/// Collect only an actually dispatched attempt; closed retry admission cannot start a later one.
+async fn collect_interrupted_attempt<Attempt>(
+    provider: &Provider,
+    request: &ProviderRequest,
+    dispatch: Option<crate::provider::DispatchObserver>,
+    mut attempt: std::pin::Pin<&mut Attempt>,
+) -> Result<ProviderCompletion>
+where
+    Attempt: Future<Output = Result<ProviderCompletion>>,
+{
+    let handed_off = if let Some(mut dispatch) = dispatch {
+        tokio::select! {
+            biased;
+            output = attempt.as_mut() => return output,
+            evidence = dispatch.wait() => evidence.is_ok(),
+        }
+    } else {
+        false
+    };
+    if handed_off {
+        let key = request.runtime_key()?;
+        provider.cancel_session(&key).await?;
+        provider.cleanup_execution(&key).await?;
+    }
+    attempt.await
 }
 
 /// Keep the original child failure while retaining later observation failures as context.

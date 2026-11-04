@@ -6,17 +6,20 @@ pub(crate) mod command;
 mod controller;
 mod event;
 mod execution;
+mod installation;
 pub(crate) use execution::{ExecutionSettlement, ExecutionSettlementKind};
+pub(crate) use installation::{TaskInstallation, TaskInstallationWork};
 mod state;
 pub(crate) use active::StaleTask;
-pub(crate) use active::TaskSnapshot;
 pub use active::{
     ExecutionEntry, ExecutionSnapshot, GoalSnapshot, PlanExecutionChoice, PlanSnapshot, Task,
-    TaskContinuation, TaskDecision, TaskEntry, TaskId, TaskInputDelivery, TaskInputId, TaskOutcome,
-    TaskOutcomeState, TaskPermit, TaskRevision, TaskTurn, TaskTurnId, TaskWork, WorkflowSnapshot,
+    TaskContinuation, TaskDecision, TaskEntry, TaskId, TaskInputDelivery, TaskInputId,
+    TaskInputIdentityError, TaskOutcome, TaskOutcomeState, TaskPermit, TaskRevision, TaskTurn,
+    TaskTurnId, TaskWork, WorkflowSnapshot,
 };
-pub(crate) use controller::SessionTaskController;
+pub(crate) use active::{TaskReceiptInput, TaskReceiptPermit, TaskSnapshot};
 pub(crate) use controller::TaskChange;
+pub(crate) use controller::{OwnerTaskCommit, SessionTaskController};
 pub(crate) use event::TaskEvent;
 pub(crate) use state::TaskNextAction;
 pub use state::{
@@ -137,9 +140,6 @@ pub struct TaskOperation {
     pub exchange_id: Option<String>,
     /// Admission time in Unix milliseconds.
     pub created_at_ms: i64,
-    #[serde(default)]
-    /// Retains running intent across successive settings changes during cleanup.
-    pub resume_after_transition: bool,
 }
 
 impl TaskOperation {

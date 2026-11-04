@@ -6,6 +6,7 @@ local config = require("forge.infra.config")
 local notifications = require("forge.infra.notifications")
 local protocol = require("forge.protocol")
 local contract = require("forge.event_contract")
+local command_intent = require("forge.command_intent")
 local session = require("forge.session")
 local receive = require("forge.receive")
 local json_transfer = require("forge.json_transfer")
@@ -1119,7 +1120,7 @@ end
 ---@param callback? ForgeCallback
 ---@param progress? fun(payload: table)
 ---@return integer? request_id Transport identity for requests without command recovery.
-function M.request(spec, callback, progress)
+local function dispatch_request(spec, callback, progress, owned_command)
   callback = callback or function() end
   local valid, policy = pcall(contract.validate_request, spec)
   if not valid then
@@ -1129,11 +1130,49 @@ function M.request(spec, callback, progress)
   local function transport(session_id, method, params, receive, sending)
     return send_request(session_id, method, params, receive, sending, progress)
   end
-  if policy.recovery == "session_command" and spec.session_id then
-    require("forge.command").dispatch(transport, spec.session_id, spec.method, spec.params, callback)
+  if (owned_command or policy.recovery == "session_command") and spec.session_id then
+    require("forge.command").dispatch(transport, spec.session_id, spec.method, spec.params, callback, owned_command)
   else
     return transport(spec.session_id, spec.method, spec.params, callback)
   end
+end
+
+---Execute one caller command; completion reports its finite committed outcome, never the eventual answer.
+---Legacy aliases pass their exact wire shape privately so existing UI response projections remain compatible.
+---@param spec ForgeCommandSpec
+---@param callback? ForgeCallback
+---@param progress? fun(payload: table)
+---@param legacy_spec? ForgeRequestSpec
+---@return integer? request_id
+function M.execute_command(spec, callback, progress, legacy_spec)
+  callback = callback or function() end
+  local valid, request = pcall(command_intent.to_request, spec)
+  if not valid then
+    protect_consumer(callback, "command validation")(nil, tostring(request), { code = "invalid_command" })
+    return
+  end
+  return dispatch_request(legacy_spec or request, function(result, failure, detail)
+    if not failure and result and result.state == "failed" then
+      callback(nil, result.error or "Command failed", { code = result.error_code or "command_failed", operation_id = result.id })
+    elseif not failure and result and result.state == "outcome_unknown" then
+      callback(nil, result.error or "Command outcome is unconfirmed", { code = result.error_code or "outcome_unknown", operation_id = result.id })
+    elseif failure and detail and detail.code == "command_outcome_uncommitted" then
+      callback(nil, failure, vim.tbl_extend("force", detail, { code = "outcome_unknown", cause_code = detail.code }))
+    else
+      callback(result, failure, detail)
+    end
+  end, progress, true)
+end
+
+---Keep transport aliases compatible while every lifecycle caller enters execute_command.
+---@param spec ForgeRequestSpec
+---@param callback? ForgeCallback
+---@param progress? fun(payload: table)
+---@return integer? request_id
+function M.request(spec, callback, progress)
+  local intent = command_intent.from_request(spec)
+  if intent then return M.execute_command(intent, callback, progress, spec) end
+  return dispatch_request(spec, callback, progress)
 end
 
 ---@param callback ForgeSubscriber

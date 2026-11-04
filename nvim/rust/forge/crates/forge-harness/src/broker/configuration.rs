@@ -1,10 +1,22 @@
 use super::*;
+use crate::exchange::command::ConfigurationRejection;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum ConfigurationCommand {
     Permission,
     Configure,
     Compact,
+}
+
+/// Select affected execution from the effective candidate, never request labels or provider names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConfigurationEffect {
+    /// Commit future policy or presentation without collecting native work.
+    Local,
+    /// Replace the root invocation while preserving independent child work.
+    ReplaceRoot,
+    /// Collect descendants whose inherited execution authority would change.
+    ReplaceTree,
 }
 
 /// Retain the exact permission authority selected before a short host commit.
@@ -125,6 +137,7 @@ pub(crate) struct ConfigurationCandidate {
     lsp_tools: Option<bool>,
     session_tools: Option<bool>,
     status_thoughts: Option<bool>,
+    question_model: Option<crate::settings::AskModel>,
     delegation_registry_changed: bool,
     update_model_preference: bool,
     resource_selection: Option<crate::settings::PortableSettings>,
@@ -136,6 +149,60 @@ pub(crate) struct ConfigurationPreparation {
     authority: Box<ConfigurationAuthority>,
     params: Value,
     resource_selection: Option<crate::settings::PortableSettings>,
+}
+
+impl ConfigurationCandidate {
+    /// Report whether this candidate applies a resource selection that needs fresh launch notices.
+    pub(crate) fn has_resource_selection(&self) -> bool {
+        self.resource_selection.is_some()
+    }
+
+    /// Get the execution scope affected by this validated effective change.
+    pub(crate) fn effect(&self) -> ConfigurationEffect {
+        let previous = &self.authority.session;
+        let selected = &self.configured;
+        if selected.access != previous.access
+            || selected.approval_mode != previous.approval_mode
+            || selected.shell != previous.shell
+        {
+            return ConfigurationEffect::ReplaceTree;
+        }
+        if selected.model != previous.model
+            || selected.resolved_model != previous.resolved_model
+            || selected.effort != previous.effort
+            || selected.context_window != previous.context_window
+            || selected.service_tier != previous.service_tier
+            || self.delegation_registry_changed
+            || self.resource_selection.is_some()
+        {
+            return ConfigurationEffect::ReplaceRoot;
+        }
+        ConfigurationEffect::Local
+    }
+
+    /// Preserve observations committed after preparation while applying only configuration fields.
+    fn rebase(&mut self, current: &crate::session::HarnessSession) {
+        let mut rebased = current.clone();
+        let selected = self.configured.as_ref();
+        rebased.model = selected.model.clone();
+        rebased.resolved_model = if selected.model == self.authority.session.model {
+            current.resolved_model.clone()
+        } else {
+            selected.resolved_model.clone()
+        };
+        rebased.effort = selected.effort.clone();
+        rebased.context_window = selected.context_window.clone();
+        rebased.service_tier = selected.service_tier;
+        rebased.access = selected.access.clone();
+        rebased.approval_mode = selected.approval_mode;
+        rebased.auto_compaction = selected.auto_compaction.clone();
+        rebased.plan_executor = selected.plan_executor.clone();
+        rebased.plan_compact = selected.plan_compact;
+        rebased.shell = selected.shell;
+        rebased.approval_timeout = selected.approval_timeout;
+        rebased.tool_timeout = selected.tool_timeout;
+        *self.configured = rebased;
+    }
 }
 
 pub(crate) struct ConfigurationCommit {
@@ -201,8 +268,8 @@ impl ConfigurationReconcileJob {
     }
 }
 
-/// Preserve the paused exchange and its postprocessing while permission work resumes.
-pub(crate) enum PermissionResume {
+/// Preserve the owner-selected paused exchange and its postprocessing during continuation.
+pub(crate) enum SelectedContinuation {
     NoWork,
     Staged {
         interaction: Box<foreground_dispatch::StagedInteraction>,
@@ -225,6 +292,8 @@ impl ConfigurationPreparation {
             .unwrap_or(broker.session.service_tier);
         let nonstandard_tier = tier != crate::provider::ServiceTier::Standard;
         p.get("plan_executor_model").is_some()
+            || p.get("model").and_then(Value::as_str).is_some()
+            || p.pointer("/ask_model/model").is_some()
             || p.get("plan_executor_effort").is_some()
             || p.get("plan_executor_enabled").and_then(Value::as_bool) == Some(true)
             || (p.get("validate").and_then(Value::as_bool) == Some(true) && selection)
@@ -269,26 +338,6 @@ impl HarnessBroker {
             Ok(true)
         })
     }
-    /// Stage operation progress for delivery outside the broker lock.
-    pub(crate) fn prepare_configuration_progress(
-        &mut self,
-        operation_id: Option<&str>,
-        state: ConfigurationProgressState,
-    ) -> Result<Option<PendingProviderDelivery>> {
-        operation_id
-            .map(str::to_owned)
-            .or_else(|| self.active_operation_id.clone())
-            .map(|operation_id| {
-                self.prepare_provider_delivery(AppliedProviderEvent::Update(
-                    SessionUpdate::ConfigurationProgress {
-                        operation_id,
-                        state,
-                    },
-                ))
-            })
-            .transpose()
-    }
-
     /// Confirm only the settings revision that this operation actually applied.
     pub(crate) fn confirm_configuration_application(&mut self, action: &Value) -> Result<()> {
         let Some(revision) = action
@@ -407,7 +456,7 @@ impl HarnessBroker {
             )?;
             anyhow::ensure!(
                 params["settings_revision"].as_u64() == Some(settings.revision),
-                "settings revision was superseded"
+                ConfigurationRejection::SettingsChanged
             );
             params["access"] =
                 serde_json::to_value(settings.desired.access.clone().unwrap_or_default())?;
@@ -457,10 +506,12 @@ impl HarnessBroker {
             .transpose()?;
         if let Some(value) = params.get("auto_compaction") {
             let policy: crate::session::AutoCompaction = serde_json::from_value(value.clone())?;
-            policy.validate(configured.context_usage.as_ref())?;
+            policy
+                .validate(configured.context_usage.as_ref())
+                .context(ConfigurationRejection::CompactionPolicyInvalid)?;
             anyhow::ensure!(
                 !policy.enabled || self.capability.native_compact,
-                "This provider does not support automatic compaction"
+                ConfigurationRejection::CompactionUnavailable
             );
             configured.auto_compaction = policy;
         }
@@ -472,10 +523,14 @@ impl HarnessBroker {
             .map(|value| serde_json::from_value::<crate::session::AccessPolicy>(value.clone()))
             .transpose()?
             .map(crate::session::AccessPolicy::validate)
-            .transpose()?;
+            .transpose()
+            .context(ConfigurationRejection::AccessPolicyInvalid)?;
         if let Some(value) = params.get("shell") {
             configured.shell = serde_json::from_value(value.clone())?;
-            configured.shell.executable()?;
+            configured
+                .shell
+                .executable()
+                .context(ConfigurationRejection::ShellUnavailable)?;
         }
         if let Some(value) = params.get("approval_mode") {
             configured.approval_mode = serde_json::from_value(value.clone())?;
@@ -495,11 +550,22 @@ impl HarnessBroker {
             .map(|value| serde_json::from_value::<crate::provider::ServiceTier>(value.clone()))
             .transpose()?;
         if let Some(tier) = requested_service_tier {
-            tier.validate(&self.capability)?;
+            tier.validate(&self.capability)
+                .context(ConfigurationRejection::ServiceTierUnavailable)?;
         }
         let requested_model = params.get("model").and_then(Value::as_str);
         let requested_effort = params.get("effort").and_then(Value::as_str);
         let requested_context_window = params.get("context_window").and_then(Value::as_str);
+        anyhow::ensure!(
+            !requested_model.is_some_and(|model| model != self.session.model)
+                || self.capability.model_selection,
+            ConfigurationRejection::ModelUnavailable,
+        );
+        anyhow::ensure!(
+            !requested_effort.is_some_and(|effort| effort != self.session.effort)
+                || self.capability.effort_selection,
+            ConfigurationRejection::EffortUnavailable,
+        );
         let validate_selection = params.get("validate").and_then(Value::as_bool) == Some(true);
         let mut plan_executor = self.session.plan_executor.clone();
         let mut plan_compact = self.session.plan_compact;
@@ -507,7 +573,7 @@ impl HarnessBroker {
             if enabled {
                 anyhow::ensure!(
                     self.capability.native_compact,
-                    "current provider does not support context compaction"
+                    ConfigurationRejection::CompactionUnavailable
                 );
             }
             plan_compact = enabled;
@@ -516,7 +582,7 @@ impl HarnessBroker {
             if enabled {
                 anyhow::ensure!(
                     self.capability.model_selection,
-                    "current provider does not support model selection"
+                    ConfigurationRejection::PlanExecutorUnavailable
                 );
                 if plan_executor.model.is_none() {
                     let active_model = self
@@ -528,7 +594,7 @@ impl HarnessBroker {
                         models
                             .iter()
                             .find(|candidate| candidate.is_default)
-                            .context("the provider has no default model")?
+                            .context(ConfigurationRejection::ModelUnavailable)?
                             .id
                             .clone()
                     } else {
@@ -563,7 +629,8 @@ impl HarnessBroker {
         let selected_tier = requested_service_tier.unwrap_or(self.session.service_tier);
         let validate_tier = selected_tier != crate::provider::ServiceTier::Standard
             && (requested_service_tier.is_some() || requested_model.is_some());
-        if validate_tier
+        if requested_model.is_some()
+            || validate_tier
             || (validate_selection
                 && (requested_model.is_some()
                     || requested_effort.is_some()
@@ -587,44 +654,42 @@ impl HarnessBroker {
                 anyhow::ensure!(
                     target_model
                         .is_some_and(|candidate| model == "default" || candidate.id == model),
-                    "model {model} is unavailable for this provider"
+                    ConfigurationRejection::ModelUnavailable
                 );
             }
             if validate_tier {
-                selected_tier.validate_model(
-                    target_model.context("the selected model is unavailable for this provider")?,
-                )?;
+                selected_tier
+                    .validate_model(target_model.context(ConfigurationRejection::ModelUnavailable)?)
+                    .context(ConfigurationRejection::ServiceTierUnavailable)?;
             }
             if let Some(effort) = requested_effort {
-                let model =
-                    target_model.context("the active model is unavailable for this provider")?;
+                let model = target_model.context(ConfigurationRejection::ModelUnavailable)?;
                 if !model.reasoning.is_empty() {
                     anyhow::ensure!(
                         model.reasoning.iter().any(|candidate| candidate == effort),
-                        "reasoning effort {effort} is unavailable for model {}",
-                        model.id
+                        ConfigurationRejection::EffortUnavailable
                     );
                 }
             }
             if let Some(context_window) = requested_context_window {
-                let model =
-                    target_model.context("the active model is unavailable for this provider")?;
+                let model = target_model.context(ConfigurationRejection::ModelUnavailable)?;
                 if !model.context_window.is_empty() {
                     anyhow::ensure!(
                         model
                             .context_window
                             .iter()
                             .any(|candidate| candidate.id == context_window),
-                        "context window {context_window} is unavailable for model {}",
-                        model.id
+                        ConfigurationRejection::ContextWindowUnavailable
                     );
                 }
             }
         }
         if let Some(model) = params.get("model").and_then(Value::as_str) {
             anyhow::ensure!(!model.trim().is_empty(), "model cannot be empty");
-            configured.model = model.to_owned();
-            configured.resolved_model = (model != "default").then(|| model.to_owned());
+            if model != configured.model {
+                configured.model = model.to_owned();
+                configured.resolved_model = (model != "default").then(|| model.to_owned());
+            }
         }
         if let Some(effort) = params.get("effort").and_then(Value::as_str) {
             anyhow::ensure!(!effort.trim().is_empty(), "effort cannot be empty");
@@ -641,6 +706,37 @@ impl HarnessBroker {
         }
         configured.plan_executor = plan_executor;
         configured.plan_compact = plan_compact;
+        let question_model = params
+            .get("ask_model")
+            .map(|value| {
+                let selection: crate::settings::AskModel = if value.is_null() {
+                    crate::settings::AskModel::default()
+                } else {
+                    serde_json::from_value(value.clone())?
+                };
+                if selection.model.is_some() {
+                    anyhow::ensure!(
+                        self.capability.model_selection,
+                        ConfigurationRejection::ModelUnavailable
+                    );
+                }
+                selection
+                    .resolve(&configured, models)
+                    .map_err(|error| match error {
+                        crate::settings::AskModelError::ModelRequired
+                        | crate::settings::AskModelError::ModelUnavailable => {
+                            ConfigurationRejection::ModelUnavailable
+                        }
+                        crate::settings::AskModelError::EffortUnavailable => {
+                            ConfigurationRejection::EffortUnavailable
+                        }
+                        crate::settings::AskModelError::ServiceTier(_) => {
+                            ConfigurationRejection::ServiceTierUnavailable
+                        }
+                    })?;
+                Ok::<_, anyhow::Error>(selection)
+            })
+            .transpose()?;
         let subagent_tools = params.get("subagent_tools").and_then(Value::as_bool);
         let lsp_tools = params.get("lsp_tools").and_then(Value::as_bool);
         let session_tools = params
@@ -680,6 +776,7 @@ impl HarnessBroker {
             lsp_tools,
             session_tools,
             status_thoughts,
+            question_model,
             delegation_registry_changed,
             update_model_preference,
             resource_selection,
@@ -693,6 +790,9 @@ impl HarnessBroker {
         candidate: &ConfigurationCandidate,
     ) -> Result<Option<ConfigurationReconcileJob>> {
         self.validate_configuration_authority(&candidate.authority)?;
+        if candidate.resource_selection.is_some() {
+            self.validate_native_configuration_authority(&candidate.authority)?;
+        }
         candidate
             .resource_selection
             .as_ref()
@@ -733,6 +833,18 @@ impl HarnessBroker {
             }
             return Err(error);
         }
+        if candidate.uncertainty.is_some() {
+            self.validate_native_configuration_authority(&candidate.authority)?;
+        }
+        if candidate.params.get("auto_compaction").is_some() {
+            candidate
+                .configured
+                .auto_compaction
+                .validate(self.session.context_usage.as_ref())?;
+        }
+        candidate.rebase(&self.session);
+        let refresh_check_policy =
+            candidate.automatic_checks.is_some() || candidate.resource_selection.is_some();
         let mut uncertainty = candidate.uncertainty.take();
         let expected_task = candidate.authority.task.clone();
         let controller = self.task_controller.clone();
@@ -799,7 +911,31 @@ impl HarnessBroker {
                 changed = true;
             }
         }
-        let provider_setting = (candidate.params.get("settings_revision").is_none() && (candidate.update_model_preference || candidate.params.get("service_tier").is_some() || candidate.params.get("plan_executor_enabled").is_some())).then(|| json!({"model":candidate.configured.model,"effort":candidate.configured.effort,"context_window":candidate.configured.context_window,"service_tier":candidate.configured.service_tier,"plan_executor":candidate.configured.plan_executor}));
+        let provider_setting = if candidate.params.get("settings_revision").is_none() {
+            let mut fields = serde_json::Map::new();
+            if candidate.update_model_preference
+                || candidate.params.get("service_tier").is_some()
+                || candidate.params.get("plan_executor_enabled").is_some()
+                || candidate.params.get("plan_executor_model").is_some()
+                || candidate.params.get("plan_executor_effort").is_some()
+            {
+                let selection = json!({"model":candidate.configured.model,"effort":candidate.configured.effort,
+                    "context_window":candidate.configured.context_window,"service_tier":candidate.configured.service_tier,
+                    "plan_executor":candidate.configured.plan_executor});
+                fields.extend(
+                    selection
+                        .as_object()
+                        .expect("provider preference encoding is an object")
+                        .clone(),
+                );
+            }
+            if let Some(selection) = &candidate.question_model {
+                fields.insert("ask_model".into(), serde_json::to_value(selection)?);
+            }
+            (!fields.is_empty()).then_some(Value::Object(fields))
+        } else {
+            None
+        };
         let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
         let target = crate::settings::SettingTarget {
             scope,
@@ -907,6 +1043,14 @@ impl HarnessBroker {
             }
             return Err(error.context(crate::provider::ProviderError::DeliveryUncertain));
         }
+        if refresh_check_policy
+            && !settings
+                .get(&workspace, &session_id, &provider_id)?
+                .desired
+                .automatic_checks_enabled()
+        {
+            self.observer.completion_queue.finish()?;
+        }
         let cleanup = if needs_cleanup {
             Some(self.prepare_configuration_cleanup()?)
         } else {
@@ -929,29 +1073,27 @@ impl HarnessBroker {
     ) -> Result<()> {
         anyhow::ensure!(
             self.capability.model_selection,
-            "current provider does not support model selection"
+            ConfigurationRejection::PlanExecutorUnavailable
         );
         let model = executor
             .model
             .as_deref()
-            .context("plan executor model is not configured")?;
+            .context(ConfigurationRejection::PlanExecutorUnavailable)?;
         let effort = executor
             .effort
             .as_deref()
-            .context("plan executor thinking is not configured")?;
+            .context(ConfigurationRejection::PlanExecutorUnavailable)?;
         let selected = model_list
             .iter()
             .find(|candidate| candidate.id == model)
-            .with_context(|| {
-                format!("plan executor model {model} is unavailable for this provider")
-            })?;
+            .context(ConfigurationRejection::PlanExecutorUnavailable)?;
         anyhow::ensure!(
             selected.reasoning.is_empty()
                 || selected
                     .reasoning
                     .iter()
                     .any(|candidate| candidate == effort),
-            "plan executor thinking {effort} is unavailable for model {model}"
+            ConfigurationRejection::PlanExecutorUnavailable
         );
         Ok(())
     }
@@ -1005,7 +1147,7 @@ impl HarnessBroker {
         &self,
         mut result: ConfigurationReconcileResult,
     ) -> Result<()> {
-        if let Err(error) = self.validate_configuration_authority(&result.authority) {
+        if let Err(error) = self.validate_native_configuration_authority(&result.authority) {
             if result.uncertainty.is_some() {
                 return Err(error.context(crate::provider::ProviderError::DeliveryUncertain));
             }
@@ -1026,10 +1168,10 @@ impl HarnessBroker {
         candidate: &mut ConfigurationCandidate,
         mut result: ConfigurationReconcileResult,
     ) -> Result<()> {
-        if let Err(error) = self.validate_configuration_authority(&result.authority) {
+        if let Err(error) = self.validate_native_configuration_authority(&result.authority) {
             return Err(error.context(crate::provider::ProviderError::DeliveryUncertain));
         }
-        self.validate_configuration_authority(&candidate.authority)
+        self.validate_native_configuration_authority(&candidate.authority)
             .map_err(|error| error.context(crate::provider::ProviderError::DeliveryUncertain))?;
         anyhow::ensure!(
             result.uncertainty.is_some(),
@@ -1083,9 +1225,7 @@ impl HarnessBroker {
                 && Arc::ptr_eq(&self.provider, &authority.provider)
                 && current.workspace == expected.workspace
                 && current.provider == expected.provider
-                && current.provider_session_id == expected.provider_session_id
                 && current.model == expected.model
-                && current.resolved_model == expected.resolved_model
                 && current.effort == expected.effort
                 && current.context_window == expected.context_window
                 && current.service_tier == expected.service_tier
@@ -1094,7 +1234,6 @@ impl HarnessBroker {
                 && current.plan_executor == expected.plan_executor
                 && current.plan_compact == expected.plan_compact
                 && current.auto_compaction == expected.auto_compaction
-                && current.context_usage == expected.context_usage
                 && current.shell == expected.shell
                 && current.approval_timeout == expected.approval_timeout
                 && current.tool_timeout == expected.tool_timeout
@@ -1107,6 +1246,19 @@ impl HarnessBroker {
                     authority.task.as_ref()
                 ),
             "configuration authority changed during provider work"
+        );
+        Ok(())
+    }
+
+    /// Require the captured native conversation as well as host authority for provider writes and collection.
+    fn validate_native_configuration_authority(
+        &self,
+        authority: &ConfigurationAuthority,
+    ) -> Result<()> {
+        self.validate_configuration_authority(authority)?;
+        anyhow::ensure!(
+            self.session.provider_session_id == authority.session.provider_session_id,
+            "native configuration binding changed during provider work"
         );
         Ok(())
     }
@@ -1191,6 +1343,20 @@ impl HarnessBroker {
         })
     }
 
+    /// Resolve caller policy intent inside the owner before choosing affected execution.
+    pub(crate) fn owner_permission_patch(
+        &self,
+        change: crate::task::PermissionChange,
+    ) -> Result<crate::exchange::command::SessionConfigurationPatch> {
+        let captured = self.prepare_permission_configuration(&json!({"change":change}))?;
+        Ok(
+            crate::exchange::command::SessionConfigurationPatch::execution_policy(
+                captured.selected_access,
+                captured.selected_approval,
+            ),
+        )
+    }
+
     /// Commit the captured permission change under the still-current task authority.
     pub(crate) fn commit_permission_configuration(
         &mut self,
@@ -1245,10 +1411,18 @@ impl HarnessBroker {
     }
 
     /// Stage the existing paused exchange without polling provider work under the broker.
-    pub(crate) fn prepare_permission_resume(&mut self, text: String) -> Result<PermissionResume> {
+    pub(crate) fn prepare_selected_continuation(
+        &mut self,
+        selected: &crate::provider::ExchangeId,
+        text: String,
+    ) -> Result<SelectedContinuation> {
+        anyhow::ensure!(
+            self.owner_resume_selected(selected)?,
+            "selected exchange no longer requires resumption"
+        );
         let interaction = self
             .store
-            .latest_exchange(&self.session.id)?
+            .load_exchange(selected.as_str())?
             .context("no Harness interaction is available to resume")?;
         anyhow::ensure!(
             interaction.state() == ExchangeState::Running
@@ -1257,7 +1431,7 @@ impl HarnessBroker {
                     .turn
                     .iter()
                     .all(|turn| turn.state() != crate::turn::TurnState::Running),
-            "the latest Harness exchange is not paused for resumption"
+            "the selected Harness exchange is not paused for resumption"
         );
         let pending_plan = if self.active_plan_awaits_input()? {
             Some(self.active_elicitation_plan()?)
@@ -1270,7 +1444,7 @@ impl HarnessBroker {
             .or(interaction.elicitation());
         if let Some(elicitation) = elicitation {
             if !elicitation.clarification_active {
-                return Ok(PermissionResume::NoWork);
+                return Ok(SelectedContinuation::NoWork);
             }
             let clarification = interaction
                 .node_list
@@ -1296,17 +1470,18 @@ impl HarnessBroker {
                 PlanPrompt::question_follow_up(&elicitation_json, &follow_up)
             };
             let mode = self.task_prompt_mode()?;
-            let staged = self.stage_foreground_interaction(
+            let staged = self.stage_selected_foreground_interaction(
                 &prompt,
                 mode,
                 None,
                 ProviderInput::from_text(prompt.clone()),
+                Some(selected),
             )?;
             let clarification = Some(match pending_plan {
                 Some(plan) => foreground_dispatch::ClarificationContext::Plan { plan_id: plan.id },
                 None => foreground_dispatch::ClarificationContext::Interaction,
             });
-            return Ok(PermissionResume::Staged {
+            return Ok(SelectedContinuation::Staged {
                 interaction: Box::new(staged),
                 clarification,
                 planning: None,
@@ -1314,7 +1489,7 @@ impl HarnessBroker {
         }
         anyhow::ensure!(
             !interaction.awaiting_input(),
-            "the latest Harness exchange is awaiting a user decision"
+            "the selected Harness exchange is awaiting a user decision"
         );
         let mode = self.task_prompt_mode()?;
         let planning = if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
@@ -1326,78 +1501,20 @@ impl HarnessBroker {
         } else {
             None
         };
-        let staged = self.stage_foreground_interaction(
+        let staged = self.stage_selected_foreground_interaction(
             &text,
             mode,
             None,
             ProviderInput::from_text(text.clone()),
+            Some(selected),
         )?;
-        Ok(PermissionResume::Staged {
+        Ok(SelectedContinuation::Staged {
             interaction: Box::new(staged),
             clarification: None,
             planning,
         })
     }
 
-    /// Stage the existing task operation's resume progress for ordered delivery.
-    pub(crate) fn prepare_permission_resume_progress(
-        &mut self,
-        operation_id: &str,
-    ) -> Result<PendingProviderDelivery> {
-        self.prepare_provider_delivery(AppliedProviderEvent::Update(
-            SessionUpdate::ConfigurationProgress {
-                operation_id: operation_id.to_owned(),
-                state: ConfigurationProgressState::Resuming,
-            },
-        ))
-    }
-
-    /// Stage the common configuration notification and optional resume after compaction.
-    pub(crate) fn finish_compaction_configuration(
-        &mut self,
-        action: &Value,
-    ) -> Result<PermissionConfigurationResult> {
-        let operation_id = action
-            .get("operation_id")
-            .and_then(Value::as_str)
-            .or_else(|| action.pointer("/_command/id").and_then(Value::as_str))
-            .or(self.active_operation_id.as_deref())
-            .map(str::to_owned);
-        let update = SessionUpdate::Configuration {
-            session: Box::new(self.session_view()?),
-            access_abbreviation: self.session.access.abbreviation().into(),
-            operation_id,
-            catalog: Box::new(self.provider_catalog_request()?),
-        };
-        let delivery = self.prepare_provider_delivery(AppliedProviderEvent::Update(update))?;
-        let resume = if action
-            .get("resume")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            let previous = self
-                .store
-                .latest_exchange(&self.session.id)?
-                .context("interrupted exchange is missing")?;
-            let notice = "Continue the interrupted request using the current repository and completed tool results. Do not repeat completed actions.";
-            if previous.is_finished() {
-                None
-            } else {
-                Some(if previous.elicitation().is_some() {
-                    notice.to_owned()
-                } else {
-                    format!("{notice}\n\nOriginal request: {}", previous.prompt)
-                })
-            }
-        } else {
-            None
-        };
-        Ok(PermissionConfigurationResult {
-            delivery,
-            resume,
-            value: serde_json::to_value(self.snapshot()?)?,
-        })
-    }
     pub(super) async fn apply_configuration(
         &mut self,
         action: Value,
@@ -1559,6 +1676,39 @@ impl HarnessBroker {
 mod owned_tests {
     use super::*;
 
+    /// Preserve context observations that arrive between settings preparation and host commit.
+    #[tokio::test]
+    async fn configuration_commit_preserves_newer_context_observations() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let preparation = broker.prepare_configuration(json!({"status_thoughts":false}))?;
+        let candidate = broker.build_configuration_candidate(preparation, &[])?;
+        assert_eq!(candidate.effect(), ConfigurationEffect::Local);
+        broker.session.context_usage = crate::session::ContextUsage::reported(900, 4000);
+        broker.session.resolved_model = Some("observed-model".into());
+        broker.session.provider_session_id = Some("established-thread".into());
+        broker.commit_configuration_candidate(candidate)?;
+        let observed = broker
+            .session
+            .context_usage
+            .as_ref()
+            .context("context observation was lost")?;
+        assert_eq!(observed.used, 900);
+        assert_eq!(observed.size, 4000);
+        assert_eq!(
+            broker.session.resolved_model.as_deref(),
+            Some("observed-model")
+        );
+        assert_eq!(
+            broker.session.provider_session_id.as_deref(),
+            Some("established-thread")
+        );
+        assert!(!broker.observer.status_thoughts.load(Ordering::Relaxed));
+        Ok(())
+    }
+
     /// A failed settings COMMIT retains the host intent and replays it exactly once.
     #[tokio::test]
     async fn configuration_commit_failure_recovers_after_host_write() -> Result<()> {
@@ -1675,7 +1825,8 @@ mod owned_tests {
         let data = tempfile::tempdir()?;
         let mut broker =
             super::super::test::planning_question_broker(workspace.path(), data.path(), false);
-        let prepared = broker.prepare_ask_model_configuration(Value::Null)?;
+        let preparation = broker.prepare_configuration(json!({"ask_model":null}))?;
+        let prepared = broker.build_configuration_candidate(preparation, &[])?;
         let mut settings = crate::settings::SettingsStore::open(data.path())?;
         settings.patch(
             crate::settings::SettingTarget {
@@ -1688,11 +1839,7 @@ mod owned_tests {
                 ..Default::default()
             },
         )?;
-        assert!(
-            broker
-                .commit_ask_model_configuration(prepared, &[])
-                .is_err()
-        );
+        assert!(broker.commit_configuration_candidate(prepared).is_err());
         Ok(())
     }
 

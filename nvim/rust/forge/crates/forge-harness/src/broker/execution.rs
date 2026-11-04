@@ -470,7 +470,7 @@ impl HarnessBroker {
         self.task_controller.apply(
             &mut self.store,
             &permit,
-            crate::task::TaskEvent::ExecutionUpdated(execution.clone()),
+            crate::task::TaskEvent::ExecutionUpdated(Box::new(execution.clone())),
             self.clock.now_ms(),
         )?;
         Ok(
@@ -751,7 +751,7 @@ impl HarnessBroker {
                 self.task_controller.apply_with_effects(
                     &mut self.store,
                     task_permit,
-                    crate::task::TaskEvent::ExecutionUpdated(execution.clone()),
+                    crate::task::TaskEvent::ExecutionUpdated(Box::new(execution.clone())),
                     crate::storage::TaskEffects {
                         plan: vec![plan.clone()],
                         ..Default::default()

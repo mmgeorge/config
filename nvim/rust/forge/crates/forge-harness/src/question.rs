@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
@@ -239,8 +239,17 @@ struct QuestionState {
     snapshot: QuestionSnapshot,
     outbox: Vec<QuestionOutbox>,
     operations: BTreeMap<String, String>,
+    /// Exact committed mutation responses; old records explicitly have no recoverable result.
+    #[serde(default)]
+    mutation_results: BTreeMap<String, QuestionSnapshot>,
+    /// Exact completed tool-wait answers, keyed by their immutable ordered question identities.
+    #[serde(default)]
+    wait_results: BTreeMap<String, Vec<QuestionRecord>>,
     chat_continuation: BTreeMap<String, ChatContinuation>,
     cancelled_exchanges: BTreeSet<String>,
+    /// Canonical answer/correction messages already returned to a live tool observer.
+    #[serde(default)]
+    observed_tool_messages: BTreeSet<String>,
 }
 
 /// Retain one automatic continuation for an interrupted chat request.
@@ -271,9 +280,27 @@ impl QuestionOrigin<'_> {
     }
 }
 
+/// Distinguish immutable creation conflicts from unavailable or incomplete durable receipts.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QuestionCreationReplayError {
+    /// The authenticated call identity already carries different creation input.
+    #[error("question call identity was reused for different input")]
+    IdentityConflict,
+    /// Older mutation receipts did not retain their original response snapshot.
+    #[error("the legacy question mutation has no retained response snapshot")]
+    LegacyResultUnavailable,
+    /// The stored creation record no longer has every promised question identity.
+    #[error("question creation receipt is incomplete")]
+    Incomplete,
+    /// The question journal could not be read or encoded.
+    #[error("question creation receipt is unavailable")]
+    State(#[source] anyhow::Error),
+}
+
 /// Serialize question changes in their own transaction, without an execution lock.
 pub(crate) struct QuestionController {
     connection: Mutex<Connection>,
+    /// Each guard registers once per ID; repeated IDs represent independently owned waits.
     waiting: Mutex<Vec<QuestionId>>,
     session_id: String,
     pub(crate) changed: tokio::sync::watch::Sender<u64>,
@@ -318,11 +345,24 @@ impl QuestionController {
             .lock()
             .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
         let state = self.load(&connection)?;
-        Ok(state.snapshot.questions.iter().any(|question| {
-            question.id == *id
-                && !state.cancelled_exchanges.contains(&question.exchange_id)
-                && !matches!(question.resolution, QuestionResolution::Retired { .. })
-        }))
+        let Some(question) = state
+            .snapshot
+            .questions
+            .iter()
+            .find(|question| question.id == *id)
+        else {
+            return Ok(false);
+        };
+        if state.cancelled_exchanges.contains(&question.exchange_id)
+            || matches!(question.resolution, QuestionResolution::Retired { .. })
+        {
+            return Ok(false);
+        }
+        Ok(task_attribution_is_current(
+            &connection,
+            &self.session_id,
+            question.task_id.as_deref(),
+        )?)
     }
 
     /// Acknowledge durable input admission; provider delivery remains independently tracked.
@@ -387,6 +427,40 @@ impl QuestionController {
         ))
     }
 
+    /// Revalidate immutable taskless continuation authority before any queued input is delivered.
+    pub(crate) fn workflow_continuation_is_current(
+        &self,
+        selection: &crate::exchange::command::ExchangeContinuationSelection,
+    ) -> Result<bool> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let latest: Option<String> = connection.query_row("SELECT id FROM exchange_record WHERE session_id=?1 AND agent_id=?2 ORDER BY ordinal DESC LIMIT 1", params![self.session_id,crate::session::HarnessSession::primary_agent_id(&self.session_id)], |row| row.get(0)).optional()?;
+        if latest.as_deref() != Some(selection.id().as_str()) {
+            return Ok(false);
+        }
+        let payload: Option<String> = connection
+            .query_row(
+                "SELECT payload FROM exchange_record WHERE session_id=?1 AND id=?2",
+                params![self.session_id, selection.id().as_str()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(payload) = payload else {
+            return Ok(false);
+        };
+        let exchange: crate::exchange::Exchange = serde_json::from_str(&payload)?;
+        let task: Option<String> = connection.query_row(
+            "SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1",
+            [&self.session_id],
+            |row| row.get(0),
+        )?;
+        let task: Option<crate::task::Task> =
+            task.map(|task| serde_json::from_str(&task)).transpose()?;
+        Ok(selection.validate(&exchange, task.as_ref()).is_ok())
+    }
+
     /// Revoke cancelled chat continuations while keeping optional questions answerable.
     pub(crate) fn cancel_chat(&self, active_exchange: Option<&str>) -> Result<()> {
         self.update(|state| {
@@ -422,6 +496,124 @@ impl QuestionController {
         })
     }
 
+    /// Replay a committed question mutation without requiring the originating invocation to remain live.
+    pub(crate) fn replay_mutation(
+        &self,
+        command: &QuestionCommand,
+    ) -> std::result::Result<Option<QuestionSnapshot>, QuestionCreationReplayError> {
+        let connection = self.connection.lock().map_err(|_| {
+            QuestionCreationReplayError::State(anyhow::anyhow!("question store poisoned"))
+        })?;
+        let state = self
+            .load(&connection)
+            .map_err(QuestionCreationReplayError::State)?;
+        let Some(previous) = state.operations.get(&command.operation_id) else {
+            return Ok(None);
+        };
+        let encoded = serde_json::to_string(command)
+            .map_err(|error| QuestionCreationReplayError::State(error.into()))?;
+        if previous != &encoded {
+            return Err(QuestionCreationReplayError::IdentityConflict);
+        }
+        state
+            .mutation_results
+            .get(&command.operation_id)
+            .cloned()
+            .map(Some)
+            .ok_or(QuestionCreationReplayError::LegacyResultUnavailable)
+    }
+
+    /// Replay an immutable creation receipt without validating live execution or publishing again.
+    pub(crate) fn replay_creation(
+        &self,
+        operation_id: &str,
+        exchange_id: &str,
+        origin: QuestionOrigin<'_>,
+        drafts: &[QuestionDraft],
+    ) -> std::result::Result<Option<Vec<QuestionId>>, QuestionCreationReplayError> {
+        let connection = self.connection.lock().map_err(|_| {
+            QuestionCreationReplayError::State(anyhow::anyhow!("question store poisoned"))
+        })?;
+        let state = self
+            .load(&connection)
+            .map_err(QuestionCreationReplayError::State)?;
+        let Some(previous) = state.operations.get(operation_id) else {
+            return Ok(None);
+        };
+        let request = creation_request(exchange_id, &origin, drafts)
+            .map_err(QuestionCreationReplayError::State)?;
+        let legacy =
+            serde_json::to_string(&(exchange_id, matches!(origin, QuestionOrigin::Chat), drafts))
+                .map_err(|error| QuestionCreationReplayError::State(error.into()))?;
+        if previous != &request && previous != &legacy {
+            return Err(QuestionCreationReplayError::IdentityConflict);
+        }
+        let prefix = format!("{}:", crate::plan::digest(operation_id.as_bytes()));
+        let ids: Vec<_> = state
+            .snapshot
+            .questions
+            .iter()
+            .filter(|question| question.id.0.starts_with(&prefix))
+            .map(|question| question.id.clone())
+            .collect();
+        if ids.len() != drafts.len() {
+            return Err(QuestionCreationReplayError::Incomplete);
+        }
+        Ok(Some(ids))
+    }
+
+    /// Attach an answer observer to an existing creation without mutating its durable questions.
+    pub(crate) fn replay_tool_wait(
+        self: &Arc<Self>,
+        ids: Vec<QuestionId>,
+    ) -> Result<LocalQuestionWait> {
+        let changed = self.changed.subscribe();
+        let result = self.wait_result(&ids)?;
+        self.waiting
+            .lock()
+            .map_err(|_| anyhow::anyhow!("question wait registry poisoned"))?
+            .extend(ids.iter().cloned());
+        Ok(LocalQuestionWait {
+            observation: Some(QuestionWaitObservation {
+                controller: self.clone(),
+                ids,
+                changed,
+                result,
+            }),
+        })
+    }
+
+    /// Read a completed wait result without replacing it with later answers or corrections.
+    fn wait_result(
+        &self,
+        ids: &[QuestionId],
+    ) -> std::result::Result<Option<Vec<QuestionRecord>>, QuestionWaitError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| QuestionWaitError::StateUnavailable)?;
+        let state = self.load(&connection).map_err(QuestionWaitError::State)?;
+        let key = wait_result_key(ids)?;
+        if let Some(result) = state.wait_results.get(&key) {
+            return Ok(Some(result.clone()));
+        }
+        if state
+            .snapshot
+            .questions
+            .iter()
+            .filter(|question| ids.contains(&question.id))
+            .any(|question| {
+                question
+                    .discussion
+                    .iter()
+                    .any(|message| state.observed_tool_messages.contains(&message.id))
+            })
+        {
+            return Err(QuestionWaitError::LegacyResultUnavailable);
+        }
+        Ok(None)
+    }
+
     /// Append questions atomically before acknowledging the model tool call.
     pub(crate) fn ask(
         &self,
@@ -442,7 +634,8 @@ impl QuestionController {
             QuestionDelivery::Message
         };
         let task = origin.task();
-        let request = serde_json::to_string(&(exchange_id, continues_chat, &drafts))?;
+        let request = creation_request(exchange_id, &origin, &drafts)?;
+        let legacy_request = serde_json::to_string(&(exchange_id, continues_chat, &drafts))?;
         self.update_guarded(task, |state| {
             ensure!(
                 !state.cancelled_exchanges.contains(exchange_id),
@@ -450,7 +643,7 @@ impl QuestionController {
             );
             if let Some(previous) = state.operations.get(operation_id) {
                 ensure!(
-                    previous == &request,
+                    previous == &request || previous == &legacy_request,
                     "question operation identity was reused"
                 );
                 return Ok(state
@@ -499,6 +692,7 @@ impl QuestionController {
     /// Keep the calling tool pending until every question is answered or withdrawn.
     /// Dropping the future releases its answer destinations so later answers use normal delivery.
     #[cfg(test)]
+    #[cfg(test)]
     pub(crate) async fn ask_wait(
         &self,
         operation_id: &str,
@@ -510,6 +704,7 @@ impl QuestionController {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn ask_wait_authorized(
         &self,
         operation_id: &str,
@@ -552,27 +747,31 @@ impl QuestionController {
         }
     }
 
-    /// Register and publish the question before releasing the tool mutation lock.
-    pub(crate) fn begin_owned_wait(
+    /// Publish on the mutation owner and retain rollback custody until its wait resource is installed.
+    pub(crate) fn prepare_tool_wait(
         self: &std::sync::Arc<Self>,
         operation_id: &str,
         exchange_id: &str,
         task: Option<&crate::task::Task>,
         drafts: Vec<QuestionDraft>,
         authority: Option<&crate::tools::TaskAuthority>,
-    ) -> Result<OwnedQuestionWait> {
+    ) -> Result<LocalQuestionWait> {
         let ids = (0..drafts.len())
             .map(|index| QuestionId::for_operation(operation_id, index))
             .collect::<Vec<_>>();
         let changed = self.changed.subscribe();
+        let result = self.wait_result(&ids)?;
         self.waiting
             .lock()
             .map_err(|_| anyhow::anyhow!("question wait registry poisoned"))?
             .extend(ids.iter().cloned());
-        let wait = OwnedQuestionWait {
-            controller: self.clone(),
-            ids,
-            changed,
+        let wait = LocalQuestionWait {
+            observation: Some(QuestionWaitObservation {
+                controller: self.clone(),
+                result,
+                ids,
+                changed,
+            }),
         };
         let publish = || {
             self.ask(
@@ -589,6 +788,152 @@ impl QuestionController {
         Ok(wait)
     }
 
+    /// Commit observation/fallback evidence before retiring one registered answer destination.
+    pub(crate) fn retire_wait(
+        &self,
+        ids: &[QuestionId],
+        end: &QuestionWaitEnd,
+        policy: QuestionWaitPolicy,
+    ) -> std::result::Result<Option<Vec<QuestionRecord>>, QuestionWaitError> {
+        if matches!(end, QuestionWaitEnd::OwnerClosed)
+            || matches!(policy, QuestionWaitPolicy::Closing)
+                && !matches!(end, QuestionWaitEnd::Observed(_))
+        {
+            release_waiting(self, ids)?;
+            return Ok(None);
+        }
+
+        // Keep question-store-before-wait-registry order, matching answer admission.
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| QuestionWaitError::StateUnavailable)?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut state = self.load(&transaction).map_err(QuestionWaitError::State)?;
+        let mut waiting = self
+            .waiting
+            .lock()
+            .map_err(|_| QuestionWaitError::RegistryUnavailable)?;
+        if ids.iter().any(|id| !waiting.contains(id)) {
+            return Err(QuestionWaitError::RegistryMismatch);
+        }
+        let previous_observed = state.observed_tool_messages.len();
+        let mut result = None;
+        let mut result_inserted = false;
+        if let QuestionWaitEnd::Observed(report) = end {
+            if report.questions.len() != ids.len()
+                || report
+                    .questions
+                    .iter()
+                    .zip(ids)
+                    .any(|(question, id)| &question.id != id)
+            {
+                return Err(QuestionWaitError::ObservationMismatch);
+            }
+            let key = wait_result_key(ids)?;
+            if let Some(saved) = state.wait_results.get(&key) {
+                result = Some(saved.clone());
+            } else {
+                result = Some(report.questions.clone());
+                state.wait_results.insert(key, report.questions.clone());
+                result_inserted = true;
+            }
+            let retained_report = QuestionWaitReport::observed(
+                result
+                    .as_ref()
+                    .expect("observed wait selects a retained result"),
+            );
+            for observed in &retained_report.messages {
+                if !ids.contains(&observed.question)
+                    || !state.snapshot.questions.iter().any(|question| {
+                        question.id == observed.question
+                            && question.discussion.iter().any(|message| {
+                                message.id == observed.message
+                                    && matches!(
+                                        message.kind,
+                                        QuestionMessageKind::Answer
+                                            | QuestionMessageKind::Correction
+                                    )
+                            })
+                    })
+                {
+                    return Err(QuestionWaitError::ObservationMismatch);
+                }
+                state
+                    .observed_tool_messages
+                    .insert(observed.message.clone());
+            }
+        }
+
+        // Recover only messages with no remaining destination and no prior tool-observation receipt.
+        let mut recovered = Vec::new();
+        for id in ids.iter().filter(|id| {
+            matches!(policy, QuestionWaitPolicy::Live)
+                && waiting
+                    .iter()
+                    .filter(|registered| *registered == *id)
+                    .count()
+                    == 1
+        }) {
+            let question = state
+                .snapshot
+                .questions
+                .iter()
+                .find(|question| question.id == *id)
+                .ok_or(QuestionWaitError::TargetMissing)?;
+            if !task_attribution_is_current(
+                &transaction,
+                &self.session_id,
+                question.task_id.as_deref(),
+            )? || state.cancelled_exchanges.contains(&question.exchange_id)
+                || matches!(question.resolution, QuestionResolution::Retired { .. })
+            {
+                continue;
+            }
+            for message in question.discussion.iter().filter(|message| {
+                matches!(
+                    message.kind,
+                    QuestionMessageKind::Answer | QuestionMessageKind::Correction
+                )
+            }) {
+                if state.observed_tool_messages.contains(&message.id)
+                    || state.outbox.iter().any(|pending| pending.id == message.id)
+                {
+                    continue;
+                }
+                recovered.push(QuestionOutbox {
+                    id: message.id.clone(),
+                    question_id: question.id.clone(),
+                    task_id: question.task_id.clone(),
+                    kind: message.kind,
+                    text: message.text.clone(),
+                    reply: saved_reply(&state, &question.id, &message.id, message.kind)
+                        .map_err(QuestionWaitError::State)?,
+                });
+            }
+        }
+        let changed = result_inserted
+            || previous_observed != state.observed_tool_messages.len()
+            || !recovered.is_empty();
+        state.outbox.extend(recovered);
+        if changed {
+            state.snapshot.revision = state
+                .snapshot
+                .revision
+                .checked_add(1)
+                .ok_or(QuestionWaitError::RevisionExhausted)?;
+            transaction.execute("INSERT INTO session_question_state(session_id,format_version,payload) VALUES(?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET format_version=excluded.format_version,payload=excluded.payload", params![self.session_id, FORMAT_VERSION, serde_json::to_string(&state)?])?;
+        }
+        transaction.commit()?;
+        release_registered(&mut waiting, ids);
+        drop(waiting);
+        drop(connection);
+        if changed {
+            self.changed.send_replace(state.snapshot.revision);
+        }
+        Ok(result)
+    }
+
     /// Commit an explicit decision or discussion item together with its delivery intent.
     pub(crate) fn apply(&self, command: QuestionCommand) -> Result<QuestionSnapshot> {
         ensure!(
@@ -596,14 +941,26 @@ impl QuestionController {
             "question operation identity is required"
         );
         let encoded = serde_json::to_string(&command)?;
-        self.update(|state| {
-            if let Some(previous) = state.operations.get(&command.operation_id) {
-                ensure!(
-                    previous == &encoded,
-                    "question operation identity was reused"
-                );
-                return Ok(state.snapshot.clone());
-            }
+        let operation_id = command.operation_id.clone();
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("question store poisoned"))?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut state = self.load(&transaction)?;
+        if let Some(previous) = state.operations.get(&operation_id) {
+            ensure!(
+                previous == &encoded,
+                "question operation identity was reused"
+            );
+            return state
+                .mutation_results
+                .get(&operation_id)
+                .cloned()
+                .ok_or_else(|| QuestionCreationReplayError::LegacyResultUnavailable.into());
+        }
+        // Apply the mutation before retaining the exact response in the same durable transaction.
+        let mutate = |state: &mut QuestionState| -> Result<()> {
             let other_required_pending = state.snapshot.questions.iter().any(|question| {
                 question.id != command.question_id
                     && question.requirement == QuestionRequirement::Required
@@ -714,8 +1071,7 @@ impl QuestionController {
                 });
                 // Optional answers remain durable history without authorizing another native turn.
                 if cancelled {
-                    state.operations.insert(command.operation_id, encoded);
-                    return Ok(state.snapshot.clone());
+                    return Ok(());
                 }
                 let waiting = question.delivery == QuestionDelivery::ToolResult
                     && self
@@ -729,8 +1085,7 @@ impl QuestionController {
                         QuestionMessageKind::Answer | QuestionMessageKind::Correction
                     )
                 {
-                    state.operations.insert(command.operation_id, encoded);
-                    return Ok(state.snapshot.clone());
+                    return Ok(());
                 }
                 let response = match kind {
                     QuestionMessageKind::Clarification => {
@@ -782,10 +1137,23 @@ impl QuestionController {
                     reply,
                 });
             }
-            state.operations.insert(command.operation_id, encoded);
-            Ok(state.snapshot.clone())
-        })?;
-        self.snapshot()
+            Ok(())
+        };
+        mutate(&mut state)?;
+        state.snapshot.revision = state
+            .snapshot
+            .revision
+            .checked_add(1)
+            .context("question snapshot revision exhausted")?;
+        let snapshot = state.snapshot.clone();
+        state.operations.insert(operation_id.clone(), encoded);
+        state
+            .mutation_results
+            .insert(operation_id, snapshot.clone());
+        transaction.execute("INSERT INTO session_question_state(session_id,format_version,payload) VALUES(?1,?2,?3) ON CONFLICT(session_id) DO UPDATE SET format_version=excluded.format_version,payload=excluded.payload", params![self.session_id, FORMAT_VERSION, serde_json::to_string(&state)?])?;
+        transaction.commit()?;
+        self.changed.send_replace(snapshot.revision);
+        Ok(snapshot)
     }
 
     fn load(&self, connection: &Connection) -> Result<QuestionState> {
@@ -875,6 +1243,33 @@ impl QuestionController {
         self.changed.send_replace(state.snapshot.revision);
         Ok(result)
     }
+}
+
+/// Derive a stable wait receipt key from the exact ordered question identities.
+fn wait_result_key(ids: &[QuestionId]) -> std::result::Result<String, QuestionWaitError> {
+    Ok(crate::plan::digest(&serde_json::to_vec(ids)?))
+}
+
+/// Encode the complete durable creation intent, including answer destination and task attribution.
+fn creation_request(
+    exchange_id: &str,
+    origin: &QuestionOrigin<'_>,
+    drafts: &[QuestionDraft],
+) -> Result<String> {
+    let source = match origin {
+        QuestionOrigin::Chat => "chat",
+        QuestionOrigin::Task(_) => "task",
+        QuestionOrigin::Discussion(_) => "discussion",
+        QuestionOrigin::Tool(_) => "tool",
+    };
+    serde_json::to_string(&(
+        2_u8,
+        exchange_id,
+        source,
+        origin.task().map(|task| task.id.as_str()),
+        drafts,
+    ))
+    .map_err(Into::into)
 }
 
 /// Restore a legacy input reply from canonical question history using a read-only connection.
@@ -1027,47 +1422,314 @@ fn decode_question_state(version: u32, encoded: &str) -> Result<QuestionState> {
 }
 
 /// Release live answer destinations when a waiting tool completes or is cancelled.
+#[cfg(test)]
 struct QuestionWait<'controller> {
     controller: &'controller QuestionController,
     ids: Vec<QuestionId>,
 }
 
-/// Owns a published question wait independently of the tool runtime lock.
-pub(crate) struct OwnedQuestionWait {
+/// Keep rollback custody on the owner until a published wait is installed as an owned resource.
+pub(crate) struct LocalQuestionWait {
+    observation: Option<QuestionWaitObservation>,
+}
+
+impl LocalQuestionWait {
+    /// Get the question identities registered by this one guard.
+    pub(crate) fn question_ids(&self) -> &[QuestionId] {
+        &self
+            .observation
+            .as_ref()
+            .expect("local question wait retains observation until ownership transfer")
+            .ids
+    }
+
+    /// Transfer the registration exactly once into a retirement capability owned by the driver.
+    pub(crate) fn into_owned(
+        mut self,
+        retirement: crate::exchange::QuestionWaitRetirement,
+    ) -> OwnedQuestionWait {
+        OwnedQuestionWait {
+            observation: self
+                .observation
+                .take()
+                .expect("local question wait transfers its observation once"),
+            retirement: WaitRetirement::Owner(retirement),
+        }
+    }
+
+    /// Preserve direct-controller custody only for isolated unit fixtures.
+    #[cfg(test)]
+    pub(crate) fn into_test_owned(mut self) -> OwnedQuestionWait {
+        let observation = self
+            .observation
+            .take()
+            .expect("local question wait transfers its observation once");
+        let retirement = LocalWaitRetirement {
+            controller: observation.controller.clone(),
+            ids: observation.ids.clone(),
+        };
+        OwnedQuestionWait {
+            observation,
+            retirement: WaitRetirement::Local(retirement),
+        }
+    }
+
+    /// Observe answers directly only in isolated controller fixtures.
+    #[cfg(test)]
+    pub(crate) async fn answers(
+        mut self,
+    ) -> std::result::Result<Vec<QuestionRecord>, QuestionWaitError> {
+        self.observation
+            .as_mut()
+            .expect("local question wait retains observation until transfer")
+            .answers()
+            .await
+    }
+}
+
+impl Drop for LocalQuestionWait {
+    /// Roll back a registration only while it remains under local mutation-owner custody.
+    fn drop(&mut self) {
+        if let Some(observation) = &self.observation {
+            let _ = release_waiting(&observation.controller, &observation.ids);
+        }
+    }
+}
+
+/// Retain readonly answer observation separately from the authority that retires its destination.
+struct QuestionWaitObservation {
     controller: std::sync::Arc<QuestionController>,
     ids: Vec<QuestionId>,
     changed: tokio::sync::watch::Receiver<u64>,
+    result: Option<Vec<QuestionRecord>>,
 }
 
-impl OwnedQuestionWait {
-    pub(crate) async fn answers(mut self) -> Result<Vec<QuestionRecord>> {
+impl QuestionWaitObservation {
+    /// Observe the exact registered questions without mutating their lifecycle or delivery state.
+    async fn answers(&mut self) -> std::result::Result<Vec<QuestionRecord>, QuestionWaitError> {
+        if let Some(result) = &self.result {
+            return Ok(result.clone());
+        }
         loop {
             let questions = self
                 .controller
-                .snapshot()?
+                .snapshot()
+                .map_err(QuestionWaitError::State)?
                 .questions
                 .into_iter()
                 .filter(|question| self.ids.contains(&question.id))
                 .collect::<Vec<_>>();
+            if questions.len() != self.ids.len() {
+                return Err(QuestionWaitError::TargetMissing);
+            }
             if questions.iter().all(|question| !question.pending()) {
                 return Ok(questions);
             }
             self.changed
                 .changed()
                 .await
-                .context("question controller closed while waiting for answers")?;
+                .map_err(|_| QuestionWaitError::ObservationLost)?;
         }
     }
 }
 
-impl Drop for OwnedQuestionWait {
+/// Keep production retirement owner-reported; fixture-only local retirement cannot enter production.
+enum WaitRetirement {
+    Owner(crate::exchange::QuestionWaitRetirement),
+    #[cfg(test)]
+    Local(LocalWaitRetirement),
+}
+
+/// Observe a published question wait while its retirement remains exclusively owned by the driver.
+pub(crate) struct OwnedQuestionWait {
+    observation: QuestionWaitObservation,
+    retirement: WaitRetirement,
+}
+
+impl OwnedQuestionWait {
+    /// Get the committed question identities owned by this answer observation.
+    #[cfg(test)]
+    pub(crate) fn question_ids(&self) -> &[QuestionId] {
+        &self.observation.ids
+    }
+
+    /// Report exactly the returned answers before releasing the wait, or terminate on owner loss.
+    pub(crate) async fn answers(
+        mut self,
+    ) -> std::result::Result<Vec<QuestionRecord>, QuestionWaitError> {
+        let result = match &mut self.retirement {
+            WaitRetirement::Owner(retirement) => tokio::select! {
+                biased;
+                _ = retirement.closed() => Err(QuestionWaitError::OwnerClosed),
+                answers = self.observation.answers() => answers,
+            },
+            #[cfg(test)]
+            WaitRetirement::Local(_) => self.observation.answers().await,
+        };
+        if let Ok(questions) = &result {
+            match &mut self.retirement {
+                WaitRetirement::Owner(retirement) => return retirement.observed(questions).await,
+                #[cfg(test)]
+                WaitRetirement::Local(retirement) => {
+                    let stored = retirement.controller.retire_wait(
+                        &retirement.ids,
+                        &QuestionWaitEnd::Observed(QuestionWaitReport::observed(questions)),
+                        QuestionWaitPolicy::Live,
+                    )?;
+                    retirement.ids.clear();
+                    return stored.ok_or(QuestionWaitError::ObservationMismatch);
+                }
+            }
+        }
+        result
+    }
+}
+
+/// Release direct-controller waits only in unit fixtures without an exchange driver.
+#[cfg(test)]
+struct LocalWaitRetirement {
+    controller: std::sync::Arc<QuestionController>,
+    ids: Vec<QuestionId>,
+}
+
+#[cfg(test)]
+impl Drop for LocalWaitRetirement {
+    /// Preserve another fixture guard's registration for the same question IDs.
     fn drop(&mut self) {
-        if let Ok(mut waiting) = self.controller.waiting.lock() {
-            waiting.retain(|id| !self.ids.contains(id));
+        let _ = release_waiting(&self.controller, &self.ids);
+    }
+}
+
+/// Retain the exact canonical messages returned by an answer observation, never later corrections.
+pub(crate) struct QuestionWaitReport {
+    questions: Vec<QuestionRecord>,
+    messages: Vec<ObservedQuestionMessage>,
+}
+
+struct ObservedQuestionMessage {
+    question: QuestionId,
+    message: String,
+}
+
+impl QuestionWaitReport {
+    /// Capture the answer/correction messages present in the tool's returned question snapshot.
+    pub(crate) fn observed(questions: &[QuestionRecord]) -> Self {
+        Self {
+            questions: questions.to_vec(),
+            messages: questions
+                .iter()
+                .flat_map(|question| {
+                    question
+                        .discussion
+                        .iter()
+                        .filter(|message| {
+                            matches!(
+                                message.kind,
+                                QuestionMessageKind::Answer | QuestionMessageKind::Correction
+                            )
+                        })
+                        .map(|message| ObservedQuestionMessage {
+                            question: question.id.clone(),
+                            message: message.id.clone(),
+                        })
+                })
+                .collect(),
         }
     }
 }
 
+/// Distinguish a completed tool observation from abandonment and explicit owner shutdown.
+pub(crate) enum QuestionWaitEnd {
+    Observed(QuestionWaitReport),
+    Abandoned,
+    OwnerClosed,
+}
+
+/// Limit fallback admission to a live owner; shutdown still retains observed-answer evidence.
+#[derive(Clone, Copy)]
+pub(crate) enum QuestionWaitPolicy {
+    Live,
+    Closing,
+}
+
+impl QuestionWaitEnd {
+    /// Get the local resource outcome for correlated logs without claiming native SDK receipt.
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Self::Observed(_) => "observed",
+            Self::Abandoned => "abandoned",
+            Self::OwnerClosed => "owner_closed",
+        }
+    }
+}
+
+/// Preserve wait-resource observation and persistence failures as typed owner facts.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum QuestionWaitError {
+    #[error("the legacy question wait has no retained response")]
+    LegacyResultUnavailable,
+    #[error("question wait owner is closed")]
+    OwnerClosed,
+    #[error("question wait observation ended")]
+    ObservationLost,
+    #[error("question wait target is missing")]
+    TargetMissing,
+    #[error("question wait registry is unavailable")]
+    RegistryUnavailable,
+    #[error("question wait registry does not contain the retained registration")]
+    RegistryMismatch,
+    #[error("question wait observation does not match its canonical messages")]
+    ObservationMismatch,
+    #[error("question wait state is unavailable")]
+    StateUnavailable,
+    #[error("question wait state revision is exhausted")]
+    RevisionExhausted,
+    #[error("question wait state could not be loaded")]
+    State(#[source] anyhow::Error),
+    #[error("question wait retirement could not be committed")]
+    Storage(#[from] rusqlite::Error),
+    #[error("question wait state could not be encoded")]
+    Codec(#[from] serde_json::Error),
+}
+
+impl QuestionWaitError {
+    /// Identify failures that leave an accepted logical response without durable custody.
+    pub(crate) fn requires_storage_fence(&self) -> bool {
+        match self {
+            Self::StateUnavailable
+            | Self::State(_)
+            | Self::Storage(_)
+            | Self::Codec(_)
+            | Self::RevisionExhausted
+            | Self::RegistryUnavailable => true,
+            Self::LegacyResultUnavailable
+            | Self::OwnerClosed
+            | Self::ObservationLost
+            | Self::TargetMissing
+            | Self::RegistryMismatch
+            | Self::ObservationMismatch => false,
+        }
+    }
+    /// Get a stable diagnostic code without parsing callback or storage text.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::LegacyResultUnavailable => "question_wait_legacy_result_unavailable",
+            Self::OwnerClosed => "question_wait_owner_closed",
+            Self::ObservationLost => "question_wait_observation_lost",
+            Self::TargetMissing => "question_wait_target_missing",
+            Self::RegistryUnavailable | Self::RegistryMismatch => {
+                "question_wait_registry_unavailable"
+            }
+            Self::ObservationMismatch => "question_wait_observation_mismatch",
+            Self::StateUnavailable | Self::State(_) => "question_wait_state_unavailable",
+            Self::RevisionExhausted => "question_wait_revision_exhausted",
+            Self::Storage(_) => "question_wait_retirement_failed",
+            Self::Codec(_) => "question_wait_encoding_failed",
+        }
+    }
+}
+
+#[cfg(test)]
 impl<'controller> QuestionWait<'controller> {
     /// Register all destinations before publishing questions so fast answers cannot bypass the tool.
     fn new(controller: &'controller QuestionController, ids: Vec<QuestionId>) -> Result<Self> {
@@ -1080,13 +1742,50 @@ impl<'controller> QuestionWait<'controller> {
     }
 }
 
+#[cfg(test)]
 impl Drop for QuestionWait<'_> {
     /// Restore normal message delivery when no live tool owns these answers.
     fn drop(&mut self) {
-        if let Ok(mut waiting) = self.controller.waiting.lock() {
-            waiting.retain(|id| !self.ids.contains(id));
+        let _ = release_waiting(self.controller, &self.ids);
+    }
+}
+
+/// Release only this guard's registrations, preserving another wait for the same question identities.
+fn release_waiting(
+    controller: &QuestionController,
+    ids: &[QuestionId],
+) -> std::result::Result<(), QuestionWaitError> {
+    let mut waiting = controller
+        .waiting
+        .lock()
+        .map_err(|_| QuestionWaitError::RegistryUnavailable)?;
+    release_registered(&mut waiting, ids);
+    Ok(())
+}
+
+/// Remove exactly one registration per selected question, preserving independent wait guards.
+fn release_registered(waiting: &mut Vec<QuestionId>, ids: &[QuestionId]) {
+    for id in ids {
+        if let Some(index) = waiting.iter().position(|registered| registered == id) {
+            waiting.swap_remove(index);
         }
     }
+}
+
+/// Validate task attribution in the same SQLite snapshot as its dependent question operation.
+fn task_attribution_is_current(
+    connection: &Connection,
+    session: &str,
+    task: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let Some(task) = task else {
+        return Ok(true);
+    };
+    let current: Option<Option<String>> = connection.query_row(
+        "SELECT json_extract(payload,'$.session.active_task.id') FROM session_record WHERE id=?1",
+        [session], |row| row.get(0),
+    ).optional()?;
+    Ok(current.flatten().as_deref() == Some(task))
 }
 
 fn content(draft: QuestionDraft, revision: u64) -> Result<QuestionContent> {
@@ -1255,6 +1954,232 @@ pub(crate) fn project(
 mod tests {
     use super::*;
 
+    /// A completed required wait replays its first committed answers after correction and restart.
+    #[tokio::test]
+    async fn completed_wait_replays_exact_answers_after_correction_and_restart() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = Arc::new(QuestionController::open(root.path(), "session")?);
+        let waiting = controller
+            .prepare_tool_wait(
+                "required-call",
+                "exchange",
+                None,
+                vec![draft(QuestionRequirement::Required)],
+                None,
+            )?
+            .into_test_owned();
+        let ids = waiting.question_ids().to_vec();
+        controller.apply(QuestionCommand {
+            operation_id: "first-answer".into(),
+            question_id: ids[0].clone(),
+            revision: 1,
+            action: QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "Original answer".into(),
+                },
+            },
+        })?;
+        let original = waiting.answers().await?;
+        controller.apply(QuestionCommand {
+            operation_id: "later-correction".into(),
+            question_id: ids[0].clone(),
+            revision: 1,
+            action: QuestionAction::Correct {
+                text: "Later correction".into(),
+            },
+        })?;
+        assert_ne!(
+            serde_json::to_value(&controller.snapshot()?.questions)?,
+            serde_json::to_value(&original)?
+        );
+        drop(controller);
+        let reopened = Arc::new(QuestionController::open(root.path(), "session")?);
+        let replayed = reopened
+            .replay_tool_wait(ids)?
+            .into_test_owned()
+            .answers()
+            .await?;
+        assert_eq!(
+            serde_json::to_value(replayed)?,
+            serde_json::to_value(original)?
+        );
+        assert!(
+            reopened
+                .outbox()?
+                .iter()
+                .any(|message| message.id == "later-correction")
+        );
+        Ok(())
+    }
+
+    /// A mutation retry must retain its original response despite later questions changing and host restart.
+    #[test]
+    fn mutation_replay_retains_original_snapshot_after_other_mutation_and_restart() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let ids = controller.ask(
+            "two-questions",
+            "exchange",
+            QuestionOrigin::Chat,
+            vec![
+                draft(QuestionRequirement::Optional),
+                draft(QuestionRequirement::Optional),
+            ],
+        )?;
+        let original_command = QuestionCommand {
+            operation_id: "first-dismiss".into(),
+            question_id: ids[0].clone(),
+            revision: 1,
+            action: QuestionAction::Dismiss,
+        };
+        let original = controller.apply(original_command.clone())?;
+        controller.apply(QuestionCommand {
+            operation_id: "second-dismiss".into(),
+            question_id: ids[1].clone(),
+            revision: 1,
+            action: QuestionAction::Dismiss,
+        })?;
+        let current_revision = controller.snapshot()?.revision;
+        assert!(current_revision > original.revision);
+        assert_eq!(
+            serde_json::to_value(controller.replay_mutation(&original_command)?.unwrap())?,
+            serde_json::to_value(&original)?
+        );
+        assert_eq!(
+            serde_json::to_value(controller.apply(original_command.clone())?)?,
+            serde_json::to_value(&original)?
+        );
+        assert_eq!(controller.snapshot()?.revision, current_revision);
+        drop(controller);
+        let reopened = QuestionController::open(root.path(), "session")?;
+        assert_eq!(
+            serde_json::to_value(reopened.replay_mutation(&original_command)?.unwrap())?,
+            serde_json::to_value(&original)?
+        );
+        assert_eq!(reopened.snapshot()?.revision, current_revision);
+        Ok(())
+    }
+
+    /// Older receipts without a saved response must not pretend the latest snapshot was their result.
+    #[test]
+    fn legacy_mutation_receipt_reports_unavailable_original_result() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let ids = controller.ask(
+            "question",
+            "exchange",
+            QuestionOrigin::Chat,
+            vec![draft(QuestionRequirement::Optional)],
+        )?;
+        let command = QuestionCommand {
+            operation_id: "legacy-dismiss".into(),
+            question_id: ids[0].clone(),
+            revision: 1,
+            action: QuestionAction::Dismiss,
+        };
+        controller.apply(command.clone())?;
+        {
+            let connection = controller.connection.lock().unwrap();
+            let encoded: String = connection.query_row(
+                "SELECT payload FROM session_question_state WHERE session_id=?1",
+                ["session"],
+                |row| row.get(0),
+            )?;
+            let mut legacy: serde_json::Value = serde_json::from_str(&encoded)?;
+            legacy.as_object_mut().unwrap().remove("mutation_results");
+            connection.execute(
+                "UPDATE session_question_state SET payload=?1 WHERE session_id=?2",
+                params![serde_json::to_string(&legacy)?, "session"],
+            )?;
+        }
+        assert!(matches!(
+            controller.replay_mutation(&command),
+            Err(QuestionCreationReplayError::LegacyResultUnavailable)
+        ));
+        assert!(controller.apply(command).is_err());
+        Ok(())
+    }
+
+    /// Replaying a creation neither duplicates questions nor mutates the durable publication revision.
+    #[test]
+    fn creation_replay_is_read_only_and_conflicting_payload_is_rejected() -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = QuestionController::open(root.path(), "session")?;
+        let drafts = vec![draft(QuestionRequirement::Optional)];
+        let ids = controller.ask(
+            "authenticated-call",
+            "exchange",
+            QuestionOrigin::Chat,
+            drafts.clone(),
+        )?;
+        let revision = controller.snapshot()?.revision;
+        assert_eq!(
+            controller
+                .replay_creation(
+                    "authenticated-call",
+                    "exchange",
+                    QuestionOrigin::Chat,
+                    &drafts
+                )?
+                .unwrap(),
+            ids
+        );
+        assert_eq!(controller.snapshot()?.revision, revision);
+        let mut changed = drafts;
+        changed[0].question = "Different content".into();
+        assert!(matches!(
+            controller.replay_creation(
+                "authenticated-call",
+                "exchange",
+                QuestionOrigin::Chat,
+                &changed
+            ),
+            Err(QuestionCreationReplayError::IdentityConflict)
+        ));
+        assert_eq!(controller.snapshot()?.questions.len(), 1);
+        Ok(())
+    }
+
+    /// Releasing a replayed wait must not redirect another live wait's answer into ordinary input.
+    #[tokio::test]
+    async fn releasing_one_owned_wait_preserves_another_registration_for_the_same_question()
+    -> Result<()> {
+        let (root, _store, _tasks) = crate::task::SessionTaskController::test_goal();
+        let controller = std::sync::Arc::new(QuestionController::open(root.path(), "session")?);
+        let first = controller.prepare_tool_wait(
+            "replayed-wait",
+            "exchange",
+            None,
+            vec![draft(QuestionRequirement::Required)],
+            None,
+        )?;
+        let second = controller.prepare_tool_wait(
+            "replayed-wait",
+            "exchange",
+            None,
+            vec![draft(QuestionRequirement::Required)],
+            None,
+        )?;
+        drop(first);
+        let id = controller.snapshot()?.questions[0].id.clone();
+        controller.apply(QuestionCommand {
+            operation_id: "answer-replayed-wait".into(),
+            question_id: id,
+            revision: 1,
+            action: QuestionAction::Answer {
+                answer: QuestionAnswer::Other {
+                    text: "Workspace".into(),
+                },
+            },
+        })?;
+        assert!(controller.outbox()?.is_empty());
+        let answers =
+            tokio::time::timeout(std::time::Duration::from_secs(1), second.answers()).await??;
+        assert_eq!(answers.len(), 1);
+        assert!(!answers[0].pending());
+        Ok(())
+    }
+
     /// Recover pending answers from canonical discussion without interpreting old wire envelopes.
     #[test]
     fn legacy_outbox_preserves_question_state_and_rebuilds_structured_reply() -> Result<()> {
@@ -1309,7 +2234,7 @@ mod tests {
         assert!(queue.apply(operation)?.error.is_none());
         drop(queue);
         {
-            let connection = rusqlite::Connection::open(root.path().join("input-queue.sqlite3"))?;
+            let connection = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
             let snapshot: String = connection.query_row(
                 "SELECT payload FROM input_session WHERE session_id='session'",
                 [],

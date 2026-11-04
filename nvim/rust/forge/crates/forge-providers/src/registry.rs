@@ -287,13 +287,13 @@ fn capability(id: &str) -> ProviderCapability {
         }
         "mock" => ProviderCapability {
             integration: ProviderIntegration { background_generation: true, isolated_generation: true,
-                terminal_termination: true, native_agent_suppression: true, mcp_runtime_status: true,
+                terminal_termination: false, native_agent_suppression: true, mcp_runtime_status: true,
                 mcp_tool_catalog: true, local_acceptance: true, resource_target: Some("mock".into()), ..Default::default() },
             native_fork: true, native_compact: true,
             compaction: CompactionCapability { lifecycle: true, background: false, summary: true, metrics: true },
             native_steer: true, native_turn_rollback: true, model_selection: true,
             effort_selection: true, fast_mode: true, ultrafast_mode: true, permission_control: true,
-            background_terminals: true, approval_mode_list: approvals, agent: Default::default(), catalog: Default::default(),
+            background_terminals: false, approval_mode_list: approvals, agent: Default::default(), catalog: Default::default(),
             ..Default::default()
         },
         _ => unreachable!("registry only calls capability for known identities"),

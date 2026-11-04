@@ -76,5 +76,37 @@ response.session.id = "snapshot-test"
 assert(snapshot.apply(state, response))
 assert(state.question_drafts.choice.ask == "Explain the tradeoff", "returning to a session lost its question draft")
 assert(state.question_picker_resume.page_id == "choice")
+-- Receiving a page cannot certify the owner's post-send durable acknowledgment.
+state.publication_cursor = 4
+response.owner_publication = { receipt_id = "slow-page", after = 4, through = 7, high_water = 9, more = true }
+response.snapshot_revision = 2
+assert(snapshot.apply(state, response))
+assert(state.publication_cursor == 4, "received page advanced its cursor before owner confirmation")
+assert(state.publication_received.through == 7)
+-- An expired send is retried from the same confirmed cursor with fresh page authority.
+response.owner_publication.receipt_id = "retried-page"
+response.snapshot_revision = 3
+assert(snapshot.apply(state, response) and state.publication_cursor == 4)
+assert(not snapshot.confirm_publication(state, {
+  receipt_id = "slow-page", runtime_epoch = state.runtime_epoch, after = 4, through = 7,
+}), "late confirmation acknowledged a different received page")
+assert(snapshot.confirm_publication(state, {
+  receipt_id = "retried-page", runtime_epoch = state.runtime_epoch, after = 4, through = 7,
+}))
+assert(state.publication_cursor == 7 and state.publication_received == nil)
+local older_page = vim.deepcopy(response)
+older_page.snapshot_revision, older_page.owner_publication.through = 1, 5
+assert(snapshot.apply(state, older_page) == false and state.publication_cursor == 7,
+  "a stale snapshot moved the retained publication cursor")
+response.snapshot_revision = 4
+response.owner_publication = { receipt_id = "empty-page", after = 7, high_water = 7, more = false }
+assert(snapshot.apply(state, response) and state.publication_cursor == 7,
+  "an empty page lost its acknowledged cursor")
+assert(snapshot.confirm_publication(state, {
+  receipt_id = "empty-page", runtime_epoch = state.runtime_epoch, after = 7,
+}))
+response.session.id, response.snapshot_revision, response.owner_publication = "new-publication-session", 1, nil
+assert(snapshot.apply(state, response) and state.publication_cursor == nil and state.publication_received == nil,
+  "another session inherited publication authority")
 package.loaded["forge.lsp.startup"] = original_startup
 print("harness_snapshot: passed")

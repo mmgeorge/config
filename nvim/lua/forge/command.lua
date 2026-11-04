@@ -17,13 +17,15 @@ end
 ---@param method string
 ---@param params? table
 ---@param callback function
-function M.dispatch(transport, session_id, method, params, callback)
-  if contract.method_policy(method).recovery ~= "session_command" then transport(session_id, method, params, callback) return end
+---@param owned_command? boolean Caller facade has normalized this method as an owner command.
+function M.dispatch(transport, session_id, method, params, callback, owned_command)
+  if not owned_command and contract.method_policy(method).recovery ~= "session_command" then transport(session_id, method, params, callback) return end
   local client = require("forge.client")
   local state = require("forge.session").harness_by_id[session_id]
   local generation = client.host_get_generation()
   local request = vim.deepcopy(params or {})
   local identity = request._command and request._command.id or request.operation_id
+    or (type(request.command) == "table" and request.command.operation_id)
     or (method == "session.input.apply" and request.id) or M.identity()
   request._command = request._command or { id = identity,
     runtime_epoch = state and state.runtime_epoch or nil }
@@ -32,7 +34,7 @@ function M.dispatch(transport, session_id, method, params, callback)
     sequence = sequence + 1
     request.answer_order = request.answer_order or { writer, sequence }
   end
-  local finished, recovering = false, false
+  local finished, recovering, refreshing_projection = false, false, false
   local receive
   local function complete(result, failure, detail)
     if finished then return end
@@ -52,6 +54,10 @@ function M.dispatch(transport, session_id, method, params, callback)
       if not failure and result and result.state == "completed" then
         local response = result.response
         if response.error then complete(nil, response.error.message, response.error)
+        elseif response.result and response.result.review_reload_required and request.review and not refreshing_projection then
+          -- The retained command already completed; reuse its identity to refresh only the original review projection.
+          refreshing_projection = true
+          transport(session_id, method, request, receive)
         else complete(response.result) end
       elseif not failure and result and result.state == "not_admitted" then
         transport(session_id, method, request, receive)
@@ -63,7 +69,7 @@ function M.dispatch(transport, session_id, method, params, callback)
   end
   receive = function(result, failure, detail)
     if finished or not current() then return end
-    if failure and (not detail or detail.code == "outcome_unknown" or detail.code == "result_encoding_failed") then
+    if failure and (not detail or detail.code == "outcome_unknown" or detail.code == "command_observation_lost" or detail.code == "result_encoding_failed") then
       if not recovering then
         recovering = true
         notifications.error("Checking command outcome: " .. failure, "Harness command")

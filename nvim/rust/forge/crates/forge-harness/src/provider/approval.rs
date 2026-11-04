@@ -1466,6 +1466,7 @@ mod test {
             PermissionDecision::Ask,
         )])?;
         let request = crate::provider::ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: None,
             harness_session_id: "directory-session".into(),
             workspace: workspace.display().to_string(),
@@ -1819,6 +1820,7 @@ mod test {
         )?));
         let coordinator = Arc::new(PermissionCoordinator::new(store.clone()));
         let request = crate::provider::ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: None,
             harness_session_id: "session".into(),
             workspace: directory.path().display().to_string(),

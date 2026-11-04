@@ -63,16 +63,6 @@ pub(crate) enum SessionAction {
         )]
         completed_turn: Option<crate::task::TaskTurnId>,
     },
-    #[serde(rename = "begin_acceptance")]
-    BeginAcceptance {
-        #[serde(flatten)]
-        review: PlanReviewRequest,
-    },
-    #[serde(rename = "cancel_acceptance")]
-    CancelAcceptance {
-        #[serde(flatten)]
-        review: PlanReviewRequest,
-    },
     #[serde(rename = "request_changes")]
     RequestChanges {
         #[serde(flatten)]
@@ -83,11 +73,9 @@ pub(crate) enum SessionAction {
         #[serde(flatten)]
         review: PlanReviewRequest,
     },
-    #[serde(rename = "complete_acceptance")]
-    CompleteAcceptance { plan_id: String, digest: String },
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ExecuteSelection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<String>,
@@ -103,6 +91,9 @@ pub(crate) struct ExecuteSelection {
     pub plan_compact: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// Retain inline review feedback for revision before execution admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<crate::plan::PlanAnnotationInput>,
     #[serde(flatten)]
     pub metadata: BTreeMap<String, Value>,
 }
@@ -145,7 +136,8 @@ impl SessionCommand {
         };
         if !task.auto_accept_plan
             || plan.paused
-            || plan.artifact.acceptance.is_some()
+            // Saved reviewer decisions require a new explicit execute/continue, even when answered.
+            || plan.artifact.review_questions().is_some()
             || plan.artifact.state != crate::plan::PlanState::AwaitingReview
             || plan.artifact.submitted_version != Some(plan.artifact.document_version)
             || !task.entry_accepted()
@@ -239,8 +231,6 @@ impl SessionCommand {
             "session.goal.resume" => "resume",
             "session.goal.clear" => "clear",
             "session.plan.accept" => "execute",
-            "session.plan.acceptance.begin" => "begin_acceptance",
-            "session.plan.acceptance.cancel" => "cancel_acceptance",
             "session.plan.changes.request" => "request_changes",
             "session.plan.cancel" => "cancel_plan",
             _ => return Ok(None),
@@ -258,11 +248,8 @@ impl SessionCommand {
                 | "resume"
                 | "clear"
                 | "continue"
-                | "begin_acceptance"
-                | "cancel_acceptance"
                 | "request_changes"
                 | "cancel_plan"
-                | "complete_acceptance"
         ) {
             return Ok(None);
         }
@@ -287,14 +274,7 @@ impl SessionCommand {
             .transpose()?
             .unwrap_or(
                 if request.method == "session.plan.accept"
-                    || matches!(
-                        action,
-                        "begin_acceptance"
-                            | "cancel_acceptance"
-                            | "request_changes"
-                            | "cancel_plan"
-                            | "complete_acceptance"
-                    )
+                    || matches!(action, "request_changes" | "cancel_plan")
                 {
                     CommandResponse::Snapshot
                 } else {
@@ -325,56 +305,6 @@ impl SessionCommand {
             display_text,
             metadata,
         }))
-    }
-
-    pub(crate) fn question_continue(
-        request: &Request,
-        prior: Option<&crate::task::TaskOperation>,
-        target: Option<(String, String)>,
-    ) -> Result<Option<Self>> {
-        ensure!(
-            request.method == "session.question.continue",
-            "acceptance continuation requires question.continue"
-        );
-        if let Some(prior) = prior {
-            ensure!(
-                prior.action["action"] == "complete_acceptance",
-                "operation ID was reused for a different action"
-            );
-            if let Some(id) = operation_id(&request.params) {
-                ensure!(
-                    id == prior.id,
-                    "continuation receipt does not match operation identity"
-                );
-            }
-            let mut params = prior.action.clone();
-            params["operation_id"] = json!(prior.id);
-            params["_command_response"] = json!(CommandResponse::Snapshot);
-            if let Some(identity) = request.params.get("_command") {
-                params["_command"] = identity.clone();
-            }
-            return Self::parse_request(&Request {
-                id: request.id,
-                method: "session.command.apply".into(),
-                params,
-            });
-        }
-        let Some((plan_id, digest)) = target else {
-            return Ok(None);
-        };
-        let action = SessionAction::CompleteAcceptance { plan_id, digest };
-        action.validate()?;
-        let mut command = Self {
-            operation_id: operation_id(&request.params)
-                .map(str::to_owned)
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            action,
-            response: CommandResponse::Snapshot,
-            display_text: None,
-            metadata: BTreeMap::new(),
-        };
-        preserve_command_metadata(&mut command, &request.params);
-        Ok(Some(command))
     }
 
     pub(crate) fn parse_text(text: &str, operation_id: Option<&str>) -> Result<Option<Self>> {
@@ -478,14 +408,11 @@ impl SessionAction {
         Ok(serde_json::to_value(self)?)
     }
 
+    #[cfg(test)]
     pub(crate) fn is_review(&self) -> bool {
         matches!(
             self,
-            Self::BeginAcceptance { .. }
-                | Self::CancelAcceptance { .. }
-                | Self::RequestChanges { .. }
-                | Self::CancelPlan { .. }
-                | Self::CompleteAcceptance { .. }
+            Self::Execute { .. } | Self::RequestChanges { .. } | Self::CancelPlan { .. }
         )
     }
 
@@ -498,15 +425,14 @@ impl SessionAction {
             return Some("plan_changes_requested");
         }
         match self {
-            Self::BeginAcceptance { .. } => Some("plan_acceptance_started"),
-            Self::CancelAcceptance { .. } => Some("plan_acceptance_cancelled"),
             Self::RequestChanges { .. } => Some("plan_changes_requested"),
             Self::CancelPlan { .. } => Some("plan_cancelled"),
-            Self::Execute { .. } | Self::CompleteAcceptance { .. } => Some("plan_accepted"),
+            Self::Execute { .. } => Some("plan_accepted"),
             _ => None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn admits_entry(&self) -> bool {
         matches!(
             self,
@@ -518,15 +444,11 @@ impl SessionAction {
                 | Self::Replan { .. }
                 | Self::Resume { .. }
                 | Self::RequestChanges { .. }
-                | Self::BeginAcceptance { .. }
-                | Self::CompleteAcceptance { .. }
         )
     }
 
     fn method(&self) -> &'static str {
         match self {
-            Self::BeginAcceptance { .. } => "session.plan.acceptance.begin",
-            Self::CancelAcceptance { .. } => "session.plan.acceptance.cancel",
             Self::RequestChanges { .. } => "session.plan.changes.request",
             Self::CancelPlan { .. } => "session.plan.cancel",
             _ => "session.command.apply",
@@ -544,10 +466,6 @@ impl SessionAction {
             Self::Replan { plan_id, revision } => ensure!(
                 !plan_id.trim().is_empty() && *revision > 0,
                 "replan requires a plan identity and positive selected revision"
-            ),
-            Self::CompleteAcceptance { plan_id, digest } => ensure!(
-                !plan_id.trim().is_empty() && !digest.is_empty(),
-                "acceptance completion requires the reviewed plan and digest"
             ),
             _ => {}
         }
@@ -854,39 +772,31 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_replay_keeps_original_review_identity() -> Result<()> {
-        let request = Request {
-            id: 1,
-            method: "session.question.continue".into(),
-            params: json!({"operation_id":"complete-once"}),
-        };
-        let command = SessionCommand::question_continue(
-            &request,
-            None,
-            Some(("original-plan".into(), "original-digest".into())),
-        )?
-        .unwrap();
-        let prior = crate::task::TaskOperation {
-            revision: 1,
-            id: command.operation_id.clone(),
-            session_id: "session".into(),
-            action: command.action.to_params()?,
-            permission_selection: None,
-            state: "completed".into(),
-            error: None,
-            exchange_id: None,
-            created_at_ms: 1,
-            resume_after_transition: false,
-        };
-        for target in [
-            None,
-            Some(("replacement-plan".into(), "replacement-digest".into())),
+    fn retired_acceptance_cancellation_has_no_task_command_alias() -> Result<()> {
+        for (method, params) in [
+            ("session.plan.acceptance.cancel", json!({"plan_id":"plan"})),
+            ("session.plan.acceptance.begin", json!({"plan_id":"plan"})),
+            (
+                "session.command.apply",
+                json!({"action":"begin_acceptance","plan_id":"plan"}),
+            ),
+            (
+                "session.command.apply",
+                json!({"action":"complete_acceptance","plan_id":"plan"}),
+            ),
+            (
+                "session.command.apply",
+                json!({"action":"cancel_acceptance","plan_id":"plan"}),
+            ),
         ] {
-            let replay =
-                SessionCommand::question_continue(&request, Some(&prior), target)?.unwrap();
-            assert_eq!(replay.operation_id, "complete-once");
-            assert_eq!(replay.action.to_params()?, command.action.to_params()?);
-            assert_eq!(replay.response, CommandResponse::Snapshot);
+            assert!(
+                SessionCommand::parse_request(&Request {
+                    id: 1,
+                    method: method.into(),
+                    params,
+                })?
+                .is_none()
+            );
         }
         Ok(())
     }
@@ -894,8 +804,6 @@ mod tests {
     #[test]
     fn review_aliases_preserve_arguments_and_dedicated_review_methods() -> Result<()> {
         for (method, action) in [
-            ("session.plan.acceptance.begin", "begin_acceptance"),
-            ("session.plan.acceptance.cancel", "cancel_acceptance"),
             ("session.plan.changes.request", "request_changes"),
             ("session.plan.cancel", "cancel_plan"),
         ] {

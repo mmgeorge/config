@@ -9,7 +9,48 @@ impl HarnessBroker {
         dispatch: &mut ForegroundDispatch,
         signal: ForegroundSignal,
     ) -> Result<ForegroundAction> {
+        let receipt = match dispatch {
+            ForegroundDispatch::Admitting(admission)
+            | ForegroundDispatch::Running { admission, .. }
+            | ForegroundDispatch::Finalizing { admission, .. } => admission.input_submission.take(),
+            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => None,
+        };
+        let previous = std::mem::replace(&mut self.input_submission, receipt);
+        let result = self.step_foreground_inner(dispatch, signal);
+        let receipt = std::mem::replace(&mut self.input_submission, previous);
+        match dispatch {
+            ForegroundDispatch::Admitting(admission)
+            | ForegroundDispatch::Running { admission, .. }
+            | ForegroundDispatch::Finalizing { admission, .. } => {
+                admission.input_submission = receipt
+            }
+            ForegroundDispatch::Done(_) | ForegroundDispatch::Transitioning => {}
+        }
+        result
+    }
+
+    /// Apply one signal with the current admission's receipt installed for legacy reducers.
+    fn step_foreground_inner(
+        &mut self,
+        dispatch: &mut ForegroundDispatch,
+        signal: ForegroundSignal,
+    ) -> Result<ForegroundAction> {
         let signal = match signal {
+            ForegroundSignal::LiveHost(request) => {
+                return self.begin_live_host_effect(dispatch, *request);
+            }
+            ForegroundSignal::PlanMutationCompleted(result) if matches!(dispatch, ForegroundDispatch::Running { transaction, .. } | ForegroundDispatch::Finalizing { transaction, .. } if transaction.live_host.is_some()) =>
+            {
+                return self.complete_live_plan_mutation(dispatch, result);
+            }
+            ForegroundSignal::PlanSubmissionCompleted(result) if matches!(dispatch, ForegroundDispatch::Running { transaction, .. } | ForegroundDispatch::Finalizing { transaction, .. } if transaction.live_host.is_some()) =>
+            {
+                return self.complete_live_plan_submission(dispatch, result);
+            }
+            ForegroundSignal::PlanTerminalPublished(result) if matches!(dispatch, ForegroundDispatch::Running { transaction, .. } | ForegroundDispatch::Finalizing { transaction, .. } if transaction.live_host.is_some()) =>
+            {
+                return self.complete_live_host_publication(dispatch, result);
+            }
             ForegroundSignal::AdmissionCleanupCompleted(result) => {
                 return self.complete_staged_admission_cleanup(dispatch, result);
             }
@@ -58,6 +99,36 @@ impl HarnessBroker {
                 };
                 self.apply_foreground_failure_checkpoint(transaction, result)?;
                 return self.advance_foreground_failure(dispatch);
+            }
+            signal => signal,
+        };
+        if matches!(
+            &signal,
+            ForegroundSignal::Native(NativeForegroundSignal::NativeReady(_))
+        ) && let ForegroundDispatch::Running { transaction, .. }
+        | ForegroundDispatch::Finalizing { transaction, .. } = dispatch
+        {
+            transaction.acknowledge_native_result();
+        }
+        if let ForegroundDispatch::Admitting(admission) = dispatch {
+            match &signal {
+                ForegroundSignal::CollectionStarted(disposition) => {
+                    admission.begin_owner_collection(*disposition)?;
+                    return Ok(ForegroundAction::Wait);
+                }
+                ForegroundSignal::CollectionCompleted(disposition) => {
+                    admission.complete_owner_collection(*disposition)?;
+                    self.fail_foreground_dispatch(dispatch, TurnCancelled.into())?;
+                    return Ok(ForegroundAction::WaitForPublicationDrain);
+                }
+                _ => {}
+            }
+        }
+        let signal = match signal {
+            ForegroundSignal::EffectFailed(error)
+                if matches!(dispatch, ForegroundDispatch::Admitting(_)) =>
+            {
+                return self.fail_foreground_dispatch(dispatch, error);
             }
             signal => signal,
         };
@@ -134,11 +205,30 @@ impl HarnessBroker {
                     return self.fail_foreground(transaction, error);
                 }
                 if transaction.question_stop_pending
+                    || !transaction.steering.pending_deliveries.is_empty()
                     || transaction.native_goal.is_some()
                     || transaction.observation_publication_in_flight
                     || !transaction.pending_session_observations.is_empty()
                 {
                     transaction.pending_native_ready = Some(*ready);
+                    return Ok(ForegroundAction::Wait);
+                }
+                if transaction.steering.refresh_readiness {
+                    // Delivery acceptance may precede a steering turn's start and terminal events.
+                    // Refresh the covered-submission barrier before checkpointing the exchange.
+                    let mut checkout = transaction.settlement.checkout()?;
+                    drop(checkout.take());
+                    let engine = transaction.engine.clone();
+                    let scope = transaction.state.scope.clone();
+                    let settlement = transaction.settlement.clone();
+                    transaction.native.restart(async move {
+                        let refreshed = engine.wait_ready(scope).await?;
+                        settlement.set_batches(refreshed.batches)?;
+                        checkout.replace(refreshed.ticket);
+                        Ok(ProviderAttempt::Ready(Box::new(refreshed.outcome)))
+                    })?;
+                    transaction.native_open = true;
+                    transaction.steering.refresh_readiness = false;
                     return Ok(ForegroundAction::Wait);
                 }
                 let ready = *ready;
@@ -168,6 +258,7 @@ impl HarnessBroker {
             }
             signal => signal,
         };
+        let already_finalizing = matches!(dispatch, ForegroundDispatch::Finalizing { .. });
         let (transaction, admission) = match dispatch {
             ForegroundDispatch::Running {
                 transaction,
@@ -196,6 +287,13 @@ impl HarnessBroker {
                     }
                 }
             }
+            ForegroundSignal::Native(NativeForegroundSignal::Cancelled)
+                if transaction.collection.is_some() =>
+            {
+                // The owner already holds collection authority; a second cleanup would retire its reader early.
+                transaction.native_open = transaction.native.has_dispatched_task();
+                Ok(ForegroundAction::Wait)
+            }
             ForegroundSignal::Native(NativeForegroundSignal::Cancelled) => {
                 self.fail_foreground(transaction, TurnCancelled.into())
             }
@@ -214,7 +312,7 @@ impl HarnessBroker {
             ForegroundSignal::UserDelivery((input, result)) => Ok(ForegroundAction::Effect(
                 ForegroundJob::SettleUserDelivery { input, result },
             )),
-            ForegroundSignal::UserDeliverySettled(input) => {
+            ForegroundSignal::UserDeliverySettled(input, _flight) => {
                 if let Some(input) = input {
                     transaction.steering.deferred.push_back(input);
                 }
@@ -266,6 +364,7 @@ impl HarnessBroker {
             ForegroundSignal::RevisionReview(request) => {
                 self.apply_foreground_revision(transaction, request)
             }
+            #[cfg(test)]
             ForegroundSignal::RevisionChecksUpdated { response, result } => {
                 Ok(self.apply_foreground_revision_checks(transaction, response, *result))
             }
@@ -285,14 +384,29 @@ impl HarnessBroker {
             ForegroundSignal::Cleanup(ExecutionCleanup::Idle | ExecutionCleanup::Pending) => {
                 Ok(ForegroundAction::Wait)
             }
-            ForegroundSignal::Cleanup(ExecutionCleanup::RestartCollected) => {
-                // Collection proves quiescence even when no further native terminal arrives.
-                // Drain accepted observations before settling through the restart path.
-                transaction.native_open = false;
-                transaction.pending_native_ready = Some(Err(ProviderError::Cancelled));
+            ForegroundSignal::CollectionStarted(disposition) => {
+                transaction.collection = Some(disposition);
+                if let Some(finalization) = transaction.finalization.as_mut() {
+                    finalization.set_collection(disposition);
+                }
+                Ok(ForegroundAction::Wait)
+            }
+            ForegroundSignal::CollectionCompleted(disposition) => {
+                transaction.collection = Some(disposition);
+                if let Some(finalization) = transaction.finalization.as_mut() {
+                    finalization.set_collection(disposition);
+                }
+                transaction.native_open = transaction.native.has_dispatched_task();
+                if !already_finalizing
+                    && !transaction.native_open
+                    && transaction.pending_native_ready.is_none()
+                {
+                    transaction.pending_native_ready = Some(Err(ProviderError::Cancelled));
+                }
                 self.collect_foreground_observations(transaction)?;
                 Ok(ForegroundAction::Wait)
             }
+            #[cfg(test)]
             ForegroundSignal::Cleanup(ExecutionCleanup::Failed(message)) => self.fail_foreground(
                 transaction,
                 anyhow::anyhow!("execution cleanup failed: {message}"),
@@ -312,6 +426,21 @@ impl HarnessBroker {
             }
             ForegroundSignal::PublicationFailed(error) => {
                 self.fail_foreground(transaction, error.into())
+            }
+            ForegroundSignal::EffectFailed(error)
+                if transaction.collection.is_some()
+                    && (error.is::<TurnCancelled>()
+                        || error
+                            .downcast_ref::<ProviderError>()
+                            .is_some_and(ProviderError::is_clean_cancellation)) =>
+            {
+                transaction.native_open = transaction.native.has_dispatched_task();
+                if !transaction.native_open && !already_finalizing {
+                    transaction
+                        .pending_native_ready
+                        .get_or_insert(Err(ProviderError::Cancelled));
+                }
+                Ok(ForegroundAction::Wait)
             }
             ForegroundSignal::EffectFailed(error) => self.fail_foreground(transaction, error),
             ForegroundSignal::ObservationPublicationDelivered(result) => {
@@ -398,6 +527,7 @@ impl HarnessBroker {
             | ForegroundSignal::AdmissionFailureCheckpointCompleted(_)
             | ForegroundSignal::RetractionGoalRestored(_)
             | ForegroundSignal::PlanMutationCompleted(_)
+            | ForegroundSignal::LiveHost(_)
             | ForegroundSignal::PlanSubmissionCompleted(_)
             | ForegroundSignal::PlanQuestionCompleted(_)
             | ForegroundSignal::GoalProgressCompleted(_)
@@ -556,5 +686,76 @@ impl HarnessBroker {
             }
         }
         failure.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(test)]
+mod receipt_scope_tests {
+    use super::*;
+
+    /// Preserve the broker's unrelated input receipt while applying or rejecting admission signals.
+    #[tokio::test]
+    async fn foreground_receipt_scope_restores_unrelated_input_on_error() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
+            "workspace":root.path(),"data_root":root.path().join("data"),
+            "client_id":"foreground-receipt-scope","provider":{"kind":"mock","command":[]},
+        }))?)?;
+        let catalog = broker.provider_catalog_request()?;
+        let provider = broker.provider.descriptor().kind;
+        let selected = broker.submission_store.prepare_input(
+            &catalog,
+            ProviderInput::from_text("Selected input"),
+            provider.clone(),
+            Some("selected".into()),
+        )?;
+        let unrelated = broker.submission_store.prepare_input(
+            &catalog,
+            ProviderInput::from_text("Unrelated input"),
+            provider,
+            Some("unrelated".into()),
+        )?;
+        broker.input_submission = Some(unrelated.clone());
+        let message = serde_json::from_value(json!({
+            "id":"selected","revision":2,"text":"Selected input","delivery":"delivering","route":"turn",
+        }))?;
+        let (publication, _updates) = publication::channel();
+        let mut dispatch = broker.begin_queued_input_dispatch(
+            message,
+            selected.clone(),
+            Vec::new(),
+            publication,
+        )?;
+        let signal = dispatch.next().await?;
+        assert!(matches!(
+            broker.step_foreground(&mut dispatch, signal)?,
+            ForegroundAction::Wait
+        ));
+        assert_eq!(
+            broker.input_submission.as_ref().unwrap().id(),
+            unrelated.id()
+        );
+        assert!(
+            broker
+                .step_foreground(&mut dispatch, ForegroundSignal::AdmissionRequested)
+                .is_err()
+        );
+        assert_eq!(
+            broker.input_submission.as_ref().unwrap().id(),
+            unrelated.id()
+        );
+        let ForegroundDispatch::Admitting(admission) = dispatch else {
+            anyhow::bail!("unexpected foreground phase after rejected admission signal");
+        };
+        assert_eq!(
+            admission.input_submission.as_ref().unwrap().id(),
+            selected.id()
+        );
+        assert!(matches!(
+            selected.record()?.delivery,
+            crate::provider::submission::SubmissionState::Prepared
+        ));
+        assert!(broker.store.latest_exchange(&broker.session.id)?.is_none());
+        Ok(())
     }
 }

@@ -203,5 +203,35 @@ input.receive(state, { revision = 16, suspended = false, execution_busy = true,
   upsert = { queued_message }, removed = {} })
 assert(#state.pending_steer == 1 and state.pending_steer[1] == queued_identity and #state.queue == 1,
   "authoritative steering dispatch did not move the existing entry into steering")
+local clarification_target = { owner = "question", question_id = "selected-question", revision = 3 }
+input.submit(state, "Clarify this question", {}, "queue", nil, nil, nil, clarification_target)
+local clarification = requests[#requests]
+clarification.callback(nil, "Try again", { code = "state_unavailable" })
+local rejected_clarification = state.input.rejected[#state.input.rejected]
+input.retry(state, rejected_clarification)
+local retried_clarification = requests[#requests]
+assert(vim.deep_equal(retried_clarification.parameters.target, clarification_target),
+  "explicit retry dropped the selected question source")
+assert(retried_clarification.parameters.action.message.submission_target == nil
+  and retried_clarification.parameters.action.message.operation_id == nil,
+  "local recovery metadata leaked into the message wire shape")
+retried_clarification.callback({ operation_id = retried_clarification.parameters.id,
+  revision = state.input.revision, suspended = false, upsert = {}, removed = {} })
+local uncertain_callbacks = 0
+input.submit(state, "uncertain input", {}, "queue", nil, function(failure)
+  assert(failure == "Collection outcome unknown")
+  uncertain_callbacks = uncertain_callbacks + 1
+end)
+local uncertain = requests[#requests]
+local uncertain_request_count = #requests
+uncertain.callback(nil, "Collection outcome unknown", { code = "outcome_unknown" })
+assert(uncertain_callbacks == 1 and not state.input.sending and #state.input.pending == 0,
+  "terminal uncertainty retained the input waiter")
+assert(#requests == uncertain_request_count, "terminal uncertainty replayed an input command")
+local retained = state.input.rejected[#state.input.rejected]
+assert(retained.delivery == "unknown" and retained.operation_id == uncertain.parameters.id,
+  "terminal uncertainty lost its original command identity or claimed definite rejection")
+uncertain.callback(nil, "Collection outcome unknown", { code = "outcome_unknown" })
+assert(uncertain_callbacks == 1, "late uncertainty completed the input waiter twice")
 print("harness_input_state: passed")
 vim.cmd("qa!")

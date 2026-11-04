@@ -59,8 +59,12 @@ request("session.question.answer", { command = { operation_id = "answer-first", 
   action = { kind = "answer", answer = { kind = "selected", option_id = "1:0" } } } })
 wait(function() return state.questions.questions[1].resolution.kind == "answered" end, "Answer did not persist")
 local second = state.questions.questions[2]
-request("session.question.ask", { command = { operation_id = "clarify-second", question_id = second.id, revision = 1,
-  action = { kind = "clarify", text = "Does this affect existing sessions?" } } })
+local input = request("session.input.get")
+request("session.input.apply", { id = "clarify-second", control_revision = input.control_revision,
+  after_control = input.control_operation_id,
+  target = { owner = "question", question_id = second.id, revision = second.content.revision },
+  action = { kind = "submit", message = { id = "clarify-second", revision = 0,
+    text = "Does this affect existing sessions?", purpose = { kind = "user" }, intent = "auto", attachments = {} } } })
 wait(function() return #state.questions.questions[2].discussion == 1 end, "Clarification disappeared")
 assert(state.questions.questions[2].resolution.kind == "pending", "Clarification answered the question")
 wait(delivery_settled, "Clarification delivery did not settle")

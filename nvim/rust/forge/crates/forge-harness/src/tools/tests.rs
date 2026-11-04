@@ -11,6 +11,7 @@ fn direct_argument_decoding_preserves_nested_error_paths() {
         _values: Vec<u64>,
     }
     let invocation = ControlToolInvocation {
+        call_id: None,
         task_permit: None,
         name: "example".into(),
         arguments: json!({"values":[1,"invalid"]}),
@@ -115,6 +116,7 @@ async fn every_tool_validates_routes_and_returns_a_controlled_result() {
             name => panic!("add a routing scenario for {name}"),
         };
         let invocation = ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: tool.name.into(),
             arguments: arguments.clone(),
@@ -157,6 +159,7 @@ async fn wrong_plan_id_returns_a_typed_tool_error_and_allows_retry() {
     context.plan_document = Some(document.clone());
     let mut runtime = ControlToolRuntime::new(context);
     let invocation = ControlToolInvocation {
+        call_id: None,
         task_permit: None,
         name: "plan_overview_read".into(),
         arguments: json!({"plan_id":"wrong"}),
@@ -177,6 +180,7 @@ async fn wrong_plan_id_returns_a_typed_tool_error_and_allows_retry() {
     assert_eq!(response["active_version"], document.version);
     runtime
         .invoke(ControlToolInvocation {
+            call_id: None,
             arguments: json!({"plan_id":"active"}),
             ..invocation
         })
@@ -195,6 +199,7 @@ fn question_tools_generate_ids_and_expose_waiting() {
             arguments["wait"] = json!(wait);
         }
         validate_arguments(&ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "question_ask".into(),
             arguments,
@@ -206,6 +211,7 @@ fn question_tools_generate_ids_and_expose_waiting() {
         invalid[extra] = json!("model-owned");
         assert!(
             validate_arguments(&ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "question_ask".into(),
                 arguments: invalid
@@ -217,6 +223,7 @@ fn question_tools_generate_ids_and_expose_waiting() {
     invalid["questions"][0]["id"] = json!("model-owned");
     assert!(
         validate_arguments(&ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "question_ask".into(),
             arguments: invalid
@@ -245,6 +252,7 @@ fn question_tools_generate_ids_and_expose_waiting() {
 fn repository_schema_preserves_complete_offsets_and_path_identities() {
     assert!(
         validate_arguments(&ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "repository_file_diff".into(),
             arguments: json!({"offset":65537,"path_hex":"61".repeat(4097)}),
@@ -268,6 +276,7 @@ fn repository_tools_reject_caller_authority_and_only_accept_advertised_inputs() 
         };
         assert!(
             validate_arguments(&ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: name.into(),
                 arguments: arguments.clone()
@@ -284,6 +293,7 @@ fn repository_tools_reject_caller_authority_and_only_accept_advertised_inputs() 
             arguments[field] = json!("forged");
             assert!(
                 validate_arguments(&ControlToolInvocation {
+                    call_id: None,
                     task_permit: None,
                     name: name.into(),
                     arguments: arguments.clone()
@@ -295,6 +305,7 @@ fn repository_tools_reject_caller_authority_and_only_accept_advertised_inputs() 
     }
     assert!(
         validate_arguments(&ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "repository_file_diff".into(),
             arguments: json!({})
@@ -303,6 +314,7 @@ fn repository_tools_reject_caller_authority_and_only_accept_advertised_inputs() 
     );
     assert!(
         validate_arguments(&ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "repository_status".into(),
             arguments: json!({ "side": "staged" })
@@ -311,6 +323,7 @@ fn repository_tools_reject_caller_authority_and_only_accept_advertised_inputs() 
     );
     assert!(
         validate_arguments(&ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "repository_diff".into(),
             arguments: json!({ "side": "other" })
@@ -358,6 +371,7 @@ fn checks_catalog_matches_runtime_requests_and_root_ownership() {
     ] {
         assert!(
             validate_arguments(&ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: name.into(),
                 arguments,
@@ -387,6 +401,7 @@ fn checks_catalog_matches_runtime_requests_and_root_ownership() {
         );
         apply_invocation(
             &ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: name.into(),
                 arguments: arguments.clone(),
@@ -398,6 +413,7 @@ fn checks_catalog_matches_runtime_requests_and_root_ownership() {
         invalid["workspace"] = json!("untrusted");
         assert!(
             validate_arguments(&ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: name.into(),
                 arguments: invalid
@@ -454,6 +470,7 @@ fn plan_tools_separate_files_and_overview() {
             | "harness_plan_task_report"
     )));
     let invocation = ControlToolInvocation {
+        call_id: None,
         task_permit: None,
         name: "plan_file_edit".into(),
         arguments: json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Add File: lib.rs\n+pub struct Owner;\n*** End Patch"}),
@@ -666,6 +683,7 @@ fn exposes_resource_oriented_plan_tools() {
 #[cfg(any())]
 fn decodes_the_advertised_plan_edit_shape() {
     let invocation = ControlToolInvocation {
+        call_id: None,
         task_permit: None,
         name: "harness_plan_edit".into(),
         arguments: json!({
@@ -883,6 +901,7 @@ fn decodes_the_advertised_plan_edit_shape() {
 #[cfg(any())]
 fn rejects_internal_identity_fields_from_model_edits() {
     let invocation = ControlToolInvocation {
+        call_id: None,
         task_permit: None,
         name: "harness_plan_edit".into(),
         arguments: json!({
@@ -913,6 +932,7 @@ fn rejects_internal_identity_fields_from_model_edits() {
 #[cfg(any())]
 fn rejects_harness_resolved_dependency_versions_from_model_edits() {
     let invocation = ControlToolInvocation {
+        call_id: None,
         task_permit: None,
         name: "harness_plan_edit".into(),
         arguments: json!({
@@ -944,6 +964,7 @@ fn rejects_harness_resolved_dependency_versions_from_model_edits() {
 #[cfg(any())]
 fn reports_the_exact_nested_json_path_for_invalid_arguments() {
     let invocation = ControlToolInvocation {
+        call_id: None,
         task_permit: None,
         name: "harness_plan_edit".into(),
         arguments: json!({
@@ -985,6 +1006,7 @@ fn reports_the_exact_nested_json_path_for_invalid_arguments() {
 #[cfg(any())]
 fn reports_every_independent_structural_violation_in_one_response() {
     let invocation = ControlToolInvocation {
+        call_id: None,
         task_permit: None,
         name: "harness_plan_edit".into(),
         arguments: json!({
@@ -1015,6 +1037,7 @@ fn reports_every_independent_structural_violation_in_one_response() {
 #[cfg(any())]
 fn rejects_member_properties_from_enum_variants_before_plan_mutation() {
     let invocation = ControlToolInvocation {
+        call_id: None,
         task_permit: None,
         name: "harness_plan_edit".into(),
         arguments: json!({

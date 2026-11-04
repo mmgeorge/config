@@ -1,12 +1,11 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
-use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::SqliteStore;
-use crate::plan::{PlanElicitation, PlanQuestionResponse};
+use crate::plan::PlanElicitation;
 
-const ACCEPTANCE_ELICITATION_PATH: &str = "$.acceptance.elicitation";
+const REVIEW_ELICITATION_PATH: &str = "$.review.elicitation";
 
 pub(super) fn preserve_answers(
     transaction: &rusqlite::Transaction<'_>,
@@ -27,7 +26,7 @@ pub(super) fn preserve_answers(
     }
     for (pointer, path) in [
         ("/elicitation", "$.elicitation"),
-        ("/acceptance/elicitation", ACCEPTANCE_ELICITATION_PATH),
+        ("/review/elicitation", REVIEW_ELICITATION_PATH),
     ] {
         let Some(proposed) = incoming
             .pointer_mut(pointer)
@@ -84,7 +83,7 @@ fn preserve_withdrawals(table: &str, incoming: &mut Value, stored: &Value) -> Re
             .filter(|resolution| resolution["kind"] == "withdrawn")
             .cloned()
             .collect();
-        for pointer in ["/elicitation", "/acceptance/elicitation"] {
+        for pointer in ["/elicitation", "/review/elicitation"] {
             let retired = incoming
                 .pointer(pointer)
                 .and_then(|elicitation| elicitation["question_set"]["questions"].as_array())
@@ -102,7 +101,7 @@ fn preserve_withdrawals(table: &str, incoming: &mut Value, stored: &Value) -> Re
                         incoming["state"] = stored["state"].clone();
                     }
                 } else {
-                    incoming["acceptance"] = Value::Null;
+                    incoming["review"] = Value::Null;
                 }
             }
         }
@@ -200,7 +199,7 @@ pub(super) fn retire_task_questions(
     if let Some(elicitation) = plan.elicitation.take() {
         question.push(elicitation);
     }
-    if let Some(acceptance) = plan.acceptance.take() {
+    if let Some(acceptance) = plan.review.take() {
         question.push(acceptance.elicitation);
     }
     if question.is_empty() {
@@ -265,48 +264,40 @@ pub(super) fn retire_task_questions(
     Ok(())
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum QuestionOwner {
-    Interaction,
-    Plan,
-    PlanAcceptance,
-}
-
-#[derive(Deserialize)]
-struct QuestionTarget {
-    owner: QuestionOwner,
-    id: String,
-    set_id: String,
-    revision: u32,
-}
-
 impl SqliteStore {
-    /// Commits one identified answer and its retry receipt in the same transaction.
-    pub(crate) fn answer_question_command(
+    /// Commit a validated decision only from its session owner's event boundary.
+    pub(crate) fn commit_question_answer(
         &mut self,
-        session_id: &str,
-        request: &Value,
-    ) -> Result<Value> {
-        let admission = self.session_admission(session_id)?;
-        admission.with_task_mutation(|| self.answer_question_command_locked(session_id, request))
+        permit: &crate::exchange::QuestionUpdatePermit<'_>,
+        request: &crate::plan::PlanQuestionAnswerRequest,
+    ) -> std::result::Result<
+        crate::plan::PlanQuestionAnswerCommit,
+        crate::plan::PlanQuestionAnswerError,
+    > {
+        use crate::plan::PlanQuestionAnswerError;
+        let session_id = permit.session();
+        let admission = self
+            .session_admission(session_id)
+            .map_err(PlanQuestionAnswerError::State)?;
+        admission
+            .with_task_mutation(|| Ok(self.commit_question_answer_locked(session_id, request)))
+            .map_err(PlanQuestionAnswerError::State)?
     }
 
-    /// Publish a plan answer's task update under the shared dependent-write fence.
-    fn answer_question_command_locked(
+    /// Couple the answer, dependent task snapshot, and immutable retry receipt in one transaction.
+    fn commit_question_answer_locked(
         &mut self,
         session_id: &str,
-        request: &Value,
-    ) -> Result<Value> {
-        let identity = request["operation_id"]
-            .as_str()
-            .context("question command identity is required")?;
-        let target: QuestionTarget = serde_json::from_value(request["target"].clone())?;
-        let question_id = request["question_id"]
-            .as_str()
-            .context("question identity is required")?;
-        let response: PlanQuestionResponse = serde_json::from_value(request["response"].clone())?;
-        let encoded = serde_json::to_string(request)?;
+        request: &crate::plan::PlanQuestionAnswerRequest,
+    ) -> std::result::Result<
+        crate::plan::PlanQuestionAnswerCommit,
+        crate::plan::PlanQuestionAnswerError,
+    > {
+        use crate::plan::{PlanQuestionAnswerCommit, PlanQuestionAnswerError, PlanQuestionOwner};
+        let identity = request.operation_id();
+        let source = request.source_id();
+        let question_id = request.question_id();
+        let encoded = request.encode_receipt()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -318,80 +309,104 @@ impl SqliteStore {
             )
             .optional()?;
         if let Some((previous, result)) = previous {
-            ensure!(
-                previous == encoded,
-                "question command identity was reused for a different answer"
-            );
-            return Ok(serde_json::from_str(&result)?);
+            if previous != encoded {
+                return Err(PlanQuestionAnswerError::IdentityConflict);
+            }
+            let result = PlanQuestionAnswerCommit::recover(request, &result)?;
+            crate::exchange::SessionPublications::retain_plan_answer(
+                &transaction,
+                session_id,
+                request,
+                &result,
+            )
+            .map_err(|error| PlanQuestionAnswerError::State(error.into()))?;
+            transaction.commit()?;
+            return Ok(result);
         }
-        let (table, pointer, condition, owner) = match target.owner {
-            QuestionOwner::Interaction => (
+
+        // Validate captured source and question revisions before changing either owner record.
+        let (table, pointer, condition) = match request.owner() {
+            PlanQuestionOwner::Interaction => (
                 "exchange_record",
                 "$.elicitation",
                 "json_extract(payload,'$.awaiting_input')=1",
-                "interaction",
             ),
-            QuestionOwner::Plan => (
+            PlanQuestionOwner::Plan => (
                 "plan_record",
                 "$.elicitation",
                 "json_extract(payload,'$.state')='awaiting_input'",
-                "plan",
             ),
-            QuestionOwner::PlanAcceptance => (
+            PlanQuestionOwner::PlanReview => (
                 "plan_record",
-                ACCEPTANCE_ELICITATION_PATH,
+                REVIEW_ELICITATION_PATH,
                 "json_extract(payload,'$.state')='awaiting_review'",
-                "plan_acceptance",
             ),
         };
         let text: Option<String> = transaction.query_row(
             &format!("SELECT json_extract(payload,?3) FROM {table} WHERE session_id=?1 AND id=?2 AND {condition}"),
-            params![session_id, target.id, pointer], |row| row.get(0),
+            params![session_id, source, pointer], |row| row.get(0),
         ).optional()?.flatten();
-        let mut elicitation: PlanElicitation = serde_json::from_str(
-            &text.context("question owner is no longer awaiting this answer")?,
-        )?;
-        ensure!(
-            elicitation.question_set.id == target.set_id && elicitation.revision == target.revision,
-            "question set changed before the answer was committed"
-        );
-        let order: Option<(String, u64)> = request
-            .get("answer_order")
-            .map(|value| serde_json::from_value(value.clone()))
-            .transpose()?;
+        let mut elicitation: PlanElicitation =
+            serde_json::from_str(&text.ok_or(PlanQuestionAnswerError::TargetMissing)?)?;
+        if matches!(request.owner(), PlanQuestionOwner::PlanReview) {
+            elicitation.require_review_confirmation();
+        }
+        if elicitation.question_set.id != request.set_id()
+            || elicitation.revision != request.revision()
+        {
+            return Err(PlanQuestionAnswerError::Changed);
+        }
+        let order = request.answer_order();
         let superseded =
-            order.as_ref().is_some_and(|(writer, sequence)| {
+            order.is_some_and(|(writer, sequence)| {
                 elicitation.answer_order.get(question_id).is_some_and(
                     |(previous_writer, previous)| previous_writer == writer && previous >= sequence,
                 )
             });
         if !superseded {
-            elicitation.answer(question_id, response)?;
+            elicitation
+                .answer(question_id, request.response().clone())
+                .map_err(PlanQuestionAnswerError::InvalidAnswer)?;
             if let Some(order) = order {
                 elicitation
                     .answer_order
-                    .insert(question_id.to_owned(), order);
+                    .insert(question_id.into(), order.clone());
             }
         }
         transaction.execute(
             &format!("UPDATE {table} SET payload=json_set(payload,?3,json(?4)) WHERE session_id=?1 AND id=?2"),
-            params![session_id, target.id, pointer, serde_json::to_string(&elicitation)?],
+            params![session_id, source, pointer, serde_json::to_string(&elicitation)?],
         )?;
-        if table == "plan_record" {
+        if !matches!(request.owner(), PlanQuestionOwner::Interaction) {
             let plan: crate::plan::PlanRecord =
-                super::task::read_record(&transaction, table, &target.id)?
-                    .context("answered plan disappeared")?;
-            let active: String = transaction.query_row("SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1", [session_id], |row| row.get(0))?;
-            let mut active: crate::task::Task = super::decode(&active)?;
-            crate::task::SessionTaskController::apply_plan_answer(&mut active, plan)?;
-            transaction.execute("UPDATE session_record SET payload=json_set(payload,'$.session.active_task',json(?2)) WHERE id=?1", params![session_id,super::encode(&active)?])?;
+                super::task::read_record(&transaction, table, source)
+                    .map_err(PlanQuestionAnswerError::State)?
+                    .ok_or(PlanQuestionAnswerError::TargetMissing)?;
+            let active: Option<String> = transaction.query_row(
+                "SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1", [session_id], |row| row.get(0),
+            )?;
+            let mut active: Option<crate::task::Task> = active
+                .as_deref()
+                .map(super::decode)
+                .transpose()
+                .map_err(PlanQuestionAnswerError::State)?;
+            let owns_plan = active.as_ref().is_some_and(|task| matches!(&task.workflow,
+                crate::task::WorkflowSnapshot::Plan { plan: current } if current.artifact.id == source));
+            if !owns_plan && matches!(request.owner(), PlanQuestionOwner::Plan) {
+                return Err(PlanQuestionAnswerError::TargetMissing);
+            }
+            if let Some(active) = active.as_mut().filter(|_| owns_plan) {
+                crate::task::SessionTaskController::apply_plan_answer(active, plan)
+                    .map_err(PlanQuestionAnswerError::InvalidAnswer)?;
+                transaction.execute(
+                    "UPDATE session_record SET payload=json_set(payload,'$.session.active_task',json(?2)) WHERE id=?1",
+                    params![session_id, super::encode(active).map_err(PlanQuestionAnswerError::State)?],
+                )?;
+            }
         }
-        let result = json!({"operation_id":identity,"active_elicitation":{
-            "owner":owner,
-            "exchange_id":if owner == "interaction" { Some(&target.id) } else { None },
-            "plan_id":if owner != "interaction" { Some(&target.id) } else { None },
-            "elicitation":elicitation,
-        }});
+
+        // Commit the result with its answer; retry returns this snapshot even after later answers.
+        let result = PlanQuestionAnswerCommit::new(request, elicitation)?;
         transaction.execute(
             "INSERT INTO command_receipt(session_id,id,request,result) VALUES(?1,?2,?3,?4)",
             params![
@@ -401,9 +416,31 @@ impl SqliteStore {
                 serde_json::to_string(&result)?
             ],
         )?;
+        crate::exchange::SessionPublications::retain_plan_answer(
+            &transaction,
+            session_id,
+            request,
+            &result,
+        )
+        .map_err(|error| PlanQuestionAnswerError::State(error.into()))?;
         transaction.commit()?;
-        self.publish_admission(session_id)?;
+        self.publish_admission(session_id)
+            .map_err(PlanQuestionAnswerError::State)?;
         Ok(result)
+    }
+
+    /// Exercise old JSON fixtures through the same validated transaction used by owner events.
+    #[cfg(test)]
+    pub(crate) fn answer_question_command(
+        &mut self,
+        session_id: &str,
+        request: &Value,
+    ) -> Result<Value> {
+        let request = crate::plan::PlanQuestionAnswerRequest::parse(request.clone())?;
+        let permit = crate::exchange::QuestionUpdatePermit::for_test(session_id);
+        Ok(serde_json::to_value(
+            self.commit_question_answer(&permit, &request)?,
+        )?)
     }
 }
 
@@ -605,7 +642,7 @@ mod tests {
     #[test]
     fn acceptance_answer_survives_stale_plan_publication_and_reopen() -> Result<()> {
         let (root, mut store, controller) = crate::task::SessionTaskController::test_goal();
-        let acceptance = crate::plan::PlanAcceptance::new(
+        let acceptance = crate::plan::PlanReview::new(
             "review-digest".into(),
             &[
                 crate::session::ApprovalMode::Ask,
@@ -617,7 +654,7 @@ mod tests {
             "state":"awaiting_review", "working_path":"", "model_revision":1,
             "submitted_version":1,
             "user_revision":0, "created_at_ms":1, "updated_at_ms":1,
-            "review_digest":"review-digest", "acceptance":acceptance
+            "review_digest":"review-digest", "review":acceptance
         }))?;
         let previous = controller.current()?.unwrap();
         controller.change(
@@ -628,8 +665,8 @@ mod tests {
         )?;
         let request = json!({
             "operation_id":"acceptance-answer",
-            "target":{"owner":"plan_acceptance","id":"plan","set_id":"plan-acceptance","revision":1},
-            "question_id":"acceptance-execution-mode",
+            "target":{"owner":"plan_acceptance","id":"plan","set_id":plan.review.as_ref().unwrap().elicitation.question_set.id,"revision":1},
+            "question_id":plan.review.as_ref().unwrap().elicitation.question_set.questions[0].id,
             "response":{"kind":"selected","option":"ask"}
         });
         let receipt = store.answer_question_command("session", &request)?;
@@ -643,7 +680,7 @@ mod tests {
         store.save_plan(&plan)?;
         let saved = store.load_plan("plan")?.unwrap();
         assert_eq!(
-            saved.acceptance.unwrap().approval_mode()?,
+            saved.review.unwrap().approval_mode()?,
             crate::session::ApprovalMode::Ask
         );
         drop(store);
@@ -656,12 +693,134 @@ mod tests {
             reopened
                 .load_plan("plan")?
                 .unwrap()
-                .acceptance
+                .review
                 .unwrap()
                 .elicitation
                 .answer
                 .len(),
             1
+        );
+        let current = controller.current()?.unwrap();
+        let replacement = crate::plan::PlanReview::new(
+            "review-digest".into(),
+            &[
+                crate::session::ApprovalMode::Ask,
+                crate::session::ApprovalMode::Deny,
+            ],
+        )?;
+        controller.update(&mut reopened, &current.permit(), 2, |task| {
+            let crate::task::WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
+                anyhow::bail!("planning task disappeared")
+            };
+            plan.artifact.review = Some(replacement);
+            Ok(())
+        })?;
+        let mut stale = request.clone();
+        stale["operation_id"] = json!("old-review-set-new-answer");
+        let stale = crate::plan::PlanQuestionAnswerRequest::parse(stale)?;
+        let permit = crate::exchange::QuestionUpdatePermit::for_test("session");
+        assert!(matches!(
+            reopened.commit_question_answer(&permit, &stale),
+            Err(crate::plan::PlanQuestionAnswerError::Changed)
+        ));
+        assert!(
+            reopened
+                .load_plan("plan")?
+                .unwrap()
+                .review
+                .unwrap()
+                .elicitation
+                .answer
+                .is_empty()
+        );
+        assert_eq!(
+            reopened.answer_question_command("session", &request)?,
+            receipt
+        );
+        Ok(())
+    }
+    /// Answer standalone review questions atomically without replacing an unrelated active task.
+    #[test]
+    fn standalone_review_answers_preserve_unrelated_task_and_retry_receipt() -> Result<()> {
+        let (root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+        let unrelated = serde_json::to_value(controller.current()?.unwrap())?;
+        let review = crate::plan::PlanReview::new(
+            "standalone-digest".into(),
+            &[
+                crate::session::ApprovalMode::Ask,
+                crate::session::ApprovalMode::Deny,
+            ],
+        )?;
+        let plan: crate::plan::PlanRecord = serde_json::from_value(json!({
+            "id":"standalone-review","session_id":"session","request":"Review saved work",
+            "state":"awaiting_review","working_path":"","model_revision":1,"submitted_version":1,
+            "user_revision":0,"created_at_ms":1,"updated_at_ms":1,
+            "review_digest":"standalone-digest","review":review
+        }))?;
+        store.save_plan(&plan)?;
+        let elicitation = &plan.review.as_ref().unwrap().elicitation;
+        let request = json!({
+            "operation_id":"standalone-answer","target":{"owner":"plan_review","id":plan.id,
+                "set_id":elicitation.question_set.id,"revision":elicitation.revision},
+            "question_id":elicitation.question_set.questions[0].id,
+            "response":{"kind":"selected","option":"ask"},"answer_order":["reviewer",1]
+        });
+        store.connection.execute_batch("CREATE TRIGGER reject_standalone_receipt BEFORE INSERT ON command_receipt BEGIN SELECT RAISE(ABORT,'receipt failed'); END;")?;
+        assert!(store.answer_question_command("session", &request).is_err());
+        assert!(
+            store
+                .load_plan(&plan.id)?
+                .unwrap()
+                .review
+                .unwrap()
+                .elicitation
+                .answer
+                .is_empty()
+        );
+        assert_eq!(
+            serde_json::to_value(controller.current()?.unwrap())?,
+            unrelated
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_standalone_receipt")?;
+        let receipt = store.answer_question_command("session", &request)?;
+        assert_eq!(
+            store
+                .load_plan(&plan.id)?
+                .unwrap()
+                .review
+                .unwrap()
+                .approval_mode()?,
+            crate::session::ApprovalMode::Ask
+        );
+        assert_eq!(
+            serde_json::to_value(controller.current()?.unwrap())?,
+            unrelated
+        );
+        let mut newer = request.clone();
+        newer["operation_id"] = json!("standalone-newer-answer");
+        newer["answer_order"] = json!(["reviewer", 2]);
+        newer["response"] = json!({"kind":"selected","option":"deny"});
+        store.answer_question_command("session", &newer)?;
+        drop(store);
+        let mut reopened = SqliteStore::open(root.path())?;
+        assert_eq!(
+            reopened.answer_question_command("session", &request)?,
+            receipt
+        );
+        assert_eq!(
+            reopened
+                .load_plan(&plan.id)?
+                .unwrap()
+                .review
+                .unwrap()
+                .approval_mode()?,
+            crate::session::ApprovalMode::Deny
+        );
+        assert_eq!(
+            serde_json::to_value(controller.current()?.unwrap())?,
+            unrelated
         );
         Ok(())
     }

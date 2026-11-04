@@ -133,6 +133,27 @@ impl NativeRpc {
         self.wait_response(id, operation).await
     }
 
+    /// Retain a read-only observation until its response or transport closure proves completion.
+    pub(super) async fn request_observation(
+        &self,
+        method: &str,
+        params: Value,
+        operation: ProviderOperation,
+    ) -> Result<Value, ProviderError> {
+        let id = self.send_request(method, params).await?;
+        let receiver = self
+            .responses
+            .lock()
+            .await
+            .remove(&id)
+            .ok_or_else(|| failure(operation, ProviderFailureKind::Protocol))?;
+        let method = self.methods.lock().await.remove(&id).unwrap_or_default();
+        let response = receiver.await;
+        self.waiters.lock().await.remove(&id);
+        let result = response.map_err(|_| failure(operation, ProviderFailureKind::Transport))??;
+        decode_result(&result, operation, &method)
+    }
+
     /// Await one request response without owning the native session reader lock.
     pub(super) async fn wait_response(
         &self,

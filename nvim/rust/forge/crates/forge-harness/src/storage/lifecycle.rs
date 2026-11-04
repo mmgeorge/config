@@ -111,8 +111,28 @@ impl SqliteStore {
         )?;
         transaction.commit()?;
         cleanup().with_context(|| format!("clean up deleting Harness session {session_id}; deletion remains pending and can be retried"))?;
-        self.connection
-            .execute("DELETE FROM session_record WHERE id=?1", [session_id])?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for table in [
+            "owner_command",
+            "input_operation",
+            "input_submitted",
+            "input_session",
+        ] {
+            transaction.execute(
+                &format!("DELETE FROM {table} WHERE session_id=?1"),
+                [session_id],
+            )?;
+        }
+        // Preserve the import tombstone even when this session never opened its old
+        // input journal. Retained legacy files cannot resurrect explicitly deleted input.
+        transaction.execute(
+            "INSERT OR IGNORE INTO input_migration(session_id) VALUES(?1)",
+            [session_id],
+        )?;
+        transaction.execute("DELETE FROM session_record WHERE id=?1", [session_id])?;
+        transaction.commit()?;
         Ok(())
     }
 

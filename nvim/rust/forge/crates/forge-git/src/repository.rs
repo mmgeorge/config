@@ -163,7 +163,8 @@ impl RepositoryState {
 
     /// Collects and adopts a full status observation without holding the state lock during I/O.
     ///
-    /// Retries detected HEAD, index, status, and changed-path metadata changes up to three times.
+    /// Retry detected HEAD, index, and content changes up to three times.
+    /// Display inventory uses a single status scan; later edits appear on refresh.
     /// Concurrent callers collect in sequence so independent documents cannot supersede each other.
     /// Invalidation prevents adoption of an older result. Native checks use a
     /// 30-second cooperative deadline. Filesystem waits can outlive that deadline. Accepted metadata

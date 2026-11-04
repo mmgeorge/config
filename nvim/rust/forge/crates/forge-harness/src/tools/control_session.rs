@@ -41,6 +41,13 @@ pub(crate) struct ControlSession {
     definitions: RwLock<Vec<ControlToolDefinition>>,
     state: StdMutex<ControlState>,
     changed: Notify,
+    host: StdMutex<Option<HostDelegate>>,
+}
+
+#[derive(Clone)]
+struct HostDelegate {
+    scope: crate::provider::InvocationScope,
+    tools: std::sync::Weak<dyn forge_provider_api::control::ProviderTools>,
 }
 
 struct PendingControlCall<'session> {
@@ -66,11 +73,30 @@ impl ControlSession {
             definitions: RwLock::new(definitions),
             state: StdMutex::new(ControlState::default()),
             changed: Notify::new(),
+            host: StdMutex::new(None),
         }
     }
 
-    pub(crate) async fn begin(&self, context: ControlTurnContext, sink: ProviderEventSink) {
+    /// Route native MCP calls through the same scoped commit and replay boundary as direct callbacks.
+    pub(crate) fn bind_host(
+        &self,
+        scope: crate::provider::InvocationScope,
+        tools: std::sync::Weak<dyn forge_provider_api::control::ProviderTools>,
+    ) {
+        *self
+            .host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(HostDelegate { scope, tools });
+    }
+
+    pub(crate) async fn begin(&self, mut context: ControlTurnContext, sink: ProviderEventSink) {
+        context.question_invocation = sink.invocation_scope().ok().cloned();
         self.close().await;
+        self.host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let active = Arc::new(ActiveControl {
             executor: Arc::new(ControlToolExecutor::new(context)),
             sink,
@@ -198,10 +224,27 @@ impl ControlEndpoint for ControlSession {
     }
 
     async fn call(&self, call: ToolCall) -> ToolResult<ControlReply> {
+        let host = self
+            .host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(host) = host {
+            let tools = host
+                .tools
+                .upgrade()
+                .ok_or_else(|| ToolError::MissingState("Host invocation has retired".into()))?;
+            let message = tools
+                .call(&host.scope, call)
+                .await
+                .map_err(|error| ToolError::Operation(Box::new(error)))?;
+            return Ok(ControlReply { message });
+        }
         let (active, _pending) = self.admit_call(&call.name)?;
         let executor = active.executor.clone();
         let sink = active.sink.clone();
         let invocation = ControlToolInvocation {
+            call_id: Some(call.id),
             task_permit: None,
             name: call.name,
             arguments: call.arguments,
@@ -276,10 +319,14 @@ mod tests {
         context.bind_test_task_controller(task_controller);
         context.checkpoint = Some(crate::checkpoint::ToolGate::new());
         state.begin(context, sink.clone()).await;
-        let mut pending = Box::pin(state.call(ToolCall {
-            name: "goal_complete".into(),
-            arguments: json!({"summary":"old turn"}),
-        }));
+        let mut pending = Box::pin(
+            state.call(ToolCall {
+                id: forge_provider_api::control::ToolCallId::new("fixture-call-1")
+                    .expect("fixture call identity is nonempty"),
+                name: "goal_complete".into(),
+                arguments: json!({"summary":"old turn"}),
+            }),
+        );
         assert!(futures_util::poll!(pending.as_mut()).is_pending());
         let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             tokio::join!(pending, state.close())
@@ -294,12 +341,15 @@ mod tests {
         state.begin(context, sink.clone()).await;
         state
             .call(ToolCall {
+                id: forge_provider_api::control::ToolCallId::new("fixture-call-2")
+                    .expect("fixture call identity is nonempty"),
                 name: "goal_complete".into(),
                 arguments: json!({"summary":"replacement turn"}),
             })
             .await?;
         let output = state.take_output().await;
-        assert!(output.evidence.structured_complete);
+        assert!(!output.evidence.structured_complete);
+        assert!(output.goal_evidence().0.structured_complete);
         assert!(output.goal_control.is_some());
         Ok(())
     }
@@ -317,6 +367,8 @@ mod tests {
             .await;
         let failure = state
             .call(ToolCall {
+                id: forge_provider_api::control::ToolCallId::new("fixture-call-3")
+                    .expect("fixture call identity is nonempty"),
                 name: "agent_spawn".into(),
                 arguments: json!({"provider":"incorrect"}),
             })
@@ -333,7 +385,7 @@ mod tests {
                 .any(|item| item["path"] == "provider" && item["code"] == "unknown_field")
         );
         assert!(
-            matches!(stream.try_next()?, Some(ProviderEvent::Diagnostic { diagnostic, .. }) if diagnostic.message.as_str().contains("text"))
+            matches!(stream.try_next()?, Some(ProviderEvent::Diagnostic { diagnostic, .. }) if diagnostic.kind == forge_provider_api::ProviderFailureKind::Rejected && diagnostic.message.as_str() == "Host tool execution failed")
         );
         Ok(())
     }
@@ -343,6 +395,8 @@ mod tests {
         let state = ControlSession::default();
         let failure = state
             .call(ToolCall {
+                id: forge_provider_api::control::ToolCallId::new("fixture-call-4")
+                    .expect("fixture call identity is nonempty"),
                 name: "plan_file_read".into(),
                 arguments: json!({}),
             })

@@ -41,5 +41,5 @@ pub(super) async fn execute(
             .context("reply text required")?
             .into(),
     };
-    super::state::apply(runtime, invocation, action)
+    super::state::apply(runtime, invocation, action).await
 }

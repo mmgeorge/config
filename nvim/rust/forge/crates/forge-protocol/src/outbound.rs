@@ -91,6 +91,19 @@ pub fn encode(message: &impl Serialize, limit: usize) -> io::Result<Vec<u8>> {
 }
 
 impl MessageSender {
+    /// Get whether this output can no longer admit frames, without sending or recording a failure.
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed() || self.failure.borrow().is_some()
+    }
+
+    /// Attempt one session-event frame without poisoning the connection when output capacity is unavailable.
+    /// A caller retaining the event may retry; this method never waits or begins a multipart transfer.
+    pub fn try_send_event(&self, event: &SessionEvent) -> io::Result<()> {
+        crate::contract::validate("session", &event.event, &event.payload)
+            .map_err(io::Error::other)?;
+        self.try_admit(Message::Event(event.clone()), false, false)
+    }
+
     /// Records a response before transport can fail, without changing event delivery.
     pub fn observe_responses(
         &self,
@@ -460,6 +473,33 @@ mod tests {
     use super::*;
     use std::future::{Future, poll_fn};
     use std::task::Poll;
+
+    /// Saturation of a retained notification must not poison control replies or later delivery.
+    #[tokio::test]
+    async fn retained_event_admission_preserves_connection_under_backpressure() {
+        let (sender, mut receiver) = channel();
+        for sequence in 0..MAX_PENDING_FRAMES - RESERVED_CONTROL_RECORDS {
+            sender.send(sequence).unwrap();
+        }
+        let event = SessionEvent {
+            session_id: "session".into(),
+            event: "exchange_updated".into(),
+            payload: json!({"text":"retained content"}),
+        };
+        let error = sender.try_send_event(&event).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        receiver.check().unwrap();
+        sender
+            .send_control_response(Response::success(7, "acknowledged").unwrap())
+            .await
+            .unwrap();
+        let response = receiver.recv().await.unwrap().unwrap();
+        let response: Response = serde_json::from_slice(response.bytes()).unwrap();
+        assert_eq!(response.id, 7);
+        drop(receiver.recv().await.unwrap().unwrap());
+        sender.try_send_event(&event).unwrap();
+        receiver.check().unwrap();
+    }
 
     #[tokio::test]
     async fn producer_failure_survives_sender_drop_while_receiver_waits() {

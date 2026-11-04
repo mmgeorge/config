@@ -10,6 +10,8 @@ pub type ProviderCompactionRequest =
     forge_provider_api::compaction::ProviderCompactionRequest<ProviderRequest>;
 mod bridge;
 mod completion;
+mod live_host_effect;
+pub(crate) use live_host_effect::{LiveHostCommit, LiveHostEffect, LiveHostEffectSender};
 pub mod events;
 mod execution;
 mod host_invocation;
@@ -23,6 +25,7 @@ pub(crate) mod session_execution;
 mod steering;
 pub mod submission;
 pub use forge_provider_api::ServiceTier;
+pub use forge_provider_api::submission::{DispatchObserver, DispatchTracker};
 pub(crate) mod text_generation;
 pub use catalog::{
     CatalogCapability, CatalogMutation, McpDefinition, McpStatus, McpToolDefinition,
@@ -35,7 +38,7 @@ pub use execution::{
 pub use forge_provider_api::terminal;
 pub use forge_provider_api::usage;
 pub use steering::SteeringInput;
-pub(crate) use steering::{ActiveSteering, SteerCommand, SteeringLane};
+pub(crate) use steering::{ActiveSteering, SteerCommand, SteeringLane, SteeringTarget};
 pub use text_generation::{BACKGROUND_SYSTEM_MESSAGE, TextGeneration};
 
 mod contract;

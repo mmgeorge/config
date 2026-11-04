@@ -81,15 +81,12 @@ The [GitHub request and result schemas](github-schemas.md) define remote reads, 
 | `session.agent.message.send` | [session](session.md#sessionagentmessagesend) | Required explicit session ID |
 | `session.agent.model.list` | [session](session.md#sessionagentmodellist) | Required explicit session ID |
 | `session.agent.start` | [session](session.md#sessionagentstart) | Required explicit session ID |
-| `session.approval.continue` | [session](session.md#sessionapprovalcontinue) | Required explicit session ID |
 | `session.approval.resolve` | [session](session.md#sessionapprovalresolve) | Required explicit session ID |
 | `session.attachment.import` | [session](session.md#sessionattachmentimport) | Required explicit session ID |
-| `session.check.cancel` | [session](session.md#sessioncheckcancel) | Required explicit session ID |
 | `session.check.complete` | [session](session.md#sessioncheckcomplete) | Required explicit session ID |
 | `session.check.editing.set` | [session](session.md#sessioncheckeditingset) | Required explicit session ID |
 | `session.check.list` | [session](session.md#sessionchecklist) | Required explicit session ID |
 | `session.check.override` | [session](session.md#sessioncheckoverride) | Required explicit session ID |
-| `session.check.run` | [session](session.md#sessioncheckrun) | Required explicit session ID |
 | `session.check.status` | [session](session.md#sessioncheckstatus) | Required explicit session ID |
 | `session.command.apply` | [session](session.md#sessioncommandapply) | Required explicit session ID |
 | `session.command.operation.get` | [session](session.md#sessioncommandoperationget) | Required explicit session ID |
@@ -122,8 +119,6 @@ The [GitHub request and result schemas](github-schemas.md) define remote reads, 
 | `session.new` | [session](session.md#sessionnew) | Optional explicit session ID |
 | `session.permission.set` | [session](session.md#sessionpermissionset) | Required explicit session ID |
 | `session.plan.accept` | [session](session.md#sessionplanaccept) | Required explicit session ID |
-| `session.plan.acceptance.begin` | [session](session.md#sessionplanacceptancebegin) | Required explicit session ID |
-| `session.plan.acceptance.cancel` | [session](session.md#sessionplanacceptancecancel) | Required explicit session ID |
 | `session.plan.cancel` | [session](session.md#sessionplancancel) | Required explicit session ID |
 | `session.plan.changes.request` | [session](session.md#sessionplanchangesrequest) | Required explicit session ID |
 | `session.plan.check.update` | [session](session.md#sessionplancheckupdate) | Required explicit session ID |
@@ -144,7 +139,6 @@ The [GitHub request and result schemas](github-schemas.md) define remote reads, 
 | `session.provider.setup` | [session](session.md#sessionprovidersetup) | Required explicit session ID |
 | `session.provider.skill.list` | [session](session.md#sessionproviderskilllist) | Required explicit session ID |
 | `session.question.answer` | [session](session.md#sessionquestionanswer) | Required explicit session ID |
-| `session.question.ask` | [session](session.md#sessionquestionask) | Required explicit session ID |
 | `session.question.continue` | [session](session.md#sessionquestioncontinue) | Required explicit session ID |
 | `session.question.skip` | [session](session.md#sessionquestionskip) | Required explicit session ID |
 | `session.rename` | [session](session.md#sessionrename) | Required explicit session ID |
@@ -153,7 +147,6 @@ The [GitHub request and result schemas](github-schemas.md) define remote reads, 
 | `session.task.get` | [session](session.md#sessiontaskget) | Required explicit session ID |
 | `session.trace.clear` | [session](session.md#sessiontraceclear) | Required explicit session ID |
 | `session.turn.cancel` | [session](session.md#sessionturncancel) | Required explicit session ID |
-| `session.turn.restart` | [session](session.md#sessionturnrestart) | Required explicit session ID |
 | `session.turn.steer` | [session](session.md#sessionturnsteer) | Required explicit session ID |
 | `settings.get` | [shared](shared.md#settingsget) | Optional explicit session ID |
 | `settings.import.apply` | [shared](shared.md#settingsimportapply) | Optional explicit session ID |

@@ -535,7 +535,34 @@ impl AutomaticCheckRefresh {
     }
 }
 
+/// Interrupt only the automatic check run captured by this owner stage.
+pub(crate) struct AutomaticCheckCancellation {
+    supervisor: Arc<CheckSupervisor>,
+    run_id: String,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl AutomaticCheckCancellation {
+    /// Close dispatch and request process interruption without claiming collection.
+    pub(crate) fn cancel(&self) -> Result<()> {
+        self.cancelled.store(true, Ordering::Release);
+        if self.supervisor.active()?.as_deref() == Some(self.run_id.as_str()) {
+            self.supervisor.cancel(&self.run_id)?;
+        }
+        Ok(())
+    }
+}
+
 impl AutomaticCheckRun {
+    /// Capture interruption authority before the owner dispatches the check worker.
+    pub(crate) fn cancellation(&self) -> AutomaticCheckCancellation {
+        AutomaticCheckCancellation {
+            supervisor: Arc::clone(&self.capture.supervisor),
+            run_id: self.run.id.clone(),
+            cancelled: Arc::clone(&self.capture.cancelled),
+        }
+    }
+
     /// Execute admitted checks independently of broker ownership.
     pub(crate) async fn run(self) -> Result<AutomaticCheckResult> {
         let run = self
@@ -555,6 +582,15 @@ impl AutomaticCheckRun {
 }
 
 impl TaskCheckRun {
+    /// Capture cancellation without releasing the task verification worker.
+    pub(crate) fn cancellation(&self) -> AutomaticCheckCancellation {
+        AutomaticCheckCancellation {
+            supervisor: Arc::clone(&self.capture.supervisor),
+            run_id: self.run.id.clone(),
+            cancelled: Arc::clone(&self.capture.cancelled),
+        }
+    }
+
     /// Run the prepared task verification without holding its admitting broker.
     pub(crate) async fn run(self) -> Result<TaskCheckResult> {
         let run = self

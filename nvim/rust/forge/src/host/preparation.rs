@@ -37,10 +37,21 @@ impl PreparationOrder {
         let Ok(method) = RuntimeMethod::decode(&envelope.request.method) else {
             return Ok(None);
         };
-        if !method.requires_provider_fork()
+        let caller_command = forge_protocol::contract::method_policy(&envelope.request.method)
+            .is_some_and(|policy| {
+                policy.recovery == forge_protocol::method_policy::Recovery::SessionCommand
+            });
+        if !caller_command
+            && !method.requires_provider_fork()
             && !matches!(
                 method,
-                RuntimeMethod::SessionCommandApply | RuntimeMethod::SessionPermissionSet
+                RuntimeMethod::SessionCommandApply
+                    | RuntimeMethod::SessionPermissionSet
+                    | RuntimeMethod::SessionCompact
+                    | RuntimeMethod::SessionCheckEditingSet
+                    | RuntimeMethod::SessionCheckOverride
+                    | RuntimeMethod::SessionExchangeRollbackPrepare
+                    | RuntimeMethod::SessionExchangeRecovery
             )
         {
             return Ok(None);
@@ -129,7 +140,7 @@ mod tests {
             .reserve(&request("source", "session.command.apply"))?
             .unwrap();
         let middle = order
-            .reserve(&request("source", "session.question.ask"))?
+            .reserve(&request("source", "session.input.apply"))?
             .unwrap();
         let last = order
             .reserve(&request("source", "session.command.apply"))?

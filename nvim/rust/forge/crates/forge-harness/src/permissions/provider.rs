@@ -204,7 +204,7 @@ impl ProviderPermissionContext {
         };
         let deny = |reason: &str| denied(reason, Some(approval_mode));
         if let Some(authority) = &task_authority
-            && let Err(error) = authority.validate()
+            && let Err(error) = authority.validate_scope()
         {
             return deny(&format!(
                 "Task authority changed before permission approval: {error:#}"
@@ -333,7 +333,7 @@ impl ProviderPermissionContext {
                     );
                 }
                 if let Some(authority) = &task_authority
-                    && let Err(error) = authority.validate()
+                    && let Err(error) = authority.validate_scope()
                 {
                     return deny(&format!(
                         "Task authority changed while permission approval was pending: {error:#}"

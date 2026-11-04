@@ -7565,7 +7565,7 @@ mod tests {
         for owner in [
             crate::broker::ElicitationOwner::Plan,
             crate::broker::ElicitationOwner::Interaction,
-            crate::broker::ElicitationOwner::PlanAcceptance,
+            crate::broker::ElicitationOwner::PlanReview,
         ] {
             let projected = project_at(
                 &TimelineEntry::Status {

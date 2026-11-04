@@ -79,7 +79,7 @@ enum PreparedOperation {
     },
     Continue {
         binding: BindingId,
-        request: forge_provider_api::ContinuationRequest,
+        request: Box<forge_provider_api::ContinuationRequest>,
     },
 }
 
@@ -267,6 +267,7 @@ impl ProviderBridge {
         request: ProviderRequest,
         scope: forge_provider_api::InvocationScope,
     ) -> Result<(), ProviderError> {
+        let _dispatch_observation = request.dispatch.observe_worker();
         let _admission = self.admission.read().await;
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Err(ProviderError::PreparationFailed(Box::new(failure(
@@ -303,7 +304,7 @@ impl ProviderBridge {
             }
             PreparedOperation::Continue { binding, request } => {
                 if !matches!(
-                    self.native.continue_session(&binding, request).await?,
+                    self.native.continue_session(&binding, *request).await?,
                     forge_provider_api::ContinuationOutcome::ExecutionResumed
                 ) {
                     return self.invalid_acceptance(&binding).await;
@@ -343,6 +344,16 @@ impl ProviderBridge {
                 ProviderOperation::AdmitInput,
                 ProviderFailureKind::Rejected,
             ));
+        }
+        if continuation.is_none() {
+            let submission = request.submission.as_ref().ok_or_else(|| {
+                failure(ProviderOperation::AdmitInput, ProviderFailureKind::Rejected)
+            })?;
+            let invocation = request.invocation_snapshot();
+            submission
+                .persist(move |receipt| receipt.seal_request(invocation).map_err(Into::into))
+                .await
+                .map_err(super::submission::journal_failure)?;
         }
         let prepared_attachments =
             prepare_attachments(request.input.attachments().to_vec()).await?;
@@ -410,10 +421,12 @@ impl ProviderBridge {
             .as_ref()
             .and_then(|skills| skills.sink(Some(sink.clone())))
             .unwrap_or(sink);
-        let context = request
+        let mut context = request
             .control_context
             .clone()
             .unwrap_or_else(|| crate::tools::ControlTurnContext::inactive(request.mode));
+        context.question_invocation = Some(scope.clone());
+        context.bind_task_authority_progress();
         let directories = self
             .permissions
             .directories(Some(&self.root), &request, &scope)
@@ -476,37 +489,49 @@ impl ProviderBridge {
         let effects = Arc::new(super::host_invocation::HostInvocation::new(
             binding.id.clone(),
             scope.clone(),
+            &request,
             context.clone(),
             &tools,
             super::host_invocation::HostInvocationResources {
                 permissions: permissions.clone(),
                 directories: Some(directories),
-                endpoint,
+                endpoint: endpoint.clone(),
                 endpoint_lease: lease.clone(),
                 relay,
                 skills,
             },
         ));
+        let delegated: Arc<dyn forge_provider_api::control::ProviderTools> = effects.clone();
+        endpoint.bind_host(scope.clone(), Arc::downgrade(&delegated));
         *host.request.lock().await = Some(request.clone());
         host.invocations
             .lock()
             .await
             .insert(scope.invocation_id.clone(), effects.clone());
         if let Some(authorization) = continuation {
+            let dispatch = request
+                .dispatch
+                .track_continuation(binding.id.clone(), scope.clone(), authorization.clone())
+                .map_err(|_| {
+                    failure(ProviderOperation::AdmitInput, ProviderFailureKind::Protocol)
+                })?;
             return Ok(PreparedOperation::Continue {
                 binding: binding.id,
-                request: forge_provider_api::ContinuationRequest::RetryableExecution {
-                    scope,
-                    authorization,
-                    callbacks: Box::new(forge_provider_api::InvocationCallbacks {
-                        tool_endpoint: Some(tool_endpoint),
-                        resource_lease: Some(lease),
-                        permissions,
-                        provider_tools: effects.clone(),
-                        turn_control: effects.clone(),
-                        host_effects: effects,
-                    }),
-                },
+                request: Box::new(
+                    forge_provider_api::ContinuationRequest::RetryableExecution {
+                        scope,
+                        authorization,
+                        dispatch: Box::new(dispatch),
+                        callbacks: Box::new(forge_provider_api::InvocationCallbacks {
+                            tool_endpoint: Some(tool_endpoint),
+                            resource_lease: Some(lease),
+                            permissions,
+                            provider_tools: effects.clone(),
+                            turn_control: effects.clone(),
+                            host_effects: effects,
+                        }),
+                    },
+                ),
             });
         }
         let configuration = forge_provider_api::InvocationConfiguration {
@@ -519,6 +544,8 @@ impl ProviderBridge {
             .ok_or_else(|| failure(ProviderOperation::AdmitInput, ProviderFailureKind::Rejected))?;
         let submission_id =
             forge_provider_api::submission::InputReceipt::id(receipt.as_ref()).clone();
+        let dispatch =
+            receipt.prepare_dispatch(&request.dispatch, binding.id.clone(), scope.clone())?;
         Ok(PreparedOperation::Prompt {
             binding: binding.id,
             request: Box::new(forge_provider_api::PromptRequest {
@@ -531,6 +558,7 @@ impl ProviderBridge {
                 task: context.task_start.clone(),
                 goal: context.native_goal.clone(),
                 submission_id,
+                dispatch,
                 input,
                 recovered_inputs,
                 instructions,
@@ -618,8 +646,20 @@ impl ProviderBridge {
                 ProviderFailureKind::SessionMissing,
             )
         })?;
+        let invocation = session
+            .invocations
+            .lock()
+            .await
+            .get(&scope.invocation_id)
+            .cloned()
+            .ok_or_else(|| failure(ProviderOperation::AdmitInput, ProviderFailureKind::Rejected))?;
+        let request = invocation.request_snapshot(&scope)?;
         let (delivery, normalized, attachments) = match input.submission() {
             Some(receipt) => {
+                receipt
+                    .persist(move |receipt| receipt.seal_request(request).map_err(Into::into))
+                    .await
+                    .map_err(super::submission::journal_failure)?;
                 let record = receipt.record().map_err(|_| {
                     failure(
                         ProviderOperation::RecordInput,
@@ -852,12 +892,63 @@ impl ProviderBridge {
         self.native.set_mcp_enabled(request, name, enabled).await
     }
 
+    /// Admit observation atomically with native retirement and retain its exclusion until completion.
+    async fn observe_binding(
+        &self,
+        owner: &ExecutionOwner,
+    ) -> Result<tokio::sync::OwnedMutexGuard<bool>, ProviderError> {
+        let session = self
+            .sessions
+            .lock()
+            .await
+            .get(owner)
+            .cloned()
+            .ok_or_else(|| {
+                failure(
+                    ProviderOperation::NativeTransport,
+                    ProviderFailureKind::SessionMissing,
+                )
+            })?;
+        let binding = session.initialized.get().ok_or_else(|| {
+            failure(
+                ProviderOperation::NativeTransport,
+                ProviderFailureKind::SessionMissing,
+            )
+        })?;
+        let permit = binding.retired.clone().lock_owned().await;
+        if *permit || binding.retiring.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(failure(
+                ProviderOperation::NativeTransport,
+                ProviderFailureKind::SessionMissing,
+            ));
+        }
+        Ok(permit)
+    }
+
     /// Query normalized terminal state without parsing process or native item fields.
     pub async fn background_terminals(
         &self,
         request: super::ProviderCatalogRequest,
     ) -> Result<super::terminal::TerminalSnapshot, ProviderError> {
-        self.native.background_terminals(request).await
+        let owner = request.owner().map_err(|_| {
+            failure(
+                ProviderOperation::NativeTransport,
+                ProviderFailureKind::Rejected,
+            )
+        })?;
+        let permit = self.observe_binding(&owner).await?;
+        let native = self.native.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            native.background_terminals(request).await
+        })
+        .await
+        .map_err(|_| {
+            failure(
+                ProviderOperation::NativeTransport,
+                ProviderFailureKind::Runtime,
+            )
+        })?
     }
 
     /// Terminate the selected opaque terminal identity.
@@ -1050,7 +1141,7 @@ impl ProviderBridge {
     pub async fn compact(
         &self,
         request: super::ProviderCompactionRequest,
-    ) -> Result<super::ProviderOutput, ProviderError> {
+    ) -> Result<forge_provider_api::Compaction, ProviderError> {
         let _admission = self.admission.read().await;
         let binding = self.binding_under_admission(&request.request).await?;
         let owner = request
@@ -1061,8 +1152,7 @@ impl ProviderBridge {
             owner,
             operation_id: request.id.clone(),
         };
-        let update = self
-            .native
+        self.native
             .compact(
                 &binding.id,
                 forge_provider_api::CompactionRequest {
@@ -1070,14 +1160,7 @@ impl ProviderBridge {
                     scope: scope.clone(),
                 },
             )
-            .await?;
-        Ok(super::ProviderOutput {
-            event: vec![ProviderEvent::Compaction {
-                scope,
-                update: Box::new(update),
-            }],
-            completion: super::ProviderCompletion::default(),
-        })
+            .await
     }
 
     /// Cancel host callbacks before asking the native owner to collect its foreground work.

@@ -9,6 +9,7 @@ use serde_json::json;
 use super::TraceStore;
 
 /// Measure a future's inline storage without constructing or polling it.
+#[cfg(test)]
 pub(crate) fn future_bytes<F, Fut>(_: &F) -> usize
 where
     F: FnOnce() -> Fut,

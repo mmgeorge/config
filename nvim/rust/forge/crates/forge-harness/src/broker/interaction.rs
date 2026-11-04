@@ -21,6 +21,27 @@ enum QuestionEffect {
     Withdraw(crate::plan::PlanQuestionWithdrawal),
 }
 
+/// Apply rejected callback dispositions even to native snapshots captured before rejection.
+fn discard_rejected_host_effects(
+    output: &mut crate::provider::ProviderCompletion,
+    batches: &mut Vec<crate::provider::HostEffectBatch>,
+) {
+    if !batches
+        .iter()
+        .any(crate::provider::HostEffectBatch::is_rejected)
+    {
+        return;
+    }
+    let mut retained =
+        crate::provider::HostEffectBatch::active_completion(batches).unwrap_or_default();
+    retained.native = std::mem::take(&mut output.native);
+    retained.dispatched_task_permit = output.dispatched_task_permit.take();
+    retained.dispatched_execution_id = output.dispatched_execution_id.take();
+    retained.dispatched_entry_id = output.dispatched_entry_id.take();
+    *output = retained;
+    batches.retain(|batch| !batch.is_rejected());
+}
+
 /// Restore an unapplied in-memory plan snapshot without overwriting newer durable progress.
 pub(super) fn reconcile_plan_effect(
     current: &mut PlanRecord,
@@ -400,6 +421,7 @@ impl HarnessBroker {
         mode: PromptMode,
         admission: Option<&ExchangeAdmission>,
         input_message_id: Option<String>,
+        selected: Option<&crate::provider::ExchangeId>,
     ) -> Result<(Exchange, bool, Vec<SessionEvent>, Vec<AppliedProviderEvent>)> {
         let now_ms = self.clock.now_ms();
         let admitted_prompt = admission.map(|value| value.prompt.as_str()).unwrap_or(text);
@@ -422,6 +444,7 @@ impl HarnessBroker {
                 admitted_prompt,
                 admission.is_some() && !automatic_repair,
                 now_ms,
+                selected,
             )?;
         interaction.input_message_id = input_message_id;
         interaction.approval_mode = Some(self.session.approval_mode);
@@ -530,6 +553,11 @@ impl HarnessBroker {
         mut output: crate::provider::ProviderCompletion,
         mut mode: PromptMode,
     ) -> Result<Box<StagedHostCompletion>> {
+        let settlement = self.host_settlement();
+        let mut batches = settlement.as_ref().map(|cell| cell.batches()).transpose()?;
+        if let Some(batches) = &mut batches {
+            discard_rejected_host_effects(&mut output, batches);
+        }
         let current = self.task_controller.current()?;
         let mut discarded_planning = false;
         if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion)
@@ -575,8 +603,6 @@ impl HarnessBroker {
             anyhow::bail!(control_error);
         }
 
-        let settlement = self.host_settlement();
-        let batches = settlement.as_ref().map(|cell| cell.batches()).transpose()?;
         if let (Some(cell), Some(batches)) = (&settlement, &batches) {
             discard_published_terminal_effects(&mut output, batches, cell)?;
         }
@@ -614,6 +640,73 @@ impl HarnessBroker {
 #[cfg(test)]
 mod receipt_tests {
     use super::*;
+
+    #[test]
+    fn rejected_callback_cannot_reappear_in_stale_terminal_effects() -> Result<()> {
+        let rejected = crate::provider::HostEffectBatch::new(
+            1,
+            ProviderCompletion {
+                plan_edit: vec![serde_json::from_value(
+                    json!({"plan_id":"plan", "expected_version":1,
+                "plan":{"title":"must not apply"}}),
+                )?],
+                ..Default::default()
+            },
+        );
+        let retained = crate::provider::HostEffectBatch::new(
+            2,
+            ProviderCompletion {
+                plan_submit: Some(crate::provider::PlanSubmitRequest {
+                    plan_id: "plan".into(),
+                    expected_version: 1,
+                }),
+                ..Default::default()
+            },
+        );
+        let mut snapshot = vec![rejected.clone(), retained];
+        let mut output = crate::provider::HostEffectBatch::active_completion(&snapshot).unwrap();
+        rejected.reject();
+        discard_rejected_host_effects(&mut output, &mut snapshot);
+        assert!(output.plan_edit.is_empty());
+        assert!(output.plan_submit.is_some());
+        let expected = applicable_host_effects(&output, &snapshot, PromptMode::Plan, false)?;
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].batch_revision, 2);
+        assert_eq!(
+            expected[0].kind,
+            crate::provider::session_execution::HostEffectKind::PlanSubmit
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_goal_callback_does_not_become_native_terminal_evidence() -> Result<()> {
+        let (_root, _store, controller) = crate::task::SessionTaskController::test_goal();
+        let permit = controller.current()?.unwrap().permit();
+        let invocation = crate::tools::ControlToolInvocation {
+            call_id: None,
+            task_permit: Some(permit),
+            name: "goal_complete".into(),
+            arguments: json!({"summary":"completed host callback"}),
+        };
+        let mut host = ProviderCompletion::default();
+        crate::tools::apply_invocation(&invocation, &mut host)?;
+        let rejected = crate::provider::HostEffectBatch::new(1, host);
+        let surviving = crate::provider::HostEffectBatch::new(2, ProviderCompletion::default());
+        let mut batches = vec![rejected.clone(), surviving];
+        let mut output = crate::provider::HostEffectBatch::active_completion(&batches).unwrap();
+        rejected.reject();
+        discard_rejected_host_effects(&mut output, &mut batches);
+        assert!(output.goal_control.is_none());
+        let (evidence, _) = output.goal_evidence();
+        assert!(!evidence.structured_complete);
+        assert!(!evidence.structured_blocked);
+        assert!(
+            applicable_host_effects(&output, &batches, PromptMode::GoalContinuation, false)?
+                .is_empty()
+        );
+        Ok(())
+    }
 
     #[test]
     fn plan_receipt_restores_missing_progress_without_overwriting_newer_progress() -> Result<()> {
@@ -680,14 +773,8 @@ mod receipt_tests {
         let mut output = first.clone();
         output.merge_execution(second.clone());
         let batches = vec![
-            crate::provider::HostEffectBatch {
-                revision: 1,
-                completion: first,
-            },
-            crate::provider::HostEffectBatch {
-                revision: 2,
-                completion: second,
-            },
+            crate::provider::HostEffectBatch::new(1, first),
+            crate::provider::HostEffectBatch::new(2, second),
         ];
         discard_published_terminal_effects(&mut output, &batches, &cell)?;
         assert!(output.plan_submit.is_none());

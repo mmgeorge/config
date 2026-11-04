@@ -8,7 +8,15 @@ use super::SqliteStore;
 /// Records that must become visible in the same commit as the session task mutation.
 #[derive(Default)]
 pub(crate) struct TaskEffects {
+    /// Revalidate captured workflow and question revisions before reserving continuation input.
+    pub continuation_guard: Vec<crate::exchange::command::WorkflowContinuationRequest>,
+    /// Replace provider/session identity and exact history atomically with task retirement.
+    pub rollback: Option<Box<super::ownership::PreparedRollback>>,
+    /// Commit task-command evidence in the same transaction as its domain mutation.
+    pub owner_task_commit: Option<crate::exchange::journal::TaskCommandCommit>,
     pub plan_guard: Vec<PlanArtifactGuard>,
+    /// Captured saved-plan authority revalidated in the task installation transaction.
+    pub source_plan: Vec<crate::exchange::command::PlanSourceGuard>,
     pub retire_questions: bool,
     pub plan: Vec<crate::plan::PlanRecord>,
     pub execution: Vec<crate::plan::PlanExecutionRecord>,
@@ -28,6 +36,81 @@ pub(crate) struct PlanArtifactGuard {
 enum TaskFence<'permit> {
     Revision(Option<&'permit TaskRevision>),
     Observation(&'permit crate::task::TaskPermit),
+}
+
+/// Revalidate the selected continuation source inside the same transaction as its reservation.
+fn validate_continuation_guard(
+    transaction: &rusqlite::Transaction<'_>,
+    session: &str,
+    request: &crate::exchange::command::WorkflowContinuationRequest,
+    task: Option<&Task>,
+) -> Result<()> {
+    use crate::exchange::command::{
+        QuestionWorkflow, TaskCommandFailure, WorkflowContinuationTarget,
+    };
+    let validate_exchange =
+        |selection: &crate::exchange::command::ExchangeContinuationSelection,
+         questions: Option<&crate::exchange::command::PlanQuestionSetSelection>|
+         -> Result<()> {
+            let latest: Option<String> = transaction.query_row("SELECT id FROM exchange_record WHERE session_id=?1 AND agent_id=?2 ORDER BY ordinal DESC LIMIT 1", params![session,crate::session::HarnessSession::primary_agent_id(session)], |row| row.get(0)).optional()?;
+            ensure!(
+                latest.as_deref() == Some(selection.id().as_str()),
+                "continuation source is no longer current"
+            );
+            let payload: String = transaction.query_row(
+                "SELECT payload FROM exchange_record WHERE id=?1 AND session_id=?2",
+                params![selection.id().as_str(), session],
+                |row| row.get(0),
+            )?;
+            let exchange: crate::exchange::Exchange = super::decode(&payload)?;
+            selection.validate(&exchange, task)?;
+            if let Some(questions) = questions {
+                questions.validate(exchange.elicitation().ok_or(TaskCommandFailure::Changed)?)?;
+            }
+            Ok(())
+        };
+    match &request.target {
+        WorkflowContinuationTarget::Exchange(selection) => validate_exchange(selection, None),
+        WorkflowContinuationTarget::Plan(selection) => {
+            selection.validate_target(task)?;
+            Ok(())
+        }
+        WorkflowContinuationTarget::Questions(selection) => match &selection.workflow {
+            QuestionWorkflow::Exchange(exchange) => {
+                validate_exchange(exchange, Some(&selection.questions))
+            }
+            QuestionWorkflow::PlanReview(source) => {
+                source.validate_target(task)?;
+                let plan: crate::plan::PlanRecord =
+                    read_record(transaction, "plan_record", source.source().id().as_str())?
+                        .ok_or(TaskCommandFailure::PlanMissing)?;
+                selection.questions.validate(
+                    &plan
+                        .review
+                        .as_ref()
+                        .ok_or(TaskCommandFailure::Changed)?
+                        .elicitation,
+                )?;
+                Ok(())
+            }
+            QuestionWorkflow::Plan {
+                source,
+                task: selected,
+            } => {
+                selected.validate(task)?;
+                let plan: crate::plan::PlanRecord =
+                    read_record(transaction, "plan_record", source.id().as_str())?
+                        .ok_or(TaskCommandFailure::PlanMissing)?;
+                source.validate(&plan)?;
+                selection.questions.validate(
+                    plan.elicitation
+                        .as_ref()
+                        .ok_or(TaskCommandFailure::Changed)?,
+                )?;
+                Ok(())
+            }
+        },
+    }
 }
 
 /// Validate ownership of live task artifacts without interpreting obsolete session formats.
@@ -176,12 +259,13 @@ impl SqliteStore {
         let admission = self.session_admission(session_id)?;
         admission.with_task_mutation(|| {
             permit.validate(admission.runtime()?.active_task.as_ref())?;
-            document.commit(session_id, || {
+            document.commit(session_id, |document| {
                 self.commit_task_effects_locked(
                     session_id,
                     TaskFence::Revision(Some(permit.revision())),
                     now_ms,
                     None,
+                    Some(document),
                     |active| {
                         permit.validate(active.as_ref())?;
                         change(active)
@@ -202,7 +286,7 @@ impl SqliteStore {
     ) -> Result<Option<Output>> {
         let admission = self.session_admission(session_id)?;
         admission.with_task_mutation(|| {
-            self.commit_task_effects_locked(session_id, fence, now_ms, command, change)
+            self.commit_task_effects_locked(session_id, fence, now_ms, command, None, change)
         })
     }
 
@@ -213,34 +297,100 @@ impl SqliteStore {
         fence: TaskFence<'_>,
         now_ms: i64,
         command: Option<&crate::task::TaskOperation>,
+        document: Option<&crate::plan::WorkingDocumentCommit<'_>>,
         change: impl FnOnce(&mut Option<Task>) -> Result<(Output, TaskEffects)>,
     ) -> Result<Option<Output>> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        Self::ensure_no_configuration_intent(&transaction, session_id)?;
-        if let Some(command) = command {
-            let existing: Option<String> = transaction
-                .query_row(
-                    "SELECT payload FROM task_operation WHERE id=?1 AND session_id=?2",
-                    params![command.id, session_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(existing) = existing {
-                let existing: crate::task::TaskOperation = super::decode(&existing)?;
-                ensure!(
-                    existing.action == command.action,
-                    "operation ID was reused for a different action"
-                );
-                ensure!(
-                    existing.state == "completed",
-                    "task command has an unfinished legacy operation"
-                );
-                return Ok(None);
+        let artifacts =
+            crate::plan::PlanFileStore::new(self.data_root.clone(), std::path::PathBuf::new());
+        let mut affected_plans = Vec::new();
+        let result = (|| {
+            if let Some(command) = command {
+                let existing: Option<String> = self
+                    .connection
+                    .query_row(
+                        "SELECT payload FROM task_operation WHERE id=?1 AND session_id=?2",
+                        params![command.id, session_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(existing) = existing {
+                    let existing: crate::task::TaskOperation = super::decode(&existing)?;
+                    ensure!(
+                        existing.action == command.action,
+                        "operation ID was reused for a different action"
+                    );
+                    ensure!(
+                        existing.state == "completed",
+                        "task command has an unfinished legacy operation"
+                    );
+                    return Ok(None);
+                }
             }
-        }
-        let payload: Option<String> = transaction
+            let observed_payload: Option<String> = self.connection.query_row(
+            "SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1 AND json_extract(payload,'$.format_version')=?2",
+            params![session_id, super::SESSION_FORMAT_VERSION], |row| row.get(0),
+        ).optional()?.context("task session is missing or incompatible")?;
+            let mut prepared_active: Option<Task> = observed_payload
+                .as_ref()
+                .map(|payload| super::decode(payload))
+                .transpose()?;
+            match &fence {
+                TaskFence::Revision(expected)
+                    if prepared_active.as_ref().map(|task| &task.revision) != *expected =>
+                {
+                    return Err(crate::task::StaleTask.into());
+                }
+                TaskFence::Observation(permit) => {
+                    permit.validate_observation(prepared_active.as_ref())?
+                }
+                TaskFence::Revision(_) => {}
+            }
+            let (output, mut effects) = change(&mut prepared_active)?;
+            // The active planning task also writes its artifact below. Include that
+            // implicit effect before sealing files or acquiring SQLite's write lock.
+            if let Some(task) = &prepared_active
+                && let WorkflowSnapshot::Plan { plan } = &task.workflow
+            {
+                effects
+                    .plan
+                    .retain(|artifact| artifact.id != plan.artifact.id);
+                effects.plan.push(plan.artifact.clone());
+            }
+            for plan in &effects.plan {
+                let claimed = match document.filter(|document| document.matches(plan)) {
+                    Some(document) => document.claim_artifacts(plan)?,
+                    None => artifacts.claim_plan_artifacts(plan)?,
+                };
+                if claimed {
+                    affected_plans.push(plan.id.clone());
+                }
+            }
+            let transaction = self
+                .connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            Self::ensure_no_configuration_intent(&transaction, session_id)?;
+            if let Some(command) = command {
+                let existing: Option<String> = transaction
+                    .query_row(
+                        "SELECT payload FROM task_operation WHERE id=?1 AND session_id=?2",
+                        params![command.id, session_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(existing) = existing {
+                    let existing: crate::task::TaskOperation = super::decode(&existing)?;
+                    ensure!(
+                        existing.action == command.action,
+                        "operation ID was reused for a different action"
+                    );
+                    ensure!(
+                        existing.state == "completed",
+                        "task command has an unfinished legacy operation"
+                    );
+                    return Ok(None);
+                }
+            }
+            let payload: Option<String> = transaction
             .query_row(
                 "SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1 AND json_extract(payload,'$.format_version')=?2",
                 params![session_id, super::SESSION_FORMAT_VERSION],
@@ -248,212 +398,251 @@ impl SqliteStore {
             )
             .optional()?
             .context("task session is missing or incompatible")?;
-        let mut active: Option<Task> =
-            payload.map(|payload| super::decode(&payload)).transpose()?;
-        match fence {
-            TaskFence::Revision(expected)
-                if active.as_ref().map(|task| &task.revision) != expected =>
-            {
-                return Err(crate::task::StaleTask.into());
-            }
-            TaskFence::Observation(permit) => permit.validate_observation(active.as_ref())?,
-            TaskFence::Revision(_) => {}
-        }
-        let previous = active.clone();
-        let (output, mut effects) = change(&mut active)?;
-        for guard in &effects.plan_guard {
-            let payload: String = transaction.query_row(
-                "SELECT payload FROM plan_record WHERE id=?1 AND session_id=?2",
-                params![guard.id, session_id],
-                |row| row.get(0),
-            )?;
-            let artifact: crate::plan::PlanRecord = super::decode(&payload)?;
             ensure!(
-                artifact.document_version == guard.document_version
-                    && artifact.review_digest == guard.review_digest,
-                "reviewed plan changed before task commit"
+                payload == observed_payload,
+                "task changed during artifact preparation"
             );
-        }
-        let entry_changed =
-            previous
-                .as_ref()
-                .zip(active.as_ref())
-                .is_some_and(|(previous, current)| {
-                    previous.entry.as_ref().map(|entry| &entry.id)
-                        != current.entry.as_ref().map(|entry| &entry.id)
-                        || previous.kind() != current.kind()
-                });
-        let retire_questions =
-            effects.retire_questions || entry_changed || previous.is_some() && active.is_none();
-        let completed = effects.event.iter().any(|event| matches!(&event.detail,
-            crate::timeline::SessionEventKind::TaskFinished { outcome } if matches!(outcome.state, crate::task::TaskOutcomeState::Complete)));
-        if !completed
-            && let Some(previous) = previous.as_ref()
-            && active.as_ref().is_none_or(|current| {
-                current.id != previous.id || current.status() == crate::task::TaskStatus::Cancelled
-            })
-        {
-            crate::question::retire_task(&transaction, session_id, previous.id.as_str())?;
-        }
-        if retire_questions {
-            super::question::retire_task_questions(
-                &transaction,
-                session_id,
-                previous.as_ref(),
-                now_ms,
-            )?;
-        }
-        if let Some(task) = &mut active {
-            task.edit(|draft| {
-                if let WorkflowSnapshot::Plan { plan } = &mut draft.workflow {
-                    let mut payload = serde_json::to_value(&plan.artifact)?;
-                    payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
-                    let preserved = super::question::preserve_answers(
-                        &transaction,
-                        "plan_record",
-                        &plan.artifact.id,
-                        super::encode(&payload)?,
-                    )?;
-                    plan.artifact = super::decode(&preserved)?;
-                    effects.plan.push(plan.artifact.clone());
+            let mut active: Option<Task> =
+                payload.map(|payload| super::decode(&payload)).transpose()?;
+            match fence {
+                TaskFence::Revision(expected)
+                    if active.as_ref().map(|task| &task.revision) != expected =>
+                {
+                    return Err(crate::task::StaleTask.into());
                 }
-                Ok(())
-            })?;
-        }
-        for checkpoint in &effects.checkpoint {
-            ensure!(
-                checkpoint.session_id == session_id,
-                "checkpoint belongs to another session"
-            );
-            let written = transaction.execute(
+                TaskFence::Observation(permit) => permit.validate_observation(active.as_ref())?,
+                TaskFence::Revision(_) => {}
+            }
+            let previous = active.clone();
+            active = prepared_active;
+            if let Some(rollback) = &effects.rollback {
+                rollback.apply(&transaction)?;
+            }
+            for guard in &effects.continuation_guard {
+                validate_continuation_guard(&transaction, session_id, guard, previous.as_ref())?;
+            }
+            for selection in &effects.source_plan {
+                let source: crate::plan::PlanRecord =
+                    read_record(&transaction, "plan_record", selection.id().as_str())?
+                        .ok_or(crate::exchange::command::TaskCommandFailure::PlanMissing)?;
+                selection.validate(&source)?;
+            }
+            for guard in &effects.plan_guard {
+                let payload: String = transaction.query_row(
+                    "SELECT payload FROM plan_record WHERE id=?1 AND session_id=?2",
+                    params![guard.id, session_id],
+                    |row| row.get(0),
+                )?;
+                let artifact: crate::plan::PlanRecord = super::decode(&payload)?;
+                ensure!(
+                    artifact.document_version == guard.document_version
+                        && artifact.review_digest == guard.review_digest,
+                    "reviewed plan changed before task commit"
+                );
+            }
+            let entry_changed =
+                previous
+                    .as_ref()
+                    .zip(active.as_ref())
+                    .is_some_and(|(previous, current)| {
+                        previous.entry.as_ref().map(|entry| &entry.id)
+                            != current.entry.as_ref().map(|entry| &entry.id)
+                            || previous.kind() != current.kind()
+                    });
+            let retire_questions =
+                effects.retire_questions || entry_changed || previous.is_some() && active.is_none();
+            let completed = effects.event.iter().any(|event| matches!(&event.detail,
+            crate::timeline::SessionEventKind::TaskFinished { outcome } if matches!(outcome.state, crate::task::TaskOutcomeState::Complete)));
+            if !completed
+                && let Some(previous) = previous.as_ref()
+                && active.as_ref().is_none_or(|current| {
+                    current.id != previous.id
+                        || current.status() == crate::task::TaskStatus::Cancelled
+                })
+            {
+                crate::question::retire_task(&transaction, session_id, previous.id.as_str())?;
+            }
+            if retire_questions {
+                super::question::retire_task_questions(
+                    &transaction,
+                    session_id,
+                    previous.as_ref(),
+                    now_ms,
+                )?;
+            }
+            if let Some(task) = &mut active {
+                task.edit(|draft| {
+                    if let WorkflowSnapshot::Plan { plan } = &mut draft.workflow {
+                        let mut payload = serde_json::to_value(&plan.artifact)?;
+                        payload["schema_version"] =
+                            serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+                        let preserved = super::question::preserve_answers(
+                            &transaction,
+                            "plan_record",
+                            &plan.artifact.id,
+                            super::encode(&payload)?,
+                        )?;
+                        plan.artifact = super::decode(&preserved)?;
+                        let prepared = effects
+                            .plan
+                            .iter_mut()
+                            .find(|artifact| artifact.id == plan.artifact.id)
+                            .context(
+                                "active plan artifact was not prepared before the transaction",
+                            )?;
+                        *prepared = plan.artifact.clone();
+                    }
+                    Ok(())
+                })?;
+            }
+            for checkpoint in &effects.checkpoint {
+                ensure!(
+                    checkpoint.session_id == session_id,
+                    "checkpoint belongs to another session"
+                );
+                let written = transaction.execute(
                 "INSERT INTO checkpoint_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE checkpoint_record.session_id=excluded.session_id",
                 params![checkpoint.id, session_id, super::encode(checkpoint)?],
             )?;
-            ensure!(written == 1, "checkpoint cannot change its owning session");
-        }
-        for artifact in &effects.plan {
-            ensure!(
-                artifact.session_id == session_id,
-                "plan belongs to another session"
-            );
-            let mut payload = serde_json::to_value(artifact)?;
-            payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
-            let payload = super::question::preserve_answers(
-                &transaction,
-                "plan_record",
-                &artifact.id,
-                super::encode(&payload)?,
-            )?;
-            let written = transaction.execute(
+                ensure!(written == 1, "checkpoint cannot change its owning session");
+            }
+            for artifact in &effects.plan {
+                ensure!(
+                    artifact.session_id == session_id,
+                    "plan belongs to another session"
+                );
+                let mut payload = serde_json::to_value(artifact)?;
+                payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+                let payload = super::question::preserve_answers(
+                    &transaction,
+                    "plan_record",
+                    &artifact.id,
+                    super::encode(&payload)?,
+                )?;
+                let written = transaction.execute(
                 "INSERT INTO plan_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE plan_record.session_id=excluded.session_id",
                 params![artifact.id, session_id, payload],
             )?;
-            ensure!(written == 1, "plan cannot change its owning session");
-        }
-        if let Some(task) = &active
-            && let WorkflowSnapshot::Execute { execution } = &task.workflow
-        {
-            effects.execution.push(execution.record.clone());
-        }
-        for record in &effects.execution {
-            ensure!(
-                record.session_id == session_id,
-                "execution belongs to another session"
-            );
-            let mut payload = serde_json::to_value(record)?;
-            payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
-            let written = transaction.execute(
+                ensure!(written == 1, "plan cannot change its owning session");
+            }
+            if let Some(task) = &active
+                && let WorkflowSnapshot::Execute { execution } = &task.workflow
+            {
+                effects.execution.push(execution.record.clone());
+            }
+            for record in &effects.execution {
+                ensure!(
+                    record.session_id == session_id,
+                    "execution belongs to another session"
+                );
+                let mut payload = serde_json::to_value(record)?;
+                payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+                let written = transaction.execute(
                 "INSERT INTO plan_execution_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE plan_execution_record.session_id=excluded.session_id",
                 params![record.id, session_id, super::encode(&payload)?],
             )?;
-            ensure!(written == 1, "execution cannot change its owning session");
-        }
-        for lifecycle in &effects.lifecycle {
-            ensure!(
-                lifecycle.session_id == session_id,
-                "lifecycle belongs to another session"
-            );
-            let mut payload = serde_json::to_value(lifecycle)?;
-            payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
-            let written = transaction.execute(
+                ensure!(written == 1, "execution cannot change its owning session");
+            }
+            for lifecycle in &effects.lifecycle {
+                ensure!(
+                    lifecycle.session_id == session_id,
+                    "lifecycle belongs to another session"
+                );
+                let mut payload = serde_json::to_value(lifecycle)?;
+                payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+                let written = transaction.execute(
                 "INSERT INTO plan_lifecycle_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE plan_lifecycle_record.session_id=excluded.session_id",
                 params![lifecycle.id, session_id, super::encode(&payload)?],
             )?;
-            ensure!(written == 1, "lifecycle cannot change its owning session");
-        }
-        for exchange in &effects.exchange {
-            ensure!(
-                exchange.session_id == session_id,
-                "exchange belongs to another session"
-            );
-            let payload = super::question::preserve_answers(
-                &transaction,
-                "exchange_record",
-                &exchange.id,
-                super::tool_output::encode(exchange)?,
-            )?;
-            let written = transaction.execute(
-                "UPDATE exchange_record SET payload=?3 WHERE id=?1 AND session_id=?2",
-                params![exchange.id, session_id, payload],
-            )?;
-            ensure!(written == 1, "task effect exchange is missing");
-            super::tool_output::synchronize(&transaction, exchange)?;
-        }
-        for event in &effects.event {
-            ensure!(
-                event.session_id == session_id && event.owner.session_id() == session_id,
-                "task event belongs to another session"
-            );
-            if let Some(exchange_id) = event.owner.exchange_id() {
-                let payload: String = transaction.query_row(
-                    "SELECT payload FROM exchange_record WHERE id=?1 AND session_id=?2",
-                    params![exchange_id, session_id],
-                    |row| row.get(0),
-                )?;
-                let exchange: crate::exchange::Exchange = super::decode(&payload)?;
-                event.owner.validate_exchange(&exchange)?;
+                ensure!(written == 1, "lifecycle cannot change its owning session");
             }
-            let previous: Option<String> = transaction
-                .query_row(
-                    "SELECT payload FROM session_event_record WHERE id=?1",
-                    [&event.id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(previous) = previous {
-                let previous: crate::timeline::SessionEventRecord = super::decode(&previous)?;
+            for exchange in &effects.exchange {
                 ensure!(
-                    previous.owner == event.owner && previous.session_id == event.session_id,
-                    "task event ownership cannot change"
+                    exchange.session_id == session_id,
+                    "exchange belongs to another session"
                 );
+                let payload = super::question::preserve_answers(
+                    &transaction,
+                    "exchange_record",
+                    &exchange.id,
+                    super::tool_output::encode(exchange)?,
+                )?;
+                let written = transaction.execute(
+                    "UPDATE exchange_record SET payload=?3 WHERE id=?1 AND session_id=?2",
+                    params![exchange.id, session_id, payload],
+                )?;
+                ensure!(written == 1, "task effect exchange is missing");
+                super::tool_output::synchronize(&transaction, exchange)?;
             }
-            let written = transaction.execute(
+            for event in &effects.event {
+                ensure!(
+                    event.session_id == session_id && event.owner.session_id() == session_id,
+                    "task event belongs to another session"
+                );
+                if let Some(exchange_id) = event.owner.exchange_id() {
+                    let payload: String = transaction.query_row(
+                        "SELECT payload FROM exchange_record WHERE id=?1 AND session_id=?2",
+                        params![exchange_id, session_id],
+                        |row| row.get(0),
+                    )?;
+                    let exchange: crate::exchange::Exchange = super::decode(&payload)?;
+                    event.owner.validate_exchange(&exchange)?;
+                }
+                let previous: Option<String> = transaction
+                    .query_row(
+                        "SELECT payload FROM session_event_record WHERE id=?1",
+                        [&event.id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(previous) = previous {
+                    let previous: crate::timeline::SessionEventRecord = super::decode(&previous)?;
+                    ensure!(
+                        previous.owner == event.owner && previous.session_id == event.session_id,
+                        "task event ownership cannot change"
+                    );
+                }
+                let written = transaction.execute(
                 "INSERT INTO session_event_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE session_event_record.session_id=excluded.session_id",
                 params![event.id, session_id, super::encode(event)?],
             )?;
-            ensure!(written == 1, "task event cannot change its owning session");
-        }
-        let encoded = super::encode(&active)?;
-        transaction.execute(
+                ensure!(written == 1, "task event cannot change its owning session");
+            }
+            let encoded = super::encode(&active)?;
+            transaction.execute(
             "UPDATE session_record SET updated_at_ms=max(updated_at_ms,?2), payload=json_set(payload,'$.session.active_task',json(?3),'$.session.updated_at_ms',max(updated_at_ms,?2)) WHERE id=?1",
             params![session_id, now_ms, encoded],
         )?;
-        if let Some(command) = command {
-            let mut receipt = command.clone();
-            receipt.state = "completed".into();
-            receipt.revision += 1;
-            transaction.execute(
-                "INSERT INTO task_operation(id,session_id,payload) VALUES(?1,?2,?3)",
-                params![receipt.id, session_id, super::encode(&receipt)?],
-            )?;
+            if let Some(command) = command {
+                let mut receipt = command.clone();
+                receipt.state = "completed".into();
+                receipt.revision += 1;
+                transaction.execute(
+                    "INSERT INTO task_operation(id,session_id,payload) VALUES(?1,?2,?3)",
+                    params![receipt.id, session_id, super::encode(&receipt)?],
+                )?;
+            }
+            if let Some(commit) = effects.owner_task_commit {
+                crate::exchange::journal::commit_task_command(&transaction, session_id, commit)?;
+            }
+            transaction.commit()?;
+            if retire_questions {
+                self.refresh_admission_membership(session_id)?;
+            } else {
+                self.publish_admission(session_id)?;
+            }
+            Ok(Some(output))
+        })();
+        // Reconcile only after SQL has committed or its transaction has rolled back.
+        for id in affected_plans {
+            if let Some(plan) = self.load_plan(&id)? {
+                match document.filter(|document| document.matches(&plan)) {
+                    Some(document) => document.reconcile(&plan)?,
+                    None => artifacts.reconcile_plan_artifacts(&plan)?,
+                }
+            }
         }
-        transaction.commit()?;
-        if retire_questions {
-            self.refresh_admission_membership(session_id)?;
-        } else {
-            self.publish_admission(session_id)?;
-        }
-        Ok(Some(output))
+        result
     }
 }
 
@@ -666,6 +855,234 @@ mod tests {
                 .and_then(|turn| turn.continuation.as_ref())
             {
                 assert_eq!(input.delivery, crate::task::TaskInputDelivery::Cancelled);
+            }
+        }
+        Ok(())
+    }
+
+    /// Task metadata must not recover a live file job before its owning result commits.
+    #[test]
+    fn native_receipt_and_metadata_preserve_pending_plan_artifacts_until_owner_commit() -> Result<()>
+    {
+        let (root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+        let workspace = tempfile::tempdir()?;
+        crate::checks::configure_fixture(workspace.path());
+        let files = crate::plan::PlanFileStore::new(root.path(), workspace.path());
+        let mut document = crate::plan::test_fixture("pending-artifact", "Preserve live edits");
+        let mut design = crate::plan::DeclarationDesign::open(workspace.path())?;
+        design.document.objective = "Preserve live artifact ownership".into();
+        design.document.background =
+            "Metadata commits can arrive between file preparation and commit.".into();
+        design.document.design = "Reconcile only the journal owned by the file revision.".into();
+        design.proposed.insert(
+            "src/owner.rs".into(),
+            "/// Own the state.
+pub struct Owner;
+"
+            .into(),
+        );
+        document.design = Some(design);
+        let prepared =
+            files.prepare_entry("session", "Preserve live edits".into(), Some(document), 2)?;
+        let id = prepared.record.id.clone();
+        let mut task = Task::plan(prepared.record, 2)?;
+        task.edit(|draft| draft.request_entry("Prepare the plan".into(), 2))?;
+        let current = controller.current()?.unwrap();
+        controller.change(
+            &mut store,
+            Some(&current.revision),
+            crate::task::TaskChange::Install(Box::new(task)),
+            2,
+        )?;
+        let prior = store.load_plan(&id)?.unwrap();
+        let original = files.read_working_document("session", &id)?;
+        let mut changed = original.clone();
+        changed.version += 1;
+        changed.overview = "The live worker has written this pending edit.".into();
+        files.write_working_mutation_guarded(&prior, &original, &changed)?;
+        let journal = root
+            .path()
+            .join("plans/session")
+            .join(&id)
+            .join("artifact-recovery.json");
+        let pending = std::fs::read(&journal)?;
+
+        let current = controller.current()?.unwrap();
+        assert!(controller.acknowledge_dispatched_input(
+            &mut store,
+            &current.permit().receipt(),
+            &current.entry.as_ref().unwrap().id,
+            crate::task::TaskReceiptInput::Entry,
+            3,
+        )?);
+        assert_eq!(std::fs::read(&journal)?, pending);
+        assert_eq!(files.read_working_document("session", &id)?, changed);
+        let current = controller.current()?.unwrap();
+        controller.change(
+            &mut store,
+            Some(&current.revision),
+            crate::task::TaskChange::Pause,
+            3,
+        )?;
+        assert_eq!(std::fs::read(&journal)?, pending);
+        assert_eq!(files.read_working_document("session", &id)?, changed);
+        let mut metadata = store.load_plan(&id)?.unwrap();
+        metadata.updated_at_ms = 4;
+        store.save_plan(&metadata)?;
+        assert_eq!(std::fs::read(&journal)?, pending);
+        assert_eq!(files.read_working_document("session", &id)?, changed);
+
+        let current = controller.current()?.unwrap();
+        let mut target = metadata;
+        target.document_version = changed.version;
+        target.title = changed.title.clone();
+        controller.update(&mut store, &current.permit(), 5, |task| {
+            let WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
+                unreachable!()
+            };
+            plan.artifact = target.clone();
+            Ok(())
+        })?;
+        assert!(!journal.exists());
+        assert_eq!(files.read_working_document("session", &id)?, changed);
+        assert_eq!(
+            store.load_plan(&id)?.unwrap().document_version,
+            changed.version
+        );
+
+        let prior = store.load_plan(&id)?.unwrap();
+        let mut submitted = prior.clone();
+        submitted.model_revision += 1;
+        let (document, _, digest) = files.submit_document_revision(
+            "session",
+            &id,
+            submitted.model_revision,
+            submitted.document_version,
+        )?;
+        submitted.submitted_version = Some(document.version);
+        submitted.review_digest = Some(digest);
+        let pending_submission = std::fs::read(&journal)?;
+        let current = controller.current()?.unwrap();
+        controller.change(
+            &mut store,
+            Some(&current.revision),
+            crate::task::TaskChange::Pause,
+            6,
+        )?;
+        store.save_plan(&prior)?;
+        assert_eq!(std::fs::read(&journal)?, pending_submission);
+        let current = controller.current()?.unwrap();
+        controller.update(&mut store, &current.permit(), 7, |task| {
+            let WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
+                unreachable!()
+            };
+            plan.artifact = submitted.clone();
+            Ok(())
+        })?;
+        assert!(!journal.exists());
+        assert_eq!(
+            store.load_plan(&id)?.unwrap().model_revision,
+            submitted.model_revision
+        );
+        Ok(())
+    }
+
+    /// Implicit planning artifacts participate in the same file/database commit as explicit effects.
+    #[test]
+    fn implicit_plan_effect_reconciles_artifacts_on_commit_and_rollback() -> Result<()> {
+        let (root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+        let workspace = tempfile::tempdir()?;
+        crate::checks::configure_fixture(workspace.path());
+        let files = crate::plan::PlanFileStore::new(root.path(), workspace.path());
+        let mut document = crate::plan::test_fixture("implicit-artifact", "Plan the change");
+        let mut design = crate::plan::DeclarationDesign::open(workspace.path())?;
+        design.document.objective = "Preserve the plan artifact commit boundary".into();
+        design.document.background =
+            "A planning task owns a working artifact and its submitted revisions.".into();
+        design.document.design =
+            "Commit the artifact together with the task and recover either database outcome."
+                .into();
+        design.proposed.insert(
+            "src/owner.rs".into(),
+            "/// Own the plan artifact.\npub struct Owner;\n".into(),
+        );
+        document.design = Some(design);
+        let prepared =
+            files.prepare_entry("session", "Plan the change".into(), Some(document), 2)?;
+        let id = prepared.record.id.clone();
+        let previous = controller.current()?.unwrap();
+        controller.change(
+            &mut store,
+            Some(&previous.revision),
+            crate::task::TaskChange::Install(Box::new(Task::plan(prepared.record, 2)?)),
+            2,
+        )?;
+        for (fail, held_document) in [(true, false), (false, false), (true, true), (false, true)] {
+            let current = controller.current()?.unwrap();
+            let mut target = store.load_plan(&id)?.unwrap();
+            target.model_revision += 1;
+            let (_, _, digest) = files.submit_document_revision(
+                "session",
+                &id,
+                target.model_revision,
+                target.document_version,
+            )?;
+            target.review_digest = Some(digest);
+            let journal = root
+                .path()
+                .join("plans/session")
+                .join(&id)
+                .join("artifact-recovery.json");
+            assert!(journal.exists());
+            if fail {
+                store.connection.execute_batch("CREATE TRIGGER reject_implicit_plan BEFORE UPDATE ON session_record BEGIN SELECT RAISE(ABORT,'implicit plan commit failure'); END;")?;
+            }
+            let result = if held_document {
+                let document = files.read_working_document("session", &id)?;
+                store.commit_task_effects_with_document(
+                    "session",
+                    &current.permit(),
+                    3,
+                    files.guard_working_document(&document),
+                    |active| {
+                        let task = active.as_mut().context("planning task disappeared")?;
+                        task.edit(|draft| {
+                            let WorkflowSnapshot::Plan { plan } = &mut draft.workflow else {
+                                unreachable!()
+                            };
+                            plan.artifact = target.clone();
+                            Ok(())
+                        })?;
+                        Ok(((), TaskEffects::default()))
+                    },
+                )
+            } else {
+                controller.update(&mut store, &current.permit(), 3, |task| {
+                    let WorkflowSnapshot::Plan { plan } = &mut task.workflow else {
+                        unreachable!()
+                    };
+                    plan.artifact = target.clone();
+                    Ok(())
+                })
+            };
+            assert_eq!(result.is_err(), fail);
+            assert!(
+                !journal.exists(),
+                "the implicit artifact journal must resolve on either SQL outcome"
+            );
+            let persisted = store.load_plan(&id)?.unwrap();
+            assert_eq!(
+                persisted.model_revision,
+                if fail {
+                    target.model_revision - 1
+                } else {
+                    target.model_revision
+                }
+            );
+            if fail {
+                store
+                    .connection
+                    .execute_batch("DROP TRIGGER reject_implicit_plan")?;
             }
         }
         Ok(())

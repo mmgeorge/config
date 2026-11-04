@@ -100,22 +100,6 @@ Start an agent within the selected session.
 
 Requires nonempty `text` (string) and accepts `profile` (string or null). Unknown fields other than the transport `operation_id` fail decoding. The profile selects the child provider/model and access configuration. This creates fresh child work without inheriting the parent transcript. Returns `{ "agent": Agent, "task": AgentTask, "status": "admitted" }` after durable admission. Repeating the same operation and captured work returns that result with `replayed: true`. Reusing the identity for different work fails. Admission may queue provider execution and does not mean the child finished. Profile/provider resolution, capacity, persistence, and ownership failures remain explicit. Supply a stable `operation_id` string for recovery. Omission generates a new UUID, so a repeated request without that identity cannot establish replay equivalence.
 
-## `session.approval.continue`
-
-Continue after the approval-wait lifecycle permits it.
-
-- **Context:** Explicit existing session; coordinator handles control methods.
-- **Input:** The explicit session approval-continuation context.
-- **Result and effects:** Returns continuation state.
-- **Boundary:** This follows the approval timeout/continuation rules rather than inventing an approval decision.
-- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/broker/mod.rs`](../../../rust/forge/crates/forge-harness/src/broker/mod.rs).
-
-**Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `session_command`.
-
-### Contract
-
-No parameter fields. Returns [BrokerSnapshot](runtime-schemas.md#brokersnapshot). It consumes pending approval-timeout feedback for this session's root execution. Without feedback it returns the current snapshot. With a running/waiting selected task it reserves a continuation carrying that feedback; a paused task remains paused. Without a selected task it runs a new chat exchange with an approval-timeout continuation origin. This does not approve the timed-out operation. Provider/storage failures remain explicit, and task reservation is distinct from provider completion.
-
 ## `session.approval.resolve`
 
 Resolve a pending approval.
@@ -149,22 +133,6 @@ Import an attachment into the session's managed attachment storage.
 Requires `path` (an absolute local path string). Optional `number` is an unsigned integer defaulting to 1 and determines the initial display label. The source must be a regular file with a UTF-8 filename. Returns [AttachmentSelection](runtime-schemas.md#attachmentselection): retained metadata `id`, editable `label`, original `name`, detected `media_type`, and UTF-8 byte offsets `start`/`end` for inserting the label.
 
 Import copies the complete file into the content-addressed object store and persists attachment metadata before returning. It does not submit the attachment, invoke a provider, or change the source file. Source changes during capture, I/O failures, invalid paths, and metadata publication failures are explicit. Later composer edits must preserve the selection identity and update its byte span. It emits no request progress.
-
-## `session.check.cancel`
-
-Cancel an identified active check run.
-
-- **Context:** Explicit existing session/check owner.
-- **Input:** run_id.
-- **Result and effects:** Returns cancellation/status information.
-- **Boundary:** Cancellation must collect owned processes before releasing their resources.
-- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/checks/tools.rs`](../../../rust/forge/crates/forge-harness/src/checks/tools.rs).
-
-**Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `session_command`.
-
-### Contract
-
-Requires `run_id` (string), with optional `interrupt_execution` (false by default). Returns `{ "run_id": ..., "cancellation_requested": true }`. Active provider work or an explicit execution interrupt coordinates native cleanup before requesting cancellation; otherwise the check supervisor cancels the run directly. Recorded output and finished commands remain available. Cleanup contention, unknown runs, and native process failures are explicit. The acknowledgement does not erase history or imply every asynchronous observer has already seen completion.
 
 ## `session.check.complete`
 
@@ -230,22 +198,6 @@ Change session/task check selection overrides.
 
 Accepts [CheckOverrides](runtime-schemas.md#checkoverrides): `enabled`, `auto`, and `scopes` maps, each defaulting to empty and keyed by configured check ID. Returns the updated catalog shape documented for [session.check.list](#sessionchecklist). It replaces temporary overrides for the selected task entry, or the ad hoc conversation when no entry exists. It does not rewrite project check definitions or start a run. Unknown IDs, unsupported file/case scope, an active run, or persistence failure reject the update.
 
-## `session.check.run`
-
-Start the selected checks.
-
-- **Context:** Explicit existing session/check owner.
-- **Input:** The supported check selection and declared input values.
-- **Result and effects:** Returns run admission/state and later progress.
-- **Boundary:** Only selected work is admitted; failures and cancellation retain run identity.
-- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/checks/tools.rs`](../../../rust/forge/crates/forge-harness/src/checks/tools.rs).
-
-**Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `session_command`.
-
-### Contract
-
-Accepts [CheckRunRequest](runtime-schemas.md#checkrunrequest): `check` is one configured check ID or an array of IDs; optional `inputs` supplies configured typed input values; `all` defaults to false. `inputs` and `all: true` are mutually exclusive. Returns `{ "run_id": ... }` after starting native check work. The service refreshes workspace changes and resolves configured commands without accepting arbitrary replacement command text. Planning, active writing agents, or active source execution prevent admission. Unknown checks, invalid inputs/selections, configuration errors, and process-admission failures are explicit. Completion is observed through check events/status, not the initial response.
-
 ## `session.check.status`
 
 Read check-run status.
@@ -267,7 +219,7 @@ Requires `run_id` (string). Optional `wait_for_completion` defaults to false; `w
 Apply a session command through its typed owner.
 
 - **Context:** Explicit existing session.
-- **Input:** operation_id, action, and variant fields. Task actions include goal, plan, execute, attach_plan, fork, replan, pause, resume, clear, and continue. The typed review variants include begin_acceptance, cancel_acceptance, request_changes, cancel_plan, and complete_acceptance. Existing configuration/compaction/rollback actions retain their separate service contracts.
+- **Input:** operation_id, action, and variant fields. Task actions include goal, plan, execute, attach_plan, fork, replan, pause, resume, clear, and continue. The typed review variants include execute, request_changes, and cancel_plan. Existing configuration/compaction/rollback actions retain their separate service contracts.
 - **Result and effects:** Task state commands return their completed receipt. Review variants return their defined snapshot/receipt response. Configuration and execution controls retain their operation lifecycle. Document each surviving action and response variant explicitly rather than assigning one shape to the whole dispatcher.
 - **Boundary:** Task commands commit state and pending delivery. Pause suspends queued input but lets current execution finish. Explicit cancellation uses `session.turn.cancel` after pausing. With no live task, pause preserves the task slot rather than failing. Capture revision before preparation and validate task/artifact authority at commit. Configuration and explicit execution controls remain separate from task ownership.
 - **Inspected source:** [task/command.rs](../../../rust/forge/crates/forge-harness/src/task/command.rs), [service/task_state.rs](../../../rust/forge/crates/forge-harness/src/service/task_state.rs), and [broker/configuration.rs](../../../rust/forge/crates/forge-harness/src/broker/configuration.rs).
@@ -280,13 +232,13 @@ Apply a session command through its typed owner.
 
 ### Contract
 
-Requires `action` and an explicit session. Task actions use [SessionAction](native-schemas.md#sessionaction): `goal`, `plan`, `execute`, `attach_plan`, `fork`, `replan`, `pause`, `resume`, `clear`, `continue`, `begin_acceptance`, `cancel_acceptance`, `request_changes`, `cancel_plan`, and `complete_acceptance`. Every variant's fields are in the linked declaration. Configuration actions `permission`, `configure`, `compact`, and `undo` use the separate [configuration contract](session-command-configuration.md).
+Requires `action` and an explicit session. Task actions use [SessionAction](native-schemas.md#sessionaction): `goal`, `plan`, `execute`, `attach_plan`, `fork`, `replan`, `pause`, `resume`, `clear`, `continue`, `request_changes`, and `cancel_plan`. Every variant's fields are in the linked declaration. Configuration actions `permission`, `configure`, `compact`, and `undo` use the separate [configuration contract](session-command-configuration.md).
 
-Supply a stable `operation_id` string. Task actions generate one if absent, but that prevents recovery by a caller that loses the response. Optional `display_text` is presentation text. Internal `_command_response` selects `receipt` or `snapshot`; task starts default to receipt, and review acceptance actions default to snapshot. Lua owns the separate `_command` transport-recovery metadata. Do not generate new operation identities for retries.
+Supply a stable `operation_id` string. If absent, the service uses `_command.id` when supplied, otherwise generates an identity. Lua preserves that identity across retries; the transport request ID is separate. Optional `display_text` is presentation text. Review commands retain their document and sequence metadata so the same completed command can refresh its original projection. Do not generate new operation identities for retries.
 
-A receipt contains string `id`, string `state`, integer `revision`, action name, and optional `error`. Snapshot mode returns [BrokerSnapshot](runtime-schemas.md#brokersnapshot) with that receipt in `task_operation`. Completion means the state transition committed, not that the provider has finished the new work. Task state, affected plan/question records, and the operation receipt commit together. Duplicate IDs with identical normalized actions return the saved receipt. Conflicting reuse fails.
+Task commands return `id`, `state: "completed"`, their typed `outcome`, and `command_result` with the command identity, FIFO sequence, revision, and outcome. Review adapters can add their captured plan/document projection. Completion reports the finite owner boundary, not the eventual provider answer. ExecutePlan can complete with `AwaitingInput` while required review decisions remain. Duplicate IDs with identical normalized intent return the retained outcome; conflicting reuse fails.
 
-The service publishes `session_changed` before the command response, then any action-specific event and `task_operation`, and wakes input delivery. Entry actions queue their generated prompt for the input coordinator. They can promote an active turn without cancelling it. Pause suspends future input admission and does not itself cancel the current provider turn. Empty or terminal task slots remain valid when pausing ordinary chat. Stale task revisions, invalid plan identities/digests, missing artifacts, and invalid transitions fail. Provider work can continue or fail after command acknowledgement, so observe the originating session rather than assuming the callback is final task completion.
+The owner publishes committed session state and owns collection, preparation, and any exact input dispatch required by the command. Entry commands retain their generated input and finish at their finite dispatch boundary. Pause suspends future input admission without cancelling the current provider turn. Empty or terminal task slots remain valid when pausing ordinary chat. Stale source revisions, invalid plan identities/digests, missing artifacts, and invalid transitions fail. Provider work can continue after command acknowledgement, so observe the originating session rather than treating the callback as final task completion.
 
 ## `session.command.operation.get`
 
@@ -302,7 +254,7 @@ Read a durable command operation's recorded outcome.
 
 ### Contract
 
-Requires `operation_id` (string). Returns the durable task/configuration receipt with `id`, `state`, `revision`, `action`, and optional `error`, or JSON null if no receipt exists for this session. This is distinct from the Lua transport command ID queried by `session.command.status.get`. It reads local storage without running or replaying the command and emits no progress. Resolve an uncertain mutation with its original ID before deciding whether any retry is safe.
+Requires `operation_id` (string). Returns the retained operation view when available, or JSON null if none exists for this session. New owner commands use the same immutable identity for `operation_id` and `_command.id`; older receipts can have separate identities. It reads local storage without running or replaying the command and emits no progress. Use `session.command.status.get` for the owner journal and its original response before deciding whether a retry is safe.
 
 ## `session.command.status.get`
 
@@ -318,7 +270,7 @@ Read the recorded outcome of a mutation command.
 
 ### Contract
 
-Requires `id` (string), the Lua transport command identity previously carried in `_command`. An absent record returns `{ "state": "not_admitted" }`. A retained record returns `state` equal to `running`, `completed`, or `outcome_unknown`, plus `response`, which is the original terminal response or null. It does not run or replay the original command and emits no progress. The identity belongs to the explicit session and its retained command journal. Use this transport-recovery result before replaying a lost response; task transition receipts use the different `operation_id` field and `session.command.operation.get`.
+Requires `id` (string), the immutable command identity carried in `_command.id` or `operation_id`. An absent record returns `{ "state": "not_admitted" }`. Owner records report `queued`, `active`, `completed`, or `outcome_unknown`, with FIFO sequence and revision. Completed records include the retained outcome and original response; active records can include committed progress. Compatibility transport records can report `running`. The lookup never runs or replays the command. Lua retries the same identity only after `not_admitted`; a terminal unknown outcome releases the UI waiter and retains the original identity for inspection without automatic replay.
 
 ## `session.compact`
 
@@ -665,6 +617,16 @@ Accepts [InputOperation](runtime-schemas.md#inputoperation): nonempty `id`, inte
 
 `submit` accepts user-purpose input only. It requires a new nonempty message identity and nonblank text unless model configuration is present. `intent` is `auto` or `queue`. Client configuration can select only `model`, `effort`, `service_tier`, and `context_window`. Harness alone generates task-entry and task-continuation purposes. `reserve` captures a message revision for editing, `commit` validates every edit before changing the queue, and `release` drops that reservation. `remove` and `retry` require the captured editable revision. `resume` requires the current control revision.
 
+A clarification uses the same `submit` operation with a top-level `target`.
+For independent questions, supply `{ "owner": "question", "question_id": "...", "revision": 1 }`.
+For planning, exchange, or review questions, supply `owner` (`plan`, `interaction`,
+or `plan_review`), source `id`, `set_id`, positive `revision`, and `question_id`.
+The caller still submits user-purpose text; the owner validates the target and
+records the scoped clarification purpose. The same input identity and command
+receipt survive retries. Delivery revalidates the captured question revision.
+Review clarification preserves answers and approval evidence and never executes
+the plan; execution requires a later explicit execute or continue command.
+
 Returns [InputUpdate](runtime-schemas.md#inputupdate). Inspect its optional `error` even when the transport succeeded. Validation failures can be recorded as unsuccessful updates without changing messages. Successful admission publishes `input_changed` before the final response and wakes the input worker afterward. The worker may later publish delivering, accepted, failed, or unknown delivery state. Admission acknowledgement is not provider acceptance.
 
 Reusing an operation ID with identical data returns its receipt and current snapshot. Different data with that ID fails. An uncertain submission is reconciled before retry. Confirmed acceptance removes it without resending, and confirmed non-delivery is reported before another explicit retry. Queue ownership ends when the session runtime is replaced. Retain the user draft and original operation/submission identities across a lost response.
@@ -822,8 +784,8 @@ Accepts `change` ([PermissionChange](native-schemas.md#permissionchange)), optio
 Install Execute from the reviewed Plan artifact.
 
 - **Context:** Explicit existing session.
-- **Input:** plan_id, reviewed digest, saved_source_digest, approval_mode, plan_executor/executor, plan_compact/compact, comment, and operation_id as accepted by ExecuteSelection.
-- **Result and effects:** Returns a session snapshot with task_operation. Commits the execution task and required artifact effects.
+- **Input:** plan_id, reviewed digest, saved_source_digest, approval_mode, plan_executor/executor, plan_compact/compact, comment, annotations, and operation_id as accepted by ExecuteSelection.
+- **Result and effects:** Returns a session snapshot with `command_result`. Commits the execution task and required artifact effects.
 - **Boundary:** Validate reviewed identity and digests atomically. Do not start provider execution inside acceptance. Preserve the shared task command contract and response variant.
 - **Inspected source:** [task/command.rs](../../../rust/forge/crates/forge-harness/src/task/command.rs), [service/task_state.rs](../../../rust/forge/crates/forge-harness/src/service/task_state.rs).
 
@@ -831,39 +793,25 @@ Install Execute from the reviewed Plan artifact.
 
 ### Contract
 
-Accepts [ExecuteSelection](native-schemas.md#executeselection), including optional captured `plan_id`, `digest`, `saved_source_digest`, approval mode, executor/compaction controls, and comment. The special plan ID `last` is normalized to omitted selection. Supply a stable `operation_id` for retries. This is the `action = "execute"` form of [session.command.apply](#sessioncommandapply), defaulting to snapshot response with `task_operation`. Acceptance validates the selected artifact and current review state before scheduling execution. It does not report the execution finished. Stale digests, unavailable plans, invalid approval settings, and incompatible task transitions fail without selecting an unrelated plan.
+Accepts [ExecuteSelection](native-schemas.md#executeselection), including optional captured `plan_id`, `digest`, `saved_source_digest`, approval mode, executor/compaction controls, and comment. The special plan ID `last` is normalized to omitted selection. Supply a stable `operation_id` for retries. This is the `action = "execute"` form of [session.command.apply](#sessioncommandapply), defaulting to snapshot response with `command_result`. Acceptance validates the selected artifact and current review state before scheduling execution. It does not report the execution finished. Stale digests, unavailable plans, invalid approval settings, and incompatible task transitions fail without selecting an unrelated plan.
 
-## `session.plan.acceptance.begin`
+Inline `annotations` are decoded as typed review ranges and validated against the
+captured source before preparing revision files. Nonempty feedback starts revision
+work with the selected execution choices retained; it does not mark the current
+plan accepted or start implementation. Direct execute requests can carry this
+feedback through the same execute command.
 
-Begin acceptance review through the shared review command.
+ExecutePlan completes with `AwaitingInput` when required review decisions remain.
+It commits revision-scoped questions and releases the command slot without
+starting execution. Answering questions does not approve the plan: a new execute
+or target-validated ContinueWorkflow command revalidates the reviewed revision,
+question set, and saved answers before dispatch. A retry of the same operation
+returns its retained result without duplicating questions or execution.
 
-- **Context:** Explicit existing session.
-- **Input:** PlanReviewRequest fields: plan_id, digest, saved_source_digest, approval_mode, comment, annotations, and operation_id when supplied.
-- **Result and effects:** Returns a session snapshot with task_operation and the acceptance-question state.
-- **Boundary:** Preserve independent execution-revision review routing. Main-task review commits without acquiring provider execution. Preserve the shared task command contract and response variant.
-- **Inspected source:** [task/command.rs](../../../rust/forge/crates/forge-harness/src/task/command.rs), [service/task_state.rs](../../../rust/forge/crates/forge-harness/src/service/task_state.rs).
-
-**Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `session_command`.
-
-### Contract
-
-Accepts [PlanReviewRequest](native-schemas.md#planreviewrequest) and optional stable `operation_id`. This is `action = "begin_acceptance"` in [session.command.apply](#sessioncommandapply), defaulting to a snapshot response. It captures the reviewed plan/digests and starts the acceptance lifecycle, including required questions. Review capture may supply the plan fields from an owned document input. Invalid or stale review identity fails. The resulting question state and receipt persist together; follow-up acceptance must retain that captured identity.
-
-## `session.plan.acceptance.cancel`
-
-Cancel pending acceptance review.
-
-- **Context:** Explicit existing session.
-- **Input:** PlanReviewRequest fields and operation_id when supplied.
-- **Result and effects:** Returns a session snapshot with task_operation after updating the owned acceptance state.
-- **Boundary:** Cancellation of review is separate from cancelling a provider turn or clearing the entire task. Preserve the shared task command contract and response variant.
-- **Inspected source:** [task/command.rs](../../../rust/forge/crates/forge-harness/src/task/command.rs), [service/task_state.rs](../../../rust/forge/crates/forge-harness/src/service/task_state.rs).
-
-**Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `session_command`.
-
-### Contract
-
-Accepts [PlanReviewRequest](native-schemas.md#planreviewrequest) and optional stable `operation_id`. This is `action = "cancel_acceptance"` in [session.command.apply](#sessioncommandapply), defaulting to a snapshot response. It cancels the identified acceptance lifecycle without deleting the plan or claiming that execution completed. Stale or mismatched acceptance state fails. Replay returns the original receipt rather than cancelling a later lifecycle.
+Closing or reopening review and question windows changes only local UI state.
+The retired `session.plan.acceptance.begin` and `session.plan.acceptance.cancel`
+methods, and `begin_acceptance` / `complete_acceptance` task actions, are
+unsupported. Historical acceptance events and receipts remain readable.
 
 ## `session.plan.cancel`
 
@@ -1191,28 +1139,30 @@ option_id,feedback?}}` or `{kind:"answer",answer:{kind:"other",text}}`. The tran
 returns the current question snapshot and publishes `questions_changed`. The same
 operation may be retried with identical content. Stale revisions and invalid choices
 fail without changing the question. The committed answer enters the durable input
-journal independently of this response. Plan acceptance continues to use its captured
-`target` and explicit acceptance confirmation.
+journal independently of this response. Plan review continues to use its captured
+`target` and explicit execution confirmation.
 
-## `session.question.ask`
+For target-form plan/workflow questions, supply `operation_id`,
+`target:{owner,id,set_id,revision}`, `question_id`, and a typed `response`. The
+current owner values are `plan`, `plan_review`, and `interaction`. The historical
+`plan_acceptance` spelling remains a decoding alias; always use
+the source and revision from the observed elicitation. Optional `answer_order` is
+`[writer,sequence]` and prevents an older answer from replacing a newer answer
+from that writer. The service sends a correlated owner event. It does not start a
+task command or write from an RPC worker. The answer, dependent task snapshot,
+immutable retry receipt, and retained `question_updated` notification commit in
+one SQLite transaction. Identical retries return the original result without
+reapplying the answer or duplicating its notification. Old receipts lacking a
+notification acquire one transactionally on retry.
 
-Submit a question through the session's question workflow.
-
-- **Context:** Explicit existing session; coordinator handles control methods.
-- **Input:** The question text and supported context.
-- **Result and effects:** Returns the resulting question/workflow state.
-- **Boundary:** This can involve provider work; it is not a local string lookup.
-- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/broker/mod.rs`](../../../rust/forge/crates/forge-harness/src/broker/mod.rs).
-
-**Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `session_command`.
-
-### Contract
-
-For ordinary questions, supply the same `command` envelope with
-`action:{kind:"clarify",text}`. This saves and queues a clarification immediately;
-it does not resolve the question. The model attaches its explanation through
-`question_reply`. `action:{kind:"correct",text}` appends an explicit correction to
-an answered question. Paused and completed tasks are not resumed by discussion.
+Failures use stable codes: `question_answer_invalid`,
+`question_answer_identity_conflict`, `question_target_missing`,
+`question_revision_changed`, `question_answer_rejected`,
+`question_answer_receipt_invalid`, and `question_answer_state_unavailable`.
+Owner intake/observation failures retain their `question_event_queue_full`,
+`question_owner_closed`, or `question_event_observation_lost` categories. A lost
+observation does not prove that the answer failed to commit; retry with the same
+operation identity and payload to retrieve its receipt.
 
 ## `session.question.continue`
 
@@ -1221,7 +1171,7 @@ Continue after required answers have committed.
 - **Context:** Explicit existing session; coordinator handles control methods.
 - **Input:** Optional captured question target with owner, id, set_id, and revision.
 - **Result and effects:** Returns continuation/session state.
-- **Boundary:** The handler rejects changed targets and incomplete required answers. Acceptance completion first resolves a prior receipt or captures the Plan ID and review digest, then commits CompleteAcceptance without provider admission. Other question continuations retain their provider-execution requirements.
+- **Boundary:** The handler captures the question identity and routes through ContinueWorkflow. The owner rejects stale targets, revalidates revision-scoped answers, and either commits AwaitingInput or dispatches the approved work once. Retrying a command resolves its original receipt.
 - **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/broker/mod.rs`](../../../rust/forge/crates/forge-harness/src/broker/mod.rs).
 
 **Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `ordinary`. Recovery: `session_command`.
@@ -1248,6 +1198,11 @@ For ordinary questions, use `command` with `action:{kind:"dismiss"}`. Only
 pending optional questions can be dismissed. Required questions can be answered,
 clarified, or explicitly withdrawn by the model; closing their picker leaves the
 gate active.
+
+For a target-form question, this route sends the same owner event as answering,
+with an explicit `skipped` response. The target must permit skipping. It shares
+the answer route's atomic persistence, retry, publication, and error contracts;
+closing a question dialog does not invoke this route.
 
 ## `session.rename`
 
@@ -1345,21 +1300,8 @@ Cancel the selected session's current execution.
 
 Accepts optional root `target` and `restore_prompt_if_no_output` (boolean, default false). It validates root control ownership, quiesces managed children, cancels root approvals, and collects provider cleanup before acknowledging cancellation. Returns `{ "cancel_requested": true }` for an active provider turn, or the settled broker cancellation result when already idle. Prompt restoration only applies when the turn can be retracted before output. Cleanup failure remains an error and prevents pretending the provider stopped. Pausing the selected task/input queue is a separate state action used by the UI before cancellation.
 
-## `session.turn.restart`
-
-Restart work through the session coordinator.
-
-- **Context:** Explicit existing session; coordinator handles control methods.
-- **Input:** The restart/control payload accepted by the coordinator.
-- **Result and effects:** Returns the new execution/control state.
-- **Boundary:** Preserve task ownership and operation identity across the restart boundary.
-- **Inspected source:** [`nvim/rust/forge/crates/forge-harness/src/broker/mod.rs`](../../../rust/forge/crates/forge-harness/src/broker/mod.rs).
-
-**Transport:** Required explicit session ID. Readiness: `runtime`. Admission: `control`. Recovery: `session_command`.
-
-### Contract
-
-Accepts optional `mode`, which is echoed in `{ "restart_requested": true, "mode": ... }`. It quiesces children, cancels root approvals, and requests restart after provider cleanup. A cleanup failure is returned and retained instead of admitting overlapping provider work. This acknowledges restart scheduling, not a completed replacement turn. The session and provider generation remain the ownership boundary for later events.
+The retired `session.turn.restart` method is unsupported. Configuration commands
+own any required collection and replacement dispatch through the session FIFO.
 
 ## `session.turn.steer`
 

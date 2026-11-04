@@ -82,7 +82,6 @@ impl HarnessBroker {
             error: None,
             exchange_id: None,
             created_at_ms: now_ms,
-            resume_after_transition: false,
         };
         self.task_controller.command_with_effects(
             &mut self.store,
@@ -95,16 +94,7 @@ impl HarnessBroker {
         self.session.active_task = self.task_controller.current()?;
         let snapshot = serde_json::to_value(self.snapshot()?)?;
         let events = event_name
-            .map(|name| {
-                self.event(
-                    name,
-                    if name == "plan_acceptance_started" {
-                        snapshot["active_elicitation"].clone()
-                    } else {
-                        json!({"plan":plan,"lifecycle":lifecycle})
-                    },
-                )
-            })
+            .map(|name| self.event(name, json!({"plan":plan,"lifecycle":lifecycle})))
             .transpose()?
             .into_iter()
             .collect();
@@ -174,9 +164,8 @@ impl BrokerObserver {
                     now_ms,
                 )?))
             }
-            SessionAction::Execute { .. } => {
-                let (task, effects) =
-                    self.prepare_execution(&action.to_params()?, goal_max_turns, now_ms)?;
+            SessionAction::Execute { selection } => {
+                let (task, effects) = self.prepare_execution(selection, goal_max_turns, now_ms)?;
                 return Ok(PreparedTaskChange {
                     change: TaskChange::prepared(current, task),
                     effects,
@@ -198,30 +187,7 @@ impl BrokerObserver {
                 completed_turn.as_ref(),
                 now_ms,
             )?,
-            SessionAction::CompleteAcceptance { plan_id, digest } => {
-                let task = current.context("session has no active task")?;
-                let WorkflowSnapshot::Plan { plan } = &task.workflow else {
-                    anyhow::bail!("acceptance requires the current planning task")
-                };
-                let acceptance = plan
-                    .artifact
-                    .acceptance
-                    .as_ref()
-                    .context("active plan has no acceptance state")?;
-                anyhow::ensure!(
-                    &plan.artifact.id == plan_id && &acceptance.review_digest == digest,
-                    "plan acceptance changed before completion"
-                );
-                let (task,effects)=self.prepare_execution(&json!({"plan_id":plan.artifact.id,"digest":acceptance.review_digest,"saved_source_digest":acceptance.saved_source_digest,"approval_mode":acceptance.approval_mode()?,"comment":acceptance.overall_comment}),goal_max_turns,now_ms)?;
-                return Ok(PreparedTaskChange {
-                    change: TaskChange::prepared(current, task),
-                    effects,
-                });
-            }
-            SessionAction::BeginAcceptance { .. }
-            | SessionAction::CancelAcceptance { .. }
-            | SessionAction::RequestChanges { .. }
-            | SessionAction::CancelPlan { .. } => {
+            SessionAction::RequestChanges { .. } | SessionAction::CancelPlan { .. } => {
                 return self.prepare_review_change(action, current, now_ms);
             }
         };
@@ -705,7 +671,6 @@ mod tests {
             error: None,
             exchange_id: None,
             created_at_ms: 1,
-            resume_after_transition: false,
         };
         broker.store.admit_task_operation(&receipt)?;
         let before = broker.store.list_exchange(&broker.session.id)?.len();

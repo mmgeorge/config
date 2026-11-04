@@ -369,7 +369,7 @@ function M.open(options, callback)
     render_markdown()
     vim.schedule(function() if alive() then owner.observe_sections() end end)
     if not options.read_only then owner.terminals = require("forge.views.harness.terminals").watch({
-      session_id = options.session_id, alive = alive, notice = notice,
+      session_id = options.session_id, alive = alive, notice = notice, capability = options.capability,
       update = function(snapshot)
         owner.status_view.context.background_terminals = snapshot
         owner.status_view:render()

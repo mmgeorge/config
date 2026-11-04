@@ -33,13 +33,6 @@ pub(super) async fn answer(
             )
             .await?;
             gate.wait().await?;
-            let _execution = child
-                .coordinator
-                .execution
-                .clone()
-                .acquire_owned()
-                .await
-                .context("review answer session is closed")?;
             let scope = ReviewAnswerScope::new(Arc::clone(&source.plan_review), document, question);
             let (sink, mut updates) = crate::broker::publication::channel();
             let _generation = child.provider_lane.read().await;
@@ -60,41 +53,33 @@ pub(super) async fn answer(
                 Some(job) => Some(job.run().await?),
                 None => None,
             };
-            let dispatch = {
-                let mut broker = child.broker.lock().await;
-                let catalog = match catalog_result {
-                    Some(result) => broker.commit_configuration_catalog(result)?,
-                    None => Vec::new(),
-                };
-                let prompt = broker.prepare_review_question(
-                    &scope,
-                    &selection,
-                    &catalog,
-                    Some((&message_sink, request_id)),
-                )?;
-                broker.begin_review_question_dispatch(prompt, scope.question.body.clone(), sink)?
-            };
             drop(_generation);
             let forwarder = tokio::spawn(async move {
                 while updates.recv().await?.is_some() {}
                 Ok::<(), anyhow::Error>(())
             });
-            let result = drive_owned_foreground(&child, dispatch, &message_sink).await;
+            let result = child
+                .exchange_owner
+                .review_question(
+                    scope,
+                    selection,
+                    catalog_result,
+                    sink,
+                    message_sink.clone(),
+                    request_id,
+                )
+                .await;
             forwarder
                 .await
                 .context("review publication worker failed")??;
             let result = result?;
-            let value = result.response.result().ok_or_else(|| {
+            result.response.result().ok_or_else(|| {
                 anyhow::anyhow!(
                     "review question dispatch failed: {:?}",
                     result.response.error()
                 )
             })?;
-            child
-                .broker
-                .lock()
-                .await
-                .finish_review_question(scope, value)
+            Ok::<(), anyhow::Error>(())
         });
     }
     let mut failures = Vec::new();

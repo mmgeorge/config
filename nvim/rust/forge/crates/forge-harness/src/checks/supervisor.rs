@@ -44,6 +44,7 @@ pub struct CheckSupervisor {
     presentation: Arc<Mutex<SessionPresentation>>,
     state: Mutex<CheckStateStore>,
     notification: OnceLock<CheckNotification>,
+    owner: OnceLock<super::owner::CheckOwnerSender>,
     trace: Arc<crate::trace::TraceStore>,
     changed: tokio::sync::Notify,
 }
@@ -260,6 +261,7 @@ impl CheckSupervisor {
                 notified: Default::default(),
             }),
             notification: OnceLock::new(),
+            owner: OnceLock::new(),
             trace,
             changed: Default::default(),
         }))
@@ -457,6 +459,29 @@ impl CheckSupervisor {
         ensure!(
             active.run_id == id,
             "check run is not owned by this active request"
+        );
+        active.cancellation.cancel();
+        Ok(())
+    }
+
+    /// Request collection of the selected run, accepting natural completion under the same lock.
+    /// A different active run never inherits cancellation intended for this identity.
+    pub(crate) fn cancel_for_collection(&self, id: &str) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("check state lock poisoned"))?;
+        let run = state.records.get(id).context("unknown check run")?;
+        if run.state != CheckState::Running {
+            return Ok(());
+        }
+        let active = state
+            .active
+            .as_ref()
+            .context("running check lost process ownership")?;
+        ensure!(
+            active.run_id == id,
+            "running check ownership changed before collection"
         );
         active.cancellation.cancel();
         Ok(())
@@ -1595,8 +1620,37 @@ impl CheckSupervisor {
         Ok(())
     }
 
+    /// Install the session owner's internal check route exactly once.
+    pub(crate) fn install_owner(&self, owner: super::owner::CheckOwnerSender) -> Result<()> {
+        self.owner
+            .set(owner)
+            .map_err(|_| anyhow::anyhow!("check owner already installed"))
+    }
+
+    /// Get the installed owner route without allowing unowned check admission.
+    pub(crate) fn owner_sender(&self) -> Result<super::owner::CheckOwnerSender> {
+        self.owner
+            .get()
+            .cloned()
+            .context("check owner is unavailable")
+    }
+
+    /// Launch already resolved work only from an authenticated owner update step.
+    pub(crate) fn launch_owned(
+        self: &Arc<Self>,
+        run: PreparedCheckRun,
+        sink: Option<SessionUpdateSink>,
+        external_cancelled: Option<Arc<AtomicBool>>,
+    ) -> Result<(
+        String,
+        tokio::sync::oneshot::Receiver<std::result::Result<CheckRun, String>>,
+    )> {
+        self.admit_and_launch(run, sink, external_cancelled, None)
+    }
+
     /// Starts an owned check task without waiting for progress delivery.
     /// Retains an optional source-work permit until the process is collected.
+    #[cfg(test)]
     pub(crate) async fn start(
         self: &Arc<Self>,
         run: PreparedCheckRun,
@@ -1607,23 +1661,6 @@ impl CheckSupervisor {
         let (id, _) = self
             .launch(run, sink, external_cancelled, admission)
             .await?;
-        Ok(id)
-    }
-
-    /// Start a provider-requested run only while its captured callback authority is current.
-    pub(crate) async fn start_authorized(
-        self: &Arc<Self>,
-        run: PreparedCheckRun,
-        sink: Option<SessionUpdateSink>,
-        external_cancelled: Option<Arc<AtomicBool>>,
-        authority: Option<&crate::tools::TaskAuthority>,
-    ) -> Result<String> {
-        let run = self.resolve(run).await?;
-        let launch = || self.admit_and_launch(run, sink, external_cancelled, None);
-        let (id, _) = match authority {
-            Some(authority) => authority.commit(launch)?,
-            None => launch()?,
-        };
         Ok(id)
     }
 

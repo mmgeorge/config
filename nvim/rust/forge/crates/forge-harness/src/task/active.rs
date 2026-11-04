@@ -196,9 +196,12 @@ impl TryFrom<TaskSnapshot> for Task {
 
     fn try_from(draft: TaskSnapshot) -> Result<Self> {
         super::state::validate_snapshot(&draft)?;
-        anyhow::ensure!(!draft.id.as_str().is_empty(), "task identity is required");
         anyhow::ensure!(
-            !draft.revision.as_str().is_empty(),
+            !draft.id.as_str().trim().is_empty(),
+            "task identity is required"
+        );
+        anyhow::ensure!(
+            !draft.revision.as_str().trim().is_empty(),
             "task revision is required"
         );
         if let Some(entry) = &draft.entry {
@@ -261,17 +264,42 @@ impl Serialize for Task {
 
 /// Identifies a task-generated provider input across delivery retries.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(transparent)]
+#[serde(try_from = "String", into = "String")]
 pub struct TaskInputId(String);
 
 impl TaskInputId {
+    /// Create a distinct identity for one task-generated input.
     pub fn fresh() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
     }
+    /// Get the opaque input identity for persistence and correlation.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
+
+impl TryFrom<String> for TaskInputId {
+    type Error = TaskInputIdentityError;
+    /// Reject missing authority while loading task/input journals or caller targets.
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        if value.trim().is_empty() {
+            return Err(TaskInputIdentityError);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl From<TaskInputId> for String {
+    /// Persist an already-validated input identity without changing its spelling.
+    fn from(value: TaskInputId) -> Self {
+        value.0
+    }
+}
+
+/// Reject an empty task-generated input identity without retaining arbitrary supplied text.
+#[derive(Debug, thiserror::Error)]
+#[error("task input identity must be nonempty")]
+pub struct TaskInputIdentityError;
 
 /// Orders completed root turns without retaining prior exchanges in task state.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -358,8 +386,8 @@ pub enum TaskInputDelivery {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WorkflowSnapshot {
     Goal { goal: GoalSnapshot },
-    Plan { plan: PlanSnapshot },
-    Execute { execution: ExecutionSnapshot },
+    Plan { plan: Box<PlanSnapshot> },
+    Execute { execution: Box<ExecutionSnapshot> },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -370,6 +398,9 @@ pub struct GoalSnapshot {
     pub native: bool,
     /// Compare actual workspace content instead of treating tool activity as progress.
     pub observed_checkpoint: Option<String>,
+    /// Preserve the latest explicit explanation for a blocked logical goal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_status: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -421,6 +452,30 @@ pub struct TaskPermit {
     observation_revision: TaskRevision,
 }
 
+/// Identify the task-owned input whose real native receipt is being observed.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TaskReceiptInput {
+    Entry,
+    Continuation,
+}
+
+/// Persist the observation owner of an input receipt across legal task revisions.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct TaskReceiptPermit {
+    id: TaskId,
+    observation_revision: TaskRevision,
+}
+
+impl TaskReceiptPermit {
+    /// Resolve only against the same task generation; user control invalidates this proof.
+    pub(crate) fn permit_for(&self, task: &Task) -> Result<TaskPermit> {
+        if task.id != self.id || task.observation_revision != self.observation_revision {
+            return Err(StaleTask.into());
+        }
+        Ok(task.permit())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct StaleTask;
 
@@ -433,6 +488,14 @@ impl std::fmt::Display for StaleTask {
 impl std::error::Error for StaleTask {}
 
 impl TaskPermit {
+    /// Retain only the immutable authority needed to observe this input's later receipt.
+    pub(crate) fn receipt(&self) -> TaskReceiptPermit {
+        TaskReceiptPermit {
+            id: self.id.clone(),
+            observation_revision: self.observation_revision.clone(),
+        }
+    }
+
     /// Attribute a completed model turn after its own legal phase transition.
     /// User control rotates this fence, so a late completion cannot affect resumed work.
     pub(crate) fn validate_observation(&self, task: Option<&Task>) -> Result<()> {
@@ -485,6 +548,7 @@ impl TaskSnapshot {
                     continuation,
                     native,
                     observed_checkpoint: None,
+                    reported_status: None,
                 },
             },
         }
@@ -503,10 +567,10 @@ impl TaskSnapshot {
             turn: None,
             observed_turn: None,
             workflow: WorkflowSnapshot::Plan {
-                plan: PlanSnapshot {
+                plan: Box::new(PlanSnapshot {
                     artifact,
                     paused: false,
-                },
+                }),
             },
         }
     }
@@ -530,12 +594,12 @@ impl TaskSnapshot {
             turn: None,
             observed_turn: None,
             workflow: WorkflowSnapshot::Execute {
-                execution: ExecutionSnapshot {
+                execution: Box::new(ExecutionSnapshot {
                     title,
                     record,
                     continuation,
                     native,
-                },
+                }),
             },
         }
     }

@@ -25,6 +25,7 @@ fn git(workspace: &Path, args: &[&str]) {
 
 fn request(workspace: &Path, mode: PromptMode, text: &str) -> ProviderRequest {
     ProviderRequest {
+        dispatch: forge_provider_api::submission::DispatchTracker::default(),
         execution_owner: None,
         harness_session_id: "harness-session".into(),
         workspace: workspace.to_string_lossy().into_owned(),
@@ -203,6 +204,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         .await
         .unwrap();
     let answer_request = ProviderRequest {
+        dispatch: forge_provider_api::submission::DispatchTracker::default(),
         execution_owner: None,
         model: "default".into(),
         ..request(

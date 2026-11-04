@@ -252,6 +252,30 @@ pub enum ProviderError {
     Delivery(events::EventDeliveryError),
 }
 
+impl ProviderError {
+    /// Identify cancellation without hiding an independent cleanup or transport failure.
+    pub fn is_clean_cancellation(&self) -> bool {
+        match self {
+            Self::Cancelled => true,
+            Self::PreparationFailed(cause) => cause.is_clean_cancellation(),
+            Self::Combined { primary, secondary } => {
+                primary.is_clean_cancellation() && secondary.iter().all(Self::is_clean_cancellation)
+            }
+            Self::Contract(_)
+            | Self::Failure(_)
+            | Self::Cleanup(_)
+            | Self::Unsupported(_)
+            | Self::Observation(_)
+            | Self::RuntimeVersion(_)
+            | Self::PreparationCleanup { .. }
+            | Self::NotConsumed { .. }
+            | Self::DeliveryUncertain
+            | Self::Retryable(_)
+            | Self::Delivery(_) => false,
+        }
+    }
+}
+
 impl std::fmt::Display for ProviderError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

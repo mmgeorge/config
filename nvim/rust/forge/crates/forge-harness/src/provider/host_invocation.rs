@@ -8,6 +8,7 @@ use forge_provider_api::{
     session::{HostEffectFailure, ProviderHostEffects},
     turn_control::{HostTurnStatus, TurnControl},
 };
+use futures_util::FutureExt;
 use tokio::sync::Notify;
 
 use crate::tools::{ControlToolExecutor, ControlToolInvocation, ControlTurnContext};
@@ -18,7 +19,9 @@ use super::{CompletionSlot, ProviderCompletion};
 pub(crate) struct HostInvocation {
     binding: BindingId,
     scope: InvocationScope,
+    request: super::ProviderRequest,
     executor: ControlToolExecutor,
+    authority: Option<crate::tools::TaskAuthority>,
     permissions: Arc<crate::permissions::provider::ProviderPermissionContext>,
     directories: Mutex<Option<super::approval::DirectoryExecution>>,
     tools: std::collections::HashSet<String>,
@@ -34,6 +37,46 @@ pub(crate) struct HostInvocation {
     lsp: Option<Arc<crate::tools::lsp::LspScope>>,
     state: Mutex<InvocationState>,
     changed: Notify,
+    live_host_effects: Option<super::LiveHostEffectSender>,
+    calls: Mutex<std::collections::HashMap<forge_provider_api::control::ToolCallId, Arc<HostCall>>>,
+}
+
+struct HostCall {
+    name: String,
+    arguments: serde_json::Value,
+    state: Mutex<HostCallState>,
+    changed: Notify,
+}
+
+#[derive(Clone)]
+enum HostCallState {
+    Running,
+    Published(HostCallPublication),
+    Complete(Result<String, ProviderError>),
+}
+
+#[derive(Clone)]
+struct HostCallPublication {
+    result: futures_util::future::Shared<
+        futures_util::future::BoxFuture<'static, Result<String, ProviderError>>,
+    >,
+}
+
+struct RunningHostCall(Arc<HostCall>);
+
+impl Drop for RunningHostCall {
+    /// Preserve ambiguity if a callback disappears before publishing a replayable batch.
+    fn drop(&mut self) {
+        let mut state = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if matches!(*state, HostCallState::Running) {
+            *state = HostCallState::Complete(Err(ProviderError::DeliveryUncertain));
+        }
+        self.0.changed.notify_waiters();
+    }
 }
 
 /// Own the callback transports and policy leases retained by one invocation.
@@ -158,6 +201,7 @@ impl HostInvocation {
     pub(crate) fn new(
         binding: BindingId,
         scope: InvocationScope,
+        request: &super::ProviderRequest,
         context: ControlTurnContext,
         tools: &[forge_provider_api::control::ControlToolDefinition],
         resources: HostInvocationResources,
@@ -171,6 +215,7 @@ impl HostInvocation {
             skills,
         } = resources;
         let completion = context.provider_completion.clone();
+        let live_host_effects = context.live_host_effects.clone();
         let skill_observer = skills
             .as_ref()
             .map(crate::skill::SkillExecution::event_observer);
@@ -179,6 +224,8 @@ impl HostInvocation {
         Self {
             binding,
             scope,
+            request: request.invocation_snapshot(),
+            authority: crate::tools::TaskAuthority::capture(&context),
             executor: ControlToolExecutor::new(context),
             permissions,
             directories: Mutex::new(directories),
@@ -195,7 +242,20 @@ impl HostInvocation {
             lsp,
             state: Mutex::new(InvocationState::default()),
             changed: Notify::new(),
+            live_host_effects,
+            calls: Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Get immutable invocation preferences only for the fully matching invocation scope.
+    pub(crate) fn request_snapshot(
+        &self,
+        scope: &InvocationScope,
+    ) -> Result<super::ProviderRequest, ProviderError> {
+        if &self.scope != scope {
+            return Err(forge_provider_api::lifecycle::LifecycleError::OwnershipMismatch.into());
+        }
+        Ok(self.request.clone())
     }
 
     /// Cancel this invocation's tools without granting replacement callbacks its authority.
@@ -355,14 +415,58 @@ impl Drop for AdmittedEffect<'_> {
     }
 }
 
-#[async_trait]
-impl ProviderTools for HostInvocation {
-    async fn call(&self, scope: &InvocationScope, call: ToolCall) -> Result<String, ProviderError> {
-        if !self.tools.contains(&call.name) {
-            return Err(rejected());
+impl HostInvocation {
+    /// Request the live logical commit while retaining the exact batch for replay after a lost waiter.
+    fn publication(
+        &self,
+        call_id: forge_provider_api::control::ToolCallId,
+        batch: super::HostEffectBatch,
+        message: String,
+    ) -> HostCallPublication {
+        let owner = self.live_host_effects.clone();
+        let scope = self.scope.clone();
+        let authority = self.authority.clone();
+        let result = async move {
+            let completion = &batch.completion;
+            if !completion.plan_edit.is_empty()
+                || !completion.design_patch.is_empty()
+                || completion.plan_submit.is_some()
+                || completion.goal_control.is_some()
+                || completion.plan_question.is_some()
+                || completion.question_withdrawal.is_some()
+            {
+                let owner = owner.ok_or_else(|| {
+                    ProviderError::Failure(ProviderFailure::new(
+                        ProviderOperation::HostEffectPublication,
+                        ProviderFailureKind::Rejected,
+                    ))
+                })?;
+                let committed = owner.commit(scope, call_id, batch).await?;
+                if let Some(permit) = committed.task_permit
+                    && let Some(authority) = &authority
+                {
+                    // The logical effect already committed. A later user revocation
+                    // prevents future callbacks; it cannot change this retained result.
+                    let _ = authority.advance(permit);
+                }
+            }
+            Ok(message)
         }
-        let mut admitted = self.admit(scope)?;
+        .boxed()
+        .shared();
+        HostCallPublication { result }
+    }
+
+    /// Execute once, publish stable batch identity, and await any required live owner commit.
+    async fn execute_call(
+        &self,
+        call: ToolCall,
+        record: &HostCall,
+        admitted: &mut AdmittedEffect<'_>,
+    ) -> Result<String, ProviderError> {
+        let call_id = call.id.clone();
         let invocation = ControlToolInvocation {
+            call_id: Some(call.id),
             task_permit: None,
             name: call.name,
             arguments: call.arguments,
@@ -400,13 +504,91 @@ impl ProviderTools for HostInvocation {
                 outcome.plan_document.as_ref(),
             ),
         };
-        self.completion.publish(completion)?;
+        let batch = self.completion.publish_batch(completion)?;
+        let publication = self.publication(call_id, batch, message);
+        *record.state.lock().map_err(|_| rejected())? =
+            HostCallState::Published(publication.clone());
+        record.changed.notify_waiters();
         self.state
             .lock()
             .map_err(|_| rejected())?
             .execution_finished |= outcome.execution_finished;
         admitted.published = true;
-        Ok(message)
+        publication.result.await
+    }
+}
+
+#[async_trait]
+impl ProviderTools for HostInvocation {
+    async fn call(&self, scope: &InvocationScope, call: ToolCall) -> Result<String, ProviderError> {
+        if scope != &self.scope || !self.tools.contains(&call.name) {
+            return Err(rejected());
+        }
+        // A committed reply remains deliverable after its own effect retires task authority.
+        let retained = {
+            let calls = self.calls.lock().map_err(|_| rejected())?;
+            calls
+                .get(&call.id)
+                .map(|record| {
+                    if record.name != call.name || record.arguments != call.arguments {
+                        return Err(rejected());
+                    }
+                    Ok(record.state.lock().map_err(|_| rejected())?.clone())
+                })
+                .transpose()?
+        };
+        match retained {
+            Some(HostCallState::Complete(result)) => return result,
+            Some(HostCallState::Published(publication)) => return publication.result.await,
+            Some(HostCallState::Running) | None => {}
+        }
+        let mut admitted = self.admit(scope)?;
+        let (record, fresh) = {
+            let mut calls = self.calls.lock().map_err(|_| rejected())?;
+            if let Some(record) = calls.get(&call.id) {
+                if record.name != call.name || record.arguments != call.arguments {
+                    return Err(rejected());
+                }
+                (record.clone(), false)
+            } else {
+                if calls.len() >= forge_protocol::MAX_PENDING_FRAMES {
+                    return Err(rejected());
+                }
+                let record = Arc::new(HostCall {
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                    state: Mutex::new(HostCallState::Running),
+                    changed: Notify::new(),
+                });
+                calls.insert(call.id.clone(), record.clone());
+                (record, true)
+            }
+        };
+        if fresh {
+            let _running = RunningHostCall(record.clone());
+            let result = self.execute_call(call, &record, &mut admitted).await;
+            *record.state.lock().map_err(|_| rejected())? = HostCallState::Complete(result.clone());
+            record.changed.notify_waiters();
+            return result;
+        }
+        admitted.published = true;
+        loop {
+            let changed = record.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let state = record.state.lock().map_err(|_| rejected())?.clone();
+            match state {
+                HostCallState::Running => changed.await,
+                HostCallState::Published(publication) => {
+                    let result = publication.result.await;
+                    *record.state.lock().map_err(|_| rejected())? =
+                        HostCallState::Complete(result.clone());
+                    record.changed.notify_waiters();
+                    return result;
+                }
+                HostCallState::Complete(result) => return result,
+            }
+        }
     }
 }
 
@@ -476,6 +658,7 @@ impl TurnControl for HostInvocation {
             replay_safe: super::retry::replay_safe(&completion),
             control_handoff: completion.evidence.structured_complete
                 || completion.evidence.structured_blocked
+                || completion.goal_control.is_some()
                 || completion.plan_submit.is_some()
                 || completion.plan_question.is_some(),
             cancelled: matches!(state.admission, Admission::Cancelled),

@@ -1,4 +1,5 @@
 vim.loader.enable(false)
+local check_tool = dofile(vim.fn.getcwd() .. "/nvim/tests/forge/fixtures/check_tool.lua")
 local root = vim.fs.normalize(vim.fn.getcwd())
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
@@ -61,14 +62,14 @@ local succeeded, failure = xpcall(function()
   assert(attempts == 1 and reused == 1, vim.inspect({ attempts = attempts, reused = reused }))
   assert(catalog.automatic.pending and catalog.automatic.blocked)
   request("session.check.override", { enabled = vim.empty_dict(), scopes = vim.empty_dict(), auto = { verify = false } })
-  local selected = request("session.check.run", { check = { "verify", "optional" } }).run_id
+  local selected = check_tool.start(request, { check = { "verify", "optional" } }).run_id
   local run
   assert(vim.wait(10000, function()
     run = request("session.check.status", { run_id = selected })
     return run.state ~= "running"
   end, 20), "explicit checks did not settle")
   assert(run.commands[1].state == "failed" and run.commands[2].state == "passed")
-  local waiting = request("session.check.run", { check = { "waiting" } }).run_id
+  local waiting = check_tool.start(request, { check = { "waiting" } }).run_id
   assert(vim.wait(5000, function() return state.checks_running and state.active_check_run == waiting end, 10),
     "check activity did not reach the composer")
   local controller = require("forge.views.harness.controller")
@@ -92,7 +93,7 @@ local succeeded, failure = xpcall(function()
   assert(vim.wait(15000, function() return not state.busy and #state.queue == 0 end, 10),
     "existing queue did not finish: " .. tostring(state.execution_notice))
   for attempt = 1, 3 do
-    local handoff = request("session.check.run", { check = { "handoff" } }).run_id
+    local handoff = check_tool.start(request, { check = { "handoff" } }).run_id
     assert(vim.wait(5000, function() return state.checks_running end, 10), "handoff check did not start")
     local prompt = "queued after normal check completion " .. attempt
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { prompt })

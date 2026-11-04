@@ -3,6 +3,12 @@ use crate::agent::Delegation;
 use crate::plan::PlanElicitation;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug)]
+enum InputAppend {
+    User,
+    Acknowledged,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExchangeOutcome {
@@ -1063,27 +1069,36 @@ impl Exchange {
         text: String,
         now_ms: i64,
     ) -> anyhow::Result<ExchangeInput> {
-        self.append_identified_input(None, intent, text, now_ms)
+        self.record_input(InputAppend::User, None, intent, text, None, now_ms)
     }
 
-    pub(crate) fn append_identified_input(
+    /// Retain accepted native input while its original exchange is still settling.
+    pub(crate) fn append_acknowledged_input(
         &mut self,
         id: Option<String>,
         intent: InputIntent,
         text: String,
         now_ms: i64,
     ) -> anyhow::Result<ExchangeInput> {
-        self.record_input(id, intent, text, None, now_ms)
+        self.record_input(InputAppend::Acknowledged, id, intent, text, None, now_ms)
     }
 
     fn record_input(
         &mut self,
+        admission: InputAppend,
         id: Option<String>,
         intent: InputIntent,
         text: String,
         question: Option<QuestionInput>,
         now_ms: i64,
     ) -> anyhow::Result<ExchangeInput> {
+        let accepts_input = match admission {
+            InputAppend::User => self.state() == ExchangeState::Running,
+            InputAppend::Acknowledged => matches!(
+                self.state(),
+                ExchangeState::Running | ExchangeState::Finalizing
+            ),
+        };
         if let Some(id) = &id
             && let Some(prompt) = self.node_list.iter().find_map(|node| match node {
                 ExchangeNode::ExchangeInput { prompt } if &prompt.id == id => Some(prompt),
@@ -1093,8 +1108,11 @@ impl Exchange {
             return Ok(prompt.clone());
         }
         anyhow::ensure!(
-            self.state() == ExchangeState::Running,
-            "user input requires a current running exchange"
+            accepts_input,
+            "input append rejected: exchange={}, state={:?}, admission={admission:?}, input_id={id:?}, question={}",
+            self.id,
+            self.state(),
+            question.is_some()
         );
         for turn in self
             .turn
@@ -1141,7 +1159,14 @@ impl Exchange {
                 && (intent != InputIntent::Clarification || question.question_id.is_some()),
             "question clarification requires a durable question target"
         );
-        self.record_input(None, intent, text, Some(question), now_ms)?;
+        self.record_input(
+            InputAppend::User,
+            None,
+            intent,
+            text,
+            Some(question),
+            now_ms,
+        )?;
         Ok(())
     }
 
@@ -1758,6 +1783,56 @@ mod test {
                 assert_eq!(serde_json::to_value(&exchange).unwrap(), original);
             }
         }
+    }
+
+    /// Preserve native steering evidence arriving after completion without reopening input admission.
+    #[test]
+    fn finalizing_exchange_retains_acknowledged_input_without_reopening() {
+        let mut exchange = interaction();
+        exchange.resume(10).unwrap();
+        exchange
+            .begin_finalization(ExchangeOutcome::Complete, 30)
+            .unwrap();
+        let prompt = exchange
+            .append_acknowledged_input(
+                Some("late-steering".into()),
+                InputIntent::Steering,
+                "accepted".into(),
+                40,
+            )
+            .unwrap();
+        assert_eq!(prompt.id, "late-steering");
+        assert_eq!(exchange.state(), ExchangeState::Finalizing);
+        assert_eq!(exchange.elapsed(100), 20);
+        assert!(
+            exchange
+                .append_input(InputIntent::Steering, "new".into(), 50)
+                .is_err()
+        );
+        exchange.finish(ExchangeOutcome::Complete, 60).unwrap();
+        let node_count = exchange.node_list.len();
+        assert!(
+            exchange
+                .append_acknowledged_input(
+                    Some("late-steering".into()),
+                    InputIntent::Steering,
+                    "accepted".into(),
+                    70,
+                )
+                .is_ok()
+        );
+        assert_eq!(exchange.node_list.len(), node_count);
+        assert!(
+            exchange
+                .append_acknowledged_input(
+                    Some("after-terminal".into()),
+                    InputIntent::Steering,
+                    "late".into(),
+                    70,
+                )
+                .is_err()
+        );
+        assert_eq!(exchange.state(), ExchangeState::Complete);
     }
 
     #[test]

@@ -184,6 +184,39 @@ impl SessionExecutionRegistry {
         Ok(())
     }
 
+    /// Retire one binding through native cleanup without closing sibling owners.
+    pub(crate) async fn retire(
+        &self,
+        owner: &ExecutionOwner,
+        reason: OwnerCloseReason,
+    ) -> Result<(), ProviderError> {
+        let _gate = self.gate.write().await;
+        let slot = self
+            .owners
+            .lock()
+            .map_err(|_| protocol("execution registry poisoned"))?
+            .get(owner)
+            .cloned();
+        if let Some(slot) = slot {
+            if let Some(engine) = slot.engine.get() {
+                engine.begin_orderly_shutdown();
+            }
+            // Reader closure is not native collection evidence. Perform this
+            // even if an earlier fence already joined the reader, and retain
+            // the binding on any failure so a later close retries it.
+            self.provider.cancel_session(&owner.runtime_key()).await?;
+            self.provider
+                .cleanup_execution(&owner.runtime_key())
+                .await?;
+            self.provider.reset_session(owner).await?;
+            if let Some(engine) = slot.engine.get() {
+                engine.close().await?;
+            }
+            slot.observer.close_collected(reason);
+        }
+        Ok(())
+    }
+
     /// Replace one failed owner only after cleanup and consumption of its observation failure.
     pub(crate) async fn replace(
         &self,
@@ -586,6 +619,26 @@ impl SettlementCell {
         }))
     }
 
+    /// Retrieve a committed result before validating mutable document evidence.
+    pub(crate) fn applied_result(
+        &self,
+        id: HostEffectId,
+    ) -> Result<Option<Box<HostEffectOutput>>, ProviderError> {
+        let ledger = self
+            .effects
+            .lock()
+            .map_err(|_| protocol("host effect ledger poisoned"))?;
+        match ledger.receipts.get(&id) {
+            Some(HostEffectState::Applied(Some(output))) => Ok(Some(output.clone())),
+            Some(HostEffectState::Applied(None)) => {
+                Err(protocol("host effect receipt has no retained result"))
+            }
+            Some(HostEffectState::Applying | HostEffectState::Ambiguous) => Err(protocol(
+                "host effect application is incomplete or ambiguous",
+            )),
+            None => Ok(None),
+        }
+    }
     /// Reserve a presentation-producing effect or retrieve its retained result.
     pub(crate) fn begin_result_effect(
         self: &Arc<Self>,
@@ -615,16 +668,6 @@ impl SettlementCell {
             .effects
             .lock()
             .map_err(|_| protocol("host effect ledger poisoned"))?;
-        if let (
-            Some((plan, version, digest)),
-            Some((previous_plan, previous_version, previous_digest)),
-        ) = (document, &ledger.document)
-            && (previous_plan != plan || *previous_version != version || previous_digest != digest)
-        {
-            return Err(protocol(
-                "plan document changed after a retained host effect",
-            ));
-        }
         match ledger.receipts.get(&id) {
             Some(HostEffectState::Applied(Some(output))) => {
                 return Ok(ResultEffectAdmission::Applied(output.clone()));
@@ -638,6 +681,16 @@ impl SettlementCell {
                 ));
             }
             None => {}
+        }
+        if let (
+            Some((plan, version, digest)),
+            Some((previous_plan, previous_version, previous_digest)),
+        ) = (document, &ledger.document)
+            && (previous_plan != plan || *previous_version != version || previous_digest != digest)
+        {
+            return Err(protocol(
+                "plan document changed after a retained host effect",
+            ));
         }
         ledger.receipts.insert(id, HostEffectState::Applying);
         ledger.sealed = false;
@@ -1340,6 +1393,11 @@ impl SessionExecution {
         })
     }
 
+    /// Close new actor admission while retaining existing invocations and their settlement delivery.
+    pub(crate) fn close_admission(&self) {
+        self.healthy.store(false, Ordering::Release);
+    }
+
     /// Mark the native stream closure as intentional before shutting its provider down.
     pub(crate) fn begin_orderly_shutdown(&self) {
         self.healthy.store(false, Ordering::Release);
@@ -1735,12 +1793,13 @@ impl Driver {
         self.retiring = Some(reason);
         self.healthy.store(false, Ordering::Release);
         let provider = self.provider.clone();
-        let owner = self.owner.clone();
-        let key = owner.runtime_key();
+        let key = self.owner.runtime_key();
         self.cleanup.spawn(async move {
             use forge_provider_api::error::{CleanupFailure, ObservationCleanup};
             let deadline = std::time::Duration::from_secs(15);
-            let fence = tokio::time::timeout(deadline, provider.fence_session(&owner)).await;
+            // Deliberate retirement preserves terminal evidence. Failure-only fencing
+            // poisons the native event stream before cancellation can publish it.
+            // cancel_session revokes host callbacks before collecting native work.
             let cancellation = tokio::time::timeout(deadline, provider.cancel_session(&key)).await;
             let collection = tokio::time::timeout(deadline, provider.cleanup_execution(&key)).await;
             let classify = |result: Result<
@@ -1753,7 +1812,7 @@ impl Driver {
             };
             ObservationCleanup::new(
                 ObservationFailure::LifecycleUnavailable,
-                classify(fence),
+                None,
                 classify(cancellation),
                 classify(collection),
             )
@@ -1937,6 +1996,10 @@ impl Driver {
                 let completion = *completion;
                 if self.failed {
                     let _ = reply.send(Err(protocol("execution owner is unavailable")));
+                    return;
+                }
+                if !self.healthy.load(Ordering::Acquire) {
+                    let _ = reply.send(Err(ProviderError::Cancelled));
                     return;
                 }
                 if let Some((revision, effects_revision, nonce)) = continuation {
@@ -2968,10 +3031,10 @@ mod tests {
         let cell = SettlementCell::default();
         cell.seal_effects(&[])?;
         cell.validate_effects_settled()?;
-        cell.set_batches(vec![crate::provider::HostEffectBatch {
-            revision: 1,
-            completion: ProviderCompletion::default(),
-        }])?;
+        cell.set_batches(vec![crate::provider::HostEffectBatch::new(
+            1,
+            ProviderCompletion::default(),
+        )])?;
         assert!(cell.validate_effects_settled().is_err());
         Ok(())
     }
@@ -3039,7 +3102,8 @@ mod tests {
         let owner = ExecutionOwner::root("host-ticket");
         let registry = SessionExecutionRegistry::new(provider.clone(), trace.clone());
         let engine = registry.owner(owner.clone()).await?;
-        let request = ProviderRequest {
+        let mut request = ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: Some(owner.clone()),
             harness_session_id: "host-ticket".into(),
             workspace: directory.path().to_string_lossy().into_owned(),
@@ -3130,6 +3194,7 @@ mod tests {
             ready.ticket.commit().await,
             Err(SettlementError::Stale)
         ));
+        request.dispatch = crate::provider::DispatchTracker::default();
         let (continuation_sink, _events) = crate::provider::events::channel(scope.clone());
         let stale = engine
             .continue_attempt(&ready.ticket, request.clone(), continuation_sink, &store)
@@ -3675,6 +3740,7 @@ mod tests {
         let mut retained_scope = None;
         for exchange in ["one", "two"] {
             let mut request = ProviderRequest {
+                dispatch: forge_provider_api::submission::DispatchTracker::default(),
                 execution_owner: Some(owner.clone()),
                 harness_session_id: "engine-fixture".into(),
                 workspace: directory.path().to_string_lossy().into_owned(),

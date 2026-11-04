@@ -28,6 +28,7 @@ pub(crate) enum GoalTermination {
 pub(crate) struct GoalControl {
     pub permit: crate::task::TaskPermit,
     pub termination: GoalTermination,
+    pub message: String,
 }
 
 /// Represents the broker action selected after a goal turn ends.
@@ -124,6 +125,7 @@ mod test {
                     goal_control: Some(GoalControl {
                         permit: current.permit(),
                         termination,
+                        message: "Observed goal outcome".into(),
                     }),
                     dispatched_task_permit: Some(previous.permit()),
                     ..Default::default()

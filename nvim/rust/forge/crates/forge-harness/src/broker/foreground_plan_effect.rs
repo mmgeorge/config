@@ -89,6 +89,9 @@ pub(crate) enum PlanQuestionResult {
 
 impl PlanQuestionJob {
     pub(crate) async fn run(self) -> Result<PlanQuestionResult> {
+        if let Some(output) = self.cell.applied_result(self.id)? {
+            return Ok(PlanQuestionResult::Applied(output));
+        }
         let document = self
             .store
             .read_working_document(&self.session_id, &self.plan.id)?;
@@ -128,6 +131,9 @@ impl PlanSubmissionJob {
             task_controller,
             permit,
         } = self;
+        if let Some(output) = cell.applied_result(id)? {
+            return Ok(PlanSubmissionResult::Applied(output));
+        }
         let before = plan.clone();
         anyhow::ensure!(
             request.plan_id == plan.id,
@@ -375,6 +381,11 @@ impl PlanMutationJob {
             permit,
             now_ms,
         } = self;
+        if let Some(output) = cell.applied_result(id)? {
+            return Ok(PlanMutationResult::Applied(Box::new(
+                output.plan_record.clone(),
+            )));
+        }
         let before = plan.clone();
         let original = store.read_working_document(&session_id, &plan.id)?;
         let digest = crate::plan::digest(&serde_json::to_vec(&original)?);
@@ -413,7 +424,7 @@ impl PlanMutationJob {
                 guard.cancel_definite()?;
                 return Err(error);
             }
-            plan.acceptance = None;
+            plan.review = None;
             plan.user_revision += 1;
             plan.generation.reset_no_progress();
         }
@@ -422,7 +433,7 @@ impl PlanMutationJob {
         plan.updated_at_ms = now_ms;
         guard.begin_mutation();
         let result = task_controller.commit_plan_write(&permit, || {
-            store.write_working_document_if_unchanged(&session_id, &plan.id, &original, &updated)
+            store.write_working_mutation_guarded(&before, &original, &updated)
         });
         if let Err(error) = result {
             if error
@@ -541,7 +552,7 @@ impl HarnessBroker {
                     &mut self.store,
                     permit,
                     self.plan_file.guard_working_document(&document),
-                    crate::task::TaskEvent::PlanArtifactUpdated(plan.clone()),
+                    crate::task::TaskEvent::PlanArtifactUpdated(Box::new(plan.clone())),
                     crate::storage::TaskEffects {
                         lifecycle,
                         exchange: vec![candidate.clone()],
@@ -648,7 +659,7 @@ impl HarnessBroker {
                 };
                 plan.document_version = document.version;
                 plan.submitted_version = Some(document.version);
-                plan.acceptance = None;
+                plan.review = None;
                 plan.title = document.title.clone();
                 plan.review_digest = Some(digest);
                 plan.validation_warning = warnings;
@@ -657,7 +668,7 @@ impl HarnessBroker {
                     &mut self.store,
                     permit,
                     self.plan_file.guard_working_document(&document),
-                    crate::task::TaskEvent::PlanArtifactUpdated(plan.clone()),
+                    crate::task::TaskEvent::PlanArtifactUpdated(Box::new(plan.clone())),
                     Default::default(),
                     self.clock.now_ms(),
                 )?;
@@ -777,7 +788,7 @@ impl HarnessBroker {
                     &mut self.store,
                     permit,
                     self.plan_file.guard_working_document(&document),
-                    crate::task::TaskEvent::PlanArtifactUpdated(plan.clone()),
+                    crate::task::TaskEvent::PlanArtifactUpdated(Box::new(plan.clone())),
                     Default::default(),
                     self.clock.now_ms(),
                 )?;

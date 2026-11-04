@@ -33,7 +33,7 @@ client.request = function(request_specification, callback)
   calls[#calls + 1] = { method = method, params = params }
   if method == "session.check.list" and load_failure then callback(nil, load_failure) return end
   if method == "session.check.override" then catalog.overrides = params end
-  if method == "session.check.run" then callback({ run_id = "fixture-run" }) else callback(vim.deepcopy(catalog)) end
+  callback(vim.deepcopy(catalog))
 end
 session.harness.session = { id = "checks-fixture", workspace = "fixture" }
 local window = vim.api.nvim_get_current_win()
@@ -99,6 +99,20 @@ local call_count = #calls
 assert(current.spec.on_confirm({ option = row("unit") }) == false)
 assert(#calls == call_count, "Enter must not run a check")
 assert(not page.footer:find("↵ run", 1, true), "the footer must not advertise Enter to run")
+
+catalog.active_run = "running-check"
+checks.open(session.harness, host)
+assert(row("cancel").label == "Cancel current work (including checks)",
+  "check cancellation must describe its whole-exchange scope")
+current = picker._state_for_test()
+local before_cancel = #calls
+assert(current.spec.on_confirm({ option = row("cancel") }) == false)
+assert(calls[before_cancel + 1].method == "session.turn.cancel", "picker must cancel through the exchange owner")
+assert(next(calls[before_cancel + 1].params) == nil, "exchange cancellation must not pretend to target one check")
+catalog.active_run = nil
+checks.open(session.harness, host)
+select("unit")
+
 
 key("<Space>")
 assert(catalog.overrides.enabled.unit == false, "Space must toggle the selected check through the host")

@@ -172,7 +172,12 @@ impl MockProvider {
         let session = self.binding(binding).await?;
         let _admission = session.admission.lock().await;
         self.collect_finished(&session).await?;
-        if request.scope.owner != session.owner || request.receipt.id() != &request.submission_id {
+        if request.scope.owner != session.owner
+            || request.receipt.id() != &request.submission_id
+            || !request
+                .dispatch
+                .matches(binding, &request.scope, &request.submission_id)
+        {
             return Err(failure(
                 ProviderOperation::AdmitInput,
                 ProviderFailureKind::Rejected,
@@ -189,6 +194,14 @@ impl MockProvider {
         }
         if let Err(error) = request.turn_control.before_send(&request.scope).await {
             return Err(reject_before_dispatch(&request.receipt, error).await);
+        }
+        // Admission serializes replacement, so reject occupied sessions before
+        // consuming the scenario reserved for the next admissible prompt.
+        if session.active.lock().await.is_some() {
+            return Err(failure(
+                ProviderOperation::AdmitInput,
+                ProviderFailureKind::Rejected,
+            ));
         }
         let script = self.control.take_script(&session.owner);
         if let Some(script) = &script {
@@ -227,12 +240,6 @@ impl MockProvider {
         let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let tasks = Arc::new(Mutex::new(MockTasks::default()));
         let mut active = session.active.lock().await;
-        if active.is_some() {
-            return Err(failure(
-                ProviderOperation::AdmitInput,
-                ProviderFailureKind::Rejected,
-            ));
-        }
         *active = Some(MockInvocation {
             scope: request.scope.clone(),
             cancelled,
@@ -246,8 +253,12 @@ impl MockProvider {
         let for_task = session.clone();
         let request_scope = request.scope.clone();
         let work = MockWork::new(&pending);
+        let (registered, registration) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let _work = work;
+            if registration.await.is_err() {
+                return Err(ProviderError::Cancelled);
+            }
             run_prompt(
                 for_task,
                 control,
@@ -262,10 +273,11 @@ impl MockProvider {
             active.as_ref().expect("active invocation inserted").scope,
             request_scope
         );
-        drop(active);
         tasks.lock().await.handles.push_back(task);
-        let accepted = acceptance.await;
+        drop(active);
+        let _ = registered.send(());
         drop(_admission);
+        let accepted = acceptance.await;
         match accepted {
             Ok(result) => result,
             Err(_) => match self.cleanup_execution(binding).await {
@@ -482,9 +494,9 @@ impl ProviderTestControl for MockControl {
                 false
             } else { true }
         });
-        if let Some(owner) = owner {
-            self.scripts.lock().unwrap().remove(owner);
-        } else {
+        // Queued scripts describe future prompts, not work owned by the cancelled
+        // invocation. Only provider shutdown discards those unconsumed scenarios.
+        if owner.is_none() {
             self.scripts.lock().unwrap().clear();
         }
     }
@@ -531,23 +543,36 @@ async fn run_prompt(
     let mut progress = PromptProgress {
         scope: request.scope.clone(),
         sink: None,
-        accepted: false,
+        delivery: PromptDelivery::Preparing,
         terminal_published: false,
     };
+    let mut accepted = Some(accepted);
     let result = run_prompt_inner(
         session.clone(),
         control,
-        request,
+        &request,
         script,
         cancelled,
-        accepted,
+        &mut accepted,
         &mut progress,
     )
     .await;
+    let result = match result {
+        Ok(PromptFinish::Terminal) => {
+            accept_prompt(&session, &request, &mut accepted, &mut progress).await
+        }
+        Ok(PromptFinish::ObservationLost) => match progress.delivery {
+            PromptDelivery::Accepted => Ok(()),
+            PromptDelivery::Preparing | PromptDelivery::Dispatched => {
+                Err(ProviderError::DeliveryUncertain)
+            }
+        },
+        Err(error) => Err(error),
+    };
     let Err(primary) = result else {
         return Ok(());
     };
-    if !progress.accepted || progress.terminal_published {
+    if matches!(progress.delivery, PromptDelivery::Preparing) || progress.terminal_published {
         return Err(primary);
     }
     let Some(sink) = progress.sink.as_ref() else {
@@ -565,19 +590,32 @@ async fn run_prompt(
 struct PromptProgress {
     scope: InvocationScope,
     sink: Option<ProviderEventSink>,
-    accepted: bool,
+    delivery: PromptDelivery,
     terminal_published: bool,
+}
+
+/// Track dispatch separately from acceptance, including terminal-only acknowledgments.
+enum PromptDelivery {
+    Preparing,
+    Dispatched,
+    Accepted,
+}
+
+/// Distinguish a native response from loss of the observation needed for acceptance.
+enum PromptFinish {
+    Terminal,
+    ObservationLost,
 }
 
 async fn run_prompt_inner(
     session: Arc<MockSession>,
     control: Arc<MockControl>,
-    request: PromptRequest,
+    request: &PromptRequest,
     script: Option<TestPromptScript>,
     mut cancelled: watch::Receiver<bool>,
-    accepted: tokio::sync::oneshot::Sender<Result<InputAcceptance, ProviderError>>,
+    accepted: &mut Option<tokio::sync::oneshot::Sender<Result<InputAcceptance, ProviderError>>>,
     progress: &mut PromptProgress,
-) -> Result<(), ProviderError> {
+) -> Result<PromptFinish, ProviderError> {
     let _operation = session.operation.lock().await;
     let binding = &session.binding.id;
     let owner = session.owner.clone();
@@ -597,31 +635,15 @@ async fn run_prompt_inner(
         .record_sending(Some(token))
         .await
         .map_err(|error| ProviderError::PreparationFailed(Box::new(error)))?;
-    let provider_session_id = session
-        .binding
-        .provider_session_id
+    request.dispatch.confirm();
+    progress.delivery = PromptDelivery::Dispatched;
+    let timing = script
         .as_ref()
-        .map(|id| id.as_str())
+        .map(|script| script.acceptance)
         .unwrap_or_default();
-    request
-        .receipt
-        .clone()
-        .record_accepted(Some(
-            RecoveryToken::new(
-                format!(
-                    "mock-accepted\n{}\n{provider_session_id}",
-                    request.submission_id.as_str()
-                )
-                .into_bytes(),
-            )
-            .map_err(|_| failure(ProviderOperation::AdmitInput, ProviderFailureKind::Unknown))?,
-        ))
-        .await?;
-    progress.accepted = true;
-    let acceptance = InputAcceptance {
-        submission_id: request.submission_id.clone(),
-    };
-    let _ = accepted.send(Ok(acceptance));
+    if timing == testing::TestInputAcceptance::BeforeResponse {
+        accept_prompt(&session, request, accepted, progress).await?;
+    }
 
     let thread_id = session
         .binding
@@ -715,7 +737,7 @@ async fn run_prompt_inner(
             .await?;
             progress.terminal_published = true;
             *session.rollback_cancelled.lock().await = true;
-            return Ok(());
+            return Ok(PromptFinish::Terminal);
         }
         return Err(error);
     }
@@ -736,6 +758,7 @@ async fn run_prompt_inner(
                 )
             };
             TestPromptScript {
+                acceptance: testing::TestInputAcceptance::BeforeResponse,
                 steps: vec![TestPromptStep::Message {
                     role: MessageRole::Response,
                     text: format!("Mock response: {prompt}{steering}"),
@@ -774,7 +797,7 @@ async fn run_prompt_inner(
                 .await?;
             }
             TestPromptStep::ToolCall { name, arguments } => {
-                if let Err(error) = run_tool_call(&request, &sink, &turn, &name, arguments).await {
+                if let Err(error) = run_tool_call(request, &sink, &turn, &name, arguments).await {
                     if matches!(error, ProviderError::Cancelled) {
                         publish_terminal(
                             &session,
@@ -787,7 +810,7 @@ async fn run_prompt_inner(
                         )
                         .await?;
                         progress.terminal_published = true;
-                        return Ok(());
+                        return Ok(PromptFinish::Terminal);
                     }
                     return Err(error);
                 }
@@ -818,7 +841,7 @@ async fn run_prompt_inner(
             )
             .await?;
             progress.terminal_published = true;
-            return Ok(());
+            return Ok(PromptFinish::Terminal);
         }
     };
     if let Err(host_failure) = request
@@ -837,7 +860,7 @@ async fn run_prompt_inner(
         )
         .await?;
         progress.terminal_published = true;
-        return Ok(());
+        return Ok(PromptFinish::Terminal);
     }
     let status = match request.turn_control.status(&scope).await {
         Ok(status) => status,
@@ -853,7 +876,7 @@ async fn run_prompt_inner(
             )
             .await?;
             progress.terminal_published = true;
-            return Ok(());
+            return Ok(PromptFinish::Terminal);
         }
     };
     let outcome = if status.cancelled {
@@ -883,7 +906,7 @@ async fn run_prompt_inner(
         })
         .await?;
         progress.terminal_published = true;
-        return Ok(());
+        return Ok(PromptFinish::ObservationLost);
     }
     let failure = match terminal {
         TestPromptTerminal::Failed(kind) => Some(kind),
@@ -900,6 +923,46 @@ async fn run_prompt_inner(
     )
     .await?;
     progress.terminal_published = true;
+    Ok(PromptFinish::Terminal)
+}
+
+/// Commit native acceptance once, independently of dispatch and response observation.
+async fn accept_prompt(
+    session: &MockSession,
+    request: &PromptRequest,
+    accepted: &mut Option<tokio::sync::oneshot::Sender<Result<InputAcceptance, ProviderError>>>,
+    progress: &mut PromptProgress,
+) -> Result<(), ProviderError> {
+    if matches!(progress.delivery, PromptDelivery::Accepted) {
+        return Ok(());
+    }
+    let provider_session_id = session
+        .binding
+        .provider_session_id
+        .as_ref()
+        .map(|id| id.as_str())
+        .unwrap_or_default();
+    request
+        .receipt
+        .clone()
+        .record_accepted(Some(
+            RecoveryToken::new(
+                format!(
+                    "mock-accepted\n{}\n{provider_session_id}",
+                    request.submission_id.as_str()
+                )
+                .into_bytes(),
+            )
+            .map_err(|_| failure(ProviderOperation::AdmitInput, ProviderFailureKind::Unknown))?,
+        ))
+        .await?;
+    progress.delivery = PromptDelivery::Accepted;
+    let acceptance = InputAcceptance {
+        submission_id: request.submission_id.clone(),
+    };
+    if let Some(accepted) = accepted.take() {
+        let _ = accepted.send(Ok(acceptance));
+    }
     Ok(())
 }
 
@@ -1076,6 +1139,8 @@ async fn run_tool_call(
                 .call(
                     &request.scope,
                     control::ToolCall {
+                        id: control::ToolCallId::new(address.tool_id.as_str())
+                            .expect("fixture tool IDs are nonempty"),
                         name: name.into(),
                         arguments,
                     },
@@ -1872,13 +1937,15 @@ impl Provider for MockProvider {
         request: CompactionRequest,
     ) -> Result<Compaction, ProviderError> {
         let session = self.binding(binding).await?;
-        let _operation = session.operation.lock().await;
+        let _admission = session.admission.lock().await;
+        self.collect_finished(&session).await?;
         if session.active.lock().await.is_some() {
             return Err(failure(
-                ProviderOperation::AdmitInput,
+                ProviderOperation::CompactSession,
                 ProviderFailureKind::Rejected,
             ));
         }
+        let _operation = session.operation.lock().await;
         let result = Compaction {
             id: request.operation_id,
             thread_id: session
@@ -2110,9 +2177,21 @@ mod tests {
         (binding, owner, stream)
     }
 
-    fn prompt(owner: ExecutionOwner, exchange: &str, receipt: Arc<Receipt>) -> PromptRequest {
+    fn prompt(
+        binding: &BindingId,
+        owner: ExecutionOwner,
+        exchange: &str,
+        receipt: Arc<Receipt>,
+    ) -> PromptRequest {
+        let scope = InvocationScope::new(owner, exchange);
+        let (dispatch, _) = forge_provider_api::submission::DispatchReporter::channel(
+            binding.clone(),
+            scope.clone(),
+            receipt.id.clone(),
+        );
         PromptRequest {
-            scope: InvocationScope::new(owner, exchange),
+            scope,
+            dispatch,
             mode: PromptMode::Chat,
             configuration: session::InvocationConfiguration {
                 model: Default::default(),
@@ -2301,7 +2380,7 @@ mod tests {
             })
         };
         let first = receipt("first");
-        let request = prompt(owner.clone(), "steering", first.clone());
+        let request = prompt(&binding.id, owner.clone(), "steering", first.clone());
         let scope = request.scope.clone();
         provider.session_prompt(&binding.id, request).await.unwrap();
         control
@@ -2428,6 +2507,238 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn occupied_submission_preserves_script_for_next_prompt() {
+        let provider = MockProvider::new().unwrap();
+        let (binding, owner, _stream) = initialized(&provider).await;
+        let control = provider.test_control().unwrap();
+        let TestControlResult::Held { id } = control
+            .dispatch(
+                &owner,
+                TestControlCommand::Hold {
+                    mode: Some(PromptMode::Chat),
+                    any_owner: false,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("response hold missing")
+        };
+        let receipt = |id: &str| {
+            Arc::new(Receipt {
+                id: SubmissionId::try_from(id.to_owned()).unwrap(),
+                state: StdMutex::new(ReceiptState::default()),
+            })
+        };
+        provider
+            .session_prompt(
+                &binding.id,
+                prompt(
+                    &binding.id,
+                    owner.clone(),
+                    "occupied-first",
+                    receipt("occupied-first"),
+                ),
+            )
+            .await
+            .unwrap();
+        control
+            .dispatch(&owner, TestControlCommand::Wait { id })
+            .await
+            .unwrap();
+        control
+            .dispatch(
+                &owner,
+                TestControlCommand::Script {
+                    script: TestPromptScript {
+                        acceptance: Default::default(),
+                        steps: Vec::new(),
+                        terminal: TestPromptTerminal::RejectedBeforeDispatch(
+                            ProviderFailureKind::Rejected,
+                        ),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let occupied = provider
+            .session_prompt(
+                &binding.id,
+                prompt(
+                    &binding.id,
+                    owner.clone(),
+                    "occupied-rejected",
+                    receipt("occupied-rejected"),
+                ),
+            )
+            .await;
+        assert!(
+            matches!(occupied, Err(ProviderError::Failure(_))),
+            "occupied admission must reject before consuming the scripted failure"
+        );
+        provider.cancel_session(&binding.id).await.unwrap();
+        let next = provider
+            .session_prompt(
+                &binding.id,
+                prompt(
+                    &binding.id,
+                    owner,
+                    "occupied-next",
+                    receipt("occupied-next"),
+                ),
+            )
+            .await;
+        assert!(
+            matches!(next, Err(ProviderError::PreparationFailed(_))),
+            "the next admissible prompt must retain the scripted rejection"
+        );
+        provider.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn owner_cancellation_preserves_script_for_next_prompt() {
+        let provider = MockProvider::new().unwrap();
+        let (binding, owner, _stream) = initialized(&provider).await;
+        provider
+            .test_control()
+            .unwrap()
+            .dispatch(
+                &owner,
+                TestControlCommand::Script {
+                    script: TestPromptScript {
+                        acceptance: Default::default(),
+                        steps: Vec::new(),
+                        terminal: TestPromptTerminal::RejectedBeforeDispatch(
+                            ProviderFailureKind::Rejected,
+                        ),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        provider.cancel_session(&binding.id).await.unwrap();
+        let receipt = Arc::new(Receipt {
+            id: SubmissionId::try_from("future-script-after-cancel").unwrap(),
+            state: StdMutex::new(ReceiptState::default()),
+        });
+        let result = provider
+            .session_prompt(
+                &binding.id,
+                prompt(
+                    &binding.id,
+                    owner,
+                    "future-script-exchange",
+                    receipt.clone(),
+                ),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ProviderError::PreparationFailed(_))),
+            "the next prompt must consume its queued rejection script"
+        );
+        assert!(!receipt.state.lock().unwrap().accepted);
+        provider.shutdown().await.unwrap();
+    }
+
+    /// Keep dispatch responsive when acceptance waits for a completed or cancelled response.
+    #[tokio::test]
+    async fn terminal_only_acceptance_allows_collection_after_dispatch() {
+        for cancel in [false, true] {
+            let provider = Arc::new(MockProvider::new().unwrap());
+            let (binding, owner, mut stream) = initialized(&provider).await;
+            let control = provider.test_control().unwrap();
+            control
+                .dispatch(
+                    &owner,
+                    TestControlCommand::Script {
+                        script: TestPromptScript {
+                            acceptance: testing::TestInputAcceptance::AfterResponse,
+                            steps: Vec::new(),
+                            terminal: TestPromptTerminal::Completed,
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+            let TestControlResult::Held { id } = control
+                .dispatch(
+                    &owner,
+                    TestControlCommand::Hold {
+                        mode: Some(PromptMode::Chat),
+                        any_owner: false,
+                    },
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("response barrier was not armed")
+            };
+            let receipt = Arc::new(Receipt {
+                id: SubmissionId::try_from("late-acceptance").unwrap(),
+                state: StdMutex::new(ReceiptState::default()),
+            });
+            let mut request = prompt(&binding.id, owner.clone(), "late-exchange", receipt.clone());
+            let (dispatch, mut observed) =
+                forge_provider_api::submission::DispatchReporter::channel(
+                    binding.id.clone(),
+                    request.scope.clone(),
+                    receipt.id.clone(),
+                );
+            request.dispatch = dispatch;
+            let task_provider = provider.clone();
+            let task_binding = binding.id.clone();
+            let submitted =
+                tokio::spawn(
+                    async move { task_provider.session_prompt(&task_binding, request).await },
+                );
+            tokio::time::timeout(std::time::Duration::from_secs(2), observed.wait())
+                .await
+                .expect("dispatch must precede terminal-only acceptance")
+                .unwrap();
+            control
+                .dispatch(&owner, TestControlCommand::Wait { id: id.clone() })
+                .await
+                .unwrap();
+            assert!(!receipt.state.lock().unwrap().accepted);
+            if cancel {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    provider.cleanup_execution(&binding.id),
+                )
+                .await
+                .expect("collection must not wait behind native acceptance")
+                .unwrap();
+            } else {
+                control
+                    .dispatch(&owner, TestControlCommand::Release { id })
+                    .await
+                    .unwrap();
+            }
+            let acceptance = tokio::time::timeout(std::time::Duration::from_secs(2), submitted)
+                .await
+                .expect("terminal evidence must release acceptance")
+                .unwrap()
+                .unwrap();
+            assert_eq!(acceptance.submission_id, receipt.id);
+            assert!(receipt.state.lock().unwrap().accepted);
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let ProviderEvent::Execution { observation } =
+                        stream.recv().await.unwrap().unwrap().event
+                        && let ExecutionUpdate::Finished { result, .. } = observation.update()
+                    {
+                        assert_eq!(matches!(result, ExecutionResult::Cancelled { .. }), cancel);
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            provider.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn accepted_held_prompt_cancels_with_terminal_evidence_and_session_stream_reuse() {
         let provider = MockProvider::new().unwrap();
         let (binding, owner, mut stream) = initialized(&provider).await;
@@ -2449,7 +2760,7 @@ mod tests {
             id: SubmissionId::try_from("first".to_owned()).unwrap(),
             state: StdMutex::new(ReceiptState::default()),
         });
-        let request = prompt(owner.clone(), "first", receipt.clone());
+        let request = prompt(&binding.id, owner.clone(), "first", receipt.clone());
         let scope = request.scope.clone();
         let accepted = provider.session_prompt(&binding.id, request).await.unwrap();
         assert_eq!(accepted.submission_id, receipt.id);
@@ -2499,7 +2810,10 @@ mod tests {
             state: StdMutex::new(ReceiptState::default()),
         });
         provider
-            .session_prompt(&binding.id, prompt(owner.clone(), "second", next))
+            .session_prompt(
+                &binding.id,
+                prompt(&binding.id, owner.clone(), "second", next),
+            )
             .await
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {

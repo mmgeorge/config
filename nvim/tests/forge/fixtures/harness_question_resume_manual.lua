@@ -54,8 +54,18 @@ end
 client.request = function(request_specification, callback)
   local method = request_specification.method
 
-  if method == "session.question.ask" then
-    vim.defer_fn(function() explanation = true callback({}) end, 3000)
+  if method == "session.input.apply" then
+    local params = request_specification.params
+    assert(params.action.kind == "submit", "clarification must use durable input admission")
+    assert(params.target and params.target.owner == "plan" and params.target.question_id == "scope",
+      "clarification must retain its selected plan question")
+    vim.defer_fn(function()
+      explanation = true
+      callback({ operation_id = params.id, revision = 1, control_revision = 0,
+        suspended = false, execution_busy = false, upsert = {}, removed = {} })
+    end, 3000)
+  elseif method == "session.input.get" then
+    callback({ revision = 0, control_revision = 0, messages = {}, suspended = false, execution_busy = false })
   elseif method == "session.state.get" then
     callback({ session = state.session, active_elicitation = state.active_elicitation })
   elseif method == "session.prompt.history.record" then callback({})

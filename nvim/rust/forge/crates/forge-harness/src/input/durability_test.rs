@@ -199,6 +199,7 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
             .context("claim failed")?;
         if !matches!(boundary, DispatchCut::NoSubmission) {
             let request = crate::provider::ProviderRequest {
+                dispatch: forge_provider_api::submission::DispatchTracker::default(),
                 execution_owner: None,
                 harness_session_id: "session".into(),
                 workspace: "workspace".into(),
@@ -272,7 +273,7 @@ fn queue_commit_failure_does_not_publish_candidate_state() -> Result<()> {
     let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
     queue.apply(queued_operation("first"))?;
     let before = serde_json::to_value(queue.snapshot()?)?;
-    let database = rusqlite::Connection::open(root.path().join("input-queue.sqlite3"))?;
+    let database = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
     database.execute_batch("CREATE TRIGGER reject_queue_write BEFORE UPDATE ON input_session BEGIN SELECT RAISE(ABORT, 'fixture disk failure'); END;")?;
     assert!(queue.apply(queued_operation("second")).is_err());
     assert_eq!(serde_json::to_value(queue.snapshot()?)?, before);
@@ -313,7 +314,7 @@ fn queue_reopen_rejects_corrupt_snapshot() -> Result<()> {
     let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
     queue.apply(queued_operation("message"))?;
     drop(queue);
-    let database = rusqlite::Connection::open(root.path().join("input-queue.sqlite3"))?;
+    let database = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
     database.execute("UPDATE input_session SET payload='{}'", [])?;
     assert!(SessionInputQueue::open(root.path(), "session", &submissions).is_err());
     Ok(())
@@ -368,5 +369,77 @@ fn empty_queue_reopen_preserves_readiness_and_explicit_suspension() -> Result<()
     drop(queue);
     let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
     assert!(queue.snapshot()?.suspended);
+    Ok(())
+}
+
+/// Commit proven non-delivery and retry eligibility without exposing an intermediate state.
+#[test]
+fn reconciled_retry_commits_one_revision_and_preserves_receipt_identity() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let submissions = submission_store(root.path())?;
+    let queue = SessionInputQueue::open(root.path(), "session", &submissions)?;
+    queue.apply(queued_operation("message"))?;
+    let request = crate::provider::ProviderRequest {
+        dispatch: forge_provider_api::submission::DispatchTracker::default(),
+        execution_owner: None,
+        harness_session_id: "session".into(),
+        workspace: "workspace".into(),
+        input: crate::provider::ProviderInput::from_text("draft message"),
+        mode: crate::provider::PromptMode::Chat,
+        model: "fixture".into(),
+        effort: "low".into(),
+        context_window: None,
+        service_tier: Default::default(),
+        access: Default::default(),
+        approval_mode: crate::session::ApprovalMode::Ask,
+        provider_session_id: None,
+        submission: None,
+        recovered_input: Vec::new(),
+        control_context: None,
+    };
+    let submission = submissions.prepare(&request, forge_providers::registry::default_id())?;
+    submission.sending(None)?;
+    queue.delivery(
+        "message",
+        Some(InputDelivery::Unknown),
+        Some(submission.id().into()),
+        None,
+    )?;
+    let before = queue.snapshot()?;
+    let retry = InputOperation {
+        id: "reconciled-retry".into(),
+        control_revision: before.control_revision,
+        after_control: None,
+        action: InputAction::Retry {
+            id: "message".into(),
+            revision: before.messages[0].revision,
+        },
+    };
+    let rejected = queue.retry_reconciled(retry.clone(), &submission.record()?)?;
+    assert_eq!(
+        rejected.error_code,
+        Some(InputRejection::DeliveryUnconfirmed)
+    );
+    assert_eq!(
+        queue.snapshot()?.messages[0].delivery,
+        InputDelivery::Unknown
+    );
+    submission.rejected("native history proved non-delivery".into())?;
+    let mut safe_retry = retry;
+    safe_retry.id = "safe-reconciled-retry".into();
+    let revision = queue.snapshot()?.revision;
+    let accepted = queue.retry_reconciled(safe_retry.clone(), &submission.record()?)?;
+    assert!(accepted.error_code.is_none());
+    assert_eq!(accepted.revision, revision + 1);
+    let message = &accepted.upsert[0];
+    assert_eq!(message.delivery, InputDelivery::Queued);
+    assert!(message.submission_id.is_none());
+    assert_eq!(message.revision, before.messages[0].revision + 1);
+    assert!(
+        queue
+            .retry_reconciled(safe_retry, &submission.record()?)?
+            .error_code
+            .is_none()
+    );
     Ok(())
 }

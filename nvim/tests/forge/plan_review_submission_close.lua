@@ -19,7 +19,7 @@ package.loaded["forge.views.harness.controller"] = {
   activate_snapshot = function() end,
   render = function() end,
   present_plan_question = function() end,
-  task_transition = function(action) assert(action.action == "execute" and action.plan_id == "plan") end,
+  task_transition = function() error("approval issued a second execution command") end,
 }
 local function submit_decision(comment)
   local decision_buf = vim.api.nvim_get_current_buf()
@@ -60,7 +60,7 @@ for _, action in ipairs({ "request_changes", "accept", "abort_plan" }) do
   review.command_set.action_by_id[action].run({})
   if action ~= "abort_plan" then submit_decision("") end
   local request = pending[#pending]
-  assert(request.method == (action == "accept" and "session.plan.acceptance.begin" or action == "abort_plan" and "session.plan.cancel" or "session.plan.changes.request"))
+  assert(request.method == (action == "accept" and "session.plan.accept" or action == "abort_plan" and "session.plan.cancel" or "session.plan.changes.request"))
   assert(request.params.draft_annotation[1].source.body == "Preserve this feedback")
   assert(#vim.fn.win_findbuf(review.buf) == 0, action .. " kept the review visible while awaiting its response")
   assert(vim.api.nvim_get_current_win() == harness.transcript_win)

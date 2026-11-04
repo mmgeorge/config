@@ -108,6 +108,9 @@ impl HarnessBroker {
             jobs.spawn(local_foreground_job(job, publication));
         }
         loop {
+            // This standalone driver holds exclusive broker ownership; the previous
+            // reducer step is its command/effect boundary, with no service command queue.
+            dispatch.authorize_submission();
             if self
                 .observer
                 .session_events()
@@ -141,16 +144,7 @@ impl HarnessBroker {
                                     }
                                     continue;
                                 }
-                                let event = if matches!(&update, publication::SessionUpdate::DocumentChanged { .. }) {
-                                    "document_changed"
-                                } else {
-                                    "provider_event"
-                                };
-                                forwarded.push(SessionEvent {
-                                    session_id: self.session.id.clone(),
-                                    event: event.into(),
-                                    payload: publication::encode_session_update(&update)?,
-                                });
+                                forwarded.push(publication::encode_session_event(&self.session.id, &update)?);
                             }
                             None => update_open = false,
                         }

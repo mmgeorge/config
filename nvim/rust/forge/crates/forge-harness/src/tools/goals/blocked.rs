@@ -33,11 +33,16 @@ pub(super) fn record(
     invocation: &crate::tools::ControlToolInvocation,
     output: &mut crate::provider::ProviderCompletion,
 ) -> crate::tools::ToolResult<()> {
-    output.evidence.structured_blocked = true;
+    #[derive(serde::Deserialize)]
+    struct Input {
+        reason: String,
+    }
+    let input: Input = serde_json::from_value(invocation.arguments.clone())?;
     if let Some(permit) = &invocation.task_permit {
         output.goal_control = Some(crate::goal::GoalControl {
             permit: permit.clone(),
             termination: crate::goal::GoalTermination::Blocked,
+            message: input.reason,
         });
     }
     Ok(())

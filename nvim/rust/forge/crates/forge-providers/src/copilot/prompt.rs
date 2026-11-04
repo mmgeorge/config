@@ -31,6 +31,8 @@ pub struct TurnOptions {
     pub repair_caution: Option<String>,
     pub attachments: MessageInput,
     pub receipt: Option<Arc<dyn InputReceipt>>,
+    /// Scoped prompt handoff; native retry continuations have no new journal input.
+    pub dispatch: Option<forge_provider_api::submission::DispatchReporter>,
     pub submission_id: Option<forge_provider_api::SubmissionId>,
     pub background_compaction_observed: bool,
     pub accepted: Option<tokio::sync::oneshot::Sender<std::result::Result<(), ProviderError>>>,
@@ -183,6 +185,9 @@ pub async fn run(
                     .send(message)
                     .await
                     .map_err(|_| ProviderError::DeliveryUncertain)?;
+                if let Some(dispatch) = &options.dispatch {
+                    dispatch.confirm();
+                }
                 if let Some(submission) = &options.receipt {
                     submission
                         .clone()

@@ -65,11 +65,59 @@ pub enum AgentOperation {
     },
 }
 
+/// Retain the exact child and latest task selected before FIFO admission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "StoredAgentTarget", into = "StoredAgentTarget")]
+pub struct AgentTarget {
+    agent_id: String,
+    task_id: Option<String>,
+}
+
+impl AgentTarget {
+    /// Get the stable child identity used by the coordinator.
+    pub(crate) fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+}
+
+/// Reject malformed child identities when command journals or callers decode a target.
+#[derive(Debug, thiserror::Error)]
+#[error("child target requires nonempty agent and task identities")]
+pub struct AgentTargetDecodeError;
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAgentTarget {
+    agent_id: String,
+    task_id: Option<String>,
+}
+
+impl TryFrom<StoredAgentTarget> for AgentTarget {
+    type Error = AgentTargetDecodeError;
+    /// Validate every persisted identity before allowing target use.
+    fn try_from(stored: StoredAgentTarget) -> std::result::Result<Self, Self::Error> {
+        let StoredAgentTarget { agent_id, task_id } = stored;
+        if agent_id.trim().is_empty() || task_id.as_ref().is_some_and(|id| id.trim().is_empty()) {
+            return Err(AgentTargetDecodeError);
+        }
+        Ok(Self { agent_id, task_id })
+    }
+}
+
+impl From<AgentTarget> for StoredAgentTarget {
+    /// Preserve a validated target without selecting a newer task.
+    fn from(target: AgentTarget) -> Self {
+        let AgentTarget { agent_id, task_id } = target;
+        Self { agent_id, task_id }
+    }
+}
+
 /// Serializes durable mutations without reacquiring an in-flight prompt's broker lock.
 pub enum AgentCommand {
     Request {
         request: Box<AgentRequest>,
         authority: Option<AgentRequestAuthority>,
+        target: Option<AgentTarget>,
         response: oneshot::Sender<Result<serde_json::Value>>,
     },
     Event {
@@ -116,6 +164,26 @@ impl AgentCommandSender {
         self.send(AgentCommand::Request {
             request: Box::new(request),
             authority: None,
+            target: None,
+            response,
+        })
+        .await?;
+        receiver
+            .await
+            .context("agent operation ended without durable acknowledgment")?
+    }
+
+    /// Submit a parent-owned command with its captured child scope.
+    pub(crate) async fn request_captured(
+        &self,
+        request: AgentRequest,
+        target: Option<AgentTarget>,
+    ) -> Result<serde_json::Value> {
+        let (response, receiver) = oneshot::channel();
+        self.send(AgentCommand::Request {
+            request: Box::new(request),
+            authority: None,
+            target,
             response,
         })
         .await?;
@@ -133,6 +201,7 @@ impl AgentCommandSender {
         self.send(AgentCommand::Request {
             request: Box::new(request),
             authority: Some(authority),
+            target: None,
             response,
         })
         .await?;
@@ -694,6 +763,42 @@ impl AgentCoordinator {
             "child task no longer owns execution"
         );
         Ok(execution.cancellation.subscribe())
+    }
+
+    /// Capture one child identity and its latest task under the coordinator lock.
+    pub(crate) fn capture_target(&self, target: &str) -> Result<AgentTarget> {
+        let state = self.state.lock().expect("agent state poisoned");
+        let agent = resolve_agent(&state, &self.session_id, target)?;
+        ensure!(
+            !agent.is_primary(),
+            "the root is not a child command target"
+        );
+        let task_id = state
+            .task_by_id
+            .values()
+            .filter(|task| task.agent_id == agent.id)
+            .max_by_key(|task| task.ordinal)
+            .map(|task| task.id.clone());
+        Ok(AgentTarget {
+            agent_id: agent.id.clone(),
+            task_id,
+        })
+    }
+
+    /// Reject a queued command if another child task replaced its captured scope.
+    pub(crate) fn validate_target(&self, target: &AgentTarget) -> Result<()> {
+        ensure!(
+            self.capture_target(&target.agent_id)? == *target,
+            "the selected child task changed before the command applied"
+        );
+        Ok(())
+    }
+
+    /// Observe collection without mistaking a replacement task for the selected work.
+    pub(crate) fn target_collected(&self, target: &AgentTarget) -> Result<bool> {
+        self.validate_target(target)?;
+        let state = self.state.lock().expect("agent state poisoned");
+        Ok(!state.execution_by_agent.contains_key(&target.agent_id))
     }
 
     pub fn resolve(&self, target: &str) -> Result<Agent> {

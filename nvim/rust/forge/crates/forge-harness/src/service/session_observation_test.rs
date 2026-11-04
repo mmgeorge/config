@@ -637,9 +637,16 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
         crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
     broker.set_provider_for_test(_provider_fixture.provider_handle());
     let execution = broker.execution_registry();
+    let initialization = broker
+        .initialization_request()?
+        .context("fixture initialization missing")?;
+    let bridge = broker.provider_handle();
     let controller = SessionController::new(broker)?;
     let (message_sink, _output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&message_sink).await?;
+    // Persisted background work requires an opened native binding, not just attached UI output.
+    execution.owner(owner.clone()).await?;
+    bridge.initialize_session(initialization).await?;
     let broker_guard = controller.broker.lock().await;
     let shutdown_controller = controller.clone();
     let shutdown = tokio::spawn(async move {
@@ -650,14 +657,19 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
         shutdown_controller.broker.lock().await.release_lease()?;
         Ok::<_, anyhow::Error>(())
     });
-    tokio::time::timeout(Duration::from_secs(2), async {
+    let observed = tokio::time::timeout(Duration::from_secs(2), async {
         while !controller.observer.session_events().has_pending()? {
             tokio::task::yield_now().await;
         }
         Ok::<_, anyhow::Error>(())
     })
-    .await
-    .context("shutdown did not publish terminal evidence")??;
+    .await;
+    if observed.is_err() && shutdown.is_finished() {
+        drop(broker_guard);
+        shutdown.await.context("shutdown worker failed")??;
+        anyhow::bail!("shutdown finished without publishing terminal evidence");
+    }
+    observed.context("shutdown did not publish terminal evidence")??;
     assert!(
         !shutdown.is_finished(),
         "shutdown released its owner before queued evidence drained"
@@ -716,5 +728,71 @@ async fn cancelled_session_observation_join_retains_collector_for_retry() -> Res
     execution.close().await?;
     tokio::time::timeout(Duration::from_secs(2), controller.finish_session_events()).await??;
     assert!(controller.session_event_task.lock().await.is_none());
+    Ok(())
+}
+
+/// Retiring an observation listener never waits for an obsolete client's outbound capacity.
+#[tokio::test]
+async fn saturated_observer_transport_does_not_block_recovery() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
+        "workspace":fixture.path(), "data_root":fixture.path().join("data"),
+        "client_id":"saturated-observer", "provider":{"kind":"mock","command":[]},
+    }))?)?;
+    let session_id = broker.snapshot()?.session.id.clone();
+    let owner = ExecutionOwner::root(&session_id);
+    let provider = observation_provider(None);
+    let _provider =
+        crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
+    broker.set_provider_for_test(_provider.provider_handle());
+    let controller = SessionController::new(broker)?;
+    let (messages, _blocked_output) = forge_protocol::outbound::channel();
+    controller.attach_session_events(&messages).await?;
+    for index in 0..forge_protocol::MAX_PENDING_FRAMES - forge_protocol::RESERVED_CONTROL_RECORDS {
+        messages.send(index)?;
+    }
+    let old_inbox = controller.observer.session_events();
+    provider
+        .event_sink(&owner)
+        .await?
+        .fail(crate::provider::events::EventDeliveryError::Closed);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if controller
+                .session_event_task
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|task| task.is_finished())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("observer stayed blocked on stale outbound capacity")?;
+    let (retained, _) = controller
+        .publications
+        .snapshot(None, std::num::NonZeroU16::new(128).unwrap())?
+        .into_parts();
+    assert!(
+        retained.iter().any(|record| record
+            .event()
+            .payload
+            .to_string()
+            .contains("Session observation failed")),
+        "observation diagnostic was not retained before listener completion"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        controller.recover_session_events(&messages),
+    )
+    .await??;
+    assert!(!Arc::ptr_eq(
+        &old_inbox,
+        &controller.observer.session_events()
+    ));
+    assert!(!controller.task_controller.native_goal_is_uncertain());
     Ok(())
 }

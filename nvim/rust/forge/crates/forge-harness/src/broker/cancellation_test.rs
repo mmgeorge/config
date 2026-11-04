@@ -39,6 +39,7 @@ async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publicati
             .await?;
         let mut transaction = broker.construct_foreground_transaction(&staged, engine.clone())?;
         // Replace the never-polled submission with accepted observation fixtures, retaining its real host owner.
+        transaction.native.pending_submission.take();
         transaction.native.task.abort_all();
         while let Some(result) = transaction.native.task.join_next().await {
             match result {
@@ -204,16 +205,19 @@ fn cancellation_fixture(
     failure: ProviderFailure,
     stats: Arc<CancellationFixtureStats>,
 ) -> Arc<crate::provider::test_support::EventFixtureProvider> {
-    let descriptor = crate::provider::ProviderDescriptor {
-        kind: crate::provider::ProviderId::new("test-cancellation").expect("fixture ID is valid"),
-        label: "Normalized cancellation fixture".into(),
-        capability: crate::provider::test_support::fixture_capability(),
-    };
+    // Managed skill preparation resolves the descriptor's provider identity through the registry.
+    let descriptor = forge_providers::registry::descriptor(
+        &forge_providers::registry::nonselectable_id()
+            .expect("registry supplies a fixture identity"),
+    )
+    .expect("fixture provider is registered");
     crate::provider::test_support::EventFixtureProvider::new(
         descriptor,
         move |request, sink, mut cancelled| {
             let stats = stats.clone();
             async move {
+                // Match native adapters: await the host checkpoint before producing turn/tool work.
+                request.turn_control.before_send(&request.scope).await?;
                 let call = stats.calls.fetch_add(1, Ordering::SeqCst);
                 let turn = crate::provider::TurnAddress {
                     scope: request.scope.clone(),
@@ -264,6 +268,16 @@ fn cancellation_fixture(
                         },
                     })
                     .await?;
+                    request
+                        .host_effects
+                        .settle_foreground(sink.binding_id(), &request.scope)
+                        .await
+                        .map_err(|_| {
+                            ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                                forge_provider_api::ProviderOperation::HostEffectPublication,
+                                forge_provider_api::ProviderFailureKind::Runtime,
+                            ))
+                        })?;
                     sink.send_wait(ProviderEvent::Execution {
                         observation: forge_provider_api::lifecycle::ExecutionObservation::new(
                             request.scope.clone(),
@@ -280,7 +294,7 @@ fn cancellation_fixture(
                 }
                 let tool = crate::provider::ToolAddress {
                     turn: turn.clone(),
-                    tool_id: "fixture-shell".into(),
+                    tool_id: "denied-native-command".into(),
                 };
                 for update in [
                     crate::provider::ToolUpdate::Requested {
@@ -366,6 +380,16 @@ fn cancellation_fixture(
                         },
                     }
                 };
+                request
+                    .host_effects
+                    .settle_foreground(sink.binding_id(), &request.scope)
+                    .await
+                    .map_err(|_| {
+                        ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::HostEffectPublication,
+                            forge_provider_api::ProviderFailureKind::Runtime,
+                        ))
+                    })?;
                 sink.send_wait(ProviderEvent::Execution {
                     observation: forge_provider_api::lifecycle::ExecutionObservation::new(
                         request.scope.clone(),
@@ -442,19 +466,27 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
     };
     assert_eq!(
         result.response.error().context("fixture should fail")?.code,
-        expected_code
+        expected_code,
+        "native failure response: {:?}",
+        result.response.error()
     );
     assert_eq!(
         stats.calls.load(Ordering::SeqCst),
         1,
-        "terminal provider results must not replay"
+        "terminal provider results must not replay; response: {:?}",
+        result.response.error()
     );
     let history = broker.store.list_exchange(&broker.session.id)?;
     assert_eq!(history.len(), 1);
     let exchange = &history[0];
     assert_eq!(exchange.state(), expected);
     assert!(exchange.provider_retry.is_none());
-    assert!(exchange.finalization_error.is_none());
+    assert!(
+        exchange.finalization_error.is_none(),
+        "unexpected finalization error: {:?}; response: {:?}",
+        exchange.finalization_error,
+        result.response.error()
+    );
     let expected_turn = match failure {
         ProviderFailure::Cancelled => TurnOutcome::Cancelled,
         ProviderFailure::SimilarMessage | ProviderFailure::Stalled => TurnOutcome::Failed,
@@ -510,5 +542,204 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
             .flat_map(|turn| turn.messages())
             .any(|message| message.text() == "AFTER-CANCEL-OK")
     );
+    Ok(())
+}
+
+/// A cancellation admitted after preparation wins before the native submission gate opens.
+#[tokio::test]
+async fn prepared_foreground_collection_prevents_native_submission() -> Result<()> {
+    let workspace = super::test::repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = super::test::planning_question_broker(workspace.path(), data.path(), false);
+    broker.checkpoint = None;
+    broker.turn_cancellation.arm(true);
+    let (publication, _updates) = publication::channel();
+    let ForegroundDispatch::Admitting(admission) = broker.begin_foreground_dispatch(
+        Request {
+            id: 1,
+            method: "session.prompt.submit".into(),
+            params: json!({"text":"Prepared before cancellation"}),
+        },
+        publication,
+    )?
+    else {
+        anyhow::bail!("fixture did not create foreground admission");
+    };
+    let mut staged = broker.stage_foreground_interaction(
+        "Prepared before cancellation",
+        PromptMode::Chat,
+        Some(&ExchangeAdmission::chat(
+            "Prepared before cancellation".into(),
+        )),
+        ProviderInput::from_text("Prepared before cancellation"),
+    )?;
+    broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
+    let engine = broker
+        .execution_registry()
+        .owner(crate::provider::ExecutionOwner::root(&broker.session.id))
+        .await?;
+    let mut transaction = broker.construct_foreground_transaction(&staged, engine)?;
+    assert!(
+        transaction.native.task.is_empty(),
+        "prepared admission started native work before owner authorization"
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let invoked = calls.clone();
+    transaction.native.pending_submission = Some(Box::pin(async move {
+        invoked.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<Result<ProviderAttempt>>().await
+    }));
+    let mut dispatch = ForegroundDispatch::Running {
+        transaction: Box::new(transaction),
+        admission,
+    };
+    broker.step_foreground(
+        &mut dispatch,
+        ForegroundSignal::CollectionStarted(ForegroundCollection::Cancel),
+    )?;
+    // The ordinary phase can reopen after the command settles; this collected generation remains fenced.
+    dispatch.authorize_submission();
+    tokio::task::yield_now().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+/// An owner collection drains real success and failure without repeating its cancellation signal.
+#[tokio::test]
+async fn collected_foreground_retains_actual_native_success_and_failure() -> Result<()> {
+    for succeeds in [true, false] {
+        let cancellation = Arc::new(TurnCancellation::new());
+        let scope = crate::provider::InvocationScope::new(
+            crate::provider::ExecutionOwner::root("collected"),
+            "exchange",
+        );
+        let (_sink, events) = crate::provider::events::channel(scope);
+        let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
+            Default::default(),
+        )?);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker_started = started.clone();
+        let worker_release = release.clone();
+        let mut native = ForegroundWait::start(
+            events,
+            async move {
+                worker_started.notify_one();
+                worker_release.notified().await;
+                Ok(if succeeds {
+                    Ok(17u32)
+                } else {
+                    Err(crate::provider::ProviderError::Failure(
+                        forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::AdmitInput,
+                            forge_provider_api::ProviderFailureKind::Rejected,
+                        ),
+                    ))
+                })
+            },
+            cancellation.clone(),
+            watchdog,
+        );
+        native.authorize_submission();
+        started.notified().await;
+        cancellation.request(false);
+        release.notify_one();
+        let NativeForegroundSignal::NativeReady(result) = native.next_collected().await? else {
+            anyhow::bail!(
+                "collection repeated a cancellation signal instead of draining native completion"
+            )
+        };
+        if succeeds {
+            assert_eq!(result.unwrap(), 17);
+        } else {
+            assert!(
+                matches!(result, Err(crate::provider::ProviderError::Failure(failure))
+            if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Collection through the complete foreground wait preserves late native evidence over level cancellation.
+#[tokio::test]
+async fn collected_transaction_drains_native_result_without_recancelling() -> Result<()> {
+    for succeeds in [true, false] {
+        let workspace = super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.checkpoint = None;
+        broker.turn_cancellation.arm(true);
+        let mut staged = broker.stage_foreground_interaction(
+            "collect",
+            PromptMode::Chat,
+            Some(&ExchangeAdmission::chat("collect".into())),
+            ProviderInput::from_text("collect"),
+        )?;
+        broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
+        let engine = broker
+            .execution_registry()
+            .owner(crate::provider::ExecutionOwner::root(&broker.session.id))
+            .await?;
+        let mut transaction = broker.construct_foreground_transaction(&staged, engine)?;
+        transaction.scan_enabled = false;
+        transaction.question_enabled = false;
+        transaction.agent_command_active = true;
+        transaction.execution_open = false;
+        transaction.cleanup_open = false;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let worker_entered = entered.clone();
+        let worker_release = release.clone();
+        transaction.native.pending_submission = Some(Box::pin(async move {
+            worker_entered.notify_one();
+            worker_release.notified().await;
+            let output = if succeeds {
+                Ok(ProviderCompletion::default())
+            } else {
+                Err(ProviderError::Failure(
+                    forge_provider_api::ProviderFailure::new(
+                        forge_provider_api::ProviderOperation::AdmitInput,
+                        forge_provider_api::ProviderFailureKind::Rejected,
+                    ),
+                ))
+            };
+            Ok(ProviderAttempt::Ready(Box::new(output)))
+        }));
+        transaction.native.authorize_submission();
+        entered.notified().await;
+        transaction.collection = Some(ForegroundCollection::Cancel);
+        broker.turn_cancellation.request(false);
+        release.notify_one();
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match transaction.next().await? {
+                    ForegroundSignal::Native(NativeForegroundSignal::NativeReady(
+                        ProviderAttempt::Ready(ready),
+                    )) => break Ok::<_, anyhow::Error>(ready),
+                    ForegroundSignal::Native(
+                        NativeForegroundSignal::Cancelled | NativeForegroundSignal::ToolExpired(_),
+                    ) => anyhow::bail!(
+                        "collection repeated cancellation instead of draining native evidence"
+                    ),
+                    _ => {}
+                }
+            }
+        })
+        .await??;
+        assert_eq!(ready.is_ok(), succeeds);
+        assert!(
+            transaction.native.has_dispatched_task(),
+            "native result must remain accounted until the broker consumes it"
+        );
+        // Collection can be processed before the already-read native result reaches the broker.
+        transaction.native_open = transaction.native.has_dispatched_task();
+        transaction.acknowledge_native_result();
+        assert!(
+            !transaction.native_open,
+            "consumed native result left an empty native poll enabled"
+        );
+    }
     Ok(())
 }

@@ -29,6 +29,15 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::prompt::NativeRecoveryEvidence;
 
+/// Retain one authorized continuation's immutable callbacks, tool admission, and dispatch evidence.
+struct ContinuationExecution {
+    scope: forge_provider_api::InvocationScope,
+    callbacks: forge_provider_api::session::InvocationCallbacks,
+    mode: forge_provider_api::PromptMode,
+    allowed_tools: HashSet<String>,
+    dispatch: forge_provider_api::submission::DispatchReporter,
+}
+
 struct RetainedResources {
     _profile: crate::profile::ResourceProfile,
     _lease: Option<Arc<dyn ResourceLease>>,
@@ -343,7 +352,17 @@ impl forge_provider_api::ProviderHostEffects for CallbackRouter {
 
 #[async_trait]
 impl NativeCallbackRouter for CallbackRouter {
-    async fn call_native(&self, call_id: &str, call: ToolCall) -> Result<String, ProviderError> {
+    async fn call_native(
+        &self,
+        call_id: &str,
+        mut call: ToolCall,
+    ) -> Result<String, ProviderError> {
+        call.id = forge_provider_api::control::ToolCallId::new(call_id).map_err(|_| {
+            failure(
+                ProviderOperation::HostEffectPublication,
+                ProviderFailureKind::Protocol,
+            )
+        })?;
         let callbacks = self.callbacks_for_native_call(call_id).await?;
         callbacks.authorize_tool(&call)?;
         callbacks.permissions.before_tool(&callbacks.scope).await?;
@@ -844,7 +863,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
                 authorization,
             } => {
                 let state = self.binding(binding).await?;
-                let authorized = {
+                let mut authorized = {
                     let mut grants = state.continuations.lock().await;
                     match grants.get(authorization.as_bytes()) {
                         Some(ContinuationGrant::NotConsumed {
@@ -862,6 +881,7 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
                         _ => unreachable!("validated continuation stays locked until consumption"),
                     }
                 };
+                authorized.dispatch = request.dispatch;
                 Ok(ContinuationOutcome::InputAccepted(
                     self.submit(binding, *authorized, true).await?,
                 ))
@@ -870,7 +890,15 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
                 scope,
                 authorization,
                 callbacks,
+                dispatch,
             } => {
+                if !dispatch.matches_continuation(binding, &scope, &authorization) {
+                    return Err(failure(
+                        ProviderOperation::AdmitInput,
+                        ProviderFailureKind::Protocol,
+                    ));
+                }
+
                 let callbacks = *callbacks;
                 let state = self.binding(binding).await?;
                 let grant = {
@@ -904,10 +932,13 @@ impl forge_provider_api::provider::Provider for CopilotProvider {
                         self.resume_retained_execution(
                             binding,
                             &state,
-                            scope,
-                            callbacks,
-                            mode,
-                            allowed_tools,
+                            ContinuationExecution {
+                                scope,
+                                callbacks,
+                                mode,
+                                allowed_tools,
+                                dispatch: *dispatch,
+                            },
                         )
                         .await?;
                         Ok(ContinuationOutcome::ExecutionResumed)
@@ -1805,6 +1836,9 @@ impl CopilotProvider {
         let grant_request = request.clone();
         if request.scope.owner != state.owner
             || request.receipt.id().as_str() != request.submission_id.as_str()
+            || !request
+                .dispatch
+                .matches(binding, &request.scope, &request.submission_id)
         {
             return Err(failure(
                 ProviderOperation::AdmitInput,
@@ -1912,6 +1946,7 @@ impl CopilotProvider {
                 attachments: request.attachments,
             },
             receipt: Some(request.receipt),
+            dispatch: Some(request.dispatch),
             submission_id: Some(submission_id.clone()),
             background_compaction_observed: true,
             scope: request.scope.clone(),
@@ -1921,7 +1956,11 @@ impl CopilotProvider {
         };
         let control: Arc<CallbackRouter> = state.callbacks.clone();
         let (activated, activation) = tokio::sync::oneshot::channel();
+        let (registered, registration) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
+            if registration.await.is_err() {
+                return Err(ProviderError::Cancelled);
+            }
             let guard = match turn.activate(Some(event_sink.clone()), None) {
                 Ok(guard) => {
                     let _ = activated.send(Ok(()));
@@ -1976,6 +2015,7 @@ impl CopilotProvider {
             }
         });
         *state.active.lock().await = Some(task);
+        let _ = registered.send(());
         match activation.await {
             Ok(Ok(())) => {}
             Ok(Err(())) => {
@@ -2003,11 +2043,15 @@ impl CopilotProvider {
         &self,
         binding: &BindingId,
         state: &Arc<BindingState>,
-        scope: forge_provider_api::InvocationScope,
-        callbacks: forge_provider_api::session::InvocationCallbacks,
-        mode: forge_provider_api::PromptMode,
-        allowed_tools: HashSet<String>,
+        execution: ContinuationExecution,
     ) -> Result<(), ProviderError> {
+        let ContinuationExecution {
+            scope,
+            callbacks,
+            mode,
+            allowed_tools,
+            dispatch,
+        } = execution;
         let _admission = state.admission.lock().await;
         let previous = {
             let mut active = state.active.lock().await;
@@ -2071,6 +2115,7 @@ impl CopilotProvider {
             repair_caution,
             attachments: forge_provider_api::input::MessageInput { prompt: String::new(), attachments: Vec::new() },
             receipt: None,
+            dispatch: Some(dispatch),
             submission_id: None,
             background_compaction_observed: true,
             scope: scope.clone(),
@@ -2085,7 +2130,10 @@ impl CopilotProvider {
         let task_scope = scope.clone();
         let task_allowed_tools = allowed_tools;
         let (activated, activation) = tokio::sync::oneshot::channel();
+        let (registered, registration) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
+            registration.await.map_err(|_| ProviderError::Cancelled)?;
+
             let guard = match turn.activate(Some(sink.clone()), None) {
                 Ok(guard) => {
                     let _ = activated.send(Ok(()));
@@ -2129,6 +2177,7 @@ impl CopilotProvider {
             }
         });
         *state.active.lock().await = Some(task);
+        let _ = registered.send(());
         match activation.await {
             Ok(Ok(())) => {}
             Ok(Err(())) => {
@@ -2502,6 +2551,8 @@ mod callback_tests {
                 .call_native(
                     id,
                     ToolCall {
+                        id: forge_provider_api::control::ToolCallId::new("fixture-call-1")
+                            .expect("fixture call identity is nonempty"),
                         name: "fixture_tool".into(),
                         arguments: json!({})
                     }

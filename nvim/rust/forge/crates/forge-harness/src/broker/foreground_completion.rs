@@ -15,7 +15,7 @@ impl HarnessBroker {
         let mut events = Vec::new();
         let (prompt, mode) = match clarification {
             foreground_dispatch::ClarificationContext::Interaction => {
-                if self.active_plan_has_acceptance()? || self.active_plan_awaits_input()? {
+                if self.active_plan_has_review_questions()? || self.active_plan_awaits_input()? {
                     return Ok(None);
                 }
                 let Some(mut candidate) = self.find_active_interaction_elicitation()? else {
@@ -174,7 +174,7 @@ impl HarnessBroker {
                         &mut self.store,
                         &permit,
                         self.plan_file.guard_working_document(&document),
-                        crate::task::TaskEvent::PlanArtifactUpdated(plan.clone()),
+                        crate::task::TaskEvent::PlanArtifactUpdated(Box::new(plan.clone())),
                         crate::storage::TaskEffects {
                             lifecycle: vec![lifecycle],
                             exchange: vec![candidate.clone()],
@@ -321,7 +321,7 @@ impl HarnessBroker {
         transaction.native.cancellation.native_cancel_settled();
         let (mut output, question_override) = match outcome {
             ForegroundOutcome::NativeReady(Ok(output)) => (output, None),
-            ForegroundOutcome::NativeReady(Err(ProviderError::Cancelled)) => {
+            ForegroundOutcome::NativeReady(Err(error)) if error.is_clean_cancellation() => {
                 let submission = admission.take_submission()?;
                 let events = std::mem::take(&mut admission.events);
                 transaction.finalization =
@@ -332,6 +332,7 @@ impl HarnessBroker {
                         Err(ProviderError::Cancelled),
                         transaction.settlement.clone(),
                         None,
+                        transaction.collection,
                     ));
                 let old = std::mem::replace(dispatch, ForegroundDispatch::Transitioning);
                 let ForegroundDispatch::Running {
@@ -358,9 +359,9 @@ impl HarnessBroker {
                 (ready, Some(*completion))
             }
             ForegroundOutcome::RequiredQuestion {
-                ready: Err(ProviderError::Cancelled),
+                ready: Err(error),
                 completion,
-            } => {
+            } if error.is_clean_cancellation() => {
                 let native = completion.native.clone();
                 let mut retained = (*completion).clone();
                 for batch in transaction.settlement.batches()? {
@@ -392,7 +393,7 @@ impl HarnessBroker {
             .provider_session_id
             .clone()
             .or(transaction.request.provider_session_id.clone());
-        if !decision {
+        if !decision && transaction.collection.is_none() {
             while let Some(input) = transaction.steering.active.try_receive() {
                 transaction.steering.deferred.push_back(input);
             }
@@ -518,6 +519,9 @@ impl HarnessBroker {
                 )));
             }
         }
+        // Close parent admission before checkpoint work can make this exchange terminal.
+        // Retain queued, undispatched inputs for the final settlement to return safely.
+        transaction.steering.active.retire();
         anyhow::ensure!(
             self.host_settlement()
                 .as_ref()
@@ -537,6 +541,7 @@ impl HarnessBroker {
                 Ok(output),
                 transaction.settlement.clone(),
                 question_override,
+                transaction.collection,
             ));
         }
         let old = std::mem::replace(dispatch, ForegroundDispatch::Transitioning);

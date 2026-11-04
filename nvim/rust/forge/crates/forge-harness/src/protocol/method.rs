@@ -25,14 +25,10 @@ pub enum RuntimeMethod {
     SessionCheckEditingSet,
     #[serde(rename = "session.check.override")]
     SessionCheckOverride,
-    #[serde(rename = "session.check.run")]
-    SessionCheckRun,
     #[serde(rename = "session.check.complete")]
     SessionCheckComplete,
     #[serde(rename = "session.check.status")]
     SessionCheckStatus,
-    #[serde(rename = "session.check.cancel")]
-    SessionCheckCancel,
     #[serde(rename = "session.task.get")]
     SessionTaskGet,
     #[serde(rename = "session.command.apply")]
@@ -103,10 +99,6 @@ pub enum RuntimeMethod {
     SessionPromptHistoryRecord,
     #[serde(rename = "session.plan.accept")]
     SessionPlanAccept,
-    #[serde(rename = "session.plan.acceptance.begin")]
-    SessionPlanAcceptanceBegin,
-    #[serde(rename = "session.plan.acceptance.cancel")]
-    SessionPlanAcceptanceCancel,
     #[serde(rename = "session.plan.entity.rename")]
     SessionPlanEntityRename,
     #[serde(rename = "session.plan.test.delete")]
@@ -129,12 +121,8 @@ pub enum RuntimeMethod {
     SessionQuestionAnswer,
     #[serde(rename = "session.question.skip")]
     SessionQuestionSkip,
-    #[serde(rename = "session.question.ask")]
-    SessionQuestionAsk,
     #[serde(rename = "session.question.continue")]
     SessionQuestionContinue,
-    #[serde(rename = "session.approval.continue")]
-    SessionApprovalContinue,
     #[serde(rename = "session.input.timeout.configure")]
     SessionInputTimeoutConfigure,
     #[serde(rename = "session.goal.set")]
@@ -177,8 +165,6 @@ pub enum RuntimeMethod {
     HostShutdown,
     #[serde(rename = "session.turn.cancel")]
     SessionTurnCancel,
-    #[serde(rename = "session.turn.restart")]
-    SessionTurnRestart,
     #[serde(rename = "session.turn.steer")]
     SessionTurnSteer,
     #[serde(rename = "session.approval.resolve")]
@@ -196,6 +182,30 @@ pub enum RuntimeMethod {
 impl RuntimeMethod {
     /// Decode an exact wire name and return a fixed rejection message.
     pub fn decode(method: &str) -> anyhow::Result<Self> {
+        if matches!(
+            method,
+            "session.plan.acceptance.begin" | "session.plan.acceptance.cancel"
+        ) {
+            anyhow::bail!("unsupported runtime method: retired plan acceptance lifecycle");
+        }
+        if method == "session.approval.continue" {
+            anyhow::bail!(
+                "unsupported runtime method: approval timeout feedback is owned internally"
+            );
+        }
+        if method == "session.turn.restart" {
+            anyhow::bail!(
+                "unsupported runtime method: restart is owned by configuration transitions"
+            );
+        }
+        if matches!(
+            method,
+            "session.question.ask" | "session.check.run" | "session.check.cancel"
+        ) {
+            anyhow::bail!(
+                "unsupported runtime method: use input submission, check tools, or exchange cancellation"
+            );
+        }
         Self::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(method))
             .map_err(|_| anyhow::anyhow!("unknown runtime method"))
     }
@@ -208,13 +218,10 @@ impl RuntimeMethod {
                 | Self::SessionPromptSubmit
                 | Self::SessionCheckComplete
                 | Self::SessionPlanAccept
-                | Self::SessionPlanAcceptanceBegin
                 | Self::SessionPlanChangesRequest
                 | Self::SessionQuestionAnswer
                 | Self::SessionQuestionSkip
-                | Self::SessionQuestionAsk
                 | Self::SessionQuestionContinue
-                | Self::SessionApprovalContinue
                 | Self::SessionGoalSet
                 | Self::SessionGoalPause
                 | Self::SessionGoalResume
@@ -230,15 +237,55 @@ impl RuntimeMethod {
             Self::SessionPromptSubmit
                 | Self::SessionCheckComplete
                 | Self::SessionAgentStart
-                | Self::SessionQuestionAsk
                 | Self::SessionQuestionContinue
-                | Self::SessionCompact
         )
     }
 }
 
 #[cfg(test)]
 mod test {
+    /// Reject retired mutation aliases before accessing any session state.
+    #[test]
+    fn rejects_retired_question_and_manual_check_methods() {
+        for method in [
+            "session.question.ask",
+            "session.check.run",
+            "session.check.cancel",
+        ] {
+            let error = super::RuntimeMethod::decode(method).unwrap_err();
+            assert!(error.to_string().contains("unsupported runtime method"));
+        }
+    }
+
+    /// Timeout feedback is an owner event and cannot be invoked as a public mutation.
+    #[test]
+    fn rejects_public_approval_timeout_continuation() {
+        let error = super::RuntimeMethod::decode("session.approval.continue").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("approval timeout feedback is owned internally")
+        );
+    }
+
+    /// Reject the retired public restart path instead of admitting a second lifecycle authority.
+    #[test]
+    fn rejects_public_restart_method() {
+        let error = super::RuntimeMethod::decode("session.turn.restart").unwrap_err();
+        assert!(error.to_string().contains("unsupported runtime method"));
+    }
+
+    #[test]
+    fn rejects_retired_plan_acceptance_methods() {
+        for method in [
+            "session.plan.acceptance.begin",
+            "session.plan.acceptance.cancel",
+        ] {
+            let error = super::RuntimeMethod::decode(method).unwrap_err();
+            assert!(error.to_string().contains("unsupported runtime method"));
+        }
+    }
+
     #[test]
     fn check_editing_has_no_guided_setup_operation() {
         assert_eq!(

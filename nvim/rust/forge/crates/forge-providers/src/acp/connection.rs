@@ -229,6 +229,18 @@ impl AcpConnection {
         method: &str,
         parameter: Value,
     ) -> Result<Value, AcpConnectionError> {
+        self.request_tracked(method, parameter, None).await
+    }
+
+    /// Hand a tracked request to the native driver before waiting for its response.
+    /// Prompt callers have already installed immutable configuration and collection
+    /// ownership. The SDK retains response/cancellation routing at publication.
+    pub(super) async fn request_tracked(
+        &self,
+        method: &str,
+        parameter: Value,
+        dispatch: Option<&forge_provider_api::submission::DispatchReporter>,
+    ) -> Result<Value, AcpConnectionError> {
         let message = UntypedMessage::new(method, parameter).map_err(|source| {
             AcpConnectionError::Protocol {
                 method: method.into(),
@@ -236,17 +248,33 @@ impl AcpConnection {
             }
         })?;
         let request = self.connection.send_request(message).block_task();
-        let response = if method == "session/prompt" {
-            request.await
+        tokio::pin!(request);
+        // Drain synchronous publication errors before confirming the tracked handoff.
+        // Pending means the SDK owns the request and response/cancellation routing;
+        // it does not prove remote delivery or receipt acceptance.
+        let response = if let std::task::Poll::Ready(response) = futures_util::poll!(&mut request) {
+            if response.is_ok()
+                && let Some(dispatch) = dispatch
+            {
+                dispatch.confirm();
+            }
+            response
         } else {
-            let seconds = if method == "authenticate" { 120 } else { 30 };
-            tokio::time::timeout(std::time::Duration::from_secs(seconds), request)
-                .await
-                .map_err(|source| AcpConnectionError::Timeout {
-                    method: method.into(),
-                    seconds,
-                    source,
-                })?
+            if let Some(dispatch) = dispatch {
+                dispatch.confirm();
+            }
+            if method == "session/prompt" {
+                request.await
+            } else {
+                let seconds = if method == "authenticate" { 120 } else { 30 };
+                tokio::time::timeout(std::time::Duration::from_secs(seconds), request)
+                    .await
+                    .map_err(|source| AcpConnectionError::Timeout {
+                        method: method.into(),
+                        seconds,
+                        source,
+                    })?
+            }
         };
         response.map_err(|source| {
             let failure = remote_failure(&source);

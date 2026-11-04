@@ -52,27 +52,4 @@ impl HarnessBroker {
             Ok(dispatch)
         })
     }
-
-    /// Release check publication ownership and preserve the completed response or typed failure.
-    pub(crate) fn finish_check_completion(
-        &mut self,
-        request_id: u64,
-        result: Result<DispatchResult>,
-    ) -> DispatchResult {
-        match result {
-            Ok(result) => result,
-            Err(error) => DispatchResult {
-                response: Response::failure(
-                    request_id,
-                    if error.is::<TurnCancelled>() {
-                        "turn_cancelled"
-                    } else {
-                        "request_failed"
-                    },
-                    crate::storage::error_message(&error),
-                ),
-                event: Vec::new(),
-            },
-        }
-    }
 }

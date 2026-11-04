@@ -83,6 +83,22 @@ local function report_configuration_error(message)
   notifications.error("Configuration rejected: " .. message, "ForgeHarness")
 end
 
+---Cancel the root exchange independently of the selected child timeline.
+---@param state table
+local function cancel_exchange(state)
+  if state.cancel_requested then return end
+  local session_id = state.session and state.session.id
+  if not session_id then return end
+  state.cancel_requested = true
+  client.request({ session_id = session_id, method = "session.turn.cancel",
+    params = { restore_prompt_if_no_output = true } }, function(_, failure)
+    if harness_state() ~= state or not state.session or state.session.id ~= session_id then return end
+    state.cancel_requested = false
+    if failure then notifications.error(failure, "Harness cancellation") end
+    M.render()
+  end)
+end
+
 local function picker_host(state)
   local window_list = {}
   for _, win in pairs({ state.transcript_win, state.composer_win }) do
@@ -96,7 +112,7 @@ local function picker_host(state)
       key = key, modes = { "n", "i" }, desc = "Interrupt Harness task", input = true, label = "interrupt",
       callback = function()
         picker.close(true)
-        if session.harness == state then M.task_transition({ action = "pause" }) end
+        if session.harness == state then cancel_exchange(state) end
       end,
     }
   end
@@ -352,6 +368,7 @@ function M.render()
   end
   state.presentation = require("forge.views.harness.presentation").open({
     startup_trace = state.startup_trace,
+    capability = function() return state.capability end,
     session_id = state.session.id, transcript_buffer = state.transcript_buf, composer_buffer = state.composer_buf,
     transcript_window = state.transcript_win, composer_window = state.composer_win,
     is_alive = function() return vim.api.nvim_buf_is_valid(state.transcript_buf) and vim.api.nvim_buf_is_valid(state.composer_buf) end,
@@ -466,7 +483,9 @@ local function synchronize_state(callback, target_state)
   end
   synchronized_state.state_sync_pending = true
   local invalidation = synchronized_state.state_invalidation or 0
-  client.request({ session_id = synchronized_session, method = "session.state.get", params = {} }, function(result, request_error, error_detail)
+  client.request({ session_id = synchronized_session, method = "session.state.get", params = {
+    publication_cursor = synchronized_state.publication_cursor,
+  } }, function(result, request_error, error_detail)
     synchronized_state.state_sync_pending = false
     if client.host_get_generation() ~= synchronized_generation or not synchronized_state.session
       or synchronized_state.session.id ~= synchronized_session then return end
@@ -499,6 +518,9 @@ local function synchronize_state(callback, target_state)
     if request_error or not result then
       local failure = request_error or "Harness broker returned an empty state snapshot"
       local code = error_detail and error_detail.code
+      if code == "reconnect_invalid_cursor" then
+        synchronized_state.publication_cursor, synchronized_state.publication_received, synchronized_state.publication_more = nil, nil, nil
+      end
       diagnostic.set(synchronized_state, "sync_error", failure,
         { owner = synchronized_session, category = "snapshot", recovery = "retry",
           severity = (not request_error or error_detail and code ~= "not_admitted" and code ~= "outcome_unknown") and "error" or "info" })
@@ -535,6 +557,20 @@ local function synchronize_state(callback, target_state)
     end
     if #state.approval > 0 then vim.schedule(M.present_approval) end
     M.render()
+    if result.owner_publication then
+      local receipt = synchronized_state.publication_received
+      if receipt then
+        -- Retry from the last confirmed cursor if lease confirmation or its notification is lost.
+        vim.defer_fn(function()
+          if synchronized_state.publication_received == receipt
+            and harness_state() == synchronized_state
+            and client.host_get_generation() == synchronized_generation then
+            synchronize_state(nil, synchronized_state)
+          end
+        end, 1000)
+      end
+      if result.owner_publication.more then return end
+    end
     local callbacks = synchronized_state.state_sync_callback or {}
     synchronized_state.state_sync_callback = nil
   for _, completed in ipairs(callbacks) do completed(result, nil) end
@@ -545,6 +581,12 @@ end
 
 local function on_event(event, payload)
   local state = harness_state()
+  if event == "publication_confirmed" then
+    if snapshot.confirm_publication(state, payload) and state.publication_more then
+      vim.schedule(function() synchronize_state(nil, state) end)
+    end
+    return
+  end
   if event ~= "provider_event" and event ~= "input_changed" and event ~= "task_operation" then
     state.state_invalidation = (state.state_invalidation or 0) + 1
   end
@@ -588,11 +630,13 @@ local function on_event(event, payload)
       if payload.active_check_run == vim.NIL then state.active_check_run = nil
       else state.active_check_run = payload.active_check_run end
     end
-    if state.status.kind ~= "awaiting_input" and state.plan_question_open then
+    local review_questions = state.active_elicitation and
+      (state.active_elicitation.owner == "plan_review" or state.active_elicitation.owner == "plan_acceptance")
+    if state.status.kind ~= "awaiting_input" and not (state.status.kind == "awaiting_plan_review" and review_questions) and state.plan_question_open then
       require("forge.views.harness.plan_question").close()
       state.plan_question_open = false
     end
-    if state.status.kind == "awaiting_plan_review" then
+    if state.status.kind == "awaiting_plan_review" and not review_questions then
       state.active_elicitation = nil
       question_presentation.reset(state)
     end
@@ -771,7 +815,7 @@ function M.present_approval(reopen)
     owner_label = owner_label,
     interrupt = function()
       if child_id then M.agent_action("interrupt", child_id)
-      else M.task_transition({ action = "pause" }) end
+      else cancel_exchange(state) end
     end,
     transcript_win = state.transcript_win,
     window_list = picker_host(state).window_list,
@@ -830,7 +874,7 @@ function M.present_plan_question(force)
     transcript_win = state.transcript_win,
     window_list = host.window_list,
     control_win = host.control_win,
-    allow_ask = owner ~= "plan_acceptance",
+    allow_ask = true,
     clarification_draft = draft,
     answer = function(params, callback)
       params.target = question_target
@@ -874,7 +918,7 @@ function M.present_plan_question(force)
             M.present_plan_question(false)
           end
         end)
-      end)
+      end, nil, vim.tbl_extend("force", question_target, { question_id = params.question_id }))
     end,
     pending = function()
       state.execution_notice = "Submitting answers"
@@ -903,20 +947,6 @@ function M.present_plan_question(force)
     end,
     closed = function()
       state.plan_question_open = false
-      if owner == "plan_acceptance" then
-        client.request({ session_id = state.session.id, method = "session.plan.acceptance.cancel", params = {} }, function(result, request_error)
-          if request_error then
-            notifications.error(request_error, "Plan acceptance")
-            synchronize_state()
-            return
-          end
-          state.active_plan = result.active_plan or state.active_plan
-          state.active_elicitation = result.active_elicitation
-          M.render()
-          M.refresh_winbar()
-        end)
-        return
-      end
       M.render()
     end,
   })
@@ -981,7 +1011,6 @@ begin_request = function(text, from_composer, attachments, captured_prompt, queu
   recap.clear(state)
   if from_composer then dismiss_composer_completion(state.composer_buf) end
   state.cancel_requested = false
-  if from_composer then state.queue_paused = false end
   prompt_submission.start(state, {
     text = text, attachments = attachments, context = context,
     source = captured_prompt and captured_prompt.source,
@@ -998,20 +1027,7 @@ function M.cancel_turn()
     M.agent_action("interrupt", state.selected_agent_run_id)
     return
   end
-  local operation = state.task_operation
-  if state.cancel_requested or operation and operation.action == "pause" then return end
-  local session_id = state.session and state.session.id
-  M.task_transition({ action = "pause" }, nil, function(success)
-    if not success or not session_id or harness_state() ~= state or state.session.id ~= session_id then return end
-    state.cancel_requested = true
-    client.request({ session_id = session_id, method = "session.turn.cancel",
-      params = { restore_prompt_if_no_output = true } }, function(_, failure)
-      if harness_state() ~= state or state.session.id ~= session_id then return end
-      state.cancel_requested = false
-      if failure then notifications.error(failure, "Harness cancellation") end
-      M.render()
-    end)
-  end)
+  cancel_exchange(state)
 end
 function M.compact(completed)
   if not (harness_state().capability and harness_state().capability.native_compact) then
@@ -1487,6 +1503,14 @@ end
 ---List provider-owned background shells and terminate only the selected shell.
 function M.open_background_picker()
   local state = harness_state()
+  if state.capability and state.capability.background_terminals == false then
+    notifications.warn("The current provider does not support background terminals", "ForgeHarness")
+    return
+  end
+  if not state.capability or state.capability.background_terminals ~= true then
+    notifications.warn("Background terminal capability is not available yet", "ForgeHarness")
+    return
+  end
   local session_id, generation = state.session.id, client.host_get_generation()
   local function current()
     return state.session and state.session.id == session_id and client.host_get_generation() == generation
@@ -2248,22 +2272,12 @@ function M.task_transition(action, submitted_text, completed, method)
   if submitted_text then action.attachments = attachment.capture(state.composer_buf).attachments end
   if state.host_error then notifications.error(state.execution_notice or state.host_error, "Harness task") return end
   if not state.session then notifications.warn("Harness is still initializing", "Harness task") return end
-  if action.action == "pause" then
-    state.queue_paused = true
-  elseif vim.tbl_contains({ "resume", "clear", "chat", "plan", "goal", "execute" }, action.action) then
-    state.queue_paused = false
-  end
   if action.action ~= "configure" and not policy_change then
     state.task_config = nil
     if state.configuration_completion then
       state.configuration_completion.complete(false)
       state.configuration_completion = nil
     end
-  end
-  local current = task_control.current(state)
-  if action.action == "resume" and current and task_control.status(current) == "running" then
-    input_state.perform(state, { kind = "resume" })
-    return
   end
   if not policy_change then set_busy(true) end
   task_control.transition(state, action, M.render, function(failure, background)
@@ -2446,7 +2460,7 @@ function M.activate_snapshot(result)
   require("forge.views.harness.health").watch(state, function()
     if harness_state() == state then M.render() end
   end)
-  if previous_session ~= state.session.id then state.queue, state.queue_edit, state.queue_paused = {}, nil, false end
+  if previous_session ~= state.session.id then state.queue, state.queue_edit = {}, nil end
   M.render()
   M.resolve_runtime_model()
   if state.active_elicitation and state.active_elicitation.elicitation then

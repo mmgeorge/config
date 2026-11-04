@@ -22,6 +22,7 @@ function HarnessSnapshot.apply(state, result)
   local session_changed = state.session and result.session and state.session.id ~= result.session.id
   if session_changed or state.runtime_epoch and state.runtime_epoch ~= result.runtime_epoch then
     state.questions = nil
+    state.publication_cursor, state.publication_received, state.publication_more = nil, nil, nil
     if session_changed then
       if require("forge.views.picker").is_open("questions") then require("forge.views.picker").close(false) end
       state.question_view_by_session = state.question_view_by_session or {}
@@ -48,6 +49,14 @@ function HarnessSnapshot.apply(state, result)
     end
   end
   state.runtime_epoch, state.snapshot_revision = result.runtime_epoch, result.snapshot_revision
+  local publication = result.owner_publication
+  if publication then
+    state.publication_received = {
+      receipt_id = publication.receipt_id, after = publication.after, through = publication.through,
+      runtime_epoch = result.runtime_epoch,
+    }
+    state.publication_more = publication.more == true
+  end
   if state.host_error then state.host_error, state.execution_notice = nil, nil end
   local operation = result.task_operation
   if operation and (operation.state == "failed" or operation.state == "outcome_unknown") then
@@ -109,6 +118,23 @@ function HarnessSnapshot.apply(state, result)
     if not selected_exists then state.selected_agent_run_id = nil end
   end
   if result.prompt_history then prompt_history.replace(result.prompt_history) end
+  return true
+end
+
+---Promote only the exact received page that the owner durably confirmed after output admission.
+---@param state table
+---@param acknowledgment table
+---@return boolean
+function HarnessSnapshot.confirm_publication(state, acknowledgment)
+  acknowledgment = presentation_value(acknowledgment)
+  local received = state.publication_received
+  if not received or received.receipt_id ~= acknowledgment.receipt_id
+    or received.runtime_epoch ~= acknowledgment.runtime_epoch
+    or state.runtime_epoch ~= acknowledgment.runtime_epoch
+    or received.after ~= acknowledgment.after or received.through ~= acknowledgment.through
+    or received.after ~= state.publication_cursor then return false end
+  state.publication_cursor = received.through or received.after or state.publication_cursor
+  state.publication_received = nil
   return true
 end
 

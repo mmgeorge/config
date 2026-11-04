@@ -62,6 +62,7 @@ M.diff_line_content_lengths = {}
 M.empty_diff_rows = {}
 
 ---@class ForgeHarnessPresentationState
+---@field publication_cursor? integer Last received publication page durably confirmed by the owner.
 ---@field presentation? HarnessPresentation
 ---@field client table?
 ---@field ready boolean
@@ -91,7 +92,6 @@ M.empty_diff_rows = {}
 ---@field render_initialized boolean
 ---@field render_fold_signature? string
 ---@field queue (string|ForgeQueuedPrompt)[]
----@field queue_paused boolean
 ---@field input? ForgeInputViewState
 ---@field execution_busy? boolean
 ---@field request_busy? boolean
@@ -173,7 +173,6 @@ local function new_harness_state()
   render_initialized = false,
   render_fold_signature = nil,
   queue = {},
-  queue_paused = false,
   pending_steer = {},
   pending_submit = {},
   transcript_buf = nil,

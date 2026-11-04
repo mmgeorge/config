@@ -39,3 +39,9 @@ Forge Ignore on a staged file unstages it first, including both rename endpoints
 Each `RepositoryStore` owns one `MutationCoordinator`, which keeps at most 64 operations. Index and worktree-file scopes use `WorktreeId`, and shared-reference scopes use `GitStorageId`. An operation starts only after every earlier operation with an intersecting scope finishes, including queued ones, so a multi-scope operation cannot be bypassed. Dropping the `wait_start` future cancels a queued operation.
 
 Cancelling a running operation sets a flag without releasing scopes, and the process owner keeps `AdmissionGuard` until termination is known. Dropping a running guard marks the operation abandoned and quarantines its scopes for the coordinator's lifetime, because the process may still be writing.
+
+## Status during concurrent edits
+
+Display observations use one complete status enumeration. Files created or changed afterward appear on refresh; opening the view does not require two identical worktree scans. HEAD and index consistency, cancellation, and repository generation checks remain enforced. Verified observations and comparison snapshots still reject changed status or worktree metadata, and mutations acquire their own exact preconditions rather than treating displayed inventory as write authorization.
+
+The deterministic `display_accepts_new_paths_during_collection_and_refreshes_inventory` regression in `forge-git` creates a file during enumeration and confirms that the first display succeeds and the next display includes it. The verified-observation regressions retain rejection of new paths and changed file metadata.

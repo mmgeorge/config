@@ -2,13 +2,32 @@ struct CompletionControl;
 
 #[async_trait]
 impl forge_provider_api::turn_control::TurnControl for CompletionControl {
-    async fn before_send(&self, _: &forge_provider_api::InvocationScope) -> Result<(), ProviderError> { Ok(()) }
-    async fn receive(&self, _: &forge_provider_api::InvocationScope) -> Result<(), ProviderError> { std::future::pending().await }
-    async fn close(&self, _: &forge_provider_api::InvocationScope) -> Result<(), ProviderError> { Ok(()) }
-    async fn status(&self, _: &forge_provider_api::InvocationScope) -> Result<forge_provider_api::turn_control::HostTurnStatus, ProviderError> {
-        Ok(forge_provider_api::turn_control::HostTurnStatus { replay_safe: true, control_handoff: false, cancelled: false, error: None })
+    async fn before_send(
+        &self,
+        _: &forge_provider_api::InvocationScope,
+    ) -> Result<(), ProviderError> {
+        Ok(())
     }
-    fn tool_finished(&self, _: &forge_provider_api::InvocationScope, _: Option<&str>) -> bool { false }
+    async fn receive(&self, _: &forge_provider_api::InvocationScope) -> Result<(), ProviderError> {
+        std::future::pending().await
+    }
+    async fn close(&self, _: &forge_provider_api::InvocationScope) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    async fn status(
+        &self,
+        _: &forge_provider_api::InvocationScope,
+    ) -> Result<forge_provider_api::turn_control::HostTurnStatus, ProviderError> {
+        Ok(forge_provider_api::turn_control::HostTurnStatus {
+            replay_safe: true,
+            control_handoff: false,
+            cancelled: false,
+            error: None,
+        })
+    }
+    fn tool_finished(&self, _: &forge_provider_api::InvocationScope, _: Option<&str>) -> bool {
+        false
+    }
 }
 
 struct CompletionEffects;
@@ -19,7 +38,9 @@ impl forge_provider_api::ProviderHostEffects for CompletionEffects {
         &self,
         _: &forge_provider_api::BindingId,
         _: &forge_provider_api::InvocationScope,
-    ) -> Result<(), forge_provider_api::session::HostEffectFailure> { Ok(()) }
+    ) -> Result<(), forge_provider_api::session::HostEffectFailure> {
+        Ok(())
+    }
 }
 
 /// Complete real SDK Chat and Background turns when live ancestry omits its durable usage node.
@@ -57,6 +78,7 @@ async fn sdk_turn_completion_survives_omitted_ancestry_and_reused_zero_turn_id()
                     repair_caution: None,
                     attachments: forge_provider_api::input::MessageInput { prompt: String::new(), attachments: Vec::new() },
                     receipt: None,
+                    dispatch: None,
                     submission_id: Some(submission_id.clone()),
                     background_compaction_observed: true,
                     accepted: None,

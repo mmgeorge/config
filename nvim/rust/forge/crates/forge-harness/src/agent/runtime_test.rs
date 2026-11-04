@@ -46,7 +46,9 @@ fn background_provider(
                 };
                 let observation = forge_provider_api::lifecycle::ExecutionObservation::new(
                     scope.clone(),
-                    forge_provider_api::lifecycle::ExecutionUpdate::Started { address: turn },
+                    forge_provider_api::lifecycle::ExecutionUpdate::Started {
+                        address: turn.clone(),
+                    },
                 )?;
                 sink.send_wait(ProviderEvent::Execution { observation })
                     .await?;
@@ -73,14 +75,28 @@ fn background_provider(
                     .await?;
                 }
                 *pending.lock().unwrap() = Some(BackgroundObservation {
-                    scope,
+                    scope: scope.clone(),
                     address: address.clone(),
                 });
                 if matches!(finish, BackgroundFinish::NoisyTimeout) {
                     loop {
                         tokio::select! {
                             changed = cancelled.changed() => {
-                                if changed.is_err() || *cancelled.borrow() { return Ok(()); }
+                                if changed.is_err() || *cancelled.borrow() {
+                                    sink.send_wait(ProviderEvent::Execution {
+                                        observation: forge_provider_api::lifecycle::ExecutionObservation::new(
+                                            scope.clone(),
+                                            forge_provider_api::lifecycle::ExecutionUpdate::Finished {
+                                                address: turn.clone(), covered_submissions: vec![request.submission_id.clone()],
+                                                completed_at_ms: 1,
+                                                result: forge_provider_api::lifecycle::ExecutionResult::Cancelled {
+                                                    completion: forge_provider_api::completion::ProviderCompletion::default().into(),
+                                                },
+                                            },
+                                        )?,
+                                    }).await?;
+                                    return Ok(());
+                                }
                             }
                             _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {
                                 sink.send_wait(ProviderEvent::Tool {
@@ -253,6 +269,7 @@ async fn collect_background_child(
             fixture.path().to_str().unwrap(),
         )?,
         request: ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: Some(owner.clone()),
             harness_session_id: "session".into(),
             workspace: fixture.path().to_string_lossy().into_owned(),
@@ -495,6 +512,7 @@ async fn independent_provider_cancellation_preserves_child_submission_boundaries
         let coordinator = crate::agent::AgentCoordinator::new("session".into());
         let (_cancel, cancellation) = watch::channel(false);
         let mut request = ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: Some(ExecutionOwner {
                 session_id: "session".into(),
                 agent_id: "child".into(),

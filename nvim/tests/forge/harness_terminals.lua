@@ -11,6 +11,7 @@ package.loaded["forge.client"] = { request = function(request_specification, rec
 end }
 local watch = require("forge.views.harness.terminals").watch({
   session_id = "session", alive = function() return alive end,
+  capability = function() return { background_terminals = true } end,
   update = function(snapshot) updates[#updates + 1] = snapshot end,
   notice = function(message) notices[#notices + 1] = message end,
 })
@@ -39,11 +40,33 @@ watch.refresh()
 assert(request == 6)
 local unsupported = require("forge.views.harness.terminals").watch({
   session_id = "session", alive = function() return true end,
+  capability = function() return { background_terminals = true } end,
   update = function() end, notice = function() error("unexpected notice") end,
 })
 unsupported.refresh()
 callback({ supported = false, terminal = {} })
 unsupported.refresh()
 assert(request == 7, "unsupported provider kept polling")
+local declared_unavailable = require("forge.views.harness.terminals").watch({
+  session_id = "session", alive = function() return true end,
+  capability = function() return { background_terminals = false } end,
+  update = function(snapshot) assert(snapshot.supported == false) end,
+  notice = function() error("unsupported capability produced an error notice") end,
+})
+declared_unavailable.refresh()
+assert(request == 7, "known unsupported capability still requested a terminal inventory")
+declared_unavailable.close()
+local capability
+local waiting = require("forge.views.harness.terminals").watch({
+  session_id = "session", alive = function() return true end,
+  capability = function() return capability end,
+  update = function() end, notice = function() error("unknown capability produced a notice") end,
+})
+waiting.refresh()
+assert(request == 7, "unknown capability triggered optimistic terminal polling")
+capability = { background_terminals = true }
+waiting.refresh()
+assert(request == 8, "terminal polling did not start after capability arrived")
+waiting.close()
 print("harness_terminals: passed")
 vim.cmd("qa!")

@@ -2,7 +2,8 @@ use super::*;
 
 pub(crate) struct InputReadiness {
     pub session: crate::storage::admission::AdmissionSession,
-    pub operation_state: Option<String>,
+    /// Transitional fact from the legacy task-operation journal; remove with its write path.
+    pub operation_blocks_input: bool,
     pub has_elicitation: bool,
     pub has_approval: bool,
     pub checks_running: bool,
@@ -43,6 +44,11 @@ pub(super) struct ObservationMetadata {
 }
 
 impl BrokerObserver {
+    /// Get the bounded internal check route installed by the session exchange owner.
+    pub(crate) fn check_owner_sender(&self) -> Result<crate::checks::owner::CheckOwnerSender> {
+        self.check_runner.owner_sender()
+    }
+
     /// Get the current owner observation generation.
     pub(crate) fn session_events(
         &self,
@@ -94,7 +100,12 @@ impl BrokerObserver {
             session: state.session.clone(),
             has_elicitation: state.has_elicitation,
             has_approval,
-            operation_state: state.operation_state.clone(),
+            operation_blocks_input: state.operation_state.as_deref().is_some_and(|state| {
+                matches!(
+                    state,
+                    "admitted" | "accepted" | "stopping" | "applying" | "verifying" | "resuming"
+                )
+            }),
             checks_running: self.check_runner.active()?.is_some(),
             native_steer: self
                 .metadata
@@ -239,7 +250,7 @@ impl BrokerObserver {
     }
 
     /// Persists conversation-scoped check editing without starting or interrupting a turn.
-    pub(super) fn set_check_editing(&self, enabled: bool) -> Result<Value> {
+    pub(crate) fn set_check_editing(&self, enabled: bool) -> Result<Value> {
         let session = SqliteStore::read_only(&self.data_root)?
             .load_session(&self.session_id)?
             .context("observed session is missing")?;
@@ -354,14 +365,12 @@ impl BrokerObserver {
         });
         let active_elicitation = plan_input
             .and_then(|plan| {
-                plan.acceptance
-                    .as_ref()
-                    .map(|acceptance| ActiveElicitation {
-                        owner: ElicitationOwner::PlanAcceptance,
-                        plan_id: Some(plan.id.clone()),
-                        exchange_id: None,
-                        elicitation: acceptance.elicitation.clone(),
-                    })
+                plan.review_questions().map(|questions| ActiveElicitation {
+                    owner: ElicitationOwner::PlanReview,
+                    plan_id: Some(plan.id.clone()),
+                    exchange_id: None,
+                    elicitation: questions.clone(),
+                })
             })
             .or_else(|| {
                 plan_input.and_then(|plan| {
@@ -579,11 +588,6 @@ impl BrokerObserver {
     /// Handles session queries and independent metadata writes without a provider turn lock.
     pub(crate) fn query(&self, method: RuntimeMethod, params: Value) -> Result<Option<Value>> {
         let result = match method {
-            RuntimeMethod::SessionCheckEditingSet => self.set_check_editing(
-                params["enabled"]
-                    .as_bool()
-                    .context("check editing requires enabled")?,
-            )?,
             RuntimeMethod::SessionStateGet => serde_json::to_value(self.snapshot()?)?,
             RuntimeMethod::SessionTaskGet => {
                 serde_json::to_value(self.snapshot()?.session.active_task)?

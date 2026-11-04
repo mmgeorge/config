@@ -9,6 +9,9 @@ use std::sync::OnceLock;
 /// Represents one provider callback into a Harness control tool.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ControlToolInvocation {
+    /// Authenticated adapter identity; untrusted argument decoding cannot populate it.
+    #[serde(skip)]
+    pub(crate) call_id: Option<forge_provider_api::control::ToolCallId>,
     pub name: String,
     pub arguments: Value,
     #[serde(skip)]
@@ -19,6 +22,7 @@ impl ControlToolInvocation {
     pub(crate) fn admit_task_control(
         &mut self,
         controller: Option<&crate::task::SessionTaskController>,
+        turn_permit: Option<&crate::task::TaskPermit>,
     ) -> anyhow::Result<()> {
         if !matches!(
             self.name.as_str(),
@@ -30,7 +34,9 @@ impl ControlToolInvocation {
             controller,
             "goal control requires a session task controller",
         )?;
-        let current = controller.admit_goal_control(self.name == "goal_complete")?;
+        let captured =
+            anyhow::Context::context(turn_permit, "goal control has no admitted turn permit")?;
+        let current = controller.admit_dispatched_goal(captured, self.name == "goal_complete")?;
         if self
             .task_permit
             .as_ref()
@@ -49,7 +55,7 @@ impl ControlToolInvocation {
         turn_permit: Option<&crate::task::TaskPermit>,
         mode: crate::provider::PromptMode,
     ) -> anyhow::Result<()> {
-        self.admit_task_control(controller)?;
+        self.admit_task_control(controller, turn_permit)?;
         let Some(controller) = controller else {
             return Ok(());
         };
@@ -73,7 +79,7 @@ impl ControlToolInvocation {
         };
         let captured =
             anyhow::Context::context(turn_permit, "task control has no admitted turn permit")?;
-        let current = controller.admit(kind)?;
+        let current = controller.admit_dispatched(kind, captured)?;
         if captured.revision() != current.revision() {
             return Err(crate::task::StaleTask.into());
         }

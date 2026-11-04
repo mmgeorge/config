@@ -467,7 +467,11 @@ impl SqliteStore {
         let plan_wait = active.as_ref().is_some_and(|task| match &task.workflow {
             crate::task::WorkflowSnapshot::Plan { plan } => {
                 !plan.paused
-                    && (plan.artifact.acceptance.is_some() || plan.artifact.elicitation.is_some())
+                    && (plan
+                        .artifact
+                        .review_questions()
+                        .is_some_and(|questions| questions.has_pending_decisions())
+                        || plan.artifact.elicitation.is_some())
             }
             _ => false,
         });

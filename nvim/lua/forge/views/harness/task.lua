@@ -122,12 +122,17 @@ function M.transition(state, action, refresh, settled, admitted, method)
           remove()
           local message = result.error ~= vim.NIL and result.error or nil
           if result.state == "failed" or result.state == "outcome_unknown" then
-            message = message or "Task transition failed"
+            message = message or (result.state == "outcome_unknown"
+              and "Task outcome could not be confirmed. Inspect the original operation before retrying."
+              or "Task transition failed")
+            if result.state == "outcome_unknown" then
+              state.execution_notice_operation = { id = operation.id, message = message }
+            end
             notifications.error(message, "Harness task")
           end
           settled(message, true)
         end
-      elseif detail and detail.code ~= "outcome_unknown" and detail.code ~= "not_admitted" then
+      elseif detail and detail.code ~= "not_admitted" then
         remove()
         notifications.error(failure, "Harness task")
         settled(failure, true)
@@ -142,7 +147,6 @@ function M.transition(state, action, refresh, settled, admitted, method)
         notifications.error(state.execution_notice, "Harness task")
         if state.task_operation then
           state.task_config = state.task_operation.config
-          if state.task_operation.poll then state.task_operation.poll() end
           settled(state.execution_notice, true)
           refresh()
           return
@@ -150,9 +154,14 @@ function M.transition(state, action, refresh, settled, admitted, method)
         settled(state.execution_notice)
         return
       end
-      diagnostic.set(state, "execution_notice", "Checking the original task operation: " .. failure,
-        { owner = identity, category = "uncertain", severity = "info" })
+      -- Command recovery has finished with an uncertain outcome. Release this UI waiter;
+      -- the immutable command remains available for inspection under its original ID.
+      remove()
       operation.state = "outcome_unknown"
+      diagnostic.set(state, "execution_notice", failure,
+        { owner = identity, category = "uncertain", severity = "warning", recovery = "inspect" })
+      state.execution_notice_operation = { id = identity, message = failure }
+      settled(failure, state.task_operation ~= nil)
       refresh()
       return
     end
@@ -173,7 +182,9 @@ function M.transition(state, action, refresh, settled, admitted, method)
       remove()
       local message = result.error ~= vim.NIL and result.error or nil
       if result.state == "failed" or result.state == "outcome_unknown" then
-        message = message or "Task transition failed"
+        message = message or (result.state == "outcome_unknown"
+          and "Task outcome could not be confirmed. Inspect the original operation before retrying."
+          or "Task transition failed")
         diagnostic.set(state, "execution_notice", message, { owner = identity, category = result.state,
           severity = result.state == "failed" and "error" or "warning", recovery = "inspect" })
         state.execution_notice_operation = { id = operation.id, message = message }
@@ -190,40 +201,7 @@ function M.transition(state, action, refresh, settled, admitted, method)
   end
   operation.receive = receive
   client.request({ session_id = session_id, method = method or "session.command.apply", params = action }, receive)
-  local function poll(owner)
-    if operation.poll_owner ~= owner then return end
-    if not current() or state.host_error then return end
-    if not operation.poll_pending then
-      operation.poll_pending = true
-      client.request({ session_id = session_id, method = "session.command.operation.get", params = { operation_id = identity } }, function(result, failure)
-        operation.poll_pending = false
-        if not current() then return end
-        if failure then
-          local notice = "Retrying task status: " .. failure
-          operation.poll_error = notice
-          diagnostic.set(state, "execution_notice", notice, { owner = identity, category = "poll", severity = "info" })
-          refresh()
-          return
-        end
-        if operation.poll_error and state.execution_notice == operation.poll_error then state.execution_notice = nil end
-        operation.poll_error = nil
-        receive(result, failure)
-      end)
-    end
-    vim.defer_fn(function() poll(owner) end, 2000)
-  end
-  operation.poll = function()
-    operation.poll_owner = {}
-    poll(operation.poll_owner)
-  end
-  vim.defer_fn(function()
-    if current() and operation.state == "submitting" then
-      diagnostic.set(state, "execution_notice", "Task acknowledgement unknown. Checking the original operation.",
-        { owner = identity, category = "uncertain", severity = "info" })
-      refresh()
-    end
-    operation.poll()
-  end, 10000)
+
 end
 
 ---@param state table

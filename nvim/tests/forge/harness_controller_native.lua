@@ -5,6 +5,7 @@ local controller = require("forge.views.harness.controller")
 local original_request, original_subscribe, original_generation = client.request, client.session_events_subscribe, client.host_get_generation
 local original_accepting = client.host_is_accepting
 local original_completion = package.loaded["blink.cmp"]
+local original_plan_question = package.loaded["forge.views.harness.plan_question"]
 local completion_visible = false
 package.loaded["blink.cmp"] = { hide = function() completion_visible = false end }
 client.host_is_accepting = function() return true end
@@ -101,6 +102,42 @@ local success, failure = xpcall(function()
   controller.activate_snapshot({ session = state.session, access_abbreviation = "rxwx" })
   assert(not state.initial_snapshot_pending, "initial snapshot did not release startup presentation")
   assert(vim.wait(1000, function() return state.presentation and state.presentation.ready end))
+  local previous_status = state.status
+  local approval = { owner = "plan_review", plan_id = "review-plan", elicitation = {
+    revision = 1, answer_revision = 1, question_set = { id = "approval-questions", questions = {
+      { id = "mode", header = "Tool approval", question = "Which mode?", allow_freeform = false,
+        options = { { label = "ask", description = "Ask for approval" }, { label = "deny", description = "Deny requests" } } },
+    } },
+    answer = { { question_id = "mode", response = { kind = "selected", option = "ask" }, source = "user" } },
+  } }
+  local opened, approval_callbacks
+  package.loaded["forge.views.harness.plan_question"] = { open = function(elicitation, callbacks)
+    assert(elicitation == approval.elicitation)
+    opened = (opened or 0) + 1
+    approval_callbacks = callbacks
+  end }
+  local live_request = client.request
+  client.request = function(specification, callback)
+    assert(specification.method == "session.document", "approval dialog dismissal sent a lifecycle RPC: " .. specification.method)
+    return live_request(specification, callback)
+  end
+  state.active_elicitation = approval
+  controller.present_plan_question(true)
+  assert(state.plan_question_open and opened == 1)
+  receive("document_changed", { session_id = "native-controller", revision = state.timeline_revision or 0,
+    status = { kind = "awaiting_plan_review" } }, "native-controller")
+  assert(state.plan_question_open and state.active_elicitation == approval, "answered review status discarded its explicit confirmation UI")
+  approval_callbacks.closed()
+  assert(not state.plan_question_open and state.active_elicitation == approval)
+  assert(approval.elicitation.answer[1].response.option == "ask", "dialog dismissal discarded committed answers")
+  approval.owner = "plan_acceptance"
+  controller.present_plan_question(true)
+  assert(state.plan_question_open and opened == 2, "dismissed approval questions could not reopen")
+  approval_callbacks.closed()
+  state.active_elicitation, state.presented_question_key = nil, nil
+  state.status = previous_status
+  client.request = live_request
+  package.loaded["forge.views.harness.plan_question"] = original_plan_question
   state.access_abbreviation = nil
   local null_snapshot = vim.json.decode([[{
     "goal": null, "goal_execution": null, "active_plan": null,
@@ -639,18 +676,15 @@ local success, failure = xpcall(function()
   assert(child_request[#child_request].params.target == "child",
     "approval interruption must ignore the selected timeline and target its owner")
   receive("provider_event", {kind="approval_cancelled",data={id=child_permission.id}},"native-controller")
-  local original_transition = controller.task_transition
-  local root_interruption
-  controller.task_transition = function(action) root_interruption=action end
+  state.cancel_requested = false
   local root_permission = vim.deepcopy(permission)
   root_permission.id = "root-approval"
   root_permission.execution_owner = {session_id="native-controller",agent_id="native-controller:agent:primary"}
   receive("provider_event", {kind="approval_requested",data=root_permission},"native-controller")
   assert(vim.wait(1000,approval_view.is_open))
   vim.fn.maparg(interrupt_key,"n",false,true).callback()
-  assert(root_interruption and root_interruption.action == "pause",
+  assert(child_request[#child_request].method == "session.turn.cancel",
     "root approval interruption must remain root-owned while a child is selected")
-  controller.task_transition = original_transition
   receive("provider_event", {kind="approval_cancelled",data={id=root_permission.id}},"native-controller")
   client.request = original_plain_request
   client.request = child_request_for
@@ -748,6 +782,7 @@ if state.working_timer then state.working_timer:stop() state.working_timer:close
 client.request, client.session_events_subscribe, client.host_get_generation = original_request, original_subscribe, original_generation
 client.host_is_accepting = original_accepting
 package.loaded["blink.cmp"] = original_completion
+package.loaded["forge.views.harness.plan_question"] = original_plan_question
 if not success then
   print(failure)
   vim.cmd("cquit 1")

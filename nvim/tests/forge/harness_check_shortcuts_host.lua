@@ -1,4 +1,5 @@
 vim.loader.enable(false)
+local check_tool = dofile(vim.fn.getcwd() .. "/nvim/tests/forge/fixtures/check_tool.lua")
 vim.opt.runtimepath:prepend(vim.fs.normalize(vim.fn.getcwd()) .. "/nvim")
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
@@ -33,7 +34,7 @@ local function press(key)
   mapping.callback()
 end
 local function start_check()
-  local run_id = request("session.check.run", { check = { "slow" } }).run_id
+  local run_id = check_tool.start(request, { check = { "slow" } }).run_id
   assert(vim.wait(5000, function()
     return state.checks_running and state.active_check_run == run_id and rows():find("Shortcut check is running", 1, true)
   end, 10), "check did not become active")

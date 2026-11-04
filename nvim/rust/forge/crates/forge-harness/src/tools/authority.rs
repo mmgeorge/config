@@ -29,24 +29,118 @@ impl PermissionAuthoritySnapshot {
     }
 }
 
+/// Share only owner-confirmed revision advancement within one immutable invocation.
+#[derive(Debug)]
+pub(crate) struct TaskAuthorityProgress {
+    current: std::sync::Mutex<TaskPermit>,
+}
+
+impl TaskAuthorityProgress {
+    pub(crate) fn new(permit: TaskPermit) -> Self {
+        Self {
+            current: std::sync::Mutex::new(permit),
+        }
+    }
+    pub(crate) fn permit(&self) -> Result<TaskPermit> {
+        Ok(self
+            .current
+            .lock()
+            .map_err(|_| anyhow::anyhow!("task authority progress lock poisoned"))?
+            .clone())
+    }
+}
+
 /// Preserves the task contract that admitted a provider callback across asynchronous waits.
 #[derive(Clone)]
 pub(crate) struct TaskAuthority {
     controller: Option<Arc<SessionTaskController>>,
     permit: Option<TaskPermit>,
+    progress: Option<Arc<TaskAuthorityProgress>>,
     generation: Option<u64>,
     permission_snapshot: Option<PermissionAuthoritySnapshot>,
     permission_required: bool,
 }
 
 impl TaskAuthority {
+    /// Check that a callback is being committed by the exact session task controller that admitted it.
+    pub(crate) fn belongs_to(&self, controller: &Arc<SessionTaskController>) -> bool {
+        self.controller
+            .as_ref()
+            .is_some_and(|captured| Arc::ptr_eq(captured, controller))
+    }
+
+    /// Get the captured task attribution without granting authority to a replacement task.
+    pub(crate) fn task_id(&self) -> Option<&crate::task::TaskId> {
+        self.permit.as_ref().map(TaskPermit::task_id)
+    }
+
     pub(crate) fn capture(context: &super::ControlTurnContext) -> Option<Self> {
         context.task_controller.as_ref().map(|_| Self {
             controller: context.task_controller.clone(),
             permit: context.task_permit.clone(),
+            progress: context.task_authority_progress.clone(),
             generation: context.task_generation,
             permission_snapshot: context.permission_snapshot.clone(),
             permission_required: context.permission_required,
+        })
+    }
+
+    pub(crate) fn current_permit(&self) -> Result<Option<TaskPermit>> {
+        self.progress
+            .as_ref()
+            .map(|progress| progress.permit())
+            .transpose()
+            .map(|permit| permit.or_else(|| self.permit.clone()))
+    }
+
+    /// Adopt only a revision explicitly returned by this invocation's live owner commit.
+    pub(crate) fn advance(&self, next: TaskPermit) -> Result<()> {
+        let progress = self
+            .progress
+            .as_ref()
+            .context("invocation has no task authority progress")?;
+        let previous = progress.permit()?;
+        ensure!(
+            previous.receipt() == next.receipt(),
+            "live task authority changed observation generation"
+        );
+        let controller = self
+            .controller
+            .as_ref()
+            .context("task authority has no controller")?;
+        let generation = self
+            .generation
+            .context("task callback generation was not captured")?;
+        controller.with_callback_authority(generation, Some(&next), || {
+            if self.permission_required && self.permission_snapshot.is_none() {
+                anyhow::bail!("permission authority was not captured");
+            }
+            let permission = self
+                .permission_snapshot
+                .as_ref()
+                .map(|snapshot| -> Result<_> {
+                    let guard = snapshot
+                        .store
+                        .read()
+                        .map_err(|_| anyhow::anyhow!("permission authority lock poisoned"))?;
+                    ensure!(
+                        guard.revocation_epoch() == snapshot.epoch,
+                        "permission authority changed before task advancement"
+                    );
+                    Ok(guard)
+                })
+                .transpose()?;
+            let mut current = progress
+                .current
+                .lock()
+                .map_err(|_| anyhow::anyhow!("task authority progress lock poisoned"))?;
+            ensure!(
+                current.receipt() == next.receipt(),
+                "task authority advancement lost its invocation"
+            );
+            *current = next.clone();
+            drop(permission);
+            Ok(())
         })
     }
 
@@ -97,7 +191,13 @@ impl TaskAuthority {
         let generation = self
             .generation
             .context("task callback generation was not captured")?;
-        controller.with_callback_authority(generation, self.permit.as_ref(), || {
+        let permit = self
+            .progress
+            .as_ref()
+            .map(|progress| progress.permit())
+            .transpose()?
+            .or_else(|| self.permit.clone());
+        controller.with_callback_authority(generation, permit.as_ref(), || {
             if self.permission_required && self.permission_snapshot.is_none() {
                 anyhow::bail!("permission authority was not captured");
             }
@@ -127,6 +227,48 @@ impl TaskAuthority {
 mod test {
     use super::*;
     use crate::task::{Task, TaskChange};
+
+    /// Only an owner-confirmed revision within the original observation fence reaches sibling callbacks.
+    #[test]
+    fn owner_confirmation_advances_shared_task_authority_without_following_user_control()
+    -> Result<()> {
+        let (_root, mut store, controller) = SessionTaskController::test_goal();
+        let initial = controller.current()?.unwrap();
+        let mut context =
+            super::super::ControlTurnContext::inactive(crate::provider::PromptMode::Chat);
+        context.task_controller = Some(controller.clone());
+        context.task_permit = Some(initial.permit());
+        context.task_generation = Some(controller.callback_snapshot()?.0);
+        context.bind_task_authority_progress();
+        let tools = TaskAuthority::capture(&context).unwrap();
+        let permissions = tools.clone();
+        controller.update(&mut store, &initial.permit(), 2, |task| {
+            let crate::task::WorkflowSnapshot::Goal { goal } = &mut task.workflow else {
+                unreachable!()
+            };
+            goal.objective.push_str(" with committed detail");
+            Ok(())
+        })?;
+        assert!(
+            tools.validate_scope().is_err(),
+            "state changes alone cannot advance callback authority"
+        );
+        let advanced = controller.current()?.unwrap();
+        tools.advance(advanced.permit())?;
+        permissions.validate_scope()?;
+        assert_eq!(
+            context.current_task_permit()?.unwrap().revision(),
+            &advanced.revision
+        );
+        controller.change(&mut store, Some(&advanced.revision), TaskChange::Pause, 3)?;
+        let paused = controller.current()?.unwrap();
+        assert!(
+            tools.advance(paused.permit()).is_err(),
+            "user control must not be adopted as owner progress"
+        );
+        assert!(permissions.validate_scope().is_err());
+        Ok(())
+    }
 
     /// Keep typed callback failures intact and reject revoked authority before invoking control.
     #[test]
@@ -216,6 +358,57 @@ mod test {
             3,
         )?;
         pending.validate()?;
+        Ok(())
+    }
+
+    /// Dispatched callbacks may precede native acknowledgment without granting unscoped control.
+    #[test]
+    fn dispatched_callback_preserves_pending_receipt_and_rejects_revocation() -> Result<()> {
+        let (_root, mut store, controller) = SessionTaskController::test_goal();
+        let original = controller.current()?.unwrap();
+        let mut pending = Task::goal(
+            "Pending native receipt".into(),
+            Default::default(),
+            false,
+            2,
+        );
+        pending.request_entry("Run the admitted task".into(), 2)?;
+        let pending = controller
+            .change(
+                &mut store,
+                Some(&original.revision),
+                TaskChange::Install(Box::new(pending)),
+                2,
+            )?
+            .unwrap();
+        let mut context = super::super::ControlTurnContext::inactive(
+            crate::provider::PromptMode::GoalContinuation,
+        );
+        context.task_controller = Some(controller.clone());
+        context.task_permit = Some(pending.permit());
+        context.task_generation = Some(controller.callback_snapshot()?.0);
+        let authority = TaskAuthority::capture(&context).unwrap();
+        assert!(controller.admit(crate::task::TaskKind::Goal).is_err());
+        assert!(authority.validate().is_err());
+        authority.validate_scope()?;
+        let mut invocation = super::super::ControlToolInvocation {
+            call_id: None,
+            name: "goal_status".into(),
+            arguments: serde_json::json!({}),
+            task_permit: None,
+        };
+        invocation.admit_turn_control(Some(&controller), Some(&pending.permit()), context.mode)?;
+        assert!(
+            !controller.current()?.unwrap().entry_accepted(),
+            "callback must not fabricate a native receipt"
+        );
+        controller.change(&mut store, Some(&pending.revision), TaskChange::Pause, 3)?;
+        assert!(authority.validate_scope().is_err());
+        assert!(
+            invocation
+                .admit_turn_control(Some(&controller), Some(&pending.permit()), context.mode)
+                .is_err()
+        );
         Ok(())
     }
 
@@ -336,7 +529,7 @@ mod test {
             .await?;
         waiting.await??;
         assert!(!Arc::ptr_eq(&old, &permissions.read().unwrap().compiled()));
-        let question = executor.execute(super::super::ControlToolInvocation {
+        let question = executor.execute(super::super::ControlToolInvocation { call_id: None,
             task_permit: None,
             name: "question_ask".into(),
             arguments: serde_json::json!({"questions":[{"header":"Choice", "question":"What should happen?", "options":[]}]}),
@@ -345,6 +538,7 @@ mod test {
         drop(question);
         assert_eq!(questions.snapshot()?.questions.len(), 1);
         let invocation = || super::super::ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "goal_status".into(),
             arguments: serde_json::json!({"status":"working"}),

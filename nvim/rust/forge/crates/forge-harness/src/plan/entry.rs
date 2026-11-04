@@ -37,13 +37,13 @@ impl PlanFileStore {
             document.title = request.lines().next().unwrap_or_default().into();
             document.overview = request.clone();
         }
-        let working_path =
-            self.create_working_document(session_id, &document.plan_id, &document)?;
         let instruction = if checks_ready {
             PlanPrompt::with_active_document(PlanPrompt::draft(&request), &document.model_json()?)
         } else {
             PlanPrompt::checks_setup(&request)
         };
+        let working_path =
+            self.create_working_document(session_id, &document.plan_id, &document)?;
         Ok(PreparedPlan {
             record: PlanRecord {
                 id: document.plan_id,
@@ -65,7 +65,7 @@ impl PlanFileStore {
                 review_digest: None,
                 accepted_digest: None,
                 elicitation: None,
-                acceptance: None,
+                review: None,
                 question_ledger: Default::default(),
                 generation: Default::default(),
                 validation_warning: Vec::new(),

@@ -1,4 +1,5 @@
 vim.loader.enable(false)
+local check_tool = dofile(vim.fn.getcwd() .. "/nvim/tests/forge/fixtures/check_tool.lua")
 local root = vim.fs.normalize(vim.fn.getcwd())
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
@@ -53,7 +54,7 @@ local succeeded, failure = xpcall(function()
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), table.concat(errors, "\n"))
   assert(request("session.check.list").configured)
-  local id = request("session.check.run", { check = "package-tests", inputs = {
+  local id = check_tool.start(request, { check = "package-tests", inputs = {
       package = "first", test = "selected",
   } }).run_id
   local run

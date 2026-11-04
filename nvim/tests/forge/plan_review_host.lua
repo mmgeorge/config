@@ -169,7 +169,7 @@ local success, failure = xpcall(function()
   local method = request_specification.method
   local params = request_specification.params or {}
 
-    if method == "session.plan.acceptance.begin" then submitted_capture = vim.deepcopy(params) end
+    if method == "session.plan.accept" then submitted_capture = vim.deepcopy(params) end
     return original_request(request_specification, callback)
   end
   review.owner.annotation_saving, review.owner.saving = true, true

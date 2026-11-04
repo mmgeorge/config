@@ -406,19 +406,26 @@ impl BackgroundManager {
                 }
             }
         }
-        if matches!(observation, ObservationContinuity::Reliable)
-            && let Err(error) = broker.finalize_observed_execution().await
-        {
-            let _ = broker.background_failure("continuation_settlement", format!("{error:#}"));
-            report(
-                &request.delivery,
-                &session_id,
-                format!("Background continuation settlement failed: {error:#}"),
-            )
-            .await;
-        }
+        let settled = if matches!(observation, ObservationContinuity::Reliable) {
+            match broker.finalize_observed_execution().await {
+                Ok(_) => true,
+                Err(error) => {
+                    let _ =
+                        broker.background_failure("continuation_settlement", format!("{error:#}"));
+                    report(
+                        &request.delivery,
+                        &session_id,
+                        format!("Background continuation settlement failed: {error}"),
+                    )
+                    .await;
+                    false
+                }
+            }
+        } else {
+            false
+        };
         if succeeded
-            && matches!(observation, ObservationContinuity::Reliable)
+            && settled
             && !native_compaction_observed
             && let Err(error) = broker.auto_compact().await
         {
@@ -426,11 +433,11 @@ impl BackgroundManager {
             report(
                 &request.delivery,
                 &session_id,
-                format!("Background compaction failed: {error:#}"),
+                format!("Background compaction failed: {error}"),
             )
             .await;
         }
-        if !succeeded || !matches!(observation, ObservationContinuity::Reliable) {
+        if !succeeded || !settled {
             let removed = self.retained.lock().await.remove(&key);
             if let Some(removed) = removed
                 && let Err(error) = self.retire(removed).await

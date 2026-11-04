@@ -15,7 +15,7 @@ use std::{
     },
 };
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 /// Retains user-selected check states independently of the project configuration.
 pub(crate) struct CheckOverrides {
@@ -173,6 +173,25 @@ impl CheckToolScope {
     }
 
     pub(crate) async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {
+        self.invoke_inner(name, arguments, None).await
+    }
+
+    /// Preserve authenticated host tool identity when requesting owner-controlled check work.
+    pub(crate) async fn invoke_with_identity(
+        &self,
+        name: &str,
+        arguments: Value,
+        identity: forge_provider_api::control::ToolCallId,
+    ) -> Result<String> {
+        self.invoke_inner(name, arguments, Some(identity)).await
+    }
+
+    async fn invoke_inner(
+        &self,
+        name: &str,
+        arguments: Value,
+        identity: Option<forge_provider_api::control::ToolCallId>,
+    ) -> Result<String> {
         if let Some(authority) = &self.task_authority {
             authority.validate_scope()?;
         }
@@ -337,6 +356,10 @@ impl CheckToolScope {
                 let request = RunRequest::try_from(serde_json::from_value::<
                     super::CheckRunRequest,
                 >(arguments)?)?;
+                let call_id = identity
+                    .clone()
+                    .context("check_run requires authenticated tool-call identity")?;
+                let retained_request = request.clone();
                 let run = self.runner.prepare_request(
                     self.runner
                         .exchange_owner(self.scope.exchange_id.as_str())?,
@@ -350,7 +373,9 @@ impl CheckToolScope {
                     self.agent.active_count() == 0,
                     "an agent started during check resolution"
                 );
-                json!({"run_id":self.runner.start_authorized(run, delivery.lifecycle,Some(Arc::clone(&self.cancelled)),self.task_authority.as_ref()).await?})
+                json!({"run_id":self.runner.owner_sender()?.start(
+                    self.scope.clone(), call_id, retained_request, run, delivery.lifecycle, Arc::clone(&self.cancelled),
+                ).await?})
             }
             "check_status" => {
                 let id = arguments["run_id"].as_str().context("run_id is required")?;
@@ -367,7 +392,10 @@ impl CheckToolScope {
             }
             "check_cancel" => {
                 let id = arguments["run_id"].as_str().context("run_id is required")?;
-                self.runner.cancel(id)?;
+                self.runner
+                    .owner_sender()?
+                    .cancel(self.scope.clone(), id.to_owned())
+                    .await?;
                 json!({"run_id":id,"cancellation_requested":true})
             }
             _ => anyhow::bail!("unknown checks tool"),

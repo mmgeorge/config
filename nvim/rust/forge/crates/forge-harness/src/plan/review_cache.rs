@@ -62,6 +62,16 @@ pub(super) struct ReviewCache {
 }
 
 impl ReviewCache {
+    /// Discard derived rendering and validation after filesystem recovery changes the working view.
+    pub(super) fn invalidate(&self) -> Result<()> {
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan cache lock poisoned"))?;
+        *current = None;
+        Ok(())
+    }
+
     /// Reuses validation only for identical canonical bytes at the requested strength.
     pub(super) fn validate(&self, document: &PlanDocument, submitted: bool) -> Result<()> {
         let checksum = digest(&crate::plan::codec::to_vec(document)?);

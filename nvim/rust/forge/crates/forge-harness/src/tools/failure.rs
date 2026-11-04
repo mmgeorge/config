@@ -349,6 +349,30 @@ pub(crate) fn control_tool_failure_json(
                 expected_shape:None,
                 hint:Some("Patch the declaration or its import, then submit the current version again.".into()),
             }).collect())
+    } else if let Some(question_error) = find_error::<crate::exchange::QuestionEventError>(error) {
+        (
+            failure_phase(invocation),
+            question_error.code().into(),
+            vec![ControlToolViolation {
+                path: "<question>".into(),
+                code: question_error.code().into(),
+                message: question_error.to_string(),
+                expected_shape: None,
+                hint: None,
+            }],
+        )
+    } else if let Some(wait_error) = find_error::<crate::question::QuestionWaitError>(error) {
+        (
+            failure_phase(invocation),
+            wait_error.code().into(),
+            vec![ControlToolViolation {
+                path: "<question_wait>".into(),
+                code: wait_error.code().into(),
+                message: wait_error.to_string(),
+                expected_shape: None,
+                hint: None,
+            }],
+        )
     } else if let Some((requested, active)) = plan_id_mismatch(error) {
         (
             failure_phase(invocation),
@@ -537,10 +561,34 @@ fn keyword_shape(error: &ValidationError<'_>, schema: &Value, keyword: &str) -> 
 mod test {
     use super::*;
 
+    /// Owner question failures must keep their typed code and sanitize underlying legacy diagnostics.
+    #[test]
+    fn question_event_failure_uses_typed_code_without_rendering_legacy_cause() {
+        let invocation = ControlToolInvocation {
+            call_id: None,
+            task_permit: None,
+            name: "question_revise".into(),
+            arguments: json!({}),
+        };
+        let error = ToolError::from(crate::exchange::QuestionEventError::Authority(
+            anyhow::anyhow!("native session secret and version conflict text"),
+        ));
+        let output = control_tool_failure_json(&invocation, &error, None);
+        let result: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["code"], "question_authority_unavailable");
+        assert_eq!(
+            result["violation"][0]["code"],
+            "question_authority_unavailable"
+        );
+        assert!(!output.contains("native session secret"));
+        assert!(!output.contains("version conflict"));
+    }
+
     #[test]
     fn typed_conversions_preserve_structured_failure_details() {
         use crate::tools::error::ToolContext;
         let invocation = ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "plan_overview_edit".into(),
             arguments: json!({"plan_id":"plan", "expected_version":1}),
@@ -576,6 +624,7 @@ mod test {
     #[test]
     fn formats_argument_failures_as_json_only() {
         let invocation = ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "harness_plan_edit".to_owned(),
             arguments: json!({ "plan_id": "plan-1", "expected_version": 2 }),
@@ -609,6 +658,7 @@ mod test {
     #[test]
     fn classifies_version_conflicts_with_the_active_version() {
         let invocation = ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "harness_plan_edit".to_owned(),
             arguments: json!({ "plan_id": "plan-1", "expected_version": 2 }),
@@ -630,6 +680,7 @@ mod test {
     #[test]
     fn formats_plan_mutation_errors_with_the_exact_path_and_hint() {
         let invocation = ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "harness_plan_edit".to_owned(),
             arguments: json!({ "plan_id": "plan-1", "expected_version": 2 }),
@@ -699,6 +750,7 @@ mod test {
     #[test]
     fn formats_return_only_expansions_as_actionable_submission_json() {
         let invocation = ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "plan_submit".to_owned(),
             arguments: json!({ "plan_id": "plan-1", "expected_version": 1 }),

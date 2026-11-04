@@ -7,7 +7,17 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod authority;
 mod journal;
+pub(crate) use authority::{InputAuthorityError, input_purpose_is_current};
+pub(crate) use journal::reserve_workflow_input;
+mod rejection;
+pub(crate) use rejection::InputRejection;
+
+/// Distinguish an unavailable retained journal from a missing operation receipt.
+#[derive(Debug, thiserror::Error)]
+#[error("input operation journal is unavailable")]
+pub(crate) struct InputJournalUnavailable;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +33,16 @@ pub enum InputIntent {
 pub enum InputRoute {
     Turn,
     Steering,
+}
+
+/// Require observed queued/claimed content or its bound receipt before updating delivery.
+pub(crate) enum InputDeliveryGuard<'a> {
+    /// Settle local work only while the original unsent revision is still unreserved.
+    Queued(u64),
+    /// Bind a receipt only to the exact input revision claimed before preparation.
+    Claimed(u64),
+    /// Apply later evidence only to the input still bound to this receipt.
+    Receipt(&'a forge_provider_api::SubmissionId),
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -42,11 +62,21 @@ pub enum InputDelivery {
 pub enum InputPurpose {
     #[default]
     User,
+    /// Preserve the exact legacy planning/exchange question selected by the caller.
+    Clarification {
+        target: crate::exchange::command::InputSubmissionTarget,
+    },
     Question {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_revision: Option<u64>,
         question_id: crate::question::QuestionId,
         task_id: Option<String>,
         message_kind: crate::question::QuestionMessageKind,
         reply: forge_provider_api::QuestionReply,
+    },
+    /// Keep taskless continuation tied to the immutable exchange selected before admission.
+    WorkflowContinuation {
+        exchange: crate::exchange::command::ExchangeContinuationSelection,
     },
     QuestionContinuation {
         exchange_id: String,
@@ -144,6 +174,9 @@ pub struct InputUpdate {
     pub suspended: bool,
     pub control_revision: u64,
     pub error: Option<String>,
+    /// Normalized rejection, absent on success and on receipts from older runtimes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error_code: Option<InputRejection>,
     pub prepend: bool,
     pub retracted: Option<String>,
 }
@@ -315,6 +348,15 @@ impl SessionInputQueue {
         }))
     }
 
+    /// Get the immutable admission receipt without pairing an old delta with the current queue revision.
+    pub(crate) fn admission_receipt(
+        &self,
+        id: &str,
+    ) -> std::result::Result<Option<InputUpdate>, InputJournalUnavailable> {
+        let state = self.state.lock().map_err(|_| InputJournalUnavailable)?;
+        Ok(state.operation.get(id).map(|(_, receipt)| receipt.clone()))
+    }
+
     /// Reconcile canonical pending task work after recovery or a revision change.
     /// Provider submission receipts retain delivery authority for the stable message identity.
     pub(crate) fn reconcile_task_input(
@@ -327,9 +369,11 @@ impl SessionInputQueue {
                 ensure!(id.as_str() == message.id, "task input identity changed");
                 revision
             }
-            InputPurpose::User
+            InputPurpose::Clarification { .. }
+            | InputPurpose::User
             | InputPurpose::Question { .. }
-            | InputPurpose::QuestionContinuation { .. } => {
+            | InputPurpose::QuestionContinuation { .. }
+            | InputPurpose::WorkflowContinuation { .. } => {
                 anyhow::bail!("task reconciliation requires task input")
             }
         };
@@ -347,9 +391,11 @@ impl SessionInputQueue {
             let previous_revision = match &previous.purpose {
                 InputPurpose::TaskEntry { revision, .. }
                 | InputPurpose::TaskContinuation { revision, .. } => revision,
-                InputPurpose::User
+                InputPurpose::Clarification { .. }
+                | InputPurpose::User
                 | InputPurpose::Question { .. }
-                | InputPurpose::QuestionContinuation { .. } => {
+                | InputPurpose::QuestionContinuation { .. }
+                | InputPurpose::WorkflowContinuation { .. } => {
                     anyhow::bail!("task input collides with user input")
                 }
             };
@@ -383,7 +429,45 @@ impl SessionInputQueue {
         Ok(Some(update))
     }
 
+    /// Publish an input reservation committed with its owning workflow transaction.
+    pub(crate) fn refresh_workflow_reservation(&self) -> Result<()> {
+        let mut retained = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input queue lock poisoned"))?;
+        let journal = self
+            .journal
+            .as_ref()
+            .context("workflow input requires durable storage")?;
+        let (state, _) = journal
+            .lock()
+            .map_err(|_| anyhow::anyhow!("input journal lock poisoned"))?
+            .load()?;
+        *retained = state;
+        self.changed.notify_one();
+        Ok(())
+    }
+
     pub fn apply(&self, operation: InputOperation) -> Result<InputUpdate> {
+        self.apply_with_retry_evidence(operation, None)
+    }
+
+    /// Re-enable uncertain input only with retained proof of non-acceptance.
+    /// Validate revision and receipt identity again under the input commit lock.
+    pub(crate) fn retry_reconciled(
+        &self,
+        operation: InputOperation,
+        evidence: &crate::provider::submission::SubmissionRecord,
+    ) -> Result<InputUpdate> {
+        self.apply_with_retry_evidence(operation, Some(evidence))
+    }
+
+    /// Validate a complete candidate before atomically publishing input and command receipts.
+    fn apply_with_retry_evidence(
+        &self,
+        operation: InputOperation,
+        evidence: Option<&crate::provider::submission::SubmissionRecord>,
+    ) -> Result<InputUpdate> {
         ensure!(
             !operation.id.is_empty(),
             "input operation identity is required"
@@ -408,20 +492,28 @@ impl SessionInputQueue {
             ..Default::default()
         };
         // Validate the complete edit before changing any message in the queue.
+        let mut candidate = state.snapshot.clone();
         let validation = if let InputAction::Submit { message } = &operation.action
             && state.submitted.contains(&message.id)
         {
-            Err(anyhow::anyhow!("message identity was already submitted"))
+            Err(InputRejection::AlreadySubmitted)
         } else {
-            Self::validate(&state.snapshot, &operation)
+            Self::validate_retry_evidence(&mut candidate, &operation, evidence)
+                .and_then(|()| Self::validate(&candidate, &operation))
         };
+        if validation.is_ok() {
+            state.snapshot = candidate;
+        }
         if validation.is_ok()
             && let InputAction::Submit { message } = &operation.action
         {
             state.submitted.insert(message.id.clone());
         }
         match validation {
-            Err(error) => update.error = Some(format!("{error:#}")),
+            Err(error) => {
+                update.error = Some(error.to_string());
+                update.error_code = Some(error);
+            }
             Ok(()) => Self::apply_action(
                 &mut state.snapshot,
                 operation.action,
@@ -440,61 +532,97 @@ impl SessionInputQueue {
         Ok(update)
     }
 
-    fn validate(snapshot: &InputSnapshot, operation: &InputOperation) -> Result<()> {
+    /// Apply receipt proof to a private draft; never expose a partial reconciliation.
+    fn validate_retry_evidence(
+        snapshot: &mut InputSnapshot,
+        operation: &InputOperation,
+        evidence: Option<&crate::provider::submission::SubmissionRecord>,
+    ) -> Result<(), InputRejection> {
+        let Some(evidence) = evidence else {
+            return Ok(());
+        };
+        let InputAction::Retry { id, revision } = &operation.action else {
+            return Err(InputRejection::DeliveryUnconfirmed);
+        };
+        if !matches!(
+            evidence.delivery,
+            crate::provider::submission::SubmissionState::Prepared
+                | crate::provider::submission::SubmissionState::Cancelled
+        ) {
+            return Err(InputRejection::DeliveryUnconfirmed);
+        }
+        let message = snapshot
+            .messages
+            .iter_mut()
+            .find(|message| message.id == *id)
+            .ok_or(InputRejection::InputMissing)?;
+        if message.revision != *revision
+            || message.submission_id.as_deref() != Some(evidence.id.as_str())
+        {
+            return Err(InputRejection::RevisionChanged);
+        }
+        if message.delivery == InputDelivery::Unknown {
+            message.delivery = InputDelivery::Failed;
+        }
+        Ok(())
+    }
+
+    fn validate(
+        snapshot: &InputSnapshot,
+        operation: &InputOperation,
+    ) -> Result<(), InputRejection> {
         match &operation.action {
             InputAction::Retry { id, revision } => {
                 let message = Self::editable(snapshot, id, *revision)?;
-                ensure!(
-                    message.delivery == InputDelivery::Failed,
-                    "only a definitely unsent message can be retried"
-                );
-                ensure!(
-                    message.reservation.is_none(),
-                    "finish editing the message before retrying"
-                );
+                if message.delivery != InputDelivery::Failed {
+                    return Err(InputRejection::DeliveryUnconfirmed);
+                }
+                if message.reservation.is_some() {
+                    return Err(InputRejection::EditInProgress);
+                }
             }
-            InputAction::Resume => ensure!(
-                snapshot.control_revision == operation.control_revision,
-                "delivery control changed before resume"
-            ),
+            InputAction::Resume => {
+                if snapshot.control_revision != operation.control_revision {
+                    return Err(InputRejection::ControlChanged);
+                }
+            }
             InputAction::Submit { message } => {
-                ensure!(
-                    !message.id.is_empty()
-                        && (!message.text.trim().is_empty() || message.config.is_some()),
-                    "message identity and text are required"
-                );
-                ensure!(
-                    !snapshot.messages.iter().any(|entry| entry.id == message.id),
-                    "message already exists"
-                );
+                if message.id.is_empty()
+                    || message.text.trim().is_empty() && message.config.is_none()
+                {
+                    return Err(InputRejection::MissingContent);
+                }
+                if snapshot.messages.iter().any(|entry| entry.id == message.id) {
+                    return Err(InputRejection::AlreadyQueued);
+                }
             }
             InputAction::Reserve {
                 id,
                 revision,
                 reservation,
             } => {
-                ensure!(
-                    !reservation.is_empty(),
-                    "edit reservation identity is required"
-                );
+                if reservation.is_empty() {
+                    return Err(InputRejection::MissingEditIdentity);
+                }
                 let message = Self::editable(snapshot, id, *revision)?;
-                ensure!(
-                    message
-                        .reservation
-                        .as_ref()
-                        .is_none_or(|owner| owner == reservation),
-                    "message is being edited by another owner"
-                );
+                if message
+                    .reservation
+                    .as_ref()
+                    .is_some_and(|owner| owner != reservation)
+                {
+                    return Err(InputRejection::EditOwned);
+                }
             }
             InputAction::Commit { reservation, edits } => {
                 let mut seen = std::collections::HashSet::new();
                 for edit in edits {
-                    ensure!(seen.insert(&edit.id), "edit repeats a message");
+                    if !seen.insert(&edit.id) {
+                        return Err(InputRejection::DuplicateEdit);
+                    }
                     let message = Self::editable(snapshot, &edit.id, edit.revision)?;
-                    ensure!(
-                        message.reservation.as_ref() == Some(reservation),
-                        "edit reservation is no longer owned"
-                    );
+                    if message.reservation.as_ref() != Some(reservation) {
+                        return Err(InputRejection::EditExpired);
+                    }
                 }
             }
             InputAction::Release { .. } => {}
@@ -651,7 +779,11 @@ impl SessionInputQueue {
             return Ok(None);
         };
         let message = &snapshot.messages[index];
-        if snapshot.suspended
+        if (snapshot.suspended
+            && !matches!(
+                message.purpose,
+                InputPurpose::Question { .. } | InputPurpose::Clarification { .. }
+            ))
             || snapshot
                 .messages
                 .iter()
@@ -681,7 +813,17 @@ impl SessionInputQueue {
             let steering_precedes_queue = route == InputRoute::Steering
                 && previous.intent == InputIntent::Queue
                 && previous.delivery == InputDelivery::Queued;
-            if user_precedes_continuation || steering_precedes_queue {
+            let question_precedes_suspended = snapshot.suspended
+                && matches!(
+                    message.purpose,
+                    InputPurpose::Question { .. } | InputPurpose::Clarification { .. }
+                )
+                && !matches!(
+                    previous.purpose,
+                    InputPurpose::Question { .. } | InputPurpose::Clarification { .. }
+                );
+            if user_precedes_continuation || steering_precedes_queue || question_precedes_suspended
+            {
                 return false;
             }
             !matches!(
@@ -696,10 +838,14 @@ impl SessionInputQueue {
         message.route = Some(route);
         message.revision += 1;
         let claimed = message.clone();
+        Self::advance(snapshot, &mut InputUpdate::default());
         self.commit(&mut retained, state)?;
+        drop(retained);
+        self.changed.notify_one();
         Ok(Some(claimed))
     }
 
+    #[cfg(test)]
     pub fn delivery(
         &self,
         id: &str,
@@ -707,6 +853,31 @@ impl SessionInputQueue {
         submission_id: Option<String>,
         error: Option<String>,
     ) -> Result<InputUpdate> {
+        self.delivery_matching(id, None, delivery, submission_id, error)?
+            .context("unconditional input delivery must produce an update")
+    }
+
+    /// Commit a delivery fact only while its original input/receipt authority still matches.
+    pub(crate) fn delivery_if_current(
+        &self,
+        id: &str,
+        guard: InputDeliveryGuard<'_>,
+        delivery: Option<InputDelivery>,
+        submission_id: Option<String>,
+        error: Option<String>,
+    ) -> Result<Option<InputUpdate>> {
+        self.delivery_matching(id, Some(guard), delivery, submission_id, error)
+    }
+
+    /// Check authority and commit the queue mutation within the same journal lock.
+    fn delivery_matching(
+        &self,
+        id: &str,
+        guard: Option<InputDeliveryGuard<'_>>,
+        delivery: Option<InputDelivery>,
+        submission_id: Option<String>,
+        error: Option<String>,
+    ) -> Result<Option<InputUpdate>> {
         let mut retained = self
             .state
             .lock()
@@ -718,20 +889,43 @@ impl SessionInputQueue {
             .iter()
             .position(|message| message.id == id)
         else {
-            return Ok(InputUpdate {
+            if guard.is_some() {
+                return Ok(None);
+            }
+            return Ok(Some(InputUpdate {
                 revision: state.snapshot.revision,
                 snapshot: Some(state.snapshot.clone()),
                 ..Default::default()
-            });
+            }));
         };
+        if let Some(guard) = guard {
+            let message = &state.snapshot.messages[index];
+            let matches = match guard {
+                InputDeliveryGuard::Queued(revision) => {
+                    message.revision == revision
+                        && message.delivery == InputDelivery::Queued
+                        && message.reservation.is_none()
+                        && message.submission_id.is_none()
+                }
+                InputDeliveryGuard::Claimed(revision) => {
+                    message.revision == revision && message.delivery == InputDelivery::Delivering
+                }
+                InputDeliveryGuard::Receipt(receipt) => {
+                    message.submission_id.as_deref() == Some(receipt.as_str())
+                }
+            };
+            if !matches {
+                return Ok(None);
+            }
+        }
         let mut update = InputUpdate::default();
         if state.snapshot.messages[index].delivery == InputDelivery::Accepted && delivery.is_some()
         {
-            return Ok(InputUpdate {
+            return Ok(Some(InputUpdate {
                 revision: state.snapshot.revision,
                 snapshot: Some(state.snapshot.clone()),
                 ..Default::default()
-            });
+            }));
         }
         if let Some(delivery) = delivery {
             let message = &mut state.snapshot.messages[index];
@@ -748,7 +942,7 @@ impl SessionInputQueue {
         self.commit(&mut retained, state)?;
         drop(retained);
         self.changed.notify_one();
-        Ok(update)
+        Ok(Some(update))
     }
 
     /// Acknowledge an already accepted provider retry and its removal in one transaction.
@@ -802,27 +996,26 @@ impl SessionInputQueue {
         Ok(update)
     }
 
+    /// Validate the selected input and revision before permitting content mutation.
     fn editable<'state>(
         snapshot: &'state InputSnapshot,
         id: &str,
         revision: u64,
-    ) -> Result<&'state InputMessage> {
+    ) -> Result<&'state InputMessage, InputRejection> {
         let message = snapshot
             .messages
             .iter()
             .find(|entry| entry.id == id)
-            .context("message was already delivered or removed")?;
-        ensure!(
-            message.revision == revision,
-            "message changed before the edit was accepted"
-        );
-        ensure!(
-            matches!(
-                message.delivery,
-                InputDelivery::Queued | InputDelivery::Failed
-            ),
-            "message delivery has already started"
-        );
+            .ok_or(InputRejection::InputMissing)?;
+        if message.revision != revision {
+            return Err(InputRejection::RevisionChanged);
+        }
+        if !matches!(
+            message.delivery,
+            InputDelivery::Queued | InputDelivery::Failed
+        ) {
+            return Err(InputRejection::DeliveryStarted);
+        }
         Ok(message)
     }
 

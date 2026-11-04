@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use self::edit_trace::{PlanEditTrace, measure};
 use crate::session::{ApprovalMode, continuation::ContinuationBudget};
 
+mod artifact_recovery;
 mod audit;
 mod comment_lint;
 pub(crate) mod conformance;
@@ -33,6 +34,10 @@ mod design_review;
 mod deviation;
 mod document;
 mod entry;
+mod question_answer;
+pub(crate) use question_answer::{
+    PlanQuestionAnswerCommit, PlanQuestionAnswerError, PlanQuestionAnswerRequest, PlanQuestionOwner,
+};
 mod review_alignment;
 mod review_delivery;
 mod review_diff;
@@ -149,8 +154,9 @@ pub struct PlanRecord {
     pub accepted_digest: Option<String>,
     #[serde(default)]
     pub elicitation: Option<PlanElicitation>,
-    #[serde(default)]
-    pub acceptance: Option<PlanAcceptance>,
+    /// Retain revision-scoped review evidence without creating a separate approval lifecycle.
+    #[serde(default, alias = "acceptance")]
+    pub review: Option<PlanReview>,
     #[serde(default)]
     pub question_ledger: PlanQuestionLedger,
     #[serde(default)]
@@ -159,6 +165,20 @@ pub struct PlanRecord {
     pub validation_warning: Vec<PlanViolation>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+impl PlanRecord {
+    /// Get retained user-review questions only while this plan is awaiting review.
+    /// Answered questions remain available for reopening and an explicit execute/continue action.
+    pub fn review_questions(&self) -> Option<&PlanElicitation> {
+        if self.state != PlanState::AwaitingReview {
+            return None;
+        }
+        self.review
+            .as_ref()
+            .map(|review| &review.elicitation)
+            .filter(|questions| !questions.question_set.questions.is_empty())
+    }
 }
 
 /// Defines one durable event in a reviewed plan lifecycle.
@@ -355,6 +375,8 @@ pub struct PlanQuestionWithdrawal {
 /// Tracks an unresolved planning decision set across answers and clarification turns.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanElicitation {
+    #[serde(default, skip_serializing_if = "ElicitationPurpose::is_workflow")]
+    purpose: ElicitationPurpose,
     #[serde(default)]
     /// Retains the original deadline across navigation and host recovery.
     pub deadline: Option<crate::session::InputDeadline>,
@@ -375,10 +397,13 @@ pub struct PlanElicitation {
     pub clarification_active: bool,
 }
 
-/// Owns the durable reviewer decisions required before a plan can execute.
+/// Retain revision-scoped reviewer evidence and questions; presence is not a lifecycle state.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanAcceptance {
+#[serde(from = "StoredPlanReview")]
+pub struct PlanReview {
     pub review_digest: String,
+    /// Identify the approval question without interpreting opaque set or question identities.
+    approval_question_id: String,
     /// Inline feedback captured with the approved source snapshot.
     #[serde(default)]
     pub annotations: Vec<PlanAnnotationInput>,
@@ -388,20 +413,25 @@ pub struct PlanAcceptance {
     #[serde(default)]
     pub saved_source_digest: Option<String>,
     pub approval_mode_list: Vec<ApprovalMode>,
+    /// Preserve execution configuration selected before review questions are answered.
+    #[serde(default)]
+    pub(crate) execution_request: Option<crate::task::command::ExecuteSelection>,
     pub elicitation: PlanElicitation,
 }
 
-impl PlanAcceptance {
-    /// Build acceptance questions from the execution modes exposed by the active provider.
+impl PlanReview {
+    /// Create review questions from the normalized execution approval modes.
     pub fn new(review_digest: String, approval_mode_list: &[ApprovalMode]) -> Result<Self> {
         anyhow::ensure!(
             !approval_mode_list.is_empty(),
             "the active provider exposes no execution mode"
         );
         let mut question_list = Vec::new();
+        let identity = uuid::Uuid::new_v4();
+        let approval_question_id = format!("review-execution-mode:{identity}");
         if !approval_mode_list.is_empty() {
             question_list.push(PlanQuestion {
-                id: "acceptance-execution-mode".into(),
+                id: approval_question_id.clone(),
                 header: "Tool approval".into(),
                 question: "How should execution handle tool approval?".into(),
                 options: approval_mode_list
@@ -417,26 +447,30 @@ impl PlanAcceptance {
             });
         }
         let question_set = PlanQuestionSet {
-            id: "plan-acceptance".into(),
+            id: format!("plan-review:{identity}"),
             questions: question_list,
         }
-        .normalize()?;
+        .normalize_for(ElicitationPurpose::PlanReview)?;
+        let mut elicitation = PlanElicitation::new(question_set);
+        elicitation.require_review_confirmation();
         Ok(Self {
             review_digest,
+            approval_question_id,
             annotations: Vec::new(),
             overall_comment: None,
             saved_source_digest: None,
             approval_mode_list: approval_mode_list.to_vec(),
-            elicitation: PlanElicitation::new(question_set),
+            execution_request: None,
+            elicitation,
         })
     }
 
-    /// Resolve the selected execution boundary only after every acceptance question has an answer.
+    /// Resolve execution approval from the committed answers to this review question set.
     pub fn approval_mode(&self) -> Result<ApprovalMode> {
         if self.approval_mode_list.len() == 1 {
             return Ok(self.approval_mode_list[0]);
         }
-        match selected_option(&self.elicitation, "acceptance-execution-mode")? {
+        match selected_option(&self.elicitation, &self.approval_question_id)? {
             "ask" => Ok(ApprovalMode::Ask),
             "deny" => Ok(ApprovalMode::Deny),
             "allow" => Ok(ApprovalMode::Allow),
@@ -445,16 +479,86 @@ impl PlanAcceptance {
     }
 }
 
+/// Distinguish time-bounded workflow questions from review decisions requiring explicit confirmation.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ElicitationPurpose {
+    #[default]
+    Workflow,
+    PlanReview,
+}
+
+impl ElicitationPurpose {
+    /// Preserve the established wire shape for ordinary workflow elicitation.
+    fn is_workflow(&self) -> bool {
+        *self == Self::Workflow
+    }
+}
+
+/// Decode legacy review evidence while preserving its question identities and committed answers.
+#[derive(Deserialize)]
+struct StoredPlanReview {
+    review_digest: String,
+    #[serde(default = "legacy_approval_question_id")]
+    approval_question_id: String,
+    #[serde(default)]
+    annotations: Vec<PlanAnnotationInput>,
+    #[serde(default)]
+    overall_comment: Option<String>,
+    #[serde(default)]
+    saved_source_digest: Option<String>,
+    approval_mode_list: Vec<ApprovalMode>,
+    #[serde(default)]
+    execution_request: Option<crate::task::command::ExecuteSelection>,
+    elicitation: PlanElicitation,
+}
+
+impl From<StoredPlanReview> for PlanReview {
+    /// Normalize legacy approval data into review evidence without granting execution authority.
+    fn from(stored: StoredPlanReview) -> Self {
+        let StoredPlanReview {
+            review_digest,
+            approval_question_id,
+            annotations,
+            overall_comment,
+            saved_source_digest,
+            approval_mode_list,
+            execution_request,
+            mut elicitation,
+        } = stored;
+        elicitation.require_review_confirmation();
+        Self {
+            review_digest,
+            approval_question_id,
+            annotations,
+            overall_comment,
+            saved_source_digest,
+            approval_mode_list,
+            execution_request,
+            elicitation,
+        }
+    }
+}
+
+/// Preserve the approval question identity used by existing stored review data.
+fn legacy_approval_question_id() -> String {
+    "acceptance-execution-mode".into()
+}
+
 fn selected_option<'a>(elicitation: &'a PlanElicitation, question_id: &str) -> Result<&'a str> {
     let answer = elicitation
         .answer
         .iter()
         .find(|answer| answer.question_id == question_id)
-        .with_context(|| format!("acceptance question {question_id:?} has no answer"))?;
+        .with_context(|| format!("review question {question_id:?} has no answer"))?;
+    anyhow::ensure!(
+        answer.source == crate::session::ResolutionSource::User,
+        "review approval requires an explicit user decision"
+    );
     match &answer.response {
         PlanQuestionResponse::Selected { option, .. } => Ok(option),
         PlanQuestionResponse::Other { .. } | PlanQuestionResponse::Skipped => {
-            anyhow::bail!("acceptance question {question_id:?} requires a selected option")
+            anyhow::bail!("review question {question_id:?} requires a selected option")
         }
     }
 }
@@ -476,13 +580,29 @@ const fn approval_mode_option_description(mode: ApprovalMode) -> &'static str {
 }
 
 impl PlanElicitation {
-    /// Capture the question-set deadline once, excluding explicit plan acceptance.
+    /// Require explicit review confirmation independently of legacy question identifiers.
+    pub(crate) fn require_review_confirmation(&mut self) {
+        self.purpose = ElicitationPurpose::PlanReview;
+        self.deadline = None;
+    }
+
+    /// Report unresolved decisions from their identities rather than the presentation cursor.
+    pub fn has_pending_decisions(&self) -> bool {
+        self.question_set.questions.iter().any(|question| {
+            !self
+                .answer
+                .iter()
+                .any(|answer| answer.question_id == question.id)
+        })
+    }
+
+    /// Capture a workflow deadline while preserving explicit review confirmation.
     pub fn start_timeout(
         &mut self,
         timeout: crate::session::InputTimeout,
         now_ms: i64,
     ) -> Result<()> {
-        if self.question_set.id != "plan-acceptance" {
+        if self.purpose == ElicitationPurpose::Workflow {
             self.deadline = timeout.deadline(now_ms)?;
         }
         Ok(())
@@ -491,8 +611,8 @@ impl PlanElicitation {
     /// Preserve confirmed responses and fill only unanswered questions before automatic submission.
     pub fn expire(&mut self) -> Result<()> {
         anyhow::ensure!(
-            self.question_set.id != "plan-acceptance",
-            "plan acceptance requires user confirmation"
+            self.purpose != ElicitationPurpose::PlanReview,
+            "plan review requires explicit confirmation"
         );
         for question in self.question_set.questions.clone() {
             if self
@@ -527,6 +647,7 @@ impl PlanElicitation {
     /// Build unresolved elicitation state from a normalized provider question set.
     pub fn new(question_set: PlanQuestionSet) -> Self {
         Self {
+            purpose: ElicitationPurpose::Workflow,
             question_set,
             deadline: None,
             resolution_source: crate::session::ResolutionSource::User,
@@ -733,7 +854,12 @@ impl PlanQuestionSet {
     }
 
     /// Assign durable identifiers and validate the question set before persistence.
-    pub fn normalize(mut self) -> Result<Self> {
+    pub fn normalize(self) -> Result<Self> {
+        self.normalize_for(ElicitationPurpose::Workflow)
+    }
+
+    /// Validate option limits from the question's domain purpose instead of an opaque identifier.
+    fn normalize_for(mut self, purpose: ElicitationPurpose) -> Result<Self> {
         anyhow::ensure!(
             !self.questions.is_empty() && self.questions.len() <= 3,
             "planning feedback must contain between one and three questions"
@@ -746,11 +872,13 @@ impl PlanQuestionSet {
                 !question.question.trim().is_empty(),
                 "planning question text cannot be empty"
             );
-            let maximum_option_count = if self.id == "plan-acceptance" { 4 } else { 3 };
+            let option_count = match purpose {
+                ElicitationPurpose::Workflow => 2..=3,
+                ElicitationPurpose::PlanReview => 1..=4,
+            };
             anyhow::ensure!(
-                question.options.is_empty()
-                    || (2..=maximum_option_count).contains(&question.options.len()),
-                "structured planning questions require two or three choices, or four for plan acceptance"
+                question.options.is_empty() || option_count.contains(&question.options.len()),
+                "workflow questions require two or three choices; review questions require one to four"
             );
             for option in &mut question.options {
                 option.recommended |= option.label.to_ascii_lowercase().contains("(recommended)");
@@ -828,7 +956,7 @@ impl From<&PlanRecord> for ArtifactSummary {
 }
 
 /// Represents one raw review comment before Rust resolves its rendered range.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanAnnotationInput {
     pub start_line: u32,
     pub end_line: u32,
@@ -904,15 +1032,44 @@ pub(crate) struct WorkingDocumentGuard<'store> {
     expected: &'store PlanDocument,
 }
 
+/// Permit artifact commits under an already validated working-document lock.
+pub(crate) struct WorkingDocumentCommit<'store> {
+    files: &'store PlanFileStore,
+    session_id: &'store str,
+    plan_id: &'store str,
+}
+
+impl WorkingDocumentCommit<'_> {
+    pub(crate) fn matches(&self, plan: &PlanRecord) -> bool {
+        plan.session_id == self.session_id && plan.id == self.plan_id
+    }
+
+    pub(crate) fn claim_artifacts(&self, plan: &PlanRecord) -> Result<bool> {
+        anyhow::ensure!(
+            self.matches(plan),
+            "artifact commit changed its held document identity"
+        );
+        self.files.claim_plan_artifacts_locked(plan)
+    }
+
+    pub(crate) fn reconcile(&self, plan: &PlanRecord) -> Result<()> {
+        anyhow::ensure!(
+            self.matches(plan),
+            "artifact commit changed its held document identity"
+        );
+        self.files.reconcile_artifact_locked(plan)
+    }
+}
+
 impl WorkingDocumentGuard<'_> {
     /// Validate the complete document and exclude file writers until the dependent commit finishes.
     ///
     /// Task-dependent callers acquire their task mutation gate before entering this method.
-    /// The closure must not mutate the working document or reenter its file store gate.
+    /// Artifact writes use the supplied permit without reentering the held file gate.
     pub(crate) fn commit<Output>(
         self,
         session_id: &str,
-        commit: impl FnOnce() -> Result<Output>,
+        commit: impl FnOnce(&WorkingDocumentCommit<'_>) -> Result<Output>,
     ) -> Result<Output> {
         let gate = self
             .files
@@ -927,7 +1084,11 @@ impl WorkingDocumentGuard<'_> {
         {
             return Err(WorkingDocumentChanged.into());
         }
-        commit()
+        commit(&WorkingDocumentCommit {
+            files: self.files,
+            session_id,
+            plan_id: &self.expected.plan_id,
+        })
     }
 }
 
@@ -997,32 +1158,6 @@ impl PlanFileStore {
         )?);
         cache.insert(reference.object_id.clone(), report.clone());
         Ok(report)
-    }
-
-    /// Restore the accepted working view without overwriting any submitted revision.
-    pub(crate) fn restore_revision(
-        &self,
-        session_id: &str,
-        plan_id: &str,
-        revision: u32,
-    ) -> Result<PlanDocument> {
-        let document = self.read_submitted_document(session_id, plan_id, revision)?;
-        let gate = self.working_document_gate(session_id, plan_id)?;
-        let _guard = gate
-            .lock()
-            .map_err(|_| anyhow::anyhow!("plan mutation gate poisoned"))?;
-        let directory = self.plan_dir(session_id, plan_id);
-        for extension in ["md", "index.json"] {
-            let source = directory
-                .join("revisions")
-                .join(format!("submitted-{revision:04}.{extension}"));
-            write_bytes_atomically(
-                &directory.join(format!("working.{extension}")),
-                &fs::read(source)?,
-            )?;
-        }
-        self.write_working_document_locked(session_id, plan_id, &document)?;
-        Ok(document)
     }
 
     /// Preserve incomplete construction until submission validates the whole plan.
@@ -1101,6 +1236,7 @@ impl PlanFileStore {
         plan_id: &str,
         document: &PlanDocument,
     ) -> Result<PathBuf> {
+        self.require_reconciled_artifacts(session_id, plan_id)?;
         let directory = self.plan_dir(session_id, plan_id);
         fs::create_dir_all(directory.join("revisions"))
             .with_context(|| format!("create plan directory {}", directory.display()))?;
@@ -1153,19 +1289,32 @@ impl PlanFileStore {
             document.version == expected_version,
             "plan version changed before rename"
         );
+        self.rename_symbol_from_document(session_id, &document, identity, name, trace)
+    }
+
+    /// Rename from the exact canonical document captured by the owner command.
+    pub(crate) fn rename_symbol_from_document(
+        &self,
+        session_id: &str,
+        document: &PlanDocument,
+        identity: &str,
+        name: &str,
+        trace: Option<&PlanEditTrace>,
+    ) -> Result<(String, PlanDocument, RenderedPlan, String)> {
+        let plan_id = &document.plan_id;
         let index = measure(trace, "rename.reference_index", || {
-            references::PlanReferenceIndex::planned(&document, &self.workspace)
+            references::PlanReferenceIndex::planned(document, &self.workspace)
         })?;
-        let (_, definition) = index.rename_definition(&document, identity)?;
+        let (_, definition) = index.rename_definition(document, identity)?;
         let renamed = measure(trace, "rename.semantic_edit", || {
-            index.renamed(&document, identity, name)
+            index.renamed(document, identity, name)
         })?;
         let rendered = measure(trace, "rename.render_changed_plan", || {
             design_review::render(&renamed)
         })?;
         let (document, rendered, digest) = self.persist_review_draft_if_unchanged(
             session_id,
-            &document,
+            document,
             PlanReviewRevision::new(plan_id, renamed, rendered)?,
             trace,
         )?;
@@ -1181,12 +1330,25 @@ impl PlanFileStore {
         new_name: String,
     ) -> Result<PlanEditResult> {
         let document = self.read_working_document(session_id, plan_id)?;
-        let result = edit::rename_added_entity(&document, entity_name, new_name)?;
-        self.write_working_document_if_unchanged(
+        self.rename_added_entity_from_document(session_id, &document, entity_name, new_name)
+    }
+
+    /// Rename an introduced entity while guarding the owner's captured canonical document.
+    pub(crate) fn rename_added_entity_from_document(
+        &self,
+        session_id: &str,
+        document: &PlanDocument,
+        entity_name: &str,
+        new_name: String,
+    ) -> Result<PlanEditResult> {
+        let plan_id = &document.plan_id;
+        let result = edit::rename_added_entity(document, entity_name, new_name)?;
+        let rendered = self.render_review(&result.document)?;
+        self.persist_review_draft_if_unchanged(
             session_id,
-            &result.plan_id,
-            &document,
-            &result.document,
+            document,
+            PlanReviewRevision::new(plan_id, result.document.clone(), rendered)?,
+            None,
         )?;
         Ok(result)
     }
@@ -1417,6 +1579,19 @@ impl PlanFileStore {
         {
             return Err(WorkingDocumentChanged.into());
         }
+        if self.root.join("harness.sqlite3").exists()
+            && let Some(prior) =
+                crate::storage::SqliteStore::read_only(&self.root)?.load_plan(plan_id)?
+        {
+            self.require_reconciled_artifacts(session_id, plan_id)?;
+            self.journal_revision_locked(
+                &prior,
+                Some(revision),
+                &review.document,
+                &review.rendered,
+            )?;
+            return Ok(review.into_parts());
+        }
         let (document, rendered, checksum) =
             self.persist_review_draft_locked(session_id, review, trace)?;
         let revision_directory = self.plan_dir(session_id, plan_id).join("revisions");
@@ -1470,6 +1645,14 @@ impl PlanFileStore {
         revision: PlanReviewRevision,
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        self.require_reconciled_artifacts(session_id, &revision.document.plan_id)?;
+        if self.root.join("harness.sqlite3").exists()
+            && let Some(prior) = crate::storage::SqliteStore::read_only(&self.root)?
+                .load_plan(&revision.document.plan_id)?
+        {
+            self.journal_revision_locked(&prior, None, &revision.document, &revision.rendered)?;
+            return Ok(revision.into_parts());
+        }
         let plan_directory = self.plan_dir(session_id, &revision.document.plan_id);
         let document = &revision.document;
         let rendered = &revision.rendered;
@@ -1490,35 +1673,6 @@ impl PlanFileStore {
         })?;
         self.review_cache.remember(&revision)?;
         Ok(revision.into_parts())
-    }
-
-    /// Freeze an unchanged reviewed draft at the final review decision.
-    pub(crate) fn submit_reviewed_revision(
-        &self,
-        session_id: &str,
-        plan_id: &str,
-        revision: u32,
-        reviewed: &review_source::PlanReviewSource,
-    ) -> Result<()> {
-        let checksum = digest(&crate::plan::codec::to_vec(&reviewed.document)?);
-        let current = self.capture_review_source(session_id, plan_id, None, &checksum)?;
-        anyhow::ensure!(
-            current.document == reviewed.document && current.saved_digest == reviewed.saved_digest,
-            "working plan changed before the review decision"
-        );
-        self.persist_rendered_revision(
-            session_id,
-            plan_id,
-            revision,
-            PlanReviewRevision::new(
-                plan_id,
-                reviewed.document.clone(),
-                reviewed.rendered.clone(),
-            )?,
-            Some(&reviewed.document),
-            None,
-        )?;
-        Ok(())
     }
 
     /// Publish a reviewed test-inventory edit without changing declarations or project files.
@@ -1890,7 +2044,7 @@ mod test {
             matches!(&fallback.answer[1].response, PlanQuestionResponse::Selected {option,..} if option == "First")
         );
         let mut acceptance =
-            PlanAcceptance::new("digest".into(), &[ApprovalMode::Ask, ApprovalMode::Ask]).unwrap();
+            PlanReview::new("digest".into(), &[ApprovalMode::Ask, ApprovalMode::Ask]).unwrap();
         assert_eq!(acceptance.overall_comment, None);
         acceptance
             .elicitation
@@ -2984,13 +3138,14 @@ mod test {
     #[test]
     fn acceptance_requires_execution_access_before_execution() {
         let mut acceptance =
-            PlanAcceptance::new("digest".into(), &[ApprovalMode::Ask, ApprovalMode::Ask]).unwrap();
+            PlanReview::new("digest".into(), &[ApprovalMode::Ask, ApprovalMode::Ask]).unwrap();
         assert_eq!(acceptance.elicitation.question_set.questions.len(), 1);
         assert!(acceptance.approval_mode().is_err());
+        let question_id = acceptance.elicitation.question_set.questions[0].id.clone();
         acceptance
             .elicitation
             .answer(
-                "acceptance-execution-mode",
+                &question_id,
                 PlanQuestionResponse::Selected {
                     option: "ask".into(),
                     feedback: None,
@@ -2998,5 +3153,56 @@ mod test {
             )
             .unwrap();
         assert_eq!(acceptance.approval_mode().unwrap(), ApprovalMode::Ask);
+    }
+
+    /// Old review data must preserve answer identities without regaining automatic timeout authority.
+    #[test]
+    fn legacy_review_preserves_question_identity_and_explicit_confirmation() -> Result<()> {
+        let review = PlanReview::new("digest".into(), &[ApprovalMode::Ask, ApprovalMode::Deny])?;
+        let mut legacy = serde_json::to_value(review)?;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("approval_question_id");
+        legacy["elicitation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("purpose");
+        legacy["elicitation"]["question_set"]["id"] = serde_json::json!("plan-acceptance");
+        legacy["elicitation"]["question_set"]["questions"][0]["id"] =
+            serde_json::json!("acceptance-execution-mode");
+        legacy["elicitation"]["answer"] = serde_json::json!([{
+            "source":"user","question_id":"acceptance-execution-mode","response":{"kind":"selected","option":"ask","feedback":null}
+        }]);
+        let mut restored: PlanReview = serde_json::from_value(legacy)?;
+        assert_eq!(restored.approval_mode()?, ApprovalMode::Ask);
+        assert_eq!(restored.elicitation.question_set.id, "plan-acceptance");
+        restored.elicitation.question_set.id = "ordinary-looking-id".into();
+        restored
+            .elicitation
+            .start_timeout(crate::session::InputTimeout::default(), 1)?;
+        assert!(restored.elicitation.deadline.is_none());
+        assert!(restored.elicitation.expire().is_err());
+        restored.elicitation.answer[0].source = crate::session::ResolutionSource::Timeout;
+        assert!(restored.approval_mode().is_err());
+        Ok(())
+    }
+
+    /// A normalized single-mode capability must remain usable without weakening workflow questions.
+    #[test]
+    fn single_review_mode_works_without_relaxing_workflow_question_validation() -> Result<()> {
+        let mut review = PlanReview::new("digest".into(), &[ApprovalMode::Ask])?;
+        assert_eq!(review.approval_mode()?, ApprovalMode::Ask);
+        assert!(review.elicitation.question_set.clone().normalize().is_err());
+        let question = review.elicitation.question_set.questions[0].id.clone();
+        review.elicitation.answer(
+            &question,
+            PlanQuestionResponse::Selected {
+                option: "ask".into(),
+                feedback: None,
+            },
+        )?;
+        assert_eq!(review.approval_mode()?, ApprovalMode::Ask);
+        Ok(())
     }
 }

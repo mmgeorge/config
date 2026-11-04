@@ -8,6 +8,7 @@ mod failure;
 mod inputs;
 mod invocation;
 mod model;
+pub(crate) mod owner;
 mod preview;
 mod publication;
 mod queue;
@@ -44,5 +45,5 @@ pub use selection::{
 pub(crate) use supervisor::CheckAdmission;
 pub use supervisor::{CheckSupervisor, CheckSupervisorContext};
 pub(crate) use tools::CheckAuthority;
-pub(crate) use tools::ConfigureChecks;
+pub(crate) use tools::{CheckOverrides, ConfigureChecks};
 pub(crate) use tools::{CheckToolLease, CheckToolScope};

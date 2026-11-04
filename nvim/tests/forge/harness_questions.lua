@@ -7,6 +7,13 @@ local questions = require("forge.views.harness.questions")
 local picker = require("forge.views.picker")
 local client = require("forge.client")
 local original_request = client.request
+local input_state = require("forge.views.harness.input_state")
+local original_submit = input_state.submit
+local submitted = {}
+input_state.submit = function(target_state, text, attachments, intent, configuration, callback, retracted, target)
+  submitted[#submitted + 1] = { state = target_state, text = text, attachments = attachments,
+    intent = intent, target = target, callback = callback }
+end
 local sent = {}
 client.request = function(request, callback) sent[#sent + 1] = { request = request, callback = callback } end
 local function question(id, requirement)
@@ -248,12 +255,16 @@ local function press_question_input(key)
   mapping.callback()
 end
 press_question_input("<C-s>")
-local clarification_request = sent[#sent]
-assert(clarification_request.request.params.command.action.kind == "clarify")
+local clarification_request = submitted[#submitted]
+assert(clarification_request.text == clarification and clarification_request.intent == "auto")
+assert(clarification_request.target.owner == "question"
+  and clarification_request.target.question_id == "clarify-then-answer"
+  and clarification_request.target.revision == 1)
 local explanation = vim.deepcopy(state.questions)
 explanation.revision = 17
 explanation.questions[1].discussion = { { kind = "reply", text = "Tabs are compact; a sidebar is wide." } }
-clarification_request.callback(explanation)
+clarification_request.callback(nil)
+questions.receive(state, explanation)
 instance = picker._state_for_test()
 assert(instance.input_kind == "ask" and instance.input_buf,
   "clarification response discarded the retained Ask editor")
@@ -292,4 +303,5 @@ assert(feedback_answer.answer.feedback == "Keep the compact layout.",
   "confirming a structured answer discarded its explicit feedback")
 picker.close(false)
 client.request = original_request
+input_state.submit = original_submit
 print("harness questions tests passed")

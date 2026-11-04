@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::provider::{ProviderModel, ServiceTier};
@@ -22,12 +22,11 @@ impl AskModel {
         &self,
         source: &HarnessSession,
         catalog: &[ProviderModel],
-    ) -> Result<Self> {
+    ) -> Result<Self, AskModelError> {
         let Some(model) = &self.model else {
-            ensure!(
-                self.effort.is_none() && self.service_tier.is_none(),
-                "Ask model tuning requires a model"
-            );
+            if self.effort.is_some() || self.service_tier.is_some() {
+                return Err(AskModelError::ModelRequired);
+            }
             return Ok(Self {
                 model: Some(
                     source
@@ -43,16 +42,16 @@ impl AskModel {
         let selected = catalog
             .iter()
             .find(|candidate| candidate.id == *model)
-            .with_context(|| format!("Ask model {model} is unavailable for this provider"))?;
+            .ok_or(AskModelError::ModelUnavailable)?;
         let effort = self
             .effort
             .clone()
             .or_else(|| selected.default_reasoning.clone());
-        if let Some(effort) = &effort {
-            ensure!(
-                selected.reasoning.is_empty() || selected.reasoning.contains(effort),
-                "Ask model reasoning {effort} is unavailable for {model}"
-            );
+        if let Some(effort) = &effort
+            && !selected.reasoning.is_empty()
+            && !selected.reasoning.contains(effort)
+        {
+            return Err(AskModelError::EffortUnavailable);
         }
         let service_tier = self.service_tier.unwrap_or_default();
         service_tier.validate_model(selected)?;
@@ -64,9 +63,26 @@ impl AskModel {
     }
 }
 
+/// Distinguish normalized question-model validation failures without retaining native messages.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AskModelError {
+    /// An override must identify its model before selecting model-specific tuning.
+    #[error("question-model tuning requires an explicit model")]
+    ModelRequired,
+    /// The normalized catalog does not contain the selected model.
+    #[error("the selected question model is unavailable")]
+    ModelUnavailable,
+    /// The selected model does not support the requested reasoning choice.
+    #[error("the selected question-model effort is unavailable")]
+    EffortUnavailable,
+    /// The selected model does not support the requested processing tier.
+    #[error(transparent)]
+    ServiceTier(#[from] forge_provider_api::service_tier::ServiceTierError),
+}
+
 impl super::SettingsSnapshot {
     /// Read provider-local Ask settings, defaulting older records to the planning model.
-    pub(crate) fn ask_model(&self) -> Result<AskModel> {
+    pub(crate) fn ask_model(&self) -> anyhow::Result<AskModel> {
         self.provider
             .get("ask_model")
             .cloned()

@@ -21,6 +21,8 @@ pub(crate) struct ForegroundAdmission {
     pub(crate) request: Request,
     pub(crate) sink: Option<publication::SessionUpdateSink>,
     pub(crate) submission: Option<PromptSubmission>,
+    /// Retain this admission's native receipt instead of borrowing the broker's next-input slot.
+    pub(super) input_submission: Option<Arc<crate::provider::submission::Submission>>,
     pub(crate) text: String,
     attachments: Vec<crate::attachment::InputAttachment>,
     pub(crate) purpose: crate::input::InputPurpose,
@@ -52,6 +54,13 @@ pub(crate) struct ForegroundAdmission {
     pub(crate) provider_prepared: bool,
     pub(crate) engine: Option<Arc<crate::provider::session_execution::SessionExecution>>,
     phase: AdmissionPhase,
+    collection: Option<AdmissionCollection>,
+}
+
+#[derive(Clone, Copy)]
+enum AdmissionCollection {
+    Collecting(ForegroundCollection),
+    Collected(ForegroundCollection),
 }
 
 enum AdmissionPhase {
@@ -72,6 +81,34 @@ enum AdmissionPhase {
 }
 
 impl ForegroundDispatch {
+    /// Static diagnostic label; never includes command or provider payloads.
+    pub(crate) fn diagnostic_name(&self) -> &'static str {
+        match self {
+            Self::Admitting(..) => "Admitting",
+            Self::Running { .. } => "Running",
+            Self::Finalizing { .. } => "Finalizing",
+            Self::Done(..) => "Done",
+            Self::Transitioning => "Transitioning",
+        }
+    }
+
+    /// Admit steering only while this foreground can still consume native input.
+    pub(crate) fn accepts_steering(&self) -> bool {
+        matches!(self, Self::Running { transaction, .. } if transaction.accepts_steering())
+    }
+
+    /// Authorize native work only while the owner admits effects for this exact foreground.
+    pub(crate) fn authorize_submission(&mut self) {
+        match self {
+            Self::Running { transaction, .. } | Self::Finalizing { transaction, .. } => {
+                if transaction.collection.is_none() && !transaction.failure_cleanup_active {
+                    transaction.native.authorize_submission();
+                }
+            }
+            Self::Admitting(_) | Self::Done(_) | Self::Transitioning => {}
+        }
+    }
+
     /// Capture the publication owner for one short broker state step.
     pub(crate) fn publication_sink(&self) -> Result<publication::SessionUpdateSink> {
         match self {
@@ -84,6 +121,23 @@ impl ForegroundDispatch {
             Self::Done(_) | Self::Transitioning => {
                 anyhow::bail!("foreground publication owner is unavailable")
             }
+        }
+    }
+
+    /// Get the scoped handoff observer once native request preparation has an invocation identity.
+    /// Pending host admission and immediate local commands have no native handoff to observe.
+    pub(crate) fn dispatch_observer(
+        &self,
+    ) -> Option<(
+        crate::provider::InvocationScope,
+        crate::provider::DispatchObserver,
+    )> {
+        match self {
+            Self::Running { transaction, .. } | Self::Finalizing { transaction, .. } => Some((
+                transaction.state.scope.clone(),
+                transaction.request.dispatch.observer(),
+            )),
+            Self::Admitting(_) | Self::Done(_) | Self::Transitioning => None,
         }
     }
 
@@ -106,7 +160,9 @@ impl ForegroundDispatch {
     /// Poll the owned phase without retaining the broker lock.
     pub(crate) async fn next(&mut self) -> Result<ForegroundSignal> {
         match self {
-            Self::Admitting(admission) if admission.failure.is_some() => {
+            Self::Admitting(admission)
+                if admission.failure.is_some() || admission.collection.is_some() =>
+            {
                 std::future::pending().await
             }
             Self::Admitting(admission) => match admission.phase {
@@ -237,6 +293,58 @@ pub(crate) struct StagedInteraction {
 }
 
 impl ForegroundAdmission {
+    /// Retain the owner's collection start without starting independent native cleanup.
+    pub(super) fn begin_owner_collection(
+        &mut self,
+        disposition: ForegroundCollection,
+    ) -> Result<()> {
+        self.record_owner_collection(AdmissionCollection::Collecting(disposition))
+    }
+
+    /// Record the owner's positive native collection evidence before settling this admission.
+    pub(super) fn complete_owner_collection(
+        &mut self,
+        disposition: ForegroundCollection,
+    ) -> Result<()> {
+        self.record_owner_collection(AdmissionCollection::Collected(disposition))
+    }
+
+    fn record_owner_collection(&mut self, next: AdmissionCollection) -> Result<()> {
+        let disposition = match &next {
+            AdmissionCollection::Collecting(disposition)
+            | AdmissionCollection::Collected(disposition) => disposition,
+        };
+        if let Some(
+            AdmissionCollection::Collecting(prior) | AdmissionCollection::Collected(prior),
+        ) = &self.collection
+        {
+            anyhow::ensure!(prior == disposition, "admission collection owner changed");
+        }
+        self.collection = Some(next);
+        Ok(())
+    }
+
+    /// Report whether the owner still retains native collection work.
+    pub(super) fn owner_collection_pending(&self) -> bool {
+        matches!(self.collection, Some(AdmissionCollection::Collecting(_)))
+    }
+
+    /// Identify internal reconfiguration without presenting it as user cancellation.
+    pub(super) fn owner_collection_restarts(&self) -> bool {
+        matches!(
+            self.collection,
+            Some(
+                AdmissionCollection::Collecting(ForegroundCollection::Restart)
+                    | AdmissionCollection::Collected(ForegroundCollection::Restart)
+            )
+        )
+    }
+
+    /// Report positive collection evidence before skipping a duplicate native fence.
+    pub(super) fn owner_collection_complete(&self) -> bool {
+        matches!(self.collection, Some(AdmissionCollection::Collected(_)))
+    }
+
     /// Transfer rollback authority exactly once into the host finalization envelope.
     pub(crate) fn take_submission(&mut self) -> Result<PromptSubmission> {
         self.submission
@@ -253,8 +361,11 @@ impl ForegroundAdmission {
             broker.check_runner.active()?.is_none(),
             "wait for or cancel the active check run before starting source work"
         );
-        if !matches!(self.purpose, crate::input::InputPurpose::Question { .. })
-            && !broker.questions.snapshot()?.required_pending()
+        if !matches!(
+            self.purpose,
+            crate::input::InputPurpose::Question { .. }
+                | crate::input::InputPurpose::Clarification { .. }
+        ) && !broker.questions.snapshot()?.required_pending()
         {
             return Ok(false);
         }
@@ -292,6 +403,35 @@ impl ProviderPrepareJob {
 }
 
 impl HarnessBroker {
+    /// Capture an owner's validated queued input without leaving mutable next-input state behind.
+    pub(crate) fn begin_queued_input_dispatch(
+        &mut self,
+        message: crate::input::InputMessage,
+        submission: Arc<crate::provider::submission::Submission>,
+        attachments: Vec<crate::attachment::InputAttachment>,
+        sink: publication::SessionUpdateSink,
+    ) -> Result<ForegroundDispatch> {
+        let previous_purpose = std::mem::replace(&mut self.input_purpose, message.purpose);
+        let previous_submission = self.input_submission.take();
+        let result = self.begin_foreground_dispatch(
+            Request {
+                id: 0,
+                method: "session.prompt.submit".into(),
+                params: json!({"text":message.text}),
+            },
+            sink,
+        );
+        self.input_purpose = previous_purpose;
+        self.input_submission = previous_submission;
+        let mut dispatch = result?;
+        dispatch.set_attachments(attachments)?;
+        let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
+            unreachable!("queued input begins at foreground admission")
+        };
+        admission.input_submission = Some(submission);
+        Ok(dispatch)
+    }
+
     /// Preserve a local caller's explicit mode, input and exchange admission.
     pub(super) fn begin_local_interaction_dispatch(
         &mut self,
@@ -351,9 +491,10 @@ impl HarnessBroker {
         Ok(dispatch)
     }
 
-    /// Transfer an already-authorized permission continuation into the owned prompt driver.
-    pub(crate) fn begin_permission_resume_dispatch(
+    /// Stage an owner-authorized selected continuation without deciding whether it should resume.
+    pub(crate) fn begin_selected_continuation_dispatch(
         &mut self,
+        selected: &crate::provider::ExchangeId,
         text: String,
         sink: publication::SessionUpdateSink,
     ) -> Result<Option<ForegroundDispatch>> {
@@ -370,13 +511,13 @@ impl HarnessBroker {
                 params: json!({"text":text.clone()}),
             };
             let mut dispatch = self.begin_foreground_dispatch(request, sink)?;
-            let resume = self.prepare_permission_resume(text)?;
+            let resume = self.prepare_selected_continuation(selected, text)?;
             let ForegroundDispatch::Admitting(admission) = &mut dispatch else {
                 unreachable!()
             };
             match resume {
-                configuration::PermissionResume::NoWork => Ok(None),
-                configuration::PermissionResume::Staged {
+                configuration::SelectedContinuation::NoWork => Ok(None),
+                configuration::SelectedContinuation::Staged {
                     interaction,
                     clarification,
                     planning,
@@ -486,6 +627,18 @@ impl HarnessBroker {
         admission: Option<&ExchangeAdmission>,
         input: ProviderInput,
     ) -> Result<StagedInteraction> {
+        self.stage_selected_foreground_interaction(text, mode, admission, input, None)
+    }
+
+    /// Preserve an owner-captured continuation target through durable turn admission.
+    pub(super) fn stage_selected_foreground_interaction(
+        &mut self,
+        text: &str,
+        mode: PromptMode,
+        admission: Option<&ExchangeAdmission>,
+        input: ProviderInput,
+        selected: Option<&crate::provider::ExchangeId>,
+    ) -> Result<StagedInteraction> {
         let submission = match self.input_submission.take() {
             Some(submission) => submission,
             None => self.submission_store.prepare(
@@ -495,7 +648,7 @@ impl HarnessBroker {
         };
         let input_message_id = submission.record()?.input_message_id;
         let (exchange, new_runtime, events, effects) =
-            self.stage_admit_interaction(text, mode, admission, input_message_id)?;
+            self.stage_admit_interaction(text, mode, admission, input_message_id, selected)?;
         Ok(StagedInteraction {
             exchange,
             new_runtime,
@@ -516,6 +669,7 @@ impl HarnessBroker {
         if !matches!(
             admission.purpose,
             crate::input::InputPurpose::Question { .. }
+                | crate::input::InputPurpose::Clarification { .. }
         ) && !snapshot.required_pending()
         {
             return Ok(None);
@@ -866,7 +1020,10 @@ impl HarnessBroker {
                 admission.phase = AdmissionPhase::Prepared;
                 Ok(ForegroundAction::Wait)
             }
-            _ => anyhow::bail!("unexpected signal during foreground admission"),
+            signal => anyhow::bail!(
+                "unexpected {} signal during foreground admission",
+                signal.diagnostic_name()
+            ),
         }
     }
 
@@ -932,6 +1089,7 @@ impl HarnessBroker {
                 request,
                 sink: Some(sink),
                 submission: Some(submission),
+                input_submission: self.input_submission.take(),
                 text,
                 attachments: Vec::new(),
                 purpose,
@@ -963,6 +1121,7 @@ impl HarnessBroker {
                 engine: None,
                 failure: None,
                 phase: AdmissionPhase::Begin,
+                collection: None,
             },
         )))
     }
@@ -1247,6 +1406,9 @@ impl HarnessBroker {
         admission: &mut ForegroundAdmission,
     ) -> Result<StagedInteraction> {
         let text = admission.text.clone();
+        if let Some(staged) = self.prepare_selected_clarification(admission)? {
+            return Ok(staged);
+        }
         if let Some(staged) = self.prepare_required_question_continuation(admission)? {
             return Ok(staged);
         }
@@ -1273,6 +1435,7 @@ impl HarnessBroker {
         if matches!(
             &admission.purpose,
             crate::input::InputPurpose::QuestionContinuation { .. }
+                | crate::input::InputPurpose::WorkflowContinuation { .. }
         ) {
             anyhow::ensure!(
                 self.task_controller.current()?.is_none(),
@@ -1403,94 +1566,13 @@ impl HarnessBroker {
                 .is_some_and(|plan| plan.state == PlanState::Failed),
             "plan generation stopped; run /plan retry or /plan cancel"
         );
-        if active_plan
-            .as_ref()
-            .is_some_and(|plan| plan.state == PlanState::AwaitingInput)
-        {
-            let mut plan = self.active_elicitation_plan()?;
-            let elicitation = plan
-                .elicitation
-                .as_mut()
-                .context("active plan has no elicitation state")?;
-            let question_id = elicitation
-                .current_question()
-                .map(|question| question.id.clone())
-                .unwrap_or_else(|| elicitation.question_set.id.clone());
-            elicitation.begin_clarification(&question_id)?;
-            let elicitation_json = serde_json::to_string_pretty(&elicitation)?;
-            let target = crate::exchange::QuestionInput {
-                set_id: elicitation.question_set.id.clone(),
-                question_id: Some(
-                    elicitation
-                        .question(&question_id)
-                        .or_else(|| elicitation.current_question())
-                        .context("clarification has no pending question")?
-                        .id
-                        .clone(),
-                ),
-                answer: Vec::new(),
-            };
-            plan.updated_at_ms = self.clock.now_ms();
-            self.append_plan_feedback(
-                &plan.id,
-                text.clone(),
-                crate::exchange::InputIntent::Clarification,
-                Some(target),
-            )?;
-            self.publish_plan(&plan)?;
-            let prompt = PlanPrompt::clarification(&plan.request, &elicitation_json, &text);
-            admission.clarification = Some(ClarificationContext::Plan {
-                plan_id: plan.id.clone(),
-            });
-            return self.stage_foreground_interaction(
-                &prompt,
-                PromptMode::Chat,
-                None,
-                ProviderInput::from_text(prompt.clone()),
-            );
-        }
-        if let Some(mut exchange) = self.find_active_interaction_elicitation()? {
-            anyhow::ensure!(
-                !self.active_plan_has_acceptance()?,
-                "plan acceptance questions do not support clarification turns"
-            );
-            let elicitation = exchange
-                .elicitation_mut()
-                .context("active interaction has no elicitation state")?;
-            let question_id = elicitation
-                .current_question()
-                .map(|question| question.id.clone())
-                .unwrap_or_else(|| elicitation.question_set.id.clone());
-            elicitation.begin_clarification(&question_id)?;
-            let elicitation_json = serde_json::to_string_pretty(elicitation)?;
-            let target = crate::exchange::QuestionInput {
-                set_id: elicitation.question_set.id.clone(),
-                question_id: Some(
-                    elicitation
-                        .question(&question_id)
-                        .or_else(|| elicitation.current_question())
-                        .context("clarification has no pending question")?
-                        .id
-                        .clone(),
-                ),
-                answer: Vec::new(),
-            };
-            exchange.append_question_input(
-                crate::exchange::InputIntent::Clarification,
-                text.clone(),
-                target,
-                self.clock.now_ms(),
-            )?;
-            self.store.save_exchange(&exchange)?;
-            let prompt = PlanPrompt::question_follow_up(&elicitation_json, &text);
-            admission.clarification = Some(ClarificationContext::Interaction);
-            return self.stage_foreground_interaction(
-                &prompt,
-                self.task_prompt_mode()?,
-                None,
-                ProviderInput::from_text(prompt.clone()),
-            );
-        }
+        anyhow::ensure!(
+            !active_plan
+                .as_ref()
+                .is_some_and(|plan| plan.state == PlanState::AwaitingInput)
+                && self.find_active_interaction_elicitation()?.is_none(),
+            "question clarification requires an explicit source and question revision"
+        );
         if let Some(plan) = active_plan
             .as_ref()
             .filter(|plan| plan.state == PlanState::ConfiguringChecks)
@@ -1576,6 +1658,9 @@ impl HarnessBroker {
         let ForegroundDispatch::Admitting(admission) = dispatch else {
             anyhow::bail!("foreground admission has no owner");
         };
+        if admission.collection.is_some() {
+            return Ok(ForegroundAction::Wait);
+        }
         if admission.command_result.is_some() {
             let action = self.prepare_foreground_command(admission)?;
             admission.phase = AdmissionPhase::Publishing;
@@ -1801,11 +1886,10 @@ pub(crate) struct TaskCompactionJob {
 }
 
 impl TaskCompactionJob {
-    pub(crate) async fn run(self) -> Result<crate::provider::ProviderOutput> {
-        self.provider
-            .compact(self.request)
-            .await
-            .map_err(Into::into)
+    pub(crate) async fn run(
+        self,
+    ) -> Result<crate::provider::Compaction, crate::provider::ProviderError> {
+        self.provider.compact(self.request).await
     }
 }
 
@@ -1872,27 +1956,28 @@ impl HarnessBroker {
     pub(crate) fn apply_task_compaction(
         &mut self,
         mut state: TaskCompaction,
-        result: Result<crate::provider::ProviderOutput>,
+        result: Result<crate::provider::Compaction, crate::provider::ProviderError>,
         allow_metadata: bool,
     ) -> Result<(PendingProviderDelivery, Option<anyhow::Error>)> {
         state.compaction.completed_at_ms = Some(self.clock.now_ms());
-        let output = match result {
-            Ok(output) => output,
+        let evidence = match result {
+            Ok(evidence) => evidence,
             Err(error) => {
                 state.compaction.state = crate::provider::CompactionState::Failed;
                 state.compaction.result.diagnostic =
                     Some(crate::provider::lifecycle_error::diagnostic(
-                        forge_provider_api::ProviderOperation::HostEffectPublication,
-                        error.as_ref(),
+                        forge_provider_api::ProviderOperation::CompactSession,
+                        &error,
                     ));
                 state.record.detail = SessionEventKind::Compaction {
                     compaction: state.compaction.into(),
                 };
                 self.store.save_session_event(&state.record)?;
                 let patch = self.reconcile_timeline()?;
-                let delivery =
-                    self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?;
-                return Ok((delivery, Some(error)));
+                return Ok((
+                    self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?,
+                    Some(error.into()),
+                ));
             }
         };
         let authority = state
@@ -1906,80 +1991,32 @@ impl HarnessBroker {
                 );
                 Ok(())
             });
-        let observed = output.event.iter().rev().find_map(|event| match event {
-            ProviderEvent::Compaction { update, .. } => Some(update.clone()),
-            _ => None,
-        });
-        let completion = output.completion;
-        let before = state.compaction.result.context_tokens_before;
-        if let Some(observed) = observed {
-            state.compaction.state = observed.state;
-            state.compaction.result = observed.result;
-        } else {
-            state.compaction.state = crate::provider::CompactionState::Completed;
-        }
-        state.compaction.result.context_tokens_before = before;
-        if state.compaction.state == crate::provider::CompactionState::Completed {
-            state.compaction.result.context_tokens_after = completion
-                .native
-                .metrics
-                .context_usage
-                .as_ref()
-                .map(|usage| usage.used);
-        }
-        let failed = state.compaction.state == crate::provider::CompactionState::Failed;
-        let failure =
-            forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::CompactSession,
-                state.compaction.result.diagnostic.as_ref().map_or(
-                    forge_provider_api::ProviderFailureKind::Unknown,
-                    |diagnostic| diagnostic.kind,
-                ),
-            ));
+        let settlement =
+            super::compaction::apply_compaction_evidence(&mut state.compaction, evidence);
         state.record.detail = SessionEventKind::Compaction {
-            compaction: state.compaction.into(),
+            compaction: state.compaction.clone().into(),
         };
         self.store.save_session_event(&state.record)?;
-        if let Err(error) = authority {
+        let failure = authority
+            .err()
+            .or_else(|| settlement.err().map(anyhow::Error::from));
+        if failure.is_some() || !allow_metadata {
             let patch = self.reconcile_timeline()?;
-            let delivery = self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?;
-            return Ok((delivery, Some(error)));
+            return Ok((
+                self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?,
+                failure,
+            ));
         }
-        if !allow_metadata {
-            let patch = self.reconcile_timeline()?;
-            let delivery = self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?;
-            return Ok((delivery, None));
-        }
-        self.capability = completion.native.capability.clone();
-        self.session.native_fork = completion.native.capability.native_fork;
-        self.session.native_compact = completion.native.capability.native_compact;
-        if let Some(id) = completion.native.provider_session_id {
-            self.session.provider_session_id = Some(id.into());
-        }
-        if let Some(usage) = completion.native.metrics.context_usage {
-            let size = self
-                .session
-                .context_usage
-                .as_ref()
-                .map_or(usage.size, |current| current.size);
-            self.session.context_usage = ContextUsage::reported(usage.used, size);
-        }
-        if !completion.native.runtime.provider.is_empty() {
-            self.session.provider_label = completion.native.runtime.provider;
-        }
-        if completion.native.runtime.model.is_some() {
-            self.session.resolved_model = completion.native.runtime.model;
-        }
+        self.apply_compaction_context(&state.compaction);
         self.save_session()?;
         let snapshot = self.snapshot()?;
         let patch = self.reconcile_timeline()?;
-        let mut delivery = self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?;
-        if failed {
-            return Ok((delivery, Some(failure.into())));
-        }
-        delivery
-            .events
-            .push(self.event("context_compacted", serde_json::to_value(&snapshot)?)?);
+        let delivery = self.prepare_provider_delivery(AppliedProviderEvent::Effects(vec![
+            AppliedProviderEvent::Timeline(patch),
+            AppliedProviderEvent::Update(SessionUpdate::ContextCompacted {
+                snapshot: Box::new(snapshot),
+            }),
+        ]))?;
         Ok((delivery, None))
     }
 }
@@ -2017,54 +2054,6 @@ impl HarnessBroker {
         };
         admission.phase = AdmissionPhase::Prior;
         Ok(ForegroundAction::Effect(job))
-    }
-}
-
-impl HarnessBroker {
-    /// Apply a task command that has no provider or filesystem wait, returning owned output.
-    pub(crate) fn dispatch_immediate_task_command(
-        &mut self,
-        request: &Request,
-    ) -> Result<DispatchResult> {
-        anyhow::ensure!(
-            RuntimeMethod::decode(&request.method)? == RuntimeMethod::SessionCommandApply,
-            "immediate task dispatch requires a task command"
-        );
-        self.timeline_reconciled_after_dispatch = false;
-        self.active_operation_id = request
-            .params
-            .get("operation_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        self.trace.record(
-            &self.session.id,
-            "lua.rpc.received",
-            json!({
-                "id": request.id, "method": request.method, "params": request.params,
-            }),
-        );
-        let command = crate::task::command::SessionCommand::parse_request(request)?
-            .context("task command requires an asynchronous transition")?;
-        let result = self.commit_session_command(command);
-        self.refresh_input_schedule()
-            .context("publish input deadline")?;
-        self.active_wait_projection = None;
-        let patch = self.reconcile_after_dispatch()?;
-        let (response, mut event) = match result {
-            Ok((value, event)) => (Response::success(request.id, value)?, event),
-            Err(error) => (
-                Response::failure(
-                    request.id,
-                    "request_failed",
-                    crate::storage::error_message(&error),
-                ),
-                Vec::new(),
-            ),
-        };
-        if !patch.is_empty() {
-            event.push(self.event("document_changed", patch.notification())?);
-        }
-        Ok(DispatchResult { response, event })
     }
 }
 
@@ -2251,48 +2240,5 @@ impl HarnessBroker {
         let patch = self.reconcile_after_dispatch()?;
         let delivery = self.prepare_provider_delivery(AppliedProviderEvent::Timeline(patch))?;
         Ok((dispatch, delivery))
-    }
-}
-
-impl HarnessBroker {
-    /// Apply the ordinary request completion boundary after unlocked owned work.
-    pub(crate) fn finish_owned_external_request(
-        &mut self,
-        id: u64,
-        method: RuntimeMethod,
-        mut result: DispatchResult,
-    ) -> DispatchResult {
-        if let Err(error) = self.refresh_input_schedule() {
-            result.response = Response::failure(
-                id,
-                "request_failed",
-                format!("publish input deadline: {error:#}"),
-            );
-            result.event.clear();
-        }
-        if method.settles_task() {
-            self.active_wait_projection = None;
-        }
-        match self.reconcile_timeline() {
-            Ok(patch) if !patch.is_empty() => {
-                match self.event("document_changed", patch.notification()) {
-                    Ok(event) => result.event.push(event),
-                    Err(error) if result.response.error().is_none() => {
-                        result.response =
-                            Response::failure(id, "timeline_patch_failed", error.to_string());
-                        result.event.clear();
-                    }
-                    Err(_) => {}
-                }
-            }
-            Err(error) if result.response.error().is_none() => {
-                result.response =
-                    Response::failure(id, "timeline_projection_failed", error.to_string());
-                result.event.clear();
-            }
-            _ => {}
-        }
-        self.trace_foreground_response(id, &result);
-        result
     }
 }

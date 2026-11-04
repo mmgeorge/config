@@ -4,6 +4,7 @@
 #[cfg(test)]
 extern crate self as forge_harness;
 
+pub mod admission;
 pub mod agent;
 /// Typed file attachments captured independently of prompt text.
 pub mod attachment;

@@ -21,7 +21,7 @@ mod questions;
 pub mod repository;
 pub(crate) mod session;
 
-pub(crate) use authority::{PermissionAuthoritySnapshot, TaskAuthority};
+pub(crate) use authority::{PermissionAuthoritySnapshot, TaskAuthority, TaskAuthorityProgress};
 pub use error::{ToolError, ToolResult};
 pub(crate) use executor::ControlToolExecutor;
 pub(crate) use failure::{

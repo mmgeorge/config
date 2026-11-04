@@ -4,6 +4,31 @@ use crate::trace::writer::MAX_TRACE_BYTES;
 use serde_json::json;
 use tempfile::tempdir;
 
+/// Public session inspection must preserve owner correlation without exposing request or answer bodies.
+#[test]
+fn inspection_preserves_command_wait_and_publication_correlation() {
+    let record = crate::trace::inspection_record(&json!({
+        "session_id":"session","event":"exchange.question_wait.retirement_failed","timestamp_ms":1,
+        "payload":{"command_id":"command","sequence":2,"update_step":3,"work_id":"work","wait_id":"wait",
+            "question_id":"question","question_revision":4,"question_count":1,"input_id":"input","input_revision":5,
+            "publication_sequence":6,"delivery":"pending","observed":false,"error_code":"question_wait_retirement_failed","outcome":"abandoned",
+            "text":"private answer","reason":"private storage detail","question_ids":["private list"],"params":{"body":"private request"}}
+    }));
+    let payload = &record["payload"];
+    assert_eq!(payload["command_id"], "command");
+    assert_eq!(payload["sequence"], 2);
+    assert_eq!(payload["update_step"], 3);
+    assert_eq!(payload["wait_id"], "wait");
+    assert_eq!(payload["question_id"], "question");
+    assert_eq!(payload["publication_sequence"], 6);
+    assert_eq!(payload["error_code"], "question_wait_retirement_failed");
+    assert_eq!(payload["observed"], false);
+    assert!(payload.get("text").is_none());
+    assert!(payload.get("reason").is_none());
+    assert!(payload.get("question_ids").is_none());
+    assert!(payload.get("params").is_none());
+}
+
 #[test]
 fn detailed_logs_preserve_bodies_isolate_sessions_and_redact_credentials() {
     let directory = tempdir().unwrap();

@@ -198,20 +198,26 @@ fn collect_with(
     }
     let initial_metadata_ms = phase_started.elapsed().as_millis();
     let phase_started = Instant::now();
-    let verified = status(check)?;
-    let verification_status_ms = phase_started.elapsed().as_millis();
-    ensure!(
-        initial.provider == verified.provider,
-        "status provider changed during observation"
-    );
-    ensure!(
-        path.len() == verified.path.len()
-            && path
-                .iter()
-                .zip(&verified.path)
-                .all(|(initial, verified)| initial.change == *verified),
-        "status changed during observation"
-    );
+    // Display inventory may age while files are edited. Exact worktree validation
+    // belongs to verified observations and mutation preconditions, not opening a view.
+    let verification_status_ms = if verify_metadata {
+        let verified = status(check)?;
+        ensure!(
+            initial.provider == verified.provider,
+            "status provider changed during observation"
+        );
+        ensure!(
+            path.len() == verified.path.len()
+                && path
+                    .iter()
+                    .zip(&verified.path)
+                    .all(|(initial, verified)| initial.change == *verified),
+            "status changed during observation"
+        );
+        phase_started.elapsed().as_millis()
+    } else {
+        0
+    };
     let phase_started = Instant::now();
     let line_stats_detail = super::stats::collect(
         repository,
@@ -225,7 +231,11 @@ fn collect_with(
     let line_stats_ms = phase_started.elapsed().as_millis();
     let phase_started = Instant::now();
     if verify_metadata {
-        let stamp = read_path_stamps(root, &verified.path, check)?;
+        let changes = path
+            .iter()
+            .map(|observed| observed.change.clone())
+            .collect::<Vec<_>>();
+        let stamp = read_path_stamps(root, &changes, check)?;
         for (observed, stamp) in path.iter().zip(stamp) {
             check()?;
             ensure!(
@@ -529,7 +539,7 @@ mod tests {
             |check| {
                 let status = StatusReader::status_native(&local, check)?;
                 calls += 1;
-                if calls == 2 {
+                if calls == 1 {
                     fs::write(root.join("untracked"), "after\nextra\n")?;
                 }
                 Ok(status)
@@ -556,6 +566,54 @@ mod tests {
         );
         assert_eq!(result.timing.initial_metadata_ms, 0);
         assert_eq!(result.timing.verification_metadata_ms, 0);
+    }
+
+    /// Opening a status view during edits keeps one complete inventory and refreshes afterward.
+    #[test]
+    fn display_accepts_new_paths_during_collection_and_refreshes_inventory() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        git(root, &["init", "--quiet"]);
+        fs::write(root.join("before"), "before\n").unwrap();
+        let (identity, shared) = crate::identity::discover_repository(root).unwrap().unwrap();
+        let local = shared.to_thread_local();
+        let analysis = forge_diff::cache::AnalysisStore::new(Default::default());
+        let counts = super::super::LineStatsCache::default();
+        let mut calls = 0;
+        let result = collect_with(
+            &local,
+            &identity,
+            CollectionMode::Display(&analysis, &counts, false),
+            &mut || Ok(()),
+            |check| {
+                let status = StatusReader::status_native(&local, check)?;
+                calls += 1;
+                fs::write(root.join(format!("during-{calls}")), "new\n")?;
+                Ok(status)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls, 1,
+            "display required identical scans of an actively edited worktree"
+        );
+        assert_eq!(result.path.len(), 1);
+        assert_eq!(result.path[0].change.path.raw(), b"before");
+        let refreshed = collect_with(
+            &local,
+            &identity,
+            CollectionMode::Display(&analysis, &counts, false),
+            &mut || Ok(()),
+            |check| StatusReader::status_native(&local, check),
+        )
+        .unwrap();
+        assert_eq!(refreshed.path.len(), 2);
+        assert!(
+            refreshed
+                .path
+                .iter()
+                .any(|path| path.change.path.raw() == b"during-1")
+        );
     }
 
     #[test]

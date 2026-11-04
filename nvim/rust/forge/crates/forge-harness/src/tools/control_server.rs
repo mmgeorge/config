@@ -42,6 +42,7 @@ impl ControlServer {
         let (stop, mut stopping) = tokio::sync::oneshot::channel();
         let driver = tokio::spawn(async move {
             let admission = Arc::new(tokio::sync::Semaphore::new(16));
+            let sessions = Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
             let mut connection = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
@@ -51,9 +52,10 @@ impl ControlServer {
                         let Ok(permit) = admission.clone().try_acquire_owned() else { continue };
                         let handler = handler.clone();
                         let path = path.clone();
+                        let sessions = sessions.clone();
                         connection.spawn(async move {
                             let _permit = permit;
-                            let _ = serve(socket, &path, handler).await;
+                            let _ = serve(socket, &path, handler, sessions).await;
                         });
                     }
                     _ = connection.join_next(), if !connection.is_empty() => {}
@@ -108,8 +110,9 @@ async fn serve(
     socket: tokio::net::TcpStream,
     path: &str,
     handler: Arc<dyn ControlEndpoint>,
+    sessions: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
 ) -> Result<()> {
-    let (mut reader, request) = tokio::time::timeout(
+    let (mut reader, request, session) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         read_request(socket, path),
     )
@@ -118,13 +121,17 @@ async fn serve(
     let Some(request) = request else {
         return Ok(());
     };
-    respond(&mut reader, request, handler).await
+    respond(&mut reader, request, handler, sessions, session).await
 }
 
 async fn read_request(
     socket: tokio::net::TcpStream,
     path: &str,
-) -> Result<(BufReader<tokio::net::TcpStream>, Option<Value>)> {
+) -> Result<(
+    BufReader<tokio::net::TcpStream>,
+    Option<Value>,
+    Option<uuid::Uuid>,
+)> {
     let mut reader = BufReader::new(socket);
     let mut line = read_header_line(&mut reader, 8192).await?;
     ensure!(
@@ -137,6 +144,7 @@ async fn read_request(
         .unwrap_or_default()
         .to_owned();
     let mut length = None;
+    let mut session = None;
     let mut header_bytes = line.len();
     loop {
         line = read_header_line(&mut reader, 8192 - header_bytes).await?;
@@ -151,17 +159,22 @@ async fn read_request(
             && name.eq_ignore_ascii_case("content-length")
         {
             length = Some(value.trim().parse::<usize>()?);
+        } else if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("mcp-session-id")
+        {
+            ensure!(session.is_none(), "duplicate MCP session identity");
+            session = Some(uuid::Uuid::parse_str(value.trim())?);
         }
     }
     if method != "POST" {
         reader.get_mut().write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
-        return Ok((reader, None));
+        return Ok((reader, None, session));
     }
     let length = length.context("control request requires content length")?;
     let mut body = vec![0; length];
     reader.read_exact(&mut body).await?;
     let request: Value = serde_json::from_slice(&body)?;
-    Ok((reader, Some(request)))
+    Ok((reader, Some(request), session))
 }
 
 async fn read_header_line(
@@ -184,6 +197,8 @@ async fn respond(
     reader: &mut BufReader<tokio::net::TcpStream>,
     request: Value,
     handler: Arc<dyn ControlEndpoint>,
+    sessions: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    session: Option<uuid::Uuid>,
 ) -> Result<()> {
     let Some(id) = request.get("id") else {
         reader
@@ -192,6 +207,25 @@ async fn respond(
             .await?;
         return Ok(());
     };
+    let initializing = request["method"] == "initialize";
+    let session = if initializing {
+        ensure!(
+            session.is_none(),
+            "MCP initialization cannot replace an existing session identity"
+        );
+        let identity = uuid::Uuid::new_v4();
+        let mut known = sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MCP session registry poisoned"))?;
+        ensure!(
+            known.len() < forge_protocol::MAX_PENDING_FRAMES,
+            "MCP session capacity reached"
+        );
+        known.insert(identity);
+        Some(identity)
+    } else {
+        session.filter(|identity| sessions.lock().is_ok_and(|known| known.contains(identity)))
+    };
     let result = match request["method"].as_str().unwrap_or_default() {
         "initialize" => Ok(Payload::Initialization(Initialization::new("1"))),
         "ping" => Ok(Payload::Empty(Empty {})),
@@ -199,10 +233,17 @@ async fn respond(
             tools: handler.definitions().await,
         })),
         "tools/call" => {
-            let outcome = match request["params"]["name"].as_str() {
-                Some(name) => {
+            ensure!(
+                id.is_string() || id.is_number(),
+                "control tool call requires a string or numeric request identity"
+            );
+            let outcome = match (session, request["params"]["name"].as_str()) {
+                (Some(session), Some(name)) => {
                     handler
                         .call(ToolCall {
+                            id: forge_provider_api::control::ToolCallId::new(format!(
+                                "mcp:{session}:{id}"
+                            ))?,
                             name: name.into(),
                             arguments: request["params"]
                                 .get("arguments")
@@ -211,7 +252,10 @@ async fn respond(
                         })
                         .await
                 }
-                None => Err(super::ToolError::Rejected(
+                (None, _) => Err(super::ToolError::MissingState(
+                    "control tool call requires an initialized MCP session".into(),
+                )),
+                (Some(_), None) => Err(super::ToolError::Rejected(
                     "control tool name missing".into(),
                 )),
             };
@@ -228,8 +272,15 @@ async fn respond(
         Ok(result) => crate::codec::to_vec(&Response::success(id, result))?,
         Err(error) => crate::codec::to_vec(&Response::failure(id, -32601, error.to_string()))?,
     };
+    let session_header = if initializing {
+        session
+            .map(|id| format!("Mcp-Session-Id: {id}\r\n"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{session_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     reader.get_mut().write_all(header.as_bytes()).await?;
@@ -286,8 +337,10 @@ mod tests {
     }
 
     async fn call_label(client: &reqwest::Client, url: &str, id: u64) -> Result<String> {
+        let session = initialize(client, url).await?;
         let response: Value = client
             .post(url)
+            .header("Mcp-Session-Id", session)
             .json(&json!({
                 "id":id,
                 "method":"tools/call",
@@ -308,6 +361,62 @@ mod tests {
             .into())
     }
 
+    async fn initialize(client: &reqwest::Client, url: &str) -> Result<String> {
+        let response = client
+            .post(url)
+            .json(&json!({"id":"init", "method":"initialize"}))
+            .send()
+            .await?;
+        Ok(response
+            .headers()
+            .get("Mcp-Session-Id")
+            .context("initialization omitted MCP session identity")?
+            .to_str()?
+            .to_owned())
+    }
+
+    struct IdentityHandler;
+
+    #[async_trait::async_trait]
+    impl ControlEndpoint for IdentityHandler {
+        async fn definitions(&self) -> Vec<ControlToolDefinition> {
+            Vec::new()
+        }
+
+        async fn call(&self, call: ToolCall) -> ToolResult<ControlReply> {
+            Ok(ControlReply {
+                message: call.id.as_str().to_owned(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_identity_is_stable_within_session_and_distinct_across_sessions() -> Result<()> {
+        let server = ControlServer::start(Arc::new(IdentityHandler)).await?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let first = initialize(&client, &server.url).await?;
+        let second = initialize(&client, &server.url).await?;
+        let mut replies = Vec::new();
+        for session in [&first, &first, &second] {
+            let reply: Value = client.post(&server.url).header("Mcp-Session-Id", session)
+                .json(&json!({"id":1,"method":"tools/call","params":{"name":"fixture","arguments":{}}}))
+                .send().await?.json().await?;
+            replies.push(reply["result"]["content"][0]["text"].clone());
+        }
+        assert_eq!(replies[0], replies[1]);
+        assert_ne!(replies[0], replies[2]);
+        let missing: Value = client
+            .post(&server.url)
+            .json(&json!({"id":1,"method":"tools/call","params":{"name":"fixture"}}))
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(missing["result"]["isError"], true);
+        server.close().await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn typed_responses_preserve_http_lengths_and_mcp_outcomes() -> Result<()> {
         let server = ControlServer::start(Arc::new(Handler)).await?;
@@ -322,8 +431,16 @@ mod tests {
             json!({"id":5,"method":"unknown"}),
         ];
         let mut responses = Vec::new();
+        let mut session = None;
         for request in requests {
-            let response = client.post(&server.url).json(&request).send().await?;
+            let mut pending = client.post(&server.url).json(&request);
+            if let Some(session) = &session {
+                pending = pending.header("Mcp-Session-Id", session);
+            }
+            let response = pending.send().await?;
+            if let Some(identity) = response.headers().get("Mcp-Session-Id") {
+                session = Some(identity.to_str()?.to_owned());
+            }
             assert_eq!(response.status(), reqwest::StatusCode::OK);
             let length = response.content_length().unwrap();
             let bytes = response.bytes().await?;
@@ -373,7 +490,7 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         });
         let (socket, _) = listener.accept().await?;
-        let (_, request) = read_request(socket, "/control").await?;
+        let (_, request, _) = read_request(socket, "/control").await?;
         sender.await??;
         assert_eq!(request.unwrap()["params"]["content"], content);
         Ok(())

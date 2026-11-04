@@ -78,6 +78,7 @@ struct CodexBinding {
     retry: Mutex<Option<RetryAuthorization>>,
     rollback: Mutex<Option<RollbackAuthorization>>,
     admission: Mutex<()>,
+    observations: Arc<tokio::sync::RwLock<bool>>,
     fenced: Mutex<bool>,
 }
 
@@ -335,6 +336,7 @@ impl CodexProvider {
             active: Mutex::new(None),
             background_reader: Mutex::new(None),
             admission: Mutex::new(()),
+            observations: Arc::new(tokio::sync::RwLock::new(false)),
             fenced: Mutex::new(false),
             retry: Mutex::new(None),
             rollback: Mutex::new(None),
@@ -357,6 +359,9 @@ impl CodexProvider {
             || session.stream.lock().await.is_some()
             || request.scope.owner != session.owner
             || request.receipt.id() != &request.submission_id
+            || !request
+                .dispatch
+                .matches(binding, &request.scope, &request.submission_id)
         {
             return Err(failure(
                 ProviderOperation::AdmitInput,
@@ -699,6 +704,7 @@ impl CodexProvider {
                 errors.push(failure(ProviderOperation::HostEffectPublication, kind));
             }
             combine_errors(errors)?;
+            request.dispatch.confirm();
             return Ok(InputAcceptance {
                 submission_id: request.submission_id,
             });
@@ -805,6 +811,7 @@ impl CodexProvider {
         };
         *active = Some(active_execution);
         let accepted_submission_id = request.submission_id.clone();
+        let dispatched = request.dispatch.clone();
         let session_task = session.clone();
         let task = tokio::spawn(async move {
             observe_execution(
@@ -819,6 +826,7 @@ impl CodexProvider {
         });
         active.as_mut().expect("active execution was inserted").task =
             Some(Arc::new(crate::retained_task::RetainedTask::new(task)));
+        dispatched.confirm();
         Ok(InputAcceptance {
             submission_id: accepted_submission_id,
         })
@@ -1157,6 +1165,8 @@ impl Provider for CodexProvider {
 
     async fn retire_session(&self, binding: &BindingId) -> Result<(), ProviderError> {
         let session = self.binding(binding).await?;
+        let mut observations = session.observations.write().await;
+        *observations = true;
         let cancel_result = self.cancel_session(binding).await;
         let profile_result = if let Some(mut profile) = session.profile.lock().await.take() {
             profile.close().map_err(|_| {
@@ -2003,66 +2013,59 @@ impl Provider for CodexProvider {
         request: forge_provider_api::CompactionRequest,
     ) -> Result<forge_provider_api::Compaction, ProviderError> {
         let session = self.binding(binding).await?;
-        if request.scope.owner() != &session.owner || session.active.lock().await.is_some() {
+        let observation = session.observations.read().await;
+        let _admission = session.admission.lock().await;
+        if *observation || *session.fenced.lock().await || request.scope.owner() != &session.owner {
             return Err(failure(
-                ProviderOperation::ReconcileSettings,
+                ProviderOperation::CompactSession,
                 ProviderFailureKind::Rejected,
             ));
         }
-        let thread_id = session
-            .binding
-            .provider_session_id
-            .as_ref()
-            .map(|id| id.as_str().to_owned())
-            .ok_or_else(|| {
-                failure(
-                    ProviderOperation::ReconcileSettings,
-                    ProviderFailureKind::SessionMissing,
-                )
-            })?;
-        session
-            .normalization
-            .lock()
-            .await
-            .bind(Some(request.scope.clone()));
-        session
-            .rpc
-            .lock()
-            .await
-            .request(
-                "thread/compact/start",
-                json!({"threadId":thread_id}),
-                ProviderOperation::ReconcileSettings,
-            )
-            .await?;
-        loop {
-            let mut message = session.rpc.lock().await.receive().await?;
-            session.mcp_context.lock().await.normalize(&mut message);
-            let mut output = forge_provider_api::completion::ProviderOutput::default();
-            session
-                .normalization
-                .lock()
-                .await
-                .normalize(&message, &mut output, None, &session.workspace)
-                .await
-                .map_err(|_| {
-                    failure(
-                        ProviderOperation::ReconcileSettings,
-                        ProviderFailureKind::Protocol,
-                    )
-                })?;
-            let mut completed = None;
-            for event in output.event {
-                if let ProviderEvent::Compaction { update, .. } = &event
-                    && update.state != forge_provider_api::compaction::CompactionState::Running
-                {
-                    completed = Some((**update).clone());
+        // A terminal event can arrive before its reader returns. Join only a
+        // settled execution; compaction must never interrupt an active turn.
+        collect_settled_execution(&session).await?;
+        if session.active.lock().await.is_some() {
+            return Err(failure(
+                ProviderOperation::CompactSession,
+                ProviderFailureKind::Rejected,
+            ));
+        }
+        // Transfer exclusive notification consumption from the idle reader.
+        stop_background_reader(&session).await?;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            compact_session(&session, request),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(failure(
+                ProviderOperation::CompactSession,
+                ProviderFailureKind::Timeout,
+            ))
+        });
+        if matches!(&result, Err(ProviderError::Failure(failure))
+            if matches!(failure.kind(), ProviderFailureKind::Timeout | ProviderFailureKind::Transport | ProviderFailureKind::Protocol))
+        {
+            // Unknown native completion cannot authorize another prompt on this binding.
+            *session.fenced.lock().await = true;
+            session.sink.fail(events::EventDeliveryError::Observation(
+                forge_provider_api::lifecycle::ObservationFailure::LifecycleUnavailable,
+            ));
+            return result;
+        }
+        let restarted = start_background_reader(&session).await;
+        match (result, restarted) {
+            (result, Ok(start)) => {
+                if let Some(start) = start {
+                    let _ = start.send(());
                 }
-                publish_event(&session.sink, event).await?;
+                result
             }
-            if let Some(compaction) = completed {
-                return Ok(compaction);
-            }
+            (Ok(_), Err(error)) => Err(error),
+            (Err(primary), Err(secondary)) => Err(ProviderError::Combined {
+                primary: Box::new(primary),
+                secondary: vec![secondary],
+            }),
         }
     }
 
@@ -2071,57 +2074,74 @@ impl Provider for CodexProvider {
         request: ProviderCatalogRequest,
     ) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
         let session = self.request_binding(&request).await?;
-        let Some(thread_id) = session
-            .binding
-            .provider_session_id
-            .as_ref()
-            .map(|id| id.as_str().to_owned())
-        else {
-            return Ok(forge_provider_api::terminal::TerminalSnapshot {
+        let observation = session.observations.clone().read_owned().await;
+        if *observation {
+            return Err(failure(
+                ProviderOperation::NativeTransport,
+                ProviderFailureKind::SessionMissing,
+            ));
+        }
+        tokio::spawn(async move {
+            let _observation = observation;
+            let Some(thread_id) = session
+                .binding
+                .provider_session_id
+                .as_ref()
+                .map(|id| id.as_str().to_owned())
+            else {
+                return Ok(forge_provider_api::terminal::TerminalSnapshot {
+                    supported: true,
+                    starting: false,
+                    terminal: Vec::new(),
+                });
+            };
+            let mut cursor = None::<String>;
+            let mut seen = std::collections::HashSet::new();
+            let mut terminal = Vec::new();
+            loop {
+                let page = session
+                    .rpc
+                    .lock()
+                    .await
+                    .request_observation(
+                        "thread/backgroundTerminals/list",
+                        json!(
+                            {"threadId":thread_id,"limit":100,"cursor":cursor}
+                        ),
+                        ProviderOperation::ReconcileSettings,
+                    )
+                    .await?;
+                let parsed = crate::terminal::parse_snapshot(&page, false).map_err(|_| {
+                    failure(
+                        ProviderOperation::ReconcileSettings,
+                        ProviderFailureKind::Protocol,
+                    )
+                })?;
+                terminal.extend(parsed.terminal);
+                let Some(next) = page.get("nextCursor").and_then(Value::as_str) else {
+                    break;
+                };
+                if !seen.insert(next.to_owned()) {
+                    return Err(failure(
+                        ProviderOperation::ReconcileSettings,
+                        ProviderFailureKind::Protocol,
+                    ));
+                }
+                cursor = Some(next.to_owned());
+            }
+            Ok(forge_provider_api::terminal::TerminalSnapshot {
                 supported: true,
                 starting: false,
-                terminal: Vec::new(),
-            });
-        };
-        let mut cursor = None::<String>;
-        let mut seen = std::collections::HashSet::new();
-        let mut terminal = Vec::new();
-        loop {
-            let page = session
-                .rpc
-                .lock()
-                .await
-                .request(
-                    "thread/backgroundTerminals/list",
-                    json!(
-                        {"threadId":thread_id,"limit":100,"cursor":cursor}
-                    ),
-                    ProviderOperation::ReconcileSettings,
-                )
-                .await?;
-            let parsed = crate::terminal::parse_snapshot(&page, false).map_err(|_| {
-                failure(
-                    ProviderOperation::ReconcileSettings,
-                    ProviderFailureKind::Protocol,
-                )
-            })?;
-            terminal.extend(parsed.terminal);
-            let Some(next) = page.get("nextCursor").and_then(Value::as_str) else {
-                break;
-            };
-            if !seen.insert(next.to_owned()) {
-                return Err(failure(
-                    ProviderOperation::ReconcileSettings,
-                    ProviderFailureKind::Protocol,
-                ));
-            }
-            cursor = Some(next.to_owned());
-        }
-        Ok(forge_provider_api::terminal::TerminalSnapshot {
-            supported: true,
-            starting: false,
-            terminal,
+                terminal,
+            })
         })
+        .await
+        .map_err(|_| {
+            failure(
+                ProviderOperation::NativeTransport,
+                ProviderFailureKind::Runtime,
+            )
+        })?
     }
 
     async fn terminate_terminal(
@@ -2197,7 +2217,15 @@ impl Provider for CodexProvider {
                 scope,
                 authorization,
                 callbacks,
+                dispatch,
             } => {
+                if !dispatch.matches_continuation(binding, &scope, &authorization) {
+                    return Err(failure(
+                        ProviderOperation::AdmitInput,
+                        ProviderFailureKind::Protocol,
+                    ));
+                }
+
                 let callbacks = *callbacks;
                 let session = self.binding(binding).await?;
                 if scope.owner != session.owner {
@@ -2346,6 +2374,7 @@ impl Provider for CodexProvider {
                     .as_mut()
                     .expect("continuation execution was inserted")
                     .task = Some(Arc::new(crate::retained_task::RetainedTask::new(task)));
+                dispatch.confirm();
                 Ok(ContinuationOutcome::ExecutionResumed)
             }
         }
@@ -2372,7 +2401,9 @@ fn consume_not_consumed(
             ProviderFailureKind::Rejected,
         ));
     }
-    Ok(authorized.request)
+    let mut request = authorized.request;
+    request.dispatch = supplied.dispatch.clone();
+    Ok(request)
 }
 
 fn same_not_consumed_request(authorized: &PromptRequest, supplied: &PromptRequest) -> bool {
@@ -2464,6 +2495,104 @@ fn same_not_consumed_request(authorized: &PromptRequest, supplied: &PromptReques
         && Arc::ptr_eq(&authorized.provider_tools, &supplied.provider_tools)
         && Arc::ptr_eq(&authorized.turn_control, &supplied.turn_control)
         && Arc::ptr_eq(&authorized.host_effects, &supplied.host_effects)
+}
+
+/// Collect terminal publication without cancelling a native turn that is still running.
+async fn collect_settled_execution(session: &CodexBinding) -> Result<(), ProviderError> {
+    let retained = {
+        let active = session.active.lock().await;
+        active.as_ref().and_then(|execution| {
+            execution
+                .task
+                .as_ref()
+                .filter(|task| task.is_finished() || execution.turn_updates.borrow().is_none())
+                .map(|task| (execution.scope.clone(), task.clone()))
+        })
+    };
+    if let Some((scope, task)) = retained {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), task.join())
+            .await
+            .map_err(|_| {
+                failure(
+                    ProviderOperation::CompactSession,
+                    ProviderFailureKind::Timeout,
+                )
+            })?;
+        let mut active = session.active.lock().await;
+        if active
+            .as_ref()
+            .is_some_and(|execution| execution.scope == scope)
+        {
+            active.take();
+        }
+        drop(active);
+        result?;
+    }
+    Ok(())
+}
+
+/// Run native compaction while admission and notification consumption are exclusively owned.
+async fn compact_session(
+    session: &Arc<CodexBinding>,
+    request: forge_provider_api::CompactionRequest,
+) -> Result<forge_provider_api::Compaction, ProviderError> {
+    let thread_id = session
+        .binding
+        .provider_session_id
+        .as_ref()
+        .map(|id| id.as_str().to_owned())
+        .ok_or_else(|| {
+            failure(
+                ProviderOperation::CompactSession,
+                ProviderFailureKind::SessionMissing,
+            )
+        })?;
+    session
+        .normalization
+        .lock()
+        .await
+        .bind(Some(request.scope.clone()));
+    session
+        .rpc
+        .lock()
+        .await
+        .request(
+            "thread/compact/start",
+            json!({"threadId":thread_id}),
+            ProviderOperation::CompactSession,
+        )
+        .await?;
+    loop {
+        let mut message = session.rpc.lock().await.receive().await?;
+        session.mcp_context.lock().await.normalize(&mut message);
+        let mut output = forge_provider_api::completion::ProviderOutput::default();
+        session
+            .normalization
+            .lock()
+            .await
+            .normalize(&message, &mut output, None, &session.workspace)
+            .await
+            .map_err(|_| {
+                failure(
+                    ProviderOperation::CompactSession,
+                    ProviderFailureKind::Protocol,
+                )
+            })?;
+        let mut completed = None;
+        for event in output.event {
+            if let ProviderEvent::Compaction { scope, update } = &event
+                && scope == &request.scope
+                && update.thread_id == thread_id
+                && update.state != forge_provider_api::compaction::CompactionState::Running
+            {
+                completed = Some((**update).clone());
+            }
+            publish_event(&session.sink, event).await?;
+        }
+        if let Some(compaction) = completed {
+            return Ok(compaction);
+        }
+    }
 }
 
 async fn collect_finished_execution(session: &CodexBinding) -> Result<(), ProviderError> {
@@ -3792,6 +3921,175 @@ mod continuation_tests {
         turn_control::{HostTurnStatus, TurnControl},
     };
 
+    /// Build a real adapter and RPC dispatcher against an isolated native wire fixture.
+    async fn compaction_fixture() -> (
+        CodexProvider,
+        Arc<CodexBinding>,
+        ProviderEventStream,
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let accept = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+        let connection = super::super::connection::CodexConnection::connect(&endpoint)
+            .await
+            .unwrap();
+        let socket = accept.await.unwrap();
+        let provider =
+            CodexProvider::new(vec!["unused-fixture-command".into()], PathBuf::new()).unwrap();
+        let owner = request().scope.owner;
+        let binding = SessionBinding {
+            id: BindingId::new("compaction-binding").unwrap(),
+            provider_session_id: Some("compaction-thread".try_into().unwrap()),
+        };
+        let (sink, stream) = events::channel(
+            binding.id.clone(),
+            forge_provider_api::EventScope::SessionOperation {
+                owner: owner.clone(),
+                operation_id: "binding".into(),
+            },
+        );
+        let session = Arc::new(CodexBinding {
+            binding: binding.clone(),
+            owner: owner.clone(),
+            workspace: String::new(),
+            model: Mutex::new(ModelSelection::default()),
+            runtime: Mutex::new(provider.runtime.clone()),
+            rpc: RpcHandle::new(NativeRpc::new(connection)),
+            sink,
+            stream: Mutex::new(None),
+            normalization: Mutex::new(CodexNormalization::default()),
+            mcp_context: Mutex::new(super::super::protocol::McpContext::default()),
+            resources: Mutex::new(CodexResources::new(Default::default(), PathBuf::new())),
+            profile: Mutex::new(None),
+            _lease: None,
+            system_instructions: String::new(),
+            native_goal: Mutex::new(None),
+            native_goal_status: Mutex::new(None),
+            access: Mutex::new(AccessPolicy::default()),
+            approval: Mutex::new(ApprovalMode::Ask),
+            approval_context: super::super::approval::ApprovalContext::default(),
+            active: Mutex::new(None),
+            background_reader: Mutex::new(None),
+            retry: Mutex::new(None),
+            rollback: Mutex::new(None),
+            admission: Mutex::new(()),
+            observations: Arc::new(tokio::sync::RwLock::new(false)),
+            fenced: Mutex::new(false),
+        });
+        provider
+            .bindings
+            .lock()
+            .await
+            .insert(binding.id.clone(), session.clone());
+        provider.owners.lock().await.insert(owner, binding.id);
+        (provider, session, stream, socket)
+    }
+
+    /// Completed generation remains compactable even before its terminal publisher has returned.
+    #[tokio::test]
+    async fn compaction_collects_terminal_worker_and_preserves_native_failure_category() {
+        use futures_util::{SinkExt, StreamExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, session, _events, mut socket) = compaction_fixture().await;
+            let (release, released) = tokio::sync::oneshot::channel();
+            let task = Arc::new(crate::retained_task::RetainedTask::new(tokio::spawn(async move {
+                released.await.unwrap(); Ok(())
+            })));
+            let (cancel, mut cancelled) = mpsc::unbounded_channel();
+            let request = request();
+            *session.active.lock().await = Some(ActiveExecution {
+                scope: request.scope.clone(), turn_id: "finished-turn".into(),
+                turn_updates: watch::channel(None).0, submissions: Arc::new(Mutex::new(Vec::new())),
+                request, cancel, task: Some(task),
+            });
+            let compact = || forge_provider_api::CompactionRequest {
+                operation_id: "compact".into(), scope: forge_provider_api::EventScope::SessionOperation {
+                    owner: session.owner.clone(), operation_id: "compact".into(),
+                },
+            };
+            let mut pending = Box::pin(provider.compact(&session.binding.id, compact()));
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+            assert!(cancelled.try_recv().is_err(), "compaction cancelled a finished generation");
+            release.send(()).unwrap();
+            let wire = tokio::spawn(async move {
+                for rejected in [false, true] {
+                    let received: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                    assert_eq!(received["method"], "thread/compact/start");
+                    let reply = if rejected {
+                        json!({"id":received["id"],"error":{"code":-32600,"message":"private native rejection"}})
+                    } else { json!({"id":received["id"],"result":{}}) };
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(reply.to_string().into())).await.unwrap();
+                    if !rejected {
+                        socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+                            "method":"item/completed","params":{"threadId":"compaction-thread",
+                            "item":{"id":"native-compaction","type":"contextCompaction"}}
+                        }).to_string().into())).await.unwrap();
+                    }
+                }
+                // Keep transport live until the adapter explicitly closes it.
+                while let Some(message) = socket.next().await {
+                    if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; }
+                }
+            });
+            assert_eq!(pending.await.unwrap().state, forge_provider_api::CompactionState::Completed);
+            assert!(session.active.lock().await.is_none());
+            let error = provider.compact(&session.binding.id, compact()).await.unwrap_err();
+            assert!(matches!(&error, ProviderError::Failure(failure)
+                if failure.operation() == ProviderOperation::CompactSession && failure.kind() == ProviderFailureKind::Rejected));
+            assert!(!error.to_string().contains("private native rejection"));
+            session.rpc.lock().await.close().await.unwrap();
+            wire.await.unwrap();
+        }).await.unwrap();
+    }
+
+    /// Compaction cannot collect, cancel, or replace a genuinely running generation.
+    #[tokio::test]
+    async fn compaction_rejects_active_turn_without_cancellation() {
+        let (provider, session, _events, _socket) = compaction_fixture().await;
+        let (release, released) = tokio::sync::oneshot::channel();
+        let task = Arc::new(crate::retained_task::RetainedTask::new(tokio::spawn(
+            async move {
+                released.await.unwrap();
+                Ok(())
+            },
+        )));
+        let (cancel, mut cancelled) = mpsc::unbounded_channel();
+        let request = request();
+        *session.active.lock().await = Some(ActiveExecution {
+            scope: request.scope.clone(),
+            turn_id: "running-turn".into(),
+            turn_updates: watch::channel(Some("running-turn".into())).0,
+            submissions: Arc::new(Mutex::new(Vec::new())),
+            request,
+            cancel,
+            task: Some(task.clone()),
+        });
+        let error = provider
+            .compact(
+                &session.binding.id,
+                forge_provider_api::CompactionRequest {
+                    operation_id: "compact".into(),
+                    scope: forge_provider_api::EventScope::SessionOperation {
+                        owner: session.owner.clone(),
+                        operation_id: "compact".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ProviderError::Failure(failure)
+            if failure.operation() == ProviderOperation::CompactSession && failure.kind() == ProviderFailureKind::Rejected));
+        assert!(session.active.lock().await.is_some());
+        assert!(cancelled.try_recv().is_err());
+        release.send(()).unwrap();
+        task.join().await.unwrap();
+        session.rpc.lock().await.close().await.unwrap();
+    }
+
     /// Collect the shared runtime even when catalog initialization has already failed.
     #[tokio::test]
     async fn shutdown_closes_runtime_after_catalog_failure() {
@@ -3933,7 +4231,16 @@ mod continuation_tests {
 
     fn request() -> PromptRequest {
         let authority = Arc::new(FixtureAuthority);
+        let (dispatch, _) = forge_provider_api::submission::DispatchReporter::channel(
+            forge_provider_api::BindingId::new("binding").unwrap(),
+            forge_provider_api::InvocationScope::new(
+                forge_provider_api::ExecutionOwner::root("continuation-test"),
+                "invocation",
+            ),
+            forge_provider_api::SubmissionId::try_from("submission").unwrap(),
+        );
         PromptRequest {
+            dispatch,
             scope: forge_provider_api::InvocationScope::new(
                 forge_provider_api::ExecutionOwner::root("continuation-test"),
                 "invocation",

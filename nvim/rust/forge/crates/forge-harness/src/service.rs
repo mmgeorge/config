@@ -25,16 +25,45 @@ use crate::session::{ProviderForkState, SessionLeaseConflict, SessionStore};
 use crate::storage::SqliteStore;
 use crate::task::command as session_command;
 
+#[path = "service/cancellation.rs"]
+mod cancellation;
 #[path = "service/check_completion.rs"]
 mod check_completion;
+#[path = "service/command.rs"]
+mod command;
+#[path = "service/compaction.rs"]
+mod compaction;
 #[path = "service/input.rs"]
 mod input_delivery;
 #[cfg(test)]
 #[path = "service/input_durability_test.rs"]
 mod input_durability_test;
+#[path = "service/local_configuration.rs"]
+mod local_configuration;
+#[path = "service/native_permission.rs"]
+mod native_permission;
+#[path = "service/native_settings.rs"]
+mod native_settings;
+#[path = "service/owner_commands.rs"]
+mod owner_commands;
+#[cfg(test)]
+#[path = "service/plan_question_event_test.rs"]
+mod plan_question_event_test;
+#[path = "service/prompt.rs"]
+mod prompt;
+#[path = "service/provider_lifecycle.rs"]
+mod provider_lifecycle;
 #[cfg(test)]
 #[path = "service/provider_startup_test.rs"]
 mod provider_startup_test;
+#[cfg(test)]
+#[path = "service/question_event_test.rs"]
+mod question_event_test;
+#[cfg(test)]
+#[path = "service/question_wait_test.rs"]
+mod question_wait_test;
+#[path = "service/reconnect.rs"]
+mod reconnect;
 #[path = "service/review_questions.rs"]
 mod review_questions;
 #[cfg(test)]
@@ -49,9 +78,6 @@ mod task_state;
 enum CheckOperation {
     List,
     Status,
-    Cancel,
-    Override,
-    Run,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,9 +91,6 @@ impl CheckOperation {
         Some(match method {
             RuntimeMethod::SessionCheckList => Self::List,
             RuntimeMethod::SessionCheckStatus => Self::Status,
-            RuntimeMethod::SessionCheckCancel => Self::Cancel,
-            RuntimeMethod::SessionCheckOverride => Self::Override,
-            RuntimeMethod::SessionCheckRun => Self::Run,
             _ => return None,
         })
     }
@@ -537,56 +560,13 @@ impl HarnessService {
         }
     }
 
-    /// Arm provider work in input order before concurrent dispatch can admit a later cancellation.
-    /// Keep the permit until execution finalization, then release it before publishing completion. Overlapping execution and
-    /// pending cleanup reject admission without resetting the current cancellation state. Direct prompts
-    /// interrupt active checks and collect their execution before acquiring admission.
+    /// Keep caller transport preparation free of lifecycle mutation and execution ownership.
     pub async fn prepare(
         &self,
-        session_id: Option<&str>,
-        method: RuntimeMethod,
+        _session_id: Option<&str>,
+        _method: RuntimeMethod,
     ) -> Result<Option<ExecutionPermit>> {
         let _activity = self.admit().await?;
-        if method.requires_provider_fork() {
-            let registry = self.registry().await?;
-            let session_id = session_id.context("an explicit session_id is required")?;
-            let controller = registry.resolve(session_id).await?;
-            let _control = Arc::clone(&controller.coordinator.control)
-                .try_acquire_owned()
-                .map_err(|_| {
-                    crate::broker::RequestNotAdmitted("Harness cleanup is still running")
-                })?;
-            let interrupted_checks = if method == RuntimeMethod::SessionPromptSubmit {
-                if let Some(run_id) = controller.checks.active()? {
-                    controller.interrupt_checks(session_id, &run_id).await?;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            let execution = if interrupted_checks {
-                tokio::time::timeout(
-                    Duration::from_secs(10),
-                    Arc::clone(&controller.coordinator.execution).acquire_owned(),
-                )
-                .await
-                .context("interrupted checks did not release execution within 10 seconds")??
-            } else {
-                Arc::clone(&controller.coordinator.execution)
-                    .try_acquire_owned()
-                    .map_err(|_| {
-                        crate::broker::RequestNotAdmitted(
-                            "a Harness execution request is already running",
-                        )
-                    })?
-            };
-            controller
-                .cancellation
-                .arm(method == RuntimeMethod::SessionPromptSubmit);
-            return Ok(Some(execution));
-        }
         Ok(None)
     }
 
@@ -596,15 +576,13 @@ impl HarnessService {
     /// acceptance replay from its receipt before consulting the current task.
     pub async fn normalize_request(
         &self,
-        session_id: Option<&str>,
+        _session_id: Option<&str>,
         request: &mut Request,
     ) -> Result<()> {
         use session_command::SessionCommand;
         if matches!(
             RuntimeMethod::decode(&request.method)?,
-            RuntimeMethod::SessionQuestionAnswer
-                | RuntimeMethod::SessionQuestionAsk
-                | RuntimeMethod::SessionQuestionSkip
+            RuntimeMethod::SessionQuestionAnswer | RuntimeMethod::SessionQuestionSkip
         ) && request.params.get("command").is_some()
         {
             let _: crate::question::QuestionCommand =
@@ -622,83 +600,21 @@ impl HarnessService {
         {
             candidate.params["operation_id"] = json!(id);
         }
-        let command = if RuntimeMethod::decode(&candidate.method)?
-            == RuntimeMethod::SessionQuestionContinue
-        {
-            let registry = self.registry().await?;
-            let controller = registry
-                .resolve(session_id.context("an explicit session_id is required")?)
-                .await?;
-            let prior = if let Some(id) = candidate.params["operation_id"].as_str() {
-                SqliteStore::read_only(&controller.data_root)?
-                    .load_task_operation(controller.observer.session_id(), id)?
-            } else {
-                None
-            };
-            let target = if prior.is_none() {
-                controller
-                    .task_controller
-                    .current()?
-                    .and_then(|task| match task.workflow.clone() {
-                        crate::task::WorkflowSnapshot::Plan { plan } => plan
-                            .artifact
-                            .acceptance
-                            .map(|acceptance| (plan.artifact.id, acceptance.review_digest)),
-                        _ => None,
-                    })
-            } else {
-                None
-            };
-            SessionCommand::question_continue(&candidate, prior.as_ref(), target)?
-        } else {
-            SessionCommand::parse_request(&candidate)?
-        };
+        if RuntimeMethod::decode(&candidate.method)? == RuntimeMethod::SessionQuestionContinue {
+            request.params = candidate.params;
+            return Ok(());
+        }
+        let command = SessionCommand::parse_request(&candidate)?;
         if let Some(command) = command {
             let identity = request.params.get("_command").cloned();
             *request = command.to_request(request.id)?;
             if let Some(identity) = identity {
                 request.params["_command"] = identity;
             }
+        } else {
+            request.params = candidate.params;
         }
         Ok(())
-    }
-
-    /// Wait for queued prompt ownership without holding cleanup admission during active work.
-    async fn prepare_queued_prompt(&self, session_id: &str) -> Result<ExecutionPermit> {
-        let registry = self.registry().await?;
-        let controller = registry.resolve(session_id).await?;
-        let request_revision = controller
-            .cancellation
-            .request_revision
-            .load(Ordering::Acquire);
-        loop {
-            let execution = Arc::clone(&controller.coordinator.execution)
-                .acquire_owned()
-                .await?;
-            if let Ok(_control) = Arc::clone(&controller.coordinator.control).try_acquire_owned() {
-                ensure!(
-                    self.accepting.load(Ordering::Acquire),
-                    "Harness service is closed"
-                );
-                ensure!(
-                    controller
-                        .cancellation
-                        .request_revision
-                        .load(Ordering::Acquire)
-                        == request_revision,
-                    "queued prompt was interrupted before admission; the message remains queued"
-                );
-                controller.cancellation.arm(true);
-                return Ok(execution);
-            }
-            // Cleanup may itself need execution ownership. Release it before waiting for cleanup.
-            drop(execution);
-            drop(
-                Arc::clone(&controller.coordinator.control)
-                    .acquire_owned()
-                    .await?,
-            );
-        }
     }
 
     /// Persist transition ordering before the admitted request begins execution.
@@ -707,16 +623,20 @@ impl HarnessService {
         let registry = self.registry().await?;
         let session_id = session_id.context("an explicit session_id is required")?;
         let controller = registry.resolve(session_id).await?;
-        let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
         let mut request = request.clone();
         if let Some(params) = request.params.as_object_mut() {
             params.remove("_command");
         }
-        if task_state::handles(&controller, &request)? {
+        if cancellation::handles(&request)
+            || native_permission::handles(&request)
+            || native_settings::handles(&request)
+            || compaction::handles(&request)
+            || local_configuration::handles(&request)
+            || task_state::handles(&controller, &request)?
+        {
             return Ok(());
         }
-        admit_task_intent(&controller, session_id, &request, &mut store)?;
-        Ok(())
+        anyhow::bail!("unsupported owner task action")
     }
 
     /// Route an operation without transferring a host-held execution permit.
@@ -751,20 +671,25 @@ impl HarnessService {
                 .as_deref()
                 .context("an explicit session_id is required")?;
             let controller = registry.resolve(session_id).await?;
-            let id = request.params["id"]
-                .as_str()
-                .context("command identity is required")?;
-            return Ok(sink
-                .send_response(Response::success(
-                    request.id,
-                    controller.coordinator.status(id)?,
-                )?)
-                .await?);
+            return command::respond_status(&controller, &request, sink).await;
         }
         let Some(identity) = identity else {
             return Box::pin(self.dispatch_request(session_id, request, sink, admission)).await;
         };
         let identity: CommandIdentity = serde_json::from_value(identity)?;
+        if cancellation::handles(&request)
+            || native_permission::handles(&request)
+            || native_settings::handles(&request)
+            || compaction::handles(&request)
+            || local_configuration::handles(&request)
+        {
+            request
+                .params
+                .as_object_mut()
+                .context("command parameters must be an object")?
+                .entry("operation_id")
+                .or_insert_with(|| json!(identity.id));
+        }
         let registry = self.registry().await?;
         let owner_id = session_id
             .as_deref()
@@ -775,6 +700,15 @@ impl HarnessService {
                 epoch == controller.observer.runtime_epoch(),
                 "command belongs to a previous host lifetime"
             );
+        }
+        if command::handles_owner_command(&controller, &request)? {
+            request
+                .params
+                .as_object_mut()
+                .context("command parameters must be an object")?
+                .entry("operation_id")
+                .or_insert_with(|| json!(identity.id));
+            return Box::pin(self.dispatch_request(session_id, request, sink, admission)).await;
         }
         let lease =
             match controller
@@ -861,15 +795,6 @@ impl HarnessService {
             return shared::dispatch(registry, session_id, request, sink).await;
         }
         let session_id = session_id.context("an explicit session_id is required")?;
-        if method == RuntimeMethod::SessionPromptSubmit
-            && request.params["queued"].as_bool() == Some(true)
-        {
-            ensure!(
-                admission.is_none(),
-                "queued prompt already owns execution admission"
-            );
-            admission = Some(self.prepare_queued_prompt(&session_id).await?);
-        }
         if method == RuntimeMethod::SessionAttachmentImport {
             registry.resolve(&session_id).await?;
             let root = PathBuf::from(&registry.initialize.data_root);
@@ -903,7 +828,6 @@ impl HarnessService {
                 .await?;
             return Ok(());
         }
-        let mut prompt_admission = None;
         let edit_trace = if matches!(
             method,
             RuntimeMethod::SessionPlanEntityRename
@@ -934,99 +858,63 @@ impl HarnessService {
             .map(|trace| trace.stage("service.capture_submission"));
         if matches!(
             method,
-            RuntimeMethod::SessionPlanAcceptanceBegin
+            RuntimeMethod::SessionPlanAccept
                 | RuntimeMethod::SessionPlanChangesRequest
                 | RuntimeMethod::SessionPlanCancel
                 | RuntimeMethod::SessionPlanEntityRename
                 | RuntimeMethod::SessionPlanTestDelete
                 | RuntimeMethod::SessionPlanCheckUpdate
         ) {
-            let params = request
-                .params
-                .as_object_mut()
-                .context("plan review submission requires an object")?;
-            params.remove("review_document");
-            if let Some(review) = params.remove("review") {
-                let input = serde_json::from_value::<forge_buffer::input::DocumentInput>(review)?;
-                if matches!(
-                    method,
-                    RuntimeMethod::SessionPlanTestDelete
-                        | RuntimeMethod::SessionPlanCheckUpdate
-                        | RuntimeMethod::SessionPlanEntityRename
-                ) {
-                    params.insert(
-                        "review_document".into(),
-                        serde_json::to_value(&input.document)?,
-                    );
-                }
-                let controller = registry.resolve(&session_id).await?;
-                if let Some(annotation) = params.remove("draft_annotation") {
-                    let digest = params
-                        .remove("draft_source_digest")
-                        .and_then(|value| value.as_str().map(str::to_owned))
-                        .context("plan annotation capture requires its saved source digest")?;
-                    let annotation_stage = edit_trace
-                        .as_ref()
-                        .map(|trace| trace.stage("service.save_draft_annotations"));
-                    controller.plan_review.save_annotations(
-                        &input.document,
-                        &digest,
-                        serde_json::from_value(annotation)?,
-                    )?;
-                    if let Some(stage) = annotation_stage {
-                        stage.complete(json!({}));
+            let controller = registry.resolve(&session_id).await?;
+            if !task_state::normalize_review_retry(&controller, &mut request).await? {
+                let params = request
+                    .params
+                    .as_object_mut()
+                    .context("plan review submission requires an object")?;
+                params.remove("review_document");
+                if let Some(review) = params.remove("review") {
+                    let input =
+                        serde_json::from_value::<forge_buffer::input::DocumentInput>(review)?;
+                    if matches!(
+                        method,
+                        RuntimeMethod::SessionPlanTestDelete
+                            | RuntimeMethod::SessionPlanCheckUpdate
+                            | RuntimeMethod::SessionPlanEntityRename
+                    ) {
+                        params.insert(
+                            "review_document".into(),
+                            serde_json::to_value(&input.document)?,
+                        );
                     }
-                }
-                let captured = controller.plan_review.submission(input)?;
-                for (key, value) in captured
-                    .as_object()
-                    .context("plan review capture is not an object")?
-                {
-                    params.insert(key.clone(), value.clone());
+                    if let Some(annotation) = params.remove("draft_annotation") {
+                        let digest = params
+                            .remove("draft_source_digest")
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                            .context("plan annotation capture requires its saved source digest")?;
+                        let annotation_stage = edit_trace
+                            .as_ref()
+                            .map(|trace| trace.stage("service.save_draft_annotations"));
+                        controller.plan_review.save_annotations(
+                            &input.document,
+                            &digest,
+                            serde_json::from_value(annotation)?,
+                        )?;
+                        if let Some(stage) = annotation_stage {
+                            stage.complete(json!({}));
+                        }
+                    }
+                    let captured = controller.plan_review.submission(input)?;
+                    for (key, value) in captured
+                        .as_object()
+                        .context("plan review capture is not an object")?
+                    {
+                        params.insert(key.clone(), value.clone());
+                    }
                 }
             }
         }
         if let Some(stage) = capture_stage {
             stage.complete(json!({}));
-        }
-        if method == RuntimeMethod::SessionPromptSubmit {
-            let params = request
-                .params
-                .as_object_mut()
-                .context("prompt submission requires an object")?;
-            params.remove("_prompt_admission");
-            if let Some(submission) = params.remove("submission") {
-                let document = submission
-                    .get("document")
-                    .cloned()
-                    .map(serde_json::from_value::<forge_buffer::identity::DocumentId>)
-                    .transpose()?;
-                let token = submission
-                    .get("token")
-                    .and_then(Value::as_u64)
-                    .context("submission token is required")?;
-                let text = params
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .context("prompt text is required")?;
-                if let Some(document) = &document {
-                    let controller = registry.resolve(&session_id).await?;
-                    controller
-                        .presentation
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                        .begin_submission(document, token, text)?;
-                    prompt_admission = Some(PromptAdmission {
-                        presentation: Arc::clone(&controller.presentation),
-                        document: document.clone(),
-                        token,
-                    });
-                }
-                params.insert(
-                    "_prompt_admission".into(),
-                    json!({"document":document,"token":token}),
-                );
-            }
         }
         let result = Box::pin(route_request(
             registry,
@@ -1037,109 +925,151 @@ impl HarnessService {
             &self.syntax,
             RequestAdmission {
                 execution: &mut admission,
-                prompt: &mut prompt_admission,
             },
         ))
         .await;
         if let Some(stage) = edit_total {
             stage.complete(json!({"status":if result.is_ok() { "completed" } else { "failed" }}));
         }
-        drop(prompt_admission);
         result
     }
 
-    /// Close admission, cancel active turns, and release leases only after dispatch and forks finish.
-    ///
-    /// A timeout retains the registry and task ownership. A later call can finish shutdown.
-    /// Provider subprocess cleanup still follows each provider's existing destruction contract.
+    /// Close each session owner and retain all effect handles until collection and dispatch finish.
+    /// A deadline leaves the registry and unfinished joins available for a later shutdown attempt.
     pub async fn shutdown(&self, deadline: Duration) -> Result<()> {
+        self.accepting.store(false, Ordering::Release);
         tokio::time::timeout(deadline, self.background.shutdown())
             .await
             .context("Background shutdown timed out")??;
-        self.accepting.store(false, Ordering::Release);
         tokio::time::timeout(deadline, async {
-            let mut child_quiescence = Vec::new();
-            if let Some(registry) = self.registry.lock().await.clone() {
+            let registry = self.registry.lock().await.clone();
+            if let Some(registry) = &registry {
                 registry.runtime.lsp.close();
-                let controller_list: Vec<_> = registry
+                let controllers: Vec<_> = registry
                     .controller_by_id
                     .read()
                     .await
                     .values()
                     .cloned()
                     .collect();
-                for controller in controller_list {
+                for controller in &controllers {
                     controller.input_stopping.store(true, Ordering::Release);
-                    if let Some(task) = controller.provider_startup.lock().await.take() {
-                        task.abort();
-                        let _ = task.await;
-                    }
                     controller.coordinator.submissions.changed.notify_one();
-                    if let Some(task) = controller.timeout_task.lock().await.take() {
-                        task.abort();
-                    }
                     controller.plan_review.close_all()?;
                     *controller.mcp_discovery.lock().await = Default::default();
-                    controller.cancellation.request(false);
-                    if let Some(control) = controller.provider_handle().mock_response_control() {
-                        control.cancel_session(None);
-                    }
-                    if let Some(id) = controller.checks.active()? {
-                        controller.checks.cancel(&id)?;
-                        while controller.checks.active()?.is_some() {
-                            controller.checks.status(&id, 250, false).await?;
-                        }
-                    }
-                    let approval_owner = crate::provider::ExecutionOwner::root(
-                        &controller.catalog_request.read().await.harness_session_id,
+                    controller.exchange_owner.close().await;
+                }
+                for controller in &controllers {
+                    let session = controller.observer.session_id();
+                    controller.trace.record(
+                        session,
+                        "service.shutdown.stage",
+                        json!({"stage":"exchange_owner"}),
                     );
-                    controller
-                        .permission
-                        .cancel_owner(&approval_owner, None)
-                        .await?;
-                    child_quiescence.push(quiesce_children(&controller).await?);
-                }
-            }
-            let _quiescence = self.activity.write().await;
-            let mut owner = self.registry.lock().await;
-            if let Some(registry) = owner.as_ref() {
-                let mut task = registry.fork_task.lock().await;
-                while let Some(result) = task.join_next().await {
-                    result.context("Harness provider fork task failed")?;
-                }
-                let controller_list: Vec<_> = registry
-                    .controller_by_id
-                    .read()
-                    .await
-                    .values()
-                    .cloned()
-                    .collect();
-                for controller in &controller_list {
-                    controller
-                        .finish_compactions()
-                        .await
-                        .context("collect retained session compactions")?;
-                }
-                registry
-                    .runtime
-                    .shutdown()
-                    .await
-                    .context("collect Harness provider runtime")?;
-                for controller in controller_list {
-                    if let Some(task) = controller.input_task.lock().await.take() {
-                        task.await.context("input worker shutdown failed")?;
+                    controller.finish_exchange_owner().await?;
+                    controller.trace.record(
+                        session,
+                        "service.shutdown.stage",
+                        json!({"stage":"prompt_settlement"}),
+                    );
+                    controller.finish_prompt_workers().await?;
+                    controller.trace.record(
+                        session,
+                        "service.shutdown.stage",
+                        json!({"stage":"provider_startup"}),
+                    );
+                    let mut startup = controller.provider_startup.lock().await;
+                    if let Some(task) = startup.as_mut() {
+                        task.await
+                            .context("provider startup failed during shutdown")?;
+                        startup.take();
                     }
-                    controller.finish_session_events().await?;
+                    controller.trace.record(
+                        session,
+                        "service.shutdown.stage",
+                        json!({"stage":"input_worker"}),
+                    );
+                    let mut input = controller.input_task.lock().await;
+                    if let Some(task) = input.as_mut() {
+                        task.await.context("input worker shutdown failed")?;
+                        input.take();
+                    }
+                    controller.trace.record(
+                        session,
+                        "service.shutdown.stage",
+                        json!({"stage":"subscriptions"}),
+                    );
                     for subscription in [&controller.timeout_task, &controller.agent_task] {
-                        if let Some(task) = subscription.lock().await.take() {
+                        let mut subscription = subscription.lock().await;
+                        if let Some(task) = subscription.as_mut() {
                             task.abort();
                             if let Err(error) = task.await
                                 && !error.is_cancelled()
                             {
                                 return Err(error).context("session subscription shutdown failed");
                             }
+                            subscription.take();
                         }
                     }
+                }
+            }
+            if let Some(registry) = &registry {
+                for controller in registry.controller_by_id.read().await.values() {
+                    controller.trace.record(
+                        controller.observer.session_id(),
+                        "service.shutdown.stage",
+                        json!({"stage":"service_activity"}),
+                    );
+                }
+            }
+            let _quiescence = self.activity.write().await;
+            if let Some(registry) = &registry {
+                for controller in registry.controller_by_id.read().await.values() {
+                    controller.trace.record(
+                        controller.observer.session_id(),
+                        "service.shutdown.stage",
+                        json!({"stage":"service_activity_collected"}),
+                    );
+                }
+            }
+            let mut owner = self.registry.lock().await;
+            if let Some(registry) = owner.as_ref() {
+                let mut forks = registry.fork_task.lock().await;
+                while let Some(result) = forks.join_next().await {
+                    result.context("Harness provider fork task failed")?;
+                }
+                let controllers: Vec<_> = registry
+                    .controller_by_id
+                    .read()
+                    .await
+                    .values()
+                    .cloned()
+                    .collect();
+                for controller in &controllers {
+                    controller.input_stopping.store(true, Ordering::Release);
+                    controller.coordinator.submissions.changed.notify_one();
+                    controller.finish_exchange_owner().await?;
+                    controller.finish_prompt_workers().await?;
+                }
+                for controller in &controllers {
+                    controller.trace.record(
+                        controller.observer.session_id(),
+                        "service.shutdown.stage",
+                        json!({"stage":"provider_runtime"}),
+                    );
+                }
+                registry
+                    .runtime
+                    .shutdown()
+                    .await
+                    .context("collect Harness provider runtime")?;
+                for controller in controllers {
+                    controller.trace.record(
+                        controller.observer.session_id(),
+                        "service.shutdown.stage",
+                        json!({"stage":"session_observation"}),
+                    );
+                    controller.finish_session_events().await?;
                     controller
                         .presentation
                         .lock()
@@ -1147,8 +1077,6 @@ impl HarnessService {
                         .close_all()?;
                     controller.broker.lock().await.release_lease()?;
                 }
-                // Controllers borrow this runtime's trace lease. Collect it only
-                // after their final observations and lease-release diagnostics.
                 let trace = registry.runtime.trace();
                 tokio::task::spawn_blocking(move || trace.close())
                     .await
@@ -1283,19 +1211,10 @@ impl HarnessService {
     }
 }
 
-/// Identify the provider-neutral boundary reached by foreground collection.
-#[derive(serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-enum CollectionPhase {
-    CancellingApprovals,
-    CollectingExecution,
-    Collected,
-}
-
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
-    compaction_workers: Mutex<CompactionWorkers>,
-    compaction_failures: std::sync::Mutex<CompactionFailureLog>,
+    publications: Arc<crate::exchange::SessionPublications>,
+    prompt_workers: Mutex<prompt::PromptWorkers>,
     questions: Arc<crate::question::QuestionController>,
     provider_startup: Mutex<Option<tokio::task::JoinHandle<()>>>,
     provider_startup_error: std::sync::Mutex<Option<String>>,
@@ -1309,354 +1228,34 @@ struct SessionController {
     data_root: PathBuf,
     observer: Arc<crate::broker::BrokerObserver>,
     timeout_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    input_timeout_configuration: Mutex<()>,
     agent_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_coordinator: Arc<crate::agent::AgentCoordinator>,
     checks: Arc<crate::checks::CheckSupervisor>,
     agent_provider_factory: crate::agent::AgentProviderFactory,
     parent_input: crate::provider::SteeringLane,
-    session_event_task: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
-    undo_task: Mutex<Option<RetainedUndoTask>>,
+    session_event_task: Mutex<Option<provider_lifecycle::SessionObservationTask>>,
     plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
     revision_review: Arc<crate::plan::revision_review::RevisionReview>,
-    broker: Mutex<HarnessBroker>,
+    broker: Arc<Mutex<HarnessBroker>>,
+    exchange_owner: crate::exchange::ExchangeOwner,
+    exchange_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     presentation: Arc<std::sync::Mutex<crate::buffer::session::SessionPresentation>>,
     cancellation: Arc<TurnCancellation>,
-    provider: std::sync::RwLock<Arc<crate::provider::Provider>>,
+    provider: Arc<std::sync::RwLock<Arc<crate::provider::Provider>>>,
     provider_lane: Arc<tokio::sync::RwLock<()>>,
     catalog_request: Arc<RwLock<crate::provider::ProviderCatalogRequest>>,
-    mcp_revision: AtomicU64,
+    mcp_revision: Arc<AtomicU64>,
     mcp_discovery: Mutex<(u64, crate::provider::mcp::McpDiscovery)>,
     permission: Arc<crate::provider::approval::PermissionCoordinator>,
 }
 
-/// Own compaction work independently of an individual request's response waiter.
-#[derive(Default)]
-struct CompactionWorkers {
-    tasks: JoinSet<Result<()>>,
-    failures: Vec<String>,
-    failure_overflow: bool,
-    stopping: bool,
-}
-
-impl CompactionWorkers {
-    fn record(&mut self, result: std::result::Result<Result<()>, tokio::task::JoinError>) {
-        let failure = match result {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(format!("{error:#}")),
-            Err(error) => Some(format!("compaction owner task failed: {error}")),
-        };
-        if let Some(failure) = failure {
-            if self.failures.len() < forge_protocol::MAX_PENDING_FRAMES {
-                self.failures.push(failure);
-            } else {
-                self.failure_overflow = true;
-            }
-        }
-    }
-}
-
-#[derive(Default)]
-struct CompactionFailureLog {
-    failures: Vec<String>,
-    overflow: bool,
-}
-
-enum RetainedUndoTask {
-    Running {
-        operation_id: String,
-        task: tokio::task::JoinHandle<Result<()>>,
-        teardown_started: Arc<AtomicBool>,
-    },
-    Failed {
-        operation_id: String,
-        message: String,
-    },
-}
-
-struct PromptAdmission {
-    presentation: Arc<std::sync::Mutex<crate::buffer::session::SessionPresentation>>,
-    document: forge_buffer::identity::DocumentId,
-    token: u64,
-}
-
-impl Drop for PromptAdmission {
-    fn drop(&mut self) {
-        if let Ok(mut presentation) = self.presentation.lock() {
-            let _ = presentation.complete_submission(&self.document, self.token, false);
-        }
-    }
-}
-
 impl SessionController {
-    fn record_compaction_failure(&self, message: String) -> Result<()> {
-        let mut log = self
-            .compaction_failures
-            .lock()
-            .map_err(|_| anyhow::anyhow!("compaction failure state poisoned"))?;
-        if log.failures.len() < forge_protocol::MAX_PENDING_FRAMES {
-            log.failures.push(message);
-        } else {
-            log.overflow = true;
-        }
-        Ok(())
-    }
-    /// Reject new work until a retained undo generation has completed successfully.
-    async fn check_undo_fence(&self) -> Result<()> {
-        let mut slot = self.undo_task.lock().await;
-        match slot.as_mut() {
-            None => Ok(()),
-            Some(RetainedUndoTask::Running {
-                operation_id,
-                task,
-                teardown_started,
-            }) if task.is_finished() => {
-                let operation_id = operation_id.clone();
-                let started = teardown_started.load(Ordering::Acquire);
-                match task
-                    .await
-                    .context("undo owner task panicked")
-                    .and_then(|result| result)
-                {
-                    Ok(()) => {
-                        *slot = None;
-                        Ok(())
-                    }
-                    Err(error) => {
-                        if started {
-                            *slot = Some(RetainedUndoTask::Failed {
-                                operation_id,
-                                message: format!("{error:#}"),
-                            });
-                        } else {
-                            *slot = None;
-                        }
-                        Err(error)
-                    }
-                }
-            }
-            Some(RetainedUndoTask::Running { operation_id, .. }) => {
-                anyhow::bail!("undo {operation_id} is still collecting its provider generation")
-            }
-            Some(RetainedUndoTask::Failed {
-                operation_id,
-                message,
-            }) => anyhow::bail!(
-                "undo {operation_id} did not collect its provider generation: {message}"
-            ),
-        }
-    }
-
-    /// Complete submission reconciliation while its provider generation remains current.
-    async fn reconcile_submission_current(
-        &self,
-        submission: &Arc<crate::provider::submission::Submission>,
-    ) -> Result<crate::provider::submission::SubmissionRecord> {
-        let _generation = self.provider_lane.read().await;
-        let provider = self.provider_handle();
-        submission.reconcile(provider.as_ref()).await
-    }
-
     /// Snapshot the current provider without retaining the generation lock across I/O.
     fn provider_handle(&self) -> Arc<crate::provider::Provider> {
         self.provider
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-    }
-
-    /// Register compaction before exposing its cancellable response waiter.
-    async fn retain_compaction(
-        &self,
-        work: impl std::future::Future<Output = Result<()>> + Send + 'static,
-    ) -> Result<tokio::sync::oneshot::Receiver<std::result::Result<(), String>>> {
-        let mut owner = self.compaction_workers.lock().await;
-        while let Some(result) = owner.tasks.try_join_next() {
-            owner.record(result);
-        }
-        anyhow::ensure!(!owner.stopping, "session compaction owner is stopping");
-        anyhow::ensure!(
-            owner.tasks.len() < forge_protocol::MAX_PENDING_FRAMES,
-            "session compaction owner is full"
-        );
-        let (reply, receiver) = tokio::sync::oneshot::channel();
-        owner.tasks.spawn(async move {
-            let result = work.await;
-            let view = result
-                .as_ref()
-                .copied()
-                .map_err(|error| format!("{error:#}"));
-            let _ = reply.send(view);
-            result
-        });
-        Ok(receiver)
-    }
-
-    /// Join every retained compaction before releasing the native runtime.
-    async fn finish_compactions(&self) -> Result<()> {
-        let mut owner = self.compaction_workers.lock().await;
-        owner.stopping = true;
-        while let Some(result) = owner.tasks.join_next().await {
-            owner.record(result);
-        }
-        anyhow::ensure!(
-            owner.failures.is_empty() && !owner.failure_overflow,
-            "retained compaction failed: {}{}",
-            owner.failures.join("; "),
-            if owner.failure_overflow {
-                "; additional failures overflowed"
-            } else {
-                ""
-            }
-        );
-        let failures = self
-            .compaction_failures
-            .lock()
-            .map_err(|_| anyhow::anyhow!("compaction failure state poisoned"))?;
-        anyhow::ensure!(
-            failures.failures.is_empty() && !failures.overflow,
-            "retained compaction effects failed: {}{}",
-            failures.failures.join("; "),
-            if failures.overflow {
-                "; additional failures overflowed"
-            } else {
-                ""
-            }
-        );
-        Ok(())
-    }
-
-    async fn start_provider(self: &Arc<Self>, sink: &MessageSender) {
-        let mut startup = self.provider_startup.lock().await;
-        if let Some(task) = startup.as_ref() {
-            if !task.is_finished()
-                || self
-                    .provider_startup_error
-                    .lock()
-                    .expect("provider startup state poisoned")
-                    .is_none()
-            {
-                return;
-            }
-            startup.take();
-        }
-        *self
-            .provider_startup_error
-            .lock()
-            .expect("provider startup state poisoned") = None;
-        let (request, execution_registry) = {
-            let mut broker = self.broker.lock().await;
-            (broker.initialization_request(), broker.execution_registry())
-        };
-        let request = match request {
-            Ok(request) => request,
-            Err(error) => {
-                let message = format!("Provider initialization failed: {error:#}");
-                *self
-                    .provider_startup_error
-                    .lock()
-                    .expect("provider startup state poisoned") = Some(message.clone());
-                let session_id = self.catalog_request.read().await.harness_session_id.clone();
-                let _ = sink
-                    .send_event(SessionEvent {
-                        session_id,
-                        event: "provider_event".into(),
-                        payload: json!({"kind":"error", "text":message}),
-                    })
-                    .await;
-                return;
-            }
-        };
-        let Some(request) = request else {
-            return;
-        };
-        let revision = self.mcp_revision.load(Ordering::Acquire);
-        let provider = self.provider_handle();
-        let owner = Arc::downgrade(self);
-        let sink = sink.clone();
-        let startup_session_id = request.harness_session_id.clone();
-        let startup_factory = || async move {
-            let initialized = async {
-                let owner = request.owner().map_err(|_| {
-                    forge_provider_api::ProviderError::Failure(
-                        forge_provider_api::ProviderFailure::new(
-                            forge_provider_api::ProviderOperation::InitializeSession,
-                            forge_provider_api::ProviderFailureKind::Rejected,
-                        ),
-                    )
-                })?;
-                execution_registry.owner(owner).await?;
-                provider.initialize_session(request.clone()).await
-            }
-            .await;
-            let Some(owner) = owner.upgrade() else {
-                return;
-            };
-            if owner.input_stopping.load(Ordering::Acquire)
-                || owner.mcp_revision.load(Ordering::Acquire) != revision
-                || !Arc::ptr_eq(&owner.provider_handle(), &provider)
-            {
-                return;
-            }
-            let missing_history = matches!(
-                initialized.as_ref(),
-                Err(crate::provider::ProviderError::Failure(failure))
-                    if failure.kind() == forge_provider_api::ProviderFailureKind::SessionMissing
-            );
-            let mut initialized = initialized.map_err(anyhow::Error::from);
-            if missing_history {
-                initialized = initialized.map_err(|error| {
-                    error.context(
-                    "Saved provider history is unavailable; retained conversation was preserved"
-                )
-                });
-            }
-            let result: Result<()> = async {
-                let Some(provider_id) = initialized? else {
-                    return Ok(());
-                };
-                let mut broker = owner.broker.lock().await;
-                if owner.mcp_revision.load(Ordering::Acquire) != revision
-                    || !Arc::ptr_eq(&owner.provider_handle(), &provider)
-                {
-                    return Ok(());
-                }
-                if let Some(snapshot) =
-                    broker.retain_initialized_session(&request, provider_id.into())?
-                {
-                    *owner.catalog_request.write().await = broker.provider_catalog_request()?;
-                    sink.send_event(SessionEvent {
-                        session_id: request.harness_session_id.clone(),
-                        event: "session_configured".into(),
-                        payload: serde_json::to_value(snapshot)?,
-                    })
-                    .await?;
-                }
-                Ok(())
-            }
-            .await;
-            if let Err(error) = result {
-                let message = format!("Provider initialization failed: {error:#}");
-                *owner
-                    .provider_startup_error
-                    .lock()
-                    .expect("provider startup state poisoned") = Some(message.clone());
-                let _ = sink
-                    .send_event(SessionEvent {
-                        session_id: request.harness_session_id,
-                        event: "provider_event".into(),
-                        payload: json!({"kind":"error", "text":message}),
-                    })
-                    .await;
-            }
-        };
-        self.trace.record(&startup_session_id, "future.stack_probe", json!({"phase":"provider.startup.construct","bytes":crate::trace::future_bytes(&startup_factory)}));
-        *startup = Some(tokio::spawn(startup_factory()));
-        self.trace.record(
-            &startup_session_id,
-            "future.stack_probe",
-            json!({"phase":"provider.startup.spawned","bytes":0}),
-        );
     }
 
     /// Gate dependent provider requests on completed, successful initialization.
@@ -1687,15 +1286,24 @@ impl SessionController {
         if configuring()? || !self.provider_ready().await {
             return Ok(pending());
         }
+        // Select the advertised generation only after retirement exclusion is acquired.
+        let generation = self.provider_lane.clone().read_owned().await;
+        if configuring()? || !self.provider_ready().await {
+            return Ok(pending());
+        }
         let request = self.catalog_request.read().await.clone();
         let revision = self.mcp_revision.load(Ordering::Acquire);
         let provider = self.provider_handle();
-        let result = tokio::time::timeout(
-            Duration::from_secs(8),
-            provider.background_terminals(request.clone()),
-        )
-        .await
-        .context("background terminal query timed out");
+        let observed = provider.clone();
+        let mut query = tokio::spawn(async move {
+            // A caller timeout detaches this task; the generation remains leased until actual completion.
+            let _generation = generation;
+            observed.background_terminals(request).await
+        });
+        let result = tokio::time::timeout(Duration::from_secs(8), &mut query)
+            .await
+            .context("background terminal query timed out")
+            .and_then(|result| result.context("background terminal query task failed"));
         if revision != self.mcp_revision.load(Ordering::Acquire)
             || !Arc::ptr_eq(&provider, &self.provider_handle())
             || configuring()?
@@ -1706,110 +1314,33 @@ impl SessionController {
         Ok(result??)
     }
 
-    /// Bound foreground collection and fence admission when cleanup cannot establish quiescence.
-    async fn collect_execution(
-        &self,
-        session_id: &str,
-    ) -> Result<(), crate::provider::ProviderError> {
-        let provider = self.provider_handle();
-        let collection = async {
-            self.trace.record(
-                session_id,
-                "execution.collection",
-                json!({"phase":CollectionPhase::CancellingApprovals}),
-            );
-            self.permission
-                .cancel_owner(&crate::provider::ExecutionOwner::root(session_id), None)
-                .await
-                .map_err(|error| {
-                    crate::provider::lifecycle_error::classify(
-                        forge_provider_api::ProviderOperation::HostEffectPublication,
-                        error,
-                    )
-                })?;
-            self.trace.record(
-                session_id,
-                "execution.collection",
-                json!({"phase":CollectionPhase::CollectingExecution}),
-            );
-            let result = provider.cleanup_execution(session_id).await;
-            self.trace.record(
-                session_id,
-                "execution.collection",
-                json!({"phase":CollectionPhase::Collected}),
-            );
-            result
-        };
-        let result = tokio::time::timeout(Duration::from_secs(30), collection)
-            .await
-            .unwrap_or_else(|_| {
-                Err(crate::provider::ProviderError::Failure(
-                    forge_provider_api::ProviderFailure::new(
-                        forge_provider_api::ProviderOperation::CleanupExecution,
-                        forge_provider_api::ProviderFailureKind::Timeout,
-                    ),
-                ))
-            });
-        if let Err(error) = &result {
-            self.task_controller.mark_native_goal_uncertain();
-            self.cancellation.fail_cleanup(error);
-        }
-        result
-    }
-
-    /// Collects the native execution before a replacement prompt can release its owner.
-    async fn interrupt_checks(&self, session_id: &str, run_id: &str) -> Result<()> {
-        let active = self.checks.active()?;
-        ensure!(
-            active.as_deref().is_none_or(|id| id == run_id),
-            "check run is not owned by this active request"
-        );
-        self.cancellation.begin_cleanup(false, false)?;
-        let cleanup = async {
-            if active.is_some()
-                && let Err(error) = self.checks.cancel(run_id)
-                && self.checks.active()?.is_some()
-            {
-                return Err(error);
-            }
-            Ok(self.collect_execution(session_id).await?)
-        }
-        .await;
-        if let Err(error) = cleanup {
-            let error = crate::provider::lifecycle_error::classify(
-                forge_provider_api::error::ProviderOperation::CleanupExecution,
-                error,
-            );
-            self.cancellation.fail_cleanup(&error);
-            return Err(anyhow::Error::new(error)
-                .context("collect provider execution before replacing a checked prompt"));
-        }
-        self.cancellation.request(false);
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while self.checks.active()?.as_deref() == Some(run_id) {
-                self.checks.status(run_id, 250, false).await?;
-                tokio::task::yield_now().await;
-            }
-            Ok::<(), anyhow::Error>(())
-        })
-        .await
-        .context("check processes did not stop within 10 seconds")??;
-        Ok(())
-    }
-
     /// Build one independently serialized controller from a durable broker session.
     fn new(mut broker: HarnessBroker) -> Result<Arc<Self>> {
         let catalog_request = broker.provider_catalog_request()?;
         let observer = broker.observer();
+        let store = SqliteStore::read_only(&broker.data_root)?;
+        for plan in store.list_plan(observer.session_id())? {
+            observer.plan_file.reconcile_plan_artifacts(&plan)?;
+        }
+
         let input = Arc::new(crate::input::SessionInputQueue::open(
             &broker.data_root,
             &catalog_request.harness_session_id,
             &broker.submission_store,
         )?);
         broker.input_wakeup = Some(input.changed.clone());
-        Ok(Arc::new(Self {
-            compaction_workers: Mutex::new(CompactionWorkers::default()),
-            compaction_failures: std::sync::Mutex::new(CompactionFailureLog::default()),
+        let (exchange_owner, exchange_driver) = crate::exchange::ExchangeOwner::channel(
+            &broker.data_root,
+            &catalog_request.harness_session_id,
+        )?;
+        broker.question_events = Some(exchange_owner.question_events());
+        let publications = Arc::new(crate::exchange::SessionPublications::open(
+            &broker.data_root,
+            &catalog_request.harness_session_id,
+        )?);
+        let controller = Arc::new(Self {
+            publications,
+            prompt_workers: Mutex::new(prompt::PromptWorkers::default()),
             questions: broker.questions.clone(),
             provider_startup: Mutex::new(None),
             provider_startup_error: std::sync::Mutex::new(None),
@@ -1823,177 +1354,83 @@ impl SessionController {
             data_root: broker.data_root.clone(),
             observer,
             timeout_task: Mutex::new(None),
-            input_timeout_configuration: Mutex::new(()),
             agent_task: Mutex::new(None),
             agent_coordinator: broker.agent_coordinator(),
             checks: broker.checks(),
             agent_provider_factory: broker.agent_provider_factory.clone(),
             parent_input: broker.parent_input.clone(),
             session_event_task: Mutex::new(None),
-            undo_task: Mutex::new(None),
             plan_review: Arc::clone(&broker.plan_review),
             revision_review: Arc::clone(&broker.revision_review),
             presentation: broker.presentation(),
             cancellation: broker.turn_cancellation(),
-            provider: std::sync::RwLock::new(broker.provider_handle()),
+            provider: Arc::new(std::sync::RwLock::new(broker.provider_handle())),
             provider_lane: Arc::new(tokio::sync::RwLock::new(())),
             catalog_request: Arc::new(RwLock::new(catalog_request)),
-            mcp_revision: AtomicU64::new(0),
+            mcp_revision: Arc::new(AtomicU64::new(0)),
             mcp_discovery: Mutex::new((0, crate::provider::mcp::McpDiscovery::default())),
             permission: broker.permission_coordinator(),
-            broker: Mutex::new(broker),
-        }))
+            broker: Arc::new(Mutex::new(broker)),
+            exchange_owner,
+            exchange_task: Mutex::new(None),
+        });
+        let task = tokio::spawn(exchange_driver.run(
+            controller.broker.clone(),
+            controller.trace.clone(),
+            controller.observer.session_id().to_owned(),
+            crate::exchange::OwnerServices {
+                provider_lifecycle: controller.provider_lifecycle(),
+                publications: controller.publications.clone(),
+                input: controller.coordinator.submissions.clone(),
+                submissions: controller.submission_store.clone(),
+                provider: controller.provider.clone(),
+                provider_lane: controller.provider_lane.clone(),
+                catalog: controller.catalog_request.clone(),
+                resource_revision: controller.mcp_revision.clone(),
+                root: controller.data_root.clone(),
+                tasks: controller.task_controller.clone(),
+                questions: controller.questions.clone(),
+                observer: controller.observer.clone(),
+                execution: controller.coordinator.execution.clone(),
+                control: controller.coordinator.control.clone(),
+                cancellation: controller.cancellation.clone(),
+                permissions: controller.permission.clone(),
+                children: controller.agent_coordinator.clone(),
+                checks: controller.checks.clone(),
+                goal_max_turns: controller.goal_max_turns,
+            },
+        ));
+        *controller
+            .exchange_task
+            .try_lock()
+            .expect("new controller has no exchange-task waiter") = Some(task);
+        Ok(controller)
     }
 
-    /// Route direct controls through the retained owner rather than an adapter-local activity flag.
-    async fn steer_retained(
-        &self,
-        owner: crate::provider::ExecutionOwner,
-        input: crate::provider::SteeringInput,
-    ) -> Result<()> {
-        let registry = self.broker.lock().await.execution_registry();
-        registry.owner(owner).await?.steer_current(input).await?;
-        Ok(())
-    }
-
-    /// Deliver provider observations without blocking intake behind a foreground broker owner.
-    async fn attach_session_events(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
-        self.attach_timeout(message_sink).await?;
-        self.attach_agents(message_sink).await?;
-        let mut task = self.session_event_task.lock().await;
-        if task.is_some() {
-            return Ok(());
+    /// Drain the persistent transition owner before releasing its broker lease.
+    async fn finish_exchange_owner(&self) -> Result<()> {
+        let mut task = self.exchange_task.lock().await;
+        if let Some(pending) = task.as_mut() {
+            self.exchange_owner.close().await;
+            pending
+                .await
+                .context("exchange owner failed during shutdown")?;
+            task.take();
         }
-        let session_id = self.catalog_request.read().await.harness_session_id.clone();
-        let registry = self.broker.lock().await.execution_registry();
-        registry
-            .owner(crate::provider::ExecutionOwner::root(&session_id))
-            .await?;
-        let controller = Arc::downgrade(self);
-        let session_events = self.observer.session_events();
-        let message_sink = message_sink.clone();
-        *task = Some(tokio::spawn(async move {
-            let result: Result<()> = async {
-                loop {
-                    if session_events.has_pending()? {
-                        session_events.take_idle_settlement_request();
-                        let Some(controller) = controller.upgrade() else {
-                            return Ok(());
-                        };
-                        let (publication, mut stream) = crate::broker::publication::channel();
-                        let (events, idle) = {
-                            let mut broker = controller.broker.lock().await;
-                            let events = broker.drain_session_events()?;
-                            let idle = broker.begin_idle_foreground(publication)?;
-                            (events, idle)
-                        };
-                        for event in events {
-                            message_sink.send_event(event).await?;
-                        }
-                        if let Some((dispatch, job)) = idle {
-                            let output = message_sink.clone();
-                            let owner = session_id.clone();
-                            let forward = async move {
-                                while let Some(update) = stream.recv().await? {
-                                    let name = if matches!(&update, crate::broker::publication::SessionUpdate::DocumentChanged { .. }) {
-                                        "document_changed"
-                                    } else { "provider_event" };
-                                    output.send_event(SessionEvent {
-                                        session_id: owner.clone(),
-                                        event: name.into(),
-                                        payload: crate::broker::publication::encode_session_update(&update)?,
-                                    }).await?;
-                                }
-                                Ok::<(), anyhow::Error>(())
-                            };
-                            let (result, forwarded) = tokio::join!(
-                                drive_owned_foreground_initial(&controller, dispatch, &message_sink, Some(job)),
-                                forward,
-                            );
-                            let result = result?;
-                            forwarded?;
-                            for event in result.event { message_sink.send_event(event).await?; }
-                        }
-                        continue;
-                    }
-                    if session_events.is_closed() {
-                        return Ok(());
-                    }
-                    // The engine fills the bounded inbox independently of broker ownership.
-                    session_events.notified().await?;
-                }
-            }
-            .await;
-            if let Err(error) = &result {
-                let _ = message_sink.send_event(SessionEvent {
-                    session_id, event: "provider_event".into(),
-                    payload: json!({"kind":"error", "text":format!("Session observation failed: {error:#}")}),
-                }).await;
-            }
-            result
-        }));
         Ok(())
     }
 
-    /// Restart observation for an explicit new prompt after failed intake has drained.
+    /// Await owner-controlled recovery, then retain the replacement observation listener.
     async fn recover_session_events(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
-        let previous = self.observer.session_events();
-        if !previous.is_closed() && !self.task_controller.native_goal_is_uncertain() {
+        let selected = self.observer.session_events();
+        if !selected.is_closed() && !self.task_controller.native_goal_is_uncertain() {
             return Ok(());
         }
-        let mut task = self.session_event_task.lock().await;
-        if !self.observer.session_events().is_closed()
-            && !self.task_controller.native_goal_is_uncertain()
-        {
-            return Ok(());
-        }
-        let session_id = self.catalog_request.read().await.harness_session_id.clone();
-        let registry = self.broker.lock().await.execution_registry();
-        if self.task_controller.native_goal_is_uncertain() {
-            self.broker.lock().await.recover_pending_configuration()?;
-        }
-        let goal_lane = self.task_controller.native_goal_lane();
-        let _goal_guard = if self.task_controller.native_goal_is_uncertain() {
-            Some(
-                tokio::time::timeout(Duration::from_secs(30), goal_lane.lock())
-                    .await
-                    .map_err(|_| crate::provider::ProviderError::DeliveryUncertain)?,
-            )
-        } else {
-            None
-        };
-        if self.task_controller.native_goal_is_uncertain() {
-            registry
-                .fence(&crate::provider::ExecutionOwner::root(&session_id))
-                .await?;
-        }
-        if let Some(pending) = task.take() {
-            // The listener publishes its original failure before it exits.
-            let _reported_failure = pending.await.context("session observation task panicked")?;
-        }
-        let next = registry
-            .replace(crate::provider::ExecutionOwner::root(&session_id))
-            .await?;
-        self.task_controller.reset_native_goal_generation()?;
-        self.observer.replace_session_events(next);
-        drop(task);
+        self.exchange_owner.recover_observation(selected).await?;
         self.attach_session_events(message_sink).await
     }
 
-    /// Persist every final provider observation before releasing the session lease.
-    /// The provider closes its stream after shutdown publication; the caller's deadline
-    /// bounds this join while retaining the task if shutdown is cancelled for retry.
-    async fn finish_session_events(&self) -> Result<()> {
-        let mut task = self.session_event_task.lock().await;
-        if let Some(pending) = task.as_mut() {
-            let result = pending.await;
-            task.take();
-            result.context("session observation task failed during shutdown")??;
-        }
-        Ok(())
-    }
-
-    async fn attach_timeout(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
+    async fn attach_timeout(self: &Arc<Self>, _message_sink: &MessageSender) -> Result<()> {
         let mut task = self.timeout_task.lock().await;
         if task.is_some() {
             return Ok(());
@@ -2005,11 +1442,10 @@ impl SessionController {
         let mut feedback = self.permission.subscribe_timeout_feedback(&owner)?;
         let mut cancellation = self.cancellation.subscribe();
         let controller = Arc::downgrade(self);
-        let message_sink = message_sink.clone();
         *task = Some(tokio::spawn(async move {
             let mut attempted = None;
             loop {
-                let mut current = schedule.borrow_and_update().clone();
+                let current = schedule.borrow_and_update().clone();
                 let pending_feedback = *feedback.borrow_and_update();
                 let cancelled = *cancellation.borrow_and_update();
                 let identity = (current.revision, pending_feedback);
@@ -2020,7 +1456,7 @@ impl SessionController {
                     if current.approval_allowed && pending_feedback {
                         return;
                     }
-                    if let Some(deadline) = &mut current.deadline {
+                    if let Some(mut deadline) = current.deadline.clone() {
                         tokio::time::sleep_until(deadline.instant(0)).await;
                     } else {
                         std::future::pending::<()>().await;
@@ -2036,131 +1472,14 @@ impl SessionController {
                 let Some(controller) = controller.upgrade() else {
                     return;
                 };
-                let admission = async {
-                    loop {
-                        let execution = Arc::clone(&controller.coordinator.execution)
-                            .acquire_owned()
-                            .await?;
-                        if let Ok(_control) = controller.coordinator.control.try_acquire() {
-                            return Ok::<_, anyhow::Error>(execution);
-                        }
-                        drop(execution);
-                        drop(controller.coordinator.control.acquire().await?);
-                    }
-                };
-                let _admission = tokio::select! {
-                    biased;
-                    _ = schedule.changed() => continue,
-                    _ = feedback.changed() => { attempted = None; continue; },
-                    _ = cancellation.changed() => { attempted = None; continue; }
-                    result = admission => match result { Ok(permit) => permit, Err(_) => return },
-                };
-                let mut broker = tokio::select! {
-                    biased;
-                    _ = schedule.changed() => continue,
-                    _ = feedback.changed() => { attempted = None; continue; },
-                    _ = cancellation.changed() => { attempted = None; continue; }
-                    broker = controller.broker.lock() => broker,
-                };
                 attempted = Some(identity);
-                let mut active_deadline = current.deadline.clone().map(|deadline| {
-                    (
-                        format!(
-                            "{}:{}",
-                            current.identity.as_deref().unwrap_or_default(),
-                            deadline.expires_at_ms
-                        ),
-                        deadline,
-                    )
-                });
-                let session_id = controller.observer.session_id().to_owned();
-                let captured = (|| -> Result<Option<Request>> {
-                    broker.refresh_input_schedule()?;
-                    if schedule.borrow().revision != current.revision || *cancellation.borrow() {
-                        return Ok(None);
-                    }
-                    broker.expire_input(&mut active_deadline)
-                })();
-                let (publication, mut stream) = crate::broker::publication::channel();
-                let output = message_sink.clone();
-                let stream_session = session_id.clone();
-                let forwarder = tokio::spawn(async move {
-                    while let Some(update) = stream.recv().await? {
-                        let payload = crate::broker::publication::encode_session_update(&update)?;
-                        let event = if matches!(
-                            &update,
-                            crate::broker::publication::SessionUpdate::DocumentChanged { .. }
-                        ) {
-                            "document_changed"
-                        } else {
-                            "provider_event"
-                        };
-                        output
-                            .send_event(SessionEvent {
-                                session_id: stream_session.clone(),
-                                event: event.into(),
-                                payload,
-                            })
-                            .await?;
-                    }
-                    Ok::<(), anyhow::Error>(())
-                });
-                let staged = match captured {
-                    Ok(Some(request)) if request.method == "session.approval.continue" => broker
-                        .with_publication_sink(&publication, |broker| {
-                            broker.begin_approval_timeout_dispatch(publication.clone())
-                        })
-                        .map(Some),
-                    Ok(Some(request)) => Err(anyhow::anyhow!(
-                        "unsupported timed input method: {}",
-                        request.method
-                    )),
-                    Ok(None) => Ok(None),
-                    Err(error) => Err(error),
-                };
-                drop(broker);
-                let result: Result<()> = async {
-                    if let Some((dispatch, delivery)) = staged? {
-                        for event in delivery.deliver_and_flush().await? {
-                            message_sink.send_event(event).await?;
-                        }
-                        if let Some(dispatch) = dispatch {
-                            let result =
-                                drive_owned_foreground(&controller, dispatch, &message_sink)
-                                    .await?;
-                            for event in result.event {
-                                message_sink.send_event(event).await?;
-                            }
-                            if let Some(failure) = result.response.error() {
-                                anyhow::bail!("{}", failure.message);
-                            }
-                        }
-                    }
-                    controller.broker.lock().await.refresh_input_schedule()?;
-                    Ok(())
-                }
-                .await;
-                drop(publication);
-                let forwarding = forwarder
+                if controller
+                    .exchange_owner
+                    .approval_timeout(current.revision)
                     .await
-                    .context("timeout publication task failed")
-                    .and_then(|result| result);
-                let result = match (result, forwarding) {
-                    (Err(error), Err(delivery)) => {
-                        Err(error.context(format!("timeout publication failed: {delivery:#}")))
-                    }
-                    (Err(error), _) => Err(error),
-                    (_, Err(delivery)) => Err(delivery),
-                    (Ok(()), Ok(())) => Ok(()),
-                };
-                controller.coordinator.submissions.changed.notify_one();
-                match result {
-                    Ok(()) => {}
-                    Err(error) if error.is::<crate::broker::TurnCancelled>() => {}
-                    Err(error) => {
-                        let _ = message_sink.send_event(SessionEvent { session_id, event: "provider_event".into(),
-                            payload: json!({"kind":"error","text":format!("Input timeout failed: {error:#}")}) }).await;
-                    }
+                    .is_err()
+                {
+                    return;
                 }
             }
         }));
@@ -2497,47 +1816,8 @@ async fn analyze_plan_source(
     Ok(())
 }
 
-/// Forwards check observations without owning execution admission.
-fn checks_event_sink(
-    output: MessageSender,
-    session_id: String,
-) -> crate::broker::publication::SessionUpdateSink {
-    let (sink, mut stream) = crate::broker::publication::channel();
-    tokio::spawn(async move {
-        let delivery = async {
-            while let Some(event) = stream.recv().await? {
-                let event_name = if matches!(
-                    &event,
-                    crate::broker::publication::SessionUpdate::DocumentChanged { .. }
-                ) {
-                    "document_changed"
-                } else {
-                    "provider_event"
-                };
-                let payload = crate::broker::publication::encode_session_update(&event)?;
-                output
-                    .send_event(SessionEvent {
-                        session_id: session_id.clone(),
-                        event: event_name.into(),
-                        payload,
-                    })
-                    .await?;
-            }
-            Ok::<(), anyhow::Error>(())
-        }
-        .await;
-        if let Err(error) = delivery {
-            output.record_failure(&std::io::Error::other(format!(
-                "deliver check notification for {session_id}: {error:#}"
-            )));
-        }
-    });
-    sink
-}
-
 struct RequestAdmission<'request> {
     execution: &'request mut Option<ExecutionPermit>,
-    prompt: &'request mut Option<PromptAdmission>,
 }
 
 async fn route_request(
@@ -2551,7 +1831,6 @@ async fn route_request(
 ) -> Result<()> {
     let RequestAdmission {
         execution: admission,
-        prompt: prompt_admission,
     } = permits;
     if matches!(
         method,
@@ -2636,10 +1915,17 @@ async fn route_request(
         return route_new_session(registry, session_id, request, message_sink).await;
     }
     let controller = registry.resolve(&session_id).await?;
+    if !command::handles_owner_command(&controller, &request)? {
+        crate::admission::complete();
+    }
     ensure!(
         !controller.input_stopping.load(Ordering::Acquire),
         "Harness session is closing"
     );
+    if method == RuntimeMethod::SessionStateGet {
+        drop(admission.take());
+        return reconnect::respond(&controller, request, message_sink).await;
+    }
     let new_queued_submission = if method == RuntimeMethod::SessionInputApply {
         let operation: crate::input::InputOperation =
             crate::codec::from_value(request.params.clone())?;
@@ -2661,11 +1947,22 @@ async fn route_request(
     }
     controller.attach_session_events(message_sink).await?;
     controller.attach_input(message_sink).await?;
+    if method == RuntimeMethod::SessionPromptSubmit {
+        drop(admission.take());
+        return prompt::apply(&controller, request, message_sink).await;
+    }
+    if owner_commands::handles(method, &request) {
+        drop(admission.take());
+        controller.attach_agents(message_sink).await?;
+        return owner_commands::apply(&controller, &request, method, message_sink).await;
+    }
+
     if matches!(
         method,
         RuntimeMethod::SessionInputApply
             | RuntimeMethod::SessionInputGet
             | RuntimeMethod::SessionInputOperationGet
+            | RuntimeMethod::SessionTurnSteer
     ) {
         return controller
             .input_request(request, method, message_sink)
@@ -2674,44 +1971,6 @@ async fn route_request(
     if method == RuntimeMethod::SessionPlanQuestionAnswer {
         return review_questions::answer(registry, controller, session_id, request, message_sink)
             .await;
-    }
-    if method == RuntimeMethod::SessionConfigure
-        && request
-            .params
-            .as_object()
-            .is_some_and(|fields| fields.len() == 1 && fields.contains_key("ask_model"))
-    {
-        let _generation = controller.provider_lane.read().await;
-        let (prepared, job) = {
-            let broker = controller.broker.lock().await;
-            let prepared =
-                broker.prepare_ask_model_configuration(request.params["ask_model"].clone())?;
-            let job = if prepared.needs_catalog() {
-                Some(broker.prepare_configuration_catalog()?)
-            } else {
-                None
-            };
-            (prepared, job)
-        };
-        let models = if let Some(job) = job {
-            let result = job.run().await?;
-            controller
-                .broker
-                .lock()
-                .await
-                .commit_configuration_catalog(result)?
-        } else {
-            Vec::new()
-        };
-        let result = controller
-            .broker
-            .lock()
-            .await
-            .commit_ask_model_configuration(prepared, &models)?;
-        message_sink
-            .send_response(Response::success(request.id, result)?)
-            .await?;
-        return Ok(());
     }
     if method == RuntimeMethod::SessionProviderMockResponse {
         let mock_provider = controller.provider_handle();
@@ -2724,6 +1983,19 @@ async fn route_request(
             .send_response(Response::success(request.id, result)?)
             .await?;
         return Ok(());
+    }
+    if native_permission::handles(&request) {
+        return native_permission::apply(&controller, &request, message_sink).await;
+    }
+    if local_configuration::handles(&request) {
+        return local_configuration::apply(&controller, &request, message_sink).await;
+    }
+    if native_settings::handles(&request) {
+        return native_settings::apply(&controller, &request, message_sink).await;
+    }
+    if compaction::handles(&request) {
+        drop(admission.take());
+        return compaction::apply(&controller, &request, message_sink).await;
     }
     if let Some(value) = controller.observer.query(method, request.params.clone())? {
         message_sink
@@ -2741,6 +2013,7 @@ async fn route_request(
             controller
                 .provider_handle()
                 .model_list(crate::provider::ProviderRequest {
+                    dispatch: forge_provider_api::submission::DispatchTracker::default(),
                     execution_owner: catalog.execution_owner,
                     harness_session_id: catalog.harness_session_id,
                     workspace: catalog.workspace,
@@ -2774,179 +2047,6 @@ async fn route_request(
         }
         message_sink
             .send_response(Response::success(request.id, model_list)?)
-            .await?;
-        return Ok(());
-    }
-    if method == RuntimeMethod::SessionConfigure
-        && request.params.as_object().is_some_and(|fields| {
-            !fields.is_empty()
-                && fields
-                    .keys()
-                    .all(|field| matches!(field.as_str(), "check_timing" | "automatic_checks"))
-        })
-    {
-        let timing = request
-            .params
-            .get("check_timing")
-            .map(|value| serde_json::from_value::<crate::checks::CheckTiming>(value.clone()))
-            .transpose()?;
-        let enabled = request
-            .params
-            .get("automatic_checks")
-            .map(|value| serde_json::from_value::<bool>(value.clone()))
-            .transpose()?;
-        let catalog = controller.catalog_request.read().await.clone();
-        let mut settings = crate::settings::SettingsStore::open(
-            PathBuf::from(&registry.initialize.data_root).as_path(),
-        )?;
-        let mut desired = crate::settings::PortableSettings::default();
-        if let Some(timing) = timing {
-            desired.check_timing = Some(timing);
-        }
-        if let Some(enabled) = enabled {
-            desired.automatic_checks = Some(enabled);
-        }
-        settings.patch(
-            crate::settings::SettingTarget {
-                scope: crate::settings::SettingScope::Global,
-                workspace: &catalog.workspace,
-                session: &session_id,
-            },
-            &desired,
-        )?;
-        let desired = settings
-            .get(
-                &catalog.workspace,
-                &session_id,
-                registry.initialize.provider.kind.as_str(),
-            )?
-            .desired;
-        if !desired.automatic_checks_enabled() {
-            controller.observer.completion_queue.finish()?;
-        }
-        message_sink
-            .send_response(Response::success(
-                request.id,
-                json!({"check_timing":desired.check_timing.unwrap_or_default(), "automatic_checks":desired.automatic_checks_enabled(), "checks_deferred":controller.observer.completion_queue.deferred()?}),
-            )?)
-            .await?;
-        return Ok(());
-    }
-    if method == RuntimeMethod::SessionConfigure
-        && request
-            .params
-            .as_object()
-            .is_some_and(|fields| fields.len() == 1 && fields.contains_key("status_thoughts"))
-    {
-        let enabled: bool = serde_json::from_value(request.params["status_thoughts"].clone())?;
-        let catalog = controller.catalog_request.read().await.clone();
-        let (enabled, patch) = {
-            let mut presentation = controller
-                .presentation
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?;
-            let mut settings = crate::settings::SettingsStore::open(
-                PathBuf::from(&registry.initialize.data_root).as_path(),
-            )?;
-            settings.patch(
-                crate::settings::SettingTarget {
-                    scope: crate::settings::SettingScope::Global,
-                    workspace: &catalog.workspace,
-                    session: &session_id,
-                },
-                &crate::settings::PortableSettings {
-                    status_thoughts: Some(enabled),
-                    ..Default::default()
-                },
-            )?;
-            let effective = settings
-                .get(
-                    &catalog.workspace,
-                    &session_id,
-                    registry.initialize.provider.kind.as_str(),
-                )?
-                .desired;
-            let enabled = effective.status_thoughts.unwrap_or(true);
-            let patch = presentation.set_status_thoughts(enabled)?;
-            controller
-                .observer
-                .status_thoughts
-                .store(enabled, Ordering::Relaxed);
-            (enabled, patch)
-        };
-        if !patch.is_empty() {
-            message_sink
-                .send_event(SessionEvent {
-                    session_id: session_id.clone(),
-                    event: "document_changed".into(),
-                    payload: patch.notification(),
-                })
-                .await?;
-        }
-        message_sink
-            .send_response(Response::success(
-                request.id,
-                json!({"status_thoughts": enabled}),
-            )?)
-            .await?;
-        return Ok(());
-    }
-    if method == RuntimeMethod::SessionInputTimeoutConfigure {
-        let catalog = controller.catalog_request.read().await.clone();
-        let configuration = controller.input_timeout_configuration.lock().await;
-        let mut settings = crate::settings::SettingsStore::open(
-            PathBuf::from(&registry.initialize.data_root).as_path(),
-        )?;
-        let mut desired = crate::settings::PortableSettings::default();
-        ensure!(
-            request
-                .params
-                .as_object()
-                .is_some_and(|fields| !fields.is_empty()
-                    && fields.keys().all(|field| matches!(
-                        field.as_str(),
-                        "approval_timeout" | "tool_timeout"
-                    ))),
-            "timeout configuration accepts only approval_timeout and tool_timeout"
-        );
-        if let Some(value) = request.params.get("approval_timeout") {
-            desired.approval_timeout = Some(
-                serde_json::from_value::<crate::session::InputTimeout>(value.clone())?
-                    .validate()?,
-            );
-        }
-        if let Some(value) = request.params.get("tool_timeout") {
-            desired.tool_timeout = Some(
-                serde_json::from_value::<crate::session::InputTimeout>(value.clone())?
-                    .require_expiry()?,
-            );
-        }
-        settings.patch(
-            crate::settings::SettingTarget {
-                scope: crate::settings::SettingScope::Global,
-                workspace: &catalog.workspace,
-                session: &session_id,
-            },
-            &desired,
-        )?;
-        let effective = settings
-            .get(
-                &catalog.workspace,
-                &session_id,
-                registry.initialize.provider.kind.as_str(),
-            )?
-            .desired;
-        let approval = effective.approval_timeout.unwrap_or_default();
-        let tool = effective.tool_timeout.unwrap_or_default();
-        controller
-            .permission
-            .configure_timeout(&session_id, approval)?;
-        drop(configuration);
-        message_sink
-            .send_response(Response::success(
-                request.id,
-                json!({"approval_timeout":approval,"tool_timeout":tool}),
-            )?)
             .await?;
         return Ok(());
     }
@@ -3008,12 +2108,7 @@ async fn route_request(
         return Ok(());
     }
     if let Some(operation) = CheckOperation::from_method(method) {
-        if matches!(
-            method,
-            RuntimeMethod::SessionCheckList
-                | RuntimeMethod::SessionCheckRun
-                | RuntimeMethod::SessionCheckOverride
-        ) {
+        if method == RuntimeMethod::SessionCheckList {
             controller.checks.refresh_changes().await?;
         }
         let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
@@ -3054,52 +2149,6 @@ async fn route_request(
                         .await?,
                 )?
             }
-            CheckOperation::Cancel => {
-                let id = request.params["run_id"]
-                    .as_str()
-                    .context("run_id required")?;
-                if request.params["interrupt_execution"].as_bool() == Some(true)
-                    || controller
-                        .provider_handle()
-                        .has_active_turn(&session_id)
-                        .await
-                {
-                    let _control = Arc::clone(&controller.coordinator.control)
-                        .try_acquire_owned()
-                        .context("Harness cleanup is still running")?;
-                    controller.interrupt_checks(&session_id, id).await?;
-                } else {
-                    controller.checks.cancel(id)?;
-                }
-                json!({"run_id":id,"cancellation_requested":true})
-            }
-            CheckOperation::Override => controller
-                .checks
-                .set_overrides(task_id, serde_json::from_value(request.params.clone())?)?,
-            CheckOperation::Run => {
-                ensure!(
-                    task.as_ref()
-                        .is_none_or(|task| task.kind() != crate::task::TaskKind::Plan)
-                        && controller.agent_coordinator.active_count() == 0,
-                    "checks cannot race planning or writing agents"
-                );
-                let admission = Arc::clone(&controller.coordinator.execution)
-                    .try_acquire_owned()
-                    .context("finish active source work before checks")?;
-                let run = controller.checks.prepare_request(
-                    controller.checks.session_owner(),
-                    crate::checks::RunRequest::try_from(serde_json::from_value::<
-                        crate::checks::CheckRunRequest,
-                    >(
-                        request.params.clone()
-                    )?)?,
-                    task_id.map(str::to_owned),
-                    session.shell,
-                    "User requested".into(),
-                )?;
-                let sink = checks_event_sink(message_sink.clone(), session_id.clone());
-                json!({"run_id":controller.checks.start(run,Some(sink),None,Some(admission)).await?})
-            }
         };
         message_sink
             .send_response(Response::success(request.id, result)?)
@@ -3117,6 +2166,7 @@ async fn route_request(
             controller.agent_provider_factory.catalog(
                 provider,
                 crate::provider::ProviderRequest {
+                    dispatch: forge_provider_api::submission::DispatchTracker::default(),
                     execution_owner: catalog.execution_owner,
                     harness_session_id: catalog.harness_session_id,
                     workspace: catalog.workspace,
@@ -3157,6 +2207,36 @@ async fn route_request(
             .get("operation_id")
             .and_then(Value::as_str)
             .context("operation_id is required")?;
+        let command_id = crate::exchange::command::CommandId::new(id)?;
+        if let Some(record) = controller.exchange_owner.command_status(command_id).await? {
+            let (state, outcome, error, error_code) = match &record.state {
+                crate::exchange::journal::CommandState::Queued { .. } => {
+                    ("queued", None, None, None)
+                }
+                crate::exchange::journal::CommandState::Active { .. } => {
+                    ("active", None, None, None)
+                }
+                crate::exchange::journal::CommandState::Finished {
+                    outcome: Ok(outcome),
+                    ..
+                } => ("completed", Some(outcome), None, None),
+                crate::exchange::journal::CommandState::Finished {
+                    outcome: Err(error),
+                    ..
+                } => ("failed", None, Some(error.to_string()), Some(error.code())),
+            };
+            message_sink
+                .send_control_response(Response::success(
+                    request.id,
+                    json!({
+                        "id":record.request.id.as_str(),"state":state,"sequence":record.sequence,
+                        "revision":record.state.revision(),"outcome":outcome,"error":error,"error_code":error_code,
+                        "progress":record.state,
+                    }),
+                )?)
+                .await?;
+            return Ok(());
+        }
         let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
         message_sink
             .send_control_response(Response::success(
@@ -3168,120 +2248,50 @@ async fn route_request(
             .await?;
         return Ok(());
     }
-    if method == RuntimeMethod::SessionPermissionSet {
-        let mut request = request;
-        request.params["action"] = json!("permission");
-        if request.params.get("operation_id").is_none() {
-            request.params["operation_id"] =
-                json!(format!("permission:{session_id}:{}", request.id));
-        }
-        request.method = "session.command.apply".into();
-        return route_task_transition(registry, controller, session_id, request, message_sink)
-            .await;
-    }
-    if method == RuntimeMethod::SessionCommandApply {
-        if request.params.get("action").and_then(Value::as_str) == Some("compact") {
-            let owner = controller.clone();
-            let worker_registry = registry.clone();
-            let worker_session = session_id.clone();
-            let worker_sink = message_sink.clone();
-            let receiver = controller
-                .retain_compaction(async move {
-                    route_task_transition(
-                        worker_registry,
-                        owner,
-                        worker_session,
-                        request,
-                        &worker_sink,
-                    )
-                    .await
-                })
-                .await?;
-            return receiver
-                .await
-                .context("retained task compaction owner disappeared")?
-                .map_err(anyhow::Error::msg);
-        }
-        return route_task_transition(registry, controller, session_id, request, message_sink)
-            .await;
-    }
-    if let Some(command) = session_command::SessionCommand::parse_request(&request)?
-        && command.action.is_review()
+    // Release transport admission before the owner can collect the current exchange.
+    if method == RuntimeMethod::SessionQuestionContinue
+        || cancellation::handles(&request)
+        || task_state::handles(&controller, &request)?
     {
-        if matches!(
-            method,
-            RuntimeMethod::SessionPlanAcceptanceBegin
-                | RuntimeMethod::SessionPlanChangesRequest
-                | RuntimeMethod::SessionPlanCancel
-        ) && let Some((value, events)) = controller
-            .revision_review
-            .decide(method, request.params.clone())
-            .await?
-        {
-            for event in events {
-                message_sink.send_event(event).await?;
-            }
-            message_sink
-                .send_response(Response::success(request.id, value)?)
-                .await?;
+        drop(admission.take());
+        if task_state::apply_continuation(&controller, &request, message_sink).await? {
             return Ok(());
         }
-        return task_state::apply_command(
+        if cancellation::handles(&request) {
+            return cancellation::apply(&controller, &request, message_sink).await;
+        }
+        if task_state::apply_plan_edit_review(&controller, &request, message_sink, syntax).await? {
+            return Ok(());
+        }
+        if task_state::apply(
             &controller,
             &session_id,
-            &command,
-            Some(request.id),
+            &request,
             registry.initialize.goal_max_turns,
             message_sink,
         )
-        .await;
+        .await?
+        {
+            return Ok(());
+        }
+    }
+    if method == RuntimeMethod::SessionCommandApply {
+        message_sink
+            .send_response(Response::failure(
+                request.id,
+                "unsupported_session_command",
+                "The requested session command is not supported",
+            ))
+            .await?;
+        return Ok(());
     }
     if method.requires_provider_fork() {
         registry
             .await_provider_fork(&session_id, &controller)
             .await?;
     }
-    let edit_trace = matches!(
-        method,
-        RuntimeMethod::SessionPlanTestDelete
-            | RuntimeMethod::SessionPlanCheckUpdate
-            | RuntimeMethod::SessionPlanEntityRename
-    )
-    .then(|| {
-        crate::plan::edit_trace::PlanEditTrace::new(
-            registry.runtime.trace(),
-            &session_id,
-            &request.method,
-            &request.params,
-        )
-    });
-    if route_control_request(
-        &controller,
-        &request,
-        method,
-        message_sink,
-        syntax,
-        edit_trace.as_ref(),
-        admission,
-    )
-    .await?
-    {
+    if route_control_request(&controller, &request, method, message_sink).await? {
         return Ok(());
-    }
-
-    if method == RuntimeMethod::SessionCompact {
-        let owner = controller.clone();
-        let worker_session = session_id.clone();
-        let worker_sink = message_sink.clone();
-        let receiver = controller
-            .retain_compaction(async move {
-                run_retained_manual_compaction(owner, worker_session, request, worker_sink).await
-            })
-            .await?;
-        return receiver
-            .await
-            .context("retained manual compaction owner disappeared")?
-            .map_err(anyhow::Error::msg);
     }
 
     let (event_sink, mut event_stream) = crate::broker::publication::channel();
@@ -3290,37 +2300,18 @@ async fn route_request(
     let routed_session_id = session_id.clone();
     let event_forwarder = tokio::spawn(async move {
         while let Some(event) = event_stream.recv().await? {
-            let (event_name, payload) = if matches!(
-                &event,
-                crate::broker::publication::SessionUpdate::DocumentChanged { .. }
-            ) {
-                (
-                    "document_changed".to_owned(),
-                    crate::broker::publication::encode_session_update(&event)?,
-                )
-            } else {
-                (
-                    "provider_event".to_owned(),
-                    crate::broker::publication::encode_session_update(&event)?,
-                )
-            };
             message_sink_for_event
-                .send_event(SessionEvent {
-                    session_id: routed_session_id.clone(),
-                    event: event_name,
-                    payload,
-                })
+                .send_event(crate::broker::publication::encode_session_event(
+                    &routed_session_id,
+                    &event,
+                )?)
                 .await?;
         }
         Ok::<(), anyhow::Error>(())
     });
     let shutdown = method == RuntimeMethod::HostShutdown;
-    let mut result = if method == RuntimeMethod::SessionPromptSubmit {
-        drive_foreground_dispatch(&controller, broker, request, event_sink, message_sink).await?
-    } else if method == RuntimeMethod::SessionCheckComplete {
+    let mut result = if method == RuntimeMethod::SessionCheckComplete {
         check_completion::drive(&controller, broker, request, event_sink, message_sink).await
-    } else if method == RuntimeMethod::SessionConfigure {
-        drive_direct_configuration(&controller, broker, request, event_sink).await
     } else {
         let result = Box::pin(broker.dispatch_stream(request, event_sink)).await;
         drop(broker);
@@ -3352,14 +2343,7 @@ async fn route_request(
         message_sink.send_event(event).await?;
     }
     controller.coordinator.submissions.changed.notify_one();
-    publish_execution_completion(
-        message_sink,
-        result.response,
-        admission,
-        prompt_admission,
-        shutdown,
-    )
-    .await
+    publish_execution_completion(message_sink, result.response, admission, shutdown).await
 }
 
 /// Release finalized execution ownership before its response can admit the next prompt.
@@ -3367,10 +2351,8 @@ async fn publish_execution_completion(
     sink: &MessageSender,
     response: Response,
     admission: &mut Option<ExecutionPermit>,
-    prompt_admission: &mut Option<PromptAdmission>,
     terminal: bool,
 ) -> Result<()> {
-    drop(prompt_admission.take());
     drop(admission.take());
     if terminal {
         sink.send_terminal_response(response)?;
@@ -3378,1257 +2360,6 @@ async fn publish_execution_completion(
         sink.send_response(response).await?;
     }
     Ok(())
-}
-
-fn admit_task_intent(
-    controller: &SessionController,
-    session_id: &str,
-    request: &Request,
-    store: &mut SqliteStore,
-) -> Result<crate::task::TaskOperation> {
-    let id = request
-        .params
-        .get("operation_id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty() && id.len() <= 128)
-        .context("task transition requires operation_id")?
-        .to_owned();
-    if let Some(previous) = store.load_task_operation(session_id, &id)? {
-        ensure!(
-            previous.action == request.params,
-            "operation ID was reused for a different action"
-        );
-        return Ok(previous);
-    }
-    let action = request
-        .params
-        .get("action")
-        .and_then(Value::as_str)
-        .context("task action is required")?;
-    ensure!(
-        [
-            "plan",
-            "execute",
-            "goal",
-            "fork",
-            "attach_plan",
-            "resume",
-            "pause",
-            "clear",
-            "undo",
-            "permission",
-            "configure",
-            "compact"
-        ]
-        .contains(&action),
-        "unknown task action"
-    );
-    if action == "undo" {
-        let rollback = &request.params["rollback"];
-        ensure!(
-            rollback["scope"] == "conversation",
-            "undo requires conversation rollback scope"
-        );
-        let selected = rollback["exchange_id"]
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .context("undo requires exchange_id")?;
-        let latest = rollback["latest_exchange_id"]
-            .as_str()
-            .context("undo requires latest_exchange_id")?;
-        let exchanges = store.list_exchange(session_id)?;
-        ensure!(
-            exchanges
-                .last()
-                .is_some_and(|exchange| exchange.id == latest),
-            "conversation changed; select the rollback interaction again"
-        );
-        ensure!(
-            exchanges.iter().any(|exchange| exchange.id == selected
-                && exchange.disposition() == crate::exchange::HistoryDisposition::Current),
-            "selected interaction is unavailable for rollback"
-        );
-    }
-    if action == "permission" {
-        let _: crate::task::PermissionChange = serde_json::from_value(
-            request
-                .params
-                .get("change")
-                .cloned()
-                .context("permission change is required")?,
-        )?;
-    }
-    if matches!(action, "plan" | "goal") {
-        ensure!(
-            request
-                .params
-                .get("text")
-                .and_then(Value::as_str)
-                .is_some_and(|text| !text.trim().is_empty()),
-            "task objective is required"
-        );
-    }
-    let session = crate::session::SessionStore::load_session(store, session_id)?
-        .context("session is missing")?;
-    let prior = store.latest_task_operation(session_id)?;
-    let pending = prior.as_ref().filter(|operation| {
-        matches!(
-            operation.state.as_str(),
-            "admitted"
-                | "accepted"
-                | "stopping"
-                | "running"
-                | "applying"
-                | "verifying"
-                | "resuming"
-        )
-    });
-    let running_intent = pending
-        .map(|operation| operation.resume_after_transition)
-        .unwrap_or_else(|| controller.coordinator.execution.available_permits() == 0);
-    let resume_after_transition = if matches!(action, "pause" | "clear" | "undo") {
-        false
-    } else if matches!(
-        action,
-        "plan" | "execute" | "goal" | "fork" | "attach_plan" | "resume"
-    ) {
-        true
-    } else {
-        running_intent
-    };
-    let permission_selection = if action == "permission" {
-        let mut access = session.access;
-        let mut approval = session.approval_mode;
-        if let Some(selection) = pending.and_then(|operation| operation.permission_selection) {
-            access.sandbox = selection.sandbox;
-            access.read_access = selection.read_access;
-            access.write_access = selection.write_access;
-            approval = selection.approval_mode;
-        }
-        let change: crate::task::PermissionChange =
-            serde_json::from_value(request.params["change"].clone())?;
-        change.apply(
-            &mut access,
-            &mut approval,
-            forge_providers::registry::resolve(&forge_providers::registry::select(
-                &session.provider,
-            )?)?
-            .capability
-            .supports_sandbox(),
-        );
-        Some(crate::task::PermissionSelection {
-            sandbox: access.sandbox,
-            read_access: access.read_access,
-            write_access: access.write_access,
-            approval_mode: approval,
-        })
-    } else {
-        None
-    };
-    let operation = crate::task::TaskOperation {
-        revision: 0,
-        id,
-        session_id: session_id.to_owned(),
-        action: request.params.clone(),
-        permission_selection,
-        state: "admitted".into(),
-        error: None,
-        exchange_id: None,
-        created_at_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64,
-        resume_after_transition,
-    };
-    store.admit_task_operation(&operation)?;
-    if matches!(action, "pause" | "clear" | "undo") {
-        controller
-            .coordinator
-            .submissions
-            .suspend(true, Some(&operation.id))?;
-    }
-    Ok(operation)
-}
-
-async fn route_task_transition(
-    registry: Arc<SessionControllerRegistry>,
-    controller: Arc<SessionController>,
-    session_id: String,
-    request: Request,
-    sink: &MessageSender,
-) -> Result<()> {
-    if task_state::apply(
-        &controller,
-        &session_id,
-        &request,
-        registry.initialize.goal_max_turns,
-        sink,
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
-    let mut operation = admit_task_intent(&controller, &session_id, &request, &mut store)?;
-    let admitted = store.claim_task_operation(&session_id, &operation.id)?;
-    if !admitted {
-        sink.send_control_response(Response::success(
-            request.id,
-            store
-                .load_task_operation(&session_id, &operation.id)?
-                .map(|operation| operation.view()),
-        )?)
-        .await?;
-        return Ok(());
-    }
-    operation.state = "accepted".into();
-    operation.revision += 1;
-    let mut retained_compaction_execution = None;
-    let result = async {
-        sink.send_control_response(Response::success(request.id, operation.view())?)
-            .await?;
-        if operation.action["action"] == "configure" {
-            controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
-        }
-        if let Some(revision) = operation
-            .action
-            .pointer("/config/settings_revision")
-            .and_then(Value::as_u64)
-        {
-            crate::settings::SettingsStore::open(
-                PathBuf::from(&registry.initialize.data_root).as_path(),
-            )?
-            .begin_application(&session_id, &operation.id, revision)?;
-        }
-        let exchange_list = store.list_exchange(&session_id)?;
-        let mut active = exchange_list.iter().filter(|exchange| {
-            !exchange.is_finished()
-                && exchange.state() != crate::exchange::ExchangeState::Queued
-                && exchange.disposition() == crate::exchange::HistoryDisposition::Current
-        });
-        operation.exchange_id = active.next().map(|exchange| exchange.id.clone());
-        ensure!(
-            active.next().is_none(),
-            "configuration has multiple active exchange owners"
-        );
-        if operation.exchange_id.is_none()
-            && let Some(run_id) = controller.checks.active()?
-        {
-            operation.exchange_id = controller
-                .checks
-                .status(&run_id, 0, false)
-                .await?
-                .owner
-                .exchange_id()
-                .map(str::to_owned);
-        }
-        retain_configuration_event(&mut store, &operation)?;
-        let registry_ref = &registry;
-        let controller_ref = &controller;
-        let operation_ref = &mut operation;
-        let store_ref = &mut store;
-        let retained_ref = &mut retained_compaction_execution;
-        let transition = move || {
-            let operation = operation_ref;
-            let store = store_ref;
-            let retained = retained_ref;
-            execute_task_transition_inner(registry_ref, controller_ref, operation, store, sink, retained)
-        };
-        controller.trace.record(&session_id, "future.stack_probe", json!({"phase":"task.transition.construct","bytes":crate::trace::future_bytes(&transition)}));
-        let transition = Box::pin(transition());
-        controller.trace.record(&session_id, "future.stack_probe", json!({"phase":"task.transition.boxed","bytes":0}));
-        transition.await
-    }
-    .await;
-    if operation.action["action"] == "configure" {
-        controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
-    }
-    match result {
-        Ok(()) => {
-            if operation.state != "superseded" {
-                operation.state = "completed".into();
-            }
-        }
-        Err(error) if error.is::<crate::broker::TurnCancelled>() => {
-            operation.state = "cancelled".into();
-            operation.error = None;
-        }
-        Err(error) => {
-            operation.state = "failed".into();
-            operation.error = Some(format!("{error:#}"));
-        }
-    }
-    if let Err(error) = store.save_task_operation(&mut operation) {
-        operation.state = "outcome_unknown".into();
-        operation.error = Some(format!(
-            "Task outcome could not be persisted: {error:#}. Effects may have occurred"
-        ));
-    }
-    retain_configuration_event(&mut store, &operation)?;
-    if operation.state == "completed"
-        && matches!(
-            operation.action["action"].as_str(),
-            Some("resume" | "plan" | "execute" | "goal" | "fork" | "attach_plan")
-        )
-    {
-        let update = controller
-            .coordinator
-            .submissions
-            .suspend(false, Some(&operation.id))?;
-        controller.publish_input(update, sink).await?;
-    }
-    controller.coordinator.submissions.changed.notify_one();
-    if operation
-        .action
-        .pointer("/config/settings_revision")
-        .is_some()
-    {
-        crate::settings::SettingsStore::open(
-            PathBuf::from(&registry.initialize.data_root).as_path(),
-        )?
-        .finish_application(&session_id, &operation.id, &operation.state)?;
-    }
-    sink.send_control_wait(Message::Event(SessionEvent {
-        session_id,
-        event: "task_operation".into(),
-        payload: operation.view(),
-    }))
-    .await?;
-    Ok(())
-}
-
-fn retain_configuration_event(
-    store: &mut SqliteStore,
-    operation: &crate::task::TaskOperation,
-) -> Result<()> {
-    if operation.action["action"] != "configure" {
-        return Ok(());
-    }
-    let existing = store
-        .list_session_event(&operation.session_id)?
-        .into_iter()
-        .find(|event| event.id == format!("configuration-{}", operation.id));
-    let created_at_ms = existing
-        .as_ref()
-        .map(|event| event.created_at_ms)
-        .unwrap_or(operation.created_at_ms);
-    let owner = match existing {
-        Some(event) => event.owner,
-        None => match operation.exchange_id.as_deref() {
-            Some(exchange_id) => {
-                store.capture_timeline_owner(&operation.session_id, exchange_id)?
-            }
-            None => crate::timeline::TimelineOwner::session(&operation.session_id),
-        },
-    };
-    store.save_session_event(&crate::timeline::SessionEventRecord {
-        id: format!("configuration-{}", operation.id),
-        session_id: operation.session_id.clone(),
-        owner,
-        created_at_ms,
-        detail: crate::timeline::SessionEventKind::Configuration {
-            operation_id: operation.id.clone(),
-            state: operation.state.clone(),
-            field: operation.action["config"]["setting_fields"]
-                .as_array()
-                .map(|field| {
-                    field
-                        .iter()
-                        .filter_map(|field| field.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_else(|| {
-                    operation.action["config"]
-                        .as_object()
-                        .map(|config| config.keys().cloned().collect())
-                        .unwrap_or_default()
-                }),
-            reason: operation.error.clone(),
-        },
-    })
-}
-
-#[cfg(test)]
-async fn execute_task_transition(
-    registry: &SessionControllerRegistry,
-    controller: &Arc<SessionController>,
-    operation: &mut crate::task::TaskOperation,
-    store: &mut SqliteStore,
-    sink: &MessageSender,
-) -> Result<()> {
-    let mut retained = None;
-    execute_task_transition_inner(registry, controller, operation, store, sink, &mut retained).await
-}
-
-async fn execute_task_transition_inner(
-    registry: &SessionControllerRegistry,
-    controller: &Arc<SessionController>,
-    operation: &mut crate::task::TaskOperation,
-    store: &mut SqliteStore,
-    sink: &MessageSender,
-    retained_compaction_execution: &mut Option<ExecutionPermit>,
-) -> Result<()> {
-    let mut action = operation.action.clone();
-    if action["action"] != "undo" {
-        controller.check_undo_fence().await?;
-    }
-    if let Some(object) = action.as_object_mut() {
-        object
-            .entry("operation_id")
-            .or_insert_with(|| json!(operation.id));
-    }
-    if let Some(selection) = operation.permission_selection {
-        action["permission_selection"] = serde_json::to_value(selection)?;
-    }
-    if matches!(
-        action["action"].as_str(),
-        Some("permission" | "configure" | "compact")
-    ) {
-        action["resume"] = json!(operation.resume_after_transition);
-    }
-    while store.pending_policy_predecessor(&operation.session_id, &operation.id)? {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let policy_change = matches!(action["action"].as_str(), Some("configure" | "permission"));
-    let control = Arc::clone(&controller.coordinator.control)
-        .acquire_owned()
-        .await?;
-    if !policy_change
-        && store
-            .latest_task_operation(&operation.session_id)?
-            .is_none_or(|latest| latest.id != operation.id)
-    {
-        operation.state = "superseded".into();
-        return Ok(());
-    }
-    operation.state = "stopping".into();
-    store.save_task_operation(operation)?;
-    retain_configuration_event(store, operation)?;
-    let changes_child_policy = action["action"] == "permission"
-        || (action["action"] == "configure"
-            && action["config"].as_object().is_some_and(|config| {
-                config.keys().any(|field| {
-                    matches!(
-                        field.as_str(),
-                        "access" | "approval_mode" | "sandbox_enabled" | "provider" | "backend"
-                    )
-                }) || config
-                    .get("setting_fields")
-                    .and_then(Value::as_array)
-                    .is_some_and(|fields| {
-                        fields.iter().filter_map(Value::as_str).any(|field| {
-                            matches!(
-                                field.split('.').next(),
-                                Some(
-                                    "access"
-                                        | "approval_mode"
-                                        | "sandbox_enabled"
-                                        | "provider"
-                                        | "backend"
-                                )
-                            )
-                        })
-                    })
-            }));
-    let child_quiescence = if changes_child_policy
-        || matches!(
-            action["action"].as_str(),
-            Some("pause" | "clear" | "stop" | "cancel" | "undo" | "verify")
-        ) {
-        Some(quiesce_children(controller).await?)
-    } else {
-        None
-    };
-    let execution = match Arc::clone(&controller.coordinator.execution).try_acquire_owned() {
-        Ok(execution) => execution,
-        Err(tokio::sync::TryAcquireError::Closed) => {
-            anyhow::bail!("session execution admission is closed")
-        }
-        Err(tokio::sync::TryAcquireError::NoPermits) => {
-            let restart = operation.resume_after_transition
-                && matches!(
-                    action["action"].as_str(),
-                    Some("permission" | "configure" | "compact")
-                );
-            let restore_prompt = action["action"] == "pause"
-                && action["restore_prompt_if_no_output"].as_bool() == Some(true);
-            controller
-                .cancellation
-                .begin_cleanup(restart, restore_prompt)?;
-            if let Some(run_id) = controller.checks.active()? {
-                controller.checks.cancel(&run_id)?;
-            }
-            if let Err(error) = controller.collect_execution(&operation.session_id).await {
-                return Err(
-                    anyhow::Error::new(error).context("collect current task before transition")
-                );
-            }
-            if restart {
-                controller.cancellation.finish_restart_cleanup();
-            } else {
-                controller.cancellation.request(restore_prompt);
-            }
-            // Execution ownership includes finalization and response delivery, independently of read-only broker locks.
-            Arc::clone(&controller.coordinator.execution)
-                .acquire_owned()
-                .await?
-        }
-    };
-    operation.exchange_id = store
-        .list_exchange(&operation.session_id)?
-        .last()
-        .map(|exchange| exchange.id.clone());
-    if !policy_change
-        && store
-            .latest_task_operation(&operation.session_id)?
-            .is_none_or(|latest| latest.id != operation.id)
-    {
-        operation.state = "superseded".into();
-        return Ok(());
-    }
-    controller.cancellation.arm(false);
-    if policy_change
-        && store
-            .latest_task_operation(&operation.session_id)?
-            .is_some_and(|latest| latest.id != operation.id)
-    {
-        action["resume"] = json!(false);
-    }
-    // Release child collection after acquiring exclusive execution, before the transition resumes work.
-    drop(child_quiescence);
-    drop(control);
-    operation.state = "running".into();
-    store.save_task_operation(operation)?;
-    sink.send_event(SessionEvent {
-        session_id: operation.session_id.clone(),
-        event: "task_operation".into(),
-        payload: operation.view(),
-    })
-    .await?;
-    if action["action"] == "undo" {
-        let outcome = drive_owned_undo(controller, &action, sink, execution).await;
-        operation.exchange_id = store
-            .list_exchange(&operation.session_id)?
-            .last()
-            .map(|exchange| exchange.id.clone());
-        outcome?;
-        return Ok(());
-    }
-    let mut broker = controller.broker.lock().await;
-    let request = Request {
-        id: 0,
-        method: "session.command.apply".into(),
-        params: action,
-    };
-    let immediate = session_command::SessionCommand::parse_request(&request)?.is_some();
-    let outcome = if matches!(
-        request.params["action"].as_str(),
-        Some("permission" | "compact" | "configure")
-    ) {
-        drop(broker);
-        // Keep nested configuration phase state off the task transition's stack.
-        let configuration = || {
-            dispatch_owned_configuration(controller, &operation.session_id, &request.params, sink)
-        };
-        controller.trace.record(&operation.session_id, "future.stack_probe", json!({"phase":"configuration.construct","bytes":crate::trace::future_bytes(&configuration)}));
-        let configuration = Box::pin(configuration());
-        controller.trace.record(
-            &operation.session_id,
-            "future.stack_probe",
-            json!({"phase":"configuration.boxed","bytes":0}),
-        );
-        configuration.await
-    } else if immediate {
-        let result = broker.dispatch_immediate_task_command(&request)?;
-        let catalog = broker.provider_catalog_request()?;
-        drop(broker);
-        *controller.catalog_request.write().await = catalog;
-        let continuing = result
-            .event
-            .iter()
-            .any(|event| event.event == "goal_continue_requested");
-        for event in result.event {
-            sink.send_event(event).await?;
-        }
-        if let Some(failure) = result.response.error() {
-            if matches!(failure.code.as_str(), "turn_cancelled" | "turn_retracted") {
-                Err(anyhow::Error::new(crate::broker::TurnCancelled))
-            } else {
-                Err(anyhow::anyhow!("{}", failure.message))
-            }
-        } else {
-            Ok(continuing)
-        }
-    } else {
-        let action = request.params["action"]
-            .as_str()
-            .unwrap_or_default()
-            .to_owned();
-        drop(broker);
-        Err(anyhow::anyhow!("unknown task action: {action}"))
-    };
-    if operation.action["action"] == "compact" {
-        *retained_compaction_execution = Some(execution);
-    } else {
-        drop(execution);
-    }
-    operation.exchange_id = store
-        .list_exchange(&operation.session_id)?
-        .last()
-        .map(|exchange| exchange.id.clone());
-    outcome?;
-    let _ = registry;
-    Ok(())
-}
-
-/// Settle an older exchange without holding the broker across checkpoint or observation waits.
-async fn settle_prior_for_undo(controller: &SessionController, sink: &MessageSender) -> Result<()> {
-    let mut prior = match controller.broker.lock().await.begin_prior_finalization()? {
-        Some(prior) => prior,
-        None => return Ok(()),
-    };
-    let mut pending = None;
-    loop {
-        let mut events = Vec::new();
-        let action = match pending.take() {
-            Some(action) => Ok(action),
-            None => controller
-                .broker
-                .lock()
-                .await
-                .advance_prior_finalization(&mut prior, &mut events),
-        };
-        for event in events {
-            sink.send_event(event).await?;
-        }
-        let action = match action {
-            Ok(action) => action,
-            Err(error) => {
-                let cleanup = controller
-                    .broker
-                    .lock()
-                    .await
-                    .abort_prior_finalization(&mut prior, &error);
-                return match cleanup {
-                    Ok(()) => Err(error),
-                    Err(cleanup) => {
-                        Err(error.context(format!("prior settlement cleanup failed: {cleanup:#}")))
-                    }
-                };
-            }
-        };
-        match action {
-            crate::broker::PriorFinalizationAction::Ready => return Ok(()),
-            crate::broker::PriorFinalizationAction::Wait(job) => {
-                if let Err(error) = job.run().await {
-                    let cleanup = controller
-                        .broker
-                        .lock()
-                        .await
-                        .abort_prior_finalization(&mut prior, &error);
-                    return match cleanup {
-                        Ok(()) => Err(error),
-                        Err(cleanup) => {
-                            Err(error
-                                .context(format!("prior settlement cleanup failed: {cleanup:#}")))
-                        }
-                    };
-                }
-            }
-            crate::broker::PriorFinalizationAction::Initial(job) => {
-                let result = job.run().await;
-                if let Err(error) = controller
-                    .broker
-                    .lock()
-                    .await
-                    .apply_prior_initial(&mut prior, result)
-                {
-                    let cleanup = controller
-                        .broker
-                        .lock()
-                        .await
-                        .abort_prior_finalization(&mut prior, &error);
-                    return match cleanup {
-                        Ok(()) => Err(error),
-                        Err(cleanup) => {
-                            Err(error
-                                .context(format!("prior settlement cleanup failed: {cleanup:#}")))
-                        }
-                    };
-                }
-            }
-            crate::broker::PriorFinalizationAction::Final(job) => {
-                let result = job.run().await;
-                let mut events = Vec::new();
-                let action = controller.broker.lock().await.apply_prior_final(
-                    &mut prior,
-                    result,
-                    &mut events,
-                );
-                for event in events {
-                    sink.send_event(event).await?;
-                }
-                match action {
-                    Ok(action) => pending = Some(action),
-                    Err(error) => {
-                        let cleanup = controller
-                            .broker
-                            .lock()
-                            .await
-                            .abort_prior_finalization(&mut prior, &error);
-                        return match cleanup {
-                            Ok(()) => Err(error),
-                            Err(cleanup) => Err(error
-                                .context(format!("prior settlement cleanup failed: {cleanup:#}"))),
-                        };
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Retire the old provider before committing rollback and installing a fresh observation owner.
-async fn drive_owned_undo(
-    controller: &Arc<SessionController>,
-    action: &Value,
-    sink: &MessageSender,
-    execution: ExecutionPermit,
-) -> Result<()> {
-    let operation_id = action
-        .get("operation_id")
-        .and_then(Value::as_str)
-        .context("undo operation identity is missing")?
-        .to_owned();
-    let mut slot = controller.undo_task.lock().await;
-    if slot.is_none() {
-        let owner = controller.clone();
-        let action = action.clone();
-        let sink = sink.clone();
-        let teardown_started = Arc::new(AtomicBool::new(false));
-        let started = teardown_started.clone();
-        let task = tokio::spawn(async move {
-            let _execution = execution;
-            run_owned_undo(&owner, &action, &sink, started).await
-        });
-        *slot = Some(RetainedUndoTask::Running {
-            operation_id: operation_id.clone(),
-            task,
-            teardown_started,
-        });
-    }
-    match slot.as_mut().expect("undo task installed") {
-        RetainedUndoTask::Failed {
-            operation_id: failed,
-            message,
-        } => {
-            anyhow::bail!("undo {failed} could not collect its native generation: {message}")
-        }
-        RetainedUndoTask::Running {
-            operation_id: running,
-            task,
-            teardown_started,
-        } => {
-            anyhow::ensure!(
-                running == &operation_id,
-                "another undo generation is still owned"
-            );
-            let result = task
-                .await
-                .context("undo owner task panicked")
-                .and_then(|result| result);
-            match result {
-                Ok(()) => {
-                    *slot = None;
-                    Ok(())
-                }
-                Err(error) => {
-                    if teardown_started.load(Ordering::Acquire) {
-                        let message = format!("{error:#}");
-                        *slot = Some(RetainedUndoTask::Failed {
-                            operation_id,
-                            message,
-                        });
-                    } else {
-                        *slot = None;
-                    }
-                    Err(error)
-                }
-            }
-        }
-    }
-}
-
-async fn run_owned_undo(
-    controller: &Arc<SessionController>,
-    action: &Value,
-    sink: &MessageSender,
-    teardown_started: Arc<AtomicBool>,
-) -> Result<()> {
-    settle_prior_for_undo(controller, sink).await?;
-    let events = controller.broker.lock().await.prepare_undo_cancel()?;
-    for event in events {
-        sink.send_event(event).await?;
-    }
-    settle_prior_for_undo(controller, sink).await?;
-    controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
-    if let Some(startup) = controller.provider_startup.lock().await.take() {
-        startup
-            .await
-            .context("previous provider initialization task panicked")?;
-    }
-    let provider_generation = controller.provider_lane.clone().write_owned().await;
-    let mut teardown = controller
-        .broker
-        .lock()
-        .await
-        .prepare_undo_teardown(action)?;
-    teardown_started.store(true, Ordering::Release);
-    teardown.run().await?;
-    controller.finish_session_events().await?;
-    let (events, replacement, goal_lane) = {
-        let mut broker = controller.broker.lock().await;
-        let mut events = broker.drain_session_events()?;
-        let (rollback_events, goal_lane) = broker.commit_undo_teardown(teardown)?;
-        events.extend(rollback_events);
-        (events, broker.provider_handle(), goal_lane)
-    };
-    for event in events {
-        sink.send_event(event).await?;
-    }
-    controller.attach_session_events(sink).await?;
-    *controller
-        .provider
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = replacement;
-    controller.task_controller.native_goal_written()?;
-    drop(goal_lane);
-    drop(provider_generation);
-    *controller
-        .provider_startup_error
-        .lock()
-        .expect("provider startup state poisoned") = None;
-    controller.start_provider(sink).await;
-    Ok(())
-}
-
-/// Commit configuration state, then deliver and resume outside broker ownership.
-async fn dispatch_owned_configuration(
-    controller: &SessionController,
-    session_id: &str,
-    action: &Value,
-    sink: &MessageSender,
-) -> Result<bool> {
-    controller.trace.record(
-        session_id,
-        "future.stack_probe",
-        json!({"phase":"configuration.enter","bytes":0}),
-    );
-    let (publication, mut stream) = crate::broker::publication::channel();
-    let output = sink.clone();
-    let session = session_id.to_owned();
-    let catalog = controller.catalog_request.clone();
-    let data_root = controller.broker.lock().await.data_root().to_path_buf();
-    let forwarder_factory = || async move {
-        while let Some(update) = stream.recv().await? {
-            if let crate::broker::publication::SessionUpdate::ConfigurationProgress {
-                operation_id,
-                state,
-            } = &update
-            {
-                let mut store = SqliteStore::open(&data_root)?;
-                let mut operation = store
-                    .load_task_operation(&session, operation_id)?
-                    .context("configuration operation is missing")?;
-                operation.state = state.as_str().into();
-                store.save_task_operation(&mut operation)?;
-                retain_configuration_event(&mut store, &operation)?;
-                output
-                    .send_control_wait(Message::Event(SessionEvent {
-                        session_id: session.clone(),
-                        event: "task_operation".into(),
-                        payload: operation.view(),
-                    }))
-                    .await?;
-                continue;
-            }
-            let payload = crate::broker::publication::encode_session_update(&update)?;
-            let (event, payload) =
-                if let crate::broker::publication::SessionUpdate::Configuration {
-                    catalog: next,
-                    ..
-                } = &update
-                {
-                    *catalog.write().await = next.as_ref().clone();
-                    ("session_configured", payload["data"].clone())
-                } else if matches!(
-                    &update,
-                    crate::broker::publication::SessionUpdate::DocumentChanged { .. }
-                ) {
-                    ("document_changed", payload)
-                } else {
-                    ("provider_event", payload)
-                };
-            output
-                .send_event(SessionEvent {
-                    session_id: session.clone(),
-                    event: event.into(),
-                    payload,
-                })
-                .await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.forwarder.construct","bytes":crate::trace::future_bytes(&forwarder_factory)}));
-    let forwarder = forwarder_factory();
-    controller.trace.record(
-        session_id,
-        "future.stack_probe",
-        json!({"phase":"configuration.forwarder.ready","bytes":0}),
-    );
-    let operation_factory = || async move {
-        controller.trace.record(
-            session_id,
-            "future.stack_probe",
-            json!({"phase":"configuration.operation.enter","bytes":0}),
-        );
-        let outcome: Result<bool> = async {
-            let _provider_generation = if action["action"] == "configure" {
-                Some(controller.provider_lane.read().await)
-            } else {
-                None
-            };
-            let (delivery, resume) = if action["action"] == "configure" {
-                let phase = || run_owned_configuration_change(controller, session_id, action, sink, &publication);
-                controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.change.construct","bytes":crate::trace::future_bytes(&phase)}));
-                Box::pin(phase()).await?
-            } else if action["action"] == "compact" {
-                let phase = || run_owned_configuration_compaction(controller, action, sink, &publication);
-                controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.compaction.construct","bytes":crate::trace::future_bytes(&phase)}));
-                Box::pin(phase()).await?
-            } else {
-                let mut broker = controller.broker.lock().await;
-                let result = broker.with_publication_sink(&publication, |broker| {
-                    let captured = broker.prepare_permission_configuration(action)?;
-                    broker.commit_permission_configuration(captured)
-                })?;
-                (result.delivery, result.resume)
-            };
-            for event in delivery.deliver_and_flush().await? {
-                sink.send_event(event).await?;
-            }
-            if let Some(prompt) = resume {
-                let operation_id = action
-                    .get("operation_id")
-                    .and_then(Value::as_str)
-                    .context("permission operation identity is missing")?;
-                let progress = {
-                    let mut broker = controller.broker.lock().await;
-                    broker.with_publication_sink(&publication, |broker| {
-                        broker.prepare_permission_resume_progress(operation_id)
-                    })?
-                };
-                for event in progress.deliver_and_flush().await? {
-                    sink.send_event(event).await?;
-                }
-                let dispatch = {
-                    let mut broker = controller.broker.lock().await;
-                    broker.with_publication_sink(&publication, |broker| {
-                        broker.begin_permission_resume_dispatch(prompt, publication.clone())
-                    })?
-                };
-                if let Some(dispatch) = dispatch {
-                    let result = drive_owned_foreground(controller, dispatch, sink).await?;
-                    let continuing = result
-                        .event
-                        .iter()
-                        .any(|event| event.event == "goal_continue_requested");
-                    for event in result.event {
-                        sink.send_event(event).await?;
-                    }
-                    if let Some(failure) = result.response.error() {
-                        if matches!(failure.code.as_str(), "turn_cancelled" | "turn_retracted") {
-                            return Err(crate::broker::TurnCancelled.into());
-                        }
-                        anyhow::bail!("{}", failure.message);
-                    }
-                    return Ok(continuing);
-                }
-            }
-            Ok(false)
-        }
-        .await;
-        drop(publication);
-        outcome
-    };
-    controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.operation.construct","bytes":crate::trace::future_bytes(&operation_factory)}));
-    let operation = operation_factory();
-    controller.trace.record(
-        session_id,
-        "future.stack_probe",
-        json!({"phase":"configuration.operation.ready","bytes":0}),
-    );
-    let (outcome, forwarding) = tokio::join!(operation, forwarder);
-    if action["action"] == "compact"
-        && let Err(error) = &forwarding
-    {
-        controller
-            .record_compaction_failure(format!("compaction event forwarder failed: {error:#}"))?;
-    }
-    let continuing = outcome?;
-    forwarding?;
-    Ok(continuing)
-}
-
-/// Run the provider-backed configuration phase as independently owned work.
-async fn run_owned_configuration_change(
-    controller: &SessionController,
-    session_id: &str,
-    action: &Value,
-    sink: &MessageSender,
-    publication: &crate::broker::publication::SessionUpdateSink,
-) -> Result<(crate::broker::PendingProviderDelivery, Option<String>)> {
-    controller.trace.record(
-        session_id,
-        "future.stack_probe",
-        json!({"phase":"configuration.applying.prepare","bytes":0}),
-    );
-    let operation_id = action.get("operation_id").and_then(Value::as_str);
-    let applying = {
-        let mut broker = controller.broker.lock().await;
-        broker.with_publication_sink(publication, |broker| {
-            broker.prepare_configuration_progress(
-                operation_id,
-                crate::broker::publication::ConfigurationProgressState::Applying,
-            )
-        })?
-    };
-    if let Some(delivery) = applying {
-        for event in delivery.deliver_and_flush().await? {
-            sink.send_event(event).await?;
-        }
-    }
-    controller.trace.record(
-        session_id,
-        "future.stack_probe",
-        json!({"phase":"configuration.applying.delivered","bytes":0}),
-    );
-    let (preparation, catalog_job) = {
-        let broker = controller.broker.lock().await;
-        let params = action
-            .get("config")
-            .cloned()
-            .context("configuration is required")?;
-        let preparation = broker.prepare_configuration(params)?;
-        let job = if preparation.needs_catalog(&broker) {
-            Some(broker.prepare_configuration_catalog()?)
-        } else {
-            None
-        };
-        (preparation, job)
-    };
-    let models = if let Some(job) = catalog_job {
-        let factory = || job.run();
-        controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.catalog.construct","bytes":crate::trace::future_bytes(&factory)}));
-        let result = factory().await?;
-        controller.trace.record(
-            session_id,
-            "future.stack_probe",
-            json!({"phase":"configuration.catalog.ready","bytes":0}),
-        );
-        controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.catalog.result_size","bytes":std::mem::size_of_val(&result)}));
-        let broker = controller.broker.lock().await;
-        controller.trace.record(
-            session_id,
-            "future.stack_probe",
-            json!({"phase":"configuration.catalog.locked","bytes":0}),
-        );
-        let models = broker.commit_configuration_catalog(result)?;
-        controller.trace.record(
-            session_id,
-            "future.stack_probe",
-            json!({"phase":"configuration.catalog.validated","bytes":0}),
-        );
-        models
-    } else {
-        Vec::new()
-    };
-    let (mut candidate, reconcile) = {
-        let broker = controller.broker.lock().await;
-        controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.candidate.prepare","bytes":std::mem::size_of_val(preparation.as_ref())}));
-        let candidate = broker.build_configuration_candidate(preparation, &models)?;
-        controller.trace.record(session_id, "future.stack_probe", json!({"phase":"configuration.candidate.built","bytes":std::mem::size_of_val(candidate.as_ref())}));
-        let reconcile = broker.prepare_candidate_reconcile(&candidate)?;
-        (candidate, reconcile)
-    };
-    if let Some(job) = reconcile {
-        let result = job.run().await?;
-        controller
-            .broker
-            .lock()
-            .await
-            .certify_candidate_reconcile(&mut candidate, result)?;
-    }
-    let committed = {
-        let mut broker = controller.broker.lock().await;
-        broker.with_publication_sink(publication, |broker| {
-            broker.commit_configuration_candidate(candidate)
-        })?
-    };
-    if let Some(job) = committed.cleanup {
-        let result = job.run().await?;
-        controller
-            .broker
-            .lock()
-            .await
-            .commit_configuration_reconcile(result)?;
-    }
-    if action.pointer("/config/settings_revision").is_some() {
-        let verifying = {
-            let mut broker = controller.broker.lock().await;
-            broker.with_publication_sink(publication, |broker| {
-                broker.prepare_configuration_progress(
-                    operation_id,
-                    crate::broker::publication::ConfigurationProgressState::Verifying,
-                )
-            })?
-        };
-        if let Some(delivery) = verifying {
-            for event in delivery.deliver_and_flush().await? {
-                sink.send_event(event).await?;
-            }
-        }
-        controller
-            .broker
-            .lock()
-            .await
-            .confirm_configuration_application(action)?;
-    }
-    let mut notices = {
-        let mut broker = controller.broker.lock().await;
-        broker.with_publication_sink(publication, |broker| {
-            broker.prepare_configuration_mcp_notices()
-        })?
-    };
-    for delivery in std::mem::take(&mut notices.deliveries) {
-        for event in delivery.deliver_and_flush().await? {
-            sink.send_event(event).await?;
-        }
-    }
-    controller
-        .broker
-        .lock()
-        .await
-        .commit_configuration_mcp_notices(notices)?;
-    let mut broker = controller.broker.lock().await;
-    let result = broker.with_publication_sink(publication, |broker| {
-        broker.finish_compaction_configuration(action)
-    })?;
-    Ok((result.delivery, result.resume))
-}
-
-/// Run compaction as a separate owned phase, preserving its terminal publication.
-async fn run_owned_configuration_compaction(
-    controller: &SessionController,
-    action: &Value,
-    sink: &MessageSender,
-    publication: &crate::broker::publication::SessionUpdateSink,
-) -> Result<(crate::broker::PendingProviderDelivery, Option<String>)> {
-    let (job, started) = {
-        let mut broker = controller.broker.lock().await;
-        broker.with_publication_sink(publication, |broker| {
-            broker.prepare_owned_compaction(crate::broker::CompactionProvenance::Manual)
-        })?
-    };
-    let start: Result<()> = async {
-        for event in started.deliver_and_flush().await? {
-            sink.send_event(event).await?;
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(error) = start {
-        let original = format!("{error:#}");
-        controller.record_compaction_failure(format!(
-            "compaction start publication failed: {original}"
-        ))?;
-        let aborted = {
-            let mut broker = controller.broker.lock().await;
-            broker.with_publication_sink(publication, |broker| {
-                broker.abort_owned_compaction(job, error)
-            })
-        };
-        let aborted = match aborted {
-            Ok(result) => result,
-            Err(error) => {
-                controller
-                    .record_compaction_failure(format!("compaction abort failed: {error:#}"))?;
-                return Err(error)
-                    .with_context(|| format!("compaction start publication failed: {original}"));
-            }
-        };
-        let (terminal, failure, _) = aborted;
-        let terminal_result: Result<()> = async {
-            for event in terminal.deliver_and_flush().await? {
-                sink.send_event(event).await?;
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(error) = &terminal_result {
-            controller.record_compaction_failure(format!(
-                "terminal compaction publication failed: {error:#}"
-            ))?;
-        }
-        if let Some(failure) = failure {
-            return match terminal_result {
-                Ok(()) => Err(failure),
-                Err(delivery) => Err(failure.context(format!(
-                    "terminal compaction publication failed: {delivery:#}"
-                ))),
-            };
-        }
-        terminal_result?;
-        anyhow::bail!("compaction start publication failed: {original}");
-    }
-    let captured = job.run().await;
-    let (finished, failure, _) = {
-        let mut broker = controller.broker.lock().await;
-        match broker.with_publication_sink(publication, |broker| {
-            broker.commit_owned_compaction(captured)
-        }) {
-            Ok(result) => result,
-            Err(error) => {
-                controller.record_compaction_failure(format!(
-                    "compaction result commit failed: {error:#}"
-                ))?;
-                return Err(error);
-            }
-        }
-    };
-    let delivered: Result<()> = async {
-        for event in finished.deliver_and_flush().await? {
-            sink.send_event(event).await?;
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(error) = &delivered {
-        controller.record_compaction_failure(format!(
-            "terminal compaction publication failed: {error:#}"
-        ))?;
-    }
-    if let Some(error) = failure {
-        return match delivered {
-            Ok(()) => Err(error),
-            Err(delivery) => Err(error.context(format!(
-                "terminal compaction publication failed: {delivery:#}"
-            ))),
-        };
-    }
-    delivered?;
-    let mut broker = controller.broker.lock().await;
-    let result = broker.with_publication_sink(publication, |broker| {
-        broker.finish_compaction_configuration(action)
-    })?;
-    Ok((result.delivery, result.resume))
 }
 
 async fn route_new_session(
@@ -4763,7 +2494,7 @@ async fn start_session_fork(
     Ok((child_result, gate_result))
 }
 
-/// Retires only an idle local controller before acquiring durable deletion ownership.
+/// Close the selected idle owner before deleting its durable session records.
 async fn delete_session(
     registry: Arc<SessionControllerRegistry>,
     source_session_id: &str,
@@ -4780,65 +2511,72 @@ async fn delete_session(
         target != source_session_id,
         "cannot delete the active session"
     );
-    let mut controllers = registry.controller_by_id.write().await;
-    if let Some(controller) = controllers.get(&target).cloned() {
-        let _control = controller
-            .coordinator
-            .control
-            .clone()
-            .try_acquire_owned()
-            .context("cannot delete a session with active control work")?;
-        let _execution = controller
-            .coordinator
-            .execution
-            .clone()
-            .try_acquire_owned()
-            .context("cannot delete a session with active execution")?;
-        ensure!(
-            controller
-                .coordinator
-                .submissions
-                .snapshot()?
-                .messages
-                .is_empty(),
-            "cannot delete a session with queued input"
-        );
-        ensure!(
-            controller.agent_coordinator.active_count() == 0,
-            "cannot delete a session with active agents"
-        );
-        ensure!(
-            controller.checks.active()?.is_none(),
-            "cannot delete a session with active checks"
-        );
-        let mut broker = controller
-            .broker
-            .try_lock()
-            .context("cannot delete a session with active work")?;
-        broker.release_lease()?;
+    let selected = registry.controller_by_id.read().await.get(&target).cloned();
+    if let Some(controller) = &selected {
+        require_idle_deletion(controller)?;
+        {
+            let mut startup = controller.provider_startup.lock().await;
+            if let Some(task) = startup.as_mut() {
+                tokio::time::timeout(Duration::from_secs(60), &mut *task)
+                    .await
+                    .context("session startup did not settle before deletion")?
+                    .context("session startup failed before deletion")?;
+                startup.take();
+            }
+        }
         controller.input_stopping.store(true, Ordering::Release);
         controller.coordinator.submissions.changed.notify_one();
-        controller.coordinator.execution.close();
-        controller.coordinator.control.close();
-        for task in [
-            controller.provider_startup.lock().await.take(),
-            controller.input_task.lock().await.take(),
-            controller.timeout_task.lock().await.take(),
-            controller.agent_task.lock().await.take(),
-        ]
-        .into_iter()
-        .flatten()
+        // The owner retains every admitted command and collection effect when this wait is cancelled.
+        tokio::time::timeout(Duration::from_secs(60), controller.finish_exchange_owner())
+            .await
+            .context("session owner did not settle before deletion")??;
+        controller.finish_prompt_workers().await?;
+        require_idle_deletion(controller)?;
         {
-            task.abort();
-            let _ = task.await;
+            let mut input = controller.input_task.lock().await;
+            if let Some(task) = input.as_mut() {
+                task.await.context("input worker failed before deletion")?;
+                input.take();
+            }
         }
-        if let Some(task) = controller.session_event_task.lock().await.take() {
-            task.abort();
-            let _ = task.await;
+        for subscription in [&controller.timeout_task, &controller.agent_task] {
+            let mut slot = subscription.lock().await;
+            if let Some(task) = slot.as_mut() {
+                task.abort();
+                if let Err(error) = task.await
+                    && !error.is_cancelled()
+                {
+                    return Err(error).context("session subscription failed before deletion");
+                }
+                slot.take();
+            }
         }
-        controllers.remove(&target);
+        {
+            let mut observation = controller.session_event_task.lock().await;
+            if let Some(task) = observation.as_mut() {
+                task.abort();
+                if let Err(error) = task.await
+                    && !error.is_cancelled()
+                {
+                    return Err(error).context("session observation failed before deletion");
+                }
+                observation.take();
+            }
+        }
     }
-    drop(controllers);
+    let mut controllers = registry.controller_by_id.write().await;
+    ensure!(
+        match (&selected, controllers.get(&target)) {
+            (Some(selected), Some(current)) => Arc::ptr_eq(selected, current),
+            (None, None) => true,
+            _ => false,
+        },
+        "session controller changed while deletion waited for its owner"
+    );
+    if let Some(controller) = &selected {
+        require_idle_deletion(controller)?;
+        controller.broker.lock().await.release_lease()?;
+    }
     let mut store = SqliteStore::open(std::path::Path::new(&registry.initialize.data_root))?;
     let session = store.load_session(&target)?.context("session not found")?;
     let plans = crate::plan::PlanFileStore::new(
@@ -4852,12 +2590,52 @@ async fn delete_session(
             &target,
         )
     })?;
+    if let Some(controller) = selected {
+        controller.coordinator.execution.close();
+        controller.coordinator.control.close();
+        controllers.remove(&target);
+    }
+    drop(controllers);
     message_sink
         .send_response(Response::success(
             request.id,
             json!({"deleted":target,"provider_session_preserved":true}),
         )?)
         .await?;
+    Ok(())
+}
+
+/// Reject deletion while any local execution, input, child, or check still owns session work.
+fn require_idle_deletion(controller: &SessionController) -> Result<()> {
+    let _control = controller
+        .coordinator
+        .control
+        .clone()
+        .try_acquire_owned()
+        .context("cannot delete a session with active control work")?;
+    let _execution = controller
+        .coordinator
+        .execution
+        .clone()
+        .try_acquire_owned()
+        .context("cannot delete a session with active execution")?;
+    ensure!(
+        controller
+            .coordinator
+            .submissions
+            .snapshot()?
+            .messages
+            .is_empty(),
+        "cannot delete a session with queued input"
+    );
+    ensure!(
+        controller.agent_coordinator.active_count() == 0,
+        "cannot delete a session with active agents"
+    );
+    ensure!(
+        controller.checks.active()?.is_none(),
+        "cannot delete a session with active checks"
+    );
     Ok(())
 }
 
@@ -4884,7 +2662,6 @@ async fn acquire_request_broker(
     controller: &SessionController,
     method: RuntimeMethod,
 ) -> Result<(MutexGuard<'_, HarnessBroker>, Option<ExecutionPermit>)> {
-    controller.check_undo_fence().await?;
     let admission = if method.requires_provider_fork() {
         None
     } else {
@@ -4898,696 +2675,37 @@ async fn acquire_request_broker(
     Ok((broker, admission))
 }
 
-/// Own the complete manual compaction and its forwarder independently of its waiter.
-async fn run_retained_manual_compaction(
-    controller: Arc<SessionController>,
-    session_id: String,
-    request: Request,
-    sink: MessageSender,
-) -> Result<()> {
-    let (broker, execution) =
-        acquire_request_broker(&controller, RuntimeMethod::SessionCompact).await?;
-    let (publication, mut stream) = crate::broker::publication::channel();
-    let forwarded = sink.clone();
-    let event_session = session_id.clone();
-    let forwarder = async move {
-        while let Some(update) = stream.recv().await? {
-            let (event, payload) = if matches!(
-                &update,
-                crate::broker::publication::SessionUpdate::DocumentChanged { .. }
-            ) {
-                (
-                    "document_changed",
-                    crate::broker::publication::encode_session_update(&update)?,
-                )
-            } else {
-                (
-                    "provider_event",
-                    crate::broker::publication::encode_session_update(&update)?,
-                )
-            };
-            forwarded
-                .send_event(SessionEvent {
-                    session_id: event_session.clone(),
-                    event: event.into(),
-                    payload,
-                })
-                .await?;
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    let (outcome, forwarding) = tokio::join!(
-        drive_manual_compaction(&controller, broker, request, publication, &sink),
-        forwarder,
-    );
-    let (mut result, retained_failure) = outcome;
-    if let Some(failure) = retained_failure {
-        controller.record_compaction_failure(failure)?;
-    }
-    forwarding.context("manual compaction event forwarding failed")?;
-    for event in result.event.drain(..) {
-        sink.send_event(event).await?;
-    }
-    let catalog = controller.broker.lock().await.provider_catalog_request()?;
-    if catalog.provider_session_id.is_some() {
-        *controller
-            .provider_startup_error
-            .lock()
-            .map_err(|_| anyhow::anyhow!("provider startup state poisoned"))? = None;
-    }
-    *controller.catalog_request.write().await = catalog;
-    controller.coordinator.submissions.changed.notify_one();
-    sink.send_response(result.response).await?;
-    drop(execution);
-    Ok(())
-}
-
-/// Apply direct configuration through owned provider phases and short authority checks.
-async fn drive_direct_configuration(
-    controller: &SessionController,
-    mut broker: MutexGuard<'_, HarnessBroker>,
-    request: Request,
-    publication: crate::broker::publication::SessionUpdateSink,
-) -> crate::broker::DispatchResult {
-    let id = request.id;
-    broker.trace_foreground_request(&request);
-    drop(broker);
-    let outcome: Result<(Value, Vec<SessionEvent>)> = async {
-        let _provider_generation = controller.provider_lane.read().await;
-        let (preparation, catalog) = {
-            let broker = controller.broker.lock().await;
-            let preparation = broker.prepare_configuration(request.params)?;
-            let catalog = if preparation.needs_catalog(&broker) {
-                Some(broker.prepare_configuration_catalog()?)
-            } else {
-                None
-            };
-            (preparation, catalog)
-        };
-        let models = if let Some(job) = catalog {
-            let result = job.run().await?;
-            controller
-                .broker
-                .lock()
-                .await
-                .commit_configuration_catalog(result)?
-        } else {
-            Vec::new()
-        };
-        let (mut candidate, reconcile) = {
-            let broker = controller.broker.lock().await;
-            let candidate = broker.build_configuration_candidate(preparation, &models)?;
-            let reconcile = broker.prepare_candidate_reconcile(&candidate)?;
-            (candidate, reconcile)
-        };
-        if let Some(job) = reconcile {
-            let result = job.run().await?;
-            controller
-                .broker
-                .lock()
-                .await
-                .certify_candidate_reconcile(&mut candidate, result)?;
-        }
-        let committed = {
-            let mut broker = controller.broker.lock().await;
-            broker.with_publication_sink(&publication, |broker| {
-                broker.commit_configuration_candidate(candidate)
-            })?
-        };
-        if let Some(cleanup) = committed.cleanup {
-            let result = cleanup.run().await?;
-            controller
-                .broker
-                .lock()
-                .await
-                .commit_configuration_reconcile(result)?;
-        }
-        Ok((committed.value, committed.events))
-    }
-    .await;
-    let result = match outcome {
-        Ok((value, event)) => match Response::success(id, value) {
-            Ok(response) => crate::broker::DispatchResult { response, event },
-            Err(error) => crate::broker::DispatchResult {
-                response: Response::failure(id, "encode_response", error.to_string()),
-                event: Vec::new(),
-            },
-        },
-        Err(error) => crate::broker::DispatchResult {
-            response: Response::failure(
-                id,
-                "request_failed",
-                crate::storage::error_message(&error),
-            ),
-            event: Vec::new(),
-        },
-    };
-    let mut broker = controller.broker.lock().await;
-    broker
-        .with_publication_sink(&publication, |broker| {
-            Ok(broker.finish_owned_external_request(id, RuntimeMethod::SessionConfigure, result))
-        })
-        .unwrap_or_else(|error| crate::broker::DispatchResult {
-            response: Response::failure(
-                id,
-                "request_failed",
-                crate::storage::error_message(&error),
-            ),
-            event: Vec::new(),
-        })
-}
-
-/// Run a manual compaction without retaining broker ownership across provider work or delivery.
-async fn drive_manual_compaction(
-    controller: &SessionController,
-    mut broker: MutexGuard<'_, HarnessBroker>,
-    request: Request,
-    publication: crate::broker::publication::SessionUpdateSink,
-    sink: &MessageSender,
-) -> (crate::broker::DispatchResult, Option<String>) {
-    let id = request.id;
-    let mut retained_failure = None;
-    let outcome: Result<Value> = async {
-        let (job, started) = broker.with_publication_sink(&publication, |broker| {
-            broker.prepare_owned_compaction(crate::broker::CompactionProvenance::Manual)
-        })?;
-        drop(broker);
-        let start: Result<()> = async {
-            for event in started.deliver_and_flush().await? {
-                sink.send_event(event).await?;
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(error) = start {
-            let original = format!("{error:#}");
-            retained_failure = Some(format!("compaction start publication failed: {original}"));
-            let (terminal, failure, _) = {
-                let mut broker = controller.broker.lock().await;
-                match broker.with_publication_sink(&publication, |broker| {
-                    broker.abort_owned_compaction(job, error)
-                }) {
-                    Ok(result) => result,
-                    Err(error) => {
-                        retained_failure = Some(format!("compaction abort failed: {error:#}"));
-                        return Err(error).with_context(|| {
-                            format!("compaction start publication failed: {original}")
-                        });
-                    }
-                }
-            };
-            let delivered: Result<()> = async {
-                for event in terminal.deliver_and_flush().await? {
-                    sink.send_event(event).await?;
-                }
-                Ok(())
-            }
-            .await;
-            if let Err(error) = &delivered {
-                retained_failure =
-                    Some(format!("terminal compaction publication failed: {error:#}"));
-            }
-            if let Some(failure) = failure {
-                return match delivered {
-                    Ok(()) => Err(failure),
-                    Err(error) => Err(failure
-                        .context(format!("terminal compaction publication failed: {error:#}"))),
-                };
-            }
-            delivered?;
-            anyhow::bail!("compaction start publication failed: {original}");
-        }
-        let captured = job.run().await;
-        let (terminal, failure) = {
-            let mut broker = controller.broker.lock().await;
-            let (terminal, failure, _) = match broker
-                .with_publication_sink(&publication, |broker| {
-                    broker.commit_owned_compaction(captured)
-                }) {
-                Ok(result) => result,
-                Err(error) => {
-                    retained_failure = Some(format!("compaction result commit failed: {error:#}"));
-                    return Err(error);
-                }
-            };
-            (terminal, failure)
-        };
-        let delivered: Result<()> = async {
-            for event in terminal.deliver_and_flush().await? {
-                sink.send_event(event).await?;
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(error) = &delivered {
-            retained_failure = Some(format!("terminal compaction publication failed: {error:#}"));
-        }
-        if let Some(error) = failure {
-            return match delivered {
-                Ok(()) => Err(error),
-                Err(delivery) => Err(error.context(format!(
-                    "terminal compaction publication failed: {delivery:#}"
-                ))),
-            };
-        }
-        delivered?;
-        Ok(serde_json::to_value(
-            controller.broker.lock().await.snapshot()?,
-        )?)
-    }
-    .await;
-    let response = match outcome {
-        Ok(value) => match Response::success(id, value) {
-            Ok(response) => crate::broker::DispatchResult {
-                response,
-                event: Vec::new(),
-            },
-            Err(error) => crate::broker::DispatchResult {
-                response: Response::failure(id, "encode_response", error.to_string()),
-                event: Vec::new(),
-            },
-        },
-        Err(error) => crate::broker::DispatchResult {
-            response: Response::failure(
-                id,
-                "request_failed",
-                crate::storage::error_message(&error),
-            ),
-            event: Vec::new(),
-        },
-    };
-    (response, retained_failure)
-}
-
-/// Run owned foreground effects outside the broker and apply each result under its owner lock.
-async fn drive_foreground_dispatch(
-    controller: &SessionController,
-    mut broker: MutexGuard<'_, HarnessBroker>,
-    request: Request,
-    sink: crate::broker::publication::SessionUpdateSink,
-    message_sink: &MessageSender,
-) -> Result<crate::broker::DispatchResult> {
-    let id = request.id;
-    broker.trace_foreground_request(&request);
-    let data_root = broker.data_root().to_path_buf();
-    let requires_attachments = broker.foreground_requires_attachments(&request);
-    drop(broker);
-    let result = async {
-        let requires_attachments = requires_attachments?;
-        let attachments = if requires_attachments {
-            crate::attachment::resolve_input(&data_root, &request.params).await?
-        } else {
-            Vec::new()
-        };
-        let mut broker = controller.broker.lock().await;
-        let mut transaction = broker.begin_foreground_dispatch(request, sink)?;
-        transaction.set_attachments(attachments)?;
-        drop(broker);
-        drive_owned_foreground(controller, transaction, message_sink).await
-    }
-    .await;
-    let broker = controller.broker.lock().await;
-    match &result {
-        Ok(response) => broker.trace_foreground_response(id, response),
-        Err(error) => broker.trace_foreground_error(id, error),
-    }
-    result
-}
-
-/// Drive an already admitted foreground transaction without retaining broker ownership.
-async fn drive_owned_foreground(
-    controller: &SessionController,
-    transaction: crate::broker::ForegroundDispatch,
-    message_sink: &MessageSender,
-) -> Result<crate::broker::DispatchResult> {
-    Box::pin(drive_owned_foreground_initial(
-        controller,
-        transaction,
-        message_sink,
-        None,
-    ))
-    .await
-}
-
-async fn drive_owned_foreground_initial(
-    controller: &SessionController,
-    mut transaction: crate::broker::ForegroundDispatch,
-    message_sink: &MessageSender,
-    initial: Option<crate::broker::ForegroundJob>,
-) -> Result<crate::broker::DispatchResult> {
-    let mut jobs: tokio::task::JoinSet<(bool, Result<crate::broker::ForegroundSignal>)> =
-        tokio::task::JoinSet::new();
-    let mut publications = std::collections::VecDeque::new();
-    let mut publication_active = false;
-    let mut publication_drain_requested = false;
-    let mut deferred_failure = None;
-    if let Some(job) = initial {
-        let publication = job.is_publication();
-        publication_active = publication;
-        jobs.spawn(run_foreground_job(job, publication));
-    }
-    loop {
-        let (signal, completed_publication) = if let Some(error) = deferred_failure.take() {
-            (crate::broker::ForegroundSignal::EffectFailed(error), false)
-        } else if publication_drain_requested && jobs.is_empty() && publications.is_empty() {
-            publication_drain_requested = false;
-            (crate::broker::ForegroundSignal::PublicationDrained, false)
-        } else {
-            tokio::select! {
-                signal = transaction.next() => (signal.unwrap_or_else(crate::broker::ForegroundSignal::EffectFailed), false),
-                result = jobs.join_next(), if !jobs.is_empty() => {
-                    match result {
-                        Some(Ok((publication, result))) => (result.unwrap_or_else(crate::broker::ForegroundSignal::EffectFailed), publication),
-                        Some(Err(error)) => (crate::broker::ForegroundSignal::EffectFailed(anyhow::anyhow!("foreground effect task failed: {error}")), false),
-                        None => (crate::broker::ForegroundSignal::EffectFailed(anyhow::anyhow!("foreground effect task disappeared")), false),
-                    }
-                }
-            }
-        };
-        let signal = match signal {
-            crate::broker::ForegroundSignal::ObservationPublicationNeedsForward { events } => {
-                let result = async {
-                    for event in events {
-                        message_sink.send_event(event).await?;
-                    }
-                    Ok(Vec::new())
-                }
-                .await;
-                crate::broker::ForegroundSignal::ObservationPublicationDelivered(result)
-            }
-            crate::broker::ForegroundSignal::CommandEventsNeedForward { events } => {
-                let result = async {
-                    for event in events {
-                        message_sink.send_event(event).await?;
-                    }
-                    Ok(())
-                }
-                .await;
-                crate::broker::ForegroundSignal::CommandEventsForwarded(result)
-            }
-            crate::broker::ForegroundSignal::CommandNeedsForward { events } => {
-                let result = async {
-                    for event in events {
-                        message_sink.send_event(event).await?;
-                    }
-                    Ok(Vec::new())
-                }
-                .await;
-                crate::broker::ForegroundSignal::CommandPublished(result)
-            }
-            crate::broker::ForegroundSignal::PermissionNeedsForward { events } => {
-                let result = async {
-                    for event in events {
-                        message_sink.send_event(event).await?;
-                    }
-                    Ok(Vec::new())
-                }
-                .await;
-                crate::broker::ForegroundSignal::PermissionPublished(result)
-            }
-            crate::broker::ForegroundSignal::AdmissionEventsNeedForward { events } => {
-                let result = async {
-                    for event in events {
-                        message_sink.send_event(event).await?;
-                    }
-                    Ok(())
-                }
-                .await;
-                crate::broker::ForegroundSignal::AdmissionEventsForwarded(result)
-            }
-            crate::broker::ForegroundSignal::FailureAdmissionEventsNeedForward { events } => {
-                let result = async {
-                    for event in events {
-                        message_sink.send_event(event).await?;
-                    }
-                    Ok(())
-                }
-                .await;
-                crate::broker::ForegroundSignal::FailureAdmissionEventsForwarded(result)
-            }
-            crate::broker::ForegroundSignal::FailurePublicationNeedsForward { events } => {
-                let result = async {
-                    for event in events {
-                        message_sink.send_event(event).await?;
-                    }
-                    Ok(Vec::new())
-                }
-                .await;
-                crate::broker::ForegroundSignal::FailurePublicationCompleted(result)
-            }
-            crate::broker::ForegroundSignal::AutoCompactionNeedsForward { events } => {
-                let result = async {
-                    for event in events {
-                        message_sink.send_event(event).await?;
-                    }
-                    Ok(Vec::new())
-                }
-                .await;
-                crate::broker::ForegroundSignal::AutoCompactionPublished(result)
-            }
-            crate::broker::ForegroundSignal::CheckRepairNeedsForward { events } => {
-                let result = async {
-                    for event in events {
-                        message_sink.send_event(event).await?;
-                    }
-                    Ok(Vec::new())
-                }
-                .await;
-                crate::broker::ForegroundSignal::CheckRepairPublished(result)
-            }
-            crate::broker::ForegroundSignal::ClarificationNeedsForward { events } => {
-                let result = async {
-                    for event in events {
-                        message_sink.send_event(event).await?;
-                    }
-                    Ok(Vec::new())
-                }
-                .await;
-                crate::broker::ForegroundSignal::ClarificationPublished(result)
-            }
-            crate::broker::ForegroundSignal::FinalResponseNeedsForward { events } => {
-                let result = async {
-                    for event in events {
-                        message_sink.send_event(event).await?;
-                    }
-                    Ok(Vec::new())
-                }
-                .await;
-                crate::broker::ForegroundSignal::FinalResponsePublished(result)
-            }
-            crate::broker::ForegroundSignal::PlanTerminalNeedsForward { events, receipts } => {
-                let result = async {
-                    for event in events {
-                        message_sink.send_event(event).await?;
-                    }
-                    receipts.acknowledge()?;
-                    Ok(Vec::new())
-                }
-                .await;
-                crate::broker::ForegroundSignal::PlanTerminalPublished(result)
-            }
-            signal => signal,
-        };
-        let action = {
-            let publication_sink = transaction.publication_sink()?;
-            let mut broker = controller.broker.lock().await;
-            broker.with_publication_sink(&publication_sink, |broker| {
-                match broker.step_foreground(&mut transaction, signal) {
-                    Ok(action) => Ok(action),
-                    Err(error) => broker.fail_foreground_dispatch(&mut transaction, error),
-                }
-            })?
-        };
-        if completed_publication {
-            publication_active = false;
-            if let Some(job) = publications.pop_front() {
-                publication_active = true;
-                jobs.spawn(run_foreground_job(job, true));
-            }
-        }
-        match action {
-            crate::broker::ForegroundAction::Wait => {}
-            crate::broker::ForegroundAction::WaitForPublicationDrain => {
-                publication_drain_requested = true;
-            }
-            crate::broker::ForegroundAction::Effect(job) => {
-                let publication = job.is_publication();
-                if publication && publication_active {
-                    publications.push_back(job);
-                } else {
-                    publication_active |= publication;
-                    jobs.spawn(run_foreground_job(job, publication));
-                }
-            }
-            crate::broker::ForegroundAction::CancelJobsAndEffect(job) => {
-                publication_drain_requested = false;
-                let publication = job.is_publication();
-                if publication && publication_active {
-                    publications.push_back(job);
-                } else {
-                    publication_active |= publication;
-                    jobs.spawn(run_foreground_job(job, publication));
-                }
-            }
-            crate::broker::ForegroundAction::Finish => {
-                anyhow::ensure!(
-                    jobs.is_empty() && publications.is_empty(),
-                    "foreground settlement still has pending effects"
-                );
-                return controller
-                    .broker
-                    .lock()
-                    .await
-                    .finish_foreground(transaction);
-            }
-            crate::broker::ForegroundAction::FinishFailure(error) => {
-                anyhow::ensure!(
-                    jobs.is_empty() && publications.is_empty(),
-                    "foreground failure still has pending effects"
-                );
-                return Err(error);
-            }
-        }
-    }
-}
-
-/// Preserve the publication lane even when an owned effect panics.
-async fn run_foreground_job(
-    job: crate::broker::ForegroundJob,
-    publication: bool,
-) -> (bool, Result<crate::broker::ForegroundSignal>) {
-    use futures_util::FutureExt;
-    let result = std::panic::AssertUnwindSafe(job.run()).catch_unwind().await;
-    (
-        publication,
-        result.unwrap_or_else(|_| Err(anyhow::anyhow!("foreground effect task panicked"))),
-    )
-}
-
-async fn quiesce_children(controller: &SessionController) -> Result<crate::agent::AgentQuiescence> {
-    let quiescence = controller.agent_coordinator.begin_quiescence();
-    if controller.agent_coordinator.active_count() == 0 {
-        return Ok(quiescence);
-    }
-    let mut activity = controller.agent_coordinator.activity();
-    tokio::time::timeout(Duration::from_secs(35), async {
-        controller
-            .agent_coordinator
-            .sender()
-            .request(crate::agent::AgentRequest {
-                operation_id: uuid::Uuid::new_v4().to_string(),
-                source: crate::agent::AgentSource::User,
-                operation: crate::agent::AgentOperation::InterruptAll,
-            })
-            .await?;
-        loop {
-            if controller.agent_coordinator.active_count() == 0 {
-                return Ok::<_, anyhow::Error>(());
-            }
-            for (agent, _) in controller.agent_coordinator.snapshot(None) {
-                if let Some(task) = controller.agent_coordinator.cleanup_task(&agent.id) {
-                    anyhow::bail!(
-                        "child {} still requires cleanup: {}",
-                        agent.task_path,
-                        task.error.unwrap_or_default()
-                    );
-                }
-            }
-            activity
-                .changed()
-                .await
-                .context("child activity owner closed during cleanup")?;
-        }
-    })
-    .await
-    .context("children did not release execution ownership within 35 seconds")??;
-    Ok(quiescence)
-}
-
-async fn request_foreground_native_cancel(
-    controller: &SessionController,
-    session_id: &str,
-    restore_prompt: bool,
-) -> Result<()> {
-    if *controller.cancellation.subscribe().borrow() {
-        return Ok(());
-    }
-    controller
-        .cancellation
-        .request_native_cancel(restore_prompt);
-    let provider = controller.provider_handle();
-    let cancellation = async {
-        let owner = crate::provider::ExecutionOwner::root(session_id);
-        controller
-            .permission
-            .cancel_owner(&owner, None)
-            .await
-            .map_err(|error| {
-                crate::provider::lifecycle_error::classify(
-                    forge_provider_api::ProviderOperation::HostEffectPublication,
-                    error,
-                )
-            })?;
-        if !provider.has_active_turn(session_id).await {
-            controller.cancellation.request(restore_prompt);
-        }
-        provider.cancel_session(session_id).await
-    };
-    match tokio::time::timeout(Duration::from_secs(15), cancellation).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
-            controller.task_controller.mark_native_goal_uncertain();
-            controller.cancellation.request(restore_prompt);
-            Err(anyhow::Error::new(error).context("native cancellation failed"))
-        }
-        Err(source) => {
-            controller.task_controller.mark_native_goal_uncertain();
-            controller.cancellation.request(restore_prompt);
-            Err(anyhow::Error::new(source).context("native cancellation exceeded 15 seconds"))
-        }
-    }
-}
-
 async fn route_control_request(
     controller: &SessionController,
     request: &Request,
     method: RuntimeMethod,
     message_sink: &MessageSender,
-    syntax: &Arc<SyntaxEngine>,
-    trace: Option<&crate::plan::edit_trace::PlanEditTrace>,
-    admission: &mut Option<ExecutionPermit>,
 ) -> Result<bool> {
+    if cancellation::handles(request) {
+        cancellation::apply(controller, request, message_sink).await?;
+        return Ok(true);
+    }
     if matches!(
         method,
-        RuntimeMethod::SessionQuestionAnswer
-            | RuntimeMethod::SessionQuestionAsk
-            | RuntimeMethod::SessionQuestionSkip
+        RuntimeMethod::SessionQuestionAnswer | RuntimeMethod::SessionQuestionSkip
     ) && let Some(command) = request.params.get("command")
     {
         let command: crate::question::QuestionCommand = serde_json::from_value(command.clone())?;
-        ensure!(
-            matches!(
-                command.action,
-                crate::question::QuestionAction::Answer { .. }
-                    | crate::question::QuestionAction::Clarify { .. }
-                    | crate::question::QuestionAction::Correct { .. }
-                    | crate::question::QuestionAction::Dismiss
-            ),
-            "this question action belongs to the model"
-        );
-        controller.questions.apply(command)?;
-        let snapshot = controller.questions.snapshot()?;
-        message_sink
-            .send_control_response(Response::success(request.id, &snapshot)?)
-            .await?;
-        message_sink
-            .send_event(SessionEvent {
-                session_id: controller.observer.session_id().into(),
-                event: "questions_changed".into(),
-                payload: serde_json::to_value(snapshot)?,
-            })
-            .await?;
-        controller.coordinator.submissions.changed.notify_one();
+        let result = match crate::exchange::QuestionChange::user(command) {
+            Ok(change) => {
+                controller
+                    .exchange_owner
+                    .question_events()
+                    .change(change)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let response = match result {
+            Ok(snapshot) => Response::success(request.id, &snapshot)?,
+            Err(error) => Response::failure(request.id, error.code(), error.to_string()),
+        };
+        message_sink.send_control_response(response).await?;
         return Ok(true);
     }
     if matches!(
@@ -5595,324 +2713,29 @@ async fn route_control_request(
         RuntimeMethod::SessionQuestionAnswer | RuntimeMethod::SessionQuestionSkip
     ) && request.params.get("target").is_some()
     {
-        let started = Instant::now();
         let mut params = request.params.clone();
         if method == RuntimeMethod::SessionQuestionSkip {
             params["response"] = json!({"kind":"skipped"});
         }
-        let session_id = controller
-            .catalog_request
-            .read()
-            .await
-            .harness_session_id
-            .clone();
-        let root = controller.data_root.clone();
-        let owner = session_id.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            SqliteStore::open(&root)?.answer_question_command(&owner, &params)
-        })
-        .await
-        .context("question answer worker failed")??;
-        controller.trace.record(&session_id, "question.answer.committed", json!({"duration_ms":started.elapsed().as_millis(),"operation_id":result["operation_id"]}));
-        message_sink
-            .send_control_response(Response::success(request.id, &result)?)
-            .await?;
-        message_sink
-            .send_event(SessionEvent {
-                session_id,
-                event: "question_updated".into(),
-                payload: result["active_elicitation"].clone(),
-            })
-            .await?;
-        return Ok(true);
-    }
-    if matches!(
-        method,
-        RuntimeMethod::SessionPlanTestDelete
-            | RuntimeMethod::SessionPlanCheckUpdate
-            | RuntimeMethod::SessionPlanEntityRename
-    ) {
-        let dispatch = trace.map(|trace| trace.stage("service.dispatch_edit"));
-        let revision_lane = trace.map(|trace| trace.stage("service.revision_lane"));
-        let (mut response, events) = if let Some((value, events)) = controller
-            .revision_review
-            .decide(method, request.params.clone())
-            .await?
-        {
-            if let Some(stage) = revision_lane {
-                stage.complete(json!({"source":"revision_review"}));
+        let result = match crate::plan::PlanQuestionAnswerRequest::parse(params) {
+            Ok(answer) => {
+                controller
+                    .exchange_owner
+                    .question_events()
+                    .answer_plan(answer)
+                    .await
             }
-            (Response::success(request.id, value)?, events)
-        } else {
-            if let Some(stage) = revision_lane {
-                stage.complete(json!({"source":"broker"}));
-            }
-            let wait = trace.map(|trace| trace.stage("service.broker_lock_wait"));
-            let (mut broker, _admission) = acquire_request_broker(controller, method).await?;
-            if let Some(stage) = wait {
-                stage.complete(json!({}));
-            }
-            let result = broker.dispatch(request.clone()).await;
-            (result.response, result.event)
+            Err(error) => Err(crate::exchange::QuestionEventError::PlanAnswer(error)),
         };
-        if let Some(stage) = dispatch {
-            stage.complete(
-                json!({"status":if response.result().is_some() { "completed" } else { "failed" }}),
-            );
-        }
-        let event_stage = trace.map(|trace| trace.stage("service.send_events"));
-        let event_count = events.len();
-        for event in events {
-            message_sink.send_event(event).await?;
-        }
-        if let Some(stage) = event_stage {
-            stage.complete(json!({"count":event_count}));
-        }
-        if let (Some(document), Some(mut value)) = (
-            request.params.get("review_document"),
-            response.result().cloned(),
-        ) {
-            let document = serde_json::from_value(document.clone())?;
-            let update = async {
-                let plan_id = value["plan"]["id"].as_str().context("updated plan identity is missing")?;
-                let digest = value["plan"]["review_digest"].as_str().context("updated plan digest is missing")?;
-                let capture = trace.map(|trace| trace.stage("service.recapture_review"));
-                let source = if let Some(source) = controller.revision_review.capture(plan_id, digest, None).await? {
-                    source
-                } else {
-                    let wait = trace.map(|trace| trace.stage("service.recapture_lock_wait"));
-                    if let Some(stage) = wait { stage.complete(json!({})); }
-                    controller.observer.capture_plan_review(plan_id, digest)?
-                };
-                if let Some(stage) = capture { stage.complete(json!({"count":source.document.design.as_ref().map_or(0, |design|design.proposed.len())})); }
-                let mut source = crate::plan::review_source::EditableReviewSource::try_from(source)?;
-                let expected_version = crate::plan::edit_trace::measure(trace, "service.reuse_review_caches", || controller.plan_review.prepare_update(&document, &mut source))?;
-                let syntax_stage = trace.map(|trace| trace.stage("service.syntax"));
-                analyze_plan_source(&mut source, syntax, || Ok(()), trace).await?;
-                if let Some(stage) = syntax_stage { stage.complete(json!({"count":source.declaration_syntax.len()})); }
-                controller.plan_review.update(&document, source, expected_version, trace)
-            }.await;
-            match update {
-                Ok(update) => value["review"] = update,
-                Err(error) => {
-                    value["review_error"] = Value::String(format!(
-                        "Plan changed, but the open review could not update: {error:#}"
-                    ))
-                }
-            }
-            response = crate::plan::edit_trace::measure(trace, "service.build_response", || {
-                Ok(Response::success(request.id, value)?)
-            })?;
-        }
-        let send = trace.map(|trace| trace.stage("service.send_response"));
-        message_sink.send_response(response).await?;
-        if let Some(stage) = send {
-            stage.complete(json!({}));
-        }
+        let response = match result {
+            Ok(result) => Response::success(request.id, &result)?,
+            Err(error) => Response::failure(request.id, error.code(), error.to_string()),
+        };
+        message_sink.send_control_response(response).await?;
         return Ok(true);
     }
-    use crate::agent::AgentOperation;
-    let text = |field: &str| {
-        request.params[field]
-            .as_str()
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_owned)
-            .with_context(|| format!("{} requires {field}", request.method))
-    };
-    let operation = match method {
-        RuntimeMethod::SessionAgentStart => {
-            let mut arguments = request.params.clone();
-            if let Some(arguments) = arguments.as_object_mut() {
-                arguments.remove("operation_id");
-            }
-            Some(AgentOperation::Spawn(serde_json::from_value(arguments)?))
-        }
-        RuntimeMethod::SessionAgentMessageSend => Some(AgentOperation::Message {
-            target: text("target")?,
-            message: text("message")?,
-        }),
-        RuntimeMethod::SessionAgentFollowup => Some(AgentOperation::Followup {
-            target: text("target")?,
-            message: text("message")?,
-        }),
-        RuntimeMethod::SessionAgentInterrupt => Some(AgentOperation::Interrupt {
-            target: text("target")?,
-        }),
-        RuntimeMethod::SessionAgentInterruptAll => Some(AgentOperation::InterruptAll),
-        _ => None,
-    };
-    if let Some(operation) = operation {
-        let result = controller
-            .agent_coordinator
-            .sender()
-            .request(crate::agent::AgentRequest {
-                operation_id: request.params["operation_id"]
-                    .as_str()
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                source: crate::agent::AgentSource::User,
-                operation,
-            })
-            .await?;
-        drop(admission.take());
-        message_sink
-            .send_response(Response::success(request.id, result)?)
-            .await?;
-        return Ok(true);
-    }
-    if matches!(
-        method,
-        RuntimeMethod::SessionPlanAcceptanceBegin
-            | RuntimeMethod::SessionPlanChangesRequest
-            | RuntimeMethod::SessionPlanCancel
-    ) && let Some((value, events)) = controller
-        .revision_review
-        .decide(method, request.params.clone())
-        .await?
-    {
-        for event in events {
-            message_sink.send_event(event).await?;
-        }
-        drop(admission.take());
-        message_sink
-            .send_response(Response::success(request.id, value)?)
-            .await?;
-        return Ok(true);
-    }
-    let _control = if matches!(method, RuntimeMethod::SessionTurnCancel) {
-        Some(
-            tokio::time::timeout(
-                Duration::from_secs(60),
-                Arc::clone(&controller.coordinator.control).acquire_owned(),
-            )
-            .await
-            .context("timed out waiting for session cancellation control")??,
-        )
-    } else if matches!(
-        method,
-        RuntimeMethod::SessionTurnRestart | RuntimeMethod::SettingsMcpSetEnabled
-    ) {
-        Some(
-            Arc::clone(&controller.coordinator.control)
-                .try_acquire_owned()
-                .context("Harness cleanup is already running")?,
-        )
-    } else {
-        None
-    };
     let catalog_request = controller.catalog_request.read().await.clone();
     let response = match method {
-        RuntimeMethod::SessionTurnCancel => {
-            validate_root_control(request.params.get("target"))?;
-            controller.broker.lock().await.cancel_question_delivery()?;
-            let cancellation_requested = *controller.cancellation.subscribe().borrow();
-            if cancellation_requested {
-                message_sink
-                    .send_control_response(Response::success(
-                        request.id,
-                        json!({ "cancel_requested": true }),
-                    )?)
-                    .await?;
-                return Ok(true);
-            }
-            {
-                let _child_quiescence = quiesce_children(controller).await?;
-                let restore_prompt = request
-                    .params
-                    .get("restore_prompt_if_no_output")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let update = controller.coordinator.submissions.suspend(true, None)?;
-                controller.publish_input(update, message_sink).await?;
-                match Arc::clone(&controller.coordinator.execution).try_acquire_owned() {
-                    Ok(_idle_owner) => {
-                        let mut broker = controller.broker.lock().await;
-                        controller.cancellation.request(restore_prompt);
-                        let result = broker.dispatch(request.clone()).await;
-                        for event in result.event {
-                            message_sink.send_event(event).await?;
-                        }
-                        message_sink.send_control_response(result.response).await?;
-                        return Ok(true);
-                    }
-                    Err(tokio::sync::TryAcquireError::NoPermits) => {
-                        request_foreground_native_cancel(
-                            controller,
-                            &catalog_request.harness_session_id,
-                            restore_prompt,
-                        )
-                        .await?;
-                    }
-                    Err(tokio::sync::TryAcquireError::Closed) => {
-                        anyhow::bail!("session execution admission is closed");
-                    }
-                }
-            }
-            Some(Response::success(
-                request.id,
-                json!({ "cancel_requested": true }),
-            )?)
-        }
-        RuntimeMethod::SessionTurnRestart => {
-            let _child_quiescence = quiesce_children(controller).await?;
-            controller.cancellation.begin_cleanup(true, false)?;
-            controller
-                .collect_execution(&catalog_request.harness_session_id)
-                .await?;
-            controller.cancellation.finish_restart_cleanup();
-            let approval_owner = crate::provider::ExecutionOwner::root(
-                &controller.catalog_request.read().await.harness_session_id,
-            );
-            controller
-                .permission
-                .cancel_owner(&approval_owner, None)
-                .await?;
-            Some(Response::success(
-                request.id,
-                json!({ "restart_requested": true, "mode": request.params.get("mode") }),
-            )?)
-        }
-        RuntimeMethod::SessionTurnSteer => {
-            let text = request
-                .params
-                .get("text")
-                .and_then(Value::as_str)
-                .filter(|text| !text.trim().is_empty())
-                .context("turn.steer requires non-empty text")?
-                .to_owned();
-            validate_root_control(request.params.get("target"))?;
-            let attachments =
-                crate::attachment::resolve_input(&controller.data_root, &request.params).await?;
-            let input = crate::provider::ProviderInput::from_text(text.clone())
-                .with_attachments(attachments.clone());
-            let provider = controller.provider_handle().descriptor().kind;
-            let submission_catalog = catalog_request.clone();
-            let submission = controller
-                .submission_store
-                .persist(move |journal| {
-                    journal.prepare_steering(&submission_catalog, input, provider)
-                })
-                .await?;
-            let input = crate::provider::SteeringInput::User {
-                text,
-                attachments,
-                submission: Some(submission),
-            };
-            if controller.parent_input.is_active() {
-                controller.parent_input.steer(input).await?;
-            } else {
-                controller
-                    .steer_retained(
-                        crate::provider::ExecutionOwner::root(&catalog_request.harness_session_id),
-                        input,
-                    )
-                    .await?;
-            }
-            Some(Response::success(
-                request.id,
-                json!({ "steered": true, "delivery": "direct" }),
-            )?)
-        }
         RuntimeMethod::SessionApprovalResolve => {
             let approval_id = request
                 .params
@@ -5968,14 +2791,7 @@ async fn route_control_request(
         _ => None,
     };
     if let Some(response) = response {
-        if matches!(
-            method,
-            RuntimeMethod::SessionTurnCancel | RuntimeMethod::SessionTurnRestart
-        ) {
-            message_sink.send_control_response(response).await?;
-        } else {
-            message_sink.send_response(response).await?;
-        }
+        message_sink.send_response(response).await?;
         return Ok(true);
     }
     Ok(false)
@@ -6007,46 +2823,14 @@ fn initialize_failure(request_id: u64, error: &anyhow::Error) -> Response {
 #[cfg(test)]
 mod tests {
     include!("service/task_state_test.rs");
+    include!("service/owner_transition_test.rs");
+    include!("service/reconnect_overlap_test.rs");
+    include!("service/live_goal_test.rs");
+    include!("service/owner_storage_failure_test.rs");
     include!("service/task_presentation_test.rs");
     use super::*;
     use crate::provider::{ProviderCatalogRequest, TextGeneration};
     use forge_diff::cache::CacheLimits;
-
-    #[tokio::test]
-    async fn retained_compaction_outlives_dropped_waiter_and_joins() -> Result<()> {
-        let fixture = tempfile::tempdir()?;
-        let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
-        let controller = SessionController::new(broker)?;
-        let (started, started_rx) = tokio::sync::oneshot::channel();
-        let (release, release_rx) = tokio::sync::oneshot::channel();
-        let waiter = controller
-            .retain_compaction(async move {
-                let _ = started.send(());
-                release_rx.await.context("compaction release disappeared")?;
-                Ok(())
-            })
-            .await?;
-        drop(waiter);
-        started_rx.await?;
-        let mut shutdown = Box::pin(controller.finish_compactions());
-        assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
-        release
-            .send(())
-            .map_err(|_| anyhow::anyhow!("compaction task disappeared"))?;
-        tokio::time::timeout(Duration::from_secs(2), shutdown).await??;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn retained_compaction_failure_remains_visible_across_shutdown_retries() -> Result<()> {
-        let fixture = tempfile::tempdir()?;
-        let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
-        let controller = SessionController::new(broker)?;
-        controller.record_compaction_failure("terminal delivery failed".into())?;
-        assert!(controller.finish_compactions().await.is_err());
-        assert!(controller.finish_compactions().await.is_err());
-        Ok(())
-    }
 
     #[tokio::test]
     async fn lsp_callbacks_enforce_session_and_request_ownership() -> Result<()> {
@@ -6831,7 +3615,6 @@ mod tests {
             error: None,
             exchange_id: None,
             created_at_ms: 1,
-            resume_after_transition: false,
         };
         store.save_task_operation(&mut operation)?;
         assert!(controller.background_terminals().await?.starting);
@@ -7067,7 +3850,7 @@ mod tests {
         controller.task_controller.apply(
             &mut SqliteStore::open(&data)?,
             &task.permit(),
-            crate::task::TaskEvent::PlanArtifactUpdated(plan.clone()),
+            crate::task::TaskEvent::PlanArtifactUpdated(Box::new(plan.clone())),
             plan.updated_at_ms,
         )?;
         let submitted = file.read_submitted_document(&session_id, &plan.id, plan.model_revision)?;
@@ -7364,17 +4147,20 @@ mod tests {
             .to_owned();
         let controller = service.registry().await?.resolve(&session_id).await?;
         let (sink, mut output) = forge_protocol::outbound::channel();
-        let mut published_revision = None;
         controller
-            .relay_questions(&sink, &mut published_revision)
+            .exchange_owner
+            .reconcile_questions(Some(sink.clone()))
             .await?;
-        let initial = output.try_recv()?;
+        let initial = tokio::time::timeout(Duration::from_secs(2), output.recv())
+            .await??
+            .context("initial question notification is missing")?;
         assert_eq!(
             serde_json::from_slice::<Value>(initial.bytes())?["event"],
             "questions_changed"
         );
         controller
-            .relay_questions(&sink, &mut published_revision)
+            .exchange_owner
+            .reconcile_questions(Some(sink.clone()))
             .await?;
         assert!(
             matches!(output.try_recv(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
@@ -7392,9 +4178,12 @@ mod tests {
             }],
         )?;
         controller
-            .relay_questions(&sink, &mut published_revision)
+            .exchange_owner
+            .reconcile_questions(Some(sink.clone()))
             .await?;
-        let changed = output.try_recv()?;
+        let changed = tokio::time::timeout(Duration::from_secs(2), output.recv())
+            .await??
+            .context("changed question notification is missing")?;
         assert_eq!(
             serde_json::from_slice::<Value>(changed.bytes())?["payload"]["questions"]
                 .as_array()
@@ -7403,7 +4192,8 @@ mod tests {
             1
         );
         controller
-            .relay_questions(&sink, &mut published_revision)
+            .exchange_owner
+            .reconcile_questions(Some(sink.clone()))
             .await?;
         assert!(
             matches!(output.try_recv(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
@@ -7451,7 +4241,10 @@ mod tests {
             }],
         )?;
         let (sink, _output) = forge_protocol::outbound::channel();
-        controller.relay_questions(&sink, &mut None).await?;
+        controller
+            .exchange_owner
+            .reconcile_questions(Some(sink.clone()))
+            .await?;
         assert!(
             controller
                 .coordinator
@@ -7472,8 +4265,14 @@ mod tests {
                     },
                 },
             })?;
-        controller.relay_questions(&sink, &mut None).await?;
-        controller.relay_questions(&sink, &mut None).await?;
+        controller
+            .exchange_owner
+            .reconcile_questions(Some(sink.clone()))
+            .await?;
+        controller
+            .exchange_owner
+            .reconcile_questions(Some(sink.clone()))
+            .await?;
         let queued = controller.coordinator.submissions.snapshot()?;
         assert_eq!(queued.messages.len(), 2);
         assert!(matches!(
@@ -7530,19 +4329,21 @@ mod tests {
         };
         let mut clarification = Request {
             id: 3,
-            method: "session.question.ask".into(),
-            params: json!({"command": crate::question::QuestionCommand {
-                operation_id: "clarification".into(),
-                question_id: ids[0].clone(),
-                revision: 1,
-                action: crate::question::QuestionAction::Clarify { text: "Which scope?".into() },
-            }}),
+            method: "session.input.apply".into(),
+            params: json!({
+                "id":"clarification",
+                "target":{"owner":"question","question_id":ids[0],"revision":1},
+                "action":{"kind":"submit","message":{
+                    "id":"clarification-input","revision":0,"text":"Which scope?",
+                    "purpose":{"kind":"user"},"intent":"auto","attachments":[]
+                }}
+            }),
         };
         let control = controller.coordinator.control.acquire().await?;
         service
             .normalize_request(Some(&session_id), &mut clarification)
             .await?;
-        assert_eq!(clarification.method, "session.question.answer");
+        assert_eq!(clarification.method, "session.input.apply");
         assert!(
             service
                 .prepare(
@@ -7567,9 +4368,14 @@ mod tests {
         )
         .await??;
         assert!(!controller.questions.snapshot()?.questions[0].pending());
-        assert_eq!(controller.questions.outbox()?.len(), 1);
-        controller.relay_questions(&sink, &mut None).await?;
-        controller.relay_questions(&sink, &mut None).await?;
+        controller
+            .exchange_owner
+            .reconcile_questions(Some(sink.clone()))
+            .await?;
+        controller
+            .exchange_owner
+            .reconcile_questions(Some(sink.clone()))
+            .await?;
         assert!(controller.questions.outbox()?.is_empty());
         let queued = controller.coordinator.submissions.snapshot()?;
         assert_eq!(queued.messages.len(), 1);
@@ -7906,7 +4712,12 @@ mod tests {
         let controller = registry.resolve(&session_id).await?;
         let (sink, _output) = forge_protocol::outbound::channel();
         let action = json!({"action":"configure","config":{"model":"fixture"}});
-        let dispatch = || dispatch_owned_configuration(&controller, &session_id, &action, &sink);
+        let request = Request {
+            id: 1,
+            method: "session.command.apply".into(),
+            params: action,
+        };
+        let dispatch = || native_settings::apply(&controller, &request, &sink);
         let bytes = crate::trace::future_bytes(&dispatch);
         assert!(
             bytes <= 32 * 1024,
@@ -7929,23 +4740,21 @@ mod tests {
             .to_owned();
         let registry = service.registry().await?;
         let controller = registry.resolve(&session_id).await?;
-        let mut store = SqliteStore::open(&controller.data_root)?;
-        let mut operation = Vec::new();
+        let store = SqliteStore::open(&controller.data_root)?;
+        let (sink, _output) = forge_protocol::outbound::channel();
         for (index, config) in [json!({"model":"model-b"}), json!({"effort":"high"})]
             .into_iter()
             .enumerate()
         {
-            operation.push(admit_task_intent(&controller, &session_id, &Request {
-                id: index as u64 + 2, method: "session.command.apply".into(),
+            let request = Request {
+                id: u64::try_from(index)? + 2,
+                method: "session.command.apply".into(),
                 params: json!({"operation_id":format!("configure-{index}"),"action":"configure","config":config}),
-            }, &mut store)?);
-        }
-        assert!(store.pending_policy_predecessor(&session_id, &operation[1].id)?);
-        let (sink, _output) = forge_protocol::outbound::channel();
-        for pending in &mut operation {
-            execute_task_transition(&registry, &controller, pending, &mut store, &sink).await?;
-            pending.state = "completed".into();
-            store.save_task_operation(pending)?;
+            };
+            controller
+                .exchange_owner
+                .execute_identified(native_settings::decode_command(&request)?, sink.clone())
+                .await?;
         }
         let session = store.load_session(&session_id)?.unwrap();
         assert_eq!(session.model, "model-b");
@@ -8018,36 +4827,25 @@ mod tests {
             let mut initial = store.load_session(&session_id)?.unwrap();
             initial.access.sandbox = initial_sandbox;
             store.save_session(&initial)?;
-            let mut operations = Vec::new();
+            let (sink, _output) = forge_protocol::outbound::channel();
             for (index, change) in changes.into_iter().enumerate() {
                 let request = Request {
-                    id: index as u64 + 2,
+                    id: u64::try_from(index)? + 2,
                     method: "session.command.apply".into(),
                     params: json!({"operation_id":format!("permission-{index}"),"action":"permission","change":change}),
                 };
-                let operation = admit_task_intent(&controller, &session_id, &request, &mut store)?;
-                let duplicate = admit_task_intent(&controller, &session_id, &request, &mut store)?;
-                assert_eq!(
-                    operation.permission_selection,
-                    duplicate.permission_selection
-                );
-                assert_eq!(
-                    store.load_session(&session_id)?.unwrap().access,
-                    initial.access
-                );
-                operations.push(operation);
-            }
-            let mut latest = operations.pop().unwrap();
-            assert!(!latest.permission_selection.unwrap().sandbox);
-            let (sink, _output) = forge_protocol::outbound::channel();
-            for mut preceding in operations {
-                execute_task_transition(&registry, &controller, &mut preceding, &mut store, &sink)
+                let command = native_permission::decode_command(&request)?;
+                let first = controller
+                    .exchange_owner
+                    .execute_identified(command.clone(), sink.clone())
                     .await?;
-                assert_eq!(preceding.state, "running");
-                preceding.state = "completed".into();
-                store.save_task_operation(&mut preceding)?;
+                let duplicate = controller
+                    .exchange_owner
+                    .execute_identified(command, sink.clone())
+                    .await?;
+                assert_eq!(first.id, duplicate.id);
+                assert_eq!(first.revision, duplicate.revision);
             }
-            execute_task_transition(&registry, &controller, &mut latest, &mut store, &sink).await?;
             let confirmed = store.load_session(&session_id)?.unwrap();
             assert_eq!(confirmed.access.abbreviation(), expected_access);
             assert_eq!(
@@ -8065,70 +4863,6 @@ mod tests {
             );
             service.shutdown(Duration::from_secs(1)).await?;
         }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn active_chat_settings_ignore_completed_idle_operations_but_preserve_pending_pause()
-    -> Result<()> {
-        let fixture = tempfile::tempdir()?;
-        let service = service();
-        let opened = service
-            .open_session(1, initialize(&fixture, "mock"))
-            .await?;
-        let session_id = opened.result().unwrap()["session"]["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let registry = service.registry().await?;
-        let controller = registry.resolve(&session_id).await?;
-        let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
-        let request = |id: &str, action: &str| Request {
-            id: 2,
-            method: "session.command.apply".into(),
-            params: json!({"operation_id":id,"action":action,"config":{}}),
-        };
-        let mut idle = admit_task_intent(
-            &controller,
-            &session_id,
-            &request("idle-config", "configure"),
-            &mut store,
-        )?;
-        assert!(!idle.resume_after_transition);
-        idle.state = "completed".into();
-        store.save_task_operation(&mut idle)?;
-        let active = controller.coordinator.execution.acquire().await?;
-        let mut changed = admit_task_intent(
-            &controller,
-            &session_id,
-            &request("active-config", "configure"),
-            &mut store,
-        )?;
-        assert!(
-            changed.resume_after_transition,
-            "a completed idle configuration suppressed the new active chat"
-        );
-        changed.state = "completed".into();
-        store.save_task_operation(&mut changed)?;
-        let pause = admit_task_intent(
-            &controller,
-            &session_id,
-            &request("pending-pause", "pause"),
-            &mut store,
-        )?;
-        assert!(!pause.resume_after_transition);
-        let stopped = admit_task_intent(
-            &controller,
-            &session_id,
-            &request("after-pause", "configure"),
-            &mut store,
-        )?;
-        assert!(
-            !stopped.resume_after_transition,
-            "configuration resumed work despite a pending explicit pause"
-        );
-        drop(active);
-        service.shutdown(Duration::from_secs(1)).await?;
         Ok(())
     }
 
@@ -8179,18 +4913,11 @@ mod tests {
             params: json!({"operation_id":"idle-running-goal-config","action":"configure",
                 "config":{"status_thoughts":status_thoughts}}),
         };
-        let mut operation = admit_task_intent(&controller, &session_id, &request, &mut store)?;
-        assert!(!operation.resume_after_transition);
-        assert_eq!(
-            serde_json::to_value(controller.task_controller.current()?.unwrap())?,
-            serde_json::to_value(&before)?,
-        );
         let (sink, _output) = forge_protocol::outbound::channel();
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            execute_task_transition(&registry, &controller, &mut operation, &mut store, &sink),
-        )
-        .await??;
+        controller
+            .exchange_owner
+            .execute_identified(native_settings::decode_command(&request)?, sink.clone())
+            .await?;
         assert_eq!(
             controller.observer.snapshot()?.status_thoughts,
             status_thoughts
@@ -8305,6 +5032,7 @@ mod tests {
         let prompt_session = session_id.clone();
         let prompt = tokio::spawn(async move {
             let request = crate::provider::ProviderRequest {
+                dispatch: forge_provider_api::submission::DispatchTracker::default(),
                 execution_owner: None,
                 harness_session_id: prompt_session,
                 workspace: ".".into(),
@@ -8922,7 +5650,7 @@ mod tests {
         let mut review = controller.revision_review.open().unwrap();
         let (sink, mut output) = forge_protocol::outbound::channel();
         for method in [
-            RuntimeMethod::SessionPlanAcceptanceBegin,
+            RuntimeMethod::SessionPlanAccept,
             RuntimeMethod::SessionPlanChangesRequest,
             RuntimeMethod::SessionPlanCancel,
             RuntimeMethod::SessionPlanEntityRename,
@@ -8949,18 +5677,9 @@ mod tests {
                     .send(Ok((json!({"reviewed":true}), Vec::new())))
                     .unwrap();
             };
-            let mut control_state = None;
             let (routed, ()) = tokio::time::timeout(Duration::from_secs(1), async {
                 tokio::join!(
-                    route_control_request(
-                        &controller,
-                        &request,
-                        method,
-                        &sink,
-                        &service.syntax,
-                        None,
-                        &mut control_state
-                    ),
+                    route_control_request(&controller, &request, method, &sink,),
                     respond
                 )
             })
@@ -9131,9 +5850,6 @@ mod tests {
                 },
                 RuntimeMethod::SessionApprovalResolve,
                 &sink,
-                &service.syntax,
-                None,
-                &mut None
             )
             .await?
         );
@@ -9178,219 +5894,6 @@ mod tests {
         })
         .await??;
         assert!(controller.permission.pending_list()?.is_empty());
-        service.shutdown(Duration::from_secs(1)).await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn permission_transition_releases_child_quiescence_before_resuming() -> Result<()> {
-        for mode in ["ask", "deny", "allow"] {
-            let fixture = tempfile::tempdir()?;
-            let service = service();
-            let opened = service
-                .open_session(1, initialize(&fixture, "mock"))
-                .await?;
-            let session_id = opened.result().unwrap()["session"]["id"]
-                .as_str()
-                .unwrap()
-                .to_owned();
-            let registry = service.registry().await?;
-            let controller = registry.resolve(&session_id).await?;
-            let mut store =
-                SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
-            let session = crate::session::SessionStore::load_session(&store, &session_id)?.unwrap();
-            let exchange: crate::exchange::Exchange = serde_json::from_value(json!({
-                "id":"interrupted", "session_id":session_id, "agent_id":session.primary_agent_id, "ordinal":1,
-                "prompt":"Explain the provider", "kind":"chat", "state":"running", "created_at_ms":0,
-                "attributed_matches_checkpoint":false, "node_list":[]
-            }))?;
-            store.save_exchange(&exchange)?;
-            let previous_execution = controller.coordinator.execution.acquire().await?;
-            let mut operation = admit_task_intent(
-                &controller,
-                &session_id,
-                &Request {
-                    id: 2,
-                    method: "session.command.apply".into(),
-                    params: json!({"operation_id":"change-permission","action":"permission","change":{"kind":"set_approval","mode":mode}}),
-                },
-                &mut store,
-            )?;
-            assert!(operation.resume_after_transition);
-            drop(previous_execution);
-            let (sink, _output) = forge_protocol::outbound::channel();
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                execute_task_transition(&registry, &controller, &mut operation, &mut store, &sink),
-            )
-            .await
-            .context("resumed provider output remained blocked by transition quiescence")??;
-            assert!(!controller.agent_coordinator.is_quiescing());
-            let exchanges = store.list_exchange(&session_id)?;
-            assert!(exchanges.last().unwrap().completed_at_ms().is_some());
-            let session = crate::session::SessionStore::load_session(&store, &session_id)?.unwrap();
-            assert_eq!(
-                session.approval_mode,
-                serde_json::from_value::<crate::session::ApprovalMode>(json!(mode))?
-            );
-            service.shutdown(Duration::from_secs(1)).await?;
-        }
-        Ok(())
-    }
-
-    /// Fail a stranded native cleanup without committing the requested access change.
-    #[tokio::test]
-    async fn permission_transition_bounds_unresponsive_cleanup() -> Result<()> {
-        let fixture = tempfile::tempdir()?;
-        let service = service();
-        let opened = service
-            .open_session(1, initialize(&fixture, "mock"))
-            .await?;
-        let session_id = opened.result().unwrap()["session"]["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let registry = service.registry().await?;
-        let controller = registry.resolve(&session_id).await?;
-        let started = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Semaphore::new(0));
-        let descriptor = forge_providers::registry::descriptor(
-            &forge_providers::registry::nonselectable_id().expect("fixture identity"),
-        )
-        .expect("fixture descriptor");
-        let provider =
-            crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
-                Err(crate::provider::ProviderError::Cancelled)
-            });
-        provider.with_cleanup({
-            let started = started.clone();
-            let release = release.clone();
-            move |_| {
-                let started = started.clone();
-                let release = release.clone();
-                async move {
-                    started.notify_one();
-                    let _permit = release.acquire().await.unwrap();
-                    Ok(())
-                }
-            }
-        });
-        let provider_fixture =
-            crate::provider::test_support::ProviderTestSession::from_native(provider)?;
-        *controller.provider.write().unwrap() = provider_fixture.provider_handle();
-        let (sink, _output) = forge_protocol::outbound::channel();
-        service.start_provider_session(&session_id, &sink).await?;
-        while !controller.provider_ready().await {
-            tokio::task::yield_now().await;
-        }
-        let previous_execution = controller.coordinator.execution.acquire().await?;
-        let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
-        let before = crate::session::SessionStore::load_session(&store, &session_id)?
-            .unwrap()
-            .access;
-        let mut operation = admit_task_intent(
-            &controller,
-            &session_id,
-            &Request {
-                id: 2,
-                method: "session.command.apply".into(),
-                params: json!({"operation_id":"blocked-permission","action":"permission","change":{"kind":"toggle_write_enabled"}}),
-            },
-            &mut store,
-        )?;
-        tokio::time::pause();
-        let mut transition = Box::pin(execute_task_transition(
-            &registry,
-            &controller,
-            &mut operation,
-            &mut store,
-            &sink,
-        ));
-        tokio::select! {
-            result = &mut transition => panic!("cleanup unexpectedly settled: {result:?}"),
-            () = started.notified() => {}
-        }
-        tokio::time::advance(Duration::from_secs(31)).await;
-        let error = transition
-            .await
-            .expect_err("unresponsive cleanup must fail the transition");
-        assert!(
-            matches!(error.downcast_ref::<crate::provider::ProviderError>(),
-            Some(crate::provider::ProviderError::Failure(failure))
-                if failure.operation() == forge_provider_api::ProviderOperation::CleanupExecution
-                    && failure.kind() == forge_provider_api::ProviderFailureKind::Timeout)
-        );
-        assert!(controller.task_controller.native_goal_is_uncertain());
-        assert!(!controller.agent_coordinator.is_quiescing());
-        assert_eq!(
-            crate::session::SessionStore::load_session(&store, &session_id)?
-                .unwrap()
-                .access,
-            before
-        );
-        release.add_permits(10);
-        drop(previous_execution);
-        service.shutdown(Duration::from_secs(2)).await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn conversation_undo_collects_execution_admission_before_rollback() -> Result<()> {
-        let fixture = tempfile::tempdir()?;
-        let service = service();
-        let opened = service
-            .open_session(1, initialize(&fixture, "mock"))
-            .await?;
-        let session_id = opened.result().unwrap()["session"]["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let registry = service.registry().await?;
-        let controller = registry.resolve(&session_id).await?;
-        let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
-        let session = crate::session::SessionStore::load_session(&store, &session_id)?.unwrap();
-        let exchange: crate::exchange::Exchange = serde_json::from_value(json!({
-            "id":"latest", "session_id":session_id, "agent_id":session.primary_agent_id, "ordinal":1,
-            "prompt":"Remove this conversation entry", "kind":"chat", "state":"complete", "created_at_ms":0,
-            "completed_at_ms":1, "attributed_matches_checkpoint":false, "node_list":[]
-        }))?;
-        store.save_exchange(&exchange)?;
-        let file = fixture.path().join("keep.txt");
-        std::fs::write(&file, "unchanged")?;
-        let execution = controller.coordinator.execution.acquire().await?;
-        let mut request = Request {
-            id: 2,
-            method: "session.command.apply".into(),
-            params: json!({
-                "operation_id":"undo-latest", "action":"undo", "rollback":{
-                    "scope":"conversation", "exchange_id":"latest", "latest_exchange_id":"stale"
-                }
-            }),
-        };
-        assert!(admit_task_intent(&controller, &session_id, &request, &mut store).is_err());
-        request.params["rollback"]["latest_exchange_id"] = json!("latest");
-        let mut operation = admit_task_intent(&controller, &session_id, &request, &mut store)?;
-        assert!(!operation.resume_after_transition);
-        let (sink, _output) = forge_protocol::outbound::channel();
-        let mut transition = Box::pin(execute_task_transition(
-            &registry,
-            &controller,
-            &mut operation,
-            &mut store,
-            &sink,
-        ));
-        assert!(
-            futures_util::poll!(transition.as_mut()).is_pending(),
-            "rollback bypassed execution ownership"
-        );
-        drop(execution);
-        tokio::time::timeout(Duration::from_secs(2), transition).await??;
-        assert_eq!(
-            store.list_exchange(&session_id)?[0].disposition(),
-            crate::exchange::HistoryDisposition::RolledBack
-        );
-        assert_eq!(std::fs::read_to_string(file)?, "unchanged");
-        assert_eq!(controller.coordinator.execution.available_permits(), 1);
         service.shutdown(Duration::from_secs(1)).await?;
         Ok(())
     }
@@ -9457,8 +5960,9 @@ mod tests {
         Ok(())
     }
 
+    /// Transport preparation never reserves execution or changes cancellation policy.
     #[tokio::test]
-    async fn queued_prompt_waits_for_cleanup_without_retaining_execution() -> Result<()> {
+    async fn prompt_preparation_leaves_busy_execution_owned() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let service = service();
         service
@@ -9467,24 +5971,26 @@ mod tests {
         let registry = service.registry().await?;
         let controller = registry.resolve(registry.initial_session_id()).await?;
         let cleanup = controller.coordinator.control.acquire().await?;
-        let mut queued = Box::pin(service.prepare_queued_prompt(registry.initial_session_id()));
-        assert!(futures_util::poll!(queued.as_mut()).is_pending());
-        let execution = controller
-            .coordinator
-            .execution
-            .try_acquire()
-            .expect("queued work blocked cleanup");
-        drop(cleanup);
-        assert!(futures_util::poll!(queued.as_mut()).is_pending());
-        assert!(controller.coordinator.control.try_acquire().is_ok());
+        let execution = controller.coordinator.execution.acquire().await?;
+        let cancelled = *controller.cancellation.subscribe().borrow();
+        let prepared = service
+            .prepare(
+                Some(registry.initial_session_id()),
+                RuntimeMethod::SessionPromptSubmit,
+            )
+            .await?;
+        assert!(prepared.is_none());
+        assert_eq!(*controller.cancellation.subscribe().borrow(), cancelled);
         drop(execution);
-        drop(tokio::time::timeout(Duration::from_secs(1), queued).await??);
+        drop(cleanup);
+        assert!(controller.coordinator.execution.try_acquire().is_ok());
         service.shutdown(Duration::from_secs(1)).await?;
         Ok(())
     }
 
+    /// A queued prompt reaches durable input acceptance while existing execution stays owned.
     #[tokio::test]
-    async fn queued_prompt_does_not_resume_after_cancellation() -> Result<()> {
+    async fn queued_prompt_commits_input_without_acquiring_execution() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let service = service();
         service
@@ -9493,13 +5999,23 @@ mod tests {
         let registry = service.registry().await?;
         let controller = registry.resolve(registry.initial_session_id()).await?;
         let execution = controller.coordinator.execution.acquire().await?;
-        let mut queued = Box::pin(service.prepare_queued_prompt(registry.initial_session_id()));
-        assert!(futures_util::poll!(queued.as_mut()).is_pending());
-        controller.cancellation.request(false);
+        let (sink, _output) = forge_protocol::outbound::channel();
+        tokio::time::timeout(Duration::from_secs(1), prompt::apply(&controller, Request {
+            id: 2, method: "session.prompt.submit".into(),
+            params: json!({"operation_id":"queued-prompt", "input_id":"queued-message", "text":"Wait for current work", "queued":true}),
+        }, &sink)).await??;
+        let snapshot = controller.coordinator.submissions.snapshot()?;
+        let message = snapshot
+            .messages
+            .iter()
+            .find(|message| message.id == "queued-message")
+            .context("queued prompt was not retained")?;
+        assert_eq!(message.intent, crate::input::InputIntent::Queue);
+        assert_eq!(message.delivery, crate::input::InputDelivery::Queued);
+        assert!(matches!(message.purpose, crate::input::InputPurpose::User));
+        assert_eq!(controller.coordinator.execution.available_permits(), 0);
+        controller.finish_prompt_workers().await?;
         drop(execution);
-        let failure = queued.await.unwrap_err();
-        assert!(failure.to_string().contains("interrupted before admission"));
-        assert!(controller.coordinator.execution.try_acquire().is_ok());
         service.shutdown(Duration::from_secs(1)).await?;
         Ok(())
     }
@@ -9511,7 +6027,6 @@ mod tests {
                 .execution
                 .clone();
         let mut admission = Some(Arc::clone(&semaphore).acquire_owned().await?);
-        let mut prompt_admission = None;
         let (sink, mut output) = forge_protocol::outbound::channel();
         for sequence in
             0..forge_protocol::MAX_PENDING_FRAMES - forge_protocol::RESERVED_CONTROL_RECORDS
@@ -9522,7 +6037,6 @@ mod tests {
             &sink,
             Response::success(2, json!({"completed":true}))?,
             &mut admission,
-            &mut prompt_admission,
             false,
         ));
         assert!(
@@ -9793,160 +6307,99 @@ mod tests {
         service.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
-    fn check_cleanup_provider(
-        started: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-        completed: Arc<AtomicBool>,
-    ) -> Arc<crate::provider::test_support::EventFixtureProvider> {
-        let descriptor = forge_providers::registry::descriptor(
-            &forge_providers::registry::nonselectable_id().expect("fixture identity"),
-        )
-        .expect("fixture descriptor");
-        let provider =
-            crate::provider::test_support::EventFixtureProvider::new(descriptor, |_, _, _| async {
-                Err(forge_provider_api::ProviderError::Cancelled)
-            });
-        provider.with_cleanup(move |_| {
-            let started = started.clone();
-            let release = release.clone();
-            let completed = completed.clone();
-            async move {
-                started.notify_one();
-                release.notified().await;
-                completed.store(true, Ordering::Release);
-                Ok(())
-            }
-        })
-    }
-
+    /// Collect an invocation-owned check through the same cancellation command as other work.
     #[tokio::test]
-    async fn direct_prompt_collects_active_checks_before_admission() -> Result<()> {
-        for interrupt_execution in [None, Some(false), Some(true)] {
-            let fixture = tempfile::tempdir()?;
-            std::fs::write(
-                fixture.path().join(".forge.json"),
-                serde_json::to_vec(&json!({
-                    "checks":{"waiting":{"trigger":{"auto":false},"action":{"command":["nu", "--no-config-file","-c","sleep 30sec"],"label":"Waiting check","category":"test"}}}
-                }))?,
-            )?;
-            let service = service();
-            assert!(
-                service
-                    .open_session(1, initialize(&fixture, "mock"))
-                    .await?
-                    .error()
-                    .is_none()
-            );
-            let registry = service.registry().await?;
-            let controller = registry
-                .controller_by_id
-                .write()
-                .await
-                .remove(registry.initial_session_id())
-                .unwrap();
-            let started = Arc::new(tokio::sync::Notify::new());
-            let release = Arc::new(tokio::sync::Notify::new());
-            let completed = Arc::new(AtomicBool::new(false));
-            let provider =
-                check_cleanup_provider(started.clone(), release.clone(), completed.clone());
-            let provider_fixture =
-                crate::provider::test_support::ProviderTestSession::from_native(provider)?;
-            *controller.provider.write().unwrap() = provider_fixture.provider_handle();
-            registry
-                .controller_by_id
-                .write()
-                .await
-                .insert(registry.initial_session_id().to_owned(), controller.clone());
-            let (provider_sink, _provider_output) = forge_protocol::outbound::channel();
+    async fn exchange_cancellation_collects_invocation_check() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        std::fs::write(
+            fixture.path().join(".forge.json"),
+            serde_json::to_vec(&json!({
+                "checks":{"waiting":{"trigger":{"auto":false},"action":{
+                    "command":["nu","--no-config-file","-c","sleep 30sec"],
+                    "label":"Waiting check","category":"test"
+                }}}
+            }))?,
+        )?;
+        let service = service();
+        assert!(
             service
-                .start_provider_session(registry.initial_session_id(), &provider_sink)
-                .await?;
-            while !controller.provider_ready().await {
-                tokio::task::yield_now().await;
-            }
-            let (sink, mut output) = forge_protocol::outbound::channel();
-            let drain =
-                tokio::spawn(async move { while output.recv().await.ok().flatten().is_some() {} });
+                .open_session(1, initialize(&fixture, "mock"))
+                .await?
+                .error()
+                .is_none()
+        );
+        let registry = service.registry().await?;
+        let session_id = registry.initial_session_id().to_owned();
+        let controller = registry.resolve(&session_id).await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let drain =
+            tokio::spawn(async move { while output.recv().await.ok().flatten().is_some() {} });
+        for (id, method, params) in [
+            (2, "session.configure", json!({"approval_mode":"allow"})),
+            (
+                3,
+                "session.provider.mock_response",
+                json!({"operation":"script","script":{
+                    "steps":[{"kind":"tool_call","name":"check_run","arguments":{"check":"waiting"}}],
+                    "terminal":"completed"
+                }}),
+            ),
+            (
+                4,
+                "session.prompt.submit",
+                json!({"text":"Run the waiting check through its tool."}),
+            ),
+        ] {
             service
                 .dispatch(
-                    Some(registry.initial_session_id().to_owned()),
+                    Some(session_id.clone()),
                     Request {
-                        id: 2,
-                        method: "session.check.run".into(),
-                        params: json!({"check":"waiting"}),
+                        id,
+                        method: method.into(),
+                        params,
                     },
                     &sink,
                 )
                 .await?;
-            let run_id = controller.checks.active()?.context("check did not start")?;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let run = controller.checks.status(&run_id, 100, false).await?;
+        }
+        let run_id = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(id) = controller.checks.active()? {
+                    let run = controller.checks.status(&id, 100, false).await?;
                     if run
                         .commands
                         .iter()
                         .any(|command| command.state == crate::checks::CheckState::Running)
                     {
-                        break Ok::<(), anyhow::Error>(());
+                        break Ok::<_, anyhow::Error>(id);
                     }
-                    ensure!(
-                        run.state == crate::checks::CheckState::Running,
-                        "check failed before cancellation: {:?}",
-                        run.state
-                    );
                 }
-            })
-            .await??;
-            let snapshot = controller.observer.snapshot()?;
-            assert!(snapshot.checks_running);
-            assert_eq!(snapshot.active_check_run.as_deref(), Some(run_id.as_str()));
-            assert!(
-                service
-                    .prepare(
-                        Some(service.registry().await.unwrap().initial_session_id()),
-                        RuntimeMethod::SessionStateGet
-                    )
-                    .await?
-                    .is_none()
-            );
-            let mut preparation = Box::pin(async {
-                if let Some(interrupt_execution) = interrupt_execution {
-                    service.dispatch(Some(registry.initial_session_id().to_owned()), Request {
-                        id: 3, method: "session.check.cancel".into(),
-                        params: json!({"run_id":run_id,"interrupt_execution":interrupt_execution}),
-                    }, &sink).await?;
-                }
-                service
-                    .prepare(
-                        Some(service.registry().await.unwrap().initial_session_id()),
-                        RuntimeMethod::SessionPromptSubmit,
-                    )
-                    .await
-            });
-            tokio::select! {
-                result = &mut preparation => panic!("prompt admitted before provider cleanup: {result:?}"),
-                _ = started.notified() => {}
-                _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("provider cleanup did not start"),
+                tokio::task::yield_now().await;
             }
-            assert!(!completed.load(Ordering::Acquire));
-            assert!(futures_util::poll!(preparation.as_mut()).is_pending());
-            release.notify_one();
-            let admission = tokio::time::timeout(Duration::from_secs(5), preparation)
-                .await
-                .context("checked prompt admission did not finish after provider cleanup")??;
-            assert!(completed.load(Ordering::Acquire));
-            assert!(admission.is_some());
-            assert!(controller.checks.active()?.is_none());
-            assert_eq!(
-                controller.checks.status(&run_id, 0, false).await?.state,
-                crate::checks::CheckState::Interrupted
-            );
-            assert!(!controller.observer.snapshot()?.checks_running);
-            drop(admission);
-            service.shutdown(Duration::from_secs(1)).await?;
-            drop(sink);
-            drain.abort();
-        }
+        })
+        .await
+        .context("invocation check did not start")??;
+        assert!(controller.observer.snapshot()?.checks_running);
+        service
+            .dispatch(
+                Some(session_id),
+                Request {
+                    id: 5,
+                    method: "session.turn.cancel".into(),
+                    params: json!({"operation_id":"collect-invocation-check"}),
+                },
+                &sink,
+            )
+            .await?;
+        assert!(controller.checks.active()?.is_none());
+        assert_eq!(
+            controller.checks.status(&run_id, 0, false).await?.state,
+            crate::checks::CheckState::Interrupted
+        );
+        assert!(!controller.observer.snapshot()?.checks_running);
+        service.shutdown(Duration::from_secs(1)).await?;
+        drop(sink);
+        drain.abort();
         Ok(())
     }
 
@@ -10993,10 +7446,14 @@ mod tests {
                         },
                     },
                 })?;
-            controller.relay_questions(&sink, &mut None).await?;
+            controller
+                .exchange_owner
+                .reconcile_questions(Some(sink.clone()))
+                .await?;
             assert!(controller.questions.outbox()?.is_empty());
             assert!(
                 !controller.task_input_is_current(&crate::input::InputPurpose::Question {
+                    content_revision: None,
                     question_id: question_ids[1].clone(),
                     task_id: None,
                     message_kind: crate::question::QuestionMessageKind::Answer,

@@ -1,5 +1,5 @@
 {
-  "version": 33,
+  "version": 34,
   "node": {
     "kind": [
       "exchange",
@@ -146,15 +146,7 @@
       "route": "refresh",
       "required": {}
     },
-    "plan_acceptance_started": {
-      "route": "refresh",
-      "required": {}
-    },
     "plan_acceptance_updated": {
-      "route": "refresh",
-      "required": {}
-    },
-    "plan_acceptance_cancelled": {
       "route": "refresh",
       "required": {}
     },
@@ -252,6 +244,13 @@
       "route": "transport",
       "required": {
         "id": "string"
+      }
+    },
+    "publication_confirmed": {
+      "route": "handle",
+      "required": {
+        "receipt_id": "string",
+        "runtime_epoch": "string"
       }
     }
   },
@@ -808,12 +807,6 @@
       "admission": "ordinary",
       "recovery": "session_command"
     },
-    "session.approval.continue": {
-      "session_context": "required",
-      "readiness": "runtime",
-      "admission": "ordinary",
-      "recovery": "session_command"
-    },
     "session.approval.resolve": {
       "session_context": "required",
       "readiness": "runtime",
@@ -825,12 +818,6 @@
       "readiness": "runtime",
       "admission": "ordinary",
       "recovery": "none"
-    },
-    "session.check.cancel": {
-      "session_context": "required",
-      "readiness": "runtime",
-      "admission": "ordinary",
-      "recovery": "session_command"
     },
     "session.check.complete": {
       "session_context": "required",
@@ -855,12 +842,6 @@
       "readiness": "runtime",
       "admission": "ordinary",
       "recovery": "none"
-    },
-    "session.check.run": {
-      "session_context": "required",
-      "readiness": "runtime",
-      "admission": "ordinary",
-      "recovery": "session_command"
     },
     "session.check.status": {
       "session_context": "required",
@@ -1054,18 +1035,6 @@
       "admission": "ordinary",
       "recovery": "session_command"
     },
-    "session.plan.acceptance.begin": {
-      "session_context": "required",
-      "readiness": "runtime",
-      "admission": "ordinary",
-      "recovery": "session_command"
-    },
-    "session.plan.acceptance.cancel": {
-      "session_context": "required",
-      "readiness": "runtime",
-      "admission": "ordinary",
-      "recovery": "session_command"
-    },
     "session.plan.cancel": {
       "session_context": "required",
       "readiness": "runtime",
@@ -1186,12 +1155,6 @@
       "admission": "ordinary",
       "recovery": "session_command"
     },
-    "session.question.ask": {
-      "session_context": "required",
-      "readiness": "runtime",
-      "admission": "ordinary",
-      "recovery": "session_command"
-    },
     "session.question.continue": {
       "session_context": "required",
       "readiness": "runtime",
@@ -1235,12 +1198,6 @@
       "recovery": "none"
     },
     "session.turn.cancel": {
-      "session_context": "required",
-      "readiness": "runtime",
-      "admission": "control",
-      "recovery": "session_command"
-    },
-    "session.turn.restart": {
       "session_context": "required",
       "readiness": "runtime",
       "admission": "control",

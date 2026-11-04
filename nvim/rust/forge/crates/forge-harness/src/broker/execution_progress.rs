@@ -212,7 +212,7 @@ impl HarnessBroker {
             &mut self.store,
             &permit,
             self.plan_file.guard_working_document(&document),
-            crate::task::TaskEvent::ExecutionUpdated(execution),
+            crate::task::TaskEvent::ExecutionUpdated(Box::new(execution)),
             effects,
             self.clock.now_ms(),
         )?;

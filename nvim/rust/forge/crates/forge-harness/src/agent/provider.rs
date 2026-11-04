@@ -242,6 +242,7 @@ impl AgentProviderFactory {
             )
         };
         Ok(ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: Some(work.owner().clone()),
             harness_session_id: root.harness_session_id.clone(),
             workspace: root.workspace.clone(),

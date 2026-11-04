@@ -24,6 +24,253 @@ fn submit(id: &str) -> InputOperation {
     }
 }
 
+/// A recovered producer must not advertise an old message delta at the queue's newer revision.
+#[test]
+fn admission_receipt_preserves_original_revision_after_queue_changes() -> Result<()> {
+    let input = SessionInputQueue::default();
+    let original = input.apply(submit("original"))?;
+    input.apply(submit("later"))?;
+    input.suspend(true, Some("pause-after-admission"))?;
+    let saved = input.admission_receipt("submit-original")?.unwrap();
+    assert_eq!(saved.revision, original.revision);
+    assert_eq!(saved.control_revision, original.control_revision);
+    assert!(saved.snapshot.is_none());
+    assert_eq!(saved.upsert.len(), 1);
+    assert_eq!(saved.upsert[0].id, "original");
+    assert!(saved.revision < input.snapshot()?.revision);
+    assert_eq!(
+        input.operation("submit-original")?.unwrap().revision,
+        input.snapshot()?.revision
+    );
+    Ok(())
+}
+
+/// Keep rejection identity stable while an invalid edit leaves content unchanged.
+#[test]
+fn stale_edit_returns_typed_rejection_without_changing_content() -> Result<()> {
+    let input = SessionInputQueue::default();
+    input.apply(submit("message"))?;
+    let result = input.apply(InputOperation {
+        id: "stale-edit".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Reserve {
+            id: "message".into(),
+            revision: 0,
+            reservation: "editor".into(),
+        },
+    })?;
+    assert_eq!(result.error_code, Some(InputRejection::RevisionChanged));
+    assert_eq!(input.snapshot()?.messages[0].text, "message message");
+    assert!(input.snapshot()?.messages[0].reservation.is_none());
+    let restored: InputUpdate = serde_json::from_slice(&serde_json::to_vec(&result)?)?;
+    assert_eq!(restored.error_code, Some(InputRejection::RevisionChanged));
+    Ok(())
+}
+
+/// Preserve reserved and edited input when an earlier local directive completes late.
+#[test]
+fn local_input_completion_cannot_remove_an_edited_or_reserved_revision() -> Result<()> {
+    let input = SessionInputQueue::default();
+    input.apply(submit("message"))?;
+    let original = input.snapshot()?.messages[0].revision;
+    input.apply(InputOperation {
+        id: "edit-message".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Reserve {
+            id: "message".into(),
+            revision: original,
+            reservation: "editor".into(),
+        },
+    })?;
+    let reserved = serde_json::to_value(input.snapshot()?)?;
+    assert!(
+        input
+            .delivery_if_current(
+                "message",
+                InputDeliveryGuard::Queued(input.snapshot()?.messages[0].revision),
+                None,
+                None,
+                None
+            )?
+            .is_none()
+    );
+    assert!(
+        input
+            .delivery_if_current(
+                "message",
+                InputDeliveryGuard::Queued(original),
+                None,
+                None,
+                None
+            )?
+            .is_none()
+    );
+    assert_eq!(serde_json::to_value(input.snapshot()?)?, reserved);
+    input.apply(InputOperation {
+        id: "commit-message".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Commit {
+            reservation: "editor".into(),
+            edits: vec![InputEdit {
+                id: "message".into(),
+                revision: input.snapshot()?.messages[0].revision,
+                text: "New content must survive".into(),
+                attachments: Vec::new(),
+                config: None,
+            }],
+        },
+    })?;
+    assert!(
+        input
+            .delivery_if_current(
+                "message",
+                InputDeliveryGuard::Queued(original),
+                Some(InputDelivery::Failed),
+                None,
+                Some("stale local result".into())
+            )?
+            .is_none()
+    );
+    assert_eq!(
+        input.snapshot()?.messages[0].delivery,
+        InputDelivery::Queued
+    );
+    assert_eq!(
+        input.snapshot()?.messages[0].text,
+        "New content must survive"
+    );
+    Ok(())
+}
+
+/// Reject stale preparation and old-receipt completion after an explicit retry rebinds the input.
+#[test]
+fn receipt_delivery_cannot_overwrite_a_newer_input_attempt() -> Result<()> {
+    let input = SessionInputQueue::default();
+    input.apply(submit("message"))?;
+    let claimed = input.claim("message", 1, InputRoute::Turn)?.unwrap();
+    let old = forge_provider_api::SubmissionId::try_from("old-receipt")?;
+    let new = forge_provider_api::SubmissionId::try_from("new-receipt")?;
+    let before = serde_json::to_value(input.snapshot()?)?;
+    assert!(
+        input
+            .delivery_if_current(
+                "message",
+                InputDeliveryGuard::Claimed(1),
+                Some(InputDelivery::Delivering),
+                Some(old.as_str().into()),
+                None
+            )?
+            .is_none()
+    );
+    assert_eq!(serde_json::to_value(input.snapshot()?)?, before);
+    input
+        .delivery_if_current(
+            "message",
+            InputDeliveryGuard::Claimed(claimed.revision),
+            Some(InputDelivery::Delivering),
+            Some(old.as_str().into()),
+            None,
+        )?
+        .unwrap();
+    input
+        .delivery_if_current(
+            "message",
+            InputDeliveryGuard::Receipt(&old),
+            Some(InputDelivery::Failed),
+            None,
+            Some("not dispatched".into()),
+        )?
+        .unwrap();
+    let revision = input.snapshot()?.messages[0].revision;
+    let retried = input.apply(InputOperation {
+        id: "retry".into(),
+        control_revision: 0,
+        after_control: None,
+        action: InputAction::Retry {
+            id: "message".into(),
+            revision,
+        },
+    })?;
+    assert!(retried.error.is_none());
+    let retry = input.snapshot()?.messages[0].clone();
+    let claimed = input
+        .claim(&retry.id, retry.revision, InputRoute::Turn)?
+        .unwrap();
+    input
+        .delivery_if_current(
+            "message",
+            InputDeliveryGuard::Claimed(claimed.revision),
+            Some(InputDelivery::Delivering),
+            Some(new.as_str().into()),
+            None,
+        )?
+        .unwrap();
+    let before = serde_json::to_value(input.snapshot()?)?;
+    assert!(
+        input
+            .delivery_if_current(
+                "message",
+                InputDeliveryGuard::Receipt(&old),
+                None,
+                None,
+                None
+            )?
+            .is_none()
+    );
+    assert_eq!(serde_json::to_value(input.snapshot()?)?, before);
+    input
+        .delivery_if_current(
+            "message",
+            InputDeliveryGuard::Receipt(&new),
+            None,
+            None,
+            None,
+        )?
+        .unwrap();
+    assert!(input.snapshot()?.messages.is_empty());
+    Ok(())
+}
+
+/// Deliver a host question reply without resuming or being blocked by earlier suspended drafts.
+#[test]
+fn suspended_question_reply_bypasses_drafts_and_advances_queue_revision() -> Result<()> {
+    let input = SessionInputQueue::default();
+    input.apply(submit("draft"))?;
+    input.suspend(true, Some("pause"))?;
+    let mut answer = submit("answer");
+    if let InputAction::Submit { message } = &mut answer.action {
+        message.purpose = InputPurpose::Question {
+            content_revision: None,
+            question_id: "question".to_owned().try_into()?,
+            task_id: None,
+            message_kind: crate::question::QuestionMessageKind::Answer,
+            reply: forge_provider_api::QuestionReply {
+                question_id: "question".into(),
+                revision: 1,
+                message_id: "answer".into(),
+                question: "Proceed?".into(),
+                response: forge_provider_api::input::QuestionReplyResponse::Answer {
+                    answer: "Yes".into(),
+                    required_questions_remain: false,
+                },
+            },
+        };
+    }
+    input.apply(answer)?;
+    let before = input.snapshot()?;
+    assert!(input.claim("draft", 1, InputRoute::Turn)?.is_none());
+    assert!(input.claim("answer", 1, InputRoute::Turn)?.is_some());
+    let after = input.snapshot()?;
+    assert!(after.suspended);
+    assert!(after.revision > before.revision);
+    assert_eq!(after.messages[0].delivery, InputDelivery::Queued);
+    assert_eq!(after.messages[1].delivery, InputDelivery::Delivering);
+    Ok(())
+}
+
 #[test]
 fn submission_after_pause_resumes_only_that_control_operation() -> Result<()> {
     let input = SessionInputQueue::default();

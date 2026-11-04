@@ -529,6 +529,7 @@ pub struct ExecutionControl {
 /// Restricts provider execution controls to their admitted broker turn.
 pub struct ExecutionControlSender {
     pub(crate) task_controller: std::sync::Arc<crate::task::SessionTaskController>,
+    pub(crate) task_permit: crate::task::TaskPermit,
     pub phase: PlanPhase,
     pub execution_id: String,
     pub generation: u64,
@@ -559,7 +560,9 @@ impl ExecutionControlSender {
 
     /// Await a committed broker result before acknowledging the provider's request.
     pub async fn send(&self, operation: ExecutionOperation) -> Result<Value> {
-        let task_permit = self.task_controller.admit(crate::task::TaskKind::Execute)?;
+        let task_permit = self
+            .task_controller
+            .admit_dispatched(crate::task::TaskKind::Execute, &self.task_permit)?;
         let task = self
             .task_controller
             .current()?
@@ -1008,6 +1011,7 @@ mod revision_policy_tests {
         let (sender, mut receiver) = mpsc::channel(1);
         let control = ExecutionControlSender {
             task_controller: controller.clone(),
+            task_permit: controller.current()?.unwrap().permit(),
             phase: record.phase,
             execution_id: record.id.clone(),
             generation: record.generation,
@@ -1068,6 +1072,7 @@ mod revision_policy_tests {
         for phase in [PlanPhase::Implement, PlanPhase::Verify, PlanPhase::Resolve] {
             let control = ExecutionControlSender {
                 task_controller: task_controller.clone(),
+                task_permit: task_controller.current().unwrap().unwrap().permit(),
                 phase,
                 execution_id: "e".into(),
                 generation: 1,

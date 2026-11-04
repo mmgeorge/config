@@ -61,9 +61,16 @@ impl ControlToolExecutor {
             admission.active += 1;
             Execution { owner: self }
         };
+        let permit = self
+            .authority
+            .as_ref()
+            .map(|authority| authority.current_permit())
+            .transpose()?
+            .flatten()
+            .or_else(|| self.task_permit.clone());
         invocation.admit_turn_control(
             self.task_controller.as_deref(),
-            self.task_permit.as_ref(),
+            permit.as_ref(),
             self.mode,
         )?;
         let mut cancelled = self.cancelled.subscribe();
@@ -82,10 +89,18 @@ impl ControlToolExecutor {
             && invocation.arguments["wait"].as_bool() == Some(true)
             && runtime.context.questions.is_some()
         {
-            let prepared = super::questions::begin_wait(&runtime, &invocation);
+            let prepared = super::questions::prepare_wait(&runtime, &invocation);
             let plan_document = runtime.plan_document().cloned();
             let execution_finished = runtime.execution_finished();
             drop(runtime);
+            let prepared = match prepared {
+                Ok(prepared) => tokio::select! {
+                    biased;
+                    _ = cancelled.wait_for(|closed| *closed) => return Err(crate::broker::TurnCancelled.into()),
+                    wait = prepared.publish() => wait,
+                },
+                Err(error) => Err(error),
+            };
             barrier.release();
             let result = match prepared {
                 Ok(wait) => {
@@ -252,6 +267,7 @@ mod test {
             .unwrap();
         let permit = task.permit();
         let mut invocation = ControlToolInvocation {
+            call_id: None,
             name: "plan_overview_read".into(),
             arguments: serde_json::json!({"plan_id":"plan"}),
             task_permit: None,
@@ -277,6 +293,7 @@ mod test {
         context.checkpoint = Some(checkpoint.clone());
         let executor = ControlToolExecutor::new(context);
         let invocation = || ControlToolInvocation {
+            call_id: None,
             name: "goal_complete".into(),
             arguments: serde_json::json!({"summary":"Finish the old goal"}),
             task_permit: None,
@@ -341,6 +358,7 @@ mod test {
         context.checkpoint = Some(crate::checkpoint::ToolGate::new());
         let executor = ControlToolExecutor::new(context);
         let invocation = || ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "goal_complete".into(),
             arguments: json!({"summary":"finished"}),
@@ -386,6 +404,7 @@ mod test {
         let executor = ControlToolExecutor::new(context);
         let outcome = executor
             .execute(ControlToolInvocation {
+                call_id: None,
                 task_permit: None,
                 name: "goal_status".into(),
                 arguments: json!({"status":"working"}),
@@ -424,6 +443,7 @@ mod test {
         context.lsp = Some(scope);
         let executor = ControlToolExecutor::new(context);
         let pending = executor.execute(ControlToolInvocation {
+            call_id: None,
             task_permit: None,
             name: "lsp_context".into(),
             arguments: json!({"path":"source.rs","line":1,"column":1}),

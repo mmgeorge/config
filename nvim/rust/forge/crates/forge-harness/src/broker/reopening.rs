@@ -95,9 +95,22 @@ impl ReopenedExecutions {
             == Some(address)
     }
 
-    fn finish(&mut self, scope: &InvocationScope) {
+    pub(super) fn finish(&mut self, scope: &InvocationScope) {
         if let Some(state) = self.revisions.get_mut(&scope.invocation_id) {
             state.active = None;
+        }
+    }
+
+    /// Apply confirmed owner-wide collection even when no further terminal event is emitted.
+    pub(super) fn finish_owner(&mut self, owner: &ExecutionOwner) {
+        for state in self.revisions.values_mut() {
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|address| &address.scope.owner == owner)
+            {
+                state.active = None;
+            }
         }
     }
 

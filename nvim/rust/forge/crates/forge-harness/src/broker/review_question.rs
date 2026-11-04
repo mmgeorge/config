@@ -4,18 +4,6 @@ use crate::plan::review_document::PlanReviewQuestion;
 use crate::settings::AskModel;
 use forge_buffer::identity::DocumentId;
 
-pub(crate) struct AskModelConfiguration {
-    selection: AskModel,
-    authority: Box<configuration::ConfigurationAuthority>,
-    revision: u64,
-}
-
-impl AskModelConfiguration {
-    pub(crate) fn needs_catalog(&self) -> bool {
-        self.selection.model.is_some()
-    }
-}
-
 impl HarnessBroker {
     /// Capture admitted review questions without appending an exchange to their source session.
     pub(crate) fn prepare_review_questions(
@@ -53,68 +41,6 @@ impl HarnessBroker {
             )?
             .ask_model()?;
         Ok((document, questions, settings))
-    }
-
-    pub(crate) fn prepare_ask_model_configuration(
-        &self,
-        value: Value,
-    ) -> Result<AskModelConfiguration> {
-        anyhow::ensure!(
-            self.store
-                .pending_configuration_intent(&self.session.id)?
-                .is_none(),
-            "session configuration requires durable recovery"
-        );
-        let selection: AskModel = if value.is_null() {
-            AskModel::default()
-        } else {
-            serde_json::from_value(value)?
-        };
-        if selection.model.is_some() {
-            anyhow::ensure!(
-                self.capability.model_selection,
-                "current provider does not support model selection"
-            );
-        }
-        let revision = crate::settings::SettingsStore::read_only(&self.data_root)?
-            .get(
-                &self.session.workspace,
-                &self.session.id,
-                &self.session.provider,
-            )?
-            .revision;
-        Ok(AskModelConfiguration {
-            selection,
-            authority: self.capture_configuration_authority()?,
-            revision,
-        })
-    }
-
-    pub(crate) fn commit_ask_model_configuration(
-        &mut self,
-        prepared: AskModelConfiguration,
-        catalog: &[crate::provider::ProviderModel],
-    ) -> Result<Value> {
-        self.validate_configuration_authority(&prepared.authority)?;
-        let selection = prepared.selection;
-        selection.resolve(&self.session, catalog)?;
-        let controller = self.task_controller.clone();
-        controller.with_task_snapshot(|current| {
-            anyhow::ensure!(
-                foreground_failure::same_retraction_task(
-                    current.as_ref(),
-                    prepared.authority.task.as_ref()
-                ),
-                "Ask configuration task authority changed before commit"
-            );
-            let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
-            settings.save_provider(
-                prepared.revision,
-                &self.session.provider,
-                &json!({"ask_model":selection}),
-            )?;
-            Ok(json!({"ask_model":selection}))
-        })
     }
 
     /// Resolve the review model and capture its question before owned dispatch.
@@ -156,37 +82,5 @@ impl HarnessBroker {
             "Answer this Plan Review question in 1-2 sentences in your final response. Do not edit files or the plan.\n\n{}",
             scope.question.prompt
         ))
-    }
-
-    /// Publish only the final answer belonging to the unchanged source question.
-    pub(crate) fn finish_review_question(
-        &self,
-        scope: Arc<ReviewAnswerScope>,
-        result: &Value,
-    ) -> Result<()> {
-        let exchange = result
-            .pointer("/exchange/id")
-            .and_then(Value::as_str)
-            .context("review question turn has no exchange")?;
-        let exchange = self
-            .store
-            .load_exchange(exchange)?
-            .context("review question exchange is missing")?;
-        anyhow::ensure!(
-            exchange.phase.state() == crate::exchange::ExchangeState::Complete,
-            "review question stopped before its answer completed"
-        );
-        let answer = exchange
-            .turn
-            .iter()
-            .flat_map(|turn| turn.messages())
-            .filter(|message| {
-                message.kind() == crate::turn::MessageKind::Assistant
-                    && message.delivery() == crate::turn::MessageDelivery::Final
-            })
-            .map(|message| message.text())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        scope.submit(answer)
     }
 }

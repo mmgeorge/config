@@ -1452,9 +1452,9 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
         steered
             .last()
             .unwrap()
-            .pointer("/result/steered")
-            .and_then(Value::as_bool),
-        Some(true)
+            .pointer("/result/outcome/result/change/change")
+            .and_then(Value::as_str),
+        Some("submitted")
     );
     let snapshot = broker.wait_for_exchanges(None, Some(&fixture_session_id), |snapshot| {
         snapshot[0]["node_list"].as_array().is_some_and(|nodes| {

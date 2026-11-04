@@ -26,9 +26,103 @@ pub(crate) fn replay_safe(output: &super::ProviderCompletion) -> bool {
         && !output.evidence.structured_blocked
 }
 
+/// Close future retry admission independently of an already-owned native attempt.
+#[derive(Clone)]
+pub(crate) struct RetryAdmission {
+    source: tokio::sync::watch::Receiver<bool>,
+    closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    changed: std::sync::Arc<tokio::sync::Notify>,
+    dispatch: std::sync::Arc<std::sync::Mutex<Option<super::DispatchObserver>>>,
+}
+
+impl RetryAdmission {
+    /// Create retry admission tied to the child cancellation owner.
+    pub(crate) fn new(source: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self {
+            source,
+            closed: Default::default(),
+            changed: Default::default(),
+            dispatch: Default::default(),
+        }
+    }
+
+    /// Prevent future attempts without discarding the currently admitted attempt's settlement waiter.
+    pub(crate) fn close(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    /// Capture the currently admitted attempt so cancellation waits for its actual handoff before cleanup.
+    pub(crate) fn current_dispatch(&self) -> Option<super::DispatchObserver> {
+        self.dispatch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn begin_attempt(&self, request: &ProviderRequest) -> Result<()> {
+        let mut dispatch = self
+            .dispatch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("retry admission poisoned"))?;
+        if self.is_closed() {
+            return Err(crate::broker::TurnCancelled.into());
+        }
+        *dispatch = Some(request.dispatch.observer());
+        Ok(())
+    }
+
+    fn finish_attempt(&self) {
+        self.dispatch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire) || *self.source.borrow()
+    }
+
+    async fn wait_closed(&mut self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.is_closed() {
+                return;
+            }
+            tokio::select! {
+                () = changed => {},
+                result = self.source.changed() => { if result.is_err() { return; } }
+            }
+        }
+    }
+}
+
+/// Run child retry policy with closed admission observed before each attempt and during delays.
+pub(crate) async fn execute_cancellable(
+    engine: &super::session_execution::SessionExecution,
+    request: ProviderRequest,
+    event_sink: ProviderEventSink,
+    trace: &TraceStore,
+    submission_store: &std::sync::Arc<super::submission::SubmissionStore>,
+    admission: RetryAdmission,
+) -> Result<ProviderCompletion> {
+    run_policy_guarded(
+        request,
+        event_sink,
+        trace,
+        Some(admission),
+        |request, sink, _| async move { engine.run_once(request, sink, submission_store).await },
+    )
+    .await
+}
+
 /// Runs one request with bounded retries only after an adapter proves safe terminal failure.
 /// Preserve broker cancellation identity when a provider terminates the request intentionally.
 /// Dropping this future cancels its delay. Native execution cleanup remains with the caller.
+#[cfg(test)]
 pub(crate) async fn execute(
     engine: &super::session_execution::SessionExecution,
     request: ProviderRequest,
@@ -142,6 +236,7 @@ pub(crate) async fn execute_until_ready(
             .get_or_insert_with(|| crate::tools::ControlTurnContext::inactive(request.mode))
             .provider_continuation = Some(failure.continuation.clone());
         request.submission = None;
+        request.dispatch = super::DispatchTracker::default();
         request.recovered_input.clear();
         progress.attempt += 1;
         progress.pending = true;
@@ -176,10 +271,25 @@ pub(crate) async fn execute_until_ready(
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn run_policy<F, Fut>(
+    request: ProviderRequest,
+    event_sink: ProviderEventSink,
+    trace: &TraceStore,
+    attempt: F,
+) -> Result<ProviderCompletion>
+where
+    F: FnMut(ProviderRequest, ProviderEventSink, bool) -> Fut,
+    Fut: std::future::Future<Output = Result<ProviderCompletion, super::ProviderError>>,
+{
+    run_policy_guarded(request, event_sink, trace, None, attempt).await
+}
+
+async fn run_policy_guarded<F, Fut>(
     mut request: ProviderRequest,
     event_sink: ProviderEventSink,
     trace: &TraceStore,
+    mut admission: Option<RetryAdmission>,
     mut attempt: F,
 ) -> Result<ProviderCompletion>
 where
@@ -195,7 +305,16 @@ where
     };
     let mut address = None;
     loop {
+        if admission.as_ref().is_some_and(RetryAdmission::is_closed) {
+            return Err(crate::broker::TurnCancelled.into());
+        }
+        if let Some(admission) = &admission {
+            admission.begin_attempt(&request)?;
+        }
         let result = attempt(request.clone(), event_sink.clone(), progress.attempt == 0).await;
+        if let Some(admission) = &admission {
+            admission.finish_attempt();
+        }
         let error = match result {
             Ok(output) => {
                 if progress.attempt > 0 {
@@ -231,6 +350,7 @@ where
             .get_or_insert_with(|| crate::tools::ControlTurnContext::inactive(request.mode))
             .provider_continuation = Some(failure.continuation.clone());
         request.submission = None;
+        request.dispatch = super::DispatchTracker::default();
         request.recovered_input.clear();
         progress.attempt += 1;
         progress.pending = true;
@@ -249,7 +369,15 @@ where
             }),
         )
         .await?;
-        tokio::time::sleep(Duration::from_secs(delay_seconds)).await;
+        if let Some(admission) = admission.as_mut() {
+            tokio::select! {
+                biased;
+                () = admission.wait_closed() => return Err(crate::broker::TurnCancelled.into()),
+                () = tokio::time::sleep(Duration::from_secs(delay_seconds)) => {}
+            }
+        } else {
+            tokio::time::sleep(Duration::from_secs(delay_seconds)).await;
+        }
         progress.record("started", Value::Null);
         publish(
             &event_sink,
@@ -355,6 +483,7 @@ mod tests {
         failure_count: usize,
         ending: Ending,
         covered: Vec<forge_provider_api::SubmissionId>,
+        effects: Arc<dyn forge_provider_api::session::ProviderHostEffects>,
     ) -> Result<(), ProviderError> {
         let address = TurnAddress {
             scope: scope.clone(),
@@ -398,6 +527,15 @@ mod tests {
                 },
             }
         };
+        effects
+            .settle_foreground(sink.binding_id(), &scope)
+            .await
+            .map_err(|_| {
+                ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::HostEffectPublication,
+                    forge_provider_api::ProviderFailureKind::Runtime,
+                ))
+            })?;
         sink.send_wait(ProviderEvent::Execution {
             observation: ExecutionObservation::new(
                 scope,
@@ -445,13 +583,14 @@ mod tests {
                         failure_count,
                         ending,
                         vec![request.submission_id],
+                        request.host_effects,
                     )
                     .await
                 }
             },
         );
         let continuation_log = log.clone();
-        provider.with_continuation(move |scope, _callbacks, sink, _cancelled| {
+        provider.with_continuation(move |scope, callbacks, sink, _cancelled| {
             let log = continuation_log.clone();
             async move {
                 let attempt = log.continuation_count.fetch_add(1, Ordering::SeqCst) + 2;
@@ -459,7 +598,16 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((attempt, tokio::time::Instant::now()));
-                emit_attempt(scope, sink, attempt, failure_count, ending, Vec::new()).await
+                emit_attempt(
+                    scope,
+                    sink,
+                    attempt,
+                    failure_count,
+                    ending,
+                    Vec::new(),
+                    callbacks.host_effects,
+                )
+                .await
             }
         });
         (provider, log)
@@ -475,6 +623,7 @@ mod tests {
 
     fn request() -> ProviderRequest {
         ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: None,
             harness_session_id: "retry-fixture".into(),
             workspace: "workspace".into(),
@@ -491,6 +640,138 @@ mod tests {
             recovered_input: Vec::new(),
             control_context: None,
         }
+    }
+
+    /// Cancellation ready before first poll never constructs a native attempt.
+    #[tokio::test]
+    async fn cancellation_before_first_poll_prevents_initial_attempt() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let trace = TraceStore::open(root.path())?;
+        let (_sender, cancelled) = tokio::sync::watch::channel(true);
+        let admission = RetryAdmission::new(cancelled);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let (sink, _stream) = crate::provider::events::channel(scope());
+        let result =
+            run_policy_guarded(request(), sink, &trace, Some(admission), move |_, _, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { Ok(ProviderCompletion::default()) }
+            })
+            .await;
+        assert!(result.unwrap_err().is::<crate::broker::TurnCancelled>());
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    /// Closing actor admission rejects an attempt queued after the cancellation decision.
+    #[tokio::test]
+    async fn closed_execution_admission_prevents_native_attempt() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let trace = Arc::new(TraceStore::open(root.path())?);
+        let store = super::super::submission::SubmissionStore::open(root.path(), trace.clone())?;
+        let (native, log) = provider(0, Ending::Completed);
+        let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+        let registry = crate::provider::session_execution::SessionExecutionRegistry::new(
+            provider.provider_handle(),
+            trace.clone(),
+        );
+        let engine = registry.owner(request().owner()?).await?;
+        engine.close_admission();
+        let (_sender, cancellation) = tokio::sync::watch::channel(false);
+        let (sink, _stream) = crate::provider::events::channel(scope());
+        let result = execute_cancellable(
+            &engine,
+            request(),
+            sink,
+            &trace,
+            &store,
+            RetryAdmission::new(cancellation),
+        )
+        .await;
+        assert!(result.unwrap_err().is::<crate::broker::TurnCancelled>());
+        assert_eq!(log.prompt_count.load(Ordering::SeqCst), 0);
+        registry.close().await?;
+        Ok(())
+    }
+
+    /// Closing admission during backoff cannot construct the subsequent attempt.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_retry_delay_prevents_subsequent_attempt() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let trace = TraceStore::open(root.path())?;
+        let (_sender, cancelled) = tokio::sync::watch::channel(false);
+        let admission = RetryAdmission::new(cancelled);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let (sink, _stream) = crate::provider::events::channel(scope());
+        let policy = run_policy_guarded(
+            request(),
+            sink,
+            &trace,
+            Some(admission.clone()),
+            move |_, _, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(ProviderError::Retryable(Box::new(
+                        forge_provider_api::retry::RetryableFailure {
+                            address: TurnAddress {
+                                scope: scope(),
+                                thread_id: "thread".into(),
+                                turn_id: "turn".into(),
+                            },
+                            category: RetryCategory::TemporaryCapacity,
+                            continuation: forge_provider_api::ContinuationToken::new(
+                                b"retry".to_vec(),
+                            )
+                            .unwrap(),
+                        },
+                    )))
+                }
+            },
+        );
+        tokio::pin!(policy);
+        assert!(futures_util::poll!(&mut policy).is_pending());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        admission.close();
+        assert!(
+            policy
+                .await
+                .unwrap_err()
+                .is::<crate::broker::TurnCancelled>()
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    /// Closing retry admission retains an already-polled attempt's actual terminal result.
+    #[tokio::test]
+    async fn cancellation_retains_current_attempt_settlement_without_retry() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let trace = TraceStore::open(root.path())?;
+        let (_sender, cancelled) = tokio::sync::watch::channel(false);
+        let admission = RetryAdmission::new(cancelled);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let ready = release.clone();
+        let (sink, _stream) = crate::provider::events::channel(scope());
+        let policy = run_policy_guarded(
+            request(),
+            sink,
+            &trace,
+            Some(admission.clone()),
+            move |_, _, _| {
+                let ready = ready.clone();
+                async move {
+                    ready.notified().await;
+                    Ok(ProviderCompletion::default())
+                }
+            },
+        );
+        tokio::pin!(policy);
+        assert!(futures_util::poll!(&mut policy).is_pending());
+        admission.close();
+        release.notify_one();
+        assert!(policy.await.is_ok());
+        Ok(())
     }
 
     #[test]
@@ -524,7 +805,8 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(error.downcast_ref::<ProviderError>(), Some(ProviderError::Retryable(failure))
-            if failure.category == RetryCategory::TemporaryCapacity)
+            if failure.category == RetryCategory::TemporaryCapacity),
+            "{error:#}"
         );
         let attempts = log.attempts.lock().unwrap();
         assert_eq!(log.prompt_count.load(Ordering::SeqCst), 1);
@@ -618,7 +900,13 @@ mod tests {
             let error = prompt(&provider, request(), Some(sink), &trace, &submission_store)
                 .await
                 .unwrap_err();
-            assert!(error.is::<crate::broker::TurnCancelled>(), "{error:#}");
+            assert!(
+                matches!(
+                    error.downcast_ref::<ProviderError>(),
+                    Some(ProviderError::Cancelled)
+                ),
+                "{error:#}"
+            );
             assert_eq!(log.prompt_count.load(Ordering::SeqCst), 1);
             assert_eq!(log.continuation_count.load(Ordering::SeqCst), failure_count);
             let mut retry_updates = Vec::new();

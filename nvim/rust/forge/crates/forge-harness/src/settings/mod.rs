@@ -4,6 +4,7 @@ mod import;
 mod resources;
 mod store;
 pub use ask_model::AskModel;
+pub(crate) use ask_model::AskModelError;
 pub(crate) use catalog::{ResourceCatalog, SkillResource};
 pub(crate) use import::{ImportKind, ImportedResource, NativeImport};
 pub(crate) use resources::SessionResources;

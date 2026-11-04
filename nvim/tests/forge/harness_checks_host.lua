@@ -1,4 +1,5 @@
 vim.loader.enable(false)
+local check_tool = dofile(vim.fn.getcwd() .. "/nvim/tests/forge/fixtures/check_tool.lua")
 local root = vim.fs.normalize(vim.fn.getcwd())
 vim.opt.runtimepath:prepend(root .. "/nvim")
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
@@ -90,8 +91,10 @@ local succeeded, failure = xpcall(function()
   toggle_editing(true)
   request("session.configure", { shell = "nushell" })
   save({ definition("failure", "exit 7"), definition("dependent", "'unexpected' | save unexpected.txt", { "failure" }), definition("independent", "sleep 200ms; print 'independent output'") })
-  assert(not pcall(request, "session.check.run"), "manual runs must name their checks")
-  local id = request("session.check.run", { check = {"failure", "dependent", "independent"}, all = true }).run_id
+  assert(not pcall(request, "session.check.run"), "retired manual-run RPC must be rejected")
+  assert(not pcall(request, "session.check.cancel", { run_id = "retired-request" }),
+    "retired check-cancel RPC must be rejected")
+  local id = check_tool.start(request, { check = {"failure", "dependent", "independent"}, all = true }).run_id
   local run
   assert(vim.wait(10000, function()
     run = request("session.check.status", { run_id = id })
@@ -117,7 +120,7 @@ local succeeded, failure = xpcall(function()
   scoped.action.inputs = { files = { type = "array", description = "Selected fixture paths", required = true } }
   save({ scoped })
   request("session.configure", { shell = "system" })
-  local scoped_id = request("session.check.run", { check = "scoped", inputs = { files = { "src/name $value.rs" } } }).run_id
+  local scoped_id = check_tool.start(request, { check = "scoped", inputs = { files = { "src/name $value.rs" } } }).run_id
   assert(vim.wait(10000, function() return request("session.check.status", { run_id = scoped_id }).state ~= "running" end, 20))
   local resolved = request("session.check.status", { run_id = scoped_id })
   assert(resolved.state == "passed", table.concat(vim.fn.readfile(resolved.commands[1].output), "\n") .. "\n" .. vim.inspect(resolved))
@@ -125,22 +128,22 @@ local succeeded, failure = xpcall(function()
   request("session.configure", { shell = "nushell" })
   scoped.action.command = "print 'missing receipt'"
   save({ scoped })
-  local bad_id = request("session.check.run", { check = "scoped", inputs = { files = { "src/example.rs" } } }).run_id
+  local bad_id = check_tool.start(request, { check = "scoped", inputs = { files = { "src/example.rs" } } }).run_id
   assert(vim.wait(10000, function() return request("session.check.status", { run_id = bad_id }).state ~= "running" end, 20))
   assert(request("session.check.status", { run_id = bad_id }).state == "configuration_error")
   assert(vim.wait(3000, function() return #errors > 0 end, 10), "configuration errors must notify the user")
   assert(errors[#errors]:find("receipt", 1, true), table.concat(errors, "\n"))
   errors = {}
   save({ definition("cancel", "sleep 10sec; 'orphan' | save cancelled-orphan.txt") })
-  local cancelled_id = request("session.check.run", { check = "cancel", all = true }).run_id
+  local cancelled_id = check_tool.start(request, { check = "cancel", all = true }).run_id
   assert(request("session.check.status", { run_id = cancelled_id }).state == "running")
-  assert(request("session.check.cancel", { run_id = cancelled_id }).cancellation_requested)
+  request("session.turn.cancel", {})
   assert(vim.wait(3000, function()
     return request("session.check.status", { run_id = cancelled_id }).state == "interrupted"
   end, 20), "cancelled check did not retain its interrupted state")
   assert(vim.fn.filereadable(workspace .. "/cancelled-orphan.txt") == 0)
   save({ definition("shutdown", "sleep 2sec; 'orphan' | save shutdown-orphan.txt") })
-  local shutdown_id = request("session.check.run", { check = "shutdown", all = true }).run_id
+  local shutdown_id = check_tool.start(request, { check = "shutdown", all = true }).run_id
   assert(request("session.check.status", { run_id = shutdown_id }).state == "running")
   local session_id = state.session.id
   require("forge.views.harness.workspace").release(state)

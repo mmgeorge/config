@@ -31,12 +31,17 @@ impl ToolHandler for ControlToolHandler {
         &self,
         invocation: ToolInvocation,
     ) -> Result<ToolResult, github_copilot_sdk::Error> {
+        let Ok(id) = forge_provider_api::control::ToolCallId::new(invocation.tool_call_id.clone())
+        else {
+            return Ok(ToolResult::Text("Invalid tool call identity".into()));
+        };
         let name = invocation.tool_name;
         let result = self
             .callbacks
             .call_native(
                 &invocation.tool_call_id,
                 ToolCall {
+                    id,
                     name: name.clone(),
                     arguments: invocation.arguments,
                 },

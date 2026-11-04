@@ -868,16 +868,6 @@ pub(crate) enum SessionAction {
         )]
         completed_turn: Option<crate::task::TaskTurnId>,
     },
-    #[serde(rename = "begin_acceptance")]
-    BeginAcceptance {
-        #[serde(flatten)]
-        review: PlanReviewRequest,
-    },
-    #[serde(rename = "cancel_acceptance")]
-    CancelAcceptance {
-        #[serde(flatten)]
-        review: PlanReviewRequest,
-    },
     #[serde(rename = "request_changes")]
     RequestChanges {
         #[serde(flatten)]
@@ -888,8 +878,6 @@ pub(crate) enum SessionAction {
         #[serde(flatten)]
         review: PlanReviewRequest,
     },
-    #[serde(rename = "complete_acceptance")]
-    CompleteAcceptance { plan_id: String, digest: String },
 }
 ```
 
@@ -914,6 +902,9 @@ pub(crate) struct ExecuteSelection {
     pub plan_compact: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
+    /// Retain inline review feedback for revision before execution admission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<crate::plan::PlanAnnotationInput>,
     #[serde(flatten)]
     pub metadata: BTreeMap<String, Value>,
 }

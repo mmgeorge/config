@@ -156,7 +156,9 @@ function M.receive(state, update)
       resolved = operation
       if failure and operation.action.kind == "submit" then
         local message = vim.deepcopy(operation.action.message)
-        message.delivery, message.error, message.local_only = "failed", failure, true
+        message.delivery, message.error, message.local_only = update.outcome_unknown and "unknown" or "failed", failure, true
+        message.operation_id = operation.id
+        message.submission_target = vim.deepcopy(operation.target)
         input.rejected[#input.rejected + 1] = message
       end
       table.remove(input.pending, index)
@@ -198,10 +200,17 @@ send_next = function(state)
   end
   local session_id = state.session.id
   local sent, send_failure = pcall(client.request, { session_id = session_id, method = "session.input.apply", params = { id = operation.id, action = operation.action,
-    control_revision = operation.control_revision, after_control = operation.after_control } }, function(result, failure, detail)
+    control_revision = operation.control_revision, after_control = operation.after_control, target = operation.target } }, function(result, failure, detail)
     if not owns_input(state, input) then return end
     if not failure and result then M.receive(state, result) return end
     if input.sending ~= operation then return end
+    if detail and detail.code == "outcome_unknown" then
+      -- Preserve the original identity and uncertainty without resubmitting a terminal command.
+      M.receive(state, { operation_id = operation.id, revision = input.revision,
+        suspended = input.suspended, upsert = {}, removed = {}, outcome_unknown = true,
+        error = failure or "Input outcome is unknown. Inspect its original operation before resending." })
+      return
+    end
     if detail and detail.code == "not_admitted" then
       vim.defer_fn(function()
         if not owns_input(state, input) or input.sending ~= operation then return end
@@ -315,8 +324,8 @@ end
 ---@param state table
 ---@param action table
 ---@param callback? fun(failure: string?)
-function M.perform(state, action, callback)
-  local operation = { id = identity(), action = vim.deepcopy(action), callback = callback,
+function M.perform(state, action, callback, target)
+  local operation = { id = identity(), action = vim.deepcopy(action), callback = callback, target = vim.deepcopy(target),
     control_revision = state.input.control_revision, after_control = state.input.pause_operation_id }
   state.input.pending[#state.input.pending + 1] = operation
   render(state)
@@ -341,8 +350,10 @@ function M.retry(state, entry)
     end
     M.discard_rejected(state, entry.id)
     local message = vim.deepcopy(entry)
+    local target = message.submission_target
     message.local_only, message.error, message.delivery = nil, nil, "queued"
-    M.perform(state, { kind = "submit", message = message })
+    message.operation_id, message.submission_target = nil, nil
+    M.perform(state, { kind = "submit", message = message }, nil, target)
   else
     M.perform(state, { kind = "retry", id = entry.id, revision = entry.revision })
   end
@@ -355,7 +366,7 @@ end
 ---@param config? table
 ---@param callback? fun(failure: string?)
 ---@param retracted? fun(): boolean
-function M.submit(state, text, attachments, intent, config, callback, retracted)
+function M.submit(state, text, attachments, intent, config, callback, retracted, target)
   local message = { id = identity(), revision = 0, text = text, attachments = attachments,
     purpose = { kind = "user" }, config = config, intent = intent, delivery = "queued" }
   if intent == "auto" and not config and not state.busy and not state.execution_busy
@@ -363,7 +374,7 @@ function M.submit(state, text, attachments, intent, config, callback, retracted)
     state.input.direct_submission[message.id] = true
   end
   if retracted then state.input.retraction[message.id] = retracted end
-  M.perform(state, { kind = "submit", message = message }, callback)
+  M.perform(state, { kind = "submit", message = message }, callback, target)
   return message.id
 end
 

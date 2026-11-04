@@ -49,6 +49,13 @@ for _, scenario in ipairs({
   submitted("Explicit follow-up", "auto", controller.steer_submit)
   submitted("Keep this queued", "queue", controller.queue_submit)
 end
+local clarification_target = { owner = "plan", id = "selected-plan", set_id = "questions", revision = 3, question_id = "q2" }
+input.submit(state, "Explain the selected question", {}, "auto", nil, nil, nil, clarification_target)
+local scoped_submission = host.requests[#host.requests].parameters
+assert(vim.deep_equal(scoped_submission.target, clarification_target), "clarification target was dropped")
+assert(scoped_submission.action.message.purpose.kind == "user", "UI manufactured an internal input purpose")
+host.flush()
+
 state.task_operation = nil
 for _, command in ipairs({ { "/plan Convert to X", "plan", "Convert to X" },
   { "/goal Complete X", "goal", "Complete X" } }) do
@@ -65,20 +72,16 @@ local retained = vim.deepcopy(state.queue)
 local before = #host.requests
 draft("Keep my unsent draft")
 controller.cancel_turn()
-local pause = transitions[#transitions]
-assert(pause.action.action == "pause" and text() == "Keep my unsent draft")
-assert(#host.requests == before and vim.deep_equal(state.queue, retained))
-state.task_operation = { action = "pause", state = "accepted" }
 local transition_count = #transitions
-controller.cancel_turn()
-assert(#transitions == transition_count, "duplicate cancellation replaced the pending pause")
-state.task_operation = nil
-pause.completed(true)
 local cancellation = controls[#controls]
 assert(cancellation.request.method == "session.turn.cancel"
   and cancellation.request.params.restore_prompt_if_no_output == true)
+assert(text() == "Keep my unsent draft" and #host.requests == before
+  and vim.deep_equal(state.queue, retained))
+local control_count = #controls
 controller.cancel_turn()
-assert(#transitions == transition_count, "duplicate cancellation was submitted during cleanup")
+assert(#transitions == transition_count and #controls == control_count,
+  "duplicate cancellation was submitted during cleanup")
 cancellation.callback({ cancel_requested = true })
 assert(text() == "Keep my unsent draft" and vim.deep_equal(state.queue, retained))
 

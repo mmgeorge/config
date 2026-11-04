@@ -32,6 +32,9 @@ pub trait Provider: Send + Sync + 'static {
     ) -> Result<ProviderEventStream, ProviderError>;
 
     /// Submit input to the retained session; success records acceptance, not completion.
+    /// Confirm `request.dispatch` independently after installing immutable invocation
+    /// configuration and cancellation/collection ownership and handing the tracked
+    /// request to the native transport. The acknowledgment may arrive only at turn end.
     async fn session_prompt(
         &self,
         binding: &BindingId,

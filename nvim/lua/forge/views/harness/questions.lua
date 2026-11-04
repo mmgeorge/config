@@ -43,9 +43,7 @@ local function submit(state, question, action)
   local operation = require("forge.command").identity()
   state.question_saving[question.id] = operation
   state.question_failure = nil
-  client.request({ session_id = session_id, method = "session.question.answer", params = {
-    command = { operation_id = operation, question_id = question.id, revision = question.content.revision, action = action },
-  } }, function(result, failure)
+  local function receive(result, failure)
     if not state.session or state.session.id ~= session_id then return end
     if state.question_saving[question.id] ~= operation then return end
     state.question_saving[question.id] = nil
@@ -56,7 +54,16 @@ local function submit(state, question, action)
     else
       if not M.receive(state, result) then refresh_picker(state) end
     end
-  end)
+  end
+  if action.kind == "clarify" then
+    require("forge.views.harness.input_state").submit(state, action.text, {}, "auto", nil,
+      function(failure) receive(nil, failure) end, nil,
+      { owner = "question", question_id = question.id, revision = question.content.revision })
+  else
+    client.request({ session_id = session_id, method = "session.question.answer", params = {
+      command = { operation_id = operation, question_id = question.id, revision = question.content.revision, action = action },
+    } }, receive)
+  end
 end
 
 local function page(state, question)

@@ -1,5 +1,6 @@
 vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
 vim.loader.enable(false)
+local check_tool = dofile(vim.fn.getcwd() .. "/nvim/tests/forge/fixtures/check_tool.lua")
 if not vim.g.forge_check_activity_grid and not vim.g.forge_check_activity_hold then
   local child = vim.fn.jobstart({ vim.v.progpath, "--embed", "--headless", "-u", "NONE", "-i", "NONE" }, { rpc = true })
   assert(child > 0)
@@ -103,7 +104,7 @@ local succeeded, failure = xpcall(function()
     "provider did not start: " .. tostring(prompt_failure) .. "\n" .. presentation_text() .. "\n" .. table.concat(errors, "\n"))
   request("session.turn.cancel")
   assert(vim.wait(3000, function() return state.presentation and state.presentation.status_view.snapshot and #state.presentation.status_view.snapshot.block == 0 end, 10))
-  local run_id = request("session.check.run", { check = { "activity", "empty" } }).run_id
+  local run_id = check_tool.start(request, { check = { "activity", "empty" } }).run_id
   assert(vim.wait(3000, function()
     answer_permissions()
     return presentation_text():find("Activity fixture", 1, true) ~= nil
@@ -276,7 +277,7 @@ local succeeded, failure = xpcall(function()
     end
     error("Rust callback command is missing")
   end
-  local streaming_id = request("session.check.run", { check = { "rust-stream" }, inputs = { test = "streaming" } }).run_id
+  local streaming_id = check_tool.start(request, { check = { "rust-stream" }, inputs = { test = "streaming" } }).run_id
   assert(vim.wait(30000, function()
     answer_permissions()
     return presentation_text():find("    running 1 test", 1, true) ~= nil
@@ -304,7 +305,7 @@ local succeeded, failure = xpcall(function()
       and presentation_text():find("running 1 test", 1, true) == nil
   end, 10), "completed Rust output did not collapse")
   for _, exact_test in ipairs({ "failure", "missing" }) do
-    local failed_id = request("session.check.run", { check = { "rust-stream" }, inputs = { test = exact_test } }).run_id
+    local failed_id = check_tool.start(request, { check = { "rust-stream" }, inputs = { test = exact_test } }).run_id
     local failed
     assert(vim.wait(15000, function()
       failed = request("session.check.status", { run_id = failed_id })

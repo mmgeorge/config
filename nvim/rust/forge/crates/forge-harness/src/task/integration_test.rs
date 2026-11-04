@@ -48,7 +48,7 @@ fn plan_acceptance_survives_revision_and_recovery_but_not_task_replacement() -> 
         controller.apply(
             &mut store,
             &initial.permit(),
-            TaskEvent::PlanArtifactUpdated(artifact.clone()),
+            TaskEvent::PlanArtifactUpdated(Box::new(artifact.clone())),
             3,
         )?;
         let revised = controller.current()?.unwrap();
@@ -223,7 +223,7 @@ fn implementation_cannot_jump_to_manual_verification_or_completion() -> Result<(
                 .apply(
                     &mut store,
                     &installed.permit(),
-                    TaskEvent::ExecutionUpdated(invalid),
+                    TaskEvent::ExecutionUpdated(Box::new(invalid)),
                     3
                 )
                 .is_err()
@@ -241,7 +241,7 @@ fn implementation_cannot_jump_to_manual_verification_or_completion() -> Result<(
             .apply(
                 &mut store,
                 &installed.permit(),
-                TaskEvent::ExecutionUpdated(invalid),
+                TaskEvent::ExecutionUpdated(Box::new(invalid)),
                 3
             )
             .is_err()
@@ -253,7 +253,7 @@ fn implementation_cannot_jump_to_manual_verification_or_completion() -> Result<(
     controller.apply(
         &mut store,
         &installed.permit(),
-        TaskEvent::ExecutionUpdated(checking),
+        TaskEvent::ExecutionUpdated(Box::new(checking)),
         4,
     )?;
     assert_eq!(controller.current()?.unwrap().phase(), TaskPhase::Check);

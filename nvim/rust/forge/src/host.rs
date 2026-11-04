@@ -446,9 +446,20 @@ impl ConnectionHost {
                         turn.wait().await;
                     }
                     let prepared = router.prepare(&mut envelope).await;
-                    drop(preparation_turn);
                     let method = prepared?;
-                    router.route(envelope, method, &sink).await
+                    let (admitted, admission) = oneshot::channel();
+                    let routed = forge_harness::admission::observe(
+                        Some(admitted),
+                        router.route(envelope, method, &sink),
+                    );
+                    tokio::pin!(routed);
+                    tokio::select! {
+                        result = &mut routed => result,
+                        _ = admission => {
+                            drop(preparation_turn);
+                            routed.await
+                        }
+                    }
                 }
                 .await;
                 if let Err(error) = outcome {
@@ -1075,6 +1086,98 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
+    }
+
+    /// Keep decoded configuration commands ordered across delayed preparation and owner admission.
+    #[tokio::test]
+    async fn delayed_configuration_preserves_transport_order_through_owner_admission() -> Result<()>
+    {
+        use tokio::io::AsyncBufReadExt;
+
+        let root = tempfile::tempdir()?;
+        let runtime = Arc::new(ForgeRuntime::new()?);
+        let opened = runtime
+            .harness
+            .open_session(
+                90,
+                serde_json::from_value(json!({
+                    "workspace":root.path(), "data_root":root.path().join("data"),
+                    "client_id":"ingress-order", "provider":{"kind":"mock","command":[]}
+                }))?,
+            )
+            .await?;
+        let session = opened.result().context("session failed to open")?["session"]["id"]
+            .as_str()
+            .context("session identity missing")?
+            .to_owned();
+        let host = ConnectionHost::new(runtime);
+        let (arrived, waiting) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        *host.router.preparation_hold.lock().unwrap() = Some(crate::router::PreparationHold {
+            request_id: 2,
+            arrived,
+            released,
+        });
+        let (client, server) = tokio::io::duplex(65536);
+        let (input, output) = tokio::io::split(server);
+        let running = tokio::spawn(async move { host.run(input, output).await });
+        let mut client = BufReader::new(client);
+        let initialize = json!({"id":1,"method":"host.initialize","params":{"protocol_version":forge_protocol::WIRE_VERSION}});
+        client
+            .get_mut()
+            .write_all(format!("{initialize}\n").as_bytes())
+            .await?;
+        let mut line = String::new();
+        client.read_line(&mut line).await?;
+        let first = json!({"id":2,"method":"session.configure","session_id":session,"params":{"operation_id":"first","status_thoughts":false}});
+        client
+            .get_mut()
+            .write_all(format!("{first}\n").as_bytes())
+            .await?;
+        timeout(Duration::from_secs(3), waiting).await??;
+        let second = json!({"id":3,"method":"session.configure","session_id":session,"params":{"operation_id":"second","status_thoughts":true}});
+        let independent = json!({"id":4,"method":"provider.registry.list","params":{}});
+        client
+            .get_mut()
+            .write_all(format!("{second}\n{independent}\n").as_bytes())
+            .await?;
+        timeout(Duration::from_secs(3), async {
+            loop {
+                line.clear();
+                client.read_line(&mut line).await?;
+                let frame: Value = serde_json::from_str(&line)?;
+                assert_ne!(frame["id"], 3, "later command overtook delayed preparation");
+                if frame["id"] == 4 {
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        release.send(()).unwrap();
+        let mut sequences = HashMap::new();
+        timeout(Duration::from_secs(3), async {
+            while sequences.len() < 2 {
+                line.clear();
+                client.read_line(&mut line).await?;
+                let frame: Value = serde_json::from_str(&line)?;
+                if let Some(id @ (2 | 3)) = frame["id"].as_u64() {
+                    assert!(frame.get("error").is_none(), "{frame}");
+                    sequences.insert(
+                        id,
+                        frame["result"]["sequence"]
+                            .as_u64()
+                            .context("missing sequence")?,
+                    );
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        assert!(sequences[&2] < sequences[&3]);
+        client.get_mut().shutdown().await?;
+        timeout(Duration::from_secs(3), running).await???;
+        Ok(())
     }
 
     #[tokio::test]

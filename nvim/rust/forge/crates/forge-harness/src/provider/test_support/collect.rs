@@ -423,6 +423,7 @@ mod tests {
         let fixture = ProviderTestSession::from_dyn(provider.clone())?;
         let owner = ExecutionOwner::root("collector");
         let request = ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: Some(owner.clone()),
             harness_session_id: "collector".into(),
             workspace: workspace.path().to_string_lossy().into_owned(),

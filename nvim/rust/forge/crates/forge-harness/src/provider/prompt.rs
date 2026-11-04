@@ -136,6 +136,7 @@ mod test {
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         context.lsp = Some(scope);
         let request = ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: None,
             harness_session_id: "session".into(),
             workspace: directory.path().display().to_string(),
@@ -179,6 +180,7 @@ mod test {
     #[test]
     fn current_context_replaces_previous_permission_and_does_not_infer_answers_from_text() {
         let mut request = ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
             execution_owner: None,
             harness_session_id: "session".into(),
             workspace: ".".into(),

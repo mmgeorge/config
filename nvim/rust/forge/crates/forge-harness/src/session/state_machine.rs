@@ -183,12 +183,12 @@ impl ExecutionStatus {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub(crate) struct PlanStatus {
     pub id: String,
     pub state: PlanState,
     pub model_revision: u32,
-    pub acceptance: bool,
+    pub review_questions_pending: bool,
     pub elicitation: bool,
     pub generation: crate::plan::PlanGeneration,
 }
@@ -199,7 +199,9 @@ impl From<&PlanRecord> for PlanStatus {
             id: plan.id.clone(),
             state: plan.state,
             model_revision: plan.model_revision,
-            acceptance: plan.acceptance.is_some(),
+            review_questions_pending: plan
+                .review_questions()
+                .is_some_and(|questions| questions.has_pending_decisions()),
             elicitation: plan.elicitation.is_some(),
             generation: plan.generation.clone(),
         }
@@ -343,12 +345,12 @@ impl SessionPhase {
                 .into(),
             };
         }
-        if let Some(plan) =
-            active_plan.filter(|plan| !executing && (plan.acceptance || plan.elicitation))
+        if let Some(plan) = active_plan
+            .filter(|plan| !executing && (plan.review_questions_pending || plan.elicitation))
         {
             return Self::AwaitingInput {
-                owner: if plan.acceptance {
-                    ElicitationOwner::PlanAcceptance
+                owner: if plan.review_questions_pending {
+                    ElicitationOwner::PlanReview
                 } else {
                     ElicitationOwner::Plan
                 },
@@ -519,7 +521,7 @@ mod test {
             review_digest: None,
             accepted_digest: None,
             elicitation: None,
-            acceptance: None,
+            review: None,
             question_ledger: Default::default(),
             generation: Default::default(),
             validation_warning: Vec::new(),
@@ -676,6 +678,47 @@ mod test {
     #[test]
     fn idle_phase_has_no_animation() {
         assert!(!SessionPhase::Idle.animated());
+    }
+
+    #[test]
+    fn answered_review_evidence_retains_questions_without_an_accepting_phase() {
+        let mut plan = plan(PlanState::AwaitingReview);
+        plan.review = Some(
+            crate::plan::PlanReview::new(
+                "digest".into(),
+                &[
+                    crate::session::ApprovalMode::Ask,
+                    crate::session::ApprovalMode::Deny,
+                ],
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            SessionPhase::resolve(Some(&plan), None, None),
+            SessionPhase::AwaitingInput {
+                owner: crate::broker::ElicitationOwner::PlanReview,
+                ..
+            }
+        ));
+        let review = plan.review.as_mut().unwrap();
+        let question = review.elicitation.question_set.questions[0].id.clone();
+        review
+            .elicitation
+            .answer(
+                &question,
+                crate::plan::PlanQuestionResponse::Selected {
+                    option: "ask".into(),
+                    feedback: None,
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            SessionPhase::resolve(Some(&plan), None, None),
+            SessionPhase::AwaitingPlanReview { .. }
+        ));
+        assert!(plan.review_questions().is_some());
+        plan.state = PlanState::Cancelled;
+        assert!(plan.review_questions().is_none());
     }
 
     #[test]

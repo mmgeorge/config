@@ -1,336 +1,86 @@
 use super::*;
-use crate::input::{
-    InputAction, InputDelivery, InputIntent, InputMessage, InputOperation, InputRoute, InputUpdate,
-};
-use crate::provider::native_goal_update;
-use crate::provider::submission::{Submission, SubmissionState};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-
-/// Retain the acknowledged native selection together with its canonical task authority.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct NativeGoalSelection {
-    /// Provider conversation that owns the acknowledged update.
-    pub(super) provider_session_id: String,
-    /// Canonical task authority observed when selecting the update.
-    pub(super) revision: Option<crate::task::TaskRevision>,
-    /// Reject acknowledgments invalidated by another writer of this provider goal.
-    pub(super) transport_epoch: u64,
-    /// Complete native goal state selected by the canonical task.
-    pub(super) update: crate::provider::NativeGoalUpdate,
-}
+use crate::input::{InputDelivery, InputOperation};
 
 impl SessionController {
     /// Keep automatic work behind both the required gate and committed answers awaiting delivery.
     pub(super) fn questions_block_work(&self) -> Result<bool> {
-        Ok(self.questions.snapshot()?.required_pending()
-            || !self.questions.outbox()?.is_empty()
-            || self
-                .coordinator
-                .submissions
-                .snapshot()?
-                .messages
-                .iter()
-                .any(|message| {
-                    matches!(
-                        message.purpose,
-                        crate::input::InputPurpose::Question { .. }
-                            | crate::input::InputPurpose::QuestionContinuation { .. }
-                    ) && message.delivery != InputDelivery::Accepted
-                }))
+        crate::exchange::questions_block_task_work(
+            &self.coordinator.submissions.snapshot()?,
+            &self.questions,
+        )
+        .map_err(Into::into)
     }
-    /// Relay committed question messages through the existing durable delivery journal.
-    pub(super) async fn relay_questions(
-        &self,
-        sink: &MessageSender,
-        published_revision: &mut Option<u64>,
-    ) -> Result<()> {
-        let _control = self.coordinator.control.acquire().await?;
-        for message in self.questions.outbox()? {
-            self.trace.record(
-                self.observer.session_id(),
-                "question.delivery.admitting",
-                json!({"question_id":message.question_id,"message_id":message.id}),
-            );
-            let input = self.coordinator.submissions.snapshot()?;
-            let operation = InputOperation {
-                id: format!("question:{}", message.id),
-                control_revision: input.control_revision,
-                after_control: input.control_operation_id,
-                action: InputAction::Submit {
-                    message: Box::new(InputMessage {
-                        id: message.id.clone(),
-                        revision: 0,
-                        text: message.text,
-                        purpose: crate::input::InputPurpose::Question {
-                            question_id: message.question_id,
-                            task_id: message.task_id,
-                            message_kind: message.kind,
-                            reply: message.reply,
-                        },
-                        attachments: Vec::new(),
-                        config: None,
-                        intent: InputIntent::Auto,
-                        delivery: InputDelivery::Queued,
-                        route: None,
-                        reservation: None,
-                        submission_id: None,
-                        error: None,
-                    }),
-                },
-            };
-            let update = match self.coordinator.submissions.operation(&operation.id)? {
-                Some(update) => update,
-                None => self.coordinator.submissions.apply(operation)?,
-            };
-            ensure!(
-                update.error.is_none(),
-                "question input admission failed: {:?}",
-                update.error
-            );
-            self.questions.admitted(&message.id)?;
-            self.publish_input(update, sink).await?;
-        }
-        for exchange_id in self.questions.ready_chat_continuations()? {
-            let original = crate::storage::SqliteStore::read_only(&self.data_root)?
-                .load_exchange(&exchange_id)?
-                .context("question continuation lost its original request")?;
-            let input = self.coordinator.submissions.snapshot()?;
-            let id = format!("question-continuation:{exchange_id}");
-            let operation = InputOperation {
-                id: id.clone(),
-                control_revision: input.control_revision,
-                after_control: input.control_operation_id,
-                action: InputAction::Submit {
-                    message: Box::new(InputMessage {
-                        id,
-                        revision: 0,
-                        text: format!(
-                            "Continue the original request using the recorded user answers. Do not repeat resolved questions.\n\nOriginal request:\n{}",
-                            original.prompt
-                        ),
-                        purpose: crate::input::InputPurpose::QuestionContinuation {
-                            exchange_id: exchange_id.clone(),
-                        },
-                        attachments: Vec::new(),
-                        config: None,
-                        intent: InputIntent::Queue,
-                        delivery: InputDelivery::Queued,
-                        route: None,
-                        reservation: None,
-                        submission_id: None,
-                        error: None,
-                    }),
-                },
-            };
-            let update = match self.coordinator.submissions.operation(&operation.id)? {
-                Some(update) => update,
-                None => self.coordinator.submissions.apply(operation)?,
-            };
-            ensure!(
-                update.error.is_none(),
-                "question continuation admission failed: {:?}",
-                update.error
-            );
-            self.questions.chat_continuation_admitted(&exchange_id)?;
-            self.publish_input(update, sink).await?;
-        }
-        let snapshot = self.questions.snapshot()?;
-        if *published_revision == Some(snapshot.revision) {
-            return Ok(());
-        }
-        let revision = snapshot.revision;
-        sink.send_event(SessionEvent {
-            session_id: self.observer.session_id().into(),
-            event: "questions_changed".into(),
-            payload: serde_json::to_value(snapshot)?,
-        })
-        .await?;
-        *published_revision = Some(revision);
-        Ok(())
-    }
-
-    pub(super) fn publish_input_pending(&self) -> Result<()> {
-        let (revision, pending) = self.coordinator.submissions.has_pending()?;
-        self.observer.completion_queue.update(revision, pending)
-    }
-
-    pub(super) async fn publish_input(
-        &self,
-        update: InputUpdate,
-        sink: &MessageSender,
-    ) -> Result<()> {
-        self.publish_input_pending()?;
-        for message in &update.upsert {
-            self.trace.record(
-                self.observer.session_id(),
-                "input.state",
-                json!({
-                    "message_id":message.id,"submission_id":message.submission_id,
-                    "revision":message.revision,"status":message.delivery,
-                }),
-            );
-        }
-        let mut payload = serde_json::to_value(update)?;
-        payload["execution_busy"] = json!(self.coordinator.execution.available_permits() == 0);
-        Ok(sink
-            .send_event(SessionEvent {
-                session_id: self.catalog_request.read().await.harness_session_id.clone(),
-                event: "input_changed".into(),
-                payload,
-            })
-            .await?)
-    }
-
+    /// Submit caller input mutations to the owner and read committed transport projections.
     pub(super) async fn input_request(
         &self,
         request: Request,
         method: RuntimeMethod,
         sink: &MessageSender,
     ) -> Result<()> {
-        let _control = self
-            .coordinator
-            .control
-            .clone()
-            .acquire_owned()
-            .await
-            .context("Harness session is closing")?;
         ensure!(
             !self.input_stopping.load(Ordering::Acquire),
             "Harness session is closing"
         );
         let result = match method {
+            RuntimeMethod::SessionTurnSteer => {
+                crate::protocol::validate_root_control(request.params.get("target"))?;
+                let command =
+                    crate::exchange::command::CommandRequest::from_steering(request.params)?;
+                match self.execute_command(command, sink).await {
+                    Ok(result) => serde_json::to_value(result)?,
+                    Err(error) => {
+                        sink.send_response(Response::failure(
+                            request.id,
+                            error.code(),
+                            error.to_string(),
+                        ))
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
             RuntimeMethod::SessionInputApply => {
+                let target = request
+                    .params
+                    .get("target")
+                    .cloned()
+                    .map(serde_json::from_value::<crate::exchange::command::InputSubmissionTarget>)
+                    .transpose()?;
                 let operation: InputOperation = crate::codec::from_value(request.params)?;
-                if self
-                    .coordinator
-                    .submissions
-                    .operation(&operation.id)?
-                    .is_some()
-                {
-                    let update = self.coordinator.submissions.apply(operation)?;
-                    sink.send_response(Response::success(request.id, update)?)
+                let command = match target {
+                    Some(target) => crate::exchange::command::CommandRequest::from_targeted_input(
+                        operation, target,
+                    )?,
+                    None => crate::exchange::command::CommandRequest::from_input(operation)?,
+                };
+                let id = command.id.clone();
+                let outcome = self.execute_command(command, sink).await;
+                match outcome {
+                    Ok(_) => {}
+                    Err(crate::exchange::command::ExecuteCommandError::Failed(
+                        crate::exchange::command::CommandFailure::Input(_)
+                        | crate::exchange::command::CommandFailure::LegacyInputRejected,
+                    )) if self
+                        .coordinator
+                        .submissions
+                        .operation(id.as_str())?
+                        .is_some() => {}
+                    Err(error) => {
+                        sink.send_response(Response::failure(
+                            request.id,
+                            error.code(),
+                            error.to_string(),
+                        ))
                         .await?;
-                    return Ok(());
-                }
-                if let InputAction::Submit { message } = &operation.action {
-                    ensure!(
-                        matches!(message.purpose, crate::input::InputPurpose::User),
-                        "task input can only be generated by Harness"
-                    );
-                    if let Some(config) = &message.config {
-                        let config = config
-                            .as_object()
-                            .context("queued configuration must be an object")?;
-                        ensure!(
-                            config.keys().all(|key| matches!(
-                                key.as_str(),
-                                "model" | "effort" | "service_tier" | "context_window"
-                            )),
-                            "queued input can only select model settings"
-                        );
+                        return Ok(());
                     }
                 }
-                if let InputAction::Retry { id, revision } = &operation.action {
-                    let snapshot = self.coordinator.submissions.snapshot()?;
-                    if let Some(message) =
-                        snapshot.messages.iter().find(|message| &message.id == id)
-                    {
-                        ensure!(
-                            message.revision == *revision,
-                            "message changed before retry"
-                        );
-                        if matches!(
-                            message.delivery,
-                            InputDelivery::Unknown | InputDelivery::Failed
-                        ) && message.submission_id.is_some()
-                        {
-                            let journal = &self.submission_store;
-                            let submission = journal.submission(
-                                message
-                                    .submission_id
-                                    .as_deref()
-                                    .context("delivery evidence is missing")?,
-                            )?;
-                            let record = self.reconcile_submission_current(&submission).await?;
-                            if matches!(record.delivery, SubmissionState::Accepted { .. }) {
-                                let update = self
-                                    .coordinator
-                                    .submissions
-                                    .acknowledge_retry(operation.clone())?;
-                                self.publish_input(update.clone(), sink).await?;
-                                sink.send_response(Response::success(request.id, update)?)
-                                    .await?;
-                                return Ok(());
-                            }
-                            ensure!(
-                                !matches!(record.delivery, SubmissionState::Sending { .. }),
-                                "Delivery is still unconfirmed. The message was not resent."
-                            );
-                            submission.cancel()?;
-                            if message.delivery == InputDelivery::Unknown {
-                                self.publish_input(
-                                    self.coordinator.submissions.delivery(
-                                        id,
-                                        Some(InputDelivery::Failed),
-                                        None,
-                                        Some(
-                                            "Non-delivery confirmed. Retry to send this message."
-                                                .into(),
-                                        ),
-                                    )?,
-                                    sink,
-                                )
-                                .await?;
-                                anyhow::bail!(
-                                    "Non-delivery confirmed. Retry to send this message."
-                                );
-                            }
-                        }
-                    }
-                }
-                if let InputAction::Commit { edits, .. } = &operation.action {
-                    for edit in edits {
-                        if let Some(config) = &edit.config {
-                            let config = config
-                                .as_object()
-                                .context("queued configuration must be an object")?;
-                            ensure!(
-                                config.keys().all(|key| matches!(
-                                    key.as_str(),
-                                    "model" | "effort" | "service_tier" | "context_window"
-                                )),
-                                "queued input can only select model settings"
-                            );
-                        }
-                        crate::attachment::resolve_input(
-                            &self.data_root,
-                            &json!({"attachments":edit.attachments}),
-                        )
-                        .await?;
-                    }
-                }
-                let update = self.coordinator.submissions.apply(operation)?;
-                if update.error.is_none()
-                    && update
-                        .upsert
-                        .iter()
-                        .any(|message| matches!(message.purpose, crate::input::InputPurpose::User))
-                {
-                    let mut store = SqliteStore::open(&self.data_root)?;
-                    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-                    self.task_controller
-                        .cancel_continuation(&mut store, now_ms)?;
-                }
-                if let Err(error) = self.publish_input(update.clone(), sink).await {
-                    sink.send_response(Response::failure(
-                        request.id,
-                        "outcome_unknown",
-                        format!("Input admitted but state publication failed: {error:#}"),
-                    ))
-                    .await?;
-                    return Ok(());
-                }
-                serde_json::to_value(update)?
+                serde_json::to_value(
+                    self.coordinator
+                        .submissions
+                        .operation(id.as_str())?
+                        .context("committed input command has no domain receipt")?,
+                )?
             }
             RuntimeMethod::SessionInputOperationGet => serde_json::to_value(
                 self.coordinator.submissions.operation(
@@ -345,11 +95,10 @@ impl SessionController {
                     json!(self.coordinator.execution.available_permits() == 0);
                 snapshot
             }
-            _ => unreachable!(),
+            _ => unreachable!("input routing accepts only input commands and queries"),
         };
         sink.send_response(Response::success(request.id, result)?)
             .await?;
-        self.coordinator.submissions.changed.notify_one();
         Ok(())
     }
 
@@ -361,15 +110,10 @@ impl SessionController {
         let owner = Arc::downgrade(self);
         let input = self.coordinator.submissions.clone();
         let admission_changed = self.observer.admission.changed.clone();
-        let mut question_changed = self.questions.changed.subscribe();
         let sink = sink.clone();
         *task = Some(tokio::spawn(async move {
             let mut jobs = JoinSet::new();
-            let mut job_owner = std::collections::HashMap::new();
-            let steering = Arc::new(Semaphore::new(1));
-            let mut native_goal_selection = None;
             let mut native_error_reported = false;
-            let mut published_questions = None;
             loop {
                 let notified = input.changed.notified();
                 let state_changed = admission_changed.notified();
@@ -380,21 +124,13 @@ impl SessionController {
                     while jobs.join_next().await.is_some() {}
                     break;
                 }
-                let native_result = controller
-                    .reconcile_native_goal(&mut native_goal_selection)
-                    .await;
-                if let Err(error) = controller
-                    .relay_questions(&sink, &mut published_questions)
-                    .await
-                {
-                    let _ = sink.send_event(SessionEvent { session_id: controller.observer.session_id().into(), event: "provider_event".into(), payload: json!({"kind":"error","text":format!("Question delivery failed: {error:#}")}) }).await;
-                }
+                let native_result = controller.synchronize_native_goal().await;
                 let native_retry = native_result.is_err();
                 if let Err(error) = &native_result {
                     if !native_error_reported {
                         let _ = sink.send_event(SessionEvent {
                             session_id: controller.observer.session_id().into(), event: "provider_event".into(),
-                            payload: json!({"kind":"error","text":format!("Native goal synchronization failed and will retry: {error:#}")}),
+                            payload: json!({"kind":"error","code":error.code(),"text":error.to_string()}),
                         }).await;
                     }
                     native_error_reported = true;
@@ -404,9 +140,7 @@ impl SessionController {
                 let progress = if native_retry {
                     Ok(InputProgress::Waiting)
                 } else {
-                    controller
-                        .admit_input(&sink, &mut jobs, &steering, &mut job_owner)
-                        .await
+                    controller.admit_input(&sink, &mut jobs).await
                 };
                 let wait_execution = match progress {
                     Ok(InputProgress::Started) => continue,
@@ -427,26 +161,16 @@ impl SessionController {
                     _ = tokio::time::sleep(Duration::from_secs(1)), if native_retry => {},
                     _ = notified => {},
                     _ = state_changed => {},
-                    _ = question_changed.changed() => {},
                     result = jobs.join_next_with_id(), if !jobs.is_empty() => {
                         match result {
-                            Some(Ok((id, _))) => {
-                                job_owner.remove(&id);
-                            }
+                            Some(Ok(_)) => {}
                             Some(Err(error)) => {
                                 let Some(controller) = owner.upgrade() else { break };
-                                if let Some(id) = job_owner.remove(&error.id())
-                                    && let Err(failure) = controller.input_failure(&id, format!("Input worker failed: {error}"), &sink).await {
-                                        let _ = sink.send_event(SessionEvent {
-                                            session_id: controller.catalog_request.read().await.harness_session_id.clone(),
-                                            event: "provider_event".into(),
-                                            payload: json!({"kind":"error","text":format!("Could not reconcile failed input worker: {failure:#}")}),
-                                        }).await;
-                                }
+                                controller.trace.record(controller.observer.session_id(), "local_work.observation_lost", json!({"job_id":error.id().to_string(),"cancelled":error.is_cancelled(),"panicked":error.is_panic()}));
                                 let _ = sink.send_event(SessionEvent {
                                     session_id: controller.catalog_request.read().await.harness_session_id.clone(),
                                     event: "provider_event".into(),
-                                    payload: json!({"kind":"error","text":format!("Input worker failed: {error}")}),
+                                    payload: json!({"kind":"error","code":"local_work_observation_lost","text":"Queued local work ended before its outcome could be observed"}),
                                 }).await;
                             }
                             None => {}
@@ -460,310 +184,88 @@ impl SessionController {
         Ok(())
     }
 
-    /// Reconcile retained lifecycle state and repair acknowledgments superseded during transport.
+    /// Request owner-controlled synchronization after provider startup has become observable.
+    async fn synchronize_native_goal(
+        &self,
+    ) -> Result<Option<crate::exchange::NativeGoalSelection>, crate::exchange::NativeGoalError>
+    {
+        if !self
+            .observer
+            .native_goal_supported()
+            .map_err(|_| crate::exchange::NativeGoalError::StateUnavailable)?
+            || !self.provider_ready().await
+        {
+            return Ok(None);
+        }
+        self.exchange_owner.synchronize_native_goal().await
+    }
+
+    /// Retain the previous fixture observation while synchronization authority lives in the owner.
+    #[cfg(test)]
     pub(super) async fn reconcile_native_goal(
         &self,
-        applied: &mut Option<NativeGoalSelection>,
+        applied: &mut Option<crate::exchange::NativeGoalSelection>,
     ) -> Result<()> {
-        if !self.observer.native_goal_supported()? || !self.provider_ready().await {
-            return Ok(());
+        if let Some(selection) = self.synchronize_native_goal().await? {
+            *applied = Some(selection);
         }
-        // Capture the current registry before taking the transport lane; no broker guard spans I/O.
-        let provider = self.provider_handle();
-        let registry = self.broker.lock().await.execution_registry();
-        let owner = crate::provider::ExecutionOwner::root(self.observer.session_id());
-        let lane = self.task_controller.native_goal_lane();
-        let _lane = match tokio::time::timeout(Duration::from_secs(30), lane.lock()).await {
-            Ok(guard) => guard,
-            Err(_) => {
-                self.task_controller.mark_native_goal_uncertain();
-                let error = anyhow::Error::new(crate::provider::ProviderError::DeliveryUncertain);
-                return Err(match registry.fence(&owner).await {
-                    Ok(()) => error,
-                    Err(cleanup) => error.context(cleanup),
-                });
-            }
-        };
-        anyhow::ensure!(
-            Arc::ptr_eq(&provider, &self.provider_handle()),
-            "provider changed before native goal transport acquired its lane"
-        );
-        self.task_controller.ensure_native_goal_certain()?;
-        loop {
-            // Capture the canonical task and provider identity before transport.
-            let session = SqliteStore::read_only(&self.data_root)?
-                .load_session(self.observer.session_id())?
-                .context("native goal session is missing")?;
-            let Some(provider_session_id) = session.provider_session_id.clone() else {
-                return Ok(());
-            };
-            let desired = self.native_goal_selection(provider_session_id.clone())?;
-            if applied.as_ref() == Some(&desired) {
-                if self.acknowledge_native_goal_if_current(&desired)? {
-                    return Ok(());
-                }
-                continue;
-            }
-            let request = crate::provider::ProviderRequest {
-                execution_owner: None,
-                harness_session_id: session.id,
-                workspace: session.workspace,
-                input: crate::provider::ProviderInput::from_text(""),
-                mode: crate::provider::PromptMode::GoalContinuation,
-                model: session.model,
-                effort: session.effort,
-                context_window: session.context_window,
-                service_tier: session.service_tier,
-                access: session.access,
-                approval_mode: session.approval_mode,
-                provider_session_id: Some(provider_session_id.try_into()?),
-                submission: None,
-                recovered_input: Vec::new(),
-                control_context: None,
-            };
-            // Apply only a still-current selection, without holding state guards across I/O.
-            if self.native_goal_selection(desired.provider_session_id.clone())? != desired {
-                continue;
-            }
-            let result = match tokio::time::timeout(
-                Duration::from_secs(30),
-                provider.goal_status(request, desired.update.clone()),
-            )
-            .await
-            {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => {
-                    self.task_controller.mark_native_goal_uncertain();
-                    Err(anyhow::Error::new(error)
-                        .context(crate::provider::ProviderError::DeliveryUncertain))
-                }
-                Err(_) => {
-                    self.task_controller.mark_native_goal_uncertain();
-                    Err(crate::provider::ProviderError::DeliveryUncertain.into())
-                }
-            };
-            let epoch = match self.task_controller.native_goal_written() {
-                Ok(epoch) => epoch,
-                Err(error) => {
-                    drop(_lane);
-                    return Err(match registry.fence(&owner).await {
-                        Ok(()) => error,
-                        Err(cleanup) => error.context(cleanup),
-                    });
-                }
-            };
-            if let Err(error) = result {
-                drop(_lane);
-                return Err(match registry.fence(&owner).await {
-                    Ok(()) => error,
-                    Err(cleanup) => error.context(cleanup),
-                });
-            }
-            if !Arc::ptr_eq(&provider, &self.provider_handle()) {
-                self.task_controller.mark_native_goal_uncertain();
-                drop(_lane);
-                let error = anyhow::Error::new(crate::provider::ProviderError::DeliveryUncertain);
-                return Err(match registry.fence(&owner).await {
-                    Ok(()) => error,
-                    Err(cleanup) => error.context(cleanup),
-                });
-            }
-            // A stale acknowledgment cannot authorize input or mark its old state applied.
-            let mut expected = desired.clone();
-            expected.transport_epoch = epoch;
-            if !self.acknowledge_native_goal_if_current(&expected)? {
-                continue;
-            }
-            *applied = Some(expected);
-            return Ok(());
-        }
-    }
-
-    /// Acknowledge only while the captured task and provider session are still canonical.
-    fn acknowledge_native_goal_if_current(&self, expected: &NativeGoalSelection) -> Result<bool> {
-        self.task_controller.with_task_snapshot(|_| {
-            self.task_controller.ensure_native_goal_certain()?;
-            let session = SqliteStore::read_only(&self.data_root)?
-                .load_session(self.observer.session_id())?
-                .context("native goal session is missing")?;
-            if session.provider_session_id.as_deref() != Some(&expected.provider_session_id)
-                || self.native_goal_selection(expected.provider_session_id.clone())? != *expected
-            {
-                return Ok(false);
-            }
-            self.task_controller
-                .acknowledge_native_goal(expected.transport_epoch);
-            Ok(true)
-        })
-    }
-
-    /// Preserve suspended native tasks instead of treating them as deleted goals.
-    fn native_goal_selection(&self, provider_session_id: String) -> Result<NativeGoalSelection> {
-        use crate::plan::PlanExecutionState;
-        use crate::provider::NativeGoalUpdate;
-        use crate::task::WorkflowSnapshot;
-        let task = self.task_controller.current()?;
-        let question_gate = self.questions_block_work()?;
-        let update = match task.as_ref() {
-            Some(task) => match &task.workflow {
-                WorkflowSnapshot::Goal { goal } if goal.native => {
-                    let state = if (!task.entry_accepted() || question_gate)
-                        && goal.state == crate::goal::GoalState::Active
-                    {
-                        crate::goal::GoalState::Paused
-                    } else {
-                        goal.state
-                    };
-                    native_goal_update(goal.objective.clone(), state)
-                }
-                WorkflowSnapshot::Execute { execution } if execution.native => {
-                    let state = match execution.record.state {
-                        PlanExecutionState::Active if task.entry_accepted() && !question_gate => {
-                            crate::goal::GoalState::Active
-                        }
-                        PlanExecutionState::Active
-                        | PlanExecutionState::Paused
-                        | PlanExecutionState::Stalled => crate::goal::GoalState::Paused,
-                        PlanExecutionState::Complete => crate::goal::GoalState::Complete,
-                        PlanExecutionState::Blocked => crate::goal::GoalState::Blocked,
-                        PlanExecutionState::Cancelled => crate::goal::GoalState::Cleared,
-                    };
-                    native_goal_update(execution.title.clone(), state)
-                }
-                WorkflowSnapshot::Goal { .. }
-                | WorkflowSnapshot::Execute { .. }
-                | WorkflowSnapshot::Plan { .. } => NativeGoalUpdate::Absent,
-            },
-            None => NativeGoalUpdate::Absent,
-        };
-        Ok(NativeGoalSelection {
-            provider_session_id,
-            revision: task.map(|task| task.revision.clone()),
-            transport_epoch: self.task_controller.native_goal_epoch(),
-            update,
-        })
+        Ok(())
     }
 
     async fn admit_input(
         self: &Arc<Self>,
         sink: &MessageSender,
         jobs: &mut JoinSet<bool>,
-        steering: &Arc<Semaphore>,
-        job_owner: &mut std::collections::HashMap<tokio::task::Id, String>,
     ) -> Result<InputProgress> {
-        if let Some(progress) = self.admit_task_checks(sink, jobs).await? {
-            return Ok(progress);
+        if let Some(progress) = self.exchange_owner.task_checks_ready(sink.clone()).await? {
+            return Ok(match progress {
+                crate::exchange::InputReadiness::Started => InputProgress::Started,
+                crate::exchange::InputReadiness::WaitExecution => InputProgress::WaitExecution,
+                crate::exchange::InputReadiness::Waiting => InputProgress::Waiting,
+            });
         }
-        self.enqueue_task_input(sink).await?;
-        let input = self.coordinator.submissions.snapshot()?;
-        if input.suspended
-            && !input.messages.iter().any(|message| {
-                matches!(message.purpose, crate::input::InputPurpose::Question { .. })
-            })
-        {
-            return Ok(InputProgress::Waiting);
+        if matches!(
+            self.recover_automatic_plan_acceptance(sink).await?,
+            AutomaticAcceptanceRecovery::Applied
+        ) {
+            return Ok(InputProgress::Started);
         }
+        self.exchange_owner
+            .reconcile_task_input(sink.clone())
+            .await?;
         let Ok(control) = self.coordinator.control.clone().try_acquire_owned() else {
             return Ok(InputProgress::Waiting);
         };
         let snapshot = self.observer.input_readiness()?;
-        if input
-            .messages
-            .iter()
-            .any(|message| message.delivery == InputDelivery::Unknown)
-        {
-            return Ok(InputProgress::Waiting);
-        }
-        let mut pending: Vec<_> = input
-            .messages
-            .into_iter()
-            .filter(|message| {
-                !matches!(
-                    message.delivery,
-                    InputDelivery::Delivering | InputDelivery::Accepted
-                )
-            })
-            .collect();
-        if pending.is_empty() {
-            drop(control);
-            return self.complete_input_checks(sink, jobs).await;
-        }
-        let selected = pending
-            .iter()
-            .position(|message| {
-                !matches!(
-                    message.purpose,
-                    crate::input::InputPurpose::TaskContinuation { .. }
-                )
-            })
-            .unwrap_or(0);
-        let mut message = pending.remove(selected);
-        if matches!(
-            message.purpose,
-            crate::input::InputPurpose::QuestionContinuation { .. }
-        ) && self.questions.snapshot()?.required_pending()
-        {
-            return Ok(InputProgress::Waiting);
-        }
-        if input.suspended
-            && !matches!(message.purpose, crate::input::InputPurpose::Question { .. })
-        {
-            if let Some(position) = pending.iter().position(|message| {
-                matches!(message.purpose, crate::input::InputPurpose::Question { .. })
-            }) {
-                message = pending.remove(position);
-            } else {
-                return Ok(InputProgress::Waiting);
-            }
-        }
-        if self.questions_block_work()?
-            && matches!(
-                message.purpose,
-                crate::input::InputPurpose::TaskEntry { .. }
-                    | crate::input::InputPurpose::TaskContinuation { .. }
-            )
-        {
-            if let Some(position) = pending.iter().position(|message| {
-                !matches!(
-                    message.purpose,
-                    crate::input::InputPurpose::TaskEntry { .. }
-                        | crate::input::InputPurpose::TaskContinuation { .. }
-                )
-            }) {
-                message = pending.remove(position);
-            } else {
-                return Ok(InputProgress::Waiting);
-            }
-        }
-        let mut command = crate::task::command::SessionCommand::queued_input(&message)?;
-        let admission = self.coordinator.execution.clone().try_acquire_owned().ok();
-        let steering_available = admission.is_none()
-            && steering.available_permits() > 0
-            && jobs.len() < crate::provider::SteeringLane::CAPACITY
+        let steering_available = self.coordinator.execution.available_permits() == 0
             && (self.parent_input.is_active()
                 || snapshot.native_steer
                     && self
                         .provider_handle()
                         .has_active_turn(&snapshot.session.id)
                         .await);
-        if command.is_none()
-            && steering_available
-            && message.intent == InputIntent::Queue
-            && message.delivery == InputDelivery::Queued
-        {
-            let Some(immediate) = pending.into_iter().find(|message| {
-                !matches!(
-                    message.purpose,
-                    crate::input::InputPurpose::TaskContinuation { .. }
-                ) && (message.intent != InputIntent::Queue
-                    || message.delivery != InputDelivery::Queued)
-            }) else {
+        let policy = if steering_available {
+            crate::exchange::InputQueuePolicy::AllowSteering
+        } else {
+            crate::exchange::InputQueuePolicy::Ordered
+        };
+        let (message, command) = match crate::exchange::select_pending_input(
+            self.coordinator.submissions.snapshot()?,
+            &self.questions,
+            policy,
+        )? {
+            crate::exchange::PendingInput::Empty => {
+                drop(control);
+                return self.complete_input_checks(sink, jobs).await;
+            }
+            crate::exchange::PendingInput::Waiting => return Ok(InputProgress::Waiting),
+            crate::exchange::PendingInput::WaitExecution => {
                 return Ok(InputProgress::WaitExecution);
-            };
-            message = immediate;
-            command = crate::task::command::SessionCommand::queued_input(&message)?;
-        }
+            }
+            crate::exchange::PendingInput::Ready(selection) => selection.into_parts(),
+        };
         if let Some(command) = command {
+            drop(control);
             let result = super::task_state::apply_command(
                 self,
                 &snapshot.session.id,
@@ -773,410 +275,57 @@ impl SessionController {
                 sink,
             )
             .await;
-            let update = match result {
-                Ok(()) => self
-                    .coordinator
-                    .submissions
-                    .delivery(&message.id, None, None, None)?,
-                Err(error) => self.coordinator.submissions.delivery(
-                    &message.id,
-                    Some(InputDelivery::Failed),
-                    None,
-                    Some(format!("{error:#}")),
-                )?,
-            };
-            self.publish_input(update, sink).await?;
-            return Ok(InputProgress::Started);
-        }
-        if snapshot.checks_running && message.intent == InputIntent::Auto {
-            if let Some(run_id) = self.checks.active()?
-                && let Err(error) = self.interrupt_checks(&snapshot.session.id, &run_id).await
-            {
-                self.publish_input(
-                    self.coordinator.submissions.delivery(
-                        &message.id,
-                        Some(InputDelivery::Failed),
-                        None,
-                        Some(format!("Could not interrupt checks: {error:#}")),
-                    )?,
-                    sink,
+            let outcome = result.map_err(|error| {
+                use crate::exchange::command::{CommandFailure, ExecuteCommandError};
+                if let Some(ExecuteCommandError::Failed(failure)) =
+                    error.downcast_ref::<ExecuteCommandError>()
+                {
+                    return failure.clone();
+                }
+                if let Some(failure) =
+                    error.downcast_ref::<crate::exchange::command::TaskCommandFailure>()
+                {
+                    return CommandFailure::Task(failure.clone());
+                }
+                CommandFailure::PrerequisiteFailed
+            });
+            self.exchange_owner
+                .settle_local_input(
+                    crate::exchange::command::InputRevision {
+                        id: crate::exchange::command::InputId::new(message.id.clone())?,
+                        revision: message.revision,
+                    },
+                    outcome,
+                    sink.clone(),
                 )
                 .await?;
-                return Ok(InputProgress::Waiting);
-            }
-            self.coordinator.submissions.changed.notify_one();
-            return Ok(InputProgress::Waiting);
-        }
-        if !self.task_input_is_current(&message.purpose)? {
-            self.publish_input(
-                self.coordinator
-                    .submissions
-                    .delivery(&message.id, None, None, None)?,
-                sink,
-            )
-            .await?;
-            return Ok(InputProgress::Waiting);
-        }
-        if message.delivery != InputDelivery::Queued || message.reservation.is_some() {
-            return Ok(InputProgress::Waiting);
-        }
-        if snapshot
-            .operation_state
-            .as_deref()
-            .is_some_and(|operation| {
-                matches!(
-                    operation,
-                    "admitted" | "accepted" | "stopping" | "applying" | "verifying" | "resuming"
-                )
-            })
-            || (message.intent == InputIntent::Queue && snapshot.has_elicitation)
-            || snapshot.has_approval
-            || snapshot.checks_running
-        {
-            return Ok(InputProgress::Waiting);
-        }
-        let steer = steering_available
-            && message.intent == InputIntent::Auto
-            && message.config.is_none()
-            && match &message.purpose {
-                crate::input::InputPurpose::TaskEntry { start, .. } => {
-                    self.provider_handle().supports_task_steering(start.kind)
-                }
-                crate::input::InputPurpose::TaskContinuation { .. }
-                | crate::input::InputPurpose::QuestionContinuation { .. } => false,
-                crate::input::InputPurpose::User => true,
-                crate::input::InputPurpose::Question { task_id, .. } => {
-                    self.task_controller
-                        .current()?
-                        .as_ref()
-                        .map(|task| task.id.as_str())
-                        == task_id.as_deref()
-                }
-            };
-        if admission.is_none() && !steer {
-            return Ok(InputProgress::WaitExecution);
-        }
-        let route = if steer {
-            InputRoute::Steering
-        } else {
-            InputRoute::Turn
-        };
-        let Some(message) =
-            self.coordinator
-                .submissions
-                .claim(&message.id, message.revision, route)?
-        else {
-            return Ok(InputProgress::Waiting);
-        };
-        if admission.is_some() {
-            self.cancellation.arm(true);
+            return Ok(InputProgress::Started);
         }
         drop(control);
-        let controller = self.clone();
-        let sink = sink.clone();
-        let steering_order = if steer {
-            Some(steering.clone().try_acquire_owned()?)
-        } else {
-            None
-        };
-        let message_id = message.id.clone();
-        let worker = jobs.spawn(async move {
-            let result = controller.deliver_input(&message, steering_order, admission, &sink).await;
-            if let Err(error) = result {
-                let diagnostic = crate::storage::error_message(&error);
-                if let Err(persistence) = controller.input_failure(&message.id, diagnostic.clone(), &sink).await {
-                        let _ = sink.send_event(SessionEvent {
-                            session_id: controller.catalog_request.read().await.harness_session_id.clone(),
-                            event: "provider_event".into(),
-                            payload: json!({"kind":"error","text":format!("Input failed: {error:#}; recording the failure also failed: {persistence:#}")}),
-                        }).await;
-                } else {
-                    let _ = sink.send_event(SessionEvent {
-                        session_id: controller.catalog_request.read().await.harness_session_id.clone(),
-                        event: "provider_event".into(),
-                        payload: json!({"kind":"error","text":diagnostic}),
-                    }).await;
-                }
-            }
-            controller.coordinator.submissions.changed.notify_one();
-            steer
-        });
-        job_owner.insert(worker.id(), message_id);
-        Ok(InputProgress::Started)
+        let readiness = self.exchange_owner.input_ready(sink.clone()).await?;
+        Ok(match readiness {
+            crate::exchange::InputReadiness::Started => InputProgress::Started,
+            crate::exchange::InputReadiness::WaitExecution => InputProgress::WaitExecution,
+            crate::exchange::InputReadiness::Waiting => InputProgress::Waiting,
+        })
     }
 
-    async fn admit_task_checks(
-        self: &Arc<Self>,
+    /// Schedule an eligible immutable ExecutePlan intent; the owner revalidates approval and dispatch.
+    async fn recover_automatic_plan_acceptance(
+        &self,
         sink: &MessageSender,
-        jobs: &mut JoinSet<bool>,
-    ) -> Result<Option<InputProgress>> {
+    ) -> Result<AutomaticAcceptanceRecovery> {
         if self.questions_block_work()? {
-            return Ok(None);
-        }
-        if self.task_controller.current()?.is_some_and(|task| {
-            task.phase() == crate::task::TaskPhase::Verify
-                && task.status() == crate::task::TaskStatus::Running
-        }) {
-            let Ok(_control) = self.coordinator.control.clone().try_acquire_owned() else {
-                return Ok(Some(InputProgress::Waiting));
-            };
-            let Ok(_execution) = self.coordinator.execution.clone().try_acquire_owned() else {
-                return Ok(Some(InputProgress::WaitExecution));
-            };
-            let scan = self.broker.lock().await.prepare_verification_gate()?;
-            if let Some(scan) = scan {
-                let (scan, current) = scan.run().await?;
-                self.broker
-                    .lock()
-                    .await
-                    .commit_verification_gate(scan, current)?;
-            }
+            return Ok(AutomaticAcceptanceRecovery::Unchanged);
         }
         let Some(task) = self.task_controller.current()? else {
-            return Ok(None);
-        };
-        let Some((turn, work)) = task
-            .turn
-            .as_ref()
-            .and_then(|turn| turn.continuation.as_ref().map(|work| (turn, work)))
-        else {
-            return Ok(None);
-        };
-        if task.next_action() != crate::task::TaskNextAction::Checks
-            || !work.work.is_checks()
-            || work.delivery != crate::task::TaskInputDelivery::Pending
-        {
-            return Ok(None);
-        }
-        let input = self.coordinator.submissions.snapshot()?;
-        if input.suspended {
-            return Ok(Some(InputProgress::Waiting));
-        }
-        if input.messages.iter().any(|message| {
-            matches!(message.purpose, crate::input::InputPurpose::User)
-                && !matches!(
-                    message.delivery,
-                    InputDelivery::Accepted | InputDelivery::Delivering
-                )
-        }) {
-            return Ok(None);
-        }
-        if !SqliteStore::read_only(&self.data_root)?
-            .continuation_source_complete(self.observer.session_id(), &turn.id)?
-        {
-            return Ok(Some(InputProgress::WaitExecution));
-        }
-        let Ok(control) = self.coordinator.control.clone().try_acquire_owned() else {
-            return Ok(Some(InputProgress::Waiting));
-        };
-        let Ok(admission) = self.coordinator.execution.clone().try_acquire_owned() else {
-            return Ok(Some(InputProgress::WaitExecution));
-        };
-        self.cancellation.arm(false);
-        drop(control);
-        let owner = self.clone();
-        let sink = sink.clone();
-        jobs.spawn(async move {
-            let session_id = owner.observer.session_id().to_owned();
-            let (publication, mut stream) = crate::broker::publication::channel();
-            let output = sink.clone();
-            let stream_session = session_id.clone();
-            let forwarder = tokio::spawn(async move {
-                while let Some(update) = stream.recv().await? {
-                    let payload = crate::broker::publication::encode_session_update(&update)?;
-                    let event = if matches!(&update, crate::broker::publication::SessionUpdate::DocumentChanged { .. }) {
-                        "document_changed"
-                    } else { "provider_event" };
-                    output.send_event(SessionEvent { session_id: stream_session.clone(), event: event.into(), payload }).await?;
-                }
-                Ok::<(), anyhow::Error>(())
-            });
-            let result: Result<()> = async {
-                let (start, start_task) = { let broker = owner.broker.lock().await;
-                    let task = owner.task_controller.current()?;
-                    (broker.begin_owned_task_checks(), task) };
-                let (mut state, scan) = match start {
-                    Ok(start) => start,
-                    Err(error) => {
-                        let task = match start_task { Some(task) => task, None => return Err(error) };
-                        return owner.report_initial_task_check_failure(&task, error, &publication, &sink).await;
-                    }
-                };
-                let prepared = async {
-                    let scanned = scan.run().await?;
-                    let mut broker = owner.broker.lock().await;
-                    broker.with_publication_sink(&publication, |broker| broker.prepare_owned_task_check_run(&mut state, scanned))
-                }.await;
-                let run = match prepared {
-                    Ok(run) => run,
-                    Err(error) => return owner.report_owned_task_check_failure(&state, error, &publication, &sink).await,
-                };
-                let checked = match run.run().await {
-                    Ok(checked) => checked,
-                    Err(error) => return owner.report_owned_task_check_failure(&state, error, &publication, &sink).await,
-                };
-                let post = { let broker = owner.broker.lock().await; broker.prepare_task_check_postscan(&state) };
-                let post = match post {
-                    Ok(post) => post,
-                    Err(error) => return owner.report_owned_task_check_failure(&state, error, &publication, &sink).await,
-                };
-                let scanned = match post.run().await {
-                    Ok(scanned) => scanned,
-                    Err(error) => return owner.report_owned_task_check_failure(&state, error, &publication, &sink).await,
-                };
-                let mut finalization = owner.broker.lock().await.prepare_task_check_finalization(state, checked, scanned)?;
-                let report = match finalization.capture_report().await {
-                    Ok(report) => report,
-                    Err(error) => {
-                        let prepared = {
-                            let mut broker = owner.broker.lock().await;
-                            broker.with_publication_sink(&publication, |broker| broker.prepare_task_check_report_failure(&finalization, &error))
-                        };
-                        let prepared = match prepared {
-                            Ok(prepared) => prepared,
-                            Err(failure) => return Err(error.context(format!("check failure persistence failed: {failure:#}"))),
-                        };
-                        match prepared.run().await {
-                            Ok((_, events, _)) => { for event in events { sink.send_event(event).await?; } return Err(error); }
-                            Err(failure) => return Err(error.context(format!("check failure publication failed: {failure:#}"))),
-                        }
-                    }
-                };
-                let delivery = {
-                    let mut broker = owner.broker.lock().await;
-                    broker.with_publication_sink(&publication, |broker| broker.commit_task_check_finalization(finalization, report))?
-                };
-                let (events, acknowledgment) = delivery.run().await?;
-                for event in events { sink.send_event(event).await?; }
-                owner.broker.lock().await.acknowledge_owned_task_check(acknowledgment)?;
-                let snapshot = owner.broker.lock().await.snapshot()?;
-                sink.send_event(SessionEvent { session_id: session_id.clone(), event: "session_changed".into(),
-                    payload: serde_json::to_value(snapshot.session)? }).await?;
-                Ok(())
-            }.await;
-            drop(publication);
-            let forwarded = forwarder.await.context("check publication task panicked").and_then(|result| result);
-            if let Err(error) = result.and(forwarded) {
-                let _ = sink.send_event(SessionEvent { session_id:session_id.clone(), event:"provider_event".into(),
-                    payload:json!({"kind":"error","text":format!("Execution checks failed: {error:#}")}) }).await;
-            }
-            drop(admission);
-            owner.coordinator.submissions.changed.notify_one();
-            false
-        });
-        Ok(Some(InputProgress::Started))
-    }
-
-    async fn report_initial_task_check_failure(
-        &self,
-        task: &crate::task::Task,
-        error: anyhow::Error,
-        publication: &crate::broker::publication::SessionUpdateSink,
-        sink: &MessageSender,
-    ) -> Result<()> {
-        let prepared = {
-            let mut broker = self.broker.lock().await;
-            broker.with_publication_sink(publication, |broker| {
-                broker.prepare_task_check_start_failure(task, &error)
-            })
-        };
-        let prepared = match prepared {
-            Ok(Some(prepared)) => prepared,
-            Ok(None) => return Err(error),
-            Err(failure) => {
-                return Err(error.context(format!("check failure persistence failed: {failure:#}")));
-            }
-        };
-        let (handled, events, acknowledgment) = match prepared.run().await {
-            Ok(result) => result,
-            Err(failure) => {
-                return Err(error.context(format!("check failure publication failed: {failure:#}")));
-            }
-        };
-        for event in events {
-            sink.send_event(event).await?;
-        }
-        if let Some(acknowledgment) = acknowledgment {
-            self.broker
-                .lock()
-                .await
-                .acknowledge_owned_task_check(acknowledgment)?;
-        }
-        if handled {
-            let snapshot = self.broker.lock().await.snapshot()?;
-            sink.send_event(SessionEvent {
-                session_id: self.observer.session_id().to_owned(),
-                event: "session_changed".into(),
-                payload: serde_json::to_value(snapshot.session)?,
-            })
-            .await?;
-            Ok(())
-        } else {
-            Err(error)
-        }
-    }
-
-    /// Persist and deliver a verification failure without retaining broker ownership.
-    async fn report_owned_task_check_failure(
-        &self,
-        state: &crate::broker::OwnedTaskChecks,
-        error: anyhow::Error,
-        publication: &crate::broker::publication::SessionUpdateSink,
-        sink: &MessageSender,
-    ) -> Result<()> {
-        let prepared = {
-            let mut broker = self.broker.lock().await;
-            broker.with_publication_sink(publication, |broker| {
-                broker.prepare_owned_task_check_failure(state, &error)
-            })
-        };
-        let prepared = match prepared {
-            Ok(prepared) => prepared,
-            Err(failure) => {
-                return Err(error.context(format!("check failure persistence failed: {failure:#}")));
-            }
-        };
-        let (handled, events, acknowledgment) = match prepared.run().await {
-            Ok(result) => result,
-            Err(failure) => {
-                return Err(error.context(format!("check failure publication failed: {failure:#}")));
-            }
-        };
-        for event in events {
-            sink.send_event(event).await?;
-        }
-        if let Some(acknowledgment) = acknowledgment {
-            self.broker
-                .lock()
-                .await
-                .acknowledge_owned_task_check(acknowledgment)?;
-        }
-        if handled {
-            let snapshot = self.broker.lock().await.snapshot()?;
-            sink.send_event(SessionEvent {
-                session_id: self.observer.session_id().to_owned(),
-                event: "session_changed".into(),
-                payload: serde_json::to_value(snapshot.session)?,
-            })
-            .await?;
-            Ok(())
-        } else {
-            Err(error)
-        }
-    }
-
-    async fn enqueue_task_input(&self, sink: &MessageSender) -> Result<()> {
-        if self.questions_block_work()? {
-            return Ok(());
-        }
-        let Some(task) = self.task_controller.current()? else {
-            return Ok(());
+            return Ok(AutomaticAcceptanceRecovery::Unchanged);
         };
         if !matches!(
             task.status(),
             crate::task::TaskStatus::Running | crate::task::TaskStatus::Waiting
         ) {
-            return Ok(());
+            return Ok(AutomaticAcceptanceRecovery::Unchanged);
         }
         let snapshot = self.coordinator.submissions.snapshot()?;
         // Recover complete submissions without replaying provider work.
@@ -1190,12 +339,6 @@ impl SessionController {
             })
             && crate::task::command::SessionCommand::approved_revision(&task)?.is_some()
         {
-            let Ok(_control) = self.coordinator.control.clone().try_acquire_owned() else {
-                return Ok(());
-            };
-            let Ok(_execution) = self.coordinator.execution.clone().try_acquire_owned() else {
-                return Ok(());
-            };
             task.permit()
                 .validate(self.task_controller.current()?.as_ref())?;
             let current = self
@@ -1204,7 +347,7 @@ impl SessionController {
                 .context("planning task is missing")?;
             let Some(command) = crate::task::command::SessionCommand::approved_revision(&current)?
             else {
-                return Ok(());
+                return Ok(AutomaticAcceptanceRecovery::Unchanged);
             };
             super::task_state::apply_command(
                 self,
@@ -1215,94 +358,12 @@ impl SessionController {
                 sink,
             )
             .await?;
-            return Ok(());
+            return Ok(AutomaticAcceptanceRecovery::Applied);
         }
-        if task.next_action() != crate::task::TaskNextAction::Model {
-            return Ok(());
-        }
-        let (id, text, purpose) = if let Some(entry) = task
-            .entry
-            .as_ref()
-            .filter(|entry| entry.delivery == crate::task::TaskInputDelivery::Pending)
-        {
-            (
-                &entry.id,
-                entry.instruction.as_str(),
-                crate::input::InputPurpose::TaskEntry {
-                    revision: task.revision.clone(),
-                    id: entry.id.clone(),
-                    start: crate::exchange::TaskStart {
-                        kind: task.kind(),
-                        title: task.title().into(),
-                    },
-                },
-            )
-        } else if let Some((turn, continuation)) = task
-            .turn
-            .as_ref()
-            .and_then(|turn| turn.continuation.as_ref().map(|input| (turn, input)))
-            .filter(|(_, input)| input.delivery == crate::task::TaskInputDelivery::Pending)
-        {
-            if continuation.work.is_checks() {
-                return Ok(());
-            }
-            if !SqliteStore::read_only(&self.data_root)?
-                .continuation_source_complete(self.observer.session_id(), &turn.id)?
-            {
-                return Ok(());
-            }
-            if snapshot.messages.iter().any(|message| {
-                matches!(message.purpose, crate::input::InputPurpose::User)
-                    && !matches!(
-                        message.delivery,
-                        InputDelivery::Accepted | InputDelivery::Delivering
-                    )
-            }) {
-                let mut store = SqliteStore::open(&self.data_root)?;
-                let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-                self.task_controller
-                    .cancel_continuation(&mut store, now_ms)?;
-                return Ok(());
-            }
-            (
-                &continuation.id,
-                continuation
-                    .work
-                    .instruction()
-                    .context("local checks have no provider instruction")?,
-                crate::input::InputPurpose::TaskContinuation {
-                    revision: task.revision.clone(),
-                    id: continuation.id.clone(),
-                    completed_turn_id: turn.id.clone(),
-                    reason: continuation.reason.clone(),
-                },
-            )
-        } else {
-            return Ok(());
-        };
-        let update = self
-            .coordinator
-            .submissions
-            .reconcile_task_input(InputMessage {
-                id: id.as_str().into(),
-                revision: 0,
-                text: text.to_owned(),
-                purpose,
-                attachments: Vec::new(),
-                config: None,
-                intent: InputIntent::Auto,
-                delivery: InputDelivery::Queued,
-                route: None,
-                reservation: None,
-                submission_id: None,
-                error: None,
-            })?;
-        if let Some(update) = update {
-            self.publish_input(update, sink).await?;
-        }
-        Ok(())
+        Ok(AutomaticAcceptanceRecovery::Unchanged)
     }
 
+    /// Request deferred checks without acquiring execution or lifecycle authority.
     async fn complete_input_checks(
         self: &Arc<Self>,
         sink: &MessageSender,
@@ -1311,46 +372,23 @@ impl SessionController {
         if !self.observer.completion_queue.deferred()? || self.checks.active()?.is_some() {
             return Ok(InputProgress::Waiting);
         }
-        let Ok(control) = self.coordinator.control.clone().try_acquire_owned() else {
-            return Ok(InputProgress::Waiting);
-        };
-        let Ok(admission) = self.coordinator.execution.clone().try_acquire_owned() else {
-            return Ok(InputProgress::WaitExecution);
-        };
-        self.cancellation.arm(false);
-        drop(control);
+        let sender = self.observer.check_owner_sender()?;
         let controller = self.clone();
         let sink = sink.clone();
         jobs.spawn(async move {
-            let session_id = controller.catalog_request.read().await.harness_session_id.clone();
-            let (publication, mut stream) = crate::broker::publication::channel();
-            let output = sink.clone();
-            let stream_session = session_id.clone();
-            let forwarder = tokio::spawn(async move {
-                while let Some(update) = stream.recv().await? {
-                    let payload = crate::broker::publication::encode_session_update(&update)?;
-                    let event = if matches!(&update, crate::broker::publication::SessionUpdate::DocumentChanged { .. }) {
-                        "document_changed"
-                    } else { "provider_event" };
-                    output.send_event(SessionEvent { session_id: stream_session.clone(), event: event.into(), payload }).await?;
+            match sender.complete().await {
+                Ok(outcome) => {
+                    for event in outcome.events {
+                        if sink.send_event(event).await.is_err() { break; }
+                    }
                 }
-                Ok::<(), anyhow::Error>(())
-            });
-            let broker = controller.broker.lock().await;
-            let response = super::check_completion::drive(&controller, broker,
-                Request { id: 0, method: "session.check.complete".into(), params: json!({}) }, publication, &sink).await;
-            let result: Result<()> = async {
-                forwarder.await.context("completion check publication task failed")??;
-                for event in response.event { sink.send_event(event).await?; }
-                if let Some(failure) = response.response.error() { anyhow::bail!("{}", failure.message); }
-                Ok(())
-            }.await;
-            drop(admission);
-            if let Err(error) = result {
-                let _ = sink.send_event(SessionEvent {
-                    session_id, event: "provider_event".into(),
-                    payload: json!({"kind":"error","text":format!("Queue completion checks failed: {error:#}")}),
-                }).await;
+                Err(error) => {
+                    let _ = sink.send_event(SessionEvent {
+                        session_id: controller.observer.session_id().to_owned(),
+                        event: "provider_event".into(),
+                        payload: json!({"kind":"error","text":format!("Queue completion checks failed: {error}")}),
+                    }).await;
+                }
             }
             controller.coordinator.submissions.changed.notify_one();
             false
@@ -1358,681 +396,26 @@ impl SessionController {
         Ok(InputProgress::Started)
     }
 
-    async fn input_failure(&self, id: &str, error: String, sink: &MessageSender) -> Result<()> {
-        let message = self
-            .coordinator
-            .submissions
-            .snapshot()?
-            .messages
-            .into_iter()
-            .find(|message| message.id == id)
-            .context("failed input is no longer retained")?;
-        let delivery = if let Some(id) = &message.submission_id {
-            let journal = &self.submission_store;
-            let submission = journal.submission(id)?;
-            if matches!(
-                message.purpose,
-                crate::input::InputPurpose::TaskEntry { .. }
-            ) && let Err(activation) = self.reconcile_submission_current(&submission).await
-            {
-                return self
-                    .publish_input(
-                        self.coordinator.submissions.delivery(
-                            &message.id,
-                            Some(InputDelivery::Failed),
-                            None,
-                            Some(format!(
-                                "{error}; task entry acknowledgement failed: {activation:#}"
-                            )),
-                        )?,
-                        sink,
-                    )
-                    .await;
-            }
-            match submission.record()?.delivery {
-                SubmissionState::Accepted { .. } => None,
-                SubmissionState::Sending { .. } => Some(InputDelivery::Unknown),
-                SubmissionState::Prepared => {
-                    submission.cancel()?;
-                    Some(InputDelivery::Failed)
-                }
-                SubmissionState::Cancelled => Some(InputDelivery::Failed),
-            }
-        } else {
-            Some(InputDelivery::Failed)
-        };
-        self.publish_input(
-            self.coordinator
-                .submissions
-                .delivery(id, delivery, None, Some(error))?,
-            sink,
-        )
-        .await
-    }
-
+    /// Read the same revision-scoped authority that the owner revalidates before dispatch.
+    #[cfg(test)]
     pub(super) fn task_input_is_current(
         &self,
         purpose: &crate::input::InputPurpose,
     ) -> Result<bool> {
-        let (revision, may_wait) = match purpose {
-            crate::input::InputPurpose::User => return Ok(true),
-            crate::input::InputPurpose::QuestionContinuation { exchange_id } => {
-                return Ok(self.task_controller.current()?.is_none()
-                    && self.questions.chat_continuation_is_current(exchange_id)?
-                    && self.questions.snapshot()?.questions.iter().any(|question| {
-                        question.exchange_id == *exchange_id
-                            && question.requirement
-                                == crate::question::QuestionRequirement::Required
-                            && !matches!(
-                                question.resolution,
-                                crate::question::QuestionResolution::Retired { .. }
-                            )
-                    }));
-            }
-            crate::input::InputPurpose::Question { question_id, .. } => {
-                return self.questions.delivery_is_current(question_id);
-            }
-            crate::input::InputPurpose::TaskEntry { revision, .. } => (revision, true),
-            crate::input::InputPurpose::TaskContinuation { revision, .. } => (revision, false),
-        };
-        Ok(self.task_controller.current()?.is_some_and(|task| {
-            &task.revision == revision
-                && match purpose {
-                    crate::input::InputPurpose::TaskContinuation {
-                        id,
-                        completed_turn_id,
-                        ..
-                    } => {
-                        task.entry_accepted()
-                            && task.turn.as_ref().is_some_and(|turn| {
-                                &turn.id == completed_turn_id
-                                    && turn.continuation.as_ref().is_some_and(|input| {
-                                        &input.id == id
-                                            && input.delivery
-                                                != crate::task::TaskInputDelivery::Cancelled
-                                    })
-                            })
-                    }
-                    _ => true,
-                }
-                && (task.status() == crate::task::TaskStatus::Running
-                    || may_wait && task.status() == crate::task::TaskStatus::Waiting)
-        }))
-    }
-
-    async fn deliver_input(
-        &self,
-        message: &InputMessage,
-        steering_order: Option<OwnedSemaphorePermit>,
-        admission: Option<ExecutionPermit>,
-        sink: &MessageSender,
-    ) -> Result<()> {
-        let steer = steering_order.is_some();
-        let catalog = self.catalog_request.read().await.clone();
-        let trace = self.trace.clone();
-        let session_id = &catalog.harness_session_id;
-        trace.record(
-            session_id,
-            "input.delivery_started",
-            json!({"message_id":message.id,"phase":if steer {"steering"} else {"turn"}}),
-        );
-        let attachments = crate::attachment::resolve_input(
+        crate::input::input_purpose_is_current(
+            &self.task_controller,
+            &self.questions,
+            purpose,
             &self.data_root,
-            &json!({"attachments":message.attachments}),
+            self.observer.session_id(),
         )
-        .await?;
-        if !self.task_input_is_current(&message.purpose)? {
-            self.publish_input(
-                self.coordinator
-                    .submissions
-                    .delivery(&message.id, None, None, None)?,
-                sink,
-            )
-            .await?;
-            return Ok(());
-        }
-        let input = match &message.purpose {
-            crate::input::InputPurpose::Question { reply, .. } => {
-                crate::provider::ProviderInput::QuestionReply {
-                    context: String::new(),
-                    reply: reply.clone(),
-                    attachments: attachments.clone(),
-                }
-            }
-            _ => crate::provider::ProviderInput::from_text(message.text.clone())
-                .with_attachments(attachments.clone()),
-        };
-        let provider = self.provider_handle().descriptor().kind;
-        let message_id = message.id.clone();
-        let task_input_id = match &message.purpose {
-            crate::input::InputPurpose::TaskEntry { id, .. }
-            | crate::input::InputPurpose::TaskContinuation { id, .. } => {
-                ensure!(id.as_str() == message.id, "task input identity changed");
-                Some(id.clone())
-            }
-            _ => None,
-        };
-        let submission_catalog = catalog.clone();
-        let submission = self
-            .submission_store
-            .persist(move |journal| {
-                if let Some(id) = task_input_id {
-                    journal.prepare_task_input(&submission_catalog, input, provider, &id)
-                } else {
-                    journal.prepare_input(&submission_catalog, input, provider, Some(message_id))
-                }
-            })
-            .await?;
-        if let crate::input::InputPurpose::TaskEntry { revision, id, .. } = &message.purpose {
-            let revision = revision.clone();
-            let id = id.clone();
-            let controller = self.task_controller.clone();
-            let data_root = self.data_root.clone();
-            submission.on_accepted(move || {
-                let mut store = SqliteStore::open(&data_root)?;
-                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-                controller.acknowledge_entry(&mut store, &revision, &id, now)?;
-                Ok(())
-            })?;
-        }
-        if let crate::input::InputPurpose::TaskContinuation { revision, id, .. } = &message.purpose
-        {
-            let revision = revision.clone();
-            let id = id.clone();
-            let controller = self.task_controller.clone();
-            let data_root = self.data_root.clone();
-            submission.on_accepted(move || {
-                let mut store = SqliteStore::open(&data_root)?;
-                let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-                controller.acknowledge_continuation(&mut store, &revision, &id, now)?;
-                Ok(())
-            })?;
-        }
-        if matches!(
-            submission.record()?.delivery,
-            SubmissionState::Accepted { .. }
-        ) {
-            return self
-                .settle_input(message, submission, Ok(()), steer, sink)
-                .await;
-        }
-        let _steering_flight = if steer {
-            Some(submission.begin_steering()?)
-        } else {
-            None
-        };
-        self.publish_input(
-            self.coordinator.submissions.delivery(
-                &message.id,
-                Some(InputDelivery::Delivering),
-                Some(submission.id().into()),
-                None,
-            )?,
-            sink,
-        )
-        .await?;
-        if !self.task_input_is_current(&message.purpose)? {
-            submission.cancel()?;
-            self.publish_input(
-                self.coordinator
-                    .submissions
-                    .delivery(&message.id, None, None, None)?,
-                sink,
-            )
-            .await?;
-            return Ok(());
-        }
-        if (self.coordinator.submissions.snapshot()?.suspended
-            && !matches!(message.purpose, crate::input::InputPurpose::Question { .. }))
-            || *self.cancellation.subscribe().borrow()
-        {
-            submission.cancel()?;
-            self.publish_input(
-                self.coordinator.submissions.delivery(
-                    &message.id,
-                    Some(InputDelivery::Queued),
-                    None,
-                    None,
-                )?,
-                sink,
-            )
-            .await?;
-            return Ok(());
-        }
-        let result = if steer {
-            let input =
-                if let crate::input::InputPurpose::TaskEntry { start, .. } = &message.purpose {
-                    crate::provider::SteeringInput::TaskEntry {
-                        start: start.clone(),
-                        goal: self.task_controller.current()?.and_then(|task| {
-                            match &task.workflow {
-                                crate::task::WorkflowSnapshot::Goal { goal } if goal.native => {
-                                    Some(forge_provider_api::NativeGoalCommand::Set {
-                                        objective: goal.objective.clone(),
-                                    })
-                                }
-                                _ => None,
-                            }
-                        }),
-                        text: message.text.clone(),
-                        submission: submission.clone(),
-                    }
-                } else {
-                    crate::provider::SteeringInput::User {
-                        text: message.text.clone(),
-                        attachments,
-                        submission: Some(submission.clone()),
-                    }
-                };
-            let mut queued = submission.steering_queued();
-            let dispatch = async {
-                if self.parent_input.is_active() {
-                    self.parent_input.steer(input).await
-                } else {
-                    self.steer_retained(
-                        crate::provider::ExecutionOwner::root(&catalog.harness_session_id),
-                        input,
-                    )
-                    .await
-                }
-            };
-            tokio::pin!(dispatch);
-            let result = tokio::select! {
-                result = &mut dispatch => result,
-                queued = async { queued.wait_for(|queued| *queued).await.map(drop) } => {
-                    queued.context("steering handoff channel closed")?;
-                    drop(steering_order);
-                    self.coordinator.submissions.changed.notify_one();
-                    dispatch.await
-                }
-            };
-            result
-        } else {
-            let mut broker = self.broker.lock().await;
-            if let Some(config) = &message.config {
-                let mut config = config.clone();
-                config["validate"] = json!(true);
-                let (publication, mut stream) = crate::broker::publication::channel();
-                let output = sink.clone();
-                let session = catalog.harness_session_id.clone();
-                let forwarder = tokio::spawn(async move {
-                    while let Some(update) = stream.recv().await? {
-                        let payload = crate::broker::publication::encode_session_update(&update)?;
-                        let event = if matches!(
-                            &update,
-                            crate::broker::publication::SessionUpdate::DocumentChanged { .. }
-                        ) {
-                            "document_changed"
-                        } else {
-                            "provider_event"
-                        };
-                        output
-                            .send_event(SessionEvent {
-                                session_id: session.clone(),
-                                event: event.into(),
-                                payload,
-                            })
-                            .await?;
-                    }
-                    Ok::<(), anyhow::Error>(())
-                });
-                let result = super::drive_direct_configuration(
-                    self,
-                    broker,
-                    Request {
-                        id: 0,
-                        method: "session.configure".into(),
-                        params: config,
-                    },
-                    publication,
-                )
-                .await;
-                forwarder
-                    .await
-                    .context("queued configuration publication task failed")??;
-                for event in result.event {
-                    sink.send_event(event).await?;
-                }
-                if let Some(failure) = result.response.error() {
-                    anyhow::bail!("{}", failure.message);
-                }
-                broker = self.broker.lock().await;
-                let updated_catalog = broker.provider_catalog_request()?;
-                drop(broker);
-                *self.catalog_request.write().await = updated_catalog;
-                broker = self.broker.lock().await;
-            }
-            broker.input_submission = Some(submission.clone());
-            broker.input_purpose = message.purpose.clone();
-            if message.text.trim().is_empty() {
-                broker.input_submission = None;
-                submission.cancel()?;
-                drop(broker);
-                drop(admission);
-                self.publish_input(
-                    self.coordinator
-                        .submissions
-                        .delivery(&message.id, None, None, None)?,
-                    sink,
-                )
-                .await?;
-                return Ok(());
-            }
-            let params = json!({"text":message.text,"attachments":message.attachments});
-            let (event_sink, mut events) = crate::broker::publication::channel();
-            let output = sink.clone();
-            let session_id = catalog.harness_session_id.clone();
-            let input = self.coordinator.submissions.clone();
-            let forwarder = tokio::spawn(async move {
-                while let Some(event) = events.recv().await? {
-                    if event.wakes_input() {
-                        input.changed.notify_one();
-                    }
-                    let (event_name, payload) = if matches!(
-                        &event,
-                        crate::broker::publication::SessionUpdate::DocumentChanged { .. }
-                    ) {
-                        (
-                            "document_changed",
-                            crate::broker::publication::encode_session_update(&event)?,
-                        )
-                    } else {
-                        (
-                            "provider_event",
-                            crate::broker::publication::encode_session_update(&event)?,
-                        )
-                    };
-                    output
-                        .send_event(SessionEvent {
-                            session_id: session_id.clone(),
-                            event: event_name.into(),
-                            payload,
-                        })
-                        .await?;
-                }
-                Ok::<(), anyhow::Error>(())
-            });
-            let mut acceptance = submission.acceptance();
-            trace.record(
-                &catalog.harness_session_id,
-                "input.dispatch_started",
-                json!({"message_id":message.id,"submission_id":submission.id()}),
-            );
-            let prompt = message.text != "/compact";
-            let request = Request {
-                id: 0,
-                method: if prompt {
-                    "session.prompt.submit"
-                } else {
-                    "session.compact"
-                }
-                .into(),
-                params,
-            };
-            let mut acceptance_failure = None;
-            let mut response = {
-                let mut dispatch = Box::pin(async {
-                    if prompt {
-                        super::drive_foreground_dispatch(self, broker, request, event_sink, sink)
-                            .await
-                    } else {
-                        let (result, failure) =
-                            super::drive_manual_compaction(self, broker, request, event_sink, sink)
-                                .await;
-                        if let Some(failure) = failure {
-                            self.record_compaction_failure(failure)?;
-                        }
-                        Ok(result)
-                    }
-                });
-                tokio::select! {
-                    biased;
-                    accepted = acceptance.changed() => {
-                        let published: Result<()> = async {
-                            accepted.context("submission acceptance channel closed")?;
-                            self.publish_input(self.coordinator.submissions.delivery(
-                                &message.id, Some(InputDelivery::Accepted), None, None,
-                            )?, sink).await
-                        }.await;
-                        if let Err(error) = published {
-                            acceptance_failure = Some(error);
-                            self.cancellation.request(false);
-                        }
-                        dispatch.await
-                    }
-                    response = &mut dispatch => response,
-                }
-            };
-            self.trace.record(
-                &catalog.harness_session_id,
-                "input.dispatch_finished",
-                json!({"message_id":message.id}),
-            );
-            // Retire host admission state even when execution failed before returning a response.
-            let postlude: Result<()> = async {
-                let refreshed = {
-                    let mut broker = self.broker.lock().await;
-                    broker.input_submission = None;
-                    self.trace.record(
-                        &catalog.harness_session_id,
-                        "input.catalog_pending",
-                        json!({"message_id":message.id}),
-                    );
-                    broker.provider_catalog_request()
-                };
-                let catalog = match refreshed {
-                    Ok(refreshed) => {
-                        *self.catalog_request.write().await = refreshed;
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                };
-                let events: Result<()> = async {
-                    if let Ok(response) = &mut response {
-                        for event in response.event.drain(..) {
-                            sink.send_event(event).await?;
-                        }
-                    }
-                    Ok(())
-                }
-                .await;
-                match (catalog, events) {
-                    (Ok(()), Ok(())) => Ok(()),
-                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-                    (Err(error), Err(events)) => Err(error.context(format!(
-                        "input response publication also failed: {events:#}"
-                    ))),
-                }
-            }
-            .await;
-            self.trace.record(
-                &catalog.harness_session_id,
-                "input.forwarder_pending",
-                json!({"message_id":message.id}),
-            );
-            // Collect failure publications before exposing the delivery result.
-            let forwarded = forwarder
-                .await
-                .context("input publication task failed")
-                .and_then(|result| result);
-            self.trace.record(
-                &catalog.harness_session_id,
-                "input.forwarder_finished",
-                json!({"message_id":message.id}),
-            );
-            let postlude = match (postlude, forwarded) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-                (Err(error), Err(forwarding)) => {
-                    Err(error.context(format!("input publication also failed: {forwarding:#}")))
-                }
-            };
-            let postlude = match (acceptance_failure, postlude) {
-                (None, result) => result,
-                (Some(error), Ok(())) => Err(error),
-                (Some(error), Err(postlude)) => {
-                    Err(error.context(format!("input finalization also failed: {postlude:#}")))
-                }
-            };
-            let response = match (response, postlude) {
-                (Ok(response), Ok(())) => Ok(response),
-                (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-                (Err(error), Err(postlude)) => {
-                    Err(error.context(format!("input finalization also failed: {postlude:#}")))
-                }
-            };
-            let response = match response {
-                Ok(response) => response,
-                Err(error) => {
-                    drop(admission);
-                    return self
-                        .settle_input(message, submission, Err(error), false, sink)
-                        .await;
-                }
-            };
-            for event in response.event {
-                sink.send_event(event).await?;
-            }
-            if response
-                .response
-                .error()
-                .is_some_and(|error| error.code == "turn_retracted")
-            {
-                submission.cancel()?;
-                drop(admission);
-                let mut update = self.coordinator.submissions.delivery(
-                    &message.id,
-                    Some(InputDelivery::Queued),
-                    None,
-                    None,
-                )?;
-                update.retracted = Some(message.id.clone());
-                self.publish_input(update, sink).await?;
-                return Ok(());
-            }
-            if message.text == "/compact" && response.response.error().is_none() {
-                submission.cancel()?;
-                drop(admission);
-                self.publish_input(
-                    self.coordinator
-                        .submissions
-                        .delivery(&message.id, None, None, None)?,
-                    sink,
-                )
-                .await?;
-                return Ok(());
-            }
-            match response.response.error() {
-                Some(error) => Err(anyhow::anyhow!("{}", error.message)),
-                None => Ok(()),
-            }
-        };
-        // Publish the settled input only after its finalized execution releases ownership.
-        drop(admission);
-        self.settle_input(message, submission, result, steer, sink)
-            .await
+        .map_err(Into::into)
     }
+}
 
-    async fn settle_input(
-        &self,
-        message: &InputMessage,
-        submission: Arc<Submission>,
-        result: Result<()>,
-        steer: bool,
-        sink: &MessageSender,
-    ) -> Result<()> {
-        let record = self.reconcile_submission_current(&submission).await?;
-        if matches!(
-            message.purpose,
-            crate::input::InputPurpose::TaskEntry { .. }
-                | crate::input::InputPurpose::TaskContinuation { .. }
-        ) && matches!(record.delivery, SubmissionState::Accepted { .. })
-        {
-            let data_root = self.data_root.clone();
-            let session_id = record.request.harness_session_id.clone();
-            let mut session = tokio::task::spawn_blocking(move || {
-                SqliteStore::open(&data_root)?
-                    .load_session(&session_id)?
-                    .context("acknowledged session is missing")
-            })
-            .await
-            .context("session publication worker failed")??;
-            session.active_task = self.task_controller.current()?;
-            sink.send_event(SessionEvent {
-                session_id: record.request.harness_session_id.clone(),
-                event: "session_changed".into(),
-                payload: serde_json::to_value(session)?,
-            })
-            .await?;
-        }
-        let error = result.err().map(|error| format!("{error:#}"));
-        if matches!(record.delivery, SubmissionState::Accepted { .. })
-            && let Some(error) = &error
-            && !*self.cancellation.subscribe().borrow()
-        {
-            sink.send_event(SessionEvent {
-                session_id: record.request.harness_session_id.clone(),
-                event: "provider_event".into(),
-                payload: json!({"kind":"error","text":error}),
-            })
-            .await?;
-        }
-        let delivery = match record.delivery {
-            SubmissionState::Accepted { .. } => None,
-            SubmissionState::Prepared
-                if steer
-                    && !self.parent_input.is_active()
-                    && !self
-                        .provider_handle()
-                        .has_active_turn(&record.request.harness_session_id)
-                        .await =>
-            {
-                Some(InputDelivery::Queued)
-            }
-            SubmissionState::Prepared | SubmissionState::Cancelled => Some(InputDelivery::Failed),
-            SubmissionState::Sending { .. } => Some(InputDelivery::Unknown),
-        };
-        let error = match delivery {
-            Some(InputDelivery::Queued) => None,
-            Some(InputDelivery::Failed) => {
-                Some(error.unwrap_or_else(|| "Provider did not confirm message acceptance".into()))
-            }
-            Some(InputDelivery::Unknown) => Some(
-                error.unwrap_or_else(|| "Delivery unconfirmed. Reconcile before retrying.".into()),
-            ),
-            _ => error,
-        };
-        // Proven non-delivery can queue, but it must not be recovered a second time by the adapter.
-        if matches!(record.delivery, SubmissionState::Prepared) {
-            submission.cancel()?;
-        }
-        if delivery == Some(InputDelivery::Failed)
-            && let crate::input::InputPurpose::TaskEntry { revision, .. }
-            | crate::input::InputPurpose::TaskContinuation { revision, .. } = &message.purpose
-        {
-            let mut store = SqliteStore::open(&self.data_root)?;
-            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-            if let Err(error) = self.task_controller.change(
-                &mut store,
-                Some(revision),
-                crate::task::TaskChange::Pause,
-                now_ms,
-            ) && !error.is::<crate::task::StaleTask>()
-            {
-                return Err(error);
-            }
-        }
-        self.publish_input(
-            self.coordinator.submissions.delivery(
-                &message.id,
-                delivery,
-                Some(submission.id().into()),
-                error,
-            )?,
-            sink,
-        )
-        .await
-    }
+enum AutomaticAcceptanceRecovery {
+    Applied,
+    Unchanged,
 }
 
 enum InputProgress {

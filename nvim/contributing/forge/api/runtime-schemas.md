@@ -1416,8 +1416,9 @@ pub struct PlanRecord {
     pub accepted_digest: Option<String>,
     #[serde(default)]
     pub elicitation: Option<PlanElicitation>,
-    #[serde(default)]
-    pub acceptance: Option<PlanAcceptance>,
+    /// Retain revision-scoped review evidence without creating a separate approval lifecycle.
+    #[serde(default, alias = "acceptance")]
+    pub review: Option<PlanReview>,
     #[serde(default)]
     pub question_ledger: PlanQuestionLedger,
     #[serde(default)]
@@ -1427,6 +1428,40 @@ pub struct PlanRecord {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
 }
+```
+
+## PlanReview
+
+Review evidence belongs to one reviewed digest. It retains source evidence,
+comments, annotations, execution choices, and questions; its presence is not an
+independent approval lifecycle. Schema 7 moves live legacy `acceptance` values to
+`review` in plan and task records. Loading old evidence preserves its question and
+answer identities and never grants new execution authority. New review attempts
+have distinct set and approval-question identities. Review timeout policy uses a
+typed purpose, rather than a sentinel question-set ID.
+
+Source: [plan/mod.rs](../../../rust/forge/crates/forge-harness/src/plan/mod.rs).
+
+```rust
+/// Retain revision-scoped reviewer evidence and questions; presence is not a lifecycle state.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(from = "StoredPlanReview")]
+pub struct PlanReview {
+    pub review_digest: String,
+    /// Identify the approval question without interpreting opaque set or question identities.
+    approval_question_id: String,
+    /// Inline feedback captured with the approved source snapshot.
+    #[serde(default)]
+    pub annotations: Vec<PlanAnnotationInput>,
+    #[serde(default)]
+    /// Retains the reviewer's optional acceptance note without changing the reviewed design.
+    pub overall_comment: Option<String>,
+    #[serde(default)]
+    pub saved_source_digest: Option<String>,
+    pub approval_mode_list: Vec<ApprovalMode>,
+    pub elicitation: PlanElicitation,
+}
+
 ```
 
 ## PlanQuestionResponse
@@ -1465,26 +1500,38 @@ pub(crate) struct DesignTestSelection {
 
 ## QuestionOwner
 
-Source: [storage/question.rs](../../../rust/forge/crates/forge-harness/src/storage/question.rs).
+Source: [plan/question_answer.rs](../../../rust/forge/crates/forge-harness/src/plan/question_answer.rs).
+The target decoder uses the typed `PlanQuestionOwner`. The old `plan_acceptance`
+spelling remains a decoding alias for historical targets and immutable receipts;
+new review notifications use `plan_review`.
 
 ```rust
-#[derive(Deserialize)]
+/// Select the persisted question source without exposing storage paths to callers.
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum QuestionOwner {
+pub(crate) enum PlanQuestionOwner {
+    /// The question set belongs to one exchange's persisted workflow state.
     Interaction,
+    /// The question set belongs to the selected plan's planning decisions.
     Plan,
-    PlanAcceptance,
+    /// The question set belongs to revision-scoped plan review evidence.
+    #[serde(alias = "plan_acceptance")]
+    PlanReview,
 }
+
 ```
 
 ## QuestionTarget
 
-Source: [storage/question.rs](../../../rust/forge/crates/forge-harness/src/storage/question.rs).
+Source: [plan/question_answer.rs](../../../rust/forge/crates/forge-harness/src/plan/question_answer.rs).
+`PlanQuestionAnswerRequest` validates these source/set identities and a positive
+revision before owner intake. The source identity and question set are not
+reselected when the queued event is applied.
 
 ```rust
 #[derive(Deserialize)]
-struct QuestionTarget {
-    owner: QuestionOwner,
+struct RawQuestionTarget {
+    owner: PlanQuestionOwner,
     id: String,
     set_id: String,
     revision: u32,

@@ -102,8 +102,22 @@ pub enum TestPromptTerminal {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TestPromptScript {
+    /// Select when native acceptance becomes observable, independently of dispatch.
+    #[serde(default)]
+    pub acceptance: TestInputAcceptance,
     pub steps: Vec<TestPromptStep>,
     pub terminal: TestPromptTerminal,
+}
+
+/// Exercise normalized acceptance timing without naming a provider or protocol.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestInputAcceptance {
+    /// Acknowledge before emitting the response, while the invocation remains active.
+    #[default]
+    BeforeResponse,
+    /// Acknowledge only after the response's native terminal evidence is published.
+    AfterResponse,
 }
 
 /// Report a matching prompt that reached a test response barrier.

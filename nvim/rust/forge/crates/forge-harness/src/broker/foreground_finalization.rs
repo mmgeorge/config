@@ -37,6 +37,7 @@ pub(crate) struct ForegroundFinalization {
         crate::provider::retry::RetryState,
     )>,
     phase: FinalizationPhase,
+    collection: Option<ForegroundCollection>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -64,6 +65,11 @@ enum FinalizationPhase {
 }
 
 impl ForegroundFinalization {
+    /// Capture a collection transition authorized by the exchange owner before reading native termination.
+    pub(crate) fn set_collection(&mut self, disposition: ForegroundCollection) {
+        self.collection = Some(disposition);
+    }
+
     /// Start another host settlement for native work on an already committed scope.
     pub(crate) fn begin_idle_refresh(
         &mut self,
@@ -154,6 +160,7 @@ impl ForegroundFinalization {
         outcome: Result<ProviderCompletion, ProviderError>,
         settlement: Arc<crate::provider::session_execution::SettlementCell>,
         question_override: Option<ProviderCompletion>,
+        collection: Option<ForegroundCollection>,
     ) -> Box<Self> {
         Box::new(Self {
             submission: Some(submission),
@@ -187,6 +194,7 @@ impl ForegroundFinalization {
             needs_host_revalidation: false,
             pending_stale_continuation: None,
             phase: FinalizationPhase::Effects,
+            collection,
         })
     }
 
@@ -204,13 +212,13 @@ impl ForegroundFinalization {
         );
         self.settlement.validate_effects_settled()?;
         if outcome == crate::exchange::ExchangeOutcome::Cancelled
-            && broker.turn_cancellation.restart.load(Ordering::Acquire)
+            && self.collection == Some(ForegroundCollection::Restart)
         {
             if runtime.checkpoint.is_some() {
                 self.phase = FinalizationPhase::InitialCheckpoint;
                 return Ok(ForegroundAction::Wait);
             }
-            return self.park_for_restart(broker, exchange);
+            return self.settle_collected_restart(broker, exchange);
         }
         if outcome == crate::exchange::ExchangeOutcome::Cancelled {
             broker.questions.cancel_chat(Some(&exchange.id))?;
@@ -270,15 +278,15 @@ impl ForegroundFinalization {
         );
         broker.finish_initial_checkpoint(runtime, exchange, result)?;
         if matches!(self.outcome, Err(ProviderError::Cancelled))
-            && broker.turn_cancellation.restart.load(Ordering::Acquire)
+            && self.collection == Some(ForegroundCollection::Restart)
         {
-            return self.park_for_restart(broker, exchange);
+            return self.settle_collected_restart(broker, exchange);
         }
         self.prepare_checkpoint(broker, exchange)
     }
 
     /// Keep the original checkpoint and exchange open for the configuration continuation.
-    fn park_for_restart(
+    fn settle_collected_restart(
         &mut self,
         broker: &mut HarnessBroker,
         exchange: &mut Exchange,
@@ -365,6 +373,7 @@ impl ForegroundFinalization {
         self.phase = FinalizationPhase::Commit;
         Ok(ForegroundAction::Effect(ForegroundJob::SettlementCommit {
             cell: self.settlement.clone(),
+            requirement: SettlementRequirement::Native,
             undispatched: Vec::new(),
         }))
     }
@@ -541,6 +550,7 @@ impl HarnessBroker {
                 Ok(provenance),
                 transaction.settlement.clone(),
                 None,
+                transaction.collection,
             ));
         }
         let finalization = transaction
@@ -1217,9 +1227,12 @@ impl HarnessBroker {
                     .transpose()?
                     .or_else(|| transaction.request.provider_session_id.clone());
                 output.native.capability = self.capability.clone();
+                let native = output.native.clone();
                 for batch in finalization.settlement.batches()? {
                     output.merge_execution(batch.completion);
                 }
+                // Host-effect batches may carry default transport metadata; cancellation keeps the advertised binding capabilities.
+                output.merge_native(native);
                 output
             }
             Err(error) => {
@@ -1430,9 +1443,25 @@ impl HarnessBroker {
             let action = finalization.checks_delivered()?;
             if let ForegroundAction::Effect(ForegroundJob::SettlementCommit {
                 cell,
+                mut requirement,
                 mut undispatched,
             }) = action
             {
+                if finalization.collection.is_some()
+                    && matches!(finalization.outcome, Err(ProviderError::Cancelled))
+                    && let Some(receipt) = &transaction.request.submission
+                {
+                    use crate::provider::submission::SubmissionRetirement;
+                    requirement = match receipt.retire_prepared()? {
+                        SubmissionRetirement::Prevented
+                        | SubmissionRetirement::AlreadyCancelled => {
+                            SettlementRequirement::CollectedUndispatched
+                        }
+                        SubmissionRetirement::Sending | SubmissionRetirement::Accepted => {
+                            SettlementRequirement::Native
+                        }
+                    };
+                }
                 // Retention preserves event ownership, never a pending input reply.
                 // End admission before draining so no command can enter the retired lane.
                 transaction.steering.active.retire();
@@ -1442,6 +1471,7 @@ impl HarnessBroker {
                 }
                 return Ok(ForegroundAction::Effect(ForegroundJob::SettlementCommit {
                     cell,
+                    requirement,
                     undispatched,
                 }));
             }
@@ -1552,12 +1582,17 @@ impl HarnessBroker {
         self.refresh_input_schedule()?;
         self.active_wait_projection = None;
         let response = if matches!(finalization.outcome, Err(ProviderError::Cancelled)) {
-            let message = if self.turn_cancellation.restart.load(Ordering::Acquire) {
+            let message = if finalization.collection == Some(ForegroundCollection::Restart) {
                 "Turn interrupted to apply configuration"
             } else {
                 "Turn cancelled by user"
             };
-            Response::failure(request_id, "turn_cancelled", message)
+            let code = if finalization.collection == Some(ForegroundCollection::Restart) {
+                "turn_reconfigured"
+            } else {
+                "turn_cancelled"
+            };
+            Response::failure(request_id, code, message)
         } else {
             Response::success(request_id, value)?
         };
@@ -1815,6 +1850,17 @@ impl HarnessBroker {
                 self.current_plan_id()?.as_deref() == Some(read_plan_id.as_str()),
                 "requested plan is not active"
             );
+        }
+        // Cancellation can settle an admitted turn before any result batch is
+        // produced. Its dispatch permit is not evidence of task progress, and
+        // cannot own a goal-effect receipt or reserve a continuation.
+        if matches!(finalization.outcome, Err(ProviderError::Cancelled))
+            && staged
+                .batches
+                .as_ref()
+                .is_none_or(|batches| batches.is_empty())
+        {
+            return self.finish_goal_effects(finalization);
         }
         let snapshot = self.questions.snapshot()?;
         let required_stop =

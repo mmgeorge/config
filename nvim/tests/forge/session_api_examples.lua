@@ -40,14 +40,13 @@ local success, failure = xpcall(function()
   assert(not problem, problem)
   session_id = initialized.session.id
   assert(request("session.task.get") == nil)
-  assert(request("session.turn.restart").restart_requested == true)
   assert(request("session.command.status.get", { id = "unsubmitted-example" }).state == "not_admitted")
   assert(request("session.input.operation.get", { id = "unsubmitted-example" }) == nil)
   assert(request("session.preview", { session_id = session_id }).session.id == session_id)
   assert(type(request("session.agent.model.list", { provider = "mock" })) == "table")
   assert(type(request("session.provider.capabilities.get")) == "table")
   request("session.provider.skill.list", nil, "unsupported provider capability")
-  assert(request("session.approval.continue").session.id == session_id)
+  request("session.approval.continue", nil, "approval timeout feedback is owned internally")
   assert(type(request("session.check.override", {
     enabled = vim.empty_dict(), auto = vim.empty_dict(), scopes = vim.empty_dict(),
   })) == "table")

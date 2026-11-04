@@ -111,7 +111,7 @@ impl HarnessBroker {
         self.task_controller.apply(
             &mut self.store,
             &task.permit(),
-            crate::task::TaskEvent::PlanArtifactUpdated(plan),
+            crate::task::TaskEvent::PlanArtifactUpdated(Box::new(plan)),
             now_ms,
         )?;
         self.check_setup = false;
@@ -183,7 +183,7 @@ impl HarnessBroker {
         )?;
         plan.submitted_version = None;
         plan.review_digest = Some(digest);
-        plan.acceptance = None;
+        plan.review = None;
         plan.updated_at_ms = self.clock.now_ms();
         let task = self
             .task_controller
@@ -192,7 +192,7 @@ impl HarnessBroker {
         self.task_controller.apply(
             &mut self.store,
             &task.permit(),
-            crate::task::TaskEvent::PlanArtifactUpdated(plan),
+            crate::task::TaskEvent::PlanArtifactUpdated(Box::new(plan)),
             self.clock.now_ms(),
         )?;
         Ok(true)
@@ -222,32 +222,6 @@ impl HarnessBroker {
                     .catalog_preview(task_id.as_deref(), self.session.shell, &settings)
                     .await?
             }
-            RuntimeMethod::SessionCheckOverride => {
-                let overrides = serde_json::from_value(params)?;
-                self.check_runner
-                    .set_overrides(task_id.as_deref(), overrides)?
-            }
-            RuntimeMethod::SessionCheckRun => {
-                anyhow::ensure!(
-                    self.agent_coordinator.active_count() == 0
-                        && !self.current_task_is_plan()?
-                        && !self
-                            .store
-                            .list_plan_execution(&self.session.id)?
-                            .iter()
-                            .any(|execution| execution.state == PlanExecutionState::Active),
-                    "checks cannot race active plan execution or writing agents"
-                );
-                let owner = self.check_runner.session_owner();
-                let run = self.check_runner.prepare_request(
-                    owner,
-                    serde_json::from_value(params)?,
-                    task_id,
-                    self.session.shell,
-                    "User requested".into(),
-                )?;
-                json!({"run_id":self.check_runner.start(run, self.event_sink.clone(),None,None).await?})
-            }
             RuntimeMethod::SessionCheckStatus => {
                 let wait_for_completion = params["wait_for_completion"].as_bool().unwrap_or(false);
                 let wait_ms = params["wait_ms"]
@@ -262,11 +236,6 @@ impl HarnessBroker {
                         )
                         .await?,
                 )?
-            }
-            RuntimeMethod::SessionCheckCancel => {
-                let id = required_text(&params, "run_id")?;
-                self.check_runner.cancel(&id)?;
-                json!({"run_id":id,"cancellation_requested":true})
             }
             _ => anyhow::bail!("unknown checks operation"),
         };

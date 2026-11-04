@@ -1,4 +1,10 @@
+mod owned_task_checks;
+pub(crate) use owned_task_checks::{OwnedTaskCheckRun, TaskCheckEvent, TaskCheckProgress};
+mod clarification;
+mod rollback_effect;
+pub(crate) use rollback_effect::RollbackEffectResult;
 mod acceptance;
+pub(crate) use acceptance::{PlanExecutionPreparation, ValidatedPlanExecution};
 #[cfg(test)]
 mod cancellation_test;
 #[cfg(test)]
@@ -6,10 +12,13 @@ mod change_results_test;
 mod checkpoint_settlement;
 mod checks;
 pub(crate) use checkpoint_settlement::FinalCheckpointCommit;
-pub(crate) use checks::OwnedTaskChecks;
 mod compaction;
 mod configuration;
-pub(crate) use compaction::CompactionProvenance;
+pub(crate) use compaction::{CompactionEvidenceError, CompactionProvenance, CompactionResult};
+pub(crate) use configuration::{
+    ConfigurationCandidate, ConfigurationCatalogResult, ConfigurationEffect,
+    ConfigurationPreparation, ConfigurationReconcileResult,
+};
 mod execution;
 mod execution_progress;
 mod foreground_completion;
@@ -21,6 +30,8 @@ mod foreground_plan_effect;
 mod foreground_undo;
 mod fork;
 mod interaction;
+mod live_goal_effect;
+mod live_host_effect;
 mod prior_finalization;
 pub(crate) use prior_finalization::PriorFinalizationAction;
 mod foreground_dispatch;
@@ -33,12 +44,21 @@ pub mod publication;
 use publication::{ConfigurationProgressState, SessionUpdate, TimelineUpdate};
 mod check_admission;
 mod check_completion;
+mod owned_check_completion;
+pub(crate) use owned_check_completion::{
+    OwnedCheckCompletion, OwnedCheckProgress, OwnedCheckResult,
+};
 mod new_session;
 mod observation;
+mod owner_control;
+pub(crate) use checkpoint_settlement::FinalCheckpointResult;
+pub(crate) use owner_control::{ControlExecution, ExchangeControlSelection, ExchangeControlView};
+pub(crate) use prior_finalization::PriorFinalization;
 mod plan_checks_update;
 pub(crate) mod plan_entry;
 mod project_checks;
 pub(crate) use check_admission::AutomaticCheckAction;
+#[cfg(test)]
 pub(crate) use plan_checks_update::{PlanChecksUpdateJob, PlanChecksUpdateResult};
 mod reopening;
 mod review_question;
@@ -58,10 +78,10 @@ use crate::goal::{ContinuationDecision, GoalRecord, GoalState};
 use crate::permissions::store::PermissionStore;
 use crate::plan::state_machine::{PlanEvent, PlanStateMachine};
 use crate::plan::{
-    ArtifactSummary, PlanAcceptance, PlanElicitation, PlanExecutionLifecycleEvent,
-    PlanExecutionPromptKind, PlanExecutionRecord, PlanExecutionState, PlanFileStore,
-    PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer, PlanQuestionResponse,
-    PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanState,
+    ArtifactSummary, PlanElicitation, PlanExecutionLifecycleEvent, PlanExecutionPromptKind,
+    PlanExecutionRecord, PlanExecutionState, PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord,
+    PlanPrompt, PlanQuestionAnswer, PlanQuestionResponse, PlanQuestionSet, PlanQuestionWithdrawal,
+    PlanRecord, PlanReview, PlanState,
 };
 use crate::protocol::RuntimeMethod;
 use crate::provider::approval::{ApprovalRequestView, PermissionCoordinator};
@@ -256,16 +276,17 @@ pub struct SessionPreview {
 }
 
 /// Represents the durable owner and question state presented by the Harness question UI.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ElicitationOwner {
     Plan,
     Interaction,
-    PlanAcceptance,
+    #[serde(alias = "plan_acceptance")]
+    PlanReview,
 }
 
 /// Represents the durable owner and question state presented by the Harness question UI.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ActiveElicitation {
     pub owner: ElicitationOwner,
     pub plan_id: Option<String>,
@@ -315,6 +336,12 @@ impl PendingProviderDelivery {
         Ok(self.events)
     }
 
+    /// Transfer committed update facts to the session owner instead of a separate forwarder.
+    /// Buffered fallback events are derived from these updates and must not be sent a second time.
+    pub(crate) fn into_updates(self) -> Vec<SessionUpdate> {
+        self.updates
+    }
+
     /// Wait until the external forwarder has consumed every update in this batch.
     pub(crate) async fn deliver_and_flush(self) -> Result<Vec<SessionEvent>> {
         let sink = self.sink.clone();
@@ -329,6 +356,38 @@ impl PendingProviderDelivery {
 pub(crate) struct ProviderSteering {
     pub(crate) active: crate::provider::ActiveSteering,
     pub(crate) deferred: std::collections::VecDeque<crate::provider::SteerCommand>,
+    pub(crate) pending_deliveries: Arc<SteeringDeliveries>,
+    pub(crate) refresh_readiness: bool,
+}
+
+/// Track steering work until its result is applied or its unlaunched owner is dropped.
+#[derive(Default)]
+pub(crate) struct SteeringDeliveries {
+    count: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+impl SteeringDeliveries {
+    /// Retain one effect and its eventual owner-applied result.
+    fn retain(self: &Arc<Self>) -> SteeringDeliveryGuard {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        SteeringDeliveryGuard(self.clone())
+    }
+
+    /// Check whether every retained effect has been applied or abandoned.
+    fn is_empty(&self) -> bool {
+        self.count.load(Ordering::Acquire) == 0
+    }
+}
+
+/// Release steering ownership on every result, task-failure, and unlaunched-effect path.
+pub(crate) struct SteeringDeliveryGuard(Arc<SteeringDeliveries>);
+
+impl Drop for SteeringDeliveryGuard {
+    fn drop(&mut self) {
+        self.0.count.fetch_sub(1, Ordering::AcqRel);
+        self.0.changed.notify_one();
+    }
 }
 
 /// Own the mutable exchange and its runtime while the service waits for provider work.
@@ -351,6 +410,9 @@ pub(crate) enum ForegroundOutcome {
 pub(crate) struct ForegroundWait<T: Send + 'static> {
     events: crate::provider::events::ProviderEventStream,
     task: tokio::task::JoinSet<Result<T>>,
+    pending_submission:
+        Option<std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send>>>,
+    result_pending: bool,
     cancellation: Arc<TurnCancellation>,
     watchdog: Arc<crate::provider::tool_timeout::ToolWatchdog>,
     stream_open: bool,
@@ -364,19 +426,25 @@ pub(crate) enum NativeForegroundSignal<T> {
     NativeReady(T),
 }
 
+#[derive(Clone, Copy)]
+enum NativeWaitMode {
+    Running,
+    Collecting,
+}
+
 impl<T: Send + 'static> ForegroundWait<T> {
-    /// Start an owned provider future and attach its native event stream.
+    /// Retain an owned provider future until the owner authorizes its submission.
     pub(crate) fn start(
         events: crate::provider::events::ProviderEventStream,
         submission: impl std::future::Future<Output = Result<T>> + Send + 'static,
         cancellation: Arc<TurnCancellation>,
         watchdog: Arc<crate::provider::tool_timeout::ToolWatchdog>,
     ) -> Self {
-        let mut task = tokio::task::JoinSet::new();
-        task.spawn(submission);
         Self {
             events,
-            task,
+            task: tokio::task::JoinSet::new(),
+            pending_submission: Some(Box::pin(submission)),
+            result_pending: false,
             cancellation,
             watchdog,
             stream_open: true,
@@ -389,20 +457,52 @@ impl<T: Send + 'static> ForegroundWait<T> {
         submission: impl std::future::Future<Output = Result<T>> + Send + 'static,
     ) -> Result<()> {
         anyhow::ensure!(
-            self.task.is_empty(),
-            "previous provider attempt is still running"
+            self.task.is_empty() && self.pending_submission.is_none(),
+            "previous provider attempt is still running or awaiting authorization"
         );
-        self.task.spawn(submission);
+        self.pending_submission = Some(Box::pin(submission));
+        self.result_pending = false;
         Ok(())
+    }
+
+    /// Launch only after the owner has applied this update's command transitions.
+    pub(crate) fn authorize_submission(&mut self) {
+        if let Some(submission) = self.pending_submission.take()
+            && !self
+                .cancellation
+                .requested
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.task.spawn(submission);
+        }
+    }
+
+    /// Report actual native work that must settle before synthesizing an undispatched cancellation.
+    pub(crate) fn has_dispatched_task(&self) -> bool {
+        !self.task.is_empty() || self.result_pending
+    }
+
+    /// Release the result-delivery obligation only when the broker processes the native result.
+    pub(crate) fn acknowledge_result(&mut self) {
+        self.result_pending = false;
     }
 
     /// Wait for native progress without retaining broker state or a presentation lock.
     pub(crate) async fn next(&mut self) -> Result<NativeForegroundSignal<T>> {
+        self.next_in_mode(NativeWaitMode::Running).await
+    }
+
+    /// Drain an owner's interrupted attempt without repeating cancellation or timeout signals.
+    pub(crate) async fn next_collected(&mut self) -> Result<NativeForegroundSignal<T>> {
+        self.next_in_mode(NativeWaitMode::Collecting).await
+    }
+
+    async fn next_in_mode(&mut self, mode: NativeWaitMode) -> Result<NativeForegroundSignal<T>> {
         loop {
             tokio::select! {
                 biased;
-                () = self.cancellation.cancelled() => return Ok(NativeForegroundSignal::Cancelled),
-                expired = self.watchdog.expired() => {
+                () = self.cancellation.cancelled(), if matches!(mode, NativeWaitMode::Running) => return Ok(NativeForegroundSignal::Cancelled),
+                expired = self.watchdog.expired(), if matches!(mode, NativeWaitMode::Running) => {
                     return Ok(NativeForegroundSignal::ToolExpired(expired?.context("tool watchdog ended during foreground execution")?));
                 }
                 event = self.events.recv(), if self.stream_open => match event {
@@ -410,8 +510,10 @@ impl<T: Send + 'static> ForegroundWait<T> {
                     Ok(None) => self.stream_open = false,
                     Err(error) => return Err(error.into()),
                 },
-                result = self.task.join_next() => {
-                    return Ok(NativeForegroundSignal::NativeReady(result.context("provider task ended without an outcome")?.context("provider task failed")??));
+                result = self.task.join_next(), if !self.task.is_empty() => {
+                    let result = result.context("provider task ended without an outcome")?.context("provider task failed")??;
+                    self.result_pending = true;
+                    return Ok(NativeForegroundSignal::NativeReady(result));
                 }
             }
         }
@@ -420,6 +522,8 @@ impl<T: Send + 'static> ForegroundWait<T> {
 
 /// Own all resources polled during one foreground request outside the broker lock.
 pub(crate) struct ForegroundTransaction {
+    pub(crate) live_host_receiver: tokio::sync::mpsc::Receiver<crate::provider::LiveHostEffect>,
+    pub(crate) live_host: Option<live_host_effect::LiveHostState>,
     pub(crate) state: OwnedForegroundTransaction,
     pub(crate) request: ProviderRequest,
     pub(crate) mode: PromptMode,
@@ -433,6 +537,7 @@ pub(crate) struct ForegroundTransaction {
     pub(crate) _lsp_lease: crate::tools::lsp::LspLease,
     pub(crate) native: ForegroundWait<ProviderAttempt>,
     pub(crate) native_open: bool,
+    pub(crate) collection: Option<ForegroundCollection>,
     pub(crate) idle_native_active: bool,
     pub(crate) provider_event_sink: ProviderEventSink,
     pub(crate) engine: Arc<crate::provider::session_execution::SessionExecution>,
@@ -496,8 +601,18 @@ pub(crate) enum NativeGoalTransition {
     },
 }
 
+/// Preserve the owner's collection disposition independently of provider cancellation flags.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForegroundCollection {
+    Cancel,
+    Restart,
+}
+
 /// Describe a single owned foreground wait result for a short broker state step.
 pub(crate) enum ForegroundSignal {
+    LiveHost(Box<crate::provider::LiveHostEffect>),
+    CollectionStarted(ForegroundCollection),
+    CollectionCompleted(ForegroundCollection),
     AdmissionWorkspaceCompleted(Box<foreground_workspace::AdmissionWorkspaceResult>),
     AdmissionRequested,
     AdmissionPrepared,
@@ -548,6 +663,7 @@ pub(crate) enum ForegroundSignal {
         result: Box<Result<execution::ExecutionControlReport>>,
     },
     RevisionReview(crate::plan::revision_review::RevisionReviewRequest),
+    #[cfg(test)]
     RevisionChecksUpdated {
         response: tokio::sync::oneshot::Sender<Result<(Value, Vec<SessionEvent>)>>,
         result: Box<Result<PlanChecksUpdateResult>>,
@@ -596,7 +712,7 @@ pub(crate) enum ForegroundSignal {
     PlanQuestionCompleted(Result<foreground_plan_effect::PlanQuestionResult>),
     GoalProgressCompleted(Box<Result<foreground_goal_effect::GoalProgressResult>>),
     ExecutionProgressCompleted(Box<Result<foreground_goal_effect::ExecutionProgressResult>>),
-    TaskCompacted(Box<Result<crate::provider::ProviderOutput>>),
+    TaskCompacted(Box<Result<crate::provider::Compaction, crate::provider::ProviderError>>),
     CompactionCompleted(Box<compaction::CompactionResult>),
     FinalizeChecksRequested,
     FinalizeCheckContinuationRequested,
@@ -637,7 +753,114 @@ pub(crate) enum ForegroundSignal {
     PriorObservationReady(Result<()>),
     PriorInitialCompleted(Result<crate::checkpoint::CheckpointRecord>),
     PriorFinalCompleted(Result<checkpoint_settlement::FinalCheckpointResult>),
-    UserDeliverySettled(Option<crate::provider::SteerCommand>),
+    UserDeliverySettled(
+        Option<crate::provider::SteerCommand>,
+        Option<SteeringDeliveryGuard>,
+    ),
+}
+
+impl ForegroundSignal {
+    /// Static diagnostic label; never includes command or provider payloads.
+    pub(crate) fn diagnostic_name(&self) -> &'static str {
+        match self {
+            Self::LiveHost(..) => "LiveHost",
+            Self::CollectionStarted(..) => "CollectionStarted",
+            Self::CollectionCompleted(..) => "CollectionCompleted",
+            Self::AdmissionWorkspaceCompleted(..) => "AdmissionWorkspaceCompleted",
+            Self::AdmissionRequested => "AdmissionRequested",
+            Self::AdmissionPrepared => "AdmissionPrepared",
+            Self::FinalizeEffectsRequested => "FinalizeEffectsRequested",
+            Self::PublicationDrained => "PublicationDrained",
+            Self::QuestionCatalog(..) => "QuestionCatalog",
+            Self::ProviderPrepared(..) => "ProviderPrepared",
+            Self::Native(NativeForegroundSignal::Cancelled) => "NativeCancelled",
+            Self::Native(NativeForegroundSignal::ToolExpired(_)) => "NativeToolExpired",
+            Self::Native(NativeForegroundSignal::ProviderEvent(_)) => "NativeProviderEvent",
+            Self::Native(NativeForegroundSignal::NativeReady(_)) => "NativeReady",
+            Self::QuestionChanged => "QuestionChanged",
+            Self::QuestionStopped(..) => "QuestionStopped",
+            Self::Checkpoint(..) => "Checkpoint",
+            Self::UserInput(..) => "UserInput",
+            Self::UserDelivery(..) => "UserDelivery",
+            Self::AgentChanged => "AgentChanged",
+            Self::AgentDelivery(..) => "AgentDelivery",
+            Self::AgentResultDelivered { .. } => "AgentResultDelivered",
+            Self::AgentApprovalsCancelled { .. } => "AgentApprovalsCancelled",
+            Self::AgentInterrupted { .. } => "AgentInterrupted",
+            Self::AgentSpawnSelected { .. } => "AgentSpawnSelected",
+            Self::AgentMessageSteered { .. } => "AgentMessageSteered",
+            Self::ExecutionControl(..) => "ExecutionControl",
+            Self::ExecutionControlEvidence { .. } => "ExecutionControlEvidence",
+            Self::ExecutionControlReport { .. } => "ExecutionControlReport",
+            Self::RevisionReview(..) => "RevisionReview",
+            #[cfg(test)]
+            Self::RevisionChecksUpdated { .. } => "RevisionChecksUpdated",
+            Self::PlanScan => "PlanScan",
+            Self::PlanScanned(..) => "PlanScanned",
+            Self::PlanMutationCompleted(..) => "PlanMutationCompleted",
+            Self::FinalCheckpoint(..) => "FinalCheckpoint",
+            Self::AutomaticCheckRefreshed(..) => "AutomaticCheckRefreshed",
+            Self::AutomaticCheckCompleted(..) => "AutomaticCheckCompleted",
+            Self::SettlementReady { .. } => "SettlementReady",
+            Self::SettlementCommitted(..) => "SettlementCommitted",
+            Self::Cleanup(..) => "Cleanup",
+            Self::SessionObservationsReady => "SessionObservationsReady",
+            Self::PublicationFailed(..) => "PublicationFailed",
+            Self::EffectFailed(..) => "EffectFailed",
+            Self::CleanupCompleted { .. } => "CleanupCompleted",
+            Self::FailurePublicationCompleted(..) => "FailurePublicationCompleted",
+            Self::FailurePublicationNeedsForward { .. } => "FailurePublicationNeedsForward",
+            Self::FailureAdmissionEventsNeedForward { .. } => "FailureAdmissionEventsNeedForward",
+            Self::FailureAdmissionEventsForwarded(..) => "FailureAdmissionEventsForwarded",
+            Self::AdmissionEventsNeedForward { .. } => "AdmissionEventsNeedForward",
+            Self::AdmissionEventsForwarded(..) => "AdmissionEventsForwarded",
+            Self::CommandEventsNeedForward { .. } => "CommandEventsNeedForward",
+            Self::CommandEventsForwarded(..) => "CommandEventsForwarded",
+            Self::AdmissionCleanupCompleted(..) => "AdmissionCleanupCompleted",
+            Self::AdmissionFailureCheckpointCompleted(..) => "AdmissionFailureCheckpointCompleted",
+            Self::FailureCheckpointCompleted(..) => "FailureCheckpointCompleted",
+            Self::FailureBaselineCompleted(..) => "FailureBaselineCompleted",
+            Self::RetractionGoalRestored(..) => "RetractionGoalRestored",
+            Self::PlanSubmissionCompleted(..) => "PlanSubmissionCompleted",
+            Self::PlanQuestionCompleted(..) => "PlanQuestionCompleted",
+            Self::GoalProgressCompleted(..) => "GoalProgressCompleted",
+            Self::ExecutionProgressCompleted(..) => "ExecutionProgressCompleted",
+            Self::TaskCompacted(..) => "TaskCompacted",
+            Self::CompactionCompleted(..) => "CompactionCompleted",
+            Self::FinalizeChecksRequested => "FinalizeChecksRequested",
+            Self::FinalizeCheckContinuationRequested => "FinalizeCheckContinuationRequested",
+            Self::FinalResponseNeedsForward { .. } => "FinalResponseNeedsForward",
+            Self::FinalResponsePublished(..) => "FinalResponsePublished",
+            Self::ClarificationNeedsForward { .. } => "ClarificationNeedsForward",
+            Self::ClarificationPublished(..) => "ClarificationPublished",
+            Self::CheckRepairNeedsForward { .. } => "CheckRepairNeedsForward",
+            Self::CheckRepairPublished(..) => "CheckRepairPublished",
+            Self::PermissionNeedsForward { .. } => "PermissionNeedsForward",
+            Self::PermissionPublished(..) => "PermissionPublished",
+            Self::CommandNeedsForward { .. } => "CommandNeedsForward",
+            Self::CommandPublished(..) => "CommandPublished",
+            Self::AutoCompactionNeedsForward { .. } => "AutoCompactionNeedsForward",
+            Self::AutoCompactionPublished(..) => "AutoCompactionPublished",
+            Self::ObservationPublicationDelivered(..) => "ObservationPublicationDelivered",
+            Self::ObservationPublicationNeedsForward { .. } => "ObservationPublicationNeedsForward",
+            Self::PublicationDelivered(..) => "PublicationDelivered",
+            Self::PlanTerminalPublished(..) => "PlanTerminalPublished",
+            Self::PlanTerminalNeedsForward { .. } => "PlanTerminalNeedsForward",
+            Self::PriorObservationReady(..) => "PriorObservationReady",
+            Self::PriorInitialCompleted(..) => "PriorInitialCompleted",
+            Self::PriorFinalCompleted(..) => "PriorFinalCompleted",
+            Self::UserDeliverySettled(..) => "UserDeliverySettled",
+        }
+    }
+}
+
+/// Specify whether native settlement exists for the collected invocation.
+#[derive(Clone, Copy)]
+pub(crate) enum SettlementRequirement {
+    /// A dispatched invocation must provide its native settlement ticket.
+    Native,
+    /// Positive receipt retirement proved collection completed before dispatch.
+    CollectedUndispatched,
 }
 
 /// Describe the next service action after a short broker state transition.
@@ -699,6 +922,7 @@ pub(crate) struct AgentInterrupt {
 pub(crate) struct OwnedAgentRequest {
     request: crate::agent::AgentRequest,
     authority: Option<crate::agent::AgentRequestAuthority>,
+    target: Option<crate::agent::AgentTarget>,
     response: tokio::sync::oneshot::Sender<Result<Value>>,
     parent_id: String,
 }
@@ -735,6 +959,8 @@ pub(crate) enum ForegroundJob {
     FailureBaseline(foreground_failure::FailureBaselineJob),
     RetractionGoal(Box<foreground_failure::RetractionGoalJob>),
     PlanSubmission(Box<foreground_plan_effect::PlanSubmissionJob>),
+    LivePlanSubmission(Box<foreground_plan_effect::PlanSubmissionJob>),
+    LivePlanMutation(Box<foreground_plan_effect::PlanMutationJob>),
     PlanQuestion(Box<foreground_plan_effect::PlanQuestionJob>),
     GoalProgress(Box<foreground_goal_effect::GoalProgressJob>),
     ExecutionProgress(Box<foreground_goal_effect::ExecutionProgressJob>),
@@ -774,6 +1000,7 @@ pub(crate) enum ForegroundJob {
         response: tokio::sync::oneshot::Sender<Result<serde_json::Value>>,
         submission: bool,
     },
+    #[cfg(test)]
     RevisionChecksUpdate {
         job: Box<PlanChecksUpdateJob>,
         response: tokio::sync::oneshot::Sender<Result<(Value, Vec<SessionEvent>)>>,
@@ -815,9 +1042,11 @@ pub(crate) enum ForegroundJob {
     },
     SettlementCommit {
         cell: Arc<crate::provider::session_execution::SettlementCell>,
+        requirement: SettlementRequirement,
         undispatched: Vec<crate::provider::SteerCommand>,
     },
     UserSteering {
+        flight: SteeringDeliveryGuard,
         engine: Arc<crate::provider::session_execution::SessionExecution>,
         scope: crate::provider::InvocationScope,
         input: crate::provider::SteerCommand,
@@ -829,6 +1058,121 @@ pub(crate) enum ForegroundJob {
 }
 
 impl ForegroundJob {
+    /// Static diagnostic label; never includes command or provider payloads.
+    pub(crate) fn diagnostic_name(&self) -> &'static str {
+        match self {
+            Self::AdmissionWorkspace(..) => "AdmissionWorkspace",
+            Self::ProviderPrepare(..) => "ProviderPrepare",
+            Self::QuestionCatalog(..) => "QuestionCatalog",
+            Self::Publication(..) => "Publication",
+            Self::FailurePublication(..) => "FailurePublication",
+            Self::FailureAdmissionEvents(..) => "FailureAdmissionEvents",
+            Self::AdmissionEvents(..) => "AdmissionEvents",
+            Self::CommandEvents(..) => "CommandEvents",
+            Self::AdmissionCleanup(..) => "AdmissionCleanup",
+            Self::AdmissionFailureCheckpoint(..) => "AdmissionFailureCheckpoint",
+            Self::FinalResponsePublication(..) => "FinalResponsePublication",
+            Self::ClarificationPublication(..) => "ClarificationPublication",
+            Self::CheckRepairPublication(..) => "CheckRepairPublication",
+            Self::PermissionPublication(..) => "PermissionPublication",
+            Self::CommandPublication(..) => "CommandPublication",
+            Self::AutoCompactionPublication(..) => "AutoCompactionPublication",
+            Self::ObservationPublication(..) => "ObservationPublication",
+            Self::FailureCheckpoint(..) => "FailureCheckpoint",
+            Self::FailureBaseline(..) => "FailureBaseline",
+            Self::RetractionGoal(..) => "RetractionGoal",
+            Self::PlanSubmission(..) => "PlanSubmission",
+            Self::LivePlanSubmission(..) => "LivePlanSubmission",
+            Self::LivePlanMutation(..) => "LivePlanMutation",
+            Self::PlanQuestion(..) => "PlanQuestion",
+            Self::GoalProgress(..) => "GoalProgress",
+            Self::ExecutionProgress(..) => "ExecutionProgress",
+            Self::TaskCompaction(..) => "TaskCompaction",
+            Self::Compaction(..) => "Compaction",
+            Self::CleanupForeground { .. } => "CleanupForeground",
+            Self::QuestionStop { .. } => "QuestionStop",
+            Self::PlanTerminalPublication { .. } => "PlanTerminalPublication",
+            Self::PriorObservation(..) => "PriorObservation",
+            Self::PriorInitial(..) => "PriorInitial",
+            Self::PriorFinal(..) => "PriorFinal",
+            Self::PlanScan(..) => "PlanScan",
+            Self::PlanMutation(..) => "PlanMutation",
+            Self::ExecutionControl { .. } => "ExecutionControl",
+            Self::ExecutionControlReport { .. } => "ExecutionControlReport",
+            #[cfg(test)]
+            Self::RevisionChecksUpdate { .. } => "RevisionChecksUpdate",
+            Self::AgentResult { .. } => "AgentResult",
+            Self::AgentCancelApprovals { .. } => "AgentCancelApprovals",
+            Self::AgentInterrupt { .. } => "AgentInterrupt",
+            Self::AgentSpawnSelect { .. } => "AgentSpawnSelect",
+            Self::AgentMessageSteer { .. } => "AgentMessageSteer",
+            Self::FinalCheckpoint(..) => "FinalCheckpoint",
+            Self::AutomaticCheckRefresh(..) => "AutomaticCheckRefresh",
+            Self::AutomaticCheckRun(..) => "AutomaticCheckRun",
+            Self::SettlementRefresh { .. } => "SettlementRefresh",
+            Self::SettlementCommit { .. } => "SettlementCommit",
+            Self::UserSteering { .. } => "UserSteering",
+            Self::SettleUserDelivery { .. } => "SettleUserDelivery",
+        }
+    }
+
+    /// Identify cleanup and settlement work that remains authorized after new invocation effects close.
+    pub(crate) fn is_collection(&self) -> bool {
+        match self {
+            Self::AdmissionCleanup(_)
+            | Self::AdmissionFailureCheckpoint(_)
+            | Self::FailureCheckpoint(_)
+            | Self::FailureBaseline(_)
+            | Self::RetractionGoal(_)
+            | Self::CleanupForeground { .. }
+            | Self::QuestionStop { .. }
+            | Self::PriorObservation(_)
+            | Self::PriorInitial(_)
+            | Self::PriorFinal(_)
+            | Self::AgentCancelApprovals { .. }
+            | Self::AgentInterrupt { .. }
+            | Self::FinalCheckpoint(_)
+            | Self::SettlementRefresh { .. }
+            | Self::SettlementCommit { .. }
+            | Self::SettleUserDelivery { .. }
+            | Self::GoalProgress(_)
+            | Self::ExecutionProgress(_)
+            | Self::PlanSubmission(_)
+            | Self::PlanMutation(_) => true,
+            #[cfg(test)]
+            Self::RevisionChecksUpdate { .. } => false,
+            Self::AdmissionWorkspace(_)
+            | Self::ProviderPrepare(_)
+            | Self::QuestionCatalog(_)
+            | Self::Publication(_)
+            | Self::FailurePublication(_)
+            | Self::FailureAdmissionEvents(_)
+            | Self::AdmissionEvents(_)
+            | Self::CommandEvents(_)
+            | Self::FinalResponsePublication(_)
+            | Self::ClarificationPublication(_)
+            | Self::CheckRepairPublication(_)
+            | Self::PermissionPublication(_)
+            | Self::CommandPublication(_)
+            | Self::AutoCompactionPublication(_)
+            | Self::ObservationPublication(_)
+            | Self::LivePlanMutation(_)
+            | Self::LivePlanSubmission(_)
+            | Self::PlanQuestion(_)
+            | Self::TaskCompaction(_)
+            | Self::Compaction(_)
+            | Self::PlanTerminalPublication { .. }
+            | Self::PlanScan(_)
+            | Self::ExecutionControl { .. }
+            | Self::ExecutionControlReport { .. }
+            | Self::AgentResult { .. }
+            | Self::AgentSpawnSelect { .. }
+            | Self::AgentMessageSteer { .. }
+            | Self::AutomaticCheckRefresh(_)
+            | Self::AutomaticCheckRun(_)
+            | Self::UserSteering { .. } => false,
+        }
+    }
     /// Identify presentation batches that must be delivered in session order.
     pub(crate) fn is_publication(&self) -> bool {
         matches!(
@@ -1004,7 +1348,7 @@ impl ForegroundJob {
                     });
                 Ok(ForegroundSignal::RetractionGoalRestored(result))
             }
-            Self::PlanSubmission(job) => {
+            Self::PlanSubmission(job) | Self::LivePlanSubmission(job) => {
                 Ok(ForegroundSignal::PlanSubmissionCompleted(job.run().await))
             }
             Self::PlanQuestion(job) => Ok(ForegroundSignal::PlanQuestionCompleted(job.run().await)),
@@ -1021,7 +1365,9 @@ impl ForegroundJob {
                 job.run().await,
             ))),
             Self::ProviderPrepare(job) => Ok(ForegroundSignal::ProviderPrepared(job.run().await)),
-            Self::PlanMutation(job) => Ok(ForegroundSignal::PlanMutationCompleted(job.run().await)),
+            Self::PlanMutation(job) | Self::LivePlanMutation(job) => {
+                Ok(ForegroundSignal::PlanMutationCompleted(job.run().await))
+            }
             Self::QuestionStop {
                 provider,
                 session_id,
@@ -1075,6 +1421,7 @@ impl ForegroundJob {
                 submission,
                 result: Box::new(job.run().await),
             }),
+            #[cfg(test)]
             Self::RevisionChecksUpdate { job, response } => {
                 Ok(ForegroundSignal::RevisionChecksUpdated {
                     response,
@@ -1191,7 +1538,11 @@ impl ForegroundJob {
                 checkout,
                 ready: Box::new(engine.wait_ready(scope).await),
             }),
-            Self::SettlementCommit { cell, undispatched } => {
+            Self::SettlementCommit {
+                cell,
+                requirement,
+                undispatched,
+            } => {
                 use crate::provider::session_execution::SettlementError;
                 for input in undispatched {
                     if let Err(error) = input.cancel_undispatched().await {
@@ -1218,7 +1569,10 @@ impl ForegroundJob {
                 };
                 let result = match checkout.ticket() {
                     Some(ticket) => ticket.commit().await,
-                    None => Err(SettlementError::Unavailable),
+                    None => match requirement {
+                        SettlementRequirement::Native => Err(SettlementError::Unavailable),
+                        SettlementRequirement::CollectedUndispatched => Ok(()),
+                    },
                 };
                 if result.is_ok() {
                     checkout.take();
@@ -1226,6 +1580,7 @@ impl ForegroundJob {
                 Ok(ForegroundSignal::SettlementCommitted(result))
             }
             Self::UserSteering {
+                flight,
                 engine,
                 scope,
                 input,
@@ -1235,13 +1590,13 @@ impl ForegroundJob {
                     .await
                     .map_err(anyhow::Error::from);
                 Ok(match input.settle_delivery(result).await {
-                    Ok(input) => ForegroundSignal::UserDeliverySettled(input),
+                    Ok(input) => ForegroundSignal::UserDeliverySettled(input, Some(flight)),
                     Err(error) => ForegroundSignal::EffectFailed(error),
                 })
             }
             Self::SettleUserDelivery { input, result } => {
                 Ok(match input.settle_delivery(result).await {
-                    Ok(input) => ForegroundSignal::UserDeliverySettled(input),
+                    Ok(input) => ForegroundSignal::UserDeliverySettled(input, None),
                     Err(error) => ForegroundSignal::EffectFailed(error),
                 })
             }
@@ -1250,6 +1605,17 @@ impl ForegroundJob {
 }
 
 impl ForegroundTransaction {
+    /// Reject later steering once native completion has been observed or retained.
+    pub(crate) fn accepts_steering(&self) -> bool {
+        self.native_open && self.pending_native_ready.is_none()
+    }
+
+    /// Close native polling when the broker consumes a result that collection may have queued first.
+    pub(crate) fn acknowledge_native_result(&mut self) {
+        self.native.acknowledge_result();
+        self.native_open = self.native.has_dispatched_task();
+    }
+
     /// Wait for one source without retaining the broker or presentation lock.
     pub(crate) async fn next(&mut self) -> Result<ForegroundSignal> {
         loop {
@@ -1290,6 +1656,7 @@ impl ForegroundTransaction {
             if self.native_goal.is_none()
                 && !self.observation_publication_in_flight
                 && !self.question_stop_pending
+                && self.steering.pending_deliveries.is_empty()
                 && self.pending_native_ready.is_some()
             {
                 // A bounded staging window is not the entire accepted observation prefix.
@@ -1312,11 +1679,15 @@ impl ForegroundTransaction {
             let watchdog = self.native.watchdog.clone();
             tokio::select! {
                 biased;
-                () = cancellation.cancelled() => return Ok(ForegroundSignal::Native(NativeForegroundSignal::Cancelled)),
-                () = cancellation.native_cancel_expired() => return Ok(ForegroundSignal::EffectFailed(
+                request = self.live_host_receiver.recv(), if self.live_host.is_none() && !self.live_host_receiver.is_closed() => {
+                    if let Some(request) = request { return Ok(ForegroundSignal::LiveHost(Box::new(request))); }
+                }
+                () = self.steering.pending_deliveries.changed.notified(), if self.pending_native_ready.is_some() => continue,
+                () = cancellation.cancelled(), if self.collection.is_none() => return Ok(ForegroundSignal::Native(NativeForegroundSignal::Cancelled)),
+                () = cancellation.native_cancel_expired(), if self.collection.is_none() => return Ok(ForegroundSignal::EffectFailed(
                     ProviderError::DeliveryUncertain.into(),
                 )),
-                expired = watchdog.expired() => {
+                expired = watchdog.expired(), if self.collection.is_none() => {
                     return Ok(ForegroundSignal::Native(NativeForegroundSignal::ToolExpired(expired?.context("tool watchdog ended during foreground execution")?)));
                 }
                 changed = self.question_changes.changed(), if self.question_enabled => {
@@ -1329,7 +1700,7 @@ impl ForegroundTransaction {
                         None => std::future::pending().await,
                     }
                 } => return Ok(ForegroundSignal::Checkpoint(checkpoint)),
-                input = self.steering.active.receive(), if self.user_delivery.is_empty() && self.steering.deferred.is_empty() => {
+                input = self.steering.active.receive(), if self.user_delivery.is_empty() && self.steering.deferred.is_empty() && self.pending_native_ready.is_none() => {
                     return Ok(ForegroundSignal::UserInput(input.context("parent input receiver closed")?));
                 }
                 delivery = self.user_delivery.join_next(), if !self.user_delivery.is_empty() => {
@@ -1355,7 +1726,9 @@ impl ForegroundTransaction {
                     let state = self.cleanup.borrow_and_update().clone();
                     if !matches!(state, ExecutionCleanup::Idle) { return Ok(ForegroundSignal::Cleanup(state)); }
                 }
-                native = self.native.next(), if self.native_open && !self.observation_publication_in_flight && self.pending_session_observations.len() < forge_protocol::MAX_PENDING_FRAMES => {
+                native = async {
+                    if self.collection.is_some() { self.native.next_collected().await } else { self.native.next().await }
+                }, if self.native_open && !self.observation_publication_in_flight && self.pending_session_observations.len() < forge_protocol::MAX_PENDING_FRAMES => {
                     let native = native?;
                     if matches!(&native, NativeForegroundSignal::NativeReady(_)) { self.native_open = false; }
                     return Ok(ForegroundSignal::Native(native));
@@ -1598,8 +1971,7 @@ pub(crate) enum ExecutionCleanup {
     #[default]
     Idle,
     Pending,
-    /// Native collection completed; settle the current exchange for configuration resumption.
-    RestartCollected,
+    #[cfg(test)]
     Failed(String),
 }
 
@@ -1610,7 +1982,6 @@ pub struct TurnCancellation {
     requested: Arc<AtomicBool>,
     submission_cancelled: Arc<AtomicBool>,
     restore_prompt: AtomicBool,
-    restart: AtomicBool,
     cleanup: tokio::sync::watch::Sender<ExecutionCleanup>,
     retraction_allowed: AtomicBool,
     notify: Notify,
@@ -1626,7 +1997,6 @@ impl TurnCancellation {
             requested: Arc::new(AtomicBool::new(false)),
             submission_cancelled: Arc::new(AtomicBool::new(false)),
             restore_prompt: AtomicBool::new(false),
-            restart: AtomicBool::new(false),
             cleanup: tokio::sync::watch::channel(ExecutionCleanup::Idle).0,
             retraction_allowed: AtomicBool::new(false),
             notify: Notify::new(),
@@ -1641,7 +2011,6 @@ impl TurnCancellation {
         self.requested.store(false, Ordering::Release);
         self.submission_cancelled.store(false, Ordering::Release);
         self.restore_prompt.store(false, Ordering::Release);
-        self.restart.store(false, Ordering::Release);
         self.cleanup.send_replace(ExecutionCleanup::Idle);
         self.retraction_allowed
             .store(retraction_allowed, Ordering::Release);
@@ -1664,6 +2033,7 @@ impl TurnCancellation {
     }
 
     /// Fence queued admission while the native owner settles its cancellation terminal.
+    #[cfg(test)]
     pub(crate) fn request_native_cancel(&self, restore_prompt: bool) {
         self.request_revision.fetch_add(1, Ordering::AcqRel);
         self.submission_cancelled.store(true, Ordering::Release);
@@ -1705,26 +2075,8 @@ impl TurnCancellation {
         }
     }
 
-    /// Interrupt provider execution while retaining the current exchange for resumption.
-    pub fn request_restart(&self) {
-        self.restart.store(true, Ordering::Release);
-        self.request_native_cancel(false);
-    }
-
-    /// Wake host restart finalization after native collection already established quiescence.
-    pub(crate) fn finish_restart_cleanup(&self) {
-        self.restart.store(true, Ordering::Release);
-        self.cleanup.send_replace(ExecutionCleanup::RestartCollected);
-    }
-
-    /// Retain provider delivery while cancellation waits for terminal execution evidence.
-    pub(crate) fn begin_cleanup(&self, restart: bool, restore_prompt: bool) -> Result<()> {
-        anyhow::ensure!(
-            matches!(*self.cleanup.borrow(), ExecutionCleanup::Idle)
-                || self.restart.load(Ordering::Acquire) == restart,
-            "pending cleanup cannot change between cancellation and restart"
-        );
-        self.restart.store(restart, Ordering::Release);
+    /// Retain provider delivery while the owner collects terminal execution evidence.
+    pub(crate) fn begin_cleanup(&self, restore_prompt: bool) -> Result<()> {
         self.restore_prompt.store(restore_prompt, Ordering::Release);
         self.submission_cancelled.store(true, Ordering::Release);
         self.cleanup.send_replace(ExecutionCleanup::Pending);
@@ -1732,6 +2084,7 @@ impl TurnCancellation {
     }
 
     /// Publish a retryable cleanup failure without dropping the provider consumer.
+    #[cfg(test)]
     pub(crate) fn fail_cleanup(&self, error: &ProviderError) {
         self.cleanup
             .send_replace(ExecutionCleanup::Failed(format!("{error:#}")));
@@ -1821,6 +2174,7 @@ pub struct HarnessBroker {
     question_model: Option<crate::settings::AskModel>,
     question_discussion: bool,
     pub(crate) questions: Arc<crate::question::QuestionController>,
+    pub(crate) question_events: Option<crate::exchange::QuestionEvents>,
     pub(crate) task_controller: Arc<crate::task::SessionTaskController>,
     context_usage_fresh: bool,
     pub(crate) lsp: Arc<crate::tools::lsp::LspService>,
@@ -2257,6 +2611,7 @@ impl HarnessBroker {
         let mut broker = Self {
             question_model: None,
             question_discussion: false,
+            question_events: None,
             questions,
             task_controller: Arc::new(crate::task::SessionTaskController::new(
                 observer.admission.clone(),
@@ -2448,6 +2803,9 @@ impl HarnessBroker {
             provider_completion: Default::default(),
             provider_continuation: None,
             questions: Some(self.questions.clone()),
+            question_events: self.question_events.clone(),
+            live_host_effects: None,
+            question_invocation: None,
             question_exchange_id: self
                 .exchange_runtime
                 .as_ref()
@@ -2483,6 +2841,7 @@ impl HarnessBroker {
                 crate::input::InputPurpose::TaskEntry { start, .. } => Some(start.clone()),
                 _ => None,
             },
+            task_authority_progress: None,
             task_permit: callback_snapshot
                 .as_ref()
                 .and_then(|(_, task)| task.as_ref().map(|task| task.permit())),
@@ -2774,29 +3133,9 @@ impl HarnessBroker {
                 candidate.params["operation_id"] = json!(id);
             }
             if method == RuntimeMethod::SessionQuestionContinue {
-                let prior = candidate.params["operation_id"]
-                    .as_str()
-                    .map(|id| self.store.load_task_operation(&self.session.id, id))
-                    .transpose()?
-                    .flatten();
-                let target =
-                    self.task_controller
-                        .current()?
-                        .and_then(|task| match task.workflow.clone() {
-                            crate::task::WorkflowSnapshot::Plan { plan } => plan
-                                .artifact
-                                .acceptance
-                                .map(|acceptance| (plan.artifact.id, acceptance.review_digest)),
-                            _ => None,
-                        });
-                crate::task::command::SessionCommand::question_continue(
-                    &candidate,
-                    prior.as_ref(),
-                    target,
-                )
-            } else {
-                crate::task::command::SessionCommand::parse_request(&candidate)
+                anyhow::bail!("workflow continuation must route through the session coordinator");
             }
+            crate::task::command::SessionCommand::parse_request(&candidate)
         })();
         let mut outcome = match command {
             Ok(Some(command)) => self.commit_session_command(command),
@@ -2964,20 +3303,20 @@ impl HarnessBroker {
                 let result = (serde_json::to_value(self.snapshot()?)?, Vec::new());
                 self.settle_automatic_checks(result, PromptMode::Chat).await
             }),
-            RuntimeMethod::SessionCheckList
-            | RuntimeMethod::SessionCheckOverride
-            | RuntimeMethod::SessionCheckRun
-            | RuntimeMethod::SessionCheckStatus
-            | RuntimeMethod::SessionCheckCancel => Box::pin(self.project_checks(method, params)),
+            RuntimeMethod::SessionCheckOverride => Box::pin(async {
+                anyhow::bail!(
+                    "check preferences must be submitted through the session command owner"
+                )
+            }),
+            RuntimeMethod::SessionCheckList | RuntimeMethod::SessionCheckStatus => {
+                Box::pin(self.project_checks(method, params))
+            }
             RuntimeMethod::SessionCommandApply => self.transition_task(params),
             RuntimeMethod::SessionProviderModelList => Box::pin(self.list_provider_model()),
             RuntimeMethod::SessionAgentStart => Box::pin(self.start_agent(params)),
             RuntimeMethod::SessionPromptSubmit => Box::pin(self.submit_prompt(params)),
             RuntimeMethod::SessionPlanAccept => Box::pin(std::future::ready(
                 self.dispatch_session_command("session.plan.accept", params),
-            )),
-            RuntimeMethod::SessionPlanAcceptanceBegin => Box::pin(std::future::ready(
-                self.dispatch_session_command("session.plan.acceptance.begin", params),
             )),
             RuntimeMethod::SessionPlanCheckUpdate => Box::pin(self.update_plan_checks(params)),
             RuntimeMethod::SessionPlanChangesRequest => Box::pin(std::future::ready(
@@ -2986,7 +3325,6 @@ impl HarnessBroker {
             RuntimeMethod::SessionPlanQuestionAnswer => Box::pin(async {
                 anyhow::bail!("plan review questions must route through the session coordinator")
             }),
-            RuntimeMethod::SessionQuestionAsk => Box::pin(self.ask_question(params)),
             RuntimeMethod::SessionQuestionContinue => Box::pin(async move {
                 if let Some(target) = params.get("target") {
                     let active = self
@@ -3019,9 +3357,6 @@ impl HarnessBroker {
                 }
                 self.continue_question().await
             }),
-            RuntimeMethod::SessionApprovalContinue => {
-                Box::pin(self.continue_after_approval_timeout())
-            }
             RuntimeMethod::SessionGoalSet => Box::pin(std::future::ready(
                 self.dispatch_session_command("session.goal.set", params),
             )),
@@ -3061,14 +3396,9 @@ impl HarnessBroker {
             self.save_session()?;
         }
         match method {
-            RuntimeMethod::SessionCheckEditingSet => Ok((
-                self.observer.set_check_editing(
-                    params["enabled"]
-                        .as_bool()
-                        .context("check editing requires enabled")?,
-                )?,
-                Vec::new(),
-            )),
+            RuntimeMethod::SessionCheckEditingSet => {
+                anyhow::bail!("check editing policy requires the session exchange owner")
+            }
             RuntimeMethod::SessionTaskGet => Ok((
                 serde_json::to_value(self.task_controller.current()?)?,
                 Vec::new(),
@@ -3173,9 +3503,6 @@ impl HarnessBroker {
             RuntimeMethod::SessionPromptHistoryRecord => self
                 .observer
                 .record_prompt_history(params, self.clock.now_ms()),
-            RuntimeMethod::SessionPlanAcceptanceCancel => {
-                self.dispatch_session_command("session.plan.acceptance.cancel", json!({}))
-            }
             RuntimeMethod::SessionPlanEntityRename => self.rename_plan_entity(params),
             RuntimeMethod::SessionPlanTestDelete => self.delete_plan_tests(params),
             RuntimeMethod::SessionPlanCancel => {
@@ -3218,8 +3545,7 @@ impl HarnessBroker {
                 self.release_lease()?;
                 Ok((json!({ "host.shutdown": true }), Vec::new()))
             }
-            RuntimeMethod::SessionTurnRestart
-            | RuntimeMethod::SessionInputApply
+            RuntimeMethod::SessionInputApply
             | RuntimeMethod::SessionInputGet
             | RuntimeMethod::SessionInputOperationGet
             | RuntimeMethod::SessionTurnSteer
@@ -3263,7 +3589,7 @@ impl HarnessBroker {
             self.task_controller.apply(
                 &mut self.store,
                 &task.permit(),
-                crate::task::TaskEvent::PlanArtifactUpdated(plan.clone()),
+                crate::task::TaskEvent::PlanArtifactUpdated(Box::new(plan.clone())),
                 self.clock.now_ms(),
             )
         } else {
@@ -4131,6 +4457,7 @@ impl HarnessBroker {
                 crate::agent::AgentCommand::Request {
                     request,
                     authority,
+                    target,
                     response,
                 } => {
                     if response.is_closed() {
@@ -4148,7 +4475,13 @@ impl HarnessBroker {
                     } else {
                         authority.is_none()
                     };
-                    let result = if authenticated {
+                    let scoped = target
+                        .as_ref()
+                        .map(|target| self.agent_coordinator.validate_target(target))
+                        .transpose();
+                    let result = if let Err(error) = scoped {
+                        Err(error)
+                    } else if authenticated {
                         self.handle_agent_request(*request, parent.as_deref_mut(), &mut event)
                             .await
                     } else {
@@ -4737,11 +5070,8 @@ impl HarnessBroker {
         ))
     }
 
-    fn answer_plan_acceptance_choice(
-        &mut self,
-        params: Value,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut plan = self.active_plan_acceptance()?;
+    fn answer_plan_review_choice(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let mut plan = self.active_plan_review()?;
         let question_id = required_text(&params, "question_id")?;
         let response: PlanQuestionResponse = serde_json::from_value(
             params
@@ -4749,7 +5079,7 @@ impl HarnessBroker {
                 .cloned()
                 .context("response is required")?,
         )?;
-        plan.acceptance
+        plan.review
             .as_mut()
             .context("active plan has no acceptance state")?
             .elicitation
@@ -4767,8 +5097,8 @@ impl HarnessBroker {
     }
 
     fn answer_question(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        if self.active_plan_has_acceptance()? {
-            return self.answer_plan_acceptance_choice(params);
+        if self.active_plan_has_review_questions()? {
+            return self.answer_plan_review_choice(params);
         }
         if self.active_plan_awaits_input()? {
             let (_, event) = self.answer_plan_question_choice(params)?;
@@ -4967,19 +5297,17 @@ impl HarnessBroker {
             }))
     }
 
-    fn active_plan_has_acceptance(&self) -> Result<bool> {
+    fn active_plan_has_review_questions(&self) -> Result<bool> {
         Ok(self
             .current_plan_id()?
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
             .flatten()
-            .is_some_and(|plan| {
-                plan.state == PlanState::AwaitingReview && plan.acceptance.is_some()
-            }))
+            .is_some_and(|plan| plan.review_questions().is_some()))
     }
 
-    fn active_plan_acceptance(&self) -> Result<PlanRecord> {
+    fn active_plan_review(&self) -> Result<PlanRecord> {
         let current_plan_id = self.current_plan_id()?;
         let plan_id = current_plan_id.as_deref().context("no active plan")?;
         let plan = self
@@ -4987,8 +5315,8 @@ impl HarnessBroker {
             .load_plan(plan_id)?
             .context("active plan record is missing")?;
         anyhow::ensure!(
-            plan.state == PlanState::AwaitingReview && plan.acceptance.is_some(),
-            "active plan has no pending acceptance"
+            plan.review_questions().is_some(),
+            "active plan has no review questions"
         );
         Ok(plan)
     }
@@ -5044,51 +5372,6 @@ impl HarnessBroker {
             exchange.append_input(intent, text, self.clock.now_ms())?;
         }
         self.store.save_exchange(&exchange)
-    }
-
-    async fn ask_plan_question(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut plan = self.active_elicitation_plan()?;
-        let question_id = required_text(&params, "question_id")?;
-        let text = required_text(&params, "text")?;
-        let elicitation = plan
-            .elicitation
-            .as_mut()
-            .context("active plan has no elicitation state")?;
-        anyhow::ensure!(
-            elicitation.question_set.id == question_id
-                || elicitation.question(&question_id).is_some(),
-            "clarification does not target a pending planning question"
-        );
-        elicitation.begin_clarification(&question_id)?;
-        let elicitation_json = serde_json::to_string_pretty(&elicitation)?;
-        let target = crate::exchange::QuestionInput {
-            set_id: elicitation.question_set.id.clone(),
-            question_id: Some(
-                elicitation
-                    .question(&question_id)
-                    .or_else(|| elicitation.current_question())
-                    .context("clarification has no pending question")?
-                    .id
-                    .clone(),
-            ),
-            answer: Vec::new(),
-        };
-        plan.updated_at_ms = self.clock.now_ms();
-        self.append_plan_feedback(
-            &plan.id,
-            text.clone(),
-            crate::exchange::InputIntent::Clarification,
-            Some(target),
-        )?;
-        self.publish_plan(&plan)?;
-        let (value, event) = self
-            .run_interaction(
-                PlanPrompt::clarification(&plan.request, &elicitation_json, &text),
-                PromptMode::Chat,
-                None,
-            )
-            .await?;
-        self.finish_plan_clarification(&plan.id, value, event).await
     }
 
     async fn finish_plan_clarification(
@@ -5149,57 +5432,6 @@ impl HarnessBroker {
             event.append(&mut next_event);
         }
         Ok((value, event))
-    }
-
-    async fn ask_question(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        anyhow::ensure!(
-            !self.active_plan_has_acceptance()?,
-            "plan acceptance questions do not support clarification turns"
-        );
-        if self.active_plan_awaits_input()? {
-            let (_, event) = self.ask_plan_question(params).await?;
-            return Ok((serde_json::to_value(self.snapshot()?)?, event));
-        }
-        let question_id = required_text(&params, "question_id")?;
-        let text = required_text(&params, "text")?;
-        let mut interaction = self.active_interaction_elicitation()?;
-        let elicitation = interaction
-            .elicitation_mut()
-            .context("active interaction has no elicitation state")?;
-        anyhow::ensure!(
-            elicitation.question_set.id == question_id
-                || elicitation.question(&question_id).is_some(),
-            "clarification does not target a pending Harness question"
-        );
-        elicitation.begin_clarification(&question_id)?;
-        let elicitation_json = serde_json::to_string_pretty(elicitation)?;
-        let target = crate::exchange::QuestionInput {
-            set_id: elicitation.question_set.id.clone(),
-            question_id: Some(
-                elicitation
-                    .question(&question_id)
-                    .or_else(|| elicitation.current_question())
-                    .context("clarification has no pending question")?
-                    .id
-                    .clone(),
-            ),
-            answer: Vec::new(),
-        };
-        interaction.append_question_input(
-            crate::exchange::InputIntent::Clarification,
-            text.clone(),
-            target,
-            self.clock.now_ms(),
-        )?;
-        self.store.save_exchange(&interaction)?;
-        let (value, event) = self
-            .run_interaction(
-                PlanPrompt::question_follow_up(&elicitation_json, &text),
-                self.task_prompt_mode()?,
-                None,
-            )
-            .await?;
-        self.finish_question_clarification(value, event).await
     }
 
     async fn finish_question_clarification(
@@ -5299,8 +5531,8 @@ impl HarnessBroker {
     }
 
     async fn continue_question(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        if self.active_plan_has_acceptance()? {
-            return self.continue_plan_acceptance().await;
+        if self.active_plan_has_review_questions()? {
+            return self.continue_plan_review().await;
         }
         if self.active_plan_awaits_input()? {
             let (_, event) = self.continue_plan_question().await?;
@@ -5365,41 +5597,6 @@ impl HarnessBroker {
         Ok((value, event))
     }
 
-    async fn continue_after_approval_timeout(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        let owner = crate::provider::ExecutionOwner::root(&self.session.id);
-        let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? else {
-            return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
-        };
-        if let Some(task) = self.task_controller.current()? {
-            if matches!(
-                task.status(),
-                crate::task::TaskStatus::Running | crate::task::TaskStatus::Waiting
-            ) {
-                let exchange = self
-                    .store
-                    .latest_exchange(&self.session.id)?
-                    .context("task has no completed turn")?;
-                self.task_controller.reserve_continuation(
-                    &mut self.store,
-                    &task.permit(),
-                    crate::task::TaskTurnId {
-                        exchange_ordinal: exchange.ordinal,
-                        turn_ordinal: exchange.turn.len(),
-                    },
-                    feedback,
-                    "An approval timed out".into(),
-                    self.clock.now_ms(),
-                )?;
-            }
-            return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
-        }
-        let mut admission = ExchangeAdmission::chat(feedback.clone());
-        admission.origin =
-            crate::exchange::ExchangeOrigin::task_continuation("An approval timed out");
-        self.run_interaction(feedback, PromptMode::Chat, Some(admission))
-            .await
-    }
-
     /// Publish canonical input ownership after a durable state transition.
     pub(crate) fn refresh_input_schedule(&self) -> Result<()> {
         let plan = if self.active_plan_awaits_input()? {
@@ -5432,7 +5629,7 @@ impl HarnessBroker {
                 .map(|(owner, input)| format!("{owner}:{}", input.question_set.id)),
             deadline: input.as_ref().and_then(|(_, input)| input.deadline.clone()),
             question_revision: input.as_ref().map(|(_, input)| input.revision),
-            approval_allowed: input.is_none() && !self.active_plan_has_acceptance()?,
+            approval_allowed: input.is_none() && !self.active_plan_has_review_questions()?,
             ..Default::default()
         };
         self.observer
@@ -5441,26 +5638,19 @@ impl HarnessBroker {
         Ok(())
     }
 
-    /// Resolve expired input only while holding the owning session's execution admission.
-    pub(crate) fn expire_input(
-        &mut self,
-        active_deadline: &mut Option<(String, crate::session::InputDeadline)>,
-    ) -> Result<Option<Request>> {
-        if self.turn_cancellation.requested.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        *active_deadline = None;
-        let owner = crate::provider::ExecutionOwner::root(&self.session.id);
-        if !self.active_plan_has_acceptance()?
-            && self.permission_coordinator.has_timeout_feedback(&owner)?
+    /// Revalidate timeout evidence only when the exchange owner considers automatic work eligible.
+    pub(crate) fn approval_timeout_ready(&mut self, revision: u64) -> Result<bool> {
+        self.refresh_input_schedule()?;
+        let current = self.observer.input_schedule.borrow();
+        if current.revision != revision
+            || !current.approval_allowed
+            || self.turn_cancellation.requested.load(Ordering::Acquire)
         {
-            return Ok(Some(Request {
-                id: 0,
-                method: "session.approval.continue".into(),
-                params: json!({}),
-            }));
+            return Ok(false);
         }
-        Ok(None)
+        let owner = crate::provider::ExecutionOwner::root(&self.session.id);
+        Ok(!self.active_plan_has_review_questions()?
+            && self.permission_coordinator.has_timeout_feedback(&owner)?)
     }
 
     fn active_elicitation_plan(&self) -> Result<PlanRecord> {
@@ -6357,7 +6547,9 @@ impl HarnessBroker {
         input: crate::provider::SteerCommand,
     ) -> ForegroundAction {
         if self.provider.descriptor().capability.native_steer {
+            transaction.steering.refresh_readiness = true;
             ForegroundAction::Effect(ForegroundJob::UserSteering {
+                flight: transaction.steering.pending_deliveries.retain(),
                 engine: transaction.engine.clone(),
                 scope: transaction.state.scope.clone(),
                 input,
@@ -6602,7 +6794,7 @@ impl HarnessBroker {
             self.reopened_execution.end_settlement(&scope);
         }
         let (mut continuation, _, events, effects) =
-            self.stage_interaction_for_turn("", true, self.clock.now_ms())?;
+            self.stage_interaction_for_turn("", true, self.clock.now_ms(), None)?;
         continuation.origin = crate::exchange::ExchangeOrigin::task_continuation(
             "The native goal requires another turn",
         );
@@ -6967,6 +7159,9 @@ impl HarnessBroker {
         transaction: &ForegroundTransaction,
         owned: &OwnedAgentRequest,
     ) -> Result<()> {
+        if let Some(target) = &owned.target {
+            self.agent_coordinator.validate_target(target)?;
+        }
         anyhow::ensure!(
             owned.parent_id == transaction.state.interaction.id,
             "child request belongs to another parent exchange"
@@ -7017,6 +7212,7 @@ impl HarnessBroker {
             crate::agent::AgentCommand::Request {
                 request,
                 authority,
+                target,
                 response,
             } => {
                 if response.is_closed() {
@@ -7025,6 +7221,7 @@ impl HarnessBroker {
                 let owned = OwnedAgentRequest {
                     request: *request,
                     authority,
+                    target,
                     response,
                     parent_id: transaction.state.interaction.id.clone(),
                 };
@@ -7855,6 +8052,7 @@ impl HarnessBroker {
                 let _ = response.send(result);
                 Ok(ForegroundAction::Wait)
             }
+            #[cfg(test)]
             RevisionReviewRequest::Decide {
                 method,
                 params,
@@ -7902,9 +8100,6 @@ impl HarnessBroker {
                     RuntimeMethod::SessionPlanEntityRename | RuntimeMethod::SessionPlanTestDelete
                 );
                 let result = match method {
-                    RuntimeMethod::SessionPlanAcceptanceBegin => {
-                        self.dispatch_session_command("session.plan.acceptance.begin", params)
-                    }
                     RuntimeMethod::SessionPlanChangesRequest => {
                         self.dispatch_session_command("session.plan.changes.request", params)
                     }
@@ -7946,6 +8141,7 @@ impl HarnessBroker {
     }
 
     /// Revalidate and commit a completed revision check edit.
+    #[cfg(test)]
     pub(crate) fn apply_foreground_revision_checks(
         &mut self,
         transaction: &mut ForegroundTransaction,
@@ -8059,20 +8255,21 @@ impl HarnessBroker {
                 let payload = publication::encode_session_update(&update)?;
                 self.trace
                     .record(&self.session.id, "lua.event.emitted", payload.clone());
-                if self.event_sink.is_some() {
-                    updates.push(update);
-                } else {
-                    events.push(self.event("provider_event", payload)?);
+                if self.event_sink.is_none() {
+                    events.push(publication::encode_session_event(
+                        &self.session.id,
+                        &update,
+                    )?);
                 }
+                updates.push(update);
             }
             if let Some(patch) = timeline
                 && !patch.is_empty()
             {
-                if self.event_sink.is_some() {
-                    updates.push(SessionUpdate::DocumentChanged { patch });
-                } else {
+                if self.event_sink.is_none() {
                     events.push(self.event("document_changed", patch.notification())?);
                 }
+                updates.push(SessionUpdate::DocumentChanged { patch });
             }
         }
         Ok(PendingProviderDelivery {
@@ -8449,7 +8646,7 @@ impl HarnessBroker {
                             }
                         interaction.observe_blocker("agent_wait".into(), false, now_ms);
                         runtime.active_wait = None;
-                        interaction.append_identified_input(
+                        interaction.append_acknowledged_input(
                             input_id.clone(),
                             crate::exchange::InputIntent::Steering,
                             text.clone(),
@@ -8830,35 +9027,6 @@ impl HarnessBroker {
         Ok(())
     }
 
-    async fn emit_timeline_patch(
-        &mut self,
-        timeline_patch: TimelinePatch,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
-        if timeline_patch.is_empty() {
-            return Ok(());
-        }
-        if let Some(event_sink) = self.event_sink.as_ref() {
-            let delivery = event_sink
-                .send_wait(SessionUpdate::DocumentChanged {
-                    patch: timeline_patch.clone(),
-                })
-                .await;
-            if let Err(error) = delivery {
-                self.trace.record(
-                    &self.session.id,
-                    "presentation.delivery_failed",
-                    json!({"error":error.to_string()}),
-                );
-                self.event_sink = None;
-                return Err(error.into());
-            }
-        } else {
-            event.push(self.event("document_changed", timeline_patch.notification())?);
-        }
-        Ok(())
-    }
-
     pub(crate) fn presentation(&self) -> Arc<std::sync::Mutex<SessionPresentation>> {
         Arc::clone(&self.presentation)
     }
@@ -8950,7 +9118,7 @@ impl HarnessBroker {
         now_ms: i64,
     ) -> Result<(Exchange, bool, Vec<SessionEvent>)> {
         let (interaction, admitted, mut events, effects) =
-            self.stage_interaction_for_turn(text, admit_exchange, now_ms)?;
+            self.stage_interaction_for_turn(text, admit_exchange, now_ms, None)?;
         for effect in effects {
             let delivery = self.prepare_provider_delivery(effect)?;
             events.extend(delivery.deliver().await?);
@@ -8964,13 +9132,15 @@ impl HarnessBroker {
         text: &str,
         admit_exchange: bool,
         now_ms: i64,
+        selected: Option<&crate::provider::ExchangeId>,
     ) -> Result<(Exchange, bool, Vec<SessionEvent>, Vec<AppliedProviderEvent>)> {
         let current = self.store.current_exchange_state(&self.session.id)?;
         if !admit_exchange {
-            let mut interaction = self
-                .store
-                .latest_exchange(&self.session.id)?
-                .context("continuation has no originating exchange")?;
+            let mut interaction = match selected {
+                Some(selected) => self.store.load_exchange(selected.as_str())?,
+                None => self.store.latest_exchange(&self.session.id)?,
+            }
+            .context("continuation has no originating exchange")?;
             interaction.resume(now_ms)?;
             return Ok((interaction, false, Vec::new(), Vec::new()));
         }
@@ -9112,7 +9282,7 @@ impl HarnessBroker {
         let records = trace.stage("delete.persist_records");
         plan.document_version = document.version;
         plan.review_digest = Some(checksum);
-        plan.acceptance = None;
+        plan.review = None;
         let change = format!(
             "Removed planned tests: {}",
             selected
@@ -9213,21 +9383,15 @@ impl HarnessBroker {
                 new_name.clone(),
             )?;
             let rendered = self.plan_file.render_review(&result.document)?;
-            let expected = result.document.clone();
-            let (document, rendered, digest) = self.plan_file.persist_review_draft_if_unchanged(
-                &self.session.id,
-                &expected,
-                crate::plan::PlanReviewRevision::new(&plan.id, result.document, rendered)?,
-                Some(&trace),
-            )?;
-            (previous, document, rendered, digest)
+            let digest = crate::plan::digest(&crate::codec::to_vec(&result.document)?);
+            (previous, result.document, rendered, digest)
         };
         let records = trace.stage("rename.persist_records");
         let version = document.version;
         plan.document_version = version;
         plan.title.clone_from(&document.title);
         plan.review_digest = Some(digest);
-        plan.acceptance = None;
+        plan.review = None;
         let change = format!("Renamed {previous_name} to {new_name}");
         plan.manual_changes.push(change);
         plan.updated_at_ms = self.clock.now_ms();
@@ -9249,10 +9413,10 @@ impl HarnessBroker {
         ))
     }
 
-    async fn continue_plan_acceptance(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan = self.active_plan_acceptance()?;
+    async fn continue_plan_review(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
+        let plan = self.active_plan_review()?;
         let acceptance = plan
-            .acceptance
+            .review
             .as_ref()
             .context("active plan has no acceptance state")?;
         let approval_mode = acceptance.approval_mode()?;
@@ -9472,6 +9636,116 @@ impl HarnessBroker {
         Ok(())
     }
 
+    /// Capture the retained preview selected by a transport request.
+    pub(crate) fn rollback_token(
+        &self,
+        preview_id: &str,
+    ) -> std::result::Result<
+        crate::exchange::rollback::PreparedRollbackToken,
+        crate::exchange::rollback::RollbackFailure,
+    > {
+        let preview = crate::checkpoint::RestorePreview::load(
+            &self.store.objects,
+            &self.session.id,
+            preview_id,
+        )
+        .map_err(|_| crate::exchange::rollback::RollbackFailure::AuthorityUnavailable)?;
+        let mut token = crate::exchange::rollback::PreparedRollbackToken::capture(&preview)?;
+        if let Some(original) = &preview.recovery_of {
+            let revision = self.restore_revision()?;
+            if &revision.preview_id != original {
+                return Err(crate::exchange::rollback::RollbackFailure::StaleAuthority);
+            }
+            if let crate::exchange::rollback::PreparedRollbackToken::Workspace {
+                recovery, ..
+            } = &mut token
+            {
+                *recovery = Some(revision);
+            }
+        }
+        Ok(token)
+    }
+
+    /// Capture interrupted restore authority for a transport recovery request.
+    pub(crate) fn restore_revision(
+        &self,
+    ) -> std::result::Result<
+        crate::exchange::rollback::RestoreRevision,
+        crate::exchange::rollback::RollbackFailure,
+    > {
+        let journal =
+            crate::checkpoint::RestoreJournal::load(&self.store.objects, &self.session.id)
+                .map_err(|_| crate::exchange::rollback::RollbackFailure::AuthorityUnavailable)?
+                .ok_or(crate::exchange::rollback::RollbackFailure::JournalMissing)?;
+        crate::exchange::rollback::RestoreRevision::capture(&journal)
+    }
+
+    /// Capture file and history authority before a rollback enters the FIFO.
+    pub(crate) fn capture_rollback(
+        &self,
+        command: &crate::exchange::rollback::RollbackCommand,
+    ) -> std::result::Result<
+        crate::exchange::rollback::RollbackCommand,
+        crate::exchange::rollback::RollbackFailure,
+    > {
+        use crate::exchange::rollback::{PreparedRollbackToken, RollbackCommand, RollbackFailure};
+        let mut captured = command.clone();
+        match &mut captured {
+            RollbackCommand::Prepare(selection)
+            | RollbackCommand::Apply(PreparedRollbackToken::Conversation { selection }) => {
+                let exchanges = self
+                    .store
+                    .list_exchange(&self.session.id)
+                    .map_err(|_| RollbackFailure::AuthorityUnavailable)?;
+                if !exchanges
+                    .last()
+                    .is_some_and(|exchange| exchange.id == selection.latest_exchange_id)
+                {
+                    return Err(RollbackFailure::StaleAuthority);
+                }
+                selection.capture_history(&exchanges)?;
+            }
+            RollbackCommand::Apply(PreparedRollbackToken::Workspace {
+                preview_id,
+                digest,
+                recovery,
+            }) => {
+                let preview = crate::checkpoint::RestorePreview::load(
+                    &self.store.objects,
+                    &self.session.id,
+                    preview_id,
+                )
+                .map_err(|_| RollbackFailure::AuthorityUnavailable)?;
+                PreparedRollbackToken::Workspace {
+                    preview_id: preview_id.clone(),
+                    digest: digest.clone(),
+                    recovery: recovery.clone(),
+                }
+                .validate(&preview)?;
+                if let Some(revision) = recovery {
+                    let journal = crate::checkpoint::RestoreJournal::load(
+                        &self.store.objects,
+                        &self.session.id,
+                    )
+                    .map_err(|_| RollbackFailure::AuthorityUnavailable)?
+                    .ok_or(RollbackFailure::JournalMissing)?;
+                    revision.validate(&journal)?;
+                } else if preview.recovery_of.is_some() {
+                    return Err(RollbackFailure::StaleAuthority);
+                }
+            }
+            RollbackCommand::ResumeRestore(revision)
+            | RollbackCommand::PrepareUndoRestore(revision) => {
+                let journal =
+                    crate::checkpoint::RestoreJournal::load(&self.store.objects, &self.session.id)
+                        .map_err(|_| RollbackFailure::AuthorityUnavailable)?
+                        .ok_or(RollbackFailure::JournalMissing)?;
+                revision.validate(&journal)?;
+            }
+        }
+        Ok(captured)
+    }
+
     async fn prepare_rollback(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         anyhow::ensure!(
             self.agent_coordinator.active_count() == 0,
@@ -9628,9 +9902,31 @@ impl HarnessBroker {
         &mut self,
         mut journal: crate::checkpoint::RestoreJournal,
     ) -> Result<(Value, Vec<SessionEvent>)> {
-        let events = self
-            .finish_conversation_rollback(&journal.preview.exchange_ids)
-            .await?;
+        // A host exit after the database commit leaves FilesComplete evidence.
+        // Reconcile that commit rather than mutating the task or provider twice.
+        let history = self.store.list_exchange(&self.session.id)?;
+        let committed = !journal.preview.exchange_ids.is_empty()
+            && journal
+                .preview
+                .exchange_ids
+                .iter()
+                .enumerate()
+                .all(|(index, id)| {
+                    let expected = if index == 0 {
+                        crate::exchange::HistoryDisposition::RolledBack
+                    } else {
+                        crate::exchange::HistoryDisposition::Superseded
+                    };
+                    history
+                        .iter()
+                        .any(|exchange| &exchange.id == id && exchange.disposition() == expected)
+                });
+        let events = if committed {
+            Vec::new()
+        } else {
+            self.finish_conversation_rollback(&journal.preview.exchange_ids)
+                .await?
+        };
         journal.state = crate::checkpoint::RestoreState::Complete;
         journal.save(&self.store.objects)?;
         Ok((json!({"restored":true}), events))
@@ -10144,132 +10440,28 @@ impl HarnessBroker {
         })
     }
 
+    /// Preserve the local driver's compatibility entry while sharing owned compaction settlement.
     async fn compact_session(&mut self, manual: bool) -> Result<(Value, Vec<SessionEvent>)> {
-        anyhow::ensure!(
-            self.capability.native_compact,
-            "current provider does not support context compaction"
-        );
-        anyhow::ensure!(
-            self.session.provider_session_id.is_some(),
-            "current session has no provider conversation to compact"
-        );
-        let now_ms = self.clock.now_ms();
-        let mut compaction = crate::provider::Compaction {
-            id: Uuid::new_v4().to_string(),
-            thread_id: self
-                .session
-                .provider_session_id
-                .clone()
-                .expect("validated provider conversation"),
-            state: crate::provider::CompactionState::Running,
-            manual,
-            started_at_ms: Some(now_ms),
-            completed_at_ms: None,
-            result: crate::provider::CompactionResult {
-                context_tokens_before: self.session.context_usage.as_ref().map(|usage| usage.used),
-                ..Default::default()
-            },
-        };
-        let mut record = SessionEventRecord {
-            id: format!("{}:compaction:{}", self.session.id, compaction.id),
-            session_id: self.session.id.clone(),
-            owner: crate::timeline::TimelineOwner::session(&self.session.id),
-            created_at_ms: now_ms,
-            detail: SessionEventKind::Compaction {
-                compaction: (compaction.clone()).into(),
-            },
-        };
-        self.store.save_session_event(&record)?;
-        let mut event = Vec::new();
-        let patch = self.reconcile_timeline()?;
-        self.emit_timeline_patch(patch, &mut event).await?;
-        let result = self
-            .provider
-            .compact(crate::provider::ProviderCompactionRequest {
-                id: compaction.id.clone(),
-                request: self.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
-            })
-            .await;
-        compaction.completed_at_ms = Some(self.clock.now_ms());
-        let output = match result {
-            Ok(output) => output,
-            Err(error) => {
-                compaction.state = crate::provider::CompactionState::Failed;
-                compaction.result.diagnostic = Some(crate::provider::lifecycle_error::diagnostic(
-                    forge_provider_api::ProviderOperation::CompactSession,
-                    &error,
-                ));
-                record.detail = SessionEventKind::Compaction {
-                    compaction: compaction.into(),
-                };
-                self.store.save_session_event(&record)?;
-                let patch = self.reconcile_timeline()?;
-                self.emit_timeline_patch(patch, &mut event).await?;
-                return Err(error.into());
+        let provenance = if manual {
+            compaction::CompactionProvenance::Manual
+        } else {
+            compaction::CompactionProvenance::Automatic {
+                turn_id: self
+                    .session
+                    .last_compaction_turn
+                    .clone()
+                    .context("automatic compaction requires its authorizing turn")?,
             }
         };
-        let observed = output.event.iter().rev().find_map(|event| match event {
-            ProviderEvent::Compaction { update, .. } => Some(update.clone()),
-            _ => None,
-        });
-        let output = output.completion;
-        let context_tokens_before = compaction.result.context_tokens_before;
-        if let Some(observed) = observed {
-            compaction.state = observed.state;
-            compaction.result = observed.result;
-        } else {
-            compaction.state = crate::provider::CompactionState::Completed;
+        let (job, started) = self.prepare_owned_compaction(provenance)?;
+        let mut events = started.deliver_and_flush().await?;
+        let result = job.run().await;
+        let (completed, failure, _) = self.commit_owned_compaction(result)?;
+        events.extend(completed.deliver_and_flush().await?);
+        if let Some(error) = failure {
+            return Err(error);
         }
-        compaction.result.context_tokens_before = context_tokens_before;
-        if compaction.state == crate::provider::CompactionState::Completed {
-            compaction.result.context_tokens_after = output
-                .metrics
-                .context_usage
-                .as_ref()
-                .map(|usage| usage.used);
-        }
-        let failed = compaction.state == crate::provider::CompactionState::Failed;
-        let failure =
-            forge_provider_api::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::CompactSession,
-                compaction.result.diagnostic.as_ref().map_or(
-                    forge_provider_api::ProviderFailureKind::Unknown,
-                    |diagnostic| diagnostic.kind,
-                ),
-            ));
-        record.detail = SessionEventKind::Compaction {
-            compaction: compaction.into(),
-        };
-        self.store.save_session_event(&record)?;
-        self.capability = output.native.capability.clone();
-        self.session.native_fork = output.native.capability.native_fork;
-        self.session.native_compact = output.native.capability.native_compact;
-        if let Some(provider_session_id) = output.native.provider_session_id {
-            self.session.provider_session_id = Some(provider_session_id.into());
-        }
-        if let Some(context_usage) = output.native.metrics.context_usage {
-            let size = self
-                .session
-                .context_usage
-                .as_ref()
-                .map_or(context_usage.size, |current| current.size);
-            self.session.context_usage = ContextUsage::reported(context_usage.used, size);
-        }
-        if !output.native.runtime.provider.is_empty() {
-            self.session.provider_label = output.native.runtime.provider;
-        }
-        if output.native.runtime.model.is_some() {
-            self.session.resolved_model = output.native.runtime.model;
-        }
-        self.save_session()?;
-        let snapshot = self.snapshot()?;
-        let patch = self.reconcile_timeline()?;
-        self.emit_timeline_patch(patch, &mut event).await?;
-        if failed {
-            return Err(failure.into());
-        }
-        event.push(self.event("context_compacted", serde_json::to_value(&snapshot)?)?);
-        Ok((serde_json::to_value(&snapshot)?, event))
+        Ok((serde_json::to_value(self.snapshot()?)?, events))
     }
 
     fn snapshot_for_session(&mut self, session: HarnessSession) -> Result<BrokerSnapshot> {
@@ -10287,49 +10479,20 @@ impl HarnessBroker {
         snapshot
     }
 
+    /// Bind the current foreground's input decorations and tool context to an invocation snapshot.
     fn provider_request(&self, input: ProviderInput, mode: PromptMode) -> Result<ProviderRequest> {
-        let mut request = ProviderRequest {
-            execution_owner: None,
-            harness_session_id: self.session.id.clone(),
-            workspace: self.session.workspace.clone(),
-            input: if self.submitted_attachments.is_empty() {
-                input
-            } else {
-                input.with_attachments(self.submitted_attachments.clone())
-            },
-            mode: if self.session.background.is_some() {
-                PromptMode::Background
-            } else {
-                mode
-            },
-            model: self.session.model.clone(),
-            effort: self.session.effort.clone(),
-            context_window: self.session.context_window.clone(),
-            service_tier: self.session.service_tier,
-            access: {
-                let mut access = self.session.access.clone();
-                if self.question_discussion {
-                    access.sandbox = true;
-                    access.write_access = crate::session::WriteScope::Off;
-                    access.writable_directory.clear();
-                }
-                access
-            },
-            approval_mode: self.session.approval_mode,
-            provider_session_id: self
-                .session
-                .provider_session_id
-                .clone()
-                .map(TryInto::try_into)
-                .transpose()?,
-            submission: None,
-            recovered_input: Vec::new(),
-            control_context: self.control_turn_context(if self.session.background.is_some() {
-                PromptMode::Background
-            } else {
-                mode
-            }),
-        };
+        let mut request = self.input_submission_request(input, mode)?;
+        if !self.submitted_attachments.is_empty() {
+            request.input = request
+                .input
+                .with_attachments(self.submitted_attachments.clone());
+        }
+        if self.question_discussion {
+            request.access.sandbox = true;
+            request.access.write_access = crate::session::WriteScope::Off;
+            request.access.writable_directory.clear();
+        }
+        request.control_context = self.control_turn_context(request.mode);
         if let Some(selection) = &self.question_model {
             request.model = selection
                 .model
@@ -10569,31 +10732,8 @@ mod test {
         expired.await;
     }
 
-    /// A collected restart must release host ownership without another native terminal event.
-    #[tokio::test]
-    async fn collected_restart_wakes_finalization_without_native_terminal() {
-        let cancellation = super::TurnCancellation::new();
-        cancellation.begin_cleanup(true, false).unwrap();
-        let mut cleanup = cancellation.cleanup.subscribe();
-        cancellation.finish_restart_cleanup();
-        cleanup.changed().await.unwrap();
-        assert!(matches!(*cleanup.borrow(), super::ExecutionCleanup::RestartCollected));
-        assert!(!cancellation.requested.load(std::sync::atomic::Ordering::Acquire));
-        assert!(
-            cancellation
-                .restart
-                .load(std::sync::atomic::Ordering::Acquire)
-        );
-        assert!(
-            cancellation
-                .native_cancel_deadline
-                .lock()
-                .unwrap()
-                .is_none()
-        );
-    }
-
     include!("workflow_test.rs");
+
     fn completed_message(
         turn: &crate::provider::TurnAddress,
         id: impl Into<String>,
@@ -11522,13 +11662,13 @@ mod test {
             let cancel = async {
                 signals.started.notified().await;
                 if cleanup_before_completion {
-                    cancellation.begin_cleanup(false, restore_prompt)?;
+                    cancellation.begin_cleanup(restore_prompt)?;
                     provider.cleanup_execution(&session_id).await?;
                 } else {
                     signals.complete.notify_one();
                     signals.settled.notified().await;
                     tokio::task::yield_now().await;
-                    cancellation.begin_cleanup(false, restore_prompt)?;
+                    cancellation.begin_cleanup(restore_prompt)?;
                 }
                 cancellation.request(restore_prompt);
                 Ok::<_, anyhow::Error>(())
@@ -11753,7 +11893,6 @@ mod test {
             ),
             exchange_id: Some(interrupted.id.clone()),
             created_at_ms: 3,
-            resume_after_transition: false,
         })?;
         drop(broker);
         let mut reopened = planning_question_broker(repository.path(), data.path(), false);
@@ -12374,7 +12513,6 @@ mod test {
             error: None,
             exchange_id: None,
             created_at_ms: 1,
-            resume_after_transition: false,
         };
         let task = broker.task_controller.current().unwrap().unwrap();
         broker
@@ -12434,7 +12572,6 @@ mod test {
             error: None,
             exchange_id: None,
             created_at_ms: 1,
-            resume_after_transition: false,
         };
         let admitted = broker
             .task_controller
@@ -12523,7 +12660,6 @@ mod test {
             error: Some("provider failed".into()),
             exchange_id: Some(exchange.id.clone()),
             created_at_ms: 1,
-            resume_after_transition: false,
         };
         broker.store.admit_task_operation(&operation).unwrap();
         assert_eq!(
@@ -13013,6 +13149,78 @@ mod test {
     }
 
     #[tokio::test]
+    async fn retired_acceptance_cancellation_preserves_review_state_and_history() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let result = broker
+            .dispatch(Request {
+                id: 1,
+                method: "session.prompt.submit".into(),
+                params: json!({"text":"/plan retain the review questions"}),
+            })
+            .await;
+        assert!(
+            result.response.error().is_none(),
+            "{:?}",
+            result.response.error()
+        );
+        run_plan_to_input_boundary(&mut broker).await.unwrap();
+        let plan = broker.snapshot().unwrap().active_plan.unwrap();
+        broker.capability.approval_mode_list =
+            vec![ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow];
+        broker
+            .dispatch_session_command(
+                "session.plan.accept",
+                json!({"plan_id":plan.id,"digest":plan.review_digest}),
+            )
+            .unwrap();
+        let before = serde_json::to_value(broker.snapshot().unwrap()).unwrap();
+        assert!(!before["active_elicitation"].is_null());
+        let stored = serde_json::to_value(broker.store.load_plan(&plan.id).unwrap()).unwrap();
+        let history = serde_json::to_value(
+            broker
+                .store
+                .list_plan_lifecycle(&broker.session.id)
+                .unwrap(),
+        )
+        .unwrap();
+        let result = broker
+            .dispatch(Request {
+                id: 2,
+                method: "session.plan.acceptance.cancel".into(),
+                params: json!({"plan_id":plan.id,"operation_id":"retired-cancel"}),
+            })
+            .await;
+        assert_eq!(result.response.error().unwrap().code, "unknown_method");
+        assert!(result.event.is_empty());
+        let after = serde_json::to_value(broker.snapshot().unwrap()).unwrap();
+        assert_eq!(after["active_elicitation"], before["active_elicitation"]);
+        assert_eq!(after["active_plan"], before["active_plan"]);
+        assert_eq!(
+            serde_json::to_value(broker.store.load_plan(&plan.id).unwrap()).unwrap(),
+            stored
+        );
+        assert_eq!(
+            serde_json::to_value(
+                broker
+                    .store
+                    .list_plan_lifecycle(&broker.session.id)
+                    .unwrap()
+            )
+            .unwrap(),
+            history
+        );
+        assert!(
+            broker
+                .store
+                .load_task_operation(&broker.session.id, "retired-cancel")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn deleting_selected_plan_tests_preserves_other_cases_and_rejects_stale_confirmation() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
@@ -13240,15 +13448,6 @@ mod test {
         broker.capability.approval_mode_list =
             vec![ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow];
         broker.snapshot().unwrap();
-        broker
-            .dispatch_session_command(
-                "session.plan.acceptance.begin",
-                json!({"plan_id":plan.id,"digest":draft.review_digest}),
-            )
-            .unwrap();
-        broker
-            .dispatch_session_command("session.plan.acceptance.cancel", json!({}))
-            .unwrap();
         let selected_task =
             serde_json::to_value(broker.task_controller.current().unwrap()).unwrap();
         assert!(
@@ -14311,277 +14510,6 @@ mod test {
         }));
     }
 
-    fn restart_provider(
-        broker: &HarnessBroker,
-        cancellation: Arc<TurnCancellation>,
-        clarification: bool,
-    ) -> (Arc<Provider>, Arc<std::sync::atomic::AtomicUsize>) {
-        let descriptor = forge_provider_api::ProviderDescriptor {
-            kind: forge_providers::registry::nonselectable_id()
-                .expect("fixture identity is available"),
-            label: "Restart lifecycle fixture".into(),
-            capability: Default::default(),
-        };
-        let invocation = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let native_invocation = invocation.clone();
-        let native = crate::provider::test_support::EventFixtureProvider::new(
-            descriptor,
-            move |request, sink, _cancelled| {
-                let invocation = native_invocation.clone();
-                let cancellation = cancellation.clone();
-                async move {
-                    use forge_provider_api::lifecycle::{
-                        ExecutionObservation, ExecutionResult, ExecutionUpdate,
-                    };
-                    use forge_provider_api::{ProviderEvent, TurnAddress};
-
-                    let attempt = invocation.fetch_add(1, Ordering::SeqCst);
-                    let address = TurnAddress {
-                        scope: request.scope.clone(),
-                        thread_id: "restart-thread".into(),
-                        turn_id: format!("turn-{attempt}").into(),
-                    };
-                    sink.send_wait(ProviderEvent::Execution {
-                        observation: ExecutionObservation::new(
-                            request.scope.clone(),
-                            ExecutionUpdate::Started {
-                                address: address.clone(),
-                            },
-                        )?,
-                    })
-                    .await?;
-                    sink.send_wait(ProviderEvent::Turn {
-                        address: address.clone(),
-                        update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
-                    })
-                    .await?;
-                    if attempt == 0 {
-                        cancellation.request_restart();
-                        sink.send_wait(ProviderEvent::Turn {
-                            address: address.clone(),
-                            update: crate::provider::TurnUpdate::Finished {
-                                outcome: forge_provider_api::turn::TurnOutcome::Interrupted,
-                                completed_at_ms: 100,
-                            },
-                        })
-                        .await?;
-                        sink.send_wait(ProviderEvent::Execution {
-                            observation: ExecutionObservation::new(
-                                request.scope.clone(),
-                                ExecutionUpdate::Finished {
-                                    address,
-                                    covered_submissions: vec![request.submission_id],
-                                    completed_at_ms: 100,
-                                    result: ExecutionResult::Cancelled {
-                                        completion: forge_provider_api::completion::ProviderCompletion::default().into(),
-                                    },
-                                },
-                            )?,
-                        }).await?;
-                        return Ok::<(), forge_provider_api::ProviderError>(());
-                    }
-                    assert_eq!(
-                        request.configuration.approval,
-                        crate::session::ApprovalMode::Allow
-                    );
-                    if clarification {
-                        let forge_provider_api::PromptInput::QuestionReply(reply) = &request.input
-                        else {
-                            panic!("clarification must remain a structured question reply");
-                        };
-                        assert!(reply.question.contains("Why choose staged migration?"));
-                        assert!(request.instructions.contains("Pending elicitation:"));
-                        assert!(
-                            request
-                                .instructions
-                                .contains("Do not continue the original request")
-                                || request
-                                    .instructions
-                                    .contains("Do not continue or submit the plan")
-                        );
-                        assert!(!request.instructions.contains("Original request:"));
-                    }
-                    sink.send_wait(ProviderEvent::Turn {
-                        address: address.clone(),
-                        update: crate::provider::TurnUpdate::Finished {
-                            outcome: forge_provider_api::turn::TurnOutcome::Completed,
-                            completed_at_ms: 100,
-                        },
-                    })
-                    .await?;
-                    sink.send_wait(ProviderEvent::Execution {
-                        observation: ExecutionObservation::new(
-                            request.scope.clone(),
-                            ExecutionUpdate::Finished {
-                                address,
-                                covered_submissions: vec![request.submission_id],
-                                completed_at_ms: 100,
-                                result: ExecutionResult::Completed {
-                                    completion:
-                                        forge_provider_api::completion::ProviderCompletion::default(
-                                        )
-                                        .into(),
-                                },
-                            },
-                        )?,
-                    })
-                    .await?;
-                    Ok(())
-                }
-            },
-        );
-        (workflow_fixture_bridge(broker, native), invocation)
-    }
-    #[tokio::test]
-    async fn mode_restart_preserves_exchange_and_checkpoint_with_distinct_turns() {
-        let repository = tempfile::tempdir().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.session.approval_mode = ApprovalMode::Ask;
-        let (provider, _) = restart_provider(&broker, broker.turn_cancellation(), false);
-        broker.provider = provider;
-        let result = broker
-            .run_interaction(
-                "Original request".into(),
-                PromptMode::Chat,
-                Some(ExchangeAdmission::chat("Original request".into())),
-            )
-            .await;
-        assert!(result.is_err());
-        let before = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(before.len(), 1);
-        assert_eq!(before[0].state(), ExchangeState::Running, "{result:?}");
-        assert_eq!(before[0].turn.len(), 1);
-        assert_eq!(
-            before[0].turn[0].state(),
-            crate::turn::TurnState::Finished {
-                outcome: crate::turn::TurnOutcome::Interrupted,
-            }
-        );
-        assert!(before[0].checkpoint_after.is_none());
-        assert_eq!(
-            broker.session.provider_session_id.as_deref(),
-            Some("restart-thread")
-        );
-        assert_eq!(
-            broker
-                .store
-                .load_session(&broker.session.id)
-                .unwrap()
-                .unwrap()
-                .provider_session_id
-                .as_deref(),
-            Some("restart-thread")
-        );
-        broker.turn_cancellation.arm(false);
-        broker
-            .transition_task(json!({"action": "permission", "change":{"kind":"set_approval","mode":"allow"}, "resume": true}))
-            .await
-            .unwrap();
-        let after = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(after.len(), 1);
-        assert_eq!(after[0].id, before[0].id);
-        assert_eq!(after[0].prompt, "Original request");
-        assert_eq!(after[0].checkpoint_before, before[0].checkpoint_before);
-        assert_eq!(after[0].turn.len(), 2);
-        assert_eq!(after[0].turn[0].state(), before[0].turn[0].state());
-        assert_eq!(after[0].state(), ExchangeState::Complete);
-    }
-
-    #[tokio::test]
-    async fn configuration_preserves_the_complete_active_task_in_every_lifecycle_state()
-    -> Result<()> {
-        for status in ["running", "waiting", "paused", "blocked"] {
-            let repository = repository();
-            let data = tempfile::tempdir()?;
-            let mut broker = planning_question_broker(repository.path(), data.path(), true);
-            let task = if status == "waiting" {
-                let prepared = broker.plan_file.prepare_entry(
-                    &broker.session.id,
-                    "Preserve the review".into(),
-                    None,
-                    1,
-                )?;
-                let mut plan = prepared.record;
-                plan.state = PlanState::AwaitingReview;
-                plan.model_revision = 1;
-                plan.submitted_version = Some(plan.document_version);
-                plan.review_digest = Some("submitted-review".into());
-                broker.store.save_plan(&plan)?;
-                crate::task::Task::plan(plan, 1)?
-            } else {
-                let mut task = crate::task::TaskSnapshot::goal(
-                    "Preserve the goal".into(),
-                    crate::session::continuation::ContinuationBudget::new(12, 3),
-                    true,
-                    1,
-                );
-                if let crate::task::WorkflowSnapshot::Goal { goal } = &mut task.workflow {
-                    goal.state = match status {
-                        "running" => GoalState::Active,
-                        "paused" => GoalState::Paused,
-                        "blocked" => GoalState::Blocked,
-                        _ => unreachable!(),
-                    };
-                    goal.continuation.turn_count = 2;
-                }
-                crate::task::Task::try_from(task)?
-            };
-            broker.task_controller.change(
-                &mut broker.store,
-                None,
-                crate::task::TaskChange::Install(Box::new(task)),
-                1,
-            )?;
-            let before = serde_json::to_value(broker.task_controller.current()?)?;
-            let (configured, events) = broker
-                .configure_session(json!({"effort":"default"}))
-                .await?;
-            assert_eq!(configured["active_task"], before);
-            assert_eq!(events[0].payload["session"]["active_task"], before);
-            let (provider, invocation) =
-                restart_provider(&broker, broker.turn_cancellation(), false);
-            broker.provider = provider;
-            broker.capability = crate::provider::test_support::fixture_capability();
-            for action in [
-                json!({"action":"configure","config":{"effort":"high"}}),
-                json!({"action":"permission","change":{"kind":"toggle_write_enabled"}}),
-                json!({"action":"permission","change":{"kind":"set_approval","mode":"allow"}}),
-                json!({"action":"configure","config":{"effort":"low"}}),
-            ] {
-                broker.transition_task(action.clone()).await?;
-                assert_eq!(
-                    serde_json::to_value(broker.task_controller.current()?)?,
-                    before,
-                    "configuration mutated {status} task: {action}"
-                );
-                assert_eq!(
-                    serde_json::to_value(
-                        broker
-                            .store
-                            .load_session(&broker.session.id)?
-                            .unwrap()
-                            .active_task
-                    )?,
-                    before,
-                    "configuration changed stored {status} task: {action}"
-                );
-                assert_eq!(
-                    serde_json::to_value(broker.snapshot()?.session.active_task)?,
-                    before,
-                    "configuration changed projected {status} task: {action}"
-                );
-                assert_eq!(
-                    invocation.load(Ordering::SeqCst),
-                    0,
-                    "configuration resumed an idle provider for {status}: {action}"
-                );
-                assert!(broker.store.list_exchange(&broker.session.id)?.is_empty());
-            }
-        }
-        Ok(())
-    }
-
     #[tokio::test]
     async fn automatic_resume_excludes_answer_forks() -> Result<()> {
         let repository = repository();
@@ -14614,100 +14542,7 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn permission_change_keeps_idle_questions_waiting_without_provider_work() {
-        for planning in [false, true] {
-            let repository = repository();
-            let data = tempfile::tempdir().unwrap();
-            let mut broker = planning_question_broker(repository.path(), data.path(), true);
-            let prompted = broker
-                .dispatch(Request {
-                    id: 1,
-                    method: "session.prompt.submit".into(),
-                    params: json!({"text":if planning {
-                        "/plan Design the migration"
-                    } else {
-                        "Design the migration"
-                    }}),
-                })
-                .await;
-            assert!(prompted.response.error().is_none());
-            if planning {
-                let task = broker.task_controller.current().unwrap().unwrap();
-                let entry = task.entry.as_ref().unwrap().clone();
-                assert!(
-                    broker
-                        .task_controller
-                        .acknowledge_entry(
-                            &mut broker.store,
-                            &task.revision,
-                            &entry.id,
-                            broker.clock.now_ms()
-                        )
-                        .unwrap()
-                );
-                broker.input_purpose = crate::input::InputPurpose::TaskEntry {
-                    revision: task.revision.clone(),
-                    id: entry.id,
-                    start: crate::exchange::TaskStart {
-                        kind: task.kind(),
-                        title: task.title().to_owned(),
-                    },
-                };
-                broker
-                    .submit_prompt(json!({"text":entry.instruction}))
-                    .await
-                    .unwrap();
-                broker.input_purpose = crate::input::InputPurpose::User;
-            }
-            let before = broker.snapshot().unwrap();
-            let (restart, invocation) = restart_provider(&broker, broker.turn_cancellation(), true);
-            broker.provider = restart.clone();
-            broker.capability = crate::provider::test_support::fixture_capability();
-            let (event_sink, mut event_stream) = publication::channel();
-            broker.event_sink = Some(event_sink);
-            let forwarded = tokio::spawn(async move {
-                let mut event = Vec::new();
-                while let Some(next) = event_stream.recv().await.unwrap() {
-                    event.push(next);
-                }
-                event
-            });
-            broker
-                .transition_task(json!({"action":"permission","change":{"kind":"toggle_write_enabled"},"resume":false}))
-                .await
-                .unwrap();
-            broker.event_sink = None;
-            let event = forwarded.await.unwrap();
-            let after = broker.snapshot().unwrap();
-            assert_eq!(
-                after.session.access.write_access,
-                crate::session::WriteScope::Off
-            );
-            assert!(event.iter().any(|event| {
-                matches!(event, SessionUpdate::Configuration { access_abbreviation, .. }
-                    if access_abbreviation == &after.access_abbreviation)
-            }));
-            assert_eq!(invocation.load(Ordering::SeqCst), 0);
-            assert_eq!(after.exchange.len(), before.exchange.len());
-            assert_eq!(after.exchange[0].id, before.exchange[0].id);
-            assert_eq!(
-                after
-                    .active_elicitation
-                    .unwrap()
-                    .elicitation
-                    .question_set
-                    .id,
-                before
-                    .active_elicitation
-                    .unwrap()
-                    .elicitation
-                    .question_set
-                    .id
-            );
-        }
-    }
-
+    /// Coordinate the fixture's native completion and retryable cleanup barriers.
     struct CleanupSignals {
         started: Notify,
         complete: Notify,
@@ -14956,7 +14791,7 @@ mod test {
         let session_id = broker.session.id.clone();
         let control = async {
             signals.started.notified().await;
-            cancellation.begin_cleanup(false, false).unwrap();
+            cancellation.begin_cleanup(false).unwrap();
             let error = provider.cleanup_execution(&session_id).await.unwrap_err();
             cancellation.fail_cleanup(&error);
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -14974,7 +14809,7 @@ mod test {
             })
             .await
             .expect("cleanup failure should persist without losing provider delivery");
-            cancellation.begin_cleanup(false, false).unwrap();
+            cancellation.begin_cleanup(false).unwrap();
             provider.cleanup_execution(&session_id).await.unwrap();
             cancellation.request(false);
         };
@@ -15647,6 +15482,8 @@ mod test {
             .call(
                 &request.scope,
                 forge_provider_api::control::ToolCall {
+                    id: forge_provider_api::control::ToolCallId::new("fixture-call-1")
+                        .expect("fixture call identity is nonempty"),
                     name: "plan_overview_edit".into(),
                     arguments: json!({
                         "plan_id":plan_id,
@@ -15682,6 +15519,8 @@ mod test {
                 .call(
                     &request.scope,
                     forge_provider_api::control::ToolCall {
+                        id: forge_provider_api::control::ToolCallId::new("fixture-call-2")
+                            .expect("fixture call identity is nonempty"),
                         name: "plan_submit".into(),
                         arguments: json!({"plan_id":plan_id,"expected_version":version}),
                     },
@@ -16648,6 +16487,7 @@ mod test {
             crate::question::QuestionMessageKind::Answer,
         ] {
             broker.input_purpose = crate::input::InputPurpose::Question {
+                content_revision: None,
                 question_id: ids[0].clone(),
                 task_id: None,
                 message_kind,
@@ -17954,6 +17794,15 @@ mod test {
             })
             .await;
         assert!(result.response.error().is_none());
+        assert!(
+            !broker.context_usage_fresh,
+            "new input reused prior-turn context usage"
+        );
+        assert_eq!(
+            broker.store.list_session_event(&broker.session.id)?.len(),
+            1,
+            "a turn without fresh usage triggered compaction"
+        );
         broker.session.context_usage = ContextUsage::reported(50_000, 100_000);
         broker.context_usage_fresh = true;
         broker.auto_compact().await?;
@@ -17969,6 +17818,11 @@ mod test {
             })
             .await;
         assert!(result.response.error().is_none());
+        assert!(!broker.context_usage_fresh);
+        assert_eq!(
+            broker.store.list_session_event(&broker.session.id)?.len(),
+            2
+        );
         broker.store.save_session_event(&SessionEventRecord {
             id: "native-running".into(),
             session_id: broker.session.id.clone(),

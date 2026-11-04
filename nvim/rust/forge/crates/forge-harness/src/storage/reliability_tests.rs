@@ -3,6 +3,150 @@ use crate::session::SessionStore;
 use anyhow::Result;
 use rusqlite::TransactionBehavior;
 
+/// Preserve review data and flattened task records while removing the old lifecycle storage path.
+#[test]
+fn legacy_review_upgrade_preserves_answers_and_requires_new_execution_authority() -> Result<()> {
+    let (root, mut store, controller) = crate::task::SessionTaskController::test_goal();
+    let mut review = crate::plan::PlanReview::new(
+        "review-digest".into(),
+        &[
+            crate::session::ApprovalMode::Ask,
+            crate::session::ApprovalMode::Deny,
+        ],
+    )?;
+    review.overall_comment = Some("Preserve the public API".into());
+    review.saved_source_digest = Some("source-digest".into());
+    let question = review.elicitation.question_set.questions[0].id.clone();
+    review.elicitation.answer(
+        &question,
+        crate::plan::PlanQuestionResponse::Selected {
+            option: "ask".into(),
+            feedback: Some("Retain the reviewed scope".into()),
+        },
+    )?;
+    review
+        .elicitation
+        .answer_order
+        .insert(question, ("view".into(), 7));
+    let expected = serde_json::to_value(&review)?;
+    let plan: crate::plan::PlanRecord = serde_json::from_value(serde_json::json!({
+        "id":"legacy-plan","session_id":"session","request":"Keep reviewed decisions","state":"awaiting_review",
+        "working_path":"","document_version":1,"model_revision":1,"submitted_version":1,"user_revision":0,
+        "review_digest":"review-digest","review":review,"created_at_ms":1,"updated_at_ms":1,
+    }))?;
+    let mut task = crate::task::Task::plan(plan, 1)?;
+    task.edit(|task| {
+        task.auto_accept_plan = true;
+        Ok(())
+    })?;
+    let current = controller.current()?.unwrap();
+    controller.change(
+        &mut store,
+        Some(&current.revision),
+        crate::task::TaskChange::Install(Box::new(task)),
+        2,
+    )?;
+    let task = controller.current()?.unwrap();
+    store.connection.execute(
+        "INSERT INTO task_record(id,session_id,payload) VALUES('archived-task','session',?1)",
+        [serde_json::to_string(&task)?],
+    )?;
+    for (table, old, new) in [
+        ("plan_record", "$.acceptance", "$.review"),
+        (
+            "session_record",
+            "$.session.active_task.plan.artifact.acceptance",
+            "$.session.active_task.plan.artifact.review",
+        ),
+        (
+            "task_record",
+            "$.plan.artifact.acceptance",
+            "$.plan.artifact.review",
+        ),
+    ] {
+        store.connection.execute(&format!("UPDATE {table} SET payload=json_remove(json_set(payload,?1,json_extract(payload,?2)),?2)"), [old,new])?;
+    }
+    store.connection.execute_batch("PRAGMA user_version=6")?;
+    let upgraded = SqliteStore::open(root.path())?;
+    let plan = upgraded.load_plan("legacy-plan")?.unwrap();
+    assert_eq!(
+        serde_json::to_value(plan.review.as_ref().unwrap())?,
+        expected
+    );
+    assert!(!plan.review_questions().unwrap().has_pending_decisions());
+    let mut questions = plan.review.unwrap().elicitation;
+    questions.start_timeout(crate::session::InputTimeout::default(), 100)?;
+    assert!(questions.deadline.is_none());
+    assert!(questions.expire().is_err());
+    let task = upgraded.load_active_task("session")?.unwrap();
+    assert!(task.auto_accept_plan);
+    assert!(crate::task::command::SessionCommand::approved_revision(&task)?.is_none());
+    for (table, old, new) in [
+        ("plan_record", "$.acceptance", "$.review"),
+        (
+            "session_record",
+            "$.session.active_task.plan.artifact.acceptance",
+            "$.session.active_task.plan.artifact.review",
+        ),
+        (
+            "task_record",
+            "$.plan.artifact.acceptance",
+            "$.plan.artifact.review",
+        ),
+    ] {
+        let (legacy, converted): (Option<String>, String) = upgraded.connection.query_row(
+            &format!("SELECT json_type(payload,?1),json_extract(payload,?2) FROM {table} LIMIT 1"),
+            [old, new],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert!(legacy.is_none());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&converted)?,
+            expected
+        );
+    }
+    Ok(())
+}
+
+/// A conflicting conversion must roll back earlier rows and leave the old schema version intact.
+#[test]
+fn conflicting_legacy_review_upgrade_rolls_back_all_records() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let mut store = SqliteStore::open(root.path())?;
+    store.save_session(&session("session", "workspace"))?;
+    for (id, payload) in [
+        ("a", r#"{"acceptance":{"review_digest":"first"}}"#),
+        (
+            "b",
+            r#"{"acceptance":{"review_digest":"old"},"review":{"review_digest":"different"}}"#,
+        ),
+    ] {
+        store.connection.execute(
+            "INSERT INTO plan_record(id,session_id,payload) VALUES(?1,'session',?2)",
+            rusqlite::params![id, payload],
+        )?;
+    }
+    store.connection.execute_batch("PRAGMA user_version=6")?;
+    assert!(SqliteStore::open(root.path()).is_err());
+    assert_eq!(
+        store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
+        6
+    );
+    let first: String =
+        store
+            .connection
+            .query_row("SELECT payload FROM plan_record WHERE id='a'", [], |row| {
+                row.get(0)
+            })?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&first)?,
+        serde_json::json!({"acceptance":{"review_digest":"first"}})
+    );
+    Ok(())
+}
+
 #[test]
 fn current_schema_reads_do_not_wait_for_another_writer() -> Result<()> {
     let root = tempfile::tempdir()?;

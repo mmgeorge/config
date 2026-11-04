@@ -1,4 +1,5 @@
 vim.loader.enable(false)
+local check_tool = dofile(vim.fn.getcwd() .. "/nvim/tests/forge/fixtures/check_tool.lua")
 local root = vim.fn.getcwd()
 vim.opt.runtimepath:prepend(root .. "/nvim")
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
@@ -42,7 +43,7 @@ local success, failure = xpcall(function()
   request(session_id, "session.configure", { shell = "nushell" })
   request(session_id, "session.prompt.submit", { text = "Before closing" })
   for _, pause_first in ipairs({ true, false }) do
-    local run_id = request(session_id, "session.check.run", { check = { "slow" } }).run_id
+    local run_id = check_tool.start(function(method, params) return request(session_id, method, params) end, { check = { "slow" } }).run_id
     assert(vim.wait(5000, function()
       local run = request(session_id, "session.check.status", { run_id = run_id })
       return run.commands[1] and run.commands[1].state == "running"

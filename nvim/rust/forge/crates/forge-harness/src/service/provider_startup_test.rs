@@ -218,6 +218,11 @@ async fn provider_startup_is_nonblocking_persists_ready_identity_and_reports_fai
         let provider = Arc::new(StartupProvider::new(fail, 0));
         let provider_fixture = ProviderTestSession::from_native(provider.clone())?;
         *controller.provider.write().unwrap() = provider_fixture.provider_handle();
+        controller
+            .broker
+            .lock()
+            .await
+            .set_provider_for_test(provider_fixture.provider_handle());
         let (sink, mut output) = forge_protocol::outbound::channel();
         controller.start_provider(&sink).await;
         provider.entered.notified().await;
@@ -335,6 +340,11 @@ async fn provider_startup_recovers_only_missing_empty_sessions() -> Result<()> {
         let provider = Arc::new(StartupProvider::new(false, 2));
         let provider_fixture = ProviderTestSession::from_native(provider.clone())?;
         *controller.provider.write().unwrap() = provider_fixture.provider_handle();
+        controller
+            .broker
+            .lock()
+            .await
+            .set_provider_for_test(provider_fixture.provider_handle());
         let (sink, _output) = forge_protocol::outbound::channel();
         controller.start_provider(&sink).await;
         controller
@@ -408,6 +418,11 @@ async fn rename_without_exchanges_is_local_and_survives_provider_replacement() -
     let provider = Arc::new(StartupProvider::new(false, 0));
     let provider_fixture = ProviderTestSession::from_native(provider.clone())?;
     *controller.provider.write().unwrap() = provider_fixture.provider_handle();
+    controller
+        .broker
+        .lock()
+        .await
+        .set_provider_for_test(provider_fixture.provider_handle());
     let session_id = controller.observer.session_id().to_owned();
     controller.observer.query(
         RuntimeMethod::SessionRename,

@@ -223,10 +223,6 @@ local function submit(review, method, params)
     if not completed.owner.closed then close_review(completed) end
     if result then controller.activate_snapshot(result) end
     controller.render()
-    if method == "session.plan.acceptance.begin"
-        and type(vim.tbl_get(result or {}, "active_plan", "acceptance")) == "table" then
-      controller.task_transition({ action = "execute", plan_id = review.plan.id, digest = review.plan.review_digest })
-    end
   end)
   if queued and (review.owner.submission_pending or review.owner.pending_operation) then hide_review(review) end
 end
@@ -327,7 +323,7 @@ local function commands(review)
   for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_visibility" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)
   command_set.register(set, "accept", function()
-    prompt_decision(review, "session.plan.acceptance.begin", "Approval comment (optional)")
+    prompt_decision(review, "session.plan.accept", "Approval comment (optional)")
   end)
   command_set.register(set, "abort_plan", function()
     if not review.plan.historical_revision then submit(review, "session.plan.cancel", {}) end

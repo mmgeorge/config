@@ -1,4 +1,5 @@
 vim.loader.enable(false)
+local check_tool = dofile(vim.fn.getcwd() .. "/nvim/tests/forge/fixtures/check_tool.lua")
 local root = vim.fs.normalize(vim.fn.getcwd())
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
@@ -138,7 +139,7 @@ local success, failure = xpcall(function()
   vim.fn.writefile({ "edit with completion checking disabled" }, workspace .. "/source.txt")
   await(completed, "disabled-check work did not complete")
   assert(executed() == 3 and state.check_timing == "after_queue", "disabled gate ran or lost its timing")
-  local explicit = request("session.check.run", { check = { "verify" } })
+  local explicit = check_tool.start(request, { check = { "verify" } })
   local checked = request("session.check.status", { run_id = explicit.run_id, wait_for_completion = true })
   assert(checked.state == "passed" and executed() == 4, "disabling automatic checks disabled explicit runs")
   applied = nil
@@ -147,7 +148,7 @@ local success, failure = xpcall(function()
   assert(request("session.check.list").automatic_checks == true, "check catalog did not observe live enablement")
   owner = vim.json.decode(table.concat(vim.fn.readfile(baseline), "\n")).owner
   submit("Work after automatic checks are enabled")
-  await(function() return starts == 7 end, "enabled-check work did not start")
+  await(function() return starts == 8 end, "enabled-check work did not start")
   await(function() return vim.json.decode(table.concat(vim.fn.readfile(baseline), "\n")).owner ~= owner end,
     "enabled-check work did not capture its baseline")
   vim.fn.writefile({ "edit after completion checking enabled" }, workspace .. "/source.txt")

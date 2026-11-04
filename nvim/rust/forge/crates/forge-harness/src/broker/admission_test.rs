@@ -82,6 +82,7 @@ async fn detached_required_answer_continues_original_exchange_before_or_after_co
             .find(|message| message.kind == QuestionMessageKind::Answer)
             .unwrap();
         broker.input_purpose = crate::input::InputPurpose::Question {
+            content_revision: None,
             question_id,
             task_id: None,
             message_kind: QuestionMessageKind::Answer,
@@ -167,8 +168,14 @@ async fn detached_required_answer_rejects_cancelled_or_newer_exchange() -> Resul
         }
         let count = broker.store.list_exchange(&broker.session.id)?.len();
         broker.input_purpose = crate::input::InputPurpose::Question {
-            reply: crate::provider::test_support::question_reply(&question_id,
-                forge_provider_api::QuestionReplyResponse::Answer { answer: "JSON".into(), required_questions_remain: false }),
+            content_revision: None,
+            reply: crate::provider::test_support::question_reply(
+                &question_id,
+                forge_provider_api::QuestionReplyResponse::Answer {
+                    answer: "JSON".into(),
+                    required_questions_remain: false,
+                },
+            ),
             question_id,
             task_id: None,
             message_kind: QuestionMessageKind::Answer,
@@ -278,8 +285,13 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
         });
         let tool_ran = Arc::new(AtomicBool::new(false));
         let provider_fixture = checkpoint_fixture(
-            repository.path().to_owned(), Some(preparation.clone()), Arc::new(Notify::new()),
-            tool_ran.clone(), Default::default(), None, false,
+            repository.path().to_owned(),
+            Some(preparation.clone()),
+            Arc::new(Notify::new()),
+            tool_ran.clone(),
+            Default::default(),
+            None,
+            false,
         )?;
         broker.provider = provider_fixture.provider_handle();
         let (sink, mut stream) = publication::channel();

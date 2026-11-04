@@ -269,14 +269,15 @@ async fn settings(
             method: "session.command.apply".into(),
             params: json!({"operation_id":operation_id,"action":"configure","config":{"settings_revision":mutation.revision,"setting_fields":mutation.field}}),
         };
-        return route_task_transition(
-            registry,
-            controller,
-            session_id.context("settings session is missing")?,
-            request,
+        task_state::apply(
+            &controller,
+            &session_id.context("settings session is missing")?,
+            &request,
+            registry.initialize.goal_max_turns,
             message_sink,
         )
-        .await;
+        .await?;
+        return Ok(());
     }
     message_sink.send_response(Response::success(request.id, json!({"id":operation_id,"state":"saved","revision":mutation.revision,"restart_required":false}))?).await?;
     Ok(())

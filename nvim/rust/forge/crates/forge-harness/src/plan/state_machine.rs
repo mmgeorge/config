@@ -110,7 +110,7 @@ mod test {
             review_digest: None,
             accepted_digest: None,
             elicitation: None,
-            acceptance: None,
+            review: None,
             question_ledger: Default::default(),
             generation: Default::default(),
             validation_warning: Vec::new(),

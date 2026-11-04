@@ -197,6 +197,7 @@ impl NativeProvider for ControlledProvider {
                     ProviderFailureKind::Transport,
                 )
             })?;
+        request.dispatch.confirm();
         Ok(InputAcceptance {
             submission_id: input,
         })
@@ -349,6 +350,7 @@ fn owners() -> [ExecutionOwner; 3] {
 /// Prepare a request with an explicit owner and the same persisted journal as production.
 fn request(owner: &ExecutionOwner, directory: &std::path::Path) -> ProviderRequest {
     ProviderRequest {
+        dispatch: forge_provider_api::submission::DispatchTracker::default(),
         execution_owner: Some(owner.clone()),
         harness_session_id: owner.session_id.to_string(),
         workspace: directory.to_string_lossy().into_owned(),

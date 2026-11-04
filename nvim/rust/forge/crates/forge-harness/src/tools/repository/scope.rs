@@ -621,6 +621,7 @@ mod tests {
         assert!(
             runtime
                 .invoke(crate::tools::ControlToolInvocation {
+                    call_id: None,
                     task_permit: None,
                     name: "repository_status".into(),
                     arguments: json!({})

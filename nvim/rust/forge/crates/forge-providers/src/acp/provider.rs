@@ -351,7 +351,12 @@ impl AcpProvider {
     ) -> Result<InputAcceptance, ProviderError> {
         let session = self.binding(binding).await?;
         session.collect_finished_prompt().await?;
-        if request.scope.owner != session.owner || request.receipt.id() != &request.submission_id {
+        if request.scope.owner != session.owner
+            || request.receipt.id() != &request.submission_id
+            || !request
+                .dispatch
+                .matches(binding, &request.scope, &request.submission_id)
+        {
             return Err(failure(
                 ProviderOperation::AdmitInput,
                 ProviderFailureKind::Rejected,
@@ -557,6 +562,7 @@ async fn run_prompt(
                 super::submission::AcpSubmission::Prompt,
                 serde_json::json!({"sessionId":session.conversation.id(),"prompt":prompt}),
                 Some(request.receipt.clone()),
+                &request.dispatch,
             )
             .await;
         let response = match response {
