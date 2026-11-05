@@ -84,7 +84,7 @@ impl Attachment {
             name,
             media_type,
         };
-        let directory = root
+        let directory = crate::storage::state::directory(root)
             .join("attachments")
             .join(crate::plan::digest(&serde_json::to_vec(&attachment)?));
         std::fs::create_dir_all(&directory)?;
@@ -123,7 +123,7 @@ impl Attachment {
     }
 
     fn path(&self, root: &Path) -> Result<PathBuf> {
-        Ok(root
+        Ok(crate::storage::state::directory(root)
             .join("attachments")
             .join(crate::plan::digest(&serde_json::to_vec(self)?))
             .join("file")
@@ -135,7 +135,7 @@ impl Attachment {
             identity.len() == 64 && identity.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "attachment identity is invalid"
         );
-        let path = root
+        let path = crate::storage::state::directory(root)
             .join("attachments")
             .join(identity)
             .join("metadata.json");

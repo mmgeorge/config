@@ -256,7 +256,8 @@ async fn admission_skips_completed_transcript_but_settles_running_exchange() -> 
         }
         broker.store.save_exchange(&previous)?;
         if completed {
-            let connection = rusqlite::Connection::open(data.path().join("harness.sqlite3"))?;
+            let connection =
+                rusqlite::Connection::open(crate::storage::state::database(&data.path()))?;
             connection.execute("UPDATE exchange_record SET payload=json_set(payload,'$.node_list','invalid transcript') WHERE id=?1", [&previous.id])?;
         }
         let (next, new_runtime, events) = broker

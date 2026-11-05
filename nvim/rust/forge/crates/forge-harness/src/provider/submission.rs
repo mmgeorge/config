@@ -191,6 +191,7 @@ pub(crate) struct SubmissionStore {
     connection: Mutex<Connection>,
     live: Mutex<HashMap<String, Weak<Submission>>>,
     trace: Arc<TraceStore>,
+    _lease: crate::storage::state::StateLease,
 }
 
 impl SubmissionStore {
@@ -261,9 +262,11 @@ impl SubmissionStore {
         if let Some(existing) = store.get(&key).and_then(Weak::upgrade) {
             return Ok(existing);
         }
-        let connection = Connection::open(root.join("provider-submissions.sqlite3"))?;
+        let lease = crate::storage::state::StateLease::open(root)?;
+        let directory = crate::storage::state::directory(root);
+        let connection = Connection::open(directory.join("provider-submissions.sqlite3"))?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        let _bootstrap = crate::storage::bootstrap_lock(root, "provider-submissions")?;
+        let _bootstrap = crate::storage::bootstrap_lock(&directory, "provider-submissions")?;
         connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS submission (
                 id TEXT PRIMARY KEY, runtime TEXT NOT NULL, provider TEXT NOT NULL, payload TEXT NOT NULL
@@ -275,6 +278,7 @@ impl SubmissionStore {
             CREATE INDEX IF NOT EXISTS submission_sending ON submission(runtime,provider)
                 WHERE json_extract(payload,'$.delivery.state')='sending';")?;
         let created = Arc::new(Self {
+            _lease: lease,
             connection: Mutex::new(connection),
             live: Mutex::new(HashMap::new()),
             trace,

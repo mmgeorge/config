@@ -143,6 +143,12 @@ function M.producer_handlers(options)
   return {
     commit = function() start_commit(false) end,
     commit_amend = function() start_commit(true) end,
+    regenerate_about = function()
+      if not options.is_alive() then return end
+      local context = options.context and options.context()
+      if not context then notifications.error("Repository context is still loading") return end
+      context.generate_about(true)
+    end,
     push = function() remote("push") end,
     pull = function() remote("pull") end,
     pr = function() open_pull_request(false) end,
@@ -211,9 +217,7 @@ function M.attach(options)
           function() return alive() and revision == owner.about_revision end, present_about)
       else present_about() end
     end
-    local first_request = not owner.about_requested
-    owner.about_requested = true
-    ai_commit.ensure(options.workspace, { ref = "HEAD", force = force == true or first_request, ignored_paths = options.ignored_paths and options.ignored_paths() or {}, on_start = accept_about }, accept_about)
+    ai_commit.ensure(options.workspace, { ref = "HEAD", force = force == true, ignored_paths = options.ignored_paths and options.ignored_paths() or {}, on_start = accept_about }, accept_about)
   end
 
   function owner.clear_about()

@@ -27,7 +27,7 @@ fn main() -> Result<()> {
         "behavior" | "tests" | "flows" => &["src/change.rs"],
         _ => anyhow::bail!("unsupported fixture language"),
     };
-    let files = PlanFileStore::new(&data, &workspace);
+    let files = PlanFileStore::new(&data, &workspace)?;
     let mut document = files.read_working_document(session, plan)?;
     let mut design = DeclarationDesign::default();
     design.document = document

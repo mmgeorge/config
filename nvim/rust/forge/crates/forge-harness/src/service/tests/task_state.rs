@@ -1537,7 +1537,8 @@ async fn plan_submission_precedes_terminal_native_acceptance() -> Result<()> {
         anyhow::bail!("initial plan command did not dispatch: {receipt:?}");
     };
     let receipts = rusqlite::Connection::open_with_flags(
-        controller.data_root.join("provider-submissions.sqlite3"),
+        crate::storage::state::directory(&controller.data_root)
+            .join("provider-submissions.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     let native_receipt: String = receipts.query_row(

@@ -236,7 +236,10 @@ pub fn build(
     trace: std::sync::Arc<crate::trace::TraceStore>,
     settings_root: std::path::PathBuf,
 ) -> Result<std::sync::Arc<Provider>> {
-    let native = forge_providers::registry::create(launch, settings_root.clone())?;
+    let native = forge_providers::registry::create(
+        launch,
+        crate::storage::state::directory(&settings_root),
+    )?;
     Ok(std::sync::Arc::new(super::bridge::ProviderBridge::new(
         native,
         permission_coordinator,

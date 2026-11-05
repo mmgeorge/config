@@ -849,7 +849,7 @@ mod receipt_tests {
     fn plan_receipt_restores_missing_progress_without_overwriting_newer_progress() -> Result<()> {
         let root = tempfile::tempdir()?;
         let workspace = tempfile::tempdir()?;
-        let store = crate::plan::PlanFileStore::new(root.path(), workspace.path());
+        let store = crate::plan::PlanFileStore::new(root.path(), workspace.path()).unwrap();
         let original = store
             .prepare_entry("session", "objective".into(), None, 1)?
             .record;

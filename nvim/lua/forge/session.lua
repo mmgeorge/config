@@ -67,6 +67,7 @@ M.empty_diff_rows = {}
 ---@field presentation? HarnessPresentation
 ---@field client table?
 ---@field ready boolean
+---@field unsubscribe? fun()
 ---@field switching_provider? boolean
 ---@field state_sync_pending? table Identity of the one active snapshot read.
 ---@field aborting_plan? boolean

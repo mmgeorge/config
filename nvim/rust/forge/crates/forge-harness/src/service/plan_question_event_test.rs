@@ -178,7 +178,8 @@ async fn plan_answer_event_rejects_replaced_task_without_restoring_questions() -
 async fn plan_answer_publication_failure_rolls_back_decision_and_receipt() -> Result<()> {
     let (_root, controller, request) = fixture().await?;
     let session = controller.observer.session_id();
-    let database = rusqlite::Connection::open(controller.data_root.join("harness.sqlite3"))?;
+    let database =
+        rusqlite::Connection::open(crate::storage::state::database(&controller.data_root))?;
     database.execute_batch("CREATE TRIGGER fail_plan_answer_publication BEFORE INSERT ON owner_publication WHEN json_extract(NEW.event,'$.event')='question_updated' BEGIN SELECT RAISE(ABORT,'publication failed'); END;")?;
     let events = controller.exchange_owner.question_events();
     let error = events
@@ -243,7 +244,8 @@ async fn legacy_plan_answer_receipt_backfills_publication_without_reapplying_ans
             request.clone(),
         )?)
         .await?;
-    let database = rusqlite::Connection::open(controller.data_root.join("harness.sqlite3"))?;
+    let database =
+        rusqlite::Connection::open(crate::storage::state::database(&controller.data_root))?;
     database.execute("DELETE FROM owner_publication_origin WHERE session_id=?1 AND json_extract(origin,'$.kind')='plan_question_answer'", [controller.observer.session_id()])?;
     database.execute("DELETE FROM owner_publication WHERE session_id=?1 AND json_extract(event,'$.event')='question_updated'", [controller.observer.session_id()])?;
     let recovered = events

@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn working_mutation_recovers_before_seal_and_after_database_commit() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let store = PlanFileStore::new(root.path(), root.path());
+        let store = PlanFileStore::new(root.path(), root.path()).unwrap();
         let original = super::super::document::test_fixture("plan", "original draft");
         let prior: PlanRecord = serde_json::from_value(serde_json::json!({
             "id":"plan", "session_id":"session", "request":"Review", "state":"awaiting_review",
@@ -485,7 +485,7 @@ mod tests {
         store.write_working_mutation_guarded(&prior, &original, &changed)?;
         assert_eq!(store.read_working_document("session", "plan")?, changed);
         // A new store models losing the foreground and its in-memory effect guard.
-        let recovered = PlanFileStore::new(root.path(), root.path());
+        let recovered = PlanFileStore::new(root.path(), root.path()).unwrap();
         recovered.reconcile_plan_artifacts(&prior)?;
         assert_eq!(
             recovered.read_working_document("session", "plan")?,
@@ -496,7 +496,7 @@ mod tests {
         let mut committed = prior.clone();
         committed.document_version = changed.version;
         recovered.seal_plan_artifacts(&committed)?;
-        let restarted = PlanFileStore::new(root.path(), root.path());
+        let restarted = PlanFileStore::new(root.path(), root.path()).unwrap();
         restarted.reconcile_plan_artifacts(&prior)?;
         assert_eq!(
             restarted.read_working_document("session", "plan")?,
@@ -504,7 +504,7 @@ mod tests {
         );
         restarted.write_working_mutation_guarded(&prior, &original, &changed)?;
         restarted.seal_plan_artifacts(&committed)?;
-        let restarted = PlanFileStore::new(root.path(), root.path());
+        let restarted = PlanFileStore::new(root.path(), root.path()).unwrap();
         restarted.reconcile_plan_artifacts(&committed)?;
         assert_eq!(restarted.read_working_document("session", "plan")?, changed);
         assert!(
@@ -520,7 +520,7 @@ mod tests {
     #[test]
     fn recorded_restore_target_claims_same_revision_artifacts() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let store = PlanFileStore::new(root.path(), root.path());
+        let store = PlanFileStore::new(root.path(), root.path()).unwrap();
         let prior: PlanRecord = serde_json::from_value(serde_json::json!({
             "id":"plan", "session_id":"session", "request":"Review", "state":"awaiting_review",
             "working_path":"working.json", "document_version":2, "model_revision":2,
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn artifact_recovery_uses_commit_proof_and_refuses_unowned_bytes() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let store = PlanFileStore::new(root.path(), root.path());
+        let store = PlanFileStore::new(root.path(), root.path()).unwrap();
         let prior: PlanRecord = serde_json::from_value(serde_json::json!({
             "id":"plan", "session_id":"session", "request":"Review", "state":"awaiting_review",
             "working_path":"working.json", "document_version":2, "model_revision":2,

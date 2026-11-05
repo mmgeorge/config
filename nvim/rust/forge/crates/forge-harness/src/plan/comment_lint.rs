@@ -373,7 +373,8 @@ mod test {
     fn submission_checks_lint_even_with_cached_validation_and_preserves_editable_draft() {
         let temporary = tempfile::tempdir().unwrap();
         let store =
-            crate::plan::PlanFileStore::new(temporary.path().join("data"), temporary.path());
+            crate::plan::PlanFileStore::new(temporary.path().join("data"), temporary.path())
+                .unwrap();
         crate::checks::configure_fixture(&store.workspace);
         let mut document = crate::plan::document::test_fixture("lint", "Introduce settings");
         let proposed = concat!(

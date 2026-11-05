@@ -165,9 +165,62 @@ local succeeded, failure = xpcall(function()
   assert(forge.open() == public and vim.api.nvim_get_current_win() == status_window,
     "cached Status entry could not focus its existing mount from a pinned input")
   assert(#vim.api.nvim_list_tabpages() == tabs, "cached Status entry created another tab")
+
+  vim.api.nvim_win_set_buf(status_window, source)
+  vim.api.nvim_set_current_win(unrelated_window)
+  local picker_buffer = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(picker_buffer, 0, -1, false, { "Retain the picker query" })
+  local picker_window = vim.api.nvim_open_win(picker_buffer, true, {
+    relative = "editor", row = 1, col = 1, width = 40, height = 1, style = "minimal",
+  })
+  local picker_notices = {}
+  vim.notify = function(message) picker_notices[#picker_notices + 1] = tostring(message) end
+  assert(forge.open() == public, "cached Status failed from a one-row picker: " .. table.concat(picker_notices, "\n"))
+  local mounted_window = vim.api.nvim_get_current_win()
+  assert(mounted_window ~= picker_window and vim.api.nvim_win_get_config(mounted_window).relative == "",
+    "cached Status mounted inside a transient picker")
+  assert(vim.api.nvim_win_get_buf(picker_window) == picker_buffer and vim.wo[picker_window].winbar == "",
+    "cached Status changed the picker buffer or presentation")
+  assert(vim.api.nvim_buf_get_lines(picker_buffer, 0, -1, false)[1] == "Retain the picker query")
+  local mounted_tabs = #vim.api.nvim_list_tabpages()
+  vim.api.nvim_set_current_win(picker_window)
+  assert(forge.open() == public and vim.api.nvim_get_current_win() == mounted_window,
+    "picker entry did not reuse the existing normal Status window")
+  assert(#vim.api.nvim_list_tabpages() == mounted_tabs, "picker entry duplicated the Status tab")
+  assert(#picker_notices == 0, table.concat(picker_notices, "\n"))
+  vim.notify = original_notify
+  vim.api.nvim_win_close(picker_window, true)
+  vim.api.nvim_buf_delete(picker_buffer, { force = true })
+  assert(vim.api.nvim_win_get_buf(mounted_window) == public.replica.buffer,
+    "picker cleanup removed the Status mount")
   status.close(public)
   await(function() return closed_document[public.document] end, "public pinned Status close did not settle")
+  if vim.api.nvim_win_is_valid(mounted_window) then vim.api.nvim_win_close(mounted_window, true) end
   if vim.api.nvim_win_is_valid(status_window) then vim.api.nvim_win_close(status_window, true) end
+  vim.api.nvim_set_current_win(unrelated_window)
+
+  picker_buffer = vim.api.nvim_create_buf(false, true)
+  picker_window = vim.api.nvim_open_win(picker_buffer, true, {
+    relative = "editor", row = 1, col = 1, width = 40, height = 1, style = "minimal",
+  })
+  local fresh = forge.open()
+  assert(vim.api.nvim_win_get_buf(picker_window) == picker_buffer, "pending Status replaced the picker")
+  pending_open[fresh.document]()
+  await(function() return fresh.ready end, "fresh Status did not open from a one-row picker")
+  mounted_window = vim.api.nvim_get_current_win()
+  assert(mounted_window ~= picker_window and vim.api.nvim_win_get_config(mounted_window).relative == "",
+    "fresh Status mounted inside a transient picker")
+  assert(vim.api.nvim_win_get_buf(picker_window) == picker_buffer and vim.wo[picker_window].winbar == "")
+  vim.schedule(function()
+    vim.api.nvim_win_close(picker_window, true)
+    vim.api.nvim_buf_delete(picker_buffer, { force = true })
+  end)
+  await(function() return not vim.api.nvim_win_is_valid(picker_window) end, "picker teardown did not settle")
+  assert(fresh.active and vim.api.nvim_win_get_buf(mounted_window) == fresh.replica.buffer,
+    "deferred picker cleanup removed fresh Status")
+  status.close(fresh)
+  await(function() return closed_document[fresh.document] end, "fresh picker Status close did not settle")
+  if vim.api.nvim_win_is_valid(mounted_window) then vim.api.nvim_win_close(mounted_window, true) end
   vim.api.nvim_set_current_win(unrelated_window)
 
   -- A failed asynchronous bind must release the cached owner and its newly created window.

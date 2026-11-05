@@ -112,7 +112,11 @@ mod tests {
         trace
             .instrument("session", "disabled", "admission", async { Ok(()) })
             .await?;
-        assert!(!root.path().join("logs/session.jsonl").exists());
+        assert!(
+            !crate::storage::state::directory(&root.path())
+                .join("logs/session.jsonl")
+                .exists()
+        );
         trace.configure(true)?;
         trace
             .instrument("session", "completed", "admission", async {
@@ -139,7 +143,9 @@ mod tests {
             assert!(futures_util::poll!(&mut future).is_pending());
         }
         trace.flush()?;
-        let text = std::fs::read_to_string(root.path().join("logs/session.jsonl"))?;
+        let text = std::fs::read_to_string(
+            crate::storage::state::directory(&root.path()).join("logs/session.jsonl"),
+        )?;
         let records: Vec<serde_json::Value> = text
             .lines()
             .map(serde_json::from_str)

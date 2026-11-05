@@ -1012,6 +1012,7 @@ pub struct PlanFileStore {
             std::sync::Arc<implementation_report::ImplementationReport>,
         >,
     >,
+    _lease: crate::storage::state::StateLease,
     root: PathBuf,
     workspace: PathBuf,
 }
@@ -1131,13 +1132,17 @@ impl PlanFileStore {
         Ok(gate)
     }
 
-    pub fn new(root: impl Into<PathBuf>, workspace: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
+    /// Create a plan store that retains the current disposable-state version.
+    pub fn new(root: impl Into<PathBuf>, workspace: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        let lease = crate::storage::state::StateLease::open(&root)?;
+        Ok(Self {
+            _lease: lease,
+            root,
             workspace: workspace.into(),
             implementation_report_cache: Default::default(),
             review_cache: Default::default(),
-        }
+        })
     }
 
     /// Share immutable report contents without copying them into durable exchanges.
@@ -1579,7 +1584,7 @@ impl PlanFileStore {
         {
             return Err(WorkingDocumentChanged.into());
         }
-        if self.root.join("harness.sqlite3").exists()
+        if crate::storage::state::database(&self.root).exists()
             && let Some(prior) =
                 crate::storage::SqliteStore::read_only(&self.root)?.load_plan(plan_id)?
         {
@@ -1646,7 +1651,7 @@ impl PlanFileStore {
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         self.require_reconciled_artifacts(session_id, &revision.document.plan_id)?;
-        if self.root.join("harness.sqlite3").exists()
+        if crate::storage::state::database(&self.root).exists()
             && let Some(prior) = crate::storage::SqliteStore::read_only(&self.root)?
                 .load_plan(&revision.document.plan_id)?
         {
@@ -1896,7 +1901,9 @@ impl PlanFileStore {
                 && component.next().is_none(),
             "invalid Harness session identifier"
         );
-        let directory = self.root.join("plans").join(session_id);
+        let directory = crate::storage::state::directory(&self.root)
+            .join("plans")
+            .join(session_id);
         if directory.exists() {
             fs::remove_dir_all(&directory).with_context(|| {
                 format!("delete session plan directory {}", directory.display())
@@ -1956,7 +1963,10 @@ impl PlanFileStore {
     }
 
     fn plan_dir(&self, session_id: &str, plan_id: &str) -> PathBuf {
-        self.root.join("plans").join(session_id).join(plan_id)
+        crate::storage::state::directory(&self.root)
+            .join("plans")
+            .join(session_id)
+            .join(plan_id)
     }
 }
 
@@ -2060,8 +2070,8 @@ mod test {
     fn working_document_cas_rejects_same_version_changes_across_store_instances() -> Result<()> {
         let temporary = tempfile::tempdir()?;
         let root = temporary.path().join("data");
-        let first = PlanFileStore::new(&root, temporary.path());
-        let second = PlanFileStore::new(&root, temporary.path());
+        let first = PlanFileStore::new(&root, temporary.path()).unwrap();
+        let second = PlanFileStore::new(&root, temporary.path()).unwrap();
         let original = document::test_fixture("cas-plan", "original");
         first.write_working_document("session", "cas-plan", &original)?;
         let mut replacement = original.clone();
@@ -2090,7 +2100,7 @@ mod test {
         let temporary = tempfile::tempdir()?;
         let root = temporary.path().join("data");
         let workspace = temporary.path().to_path_buf();
-        let initial_store = PlanFileStore::new(&root, &workspace);
+        let initial_store = PlanFileStore::new(&root, &workspace).unwrap();
         let original = document::test_fixture("race-plan", "original");
         initial_store.write_working_document("session", "race-plan", &original)?;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
@@ -2102,7 +2112,7 @@ mod test {
                 let original = original.clone();
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
-                    let store = PlanFileStore::new(root, workspace);
+                    let store = PlanFileStore::new(root, workspace).unwrap();
                     let mut updated = original.clone();
                     updated.overview = name.into();
                     barrier.wait();
@@ -2132,7 +2142,7 @@ mod test {
     #[test]
     fn warm_review_edits_preserve_a_multifile_plan() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
         crate::checks::configure_fixture(&store.workspace);
         let mut document = document::test_fixture("fast-review", "Review a multifile plan");
         let mut design = DeclarationDesign::default();
@@ -2200,7 +2210,7 @@ mod test {
                 .unwrap(),
             document
         );
-        let reopened = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let reopened = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
         crate::checks::configure_fixture(&reopened.workspace);
         let checksum = digest(&crate::plan::codec::to_vec(&deleted).unwrap());
         let reviewed = reopened
@@ -2279,7 +2289,7 @@ mod test {
             }],
         );
         document.design = Some(design);
-        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
         crate::checks::configure_fixture(&store.workspace);
         store
             .persist_revision("session", "rename", 1, document.clone(), None, None)
@@ -2402,7 +2412,7 @@ mod test {
             "Cargo.toml already enables engine rendering.".into();
         document.design.as_mut().unwrap().document.requirements =
             vec!["Enable input without disabling rendering.".into()];
-        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
         crate::checks::configure_fixture(&store.workspace);
         store
             .write_working_document("session", "plan", &document)
@@ -2542,7 +2552,7 @@ mod test {
             "Update package metadata, type checks, CI, and the XML project.".into();
         let mut document = document::test_fixture("plan", "Configuration");
         document.design = Some(design);
-        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
         crate::checks::configure_fixture(&store.workspace);
         store
             .write_working_document("session", "plan", &document)
@@ -2618,7 +2628,7 @@ mod test {
             "pub struct Registry {\n pub first: u64,\n pub second: u64\n}\n".into(),
         );
         document.design = Some(design);
-        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path()).unwrap();
         crate::checks::configure_fixture(&store.workspace);
         store
             .write_working_document("session", "plan", &document)
@@ -2678,7 +2688,7 @@ mod test {
     #[test]
     fn preserves_submitted_json_revisions_while_the_working_document_changes() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = PlanFileStore::new(temporary.path(), temporary.path());
+        let store = PlanFileStore::new(temporary.path(), temporary.path()).unwrap();
         crate::checks::configure_fixture(&store.workspace);
         let document = document::test_fixture("plan", "Initial");
         store
@@ -2711,25 +2721,27 @@ mod test {
             "Initial"
         );
         assert!(
-            temporary
-                .path()
+            crate::storage::state::directory(&temporary.path())
                 .join("plans/session/plan/revisions/submitted-0001.json")
                 .exists()
         );
         assert!(
-            temporary
-                .path()
+            crate::storage::state::directory(&temporary.path())
                 .join("plans/session/plan/revisions/submitted-0001.index.json")
                 .exists()
         );
         store.delete_session("session").unwrap();
-        assert!(!temporary.path().join("plans/session").exists());
+        assert!(
+            !crate::storage::state::directory(&temporary.path())
+                .join("plans/session")
+                .exists()
+        );
     }
 
     #[test]
     fn renders_only_complete_submissions_while_preserving_repairable_drafts() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = PlanFileStore::new(temporary.path(), temporary.path());
+        let store = PlanFileStore::new(temporary.path(), temporary.path()).unwrap();
         crate::checks::configure_fixture(&store.workspace);
         let document = document::test_fixture("plan", "Initial");
         store
@@ -2738,7 +2750,8 @@ mod test {
         store
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
-        let working_markdown_path = temporary.path().join("plans/session/plan/working.md");
+        let working_markdown_path = crate::storage::state::directory(&temporary.path())
+            .join("plans/session/plan/working.md");
         let submitted_markdown = fs::read_to_string(&working_markdown_path).unwrap();
 
         let incomplete = store

@@ -286,7 +286,9 @@ async fn shared_runtime_initialization_does_not_create_or_select_a_session() -> 
     let registry = service.registry().await?;
     assert!(registry.initial_session_id.is_none());
     assert!(registry.controller_by_id.read().await.is_empty());
-    let database = rusqlite::Connection::open(fixture.path().join("data/harness.sqlite3"))?;
+    let database = rusqlite::Connection::open(crate::storage::state::database(
+        &fixture.path().join("data"),
+    ))?;
     let count: i64 =
         database.query_row("SELECT count(*) FROM session_record", [], |row| row.get(0))?;
     assert_eq!(count, 0);
@@ -1005,7 +1007,7 @@ async fn manual_plan_edits_retain_projection_and_decision_history() -> Result<()
         )?
         .context("reviewed plan is missing")?;
     let data = fixture.path().join("data");
-    let file = crate::plan::PlanFileStore::new(data.clone(), fixture.path());
+    let file = crate::plan::PlanFileStore::new(data.clone(), fixture.path()).unwrap();
     let mut canonical = file.read_working_document(&session_id, &plan.id)?;
     canonical.design.as_mut().unwrap().document.tests = serde_json::from_value(json!([
         {"file":"tests/config.rs","cases":[
@@ -5263,7 +5265,7 @@ async fn sqlite_contention_fails_explicitly_and_leaves_host_usable() -> Result<(
         .as_str()
         .unwrap()
         .to_owned();
-    let mut external = rusqlite::Connection::open(root.join("harness.sqlite3"))?;
+    let mut external = rusqlite::Connection::open(crate::storage::state::database(&root))?;
     let lock = external.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let failure = service

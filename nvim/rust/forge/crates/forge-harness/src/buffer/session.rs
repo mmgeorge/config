@@ -4515,7 +4515,7 @@ mod tests {
         tokio::task::spawn_blocking(move || -> Result<()> {
             ensure!(std::process::Command::new("git").args(["init", "-q"]).current_dir(&saved_workspace).status()?.success(), "fixture git initialization failed");
             let mut store = crate::storage::SqliteStore::open(&saved_data)?;
-            let connection = rusqlite::Connection::open(saved_data.join("harness.sqlite3"))?;
+            let connection = rusqlite::Connection::open(crate::storage::state::database(&saved_data))?;
             connection.execute("INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES('session', ?1, 0, '{}')", [saved_workspace.to_string_lossy().as_ref()])?;
             for (id, text) in [("before", before), ("after", saved_after.as_str())] {
                 store.save_checkpoint(&crate::checkpoint::CheckpointRecord {

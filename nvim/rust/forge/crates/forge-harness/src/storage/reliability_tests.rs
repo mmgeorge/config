@@ -22,40 +22,35 @@ fn provider_failure_display_does_not_repeat_its_source_chain() {
     assert_eq!(displayed.matches("Persistence").count(), 1);
 }
 
-/// Upgrade existing version-seven databases before provider admission needs durable operation evidence.
+/// Isolate obsolete history before provider admission needs durable operation evidence.
 #[test]
-fn version_seven_upgrade_adds_core_log_without_rewriting_sessions() -> Result<()> {
+fn obsolete_history_is_replaced_before_core_log_admission() -> Result<()> {
     use crate::exchange::core_log::{CoreEventLog, CoreOperation, CoreRecord};
     use forge_provider_api::{EventScope, ExecutionOwner, OperationId, ProviderOperation};
 
     let root = tempfile::tempdir()?;
     let mut store = SqliteStore::open(root.path())?;
     store.save_session(&session("existing-session", "workspace"))?;
-    let original: String = store.connection.query_row(
-        "SELECT payload FROM session_record WHERE id='existing-session'",
-        [],
-        |row| row.get(0),
-    )?;
     store.connection.execute_batch(
         "DROP TABLE owner_core_log; PRAGMA user_version=7;
          CREATE TRIGGER preserve_existing_sessions BEFORE UPDATE ON session_record
          BEGIN SELECT RAISE(ABORT,'unexpected session rewrite'); END;",
     )?;
     drop(store);
+    std::fs::rename(
+        super::state::directory(root.path()),
+        root.path().join("state/v7"),
+    )?;
 
-    let upgraded = SqliteStore::open(root.path())?;
+    let mut upgraded = SqliteStore::open(root.path())?;
     assert_eq!(
         upgraded
             .connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
         super::schema::VERSION
     );
-    let retained: String = upgraded.connection.query_row(
-        "SELECT payload FROM session_record WHERE id='existing-session'",
-        [],
-        |row| row.get(0),
-    )?;
-    assert_eq!(retained, original);
+    assert!(upgraded.load_session("existing-session")?.is_none());
+    upgraded.save_session(&session("current-session", "workspace"))?;
     let log = CoreEventLog::new(root.path().to_owned());
     let record = CoreRecord::OperationStarted {
         operation: CoreOperation::Provider {
@@ -63,12 +58,12 @@ fn version_seven_upgrade_adds_core_log_without_rewriting_sessions() -> Result<()
             kind: ProviderOperation::SessionOpen,
             binding: None,
             scope: EventScope::Binding {
-                owner: ExecutionOwner::root("existing-session"),
+                owner: ExecutionOwner::root("current-session"),
             },
             invocation: None,
         },
     };
-    assert_eq!(log.append("existing-session", &record)?, Some(1));
+    assert_eq!(log.append("current-session", &record)?, Some(1));
     assert_eq!(log.append("utility-without-history", &record)?, None);
     drop(upgraded);
     let reopened = SqliteStore::open(root.path())?;
@@ -82,9 +77,9 @@ fn version_seven_upgrade_adds_core_log_without_rewriting_sessions() -> Result<()
     Ok(())
 }
 
-/// Preserve review data and flattened task records while removing the old lifecycle storage path.
+/// Discard obsolete review decisions and task records instead of reconstructing authority.
 #[test]
-fn legacy_review_upgrade_preserves_answers_and_requires_new_execution_authority() -> Result<()> {
+fn obsolete_review_history_is_deleted_without_reconstructing_authority() -> Result<()> {
     let (root, mut store, controller) = crate::task::SessionTaskController::test_goal();
     let mut review = crate::plan::PlanReview::new(
         "review-digest".into(),
@@ -107,7 +102,6 @@ fn legacy_review_upgrade_preserves_answers_and_requires_new_execution_authority(
         .elicitation
         .answer_order
         .insert(question, ("view".into(), 7));
-    let expected = serde_json::to_value(&review)?;
     let plan: crate::plan::PlanRecord = serde_json::from_value(serde_json::json!({
         "id":"legacy-plan","session_id":"session","request":"Keep reviewed decisions","state":"awaiting_review",
         "working_path":"","document_version":1,"model_revision":1,"submitted_version":1,"user_revision":0,
@@ -146,50 +140,28 @@ fn legacy_review_upgrade_preserves_answers_and_requires_new_execution_authority(
         store.connection.execute(&format!("UPDATE {table} SET payload=json_remove(json_set(payload,?1,json_extract(payload,?2)),?2)"), [old,new])?;
     }
     store.connection.execute_batch("PRAGMA user_version=6")?;
+    drop(store);
+    drop(controller);
+    std::fs::rename(
+        super::state::directory(root.path()),
+        root.path().join("state/v6"),
+    )?;
     let upgraded = SqliteStore::open(root.path())?;
-    let plan = upgraded.load_plan("legacy-plan")?.unwrap();
-    assert_eq!(
-        serde_json::to_value(plan.review.as_ref().unwrap())?,
-        expected
-    );
-    assert!(!plan.review_questions().unwrap().has_pending_decisions());
-    let mut questions = plan.review.unwrap().elicitation;
-    questions.start_timeout(crate::session::InputTimeout::default(), 100)?;
-    assert!(questions.deadline.is_none());
-    assert!(questions.expire().is_err());
-    let task = upgraded.load_active_task("session")?.unwrap();
-    assert!(task.auto_accept_plan);
-    assert!(crate::task::command::SessionCommand::approved_revision(&task)?.is_none());
-    for (table, old, new) in [
-        ("plan_record", "$.acceptance", "$.review"),
-        (
-            "session_record",
-            "$.session.active_task.plan.artifact.acceptance",
-            "$.session.active_task.plan.artifact.review",
-        ),
-        (
-            "task_record",
-            "$.plan.artifact.acceptance",
-            "$.plan.artifact.review",
-        ),
-    ] {
-        let (legacy, converted): (Option<String>, String) = upgraded.connection.query_row(
-            &format!("SELECT json_type(payload,?1),json_extract(payload,?2) FROM {table} LIMIT 1"),
-            [old, new],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        assert!(legacy.is_none());
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&converted)?,
-            expected
-        );
+    for table in ["session_record", "plan_record", "task_record"] {
+        let retained: i64 =
+            upgraded
+                .connection
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(retained, 0);
     }
     Ok(())
 }
 
-/// A conflicting conversion must roll back earlier rows and leave the old schema version intact.
+/// Refuse replacement while a live connection owns the old history.
 #[test]
-fn conflicting_legacy_review_upgrade_rolls_back_all_records() -> Result<()> {
+fn live_history_blocks_schema_replacement_without_changing_records() -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut store = SqliteStore::open(root.path())?;
     store.save_session(&session("session", "workspace"))?;
@@ -249,11 +221,16 @@ fn current_schema_reads_do_not_wait_for_another_writer() -> Result<()> {
 }
 
 #[test]
-fn receipt_upgrade_does_not_rescan_existing_conversations() -> Result<()> {
+fn obsolete_history_replacement_does_not_decode_existing_conversations() -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut store = SqliteStore::open(root.path())?;
     store.save_session(&session("session", "workspace"))?;
     store.connection.execute_batch("DROP TABLE command_receipt; PRAGMA user_version=1; CREATE TRIGGER prevent_scan BEFORE UPDATE ON exchange_record BEGIN SELECT RAISE(ABORT,'unexpected conversation rewrite'); END;")?;
+    drop(store);
+    std::fs::rename(
+        super::state::directory(root.path()),
+        root.path().join("state/v1"),
+    )?;
     let upgraded = SqliteStore::open(root.path())?;
     assert_eq!(
         upgraded
@@ -272,7 +249,7 @@ fn receipt_upgrade_does_not_rescan_existing_conversations() -> Result<()> {
 }
 
 #[test]
-fn schema_upgrade_rolls_back_and_newer_databases_are_preserved() -> Result<()> {
+fn newer_databases_are_preserved_and_obsolete_history_is_deleted() -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut store = SqliteStore::open(root.path())?;
     store.save_session(&session("session", "workspace"))?;
@@ -299,11 +276,15 @@ fn schema_upgrade_rolls_back_and_newer_databases_are_preserved() -> Result<()> {
     store
         .connection
         .execute_batch("DROP TRIGGER refuse_conversion")?;
+    drop(store);
+    std::fs::rename(
+        super::state::directory(root.path()),
+        root.path().join("state/v0"),
+    )?;
     let migrated = SqliteStore::open(root.path())?;
-    assert_eq!(
-        migrated.tool_output_bytes("old", "turn", "call", 0, 100)?.0,
-        b"retained"
-    );
+    assert!(migrated.load_exchange("old")?.is_none());
+    let mut store = migrated;
+    store.save_session(&session("current", "workspace"))?;
     store
         .connection
         .pragma_update(None, "user_version", super::schema::VERSION + 1)?;
@@ -311,16 +292,7 @@ fn schema_upgrade_rolls_back_and_newer_databases_are_preserved() -> Result<()> {
         .err()
         .expect("newer schema must fail");
     assert!(format!("{error:#}").contains("newer than supported"));
-    assert!(
-        store
-            .connection
-            .query_row(
-                "SELECT payload FROM exchange_record WHERE id='old'",
-                [],
-                |row| row.get::<_, String>(0)
-            )?
-            .contains("tool_output_format")
-    );
+    assert!(store.load_session("current")?.is_some());
     Ok(())
 }
 
@@ -330,7 +302,7 @@ fn partial_deletion_recovers_without_blocking_unrelated_writes() -> Result<()> {
     let mut store = SqliteStore::open(root.path())?;
     store.save_session(&session("deleted", "workspace"))?;
     store.save_session(&session("survivor", "workspace"))?;
-    let plans = root.path().join("plans/deleted");
+    let plans = crate::storage::state::directory(&root.path()).join("plans/deleted");
     std::fs::create_dir_all(&plans)?;
     std::fs::write(plans.join("first"), "first")?;
     std::fs::write(plans.join("second"), "second")?;

@@ -557,7 +557,7 @@ mod tests {
     fn asynchronous_failure_evidence_survives_successful_input_acceptance() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         persist_test_session(root.path(), "session")?;
-        let database = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
+        let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
         let log = CoreEventLog::new(root.path().to_owned());
         let scope = InvocationScope::new(
             forge_provider_api::ExecutionOwner::root("session"),
@@ -661,7 +661,7 @@ mod tests {
             },
         };
         assert_eq!(log.append("session", &record)?, None);
-        let database = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
+        let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
         assert_eq!(
             database.query_row("SELECT COUNT(*) FROM session_record", [], |row| row
                 .get::<_, i64>(0))?,

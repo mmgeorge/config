@@ -1,21 +1,17 @@
 use super::{decode, decode_current_session};
 use crate::{exchange::Exchange, session::HarnessSession};
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use std::path::Path;
 
 /// Reads committed history without initializing schemas, hydrating output, or acquiring ownership.
 pub(crate) struct SessionReader {
-    connection: Connection,
+    connection: super::database::HistoryConnection,
 }
 
 impl SessionReader {
     pub(crate) fn open(root: &Path) -> Result<Self> {
-        let connection = Connection::open_with_flags(
-            root.join("harness.sqlite3"),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        let connection = super::database::HistoryConnection::read_only(root)?;
         connection.execute_batch("BEGIN DEFERRED")?;
         Ok(Self { connection })
     }

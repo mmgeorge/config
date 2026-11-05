@@ -285,7 +285,7 @@ impl SqliteStore {
         change: impl FnOnce(&mut Option<Task>) -> Result<(Output, TaskEffects)>,
     ) -> Result<Option<Output>> {
         let artifacts =
-            crate::plan::PlanFileStore::new(self.data_root.clone(), std::path::PathBuf::new());
+            crate::plan::PlanFileStore::new(self.data_root.clone(), std::path::PathBuf::new())?;
         let mut affected_plans = Vec::new();
         let result = (|| {
             let observed_payload: Option<String> = self.connection.query_row(
@@ -794,7 +794,7 @@ mod tests {
         let (root, mut store, controller) = crate::task::SessionTaskController::test_goal();
         let workspace = tempfile::tempdir()?;
         crate::checks::configure_fixture(workspace.path());
-        let files = crate::plan::PlanFileStore::new(root.path(), workspace.path());
+        let files = crate::plan::PlanFileStore::new(root.path(), workspace.path()).unwrap();
         let mut document = crate::plan::test_fixture("pending-artifact", "Preserve live edits");
         let mut design = crate::plan::DeclarationDesign::open(workspace.path())?;
         design.document.objective = "Preserve live artifact ownership".into();
@@ -827,8 +827,7 @@ pub struct Owner;
         changed.version += 1;
         changed.overview = "The live worker has written this pending edit.".into();
         files.write_working_mutation_guarded(&prior, &original, &changed)?;
-        let journal = root
-            .path()
+        let journal = crate::storage::state::directory(&root.path())
             .join("plans/session")
             .join(&id)
             .join("artifact-recovery.json");
@@ -920,7 +919,7 @@ pub struct Owner;
         let (root, mut store, controller) = crate::task::SessionTaskController::test_goal();
         let workspace = tempfile::tempdir()?;
         crate::checks::configure_fixture(workspace.path());
-        let files = crate::plan::PlanFileStore::new(root.path(), workspace.path());
+        let files = crate::plan::PlanFileStore::new(root.path(), workspace.path()).unwrap();
         let mut document = crate::plan::test_fixture("implicit-artifact", "Plan the change");
         let mut design = crate::plan::DeclarationDesign::open(workspace.path())?;
         design.document.objective = "Preserve the plan artifact commit boundary".into();
@@ -955,8 +954,7 @@ pub struct Owner;
                 target.document_version,
             )?;
             target.review_digest = Some(digest);
-            let journal = root
-                .path()
+            let journal = crate::storage::state::directory(&root.path())
                 .join("plans/session")
                 .join(&id)
                 .join("artifact-recovery.json");
@@ -1020,7 +1018,7 @@ pub struct Owner;
         let (root, mut store, controller) = crate::task::SessionTaskController::test_goal();
         let workspace = tempfile::tempdir()?;
         crate::checks::configure_fixture(workspace.path());
-        let files = crate::plan::PlanFileStore::new(root.path(), workspace.path());
+        let files = crate::plan::PlanFileStore::new(root.path(), workspace.path()).unwrap();
         let prepared = files.prepare_entry("session", "Plan the change".into(), None, 2)?;
         let plan_id = prepared.record.id.clone();
         let mut plan = Task::plan(prepared.record, 2)?;

@@ -1412,7 +1412,7 @@ mod tests {
     #[test]
     fn projected_annotations_keep_literal_text_and_exact_canonical_source_rows() {
         let temporary = tempfile::tempdir().unwrap();
-        let store = PlanFileStore::new(temporary.path(), temporary.path());
+        let store = PlanFileStore::new(temporary.path(), temporary.path()).unwrap();
         crate::checks::configure_fixture(&store.workspace);
         let mut canonical = crate::plan::document::test_fixture(
             "plan",

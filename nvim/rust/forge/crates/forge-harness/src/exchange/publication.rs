@@ -139,7 +139,7 @@ impl RetainedPublication {
 /// Serialize publication identity and delivery evidence independently of exchange mutation ownership.
 pub(crate) struct SessionPublications {
     session: String,
-    connection: Mutex<Connection>,
+    connection: Mutex<crate::storage::database::HistoryConnection>,
     changed: tokio::sync::Notify,
     reconciliation: Mutex<Option<PublicationBarrier>>,
     failed: AtomicBool,
@@ -178,9 +178,7 @@ impl SessionPublications {
         if session.trim().is_empty() {
             return Err(PublicationError::SessionMismatch);
         }
-        let connection = Connection::open(root.join("harness.sqlite3"))?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
+        let connection = crate::storage::database::HistoryConnection::open(root)?;
         Ok(Self {
             session: session.into(),
             connection: Mutex::new(connection),
@@ -1003,6 +1001,8 @@ impl Drop for PublicationDelivery {
 /// Preserve publication-storage failures separately from transient UI-channel availability.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PublicationError {
+    #[error("publication database could not be opened")]
+    Database(#[from] crate::storage::database::DatabaseError),
     #[error("reconnect response lease expired before confirmation")]
     ReconciliationExpired,
     #[error("publication cursor is beyond the committed session prefix")]
@@ -1037,7 +1037,8 @@ impl PublicationError {
     /// Retain valid producer work after storage uncertainty without queuing rejected identities or content.
     fn requires_recovery(&self) -> bool {
         match self {
-            Self::Storage(_)
+            Self::Database(_)
+            | Self::Storage(_)
             | Self::Codec(_)
             | Self::DeliveryState { .. }
             | Self::Unavailable

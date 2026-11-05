@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 /// Shares immutable checkpoint bytes without sharing a SQLite connection.
 #[derive(Clone)]
 pub struct ObjectStore {
+    _lease: super::state::StateLease,
     root: Arc<PathBuf>,
     cache: Arc<std::sync::Mutex<std::collections::HashMap<(PathBuf, String), SourceCapture>>>,
     baseline: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
@@ -46,10 +47,14 @@ pub(crate) struct FileCapture {
 
 impl ObjectStore {
     pub fn open(data_root: &Path) -> Result<Self> {
-        let root = data_root.join("objects").join("sha256");
+        let lease = super::state::StateLease::open(data_root)?;
+        let root = super::state::directory(data_root)
+            .join("objects")
+            .join("sha256");
         fs::create_dir_all(&root)
             .with_context(|| format!("create Harness object directory {}", root.display()))?;
         Ok(Self {
+            _lease: lease,
             root: Arc::new(root),
             cache: Arc::default(),
             baseline: Arc::default(),

@@ -2322,7 +2322,7 @@ mod tests {
                 2,
             )?
             .unwrap();
-        let files = crate::plan::PlanFileStore::new(root.path(), root.path());
+        let files = crate::plan::PlanFileStore::new(root.path(), root.path()).unwrap();
         let original = crate::plan::test_fixture("document-plan", "original");
         files.create_working_document("session", "document-plan", &original)?;
         let mut intervening = original.clone();

@@ -17,6 +17,12 @@ pub enum Command {
     Nvim,
     /// Run the plan and goal control-tool MCP server.
     Mcp,
+    /// Delete unlocked Harness state versions while retaining settings and reporting locked versions.
+    HistoryClear {
+        /// Harness data directory, separate from repository files and permissions.
+        #[arg(long)]
+        data_root: std::path::PathBuf,
+    },
 }
 
 #[inline(never)]
@@ -27,6 +33,14 @@ pub enum Command {
 pub fn run(command: Command, diagnostic_skip_line_stats: bool) -> Result<()> {
     shutdown::run(async {
         match command {
+            Command::HistoryClear { data_root } => {
+                let report = forge_harness::storage::state::clear(&data_root)?;
+                println!("{}", serde_json::to_string(&report)?);
+                if !report.retained.is_empty() {
+                    anyhow::bail!("Some Forge state versions could not be cleared");
+                }
+                Ok(())
+            }
             Command::Mcp => forge_harness::tools::run_stdio().await,
             Command::Nvim => {
                 let host = Arc::new(runtime::ForgeRuntime::new()?);

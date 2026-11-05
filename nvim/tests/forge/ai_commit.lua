@@ -6,6 +6,7 @@ local original_client = package.loaded["forge.client"]
 local original_notify = vim.notify
 local original_settings = package.loaded["forge.integrations.background_settings"]
 local function generation_get_config() return { provider = { kind = "fixture_alpha" } } end
+package.loaded["forge.client"] = { generation_get_config = generation_get_config }
 package.loaded["forge.integrations.background_settings"] = {
   request = function(_, _, callback)
     callback({ settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
@@ -60,6 +61,63 @@ local function run()
   assert_equal(#notices, completed_count, "completed generation timer kept notifying")
   assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], "reused draft")
   vim.api.nvim_buf_delete(buffer, { force = true })
+
+  local source = { head = "fixture-head", file = { { id = 1, generation = 1, section = "staged" } } }
+  local function open_context(document)
+    return require("forge.views.status.status_context").attach({
+      document_id = document, workspace = cwd,
+      is_alive = function() return true end,
+      capture_input = function() error("unexpected input") end,
+      is_input_current = function() return true end,
+      get_about_source = function() return vim.deepcopy(source) end,
+      present = function() end,
+    })
+  end
+  local context = open_context("first-status")
+  context.generate_about()
+  assert_equal(#requests, 0, "opening Status bypassed the cached draft")
+  assert_equal(context.about.message, "reused draft")
+  context.close()
+  source.file[#source.file + 1] = { id = 2, generation = 1, section = "staged" }
+  context = open_context("reopened-status")
+  context.generate_about()
+  assert_equal(#requests, 0, "reopening Status regenerated after staging another file")
+  assert_equal(context.about.message, "reused draft")
+  local replica = require("forge.buffer").open("about-command")
+  replica.status = "Applied"
+  local command_owner = require("forge.document_commands").attach(replica, {
+    view = "status",
+    handler = require("forge.views.status.status_context").producer_handlers({
+      workspace = cwd, is_alive = function() return true end, context = function() return context end,
+    }),
+  })
+  local regenerate_about
+  vim.api.nvim_buf_call(replica.buffer, function()
+    local mapping = vim.fn.maparg("<C-a>", "n", false, true)
+    assert_equal(type(mapping.callback), "function", "Status has no manual About regeneration mapping")
+    regenerate_about = mapping.callback
+  end)
+  regenerate_about()
+  local superseded_about, superseded_request = take("generate", "status")
+  local waiting_commit = vim.api.nvim_create_buf(false, true)
+  ai_commit.populate_commit_buffer_when_ready(waiting_commit, cwd)
+  regenerate_about()
+  assert(superseded_request.cancelled, "Status regeneration did not cancel its previous request")
+  superseded_about({ state = "ready", message = "obsolete About" })
+  assert_equal(context.about.state, "generating", "superseded About replaced the active generation")
+  assert(vim.api.nvim_buf_get_lines(waiting_commit, 0, 1, false)[1] ~= "obsolete About",
+    "superseded About reached the waiting commit editor")
+  take("generate", "status")({ state = "ready", message = "reused draft" })
+  assert_equal(context.about.state, "ready", "explicit Status generation did not complete")
+  assert_equal(vim.api.nvim_buf_get_lines(waiting_commit, 0, 1, false)[1], "reused draft",
+    "waiting commit editor did not receive the replacement About")
+  vim.api.nvim_buf_delete(waiting_commit, { force = true })
+  assert(vim.iter(command_owner.binding):any(function(binding)
+    return binding.spec.id == "regenerate_about" and binding.keys[1] == "<C-a>"
+  end), "About regeneration is absent from Status help bindings")
+  command_owner.close()
+  require("forge.buffer").close(replica)
+  context.close()
 
   buffer = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { "", "# Git comment" })

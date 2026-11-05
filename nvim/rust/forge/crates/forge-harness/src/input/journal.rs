@@ -1,10 +1,10 @@
 use super::{InputSnapshot, InputState, InputUpdate};
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 
 /// Persist active input separately from immutable idempotency receipts.
 pub(super) struct InputJournal {
-    connection: Connection,
+    connection: crate::storage::database::HistoryConnection,
     session_id: String,
 }
 
@@ -31,13 +31,7 @@ impl InputJournal {
 
     /// Open the queue journal using the same durable SQLite policy as provider submissions.
     pub(super) fn open(root: &std::path::Path, session_id: &str) -> Result<Self> {
-        std::fs::create_dir_all(root)?;
-        // Bootstrap the shared schema before opening this domain's independent handle.
-        // Input receipt and owner-command completion now commit in the same database.
-        drop(crate::storage::SqliteStore::open(root)?);
-        let connection = Connection::open(root.join("harness.sqlite3"))?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
+        let connection = crate::storage::database::HistoryConnection::open(root)?;
         Ok(Self {
             connection,
             session_id: session_id.into(),
@@ -222,8 +216,6 @@ pub(crate) fn reserve_workflow_input(
     Ok(())
 }
 
-/// Copy one legacy session once, retaining the source for rollback and inspection.
-/// The migration marker commits with all records, preventing old queues from returning
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -53,6 +53,7 @@
 ---@field discard ForgeKeymap
 ---@field open ForgeKeymap
 ---@field commit ForgeKeymap
+---@field regenerate_about ForgeKeymap
 ---@field push ForgeKeymap
 ---@field pull ForgeKeymap
 ---@field pr ForgeKeymap
@@ -280,6 +281,7 @@ M.defaults = {
       open = { "o", "<CR>", "." },
       commit = "cc",
       commit_amend = "ca",
+      regenerate_about = "<C-a>",
       push = "opp",
       pull = "opP",
       pr = "ogp",

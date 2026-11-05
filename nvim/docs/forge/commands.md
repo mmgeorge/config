@@ -27,6 +27,17 @@ history tools. Configuration inspection and the `harness-sessions` skill remain
 available when history is off. Session-specific reads default to the current
 session. Unfiltered listing/search considers all accessible sessions.
 
+`:ForgeHistoryClear` stops its Forge host and attempts to delete every version
+under `stdpath("data")/forge/harness/state/`. It removes unlocked versions completely:
+sessions, Background conversations, transcripts, plans, captured files, journals,
+and private provider runtimes. A live owner or locked database preserves that whole
+version; the command reports its path and reason while clearing unlocked siblings.
+It removes `state/` when empty. Settings, model preferences and pins, permissions,
+repository files, and unsent composer text survive. Reopen `:ForgeHarness` afterward
+to start a new session. Breaking state versions select a new directory automatically,
+so old editors do not prevent new hosts from starting. The former unversioned
+storage layout lies outside this command's deletion scope.
+
 `harness_session_log` reads newest-first and returns up to 1,000 complete entries
 per page by default. Its optional positive integer `limit` selects another page
 size. Follow `next_cursor` with the same arguments to read older records; the
@@ -43,6 +54,10 @@ or large entries. The first request reads only its batch, not the entire retaine
 | `:ForgeFileRevision <file> <commit>` | File, then revision | Open a read-only historical file |
 | `:ForgeDiffCompactPreview` | None | Preview the compacted working-tree diff |
 | `:ForgeDiffCompactPreview!` | Bang | Preview the compacted staged diff |
+
+Invoking `:ForgeStatus` from a floating picker or a window pinned to another buffer
+reuses an existing non-floating Status window, or opens a new tab if none exists.
+Forge leaves the picker or pinned buffer untouched.
 
 ForgeStatus file rows, file-specific comparison labels, and single-file discard
 confirmations show paths relative to the editor cwd in the window that opened the view.
@@ -98,10 +113,18 @@ changes, they use unstaged tracked changes and untracked files, excluding ignore
 files. A partially staged file contributes its staged contents only. Commit-message
 generation sends a compact diff to the selected model without progress, waiting, or completion popups. Generation failures
 produce error notifications and preserve the existing draft, including edits made while waiting.
+
+Reopening ForgeStatus reuses its cached About draft without checking changes made
+while Status was closed. Press `Ctrl-A` in Normal mode to regenerate About from
+the current staged changes, or non-ignored worktree changes when nothing is staged.
+It cancels any previous About generation and keeps waiting commit editors attached
+to the replacement request. Changes detected while the same Status context remains
+alive still trigger automatic regeneration.
+
 For a new commit, the editor copies the existing About draft or waits for its in-progress
 generation. It does not start another generation. About and the commit editor's first
 line show an animated `Generating with <model>` status, including thinking and speed.
-Failures and cancellation restore the previous subject. `Ctrl-A` cancels the previous
+Failures and cancellation restore the previous subject. In the commit editor, `Ctrl-A` cancels the previous
 generation request before regenerating from staged changes, or from the latest commit
 when amending. Late results from the cancelled request cannot replace the new draft.
 Entering Insert mode while generation is pending cancels that request and removes

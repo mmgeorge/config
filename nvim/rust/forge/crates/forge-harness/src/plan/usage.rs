@@ -563,7 +563,8 @@ mod tests {
     fn removing_calls_rejects_cached_submission_without_rewriting_the_draft() {
         let workspace = tempfile::tempdir().unwrap();
         let store =
-            crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
+            crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path())
+                .unwrap();
         crate::checks::configure_fixture(&store.workspace);
         let mut document = crate::plan::document::test_fixture("uses", "Connect internal behavior");
         let mut design = design("lib.rs", "pub fn install() { worker(); }\nfn worker() {}\n");

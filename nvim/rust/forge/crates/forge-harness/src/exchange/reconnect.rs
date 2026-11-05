@@ -69,6 +69,7 @@ impl ReconnectError {
                 | PublicationError::InvalidSequence
                 | PublicationError::SequenceExhausted
                 | PublicationError::Unavailable
+                | PublicationError::Database(_)
                 | PublicationError::Storage(_)
                 | PublicationError::Codec(_)
                 | PublicationError::DeliveryState { .. },

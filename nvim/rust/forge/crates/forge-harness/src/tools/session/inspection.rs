@@ -472,7 +472,7 @@ impl HarnessInspectionScope {
         result["locations"] = json!({"config_directory":root,"forge_rust":source.as_ref().map(|root|root.join("rust/forge")),
             "forge_lua":source.as_ref().map(|root|root.join("lua/forge")),
             "documentation":source.as_ref().map(|root|root.join("contributing/forge/README.md")),
-            "permissions":self.permission_path,"sessions_database":self.data_root.join("harness.sqlite3"),
+            "permissions":self.permission_path,"sessions_database":crate::storage::state::database(&self.data_root),
             "settings_database":self.data_root.join("settings.db"),"project_checks":Path::new(&session.workspace).join(".forge.json"),
             "session_log":self.trace.session_status(&session.id).path});
         Ok(result)

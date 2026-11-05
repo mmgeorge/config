@@ -2519,14 +2519,16 @@ impl HarnessBroker {
                 session_id: session.id.clone(),
                 data_root: data_root.clone(),
                 workspace: PathBuf::from(&session.workspace),
-                root: data_root.join(&session.id).join("checks"),
+                root: crate::storage::state::directory(&data_root)
+                    .join(&session.id)
+                    .join("checks"),
             },
             Arc::clone(&presentation),
             store.objects.clone(),
             Arc::clone(&runtime.repositories),
             trace.clone(),
         )?;
-        let plan_file = Arc::new(PlanFileStore::new(&data_root, &session.workspace));
+        let plan_file = Arc::new(PlanFileStore::new(&data_root, &session.workspace).unwrap());
         let questions = Arc::new(crate::question::QuestionController::open(
             &data_root,
             &session.id,

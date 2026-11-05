@@ -5,7 +5,7 @@ return {
     dependencies = { "folke/snacks.nvim" },
     cmd = {
       "ForgeBranchDiff", "ForgeBranchDiffFile", "ForgeFileRevision", "ForgeDiffCompactPreview",
-      "ForgeHarness", "ForgeHarnessNew", "ForgeHarnessLog", "ForgePermissions", "ForgeStartupLog",
+      "ForgeHarness", "ForgeHarnessNew", "ForgeHarnessLog", "ForgeHistoryClear", "ForgePermissions", "ForgeStartupLog",
       "ForgeGitConfigCacheReset",
       "ForgeDebugCommitPromptPreview",
       "ForgeDebugBackgroundTimeline",
@@ -76,6 +76,9 @@ return {
       vim.api.nvim_create_user_command("ForgeHarnessNew", function()
         forge.new_harness_session()
       end, { desc = "Create a fresh Harness session" })
+      vim.api.nvim_create_user_command("ForgeHistoryClear", function()
+        require("forge.client").history_clear()
+      end, { desc = "Stop Forge and delete local Harness, prompt, and Background history" })
       vim.api.nvim_create_user_command("ForgeHarnessLog", function(command)
         local active = require("forge.session").harness.session
         if not active then

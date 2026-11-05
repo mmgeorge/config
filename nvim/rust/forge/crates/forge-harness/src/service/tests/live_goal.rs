@@ -105,7 +105,8 @@ async fn live_goal_controls_commit_before_native_acceptance() -> Result<()> {
             );
         }
         let receipts = rusqlite::Connection::open_with_flags(
-            controller.data_root.join("provider-submissions.sqlite3"),
+            crate::storage::state::directory(&controller.data_root)
+                .join("provider-submissions.sqlite3"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         )?;
         let receipt: String =

@@ -1,17 +1,17 @@
 use std::path::Path;
 
 use anyhow::{Result, ensure};
-use rusqlite::{Connection, params};
+use rusqlite::params;
 
 /// Persists provider-wide pins independently of session leases and format versions.
 pub(crate) struct ModelPinStore {
-    connection: Connection,
+    connection: rusqlite::Connection,
 }
 
 impl ModelPinStore {
-    /// Opens the Harness database without loading or resetting session state.
+    /// Open persistent preferences without opening disposable history.
     pub(crate) fn open(data_root: &Path) -> Result<Self> {
-        let super::SqliteStore { connection, .. } = super::SqliteStore::open(data_root)?;
+        let connection = super::preferences::open(data_root)?;
         Ok(Self { connection })
     }
 

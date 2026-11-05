@@ -462,7 +462,7 @@ async fn bridge(
 async fn open_completion_log_failure_collects_allocated_binding_and_stream() -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     drop(crate::storage::SqliteStore::open(root.path())?);
-    let database = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
+    let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
     database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('bridge-test-session','workspace',1,'{}')", [])?;
     database.execute_batch("CREATE TRIGGER reject_open_completion BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='operation_completed' AND json_extract(NEW.record,'$.operation.kind')='session_open' BEGIN SELECT RAISE(ABORT,'fixture completion evidence failure'); END;")?;
     let native = BridgeFixtureProvider::new(false);
@@ -495,7 +495,7 @@ async fn open_log_failure_retries_native_cleanup_and_drains_retained_stream() ->
 {
     let root = tempfile::tempdir()?;
     drop(crate::storage::SqliteStore::open(root.path())?);
-    let database = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
+    let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
     database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('bridge-test-session','workspace',1,'{}')", [])?;
     database.execute_batch("CREATE TRIGGER reject_open_completion BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='operation_completed' AND json_extract(NEW.record,'$.operation.kind')='session_open' BEGIN SELECT RAISE(ABORT,'fixture completion evidence failure'); END;")?;
     let native = BridgeFixtureProvider::new(true);
@@ -527,7 +527,7 @@ async fn retained_open_cleanup_bypasses_failed_core_start_and_preserves_uncertai
 -> anyhow::Result<()> {
     let root = tempfile::tempdir()?;
     drop(crate::storage::SqliteStore::open(root.path())?);
-    let database = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
+    let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
     database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('bridge-test-session','workspace',1,'{}')", [])?;
     let native = BridgeFixtureProvider::new(false);
     *native.open_persistent_failure.lock().unwrap() = Some(

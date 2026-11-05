@@ -299,7 +299,7 @@ pub(crate) enum QuestionCreationReplayError {
 
 /// Serialize question changes in their own transaction, without an execution lock.
 pub(crate) struct QuestionController {
-    connection: Mutex<Connection>,
+    connection: Mutex<crate::storage::database::HistoryConnection>,
     /// Each guard registers once per ID; repeated IDs represent independently owned waits.
     waiting: Mutex<Vec<QuestionId>>,
     session_id: String,
@@ -309,7 +309,7 @@ pub(crate) struct QuestionController {
 impl QuestionController {
     /// Create a controller using the session database's durable SQLite policy.
     pub(crate) fn open(root: &Path, session_id: &str) -> Result<Self> {
-        let connection = Connection::open(root.join("harness.sqlite3"))?;
+        let connection = crate::storage::database::HistoryConnection::open(root)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch("CREATE TABLE IF NOT EXISTS session_question_state(session_id TEXT PRIMARY KEY REFERENCES session_record(id) ON DELETE CASCADE,format_version INTEGER NOT NULL,payload TEXT NOT NULL);")?;
         Ok(Self {
@@ -2213,7 +2213,8 @@ mod tests {
         assert!(queue.apply(operation)?.error.is_none());
         drop(queue);
         {
-            let connection = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
+            let connection =
+                rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
             let snapshot: String = connection.query_row(
                 "SELECT payload FROM input_session WHERE session_id='session'",
                 [],

@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use super::SqliteStore;
 use crate::exchange::Exchange;
@@ -29,36 +28,6 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
         output TEXT NOT NULL, PRIMARY KEY(exchange_id,turn_id,tool_id,byte_offset)
     );",
     )?;
-    initialize_positions(connection)?;
-    let transaction = connection;
-    let mut cursor: Option<i64> = None;
-    loop {
-        let record: Option<(i64, String, String)> = transaction.query_row(
-            "SELECT rowid,id,payload FROM exchange_record WHERE (?1 IS NULL OR rowid>?1) AND coalesce(json_extract(payload,'$.tool_output_format'),0)<>2 ORDER BY rowid LIMIT 1",
-            [cursor], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-        ).optional()?;
-        let Some((row, id, payload)) = record else {
-            break;
-        };
-        let mut value: Value = serde_json::from_str(&payload)?;
-        visit_output(&mut value, |turn, tool, output| {
-            transaction.execute(
-                "INSERT OR IGNORE INTO tool_output_owner VALUES(?1,?2,?3)",
-                params![id, turn, tool],
-            )?;
-            // Recovery can rewrite metadata with empty inline output while retaining chunks.
-            if !output.is_empty() {
-                replace(transaction, &id, turn, tool, &output.into())?;
-            }
-            Ok(())
-        })?;
-        value["tool_output_format"] = Value::from(2);
-        transaction.execute(
-            "UPDATE exchange_record SET payload=?2 WHERE id=?1",
-            params![id, serde_json::to_string(&value)?],
-        )?;
-        cursor = Some(row);
-    }
     initialize_positions(connection)?;
     Ok(())
 }
@@ -113,25 +82,6 @@ pub(super) fn visit_tool_records(
     Ok(())
 }
 
-fn visit_output(
-    value: &mut Value,
-    mut visit: impl FnMut(&str, &str, &str) -> Result<()>,
-) -> Result<()> {
-    visit_tool_records(
-        value
-            .as_object_mut()
-            .context("stored exchange is not an object")?,
-        |turn, tool_id, tool| {
-            let output = tool["output"]
-                .as_str()
-                .context("stored tool output is not text")?;
-            visit(turn, tool_id, output)?;
-            tool["output"] = Value::String(String::new());
-            Ok(())
-        },
-    )
-}
-
 pub(super) fn initialize_positions(connection: &Connection) -> Result<()> {
     connection.execute_batch("CREATE TABLE IF NOT EXISTS tool_output_summary (
         exchange_id TEXT NOT NULL,turn_id TEXT NOT NULL,tool_id TEXT NOT NULL,
@@ -144,82 +94,6 @@ pub(super) fn initialize_positions(connection: &Connection) -> Result<()> {
         PRIMARY KEY(exchange_id,turn_id,tool_id,byte_offset),
         FOREIGN KEY(exchange_id,turn_id,tool_id) REFERENCES tool_output_owner(exchange_id,turn_id,tool_id) ON DELETE CASCADE);
         CREATE INDEX IF NOT EXISTS tool_output_character_order ON tool_output_position(exchange_id,turn_id,tool_id,char_offset);")?;
-    connection.execute_batch("CREATE TEMP TABLE tool_output_upgrade(byte_offset INTEGER PRIMARY KEY,char_offset INTEGER NOT NULL,char_count INTEGER NOT NULL,output TEXT NOT NULL)")?;
-    let mut cursor = 0i64;
-    loop {
-        let owner: Option<(i64,String,String,String)> = connection.query_row("SELECT rowid,exchange_id,turn_id,tool_id FROM tool_output_owner WHERE rowid>?1 AND NOT EXISTS(SELECT 1 FROM tool_output_summary s WHERE s.exchange_id=tool_output_owner.exchange_id AND s.turn_id=tool_output_owner.turn_id AND s.tool_id=tool_output_owner.tool_id) ORDER BY rowid LIMIT 1",[cursor],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).optional()?;
-        let Some((row, exchange, turn, tool)) = owner else {
-            break;
-        };
-        migrate_output(connection, &exchange, &turn, &tool)?;
-        cursor = row;
-    }
-    connection.execute_batch("DROP TABLE tool_output_upgrade")?;
-    Ok(())
-}
-
-fn migrate_output(connection: &Connection, exchange: &str, turn: &str, tool: &str) -> Result<()> {
-    // Stage validated windows before replacing legacy chunks in the migration transaction.
-    connection.execute("DELETE FROM tool_output_upgrade", [])?;
-    let mut hash = Sha256::new();
-    let mut bytes = 0i64;
-    let mut characters = 0i64;
-    let mut statement = connection.prepare("SELECT byte_offset,length(cast(output AS BLOB)) FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 ORDER BY byte_offset")?;
-    let mut rows = statement.query(params![exchange, turn, tool])?;
-    while let Some(row) = rows.next()? {
-        let start: i64 = row.get(0)?;
-        let length: i64 = row.get(1)?;
-        ensure!(
-            start == bytes,
-            "stored tool output has a discontinuous byte offset"
-        );
-        let mut consumed = 0i64;
-        while consumed < length {
-            let window:Vec<u8> = connection.query_row("SELECT substr(cast(output AS BLOB),?5,16384) FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 AND byte_offset=?4",params![exchange,turn,tool,start,consumed+1],|row|row.get(0))?;
-            let valid = match std::str::from_utf8(&window) {
-                Ok(text) => text.len(),
-                Err(error) if error.error_len().is_none() => error.valid_up_to(),
-                Err(error) => return Err(error).context("stored tool output is not UTF-8"),
-            };
-            ensure!(
-                valid > 0,
-                "stored tool output ended inside a UTF-8 character"
-            );
-            let text = std::str::from_utf8(&window[..valid])?;
-            let count = text.chars().count() as i64;
-            connection.execute(
-                "INSERT INTO tool_output_upgrade VALUES(?1,?2,?3,?4)",
-                params![bytes, characters, count, text],
-            )?;
-            hash.update(text.as_bytes());
-            bytes += valid as i64;
-            characters += count;
-            consumed += valid as i64;
-        }
-    }
-    drop(rows);
-    drop(statement);
-    // Publish indexed chunks and their summary together with the schema version.
-    connection.execute(
-        "DELETE FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3",
-        params![exchange, turn, tool],
-    )?;
-    connection.execute(
-        "INSERT INTO tool_output_chunk SELECT ?1,?2,?3,byte_offset,output FROM tool_output_upgrade",
-        params![exchange, turn, tool],
-    )?;
-    connection.execute("INSERT INTO tool_output_position SELECT ?1,?2,?3,byte_offset,char_offset,char_count FROM tool_output_upgrade",params![exchange,turn,tool])?;
-    connection.execute(
-        "INSERT INTO tool_output_summary VALUES(?1,?2,?3,?4,?5,?6)",
-        params![
-            exchange,
-            turn,
-            tool,
-            bytes,
-            characters,
-            hex::encode(hash.finalize())
-        ],
-    )?;
     Ok(())
 }
 

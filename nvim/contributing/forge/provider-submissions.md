@@ -6,7 +6,7 @@ This reference explains what counts as acceptance for each provider, and how to 
 
 ## Journal states
 
-`provider/submission.rs` owns the journal in `provider-submissions.sqlite3` under the Harness data root, using WAL and FULL synchronous commits. It stays enabled when tracing is disabled. Root admission saves the complete typed input before acknowledging the composer, and live steering saves its input before entering the active-turn queue. Child and Background requests use the same journal with their own owner identity.
+`provider/submission.rs` owns `provider-submissions.sqlite3` under the current Harness `state/vN/` directory, using WAL and FULL synchronous commits and retaining that version's lifetime lease. It stays enabled when tracing is disabled. Root admission saves the complete typed input before acknowledging the composer, and live steering saves its input before entering the active-turn queue. Child and Background requests use the same journal with their own owner identity.
 
 Owner-targeted steering is registered with the shared session execution engine before dispatch. The adapter reports delivery separately from execution completion. Its 30-second acknowledgment deadline produces an uncertain-delivery error; it never silently queues another copy. Cancelling the owning turn still interrupts delivery.
 

@@ -1254,8 +1254,7 @@ fn corrupt_restore_object_is_rejected_before_any_worktree_deletion() {
         .find(|file| file.path == "tracked.txt")
         .unwrap()
         .object_id;
-    let object = data
-        .path()
+    let object = crate::storage::state::directory(&data.path())
         .join("objects/sha256")
         .join(&identity[..2])
         .join(&identity[2..]);
@@ -1716,7 +1715,7 @@ fn clean_checkpoint_keeps_git_baseline_without_duplicate_objects() {
     assert!(checkpoint.deleted.is_empty());
     assert!(checkpoint.tree.is_some());
     assert_eq!(
-        fs::read_dir(data.path().join("objects/sha256"))
+        fs::read_dir(crate::storage::state::directory(&data.path()).join("objects/sha256"))
             .unwrap()
             .count(),
         0

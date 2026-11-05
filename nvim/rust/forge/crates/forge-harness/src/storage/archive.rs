@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
 use super::objects::ObjectStore;
@@ -41,28 +40,6 @@ pub(super) fn encode(value: &mut Value, objects: &ObjectStore) -> Result<()> {
         }
         Ok(())
     })
-}
-
-/// Converts legacy inherited output once, within the owning schema migration.
-pub(super) fn migrate(connection: &Connection, objects: &ObjectStore) -> Result<()> {
-    let mut cursor = (String::new(), -1_i64);
-    loop {
-        let next: Option<(String, i64, String)> = connection.query_row(
-            "SELECT session_id,ordinal,payload FROM fork_history_record WHERE (session_id,ordinal)>(?1,?2) ORDER BY session_id,ordinal LIMIT 1",
-            params![cursor.0,cursor.1], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
-        ).optional()?;
-        let Some((session, ordinal, payload)) = next else {
-            break;
-        };
-        let mut value: Value = crate::codec::from_str(&payload)?;
-        encode(&mut value, objects)?;
-        connection.execute(
-            "UPDATE fork_history_record SET payload=?3 WHERE session_id=?1 AND ordinal=?2",
-            params![session, ordinal, super::encode(&value)?],
-        )?;
-        cursor = (session, ordinal);
-    }
-    Ok(())
 }
 
 /// Attaches runtime storage access without serializing machine-specific paths into history.

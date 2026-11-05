@@ -93,7 +93,7 @@ pub fn prepare_provider_fork(
     child.updated_at_ms = now_ms;
     child.lease_owner = Some(client_id.to_owned());
     crate::settings::SettingsStore::open(data_root)?.fork_session(&source.id, &child.id)?;
-    let plan_file = crate::plan::PlanFileStore::new(data_root, &source.workspace);
+    let plan_file = crate::plan::PlanFileStore::new(data_root, &source.workspace)?;
     let history = store.read_snapshot(|| {
         let interaction = store.list_exchange(&source.id)?;
         let plan_list = store.list_plan(&source.id)?;
@@ -122,7 +122,9 @@ pub fn prepare_provider_fork(
         let timeline = TimelineProjector::with_history(
             timeline,
             crate::checks::CheckSupervisor::saved_history(
-                &data_root.join(&source.id).join("checks"),
+                &crate::storage::state::directory(data_root)
+                    .join(&source.id)
+                    .join("checks"),
             )?,
             interaction.iter().chain(&agent_exchange_list),
         )?;

@@ -342,7 +342,7 @@ mod tests {
     {
         let root = tempfile::tempdir()?;
         crate::exchange::core_log::persist_test_session(root.path(), "session")?;
-        let database = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
+        let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
         database.execute_batch("CREATE TRIGGER reject_auth_completion BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='operation_completed' BEGIN SELECT RAISE(ABORT,'fixture completion storage failure'); END;")?;
         let trace = Arc::new(crate::trace::TraceStore::open(root.path())?);
         let core = CoreEventLog::new(root.path().to_owned());
@@ -378,7 +378,7 @@ mod tests {
     {
         let root = tempfile::tempdir()?;
         drop(crate::storage::SqliteStore::open(root.path())?);
-        let database = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
+        let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
         database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('session','workspace',1,'{}')", [])?;
         let trace = Arc::new(crate::trace::TraceStore::open(root.path())?);
         trace.configure(false)?;
@@ -424,7 +424,7 @@ mod tests {
     {
         let root = tempfile::tempdir()?;
         drop(crate::storage::SqliteStore::open(root.path())?);
-        let database = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
+        let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
         database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('session','workspace',1,'{}')", [])?;
         database.execute_batch("CREATE TRIGGER reject_operation_evidence BEFORE INSERT ON owner_core_log BEGIN SELECT RAISE(ABORT,'fixture core storage failure'); END;")?;
         let trace = Arc::new(crate::trace::TraceStore::open(root.path())?);

@@ -2,14 +2,17 @@ pub(crate) mod admission;
 mod archive;
 pub(crate) mod configuration;
 mod current;
+pub mod database;
 pub(crate) mod inspection;
 pub(crate) mod lifecycle;
 pub(crate) mod model_pin;
 pub mod objects;
 mod ownership;
+mod preferences;
 mod question;
 mod recovery;
 mod schema;
+pub mod state;
 mod task;
 pub(crate) use schema::bootstrap_lock;
 pub(crate) use task::{PlanArtifactGuard, TaskEffects};
@@ -36,7 +39,6 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use std::time::Duration;
 
 const SESSION_FORMAT_VERSION: u32 = 64;
 const PREFERENCE_FORMAT_VERSION: u32 = 44;
@@ -77,7 +79,7 @@ struct SessionEnvelope {
 
 /// Owns SQLite metadata and content-addressed objects for the Harness broker.
 pub struct SqliteStore {
-    connection: Connection,
+    connection: database::HistoryConnection,
     admission: std::sync::Arc<admission::AdmissionRegistry>,
     current_exchange: std::cell::RefCell<Option<current::CurrentExchangeCache>>,
     session_lock: std::collections::HashMap<String, std::sync::Arc<fs::File>>,
@@ -132,7 +134,7 @@ impl SqliteStore {
 
     /// Acquires an independent lock handle for runtime ownership or session deletion.
     fn acquire_runtime_lock(&self, session_id: &str) -> Result<fs::File> {
-        let directory = self.data_root.join("session-owner");
+        let directory = state::directory(&self.data_root).join("session-owner");
         fs::create_dir_all(&directory)?;
         let path = directory.join(format!(
             "{}.lock",
@@ -163,18 +165,12 @@ impl SqliteStore {
         }
         Ok(owner)
     }
-    /// Opens storage and upgrades its schema only when its persisted version requires it.
+    /// Open current history, replacing an incompatible database without migrating sessions.
     pub fn open(data_root: &Path) -> Result<Self> {
         fs::create_dir_all(data_root)
             .with_context(|| format!("create Harness data directory {}", data_root.display()))?;
         let objects = objects::ObjectStore::open(data_root)?;
-        let database = data_root.join("harness.sqlite3");
-        let mut connection = Connection::open(&database)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        schema::initialize(&mut connection, &objects, data_root)
-            .with_context(|| format!("initialize Harness database {}", database.display()))?;
+        let connection = database::HistoryConnection::open(data_root)?;
         Ok(Self {
             connection,
             admission: admission::registry(data_root)?,
@@ -185,17 +181,9 @@ impl SqliteStore {
         })
     }
 
-    /// Opens initialized storage without schema writes or migration scans.
+    /// Open initialized storage without schema writes.
     pub(crate) fn read_only(data_root: &Path) -> Result<Self> {
-        let database = data_root.join("harness.sqlite3");
-        let connection =
-            Connection::open_with_flags(&database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .with_context(|| format!("open Harness database {}", database.display()))?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        anyhow::ensure!(
-            schema::validate(&connection)? == schema::VERSION,
-            "Harness database requires schema initialization before reading"
-        );
+        let connection = database::HistoryConnection::read_only(data_root)?;
         Ok(Self {
             connection,
             admission: admission::registry(data_root)?,
@@ -213,7 +201,7 @@ impl SqliteStore {
         provider: &str,
     ) -> Result<Option<HarnessPreference>> {
         let payload: Option<serde_json::Value> = self.load_payload(
-            "SELECT payload FROM preference_record WHERE workspace = ?1 AND backend = ?2",
+            "SELECT payload FROM preferences.preference_record WHERE workspace = ?1 AND backend = ?2",
             params![workspace, provider],
         )?;
         let Some(payload) =
@@ -238,7 +226,7 @@ impl SqliteStore {
         preference: &HarnessPreference,
     ) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO preference_record(workspace, backend, payload) VALUES(?1, ?2, ?3) \
+            "INSERT INTO preferences.preference_record(workspace, backend, payload) VALUES(?1, ?2, ?3) \
              ON CONFLICT(workspace, backend) DO UPDATE SET payload=excluded.payload",
             params![workspace, provider, encode(&serde_json::json!({"format_version":PREFERENCE_FORMAT_VERSION,"preference":preference}))?],
         )?;
@@ -678,7 +666,8 @@ impl SqliteStore {
     /// Write a plan lifecycle record.
     pub fn save_plan(&mut self, plan: &PlanRecord) -> Result<()> {
         // Acquire the file gate before opening SQLite's write transaction.
-        let artifacts = crate::plan::PlanFileStore::new(&self.data_root, std::path::PathBuf::new());
+        let artifacts =
+            crate::plan::PlanFileStore::new(&self.data_root, std::path::PathBuf::new()).unwrap();
         let owns_artifacts = artifacts.claim_plan_artifacts(plan)?;
         let committed = (|| -> Result<()> {
             let transaction = self
@@ -1617,7 +1606,7 @@ mod test {
             "INSERT INTO checkpoint_record(id,session_id,payload) VALUES('old','legacy','{}')",
             [],
         )?;
-        store.connection.execute("INSERT INTO preference_record(workspace,backend,payload) VALUES('D:/work','mock','{}')", [])?;
+        store.connection.execute("INSERT INTO preferences.preference_record(workspace,backend,payload) VALUES('D:/work','mock','{}')", [])?;
         store.connection.execute(
             "INSERT INTO prompt_history_record(text,created_at_ms) VALUES('keep',1)",
             [],
@@ -1647,7 +1636,7 @@ mod test {
     }
 
     #[test]
-    fn streamed_output_reopens_migrates_and_commits_completion_atomically() -> Result<()> {
+    fn streamed_output_reopens_and_commits_completion_atomically() -> Result<()> {
         use crate::provider::{
             ProviderEvent, TextUpdate, ToolActivityKind, ToolInvocation, ToolOutcome, ToolUpdate,
         };
@@ -1724,11 +1713,6 @@ mod test {
                 .output,
             expected
         );
-        store.connection.execute(
-            "UPDATE exchange_record SET payload=?1 WHERE id='stream'",
-            [encode(&exchange)?],
-        )?;
-        store.connection.pragma_update(None, "user_version", 0)?;
         drop(store);
         let mut store = SqliteStore::open(directory.path())?;
         assert_eq!(
@@ -2344,7 +2328,7 @@ mod test {
         ] {
             let encoded = encode(&payload).unwrap();
             store.connection.execute(
-                "INSERT INTO preference_record(workspace,backend,payload) VALUES(?1,'fixture-alpha',?2)",
+                "INSERT INTO preferences.preference_record(workspace,backend,payload) VALUES(?1,'fixture-alpha',?2)",
                 params![workspace, encoded],
             ).unwrap();
             assert!(
@@ -2356,7 +2340,7 @@ mod test {
             let retained: String = store
                 .connection
                 .query_row(
-                    "SELECT payload FROM preference_record WHERE workspace=?1 AND backend='fixture-alpha'",
+                    "SELECT payload FROM preferences.preference_record WHERE workspace=?1 AND backend='fixture-alpha'",
                     [workspace],
                     |row| row.get(0),
                 )
@@ -2364,7 +2348,7 @@ mod test {
             assert_eq!(retained, encoded);
         }
         store.connection.execute(
-            "INSERT INTO preference_record(workspace,backend,payload) VALUES('current','fixture-alpha',?1)",
+            "INSERT INTO preferences.preference_record(workspace,backend,payload) VALUES('current','fixture-alpha',?1)",
             [encode(&serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION,
                 "preference": {"model":"current-model", "effort":"high"}})).unwrap()],
         ).unwrap();
@@ -2402,7 +2386,7 @@ mod test {
             },
         }))?;
         store.connection.execute(
-            "INSERT INTO preference_record(workspace, backend, payload) VALUES('D:/work', 'fixture-alpha', ?1)",
+            "INSERT INTO preferences.preference_record(workspace, backend, payload) VALUES('D:/work', 'fixture-alpha', ?1)",
             [&obsolete_preference],
         )?;
         store.save_session(&session("current-access", "D:/work"))?;
@@ -2424,7 +2408,7 @@ mod test {
         )?;
         assert_eq!(retained, encoded);
         let retained_preference: String = store.connection.query_row(
-            "SELECT payload FROM preference_record WHERE workspace='D:/work' AND backend='fixture-alpha'",
+            "SELECT payload FROM preferences.preference_record WHERE workspace='D:/work' AND backend='fixture-alpha'",
             [],
             |row| row.get(0),
         )?;

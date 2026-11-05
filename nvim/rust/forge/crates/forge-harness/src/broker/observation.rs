@@ -721,7 +721,9 @@ impl BrokerObserver {
         let timeline = TimelineProjector::with_history(
             timeline,
             crate::checks::CheckSupervisor::saved_history(
-                &self.data_root.join(&session_id).join("checks"),
+                &crate::storage::state::directory(&self.data_root)
+                    .join(&session_id)
+                    .join("checks"),
             )?,
             interaction.iter().chain(&agent_exchange_list),
         )?;

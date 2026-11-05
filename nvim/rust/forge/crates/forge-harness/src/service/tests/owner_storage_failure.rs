@@ -181,7 +181,8 @@ async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() 
             .execute_identified(queued_command.clone(), sink.clone()),
     );
     assert!(futures_util::poll!(queued.as_mut()).is_pending());
-    let database = rusqlite::Connection::open(controller.data_root.join("harness.sqlite3"))?;
+    let database =
+        rusqlite::Connection::open(crate::storage::state::database(&controller.data_root))?;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let admitted: bool = database.query_row(

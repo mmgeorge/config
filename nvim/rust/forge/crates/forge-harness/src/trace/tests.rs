@@ -134,7 +134,7 @@ fn bounds_metadata_and_truncates_before_crossing_file_limit() {
     let directory = tempdir().unwrap();
     let trace = TraceStore::open(directory.path()).unwrap();
     trace.configure(true).unwrap();
-    let path = directory.path().join("harness-trace.jsonl");
+    let path = crate::storage::state::directory(&directory.path()).join("harness-trace.jsonl");
     std::fs::OpenOptions::new()
         .write(true)
         .open(&path)
@@ -162,12 +162,19 @@ fn appends_session_identified_records_only_when_enabled() {
     let directory = tempdir().unwrap();
     let trace = TraceStore::open(directory.path()).unwrap();
     trace.record("session-a", "ignored", json!({ "value": 0 }));
-    assert!(!directory.path().join("harness-trace.jsonl").exists());
+    assert!(
+        !crate::storage::state::directory(&directory.path())
+            .join("harness-trace.jsonl")
+            .exists()
+    );
 
     trace.configure(true).unwrap();
     trace.record("session-a", "recorded", json!({ "secret": "retained" }));
     trace.flush().unwrap();
-    let contents = std::fs::read_to_string(directory.path().join("harness-trace.jsonl")).unwrap();
+    let contents = std::fs::read_to_string(
+        crate::storage::state::directory(&directory.path()).join("harness-trace.jsonl"),
+    )
+    .unwrap();
     assert!(contents.contains("session-a"));
     assert!(!contents.contains("retained"));
 }
@@ -184,7 +191,10 @@ fn persists_enablement_and_clears_the_append_only_file() {
     assert!(trace.status().enabled);
     trace.clear().unwrap();
     trace.flush().unwrap();
-    let contents = std::fs::read_to_string(directory.path().join("harness-trace.jsonl")).unwrap();
+    let contents = std::fs::read_to_string(
+        crate::storage::state::directory(&directory.path()).join("harness-trace.jsonl"),
+    )
+    .unwrap();
     assert!(contents.contains("trace.cleared"));
     assert!(!contents.contains("\"event\":\"first\""));
 }
@@ -200,7 +210,10 @@ fn independent_handles_append_after_another_owner_clears() {
     first.record("first", "after_first", json!({}));
     second.record("second", "after_second", json!({}));
     second.flush().unwrap();
-    let contents = std::fs::read_to_string(directory.path().join("harness-trace.jsonl")).unwrap();
+    let contents = std::fs::read_to_string(
+        crate::storage::state::directory(&directory.path()).join("harness-trace.jsonl"),
+    )
+    .unwrap();
     let event = contents
         .lines()
         .map(|line| {
@@ -366,11 +379,15 @@ fn explicit_flush_preserves_typed_writer_io_failure() {
     let trace = TraceStore::open(directory.path()).unwrap();
     trace.configure(true).unwrap();
     std::fs::rename(
-        directory.path().join("logs"),
+        crate::storage::state::directory(&directory.path()).join("logs"),
         directory.path().join("original-logs"),
     )
     .unwrap();
-    std::fs::write(directory.path().join("logs"), b"blocked directory").unwrap();
+    std::fs::write(
+        crate::storage::state::directory(&directory.path()).join("logs"),
+        b"blocked directory",
+    )
+    .unwrap();
     trace.record("session", "accepted-diagnostic", json!({}));
     let failure = trace.flush().unwrap_err();
     assert!(matches!(failure, super::TraceError::WriterFailed(_)));

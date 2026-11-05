@@ -659,7 +659,7 @@ async fn plan_feedback(provider: &str) -> Result<()> {
         plan.question_ledger.resolution.len() == 1,
         "feedback was replayed or lost"
     );
-    let document = forge_harness::plan::PlanFileStore::new(&service.data_root, &workspace)
+    let document = forge_harness::plan::PlanFileStore::new(&service.data_root, &workspace).unwrap()
         .read_working_document(&service.session_id, &plan.id)?;
     let design = document.design.context("submitted plan omitted its semantic design")?;
     let proposed: serde_json::Value = serde_json::from_str(design.proposed.get("settings.json").context("submitted design omitted settings.json")?)?;

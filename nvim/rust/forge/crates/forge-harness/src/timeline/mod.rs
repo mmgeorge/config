@@ -692,7 +692,7 @@ mod test {
             agent_run_list: Vec::new(),
             agent_exchange_list: Vec::new(),
             session_event_list: event,
-            plan_file: &PlanFileStore::new(directory.path(), directory.path()),
+            plan_file: &PlanFileStore::new(directory.path(), directory.path()).unwrap(),
         })?;
         assert_eq!(timeline.len(), 1);
         assert_eq!(timeline[0].id(), "failed");
@@ -907,7 +907,7 @@ mod test {
             agent_run_list: vec![root_run, child_run],
             agent_exchange_list: vec![root_exchange, child_turn],
             session_event_list: Vec::new(),
-            plan_file: &PlanFileStore::new(directory.path(), directory.path()),
+            plan_file: &PlanFileStore::new(directory.path(), directory.path()).unwrap(),
         })
         .unwrap();
 

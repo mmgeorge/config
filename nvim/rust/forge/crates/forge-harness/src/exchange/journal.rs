@@ -71,6 +71,8 @@ impl CommandRecord {
 /// Distinguish durable identity conflicts from storage and schema failures.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CommandJournalError {
+    #[error("owner command database could not be opened")]
+    Database(#[from] crate::storage::database::DatabaseError),
     /// Exchange state could not commit the active command's postcondition.
     #[error("owner domain state could not be committed")]
     DomainCommit,
@@ -102,7 +104,7 @@ pub(crate) enum CommandJournalError {
 
 /// Own the session's admission journal; domain commits can use the same SQL tables.
 pub(crate) struct CommandJournal {
-    connection: Connection,
+    connection: crate::storage::database::HistoryConnection,
     session: String,
 }
 
@@ -112,9 +114,7 @@ impl CommandJournal {
         if session.trim().is_empty() {
             return Err(CommandJournalError::InvalidSession);
         }
-        let connection = Connection::open(root.join("harness.sqlite3"))?;
-        connection.busy_timeout(std::time::Duration::from_secs(5))?;
-        connection.pragma_update(None, "synchronous", "FULL")?;
+        let connection = crate::storage::database::HistoryConnection::open(root)?;
         Ok(Self {
             connection,
             session: session.into(),

@@ -814,7 +814,7 @@ function M.apply_update(state, update)
   M.demand(state)
 end
 
----Mount Status without replacing a buffer pinned by another feature.
+---Mount Status without replacing floating UI or a buffer pinned by another feature.
 ---@param state ForgeNativeStatus
 ---@param window integer
 ---@return integer? window
@@ -829,8 +829,11 @@ function M.show(state, window)
   local created
   local target = window
   local ok, failure = xpcall(function()
-    if vim.wo[window].winfixbuf and vim.api.nvim_win_get_buf(window) ~= state.replica.buffer then
-      local displayed = vim.fn.win_findbuf(state.replica.buffer)
+    if vim.api.nvim_win_get_config(window).relative ~= ""
+      or (vim.wo[window].winfixbuf and vim.api.nvim_win_get_buf(window) ~= state.replica.buffer) then
+      local displayed = vim.tbl_filter(function(candidate)
+        return vim.api.nvim_win_get_config(candidate).relative == ""
+      end, vim.fn.win_findbuf(state.replica.buffer))
       if #displayed > 0 then
         target = displayed[1]
       else

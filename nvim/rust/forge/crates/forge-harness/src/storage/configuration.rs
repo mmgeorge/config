@@ -15,6 +15,13 @@ pub(crate) struct ConfigurationIntent {
     pub(crate) provider_setting: Option<serde_json::Value>,
 }
 
+/// Retain the settings request and preference write in the same session transaction.
+#[derive(Deserialize, Serialize)]
+struct PendingConfiguration {
+    intent: ConfigurationIntent,
+    preference: Option<HarnessPreference>,
+}
+
 impl SqliteStore {
     #[cfg(test)]
     pub(crate) fn execute_configuration_test_sql(&self, sql: &str) -> Result<()> {
@@ -67,7 +74,7 @@ impl SqliteStore {
         self.clear_configuration_intent(&intent)?;
         Ok(true)
     }
-    /// Atomically retain the intent with the owned session and preference write.
+    /// Atomically retain the settings and preference intent with the owned session.
     pub(crate) fn commit_configuration_intent(
         &mut self,
         session: &HarnessSession,
@@ -102,12 +109,13 @@ impl SqliteStore {
         )?;
         anyhow::ensure!(!pending, "a configuration intent requires recovery");
         transaction.execute("UPDATE session_record SET workspace=?2, updated_at_ms=?3, payload=json_set(?4,'$.session.name',json_extract(payload,'$.session.name'),'$.session.active_task',json_extract(payload,'$.session.active_task')) WHERE id=?1", params![session.id, session.workspace, session.updated_at_ms, encode_session(session)?])?;
-        if let Some(preference) = preference {
-            transaction.execute("INSERT INTO preference_record(workspace,backend,payload) VALUES(?1,?2,?3) ON CONFLICT(workspace,backend) DO UPDATE SET payload=excluded.payload", params![session.workspace, session.provider, encode(&serde_json::json!({"format_version":PREFERENCE_FORMAT_VERSION,"preference":preference}))?])?;
-        }
+        let pending = PendingConfiguration {
+            intent: intent.clone(),
+            preference: preference.cloned(),
+        };
         transaction.execute(
             "INSERT INTO command_receipt(session_id,id,request,result) VALUES(?1,?2,?3,?4)",
-            params![session.id, intent.id, encode(intent)?, INTENT_KIND],
+            params![session.id, intent.id, encode(&pending)?, INTENT_KIND],
         )?;
         transaction.commit()?;
         self.publish_admission(&session.id)
@@ -124,7 +132,8 @@ impl SqliteStore {
         let Some(row) = rows.next()? else {
             return Ok(None);
         };
-        let intent: ConfigurationIntent = decode(&row.get::<_, String>(0)?)?;
+        let pending: PendingConfiguration = decode(&row.get::<_, String>(0)?)?;
+        let intent = pending.intent;
         anyhow::ensure!(
             rows.next()?.is_none() && intent.session == session,
             "ambiguous configuration intents"
@@ -136,6 +145,15 @@ impl SqliteStore {
         &mut self,
         intent: &ConfigurationIntent,
     ) -> Result<()> {
+        let payload: String = self.connection.query_row(
+            "SELECT request FROM command_receipt WHERE session_id=?1 AND id=?2 AND result=?3",
+            params![intent.session, intent.id, INTENT_KIND],
+            |row| row.get(0),
+        )?;
+        let pending: PendingConfiguration = decode(&payload)?;
+        if let Some(preference) = pending.preference {
+            super::preferences::apply_configuration(&self.data_root, intent, &preference)?;
+        }
         let deleted = self.connection.execute(
             "DELETE FROM command_receipt WHERE session_id=?1 AND id=?2 AND result=?3",
             params![intent.session, intent.id, INTENT_KIND],
@@ -143,6 +161,67 @@ impl SqliteStore {
         anyhow::ensure!(
             deleted == 1,
             "configuration intent disappeared before completion"
+        );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Keep a failed acknowledgement retryable without overwriting a later preference edit.
+    #[test]
+    fn configuration_preference_recovery_is_idempotent() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut store = SqliteStore::open(root.path())?;
+        let mut session = super::super::test::session("session", "workspace");
+        session.lease_owner = Some("client".into());
+        store.save_session(&session)?;
+        let preference: HarnessPreference =
+            serde_json::from_value(serde_json::json!({"model":"selected","effort":"low"}))?;
+        let intent = ConfigurationIntent {
+            id: "configuration:fixture".into(),
+            session: session.id.clone(),
+            workspace: session.workspace.clone(),
+            provider: session.provider.clone(),
+            revision: 0,
+            scope: crate::settings::SettingScope::Workspace,
+            portable: None,
+            provider_setting: None,
+        };
+        store.commit_configuration_intent(&session, "client", Some(&preference), &intent)?;
+        assert!(
+            store
+                .load_preference(&session.workspace, &session.provider)?
+                .is_none()
+        );
+        store.connection.execute_batch(
+            "CREATE TRIGGER reject_acknowledgement BEFORE DELETE ON command_receipt
+             BEGIN SELECT RAISE(ABORT,'acknowledgement interrupted'); END;",
+        )?;
+        assert!(store.clear_configuration_intent(&intent).is_err());
+        assert_eq!(
+            store
+                .load_preference(&session.workspace, &session.provider)?
+                .unwrap()
+                .model,
+            "selected"
+        );
+        let mut later = preference;
+        later.model = "later-edit".into();
+        store.save_preference(&session.workspace, &session.provider, &later)?;
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_acknowledgement")?;
+        store.clear_configuration_intent(&intent)?;
+        assert!(store.pending_configuration_intent(&session.id)?.is_none());
+        assert_eq!(
+            store
+                .load_preference(&session.workspace, &session.provider)?
+                .unwrap()
+                .model,
+            "later-edit"
         );
         Ok(())
     }

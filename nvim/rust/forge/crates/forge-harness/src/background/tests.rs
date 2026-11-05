@@ -56,9 +56,9 @@ async fn generate(
         .await
 }
 
-/// Generate through the real background workflow after upgrading the previously deployed schema.
+/// Admit commit generation while incompatible operation storage remains open in another version.
 #[tokio::test]
-async fn commit_generation_upgrades_version_seven_operation_storage() -> Result<()> {
+async fn commit_generation_replaces_incompatible_operation_storage() -> Result<()> {
     let fixture = tempfile::tempdir()?;
     let root = fixture.path().join("repository");
     std::fs::create_dir(&root)?;
@@ -67,16 +67,33 @@ async fn commit_generation_upgrades_version_seven_operation_storage() -> Result<
     git(&root, &["config", "user.email", "fixture@example.test"]);
     let data = fixture.path().join("state");
     drop(SqliteStore::open(&data)?);
-    let database = rusqlite::Connection::open(data.join("harness.sqlite3"))?;
-    database.execute_batch("DROP TABLE owner_core_log; PRAGMA user_version=7;")?;
+    let database = rusqlite::Connection::open(crate::storage::state::database(&data))?;
+    database.execute_batch(
+        "ALTER TABLE input_operation RENAME COLUMN payload TO outcome;
+         INSERT INTO session_record VALUES('obsolete','workspace',1,'{}');
+         PRAGMA user_version=8;",
+    )?;
     drop(database);
+    let previous = data.join("state/v8");
+    std::fs::rename(crate::storage::state::directory(&data), &previous)?;
+    let old_database = rusqlite::Connection::open(previous.join("harness.sqlite3"))?;
+    old_database.execute_batch("BEGIN EXCLUSIVE")?;
 
     let manager = manager();
     let result = generate(&manager, &root, &data).await;
     manager.shutdown().await?;
     let generated = result?;
     assert!(!generated.text.trim().is_empty());
-    let database = rusqlite::Connection::open(data.join("harness.sqlite3"))?;
+    let database = rusqlite::Connection::open(crate::storage::state::database(&data))?;
+    assert_eq!(
+        database.query_row(
+            "SELECT count(*) FROM session_record WHERE id='obsolete'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?,
+        0,
+        "incompatible history must be deleted rather than migrated"
+    );
     let recorded: i64 = database.query_row(
         "SELECT count(*) FROM owner_core_log WHERE session_id=?1 AND json_extract(record,'$.record')='operation_completed' AND json_extract(record,'$.operation.kind')='session_open'",
         [&generated.session_id], |row| row.get(0),
@@ -85,6 +102,8 @@ async fn commit_generation_upgrades_version_seven_operation_storage() -> Result<
         recorded > 0,
         "commit generation must retain its successful provider-open evidence"
     );
+    assert!(previous.join("harness.sqlite3").is_file());
+    old_database.execute_batch("ROLLBACK")?;
     Ok(())
 }
 

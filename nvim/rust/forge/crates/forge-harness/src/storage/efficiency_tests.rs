@@ -40,7 +40,7 @@ fn output_exchange(text: &str) -> Result<(Exchange, ProviderEvent)> {
 }
 
 #[test]
-fn output_saves_pages_and_migration_preserve_content_without_history_reads() -> Result<()> {
+fn output_saves_and_pages_preserve_content_without_history_reads() -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut store = SqliteStore::open(root.path())?;
     store.save_session(&test::session("session", "workspace"))?;
@@ -116,17 +116,7 @@ fn output_saves_pages_and_migration_preserve_content_without_history_reads() -> 
         "UPDATE tool_output_chunk SET output='追加🙂' WHERE byte_offset=?1",
         [offset],
     )?;
-    store.connection.execute_batch("DROP TABLE tool_output_position; DROP TABLE tool_output_summary; PRAGMA user_version=2; CREATE TRIGGER reject_migration BEFORE INSERT ON tool_output_chunk BEGIN SELECT RAISE(ABORT,'migration failure'); END;")?;
-    assert!(SqliteStore::open(root.path()).is_err());
-    assert_eq!(
-        store
-            .connection
-            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
-        2
-    );
-    store
-        .connection
-        .execute_batch("DROP TRIGGER reject_migration")?;
+    drop(store);
     let reopened = SqliteStore::open(root.path())?;
     assert_eq!(
         reopened
@@ -322,13 +312,12 @@ fn runtime_projection_tracks_commits_without_database_reads() -> Result<()> {
 }
 
 #[test]
-fn legacy_empty_output_can_append_after_migration() -> Result<()> {
+fn empty_output_can_append_after_reopening() -> Result<()> {
     let root = tempfile::tempdir()?;
     let mut store = SqliteStore::open(root.path())?;
     store.save_session(&test::session("session", "workspace"))?;
     let (mut exchange, mut event) = output_exchange("")?;
     store.save_exchange(&exchange)?;
-    store.connection.execute_batch("DELETE FROM tool_output_owner; UPDATE exchange_record SET payload=json_remove(payload,'$.tool_output_format'); PRAGMA user_version=0;")?;
     drop(store);
     let mut store = SqliteStore::open(root.path())?;
     if let ProviderEvent::Tool { update, .. } = &mut event {

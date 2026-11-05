@@ -4130,7 +4130,8 @@ mod tests {
     async fn core_persistence_failure_prevents_native_event_forwarding() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
         drop(crate::storage::SqliteStore::open(directory.path())?);
-        let database = rusqlite::Connection::open(directory.path().join("harness.sqlite3"))?;
+        let database =
+            rusqlite::Connection::open(crate::storage::state::database(&directory.path()))?;
         database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('session','workspace',1,'{}')", [])?;
         database.execute_batch("CREATE TRIGGER reject_consumption BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='provider_event_consumed' BEGIN SELECT RAISE(ABORT,'fixture consumption evidence failure'); END;")?;
         let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);

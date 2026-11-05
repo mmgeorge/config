@@ -93,8 +93,30 @@ local function release_presentation(state)
     notifications.error("Cannot transfer Harness panes: " .. (ok and "presentation cleanup did not complete" or tostring(closed)), "ForgeHarness")
     return false
   end
+
   if state.presentation == owner then state.presentation = nil end
   return true
+end
+
+---Forget deleted session identities while retaining unsent composer text.
+function M.history_clear()
+  for _, state in pairs(state_by_session_id) do
+    if state.unsubscribe then state.unsubscribe() state.unsubscribe = nil end
+    release_presentation(state)
+    state.session, state.client, state.input = nil, nil, nil
+    state.ready, state.timeline, state.queue = false, {}, {}
+    state.prompt_history, state.prompt_history_index = {}, 0
+    state.host_error = "History cleared. Open ForgeHarness to start a new session."
+    local buffer = state.transcript_buf
+    if buffer and vim.api.nvim_buf_is_valid(buffer) then
+      vim.bo[buffer].modifiable = true
+      vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { state.host_error })
+      vim.bo[buffer].modifiable = false
+    end
+  end
+  state_by_session_id = {}
+  session.harness_by_id = {}
+  session.select_harness(session.new_harness_state())
 end
 
 ---@class ForgeHarnessSessionActivation

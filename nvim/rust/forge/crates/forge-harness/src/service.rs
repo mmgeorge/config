@@ -145,7 +145,6 @@ impl HarnessService {
         let _activity = self.admit().await?;
         let mut model = config.model;
         if model == "default"
-            && config.data_root.join("harness.sqlite3").is_file()
             && let Some(preference) = SqliteStore::open(&config.data_root)?
                 .load_preference(workspace, config.provider.kind.as_str())?
         {
@@ -2574,7 +2573,8 @@ async fn delete_session(
     let plans = crate::plan::PlanFileStore::new(
         std::path::Path::new(&registry.initialize.data_root),
         &session.workspace,
-    );
+    )
+    .unwrap();
     store.delete_session_with(&target, || {
         plans.delete_session(&target)?;
         crate::input::SessionInputQueue::delete_persisted(

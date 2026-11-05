@@ -100,7 +100,8 @@ async fn question_input_acknowledgment_retry_reuses_immutable_receipt_and_public
             },
         })?;
     let message = controller.questions.outbox()?[0].clone();
-    let connection = rusqlite::Connection::open(controller.data_root.join("harness.sqlite3"))?;
+    let connection =
+        rusqlite::Connection::open(crate::storage::state::database(&controller.data_root))?;
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch("CREATE TRIGGER reject_question_ack BEFORE UPDATE ON session_question_state WHEN json_array_length(json_extract(OLD.payload,'$.outbox')) > json_array_length(json_extract(NEW.payload,'$.outbox')) BEGIN SELECT RAISE(ABORT,'injected question acknowledgment failure'); END;")?;
     let receipt = tokio::time::timeout(Duration::from_secs(2), async {
@@ -295,7 +296,8 @@ async fn task_creation_without_transport_retains_publications_and_confirms_dispa
         assert_eq!(current.id.as_str(), task.id().as_str());
         assert_eq!(current.entry.as_ref().unwrap().id, input);
         assert_eq!(current.kind(), kind);
-        let connection = rusqlite::Connection::open(controller.data_root.join("harness.sqlite3"))?;
+        let connection =
+            rusqlite::Connection::open(crate::storage::state::database(&controller.data_root))?;
         let retained: i64 = connection.query_row(
             "SELECT COUNT(*) FROM owner_publication WHERE session_id=?1",
             [&session],
@@ -1627,7 +1629,8 @@ async fn input_owner_captures_receipt_after_queued_model_settings() -> Result<()
             .await?
     );
     let connection = rusqlite::Connection::open_with_flags(
-        controller.data_root.join("provider-submissions.sqlite3"),
+        crate::storage::state::directory(&controller.data_root)
+            .join("provider-submissions.sqlite3"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )?;
     let receipt = tokio::time::timeout(Duration::from_secs(10), async {

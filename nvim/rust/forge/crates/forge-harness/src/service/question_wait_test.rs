@@ -164,7 +164,8 @@ async fn wait_retirement_retries_observation_storage_without_queuing_an_answer_c
         .await?;
     let question = wait.question_ids()[0].clone();
     answer(&controller, &question, "answer-with-retirement-failure").await?;
-    let connection = rusqlite::Connection::open(controller.data_root.join("harness.sqlite3"))?;
+    let connection =
+        rusqlite::Connection::open(crate::storage::state::database(&controller.data_root))?;
     connection.busy_timeout(Duration::from_secs(5))?;
     connection.execute_batch("CREATE TRIGGER reject_wait_observation BEFORE UPDATE ON session_question_state WHEN json_array_length(json_extract(NEW.payload,'$.observed_tool_messages')) > json_array_length(json_extract(OLD.payload,'$.observed_tool_messages')) BEGIN SELECT RAISE(ABORT,'injected wait retirement failure'); END;")?;
     let outcome = tokio::time::timeout(Duration::from_secs(3), wait.answers())

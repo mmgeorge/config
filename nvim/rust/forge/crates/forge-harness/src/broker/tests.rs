@@ -54,7 +54,7 @@ async fn live_status_and_agent_queries_do_not_reload_unrelated_history() -> Resu
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     broker.create_task(crate::task::TaskKind::Goal, "active".into(), None, None)?;
     let task = broker.task_controller.current()?.unwrap();
-    let connection = rusqlite::Connection::open(data.path().join("harness.sqlite3"))?;
+    let connection = rusqlite::Connection::open(crate::storage::state::database(&data.path()))?;
     connection.execute("INSERT INTO exchange_record(id,session_id,agent_id,ordinal,payload) VALUES('old',?1,?2,1,?3)",rusqlite::params![broker.session.id,HarnessSession::primary_agent_id(&broker.session.id),serde_json::json!({"state":"complete","turn":"malformed history"}).to_string()])?;
     assert_eq!(
         broker.task_controller.current()?.unwrap().revision,
@@ -2689,75 +2689,6 @@ fn semantic_execution_provider(
 }
 
 #[tokio::test]
-async fn obsolete_task_sessions_remain_hidden_without_reactivation() -> Result<()> {
-    for executing in [false, true] {
-        let repository = repository();
-        let data = tempfile::tempdir()?;
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.provider = crate::provider::build(
-            ProviderLaunch {
-                kind: forge_providers::registry::nonselectable_id()
-                    .expect("registry supplies a nonselectable fixture identity"),
-                command: vec!["mock".into()],
-            },
-            broker.permission_coordinator.clone(),
-            broker.trace.clone(),
-            broker.data_root.clone(),
-        )?;
-        broker
-            .submit_prompt(json!({"text":"/plan add a reusable API"}))
-            .await?;
-        run_plan_to_input_boundary(&mut broker).await?;
-        if executing {
-            let plan = broker
-                .snapshot()?
-                .active_plan
-                .context("test plan missing")?;
-            let fixture_provider = stopped_execution_provider(&broker, true);
-            broker.provider = fixture_provider;
-            broker.dispatch_session_command(
-                "session.plan.accept",
-                json!({"plan_id":plan.id,"approval_mode":"ask"}),
-            )?;
-        }
-        let before = broker
-            .store
-            .load_active_task(&broker.session.id)?
-            .context("task missing before migration")?;
-        let plan_id = match &before.workflow {
-            crate::task::WorkflowSnapshot::Plan { plan } => plan.artifact.id.clone(),
-            crate::task::WorkflowSnapshot::Execute { execution } => {
-                execution.record.plan_id.clone()
-            }
-            crate::task::WorkflowSnapshot::Goal { .. } => unreachable!(),
-        };
-        let title = broker.store.load_plan(&plan_id)?.unwrap().title;
-        let session_id = broker.session.id.clone();
-        let path = broker.data_root.join("harness.sqlite3");
-        let connection = rusqlite::Connection::open(&path)?;
-        connection.execute("UPDATE session_record SET payload=json_set(payload,'$.format_version',51,'$.session.active_task',NULL) WHERE id=?1", [&session_id])?;
-        connection.pragma_update(None, "user_version", 3)?;
-        drop(connection);
-        drop(broker);
-        let migrated = SqliteStore::open(data.path())?;
-        assert!(migrated.load_session(&session_id)?.is_none());
-        assert!(migrated.load_active_task(&session_id).is_err());
-        let connection = rusqlite::Connection::open(&path)?;
-        let version: i64 = connection.query_row(
-            "SELECT json_extract(payload, '$.format_version') FROM session_record WHERE id=?1",
-            [&session_id],
-            |row| row.get(0),
-        )?;
-        assert_eq!(
-            version, 51,
-            "storage schema setup rewrote an obsolete session"
-        );
-        assert_eq!(migrated.load_plan(&plan_id)?.unwrap().title, title);
-    }
-    Ok(())
-}
-
-#[tokio::test]
 async fn execution_failure_and_cancellation_resume_the_phase_without_accepting_again() {
     for cancelled in [false, true] {
         let repository = repository();
@@ -5270,7 +5201,9 @@ async fn session_mutations_enforce_target_ownership() -> Result<()> {
     let target = mutable_question_broker(target_workspace.path(), data.path());
     let target_id = target.session.id.clone();
     let target_name = target.session.name.clone();
-    let plan_directory = data.path().join("plans").join(&target_id);
+    let plan_directory = crate::storage::state::directory(&data.path())
+        .join("plans")
+        .join(&target_id);
     fs::create_dir_all(&plan_directory)?;
     let plan = plan_directory.join("preserved.md");
     fs::write(&plan, "preserve active plan")?;

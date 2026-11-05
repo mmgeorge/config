@@ -37,6 +37,8 @@ pub enum TraceAdmission {
 /// Preserve diagnostic writer failures independently of execution outcomes.
 #[derive(Debug)]
 pub enum TraceError {
+    /// The disposable trace directory could not retain its state lease.
+    State(anyhow::Error),
     /// An owned trace file or writer thread could not be accessed.
     Io {
         operation: &'static str,
@@ -59,7 +61,7 @@ impl TraceError {
     /// Distinguish lost diagnostics from a writer that could not be collected.
     pub(super) fn is_diagnostic(&self) -> bool {
         match self {
-            Self::Io { .. } | Self::Encoding(_) => true,
+            Self::Io { .. } | Self::Encoding(_) | Self::State(_) => true,
             Self::WriterFailed(source) => source.is_diagnostic(),
             Self::Closed | Self::Poisoned | Self::Panicked => false,
         }
@@ -70,6 +72,7 @@ impl std::fmt::Display for TraceError {
     /// Render diagnostic failures at the caller's reporting boundary.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::State(source) => write!(formatter, "acquire Harness trace state: {source:#}"),
             Self::Io {
                 operation,
                 path,
@@ -92,6 +95,7 @@ impl std::error::Error for TraceError {
     /// Retain the typed filesystem, encoding, or prior writer cause.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::State(source) => Some(source.as_ref()),
             Self::Io { source, .. } => Some(source),
             Self::Encoding(source) => Some(source),
             Self::WriterFailed(source) => Some(source.as_ref()),
@@ -617,19 +621,22 @@ struct Files {
     config_path: PathBuf,
     file: Option<File>,
     enabled: bool,
+    _lease: crate::storage::state::StateLease,
 }
 
 impl Files {
     /// Open persistent configuration before publishing the writer to producers.
     fn open(root: &Path) -> TraceResult<Self> {
+        let lease = crate::storage::state::StateLease::open(root).map_err(TraceError::State)?;
         let config_path = root.join("harness-trace-config.json");
         let enabled = fs::read(&config_path)
             .ok()
             .and_then(|contents| serde_json::from_slice::<TraceConfig>(&contents).ok())
             .is_some_and(|config| config.enabled);
-        let path = root.join("harness-trace.jsonl");
+        let path = crate::storage::state::directory(root).join("harness-trace.jsonl");
         let file = enabled.then(|| open_global(&path)).transpose()?;
         Ok(Self {
+            _lease: lease,
             root: root.to_owned(),
             path,
             config_path,
@@ -1052,7 +1059,9 @@ pub(super) fn session_path(root: &Path, session_id: &str) -> PathBuf {
     } else {
         format!("_{}", hex::encode(session_id.as_bytes()))
     };
-    root.join("logs").join(format!("{name}.jsonl"))
+    crate::storage::state::directory(root)
+        .join("logs")
+        .join(format!("{name}.jsonl"))
 }
 
 #[cfg(test)]

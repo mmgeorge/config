@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(super) const VERSION: i64 = 8;
+pub(super) const VERSION: i64 = super::state::VERSION as i64;
 const APPLICATION: i64 = 0x464f5247;
 
 /// Serializes bootstrap pragmas across processes before SQLite can acquire its own write lock.
@@ -44,60 +44,23 @@ pub(super) fn validate(connection: &Connection) -> Result<i64> {
         version <= VERSION,
         "Harness database schema {version} is newer than supported schema {VERSION}; update Harness"
     );
+    if application == 0 {
+        let foreign: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%') AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_record')",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(!foreign, "database belongs to another application");
+    }
     Ok(version)
 }
 
-/// Upgrades recognized legacy databases once and commits their version with the converted records.
-pub(super) fn initialize(
-    connection: &mut Connection,
-    objects: &super::objects::ObjectStore,
-    root: &std::path::Path,
-) -> Result<()> {
-    if validate(connection)? == VERSION {
-        return Ok(());
-    }
-    let _bootstrap = bootstrap_lock(root, "harness")?;
-    if validate(connection)? == VERSION {
-        return Ok(());
-    }
+/// Create the exact schema for this executable's disposable-state version.
+pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
     connection.pragma_update(None, "journal_mode", "WAL")?;
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
-        .context("acquire Harness schema migration write lock (SQLite wait limit: 5 seconds)")?;
-    if validate(&transaction)? == VERSION {
-        return Ok(());
-    }
-    let previous = validate(&transaction)?;
-    if previous > 0 {
-        if previous == 1 {
-            initialize_commands(&transaction)?;
-        }
-        initialize_query_indexes(&transaction)?;
-        super::tool_output::initialize_positions(&transaction)?;
-        initialize_owner_commands(&transaction)?;
-        initialize_plan_reviews(&transaction)?;
-        transaction.pragma_update(None, "user_version", VERSION)?;
-        transaction.commit()?;
-        return Ok(());
-    }
-    let foreign: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%') AND NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('session_record','preference_record','model_pin'))",
-        [], |row| row.get(0),
-    )?;
-    ensure!(
-        !foreign,
-        "unrecognized unversioned Harness database; existing data was preserved"
-    );
-    transaction.execute_batch(
-        r#"
-            CREATE TABLE IF NOT EXISTS preference_record (
-                workspace TEXT NOT NULL,
-                backend TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                PRIMARY KEY(workspace, backend)
-            );
-            "#,
-    )?;
+        .context("acquire Harness schema initialization write lock")?;
     transaction.execute_batch(
         r#"
             CREATE TABLE IF NOT EXISTS session_record (
@@ -226,8 +189,7 @@ pub(super) fn initialize(
     )?;
 
     transaction.execute_batch(
-        "CREATE TABLE IF NOT EXISTS model_pin (backend TEXT NOT NULL, model TEXT NOT NULL, PRIMARY KEY(backend,model));
-         CREATE TABLE IF NOT EXISTS session_deletion (session_id TEXT PRIMARY KEY REFERENCES session_record(id) ON DELETE CASCADE);
+        "CREATE TABLE IF NOT EXISTS session_deletion (session_id TEXT PRIMARY KEY REFERENCES session_record(id) ON DELETE CASCADE);
          CREATE INDEX IF NOT EXISTS task_session ON task_record(session_id);
          CREATE INDEX IF NOT EXISTS comment_exchange ON exchange_comment(interaction_id);
          CREATE INDEX IF NOT EXISTS plan_session ON plan_record(session_id);
@@ -244,78 +206,11 @@ pub(super) fn initialize(
     )?;
     super::tool_output::initialize(&transaction)?;
     initialize_query_indexes(&transaction)?;
-    super::archive::migrate(&transaction, objects)?;
     initialize_commands(&transaction)?;
     initialize_owner_commands(&transaction)?;
-    initialize_plan_reviews(&transaction)?;
     transaction.pragma_update(None, "application_id", APPLICATION)?;
     transaction.pragma_update(None, "user_version", VERSION)?;
     transaction.commit()?;
-    Ok(())
-}
-
-/// Convert live legacy review data without changing task/plan state or immutable history receipts.
-fn initialize_plan_reviews(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
-    for (table, pointer, path) in [
-        ("plan_record", "", "$.acceptance"),
-        (
-            "session_record",
-            "/session/active_task/plan/artifact",
-            "$.session.active_task.plan.artifact.acceptance",
-        ),
-        (
-            "task_record",
-            "/plan/artifact",
-            "$.plan.artifact.acceptance",
-        ),
-    ] {
-        loop {
-            // Bound conversion memory while the schema transaction owns every affected record.
-            let rows: Vec<(String, String)> = {
-                let mut query = transaction.prepare(&format!("SELECT id,payload FROM {table} WHERE json_type(payload,?1) IS NOT NULL ORDER BY id LIMIT 64"))?;
-                query
-                    .query_map([path], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .collect::<rusqlite::Result<_>>()?
-            };
-            if rows.is_empty() {
-                break;
-            }
-            for (id, encoded) in rows {
-                let mut payload: serde_json::Value = serde_json::from_str(&encoded)?;
-                let artifact = payload
-                    .pointer_mut(pointer)
-                    .and_then(serde_json::Value::as_object_mut)
-                    .context("legacy review artifact is not an object")?;
-                let previous = artifact
-                    .remove("acceptance")
-                    .context("legacy review field disappeared during migration")?;
-                // Reject conflicting evidence before replacing the live storage path.
-                if !previous.is_null() {
-                    if let Some(current) = artifact.get("review").filter(|value| !value.is_null()) {
-                        ensure!(
-                            current == &previous,
-                            "conflicting review evidence in {table} record {id}"
-                        );
-                    } else {
-                        artifact.insert("review".into(), previous);
-                    }
-                }
-                if let Some(questions) = artifact
-                    .get_mut("review")
-                    .and_then(|review| review.get_mut("elicitation"))
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    // A recovered review keeps its decisions but cannot acquire timeout authority.
-                    questions.insert("purpose".into(), serde_json::json!("plan_review"));
-                    questions.insert("deadline".into(), serde_json::Value::Null);
-                }
-                transaction.execute(
-                    &format!("UPDATE {table} SET payload=?2 WHERE id=?1"),
-                    rusqlite::params![id, serde_json::to_string(&payload)?],
-                )?;
-            }
-        }
-    }
     Ok(())
 }
 

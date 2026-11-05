@@ -1110,7 +1110,8 @@ mod tests {
         )
         .unwrap();
         let store =
-            crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
+            crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path())
+                .unwrap();
         crate::checks::configure_fixture(&store.workspace);
         let mut design = DeclarationDesign::default();
         design.document.objective = "Verify score resets".into();
@@ -1165,7 +1166,8 @@ mod tests {
     fn complete_specification_survives_review_and_optional_section_removal() {
         let workspace = tempfile::tempdir().unwrap();
         let store =
-            crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
+            crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path())
+                .unwrap();
         crate::checks::configure_fixture(&store.workspace);
         let empty = DeclarationDesign::default();
         let metadata = serde_json::json!({
@@ -1497,7 +1499,7 @@ mod tests {
         let formatted = patched.formatted().unwrap();
         let mut document = crate::plan::document::test_fixture("deep", "Deep declarations");
         document.design = Some(formatted);
-        let store = crate::plan::PlanFileStore::new(storage.path(), workspace.path());
+        let store = crate::plan::PlanFileStore::new(storage.path(), workspace.path()).unwrap();
         store
             .write_working_document("session", "deep", &document)
             .unwrap();
@@ -1566,12 +1568,13 @@ mod tests {
                     assert_eq!(changed.proposed_calls[path], expected);
                     let mut document = crate::plan::document::test_fixture("boundary", "Boundary");
                     document.design = Some(changed.clone());
-                    let store = crate::plan::PlanFileStore::new(storage.path(), workspace.path());
+                    let store =
+                        crate::plan::PlanFileStore::new(storage.path(), workspace.path()).unwrap();
                     store
                         .write_working_document("session", "boundary", &document)
                         .unwrap();
                     let reopened =
-                        crate::plan::PlanFileStore::new(storage.path(), workspace.path());
+                        crate::plan::PlanFileStore::new(storage.path(), workspace.path()).unwrap();
                     let saved = reopened
                         .read_working_document("session", "boundary")
                         .unwrap();

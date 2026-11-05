@@ -15,6 +15,7 @@ local perf = require("forge.infra.perf")
 local launcher_for_test = nil
 local shutdown_autocmd = false
 local exiting = false
+local history_clearing = false
 local host_drain_timeout_ms = 3000
 local host_unix_collection_timeout_ms = 1000
 local host_windows_collection_timeout_ms = 2000
@@ -165,6 +166,7 @@ end
 ---@return integer?
 local function host_admit_request(method, callback)
   local client = host_state()
+  if history_clearing then callback(nil, "Forge history is being cleared", { code = "not_admitted" }) return nil end
   if exiting then callback(nil, "Forge host is exiting", { code = "not_admitted" }) return nil end
   if client.draining then callback(nil, "Forge host is draining", { code = "not_admitted" }) return nil end
   if client.next_id >= 9007199254740991 then
@@ -970,6 +972,7 @@ end
 function M.host_start(callback)
   callback = protect_consumer(callback or function() end, "startup")
   local client = host_state()
+  if history_clearing then callback(nil, "Forge history is being cleared", { code = "not_admitted" }) return end
   if exiting then callback(nil, "Forge host is exiting", { code = "not_admitted" }) return end
   host_ensure_shutdown_autocmd()
   if client.draining then callback(nil, "Forge host is draining") return end
@@ -1400,6 +1403,76 @@ function M.host_stop(reason, on_stopped)
   local stopped = client.stop_callback or {}
   client.stop_callback = {}
   for _, finished in ipairs(stopped) do finished() end
+end
+
+---Stop the host before clearing state versions, fencing requests until native cleanup settles.
+---@param callback? fun(error?: string)
+function M.history_clear(callback)
+  if history_clearing then
+    local failure = "Forge history is already being cleared"
+    notifications.error(failure, "ForgeHistoryClear")
+    if callback then callback(failure) end
+    return
+  end
+  local executable = builder.binary_path()
+  if vim.fn.executable(executable) ~= 1 then
+    local failure = "Forge executable is missing. Run :ForgeBuild before clearing history."
+    notifications.error(failure, "ForgeHistoryClear")
+    if callback then callback(failure) end
+    return
+  end
+  history_clearing = true
+  local function finish(failure, current_cleared)
+    history_clearing = false
+    if current_cleared then
+      local client = host_state()
+      client.snapshot, client.snapshot_by_id, client.publication_by_session = nil, {}, {}
+      local cleaned, cleanup_error = pcall(function()
+        require("forge.views.harness.session_navigation").history_clear()
+      end)
+      if not cleaned then
+        failure = (failure and (failure .. "\n") or "") .. "State cleared, but view cleanup failed: " .. tostring(cleanup_error)
+      end
+    end
+    if failure then
+      notifications.error("History clear failed: " .. failure, "ForgeHistoryClear")
+    end
+    if callback then callback(failure) end
+  end
+  M.host_stop("Forge history is being cleared", function()
+    local started, failure = pcall(vim.system, {
+      executable, "history-clear", "--data-root", vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "harness"),
+    }, { text = true, stdout = true, stderr = true }, function(result)
+      vim.schedule(function()
+        if vim.trim(result.stdout or "") == "" then
+          finish(vim.trim(result.stderr or "") ~= "" and vim.trim(result.stderr)
+            or ("Forge history-clear returned no report (exit " .. tostring(result.code) .. ")"))
+          return
+        end
+        local decoded, report = pcall(vim.json.decode, result.stdout)
+        if not decoded or type(report) ~= "table" or type(report.current_cleared) ~= "boolean"
+          or type(report.retained) ~= "table" then
+          finish("Forge history-clear returned an invalid report: " .. tostring(report))
+          return
+        end
+        local retained = {}
+        for _, entry in ipairs(report.retained) do
+          if type(entry) ~= "table" or type(entry.path) ~= "string" or type(entry.message) ~= "string" then
+            finish("Forge history-clear returned an invalid retained-version entry", report.current_cleared)
+            return
+          end
+          retained[#retained + 1] = entry.path .. ": " .. entry.message
+        end
+        local failure = #retained > 0 and table.concat(retained, "\n") or nil
+        if result.code ~= 0 and not failure then
+          failure = vim.trim(result.stderr or "") ~= "" and vim.trim(result.stderr)
+            or ("Forge history-clear exited " .. tostring(result.code))
+        end
+        finish(failure, report.current_cleared)
+      end)
+    end)
+    if not started then finish(tostring(failure)) end
+  end)
 end
 
 function M.host_get_generation()

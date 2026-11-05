@@ -65,8 +65,7 @@ impl TraceStore {
     pub fn status(&self) -> TraceStatus {
         TraceStatus {
             enabled: self.is_enabled(),
-            path: self
-                .root
+            path: crate::storage::state::directory(&self.root)
                 .join("harness-trace.jsonl")
                 .to_string_lossy()
                 .into_owned(),

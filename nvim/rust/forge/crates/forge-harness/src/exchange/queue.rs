@@ -684,7 +684,7 @@ mod tests {
             "session",
             3,
         );
-        let database = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
+        let database = rusqlite::Connection::open(crate::storage::state::database(&root.path()))?;
         database.execute_batch("CREATE TRIGGER reject_core_response BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='command_responded' BEGIN SELECT RAISE(ABORT,'fixture core response failure'); END;")?;
         queue.finish(
             active,

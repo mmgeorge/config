@@ -526,7 +526,9 @@ impl BackgroundManager {
             .background_generation,
             "This provider does not support tool-free persistent Background sessions"
         );
-        let directory = request.config.data_root.join("background-owner");
+        let store = SqliteStore::open(&request.config.data_root)?;
+        let directory =
+            crate::storage::state::directory(&request.config.data_root).join("background-owner");
         fs::create_dir_all(&directory)?;
         let ownership = fs::OpenOptions::new()
             .create(true)
@@ -539,7 +541,6 @@ impl BackgroundManager {
                 "Background session is busy in another editor. Retry after it finishes: {error}"
             )
         })?;
-        let store = SqliteStore::open(&request.config.data_root)?;
         let previous = store
             .list_session(Some(&request.context.workspace))?
             .into_iter()
@@ -868,7 +869,7 @@ impl BackgroundManager {
             )?;
             snapshot = settings.get(&selected.workspace, &selected.id, &selected.provider)?;
         }
-        let plan_file = crate::plan::PlanFileStore::new(&query.data_root, &selected.workspace);
+        let plan_file = crate::plan::PlanFileStore::new(&query.data_root, &selected.workspace)?;
         let session_events = store.list_session_event(&selected.id)?;
         let entries =
             crate::timeline::TimelineProjector::build(crate::timeline::TimelineProjection {

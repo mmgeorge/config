@@ -1158,7 +1158,7 @@ mod test {
         for patch in output.design_patch {
             replayed = replayed.patch_design(&workspace, patch).unwrap();
         }
-        let files = crate::plan::PlanFileStore::new(workspace.join("data"), &workspace);
+        let files = crate::plan::PlanFileStore::new(workspace.join("data"), &workspace).unwrap();
         files
             .write_working_document("session", "plan", &replayed)
             .unwrap();

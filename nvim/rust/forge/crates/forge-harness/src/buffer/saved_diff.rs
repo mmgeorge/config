@@ -116,7 +116,7 @@ mod tests {
         assert!(initialized.success());
         let data = tempfile::tempdir()?;
         let mut store = SqliteStore::open(data.path())?;
-        let connection = rusqlite::Connection::open(data.path().join("harness.sqlite3"))?;
+        let connection = rusqlite::Connection::open(crate::storage::state::database(&data.path()))?;
         connection.execute("INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES('captured-session', ?1, 0, '{}')", [workspace.path().to_string_lossy().as_ref()])?;
         let before_text = b"pub fn saved() { previous(); }\n";
         let after_text = b"pub fn saved() { updated(); }\n";

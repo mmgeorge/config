@@ -8,6 +8,12 @@ Staging the wrong hunk, or discarding an edit the user made a moment ago, loses 
 
 `StatusDocument` publishes `StatusSnapshot` values holding a document revision, view kind, repository context, ordered sections, and semantic file records. A file record carries a numeric handle, source generation, section, change kind, display path, rename origin, and statistics state, but no rendered rows or diff bodies. `forge.status_render` shows paths relative to the editor cwd captured at open, and owns every header row.
 
+`forge.status.show` keeps document mounting separate from transient window ownership.
+When the opening window floats or pins another buffer with `winfixbuf`, it reuses
+a non-floating Status window or creates a new tab. Both initial publication and
+cached reopening use this boundary, so a one-row picker never inherits the Status
+winbar and picker teardown cannot remove the Status mount.
+
 Expanding a file sends its handle through `StatusInput`. Rust acquires the source lazily and returns `BodyDelivery`, with a first body snapshot followed by patches under the body's own document identity. Initial demand waits for Tree-sitter analysis, so syntax arrives with the first chunk, and a parse failure returns the plain diff with a diagnostic.
 
 Display grouping merges adjacent hunks whose scopes are equal or nested and whose padded windows are at most six lines apart. Each group keeps the union of its raw hunk identities, so actions on bridge context stage exactly those edits. Omitted ranges render an `...` row with no source coordinate or mutation target.

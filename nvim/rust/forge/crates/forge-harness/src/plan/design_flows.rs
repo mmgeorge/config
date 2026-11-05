@@ -485,7 +485,8 @@ mod tests {
 
         let workspace = tempfile::tempdir().unwrap();
         let store =
-            super::super::PlanFileStore::new(workspace.path().join("data"), workspace.path());
+            super::super::PlanFileStore::new(workspace.path().join("data"), workspace.path())
+                .unwrap();
         let mut document = super::super::document::test_fixture("labels", "Flow presentation");
         let design = document.design.get_or_insert_with(Default::default);
         design.document.flows = vec![flow];
@@ -532,7 +533,8 @@ mod tests {
         assert_eq!(rendered.matches("if ready").count(), 40);
         let workspace = tempfile::tempdir().unwrap();
         let store =
-            super::super::PlanFileStore::new(workspace.path().join("data"), workspace.path());
+            super::super::PlanFileStore::new(workspace.path().join("data"), workspace.path())
+                .unwrap();
         let mut document =
             super::super::document::test_fixture("deep-flows", "Preserve complete flows");
         document.design = Some(super::super::DeclarationDesign::default());

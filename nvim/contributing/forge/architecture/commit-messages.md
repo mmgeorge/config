@@ -6,6 +6,16 @@ A generated message is only as accurate as the context it receives, and a raw di
 
 HEAD generation includes tracked changes and untracked files, staged generation compares the index with HEAD, and amend generation reads the latest commit's old and new objects. All three, and PR descriptions, use one native diff and excerpt formatter. Ignored paths and `filter=lfs` paths are excluded before any content is read. Other binary and unsupported sources keep an inventory entry without an excerpt.
 
+Status chooses staged changes when any exist and otherwise uses the HEAD comparison.
+`forge.integrations.ai_commit` retains drafts by workspace and comparison for the
+editor process. A new Status context reuses that cache without validating intervening
+Git changes; its source-change tracking starts from the reopened view.
+The shared Status `regenerate_about` command forces a new About request through
+the same generation owner used by the commit editor. That owner cancels the prior
+request, rejects superseded responses, and transfers waiting consumers to the
+replacement, so an open commit editor receives the replacement rather than an
+obsolete result.
+
 ## Excerpt rules
 
 The system instructions and user prompt together hold at most 500,000 UTF-8 bytes, counted before JSON escaping. The prompt lists changed paths with full counts, then excerpts in path order, with test and spec paths last. Emission stops at the byte limit.

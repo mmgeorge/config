@@ -86,7 +86,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let workspace = tempfile::tempdir()?;
         crate::checks::configure_fixture(workspace.path());
-        let store = PlanFileStore::new(root.path(), workspace.path());
+        let store = PlanFileStore::new(root.path(), workspace.path()).unwrap();
         let request = format!(
             "{}\nKeep every requirement.",
             "Detailed objective ".repeat(256)
