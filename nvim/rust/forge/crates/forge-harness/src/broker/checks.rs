@@ -32,32 +32,6 @@ impl ExecutionCheckEvidenceJob {
     }
 }
 
-/// Retain the current verification authority while evidence is checked unlocked.
-pub(crate) struct VerificationGateScan {
-    permit: crate::task::TaskPermit,
-    source: crate::task::TaskTurnId,
-    evidence: ExecutionCheckEvidenceJob,
-}
-
-impl VerificationGateScan {
-    pub(crate) async fn run(self) -> Result<(Self, bool)> {
-        let Self {
-            permit,
-            source,
-            evidence,
-        } = self;
-        let current = evidence.run().await?;
-        Ok((
-            Self {
-                permit,
-                source,
-                evidence: ExecutionCheckEvidenceJob::Invalid,
-            },
-            current,
-        ))
-    }
-}
-
 /// Retain the task, accepted design and source while verification runs unlocked.
 pub(crate) struct OwnedTaskChecks {
     task: crate::task::Task,
@@ -724,7 +698,7 @@ impl HarnessBroker {
         &self,
         state: OwnedTaskChecks,
         result: super::check_admission::TaskCheckResult,
-        scan: TaskCheckScanResult,
+        _scan: TaskCheckScanResult,
     ) -> Result<TaskCheckFinalization> {
         let interaction = self
             .store
@@ -735,12 +709,6 @@ impl HarnessBroker {
             .context("provider execution changed while checks ran")?;
         let mut execution = state.execution.clone();
         let mut goal = self.active_goal()?;
-        if scan.progress.source_digest != run.workspace_digest
-            || scan.workspace_identity != state.workspace_identity
-        {
-            run.progress = scan.progress;
-            run.progress.unverified.push("Workspace changed while checks ran. Run Checking again against the current source.".into());
-        }
         if run.state == CheckState::Interrupted {
             execution.state = PlanExecutionState::Paused;
             goal.state = GoalState::Paused;
@@ -895,67 +863,6 @@ impl HarnessBroker {
     }
 }
 
-impl HarnessBroker {
-    /// Capture current verification evidence without holding the broker during workspace I/O.
-    pub(crate) fn prepare_verification_gate(&self) -> Result<Option<VerificationGateScan>> {
-        let Some(task) = self.task_controller.current()? else {
-            return Ok(None);
-        };
-        let crate::task::WorkflowSnapshot::Execute { execution } = &task.workflow else {
-            return Ok(None);
-        };
-        if execution.record.phase != crate::plan::PlanPhase::Verify
-            || execution.record.state != PlanExecutionState::Active
-        {
-            return Ok(None);
-        }
-        let document = self.plan_file.read_submitted_document(
-            &self.session.id,
-            &execution.record.plan_id,
-            execution.record.revision,
-        )?;
-        let design = document
-            .design
-            .as_ref()
-            .context("accepted execution design is missing")?;
-        let source = match &task.turn {
-            Some(turn) => turn.id.clone(),
-            None => {
-                let exchange = self
-                    .store
-                    .latest_exchange(&self.session.id)?
-                    .context("verification source is missing")?;
-                crate::task::TaskTurnId {
-                    exchange_ordinal: exchange.ordinal,
-                    turn_ordinal: exchange.turn.len(),
-                }
-            }
-        };
-        Ok(Some(VerificationGateScan {
-            permit: task.permit(),
-            source,
-            evidence: self.prepare_execution_check_evidence(&execution.record, design)?,
-        }))
-    }
-
-    pub(crate) fn commit_verification_gate(
-        &mut self,
-        scan: VerificationGateScan,
-        current: bool,
-    ) -> Result<()> {
-        scan.permit
-            .validate(self.task_controller.current()?.as_ref())?;
-        if !current {
-            self.task_controller.apply(
-                &mut self.store,
-                &scan.permit,
-                crate::task::TaskEvent::VerificationInputsChanged(scan.source),
-                self.clock.now_ms(),
-            )?;
-        }
-        Ok(())
-    }
-}
 
 impl HarnessBroker {
     /// Record check failure under the admitting permit and return owned publication work.

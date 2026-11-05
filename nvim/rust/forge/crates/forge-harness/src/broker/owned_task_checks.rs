@@ -1,7 +1,7 @@
 //! Advance task verification only in the exchange owner between detached worker results.
 use super::checks::{
     OwnedTaskChecks, TaskCheckAcknowledgment, TaskCheckFinalization, TaskCheckReport,
-    TaskCheckScanResult, VerificationGateScan,
+    TaskCheckScanResult,
 };
 use super::*;
 use crate::checks::owner::CheckOwnerFailure;
@@ -12,7 +12,6 @@ type TaskCheckFailurePublicationResult =
 
 /// Carry one immutable worker result back to the owning update step.
 pub(crate) enum TaskCheckEvent {
-    Gate(Box<Result<(VerificationGateScan, bool)>>),
     Scanned(Box<(OwnedTaskChecks, Result<TaskCheckScanResult>)>),
     Checked(Box<(OwnedTaskChecks, Result<check_admission::TaskCheckResult>)>),
     Postscanned(
@@ -55,14 +54,7 @@ impl OwnedTaskCheckRun {
         let Some(task) = broker.task_controller.current()? else {
             return Ok(None);
         };
-        let gate = if task.phase() == crate::task::TaskPhase::Verify
-            && task.status() == crate::task::TaskStatus::Running
-        {
-            broker.prepare_verification_gate()?
-        } else {
-            None
-        };
-        if gate.is_none() && !Self::eligible(broker, &task)? {
+        if !Self::eligible(broker, &task)? {
             return Ok(None);
         }
         let mut run = Self {
@@ -72,13 +64,7 @@ impl OwnedTaskCheckRun {
             sink,
             stopping: false,
         };
-        if let Some(gate) = gate {
-            run.worker = Some(tokio::spawn(async move {
-                TaskCheckEvent::Gate(Box::new(gate.run().await))
-            }));
-        } else {
-            run.begin(broker)?;
-        }
+        run.begin(broker)?;
         Ok(Some(run))
     }
 
@@ -108,21 +94,6 @@ impl OwnedTaskCheckRun {
                     events: Vec::new(),
                     failure: Some(CheckOwnerFailure::Worker(error)),
                 });
-            }
-            TaskCheckEvent::Gate(result) => {
-                let (gate, current) = match *result {
-                    Ok(result) => result,
-                    Err(error) => return self.fail_initial(broker, error),
-                };
-                broker.commit_verification_gate(gate, current)?;
-                let Some(task) = broker.task_controller.current()? else {
-                    return Ok(Self::finished());
-                };
-                if !Self::eligible(broker, &task)? {
-                    return Ok(Self::finished());
-                }
-                self.task = task;
-                self.begin(broker)?;
             }
             TaskCheckEvent::Scanned(payload) => {
                 let (mut state, result) = *payload;
@@ -314,11 +285,4 @@ impl OwnedTaskCheckRun {
         })
     }
 
-    /// Finish a gate that no longer requires check continuation.
-    fn finished() -> TaskCheckProgress {
-        TaskCheckProgress::Finished {
-            events: Vec::new(),
-            failure: None,
-        }
-    }
 }

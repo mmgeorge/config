@@ -469,7 +469,7 @@ impl PlanExecutionRecord {
                 "Harness runs the declaration and accepted checks locally. No model turn runs in this phase."
             }
             PlanPhase::Verify => {
-                "Perform only the accepted plan's manual verification actions, in order. Harness has already passed the declaration and automated checks. Do not rerun automated checks, edit source, or revise the plan. Report each manual action as passed, failed, or blocked, with observations and tool evidence, and report blockers honestly. Observed defects go to Resolve. Get the exact evidence IDs with plan_overview_read before submitting results."
+                "Perform only the accepted plan's manual verification actions, in order. If an action requests an automated check already passed by Harness, report its recorded result and evidence instead of running it again. Harness has already passed the declaration and automated checks. Do not rerun automated checks, edit source, or revise the plan. Report each manual action as passed, failed, or blocked, with observations and tool evidence, and report blockers honestly. Observed defects go to Resolve. Get the exact evidence IDs with plan_overview_read before submitting results."
             }
         };
         let reporting = if self.phase == PlanPhase::Verify {

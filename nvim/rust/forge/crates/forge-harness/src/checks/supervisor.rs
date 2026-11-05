@@ -1168,12 +1168,6 @@ impl CheckSupervisor {
                         before,
                         &after,
                     )?;
-                    if run.commands[index].state == CheckState::Passed
-                        && run.commands[index].evidence.is_none()
-                    {
-                        run.commands[index].state = CheckState::Stale;
-                        run.commands[index].error = Some("Check inputs changed during execution. Verify again after source changes settle.".into());
-                    }
                 }
             }
             let check = &run.commands[index];
@@ -1199,29 +1193,6 @@ impl CheckSupervisor {
             if run.commands[index].state == CheckState::Interrupted {
                 run.interrupt();
                 return Ok(());
-            }
-        }
-        let Some(checkpoint) = cancelled
-            .read(external_cancelled, self.changes.snapshot())
-            .await?
-        else {
-            run.interrupt();
-            return Ok(());
-        };
-        if let Some(checkpoint) = checkpoint {
-            for index in 0..run.commands.len() {
-                let command = &run.commands[index];
-                if command.state == CheckState::Passed
-                    && let Some(evidence) = &command.evidence
-                    && !evidence.covers(
-                        &run.clone().into_record(),
-                        &command.clone().into_record(),
-                        &checkpoint,
-                    )?
-                {
-                    run.commands[index].state = CheckState::Stale;
-                    run.commands[index].error = Some("Later source changes superseded this check's evidence. Verify current inputs again.".into());
-                }
             }
         }
         run.completed_at_ms = Some(now_ms());

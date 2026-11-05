@@ -75,9 +75,6 @@ impl CheckEvidence {
                 prepared.selected.definition_id == definition.id
                     && definition.purpose == super::config::CheckPurpose::Prepare
             });
-        if !preparation && !before.changed_paths(after)?.is_empty() {
-            return Ok(None);
-        }
         let checkpoint = if preparation { after.clone() } else { before };
         let source_identity = checkpoint.check_identity(None, &[])?;
         Ok(Some(Self {

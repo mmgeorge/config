@@ -1513,8 +1513,7 @@ impl ExchangeDriver {
                 if !self.task_check_requests.is_empty() {
                     let mut readiness = Some(InputReadiness::Waiting);
                     let relevant = services.tasks.current().ok().flatten().is_some_and(|task| {
-                        task.phase() == crate::task::TaskPhase::Verify
-                            || task.next_action() == crate::task::TaskNextAction::Checks
+                        task.next_action() == crate::task::TaskNextAction::Checks
                     });
                     if task_verification.is_none() && !relevant {
                         readiness = None;
