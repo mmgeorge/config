@@ -4,7 +4,8 @@ description: >-
   Design, implement, refactor, review, and test Rust code. Use for .rs files, Cargo
   dependencies, type and ownership design, async state coordination, synchronization
   (Mutex, RwLock, atomics, channels), Serde, Facet, thiserror, rustdoc, FFI, dynamic
-  libraries, and hot reload.
+  libraries, hot reload, Criterion benchmarks, Samply profiling, and Rust performance
+  investigations.
 ---
 
 # Rust
@@ -155,6 +156,7 @@ drop(guard);
 | [synchronization.md](references/synchronization.md) | Adding or restructuring locks, atomics, channels, completion queues, cancellation, or shared mutable state |
 | [dynamic-libraries.md](references/dynamic-libraries.md) | Changing Rust dylibs, FFI, native loading, host/plugin contracts, or hot-reload unload order |
 | [testing.md](references/testing.md) | Adding, moving, or removing tests |
+| [benchmarking-and-profiling.md](references/benchmarking-and-profiling.md) | Setting up Criterion/Samply helpers, reading artifacts without a GUI, or supporting optimization changes with measurements |
 
 
 ## Testing
