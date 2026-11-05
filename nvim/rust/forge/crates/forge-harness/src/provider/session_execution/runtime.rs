@@ -1575,6 +1575,16 @@ impl SessionExecution {
                                 driver.begin_retirement(reason);
                                 continue;
                             }
+                            if !driver.failed
+                                && (!driver.invocations.is_empty() || driver.state.active_scope().is_some())
+                            {
+                                driver.fail_observation(ObservationFailure::Disconnected);
+                            }
+                            // Native close waits for its final events to be consumed.
+                            // Keep this owner reading until that cleanup finishes.
+                            if !driver.cleanup.is_empty() {
+                                continue;
+                            }
                             break;
                         },
                         Some(command) => driver.command(command),
@@ -3948,22 +3958,34 @@ impl Driver {
                 crate::provider::events::EventDeliveryError::Observation(failure.clone()),
             ),
         }
-        let invocations = std::mem::take(&mut self.invocations);
-        for (_, invocation) in invocations {
+        // Retain execution identity until close has consumed its terminal events.
+        // Removing it here would reject settlement and strand the close watermark.
+        let waiters: Vec<_> = self
+            .invocations
+            .values_mut()
+            .map(|invocation| {
+                (
+                    invocation.scope.clone(),
+                    invocation.output.clone(),
+                    invocation.reply.take(),
+                )
+            })
+            .collect();
+        for (scope, output, reply) in waiters {
             if let Ok(observation) = forge_provider_api::lifecycle::ExecutionObservation::new(
-                invocation.scope,
+                scope,
                 ExecutionUpdate::ObservationLost {
                     failure: failure.clone(),
                     completion: None,
                 },
             ) {
                 self.enqueue(Delivery::Event {
-                    sink: invocation.output,
+                    sink: output,
                     event: Box::new(ProviderEvent::Execution { observation }),
                     fallback: Some(self.idle.clone()),
                 });
             }
-            if let Some(reply) = invocation.reply {
+            if let Some(reply) = reply {
                 let original = match &origin {
                     FailureOrigin::Observation => None,
                     FailureOrigin::Error(error) => Some(error.clone()),
@@ -5199,6 +5221,91 @@ mod tests {
             response.await.unwrap(),
             Err(ProviderError::Observation(ObservationFailure::Disconnected))
         ));
+    }
+
+    /// Error cleanup must consume cancellation events before waiting for the provider close watermark.
+    #[tokio::test]
+    async fn failed_foreground_close_drains_native_cancellation_events() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        crate::exchange::core_log::persist_test_session(
+            directory.path(),
+            "failed-foreground-close",
+        )?;
+        let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
+        let provider: Arc<Provider> = crate::provider::build(
+            ProviderLaunch {
+                kind: forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+                command: Vec::new(),
+            },
+            crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
+            trace.clone(),
+            directory.path().into(),
+        )?;
+        let store =
+            crate::provider::submission::SubmissionStore::open(directory.path(), trace.clone())?;
+        let owner = ExecutionOwner::root("failed-foreground-close");
+        let registry = SessionExecutionRegistry::new(provider.clone(), trace);
+        let engine = registry.owner(owner.clone()).await?;
+        let control = provider.mock_response_control().unwrap();
+        let hold = control
+            .dispatch(
+                owner.session_id.as_str(),
+                MockResponseCommand::Hold {
+                    mode: Some(PromptMode::Chat),
+                    any_session: false,
+                },
+            )
+            .await?;
+        let request = ProviderRequest {
+            dispatch: forge_provider_api::submission::DispatchTracker::default(),
+            execution_owner: Some(owner.clone()),
+            harness_session_id: owner.session_id.to_string(),
+            workspace: directory.path().to_string_lossy().into_owned(),
+            input: ProviderInput::from_text("Wait until cancelled"),
+            mode: PromptMode::Chat,
+            model: "default".into(),
+            effort: "default".into(),
+            context_window: None,
+            service_tier: Default::default(),
+            access: Default::default(),
+            approval_mode: crate::session::ApprovalMode::Ask,
+            provider_session_id: None,
+            submission: None,
+            recovered_input: Vec::new(),
+            control_context: None,
+        };
+        let scope = InvocationScope::new(owner.clone(), "exchange");
+        let (sink, mut events) = crate::provider::events::channel(scope);
+        let drain = tokio::spawn(async move { while let Ok(Some(_)) = events.recv().await {} });
+        let running = engine.clone();
+        let result = tokio::spawn(async move { running.run_once(request, sink, &store).await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            control.dispatch(
+                owner.session_id.as_str(),
+                MockResponseCommand::Wait {
+                    id: hold["id"].as_str().unwrap().into(),
+                },
+            ),
+        )
+        .await??;
+        let close = tokio::time::timeout(std::time::Duration::from_secs(5), engine.close()).await;
+        if close.is_err() {
+            let artifacts = directory.keep();
+            anyhow::bail!(
+                "foreground close deadlocked; trace retained at {}",
+                artifacts.display()
+            );
+        }
+        close??;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), result)
+                .await??
+                .is_err()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), drain).await??;
+        Ok(())
     }
 
     /// Keep a host result pending after acceptance, and reuse one engine for the next exchange.
