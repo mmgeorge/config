@@ -310,7 +310,7 @@ impl OwnedTaskCheckRun {
         Ok(SessionEvent {
             session_id: broker.session.id.clone(),
             event: "session_changed".into(),
-            payload: serde_json::to_value(broker.snapshot()?.session)?,
+            payload: json!({"snapshot":broker.snapshot()?}),
         })
     }
 

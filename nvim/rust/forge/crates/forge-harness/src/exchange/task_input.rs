@@ -74,7 +74,7 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
                 if snapshot.messages.iter().any(|message| {
                     matches!(message.purpose, InputPurpose::User)
                         && !matches!(
-                            message.delivery,
+                            message.delivery(),
                             InputDelivery::Accepted | InputDelivery::Delivering
                         )
                 }) {
@@ -100,20 +100,16 @@ pub(super) fn reconcile(services: &OwnerServices) -> Result<TaskInputProduction,
             } else {
                 return Ok(PreparedProduction::Idle);
             };
-            let changed = services.input.reconcile_task_input(InputMessage {
-                id: id.as_str().into(),
-                revision: 0,
-                text: text.to_owned(),
-                purpose,
-                attachments: Vec::new(),
-                config: None,
-                intent: InputIntent::Auto,
-                delivery: InputDelivery::Queued,
-                route: None,
-                reservation: None,
-                submission_id: None,
-                error: None,
-            })?;
+            let changed = services.input.reconcile_task_input(InputMessage::queued(
+                crate::input::InputDraft {
+                    id: id.as_str().into(),
+                    text: text.to_owned(),
+                    purpose,
+                    attachments: Vec::new(),
+                    config: None,
+                    intent: InputIntent::Auto,
+                },
+            ))?;
             Ok(match changed {
                 Some(update) => PreparedProduction::Updated(update),
                 None => PreparedProduction::Idle,

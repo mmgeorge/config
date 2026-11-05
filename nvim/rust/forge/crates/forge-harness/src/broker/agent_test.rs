@@ -1,3 +1,18 @@
+use super::super::{
+    AppliedProviderEvent, ApprovalMode, Exchange, ExchangeAdmission, ExchangeState, HarnessBroker,
+    InitializeRequest, PlanExecutionState, PromptMode, ProviderEvent, ProviderInput,
+    ProviderLaunch, SessionUpdate, TurnCancelled,
+};
+use super::test_support::{
+    admit_child_fixture, check_fixture, child_address, child_event, child_tool, completed_message,
+    planning_question_broker, repository, settle_managed_children,
+};
+use anyhow::{Context, Result};
+use serde_json::{Value, json};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use uuid::Uuid;
+
 type TestReceiptWaiters = Arc<std::sync::Mutex<Vec<(String, tokio::sync::oneshot::Sender<()>)>>>;
 
 fn save_child_profile(
@@ -260,47 +275,81 @@ async fn profile_selection_captures_tuning_and_instructions_without_widening_per
     Ok(())
 }
 
-fn admit_child_fixture(broker: &mut HarnessBroker, name: &str) -> Result<crate::agent::AgentWork> {
-    let mut parent = Exchange::agent_admission(
-        &broker.session.id,
-        broker.store.next_exchange_ordinal(&broker.session.id)?,
-        "Admission".into(),
-        100,
-    );
-    let spawn = crate::agent::SpawnAgentRequest {
-        profile: Some(name.into()),
-        text: "Inspect".into(),
+/// Keep binding status out of task transitions while validating the exact child owner.
+#[test]
+fn child_terminal_inventory_does_not_require_or_mutate_an_invocation() -> Result<()> {
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    let admission = admit_child_fixture(&mut broker, "terminal-status")?;
+    let owner = crate::provider::ExecutionOwner {
+        session_id: broker.session.id.clone().into(),
+        agent_id: admission.agent.id.clone().into(),
     };
-    let request = crate::agent::AgentRequest {
-        operation_id: name.into(),
-        source: crate::agent::AgentSource::User,
-        operation: crate::agent::AgentOperation::Spawn(spawn.clone()),
+    let status = |owner| ProviderEvent::Terminals {
+        scope: forge_provider_api::EventScope::Binding { owner },
+        snapshot: forge_provider_api::terminal::TerminalSnapshot {
+            supported: true,
+            starting: false,
+            terminal: Vec::new(),
+        },
     };
-    let selection = crate::agent::AgentSelection {
-        profile: "worker".into(),
-        instructions: String::new(),
-        provider: forge_providers::registry::nonselectable_id()
-            .expect("registry supplies a nonselectable fixture identity"),
-        model: "mock".into(),
-        reasoning_effort: "low".into(),
-        context_window: None,
-        service_tier: Default::default(),
-        access: broker.session.access.clone(),
-        approval_mode: broker.session.approval_mode,
-    };
-    let admission = broker
+    let before = broker
         .agent_coordinator
-        .reserve_spawn(&request, &spawn, selection, &parent.id, 100)?;
-    parent.append_agent_task(&admission.task)?;
-    broker
-        .store
-        .admit_agent_task(&admission.agent, &admission.task, &parent)?;
-    let admission = match admission.commit()? {
-        crate::agent::AgentCommit::Admitted(work) => work,
-        crate::agent::AgentCommit::Existing(_) => anyhow::bail!("fixture reused a child admission"),
+        .task(&admission.task.id)
+        .unwrap()
+        .state;
+    assert!(matches!(
+        broker.apply_managed_agent_observation(
+            owner.clone(),
+            &admission.task.id,
+            status(owner.clone()),
+            &mut Vec::new()
+        )?,
+        AppliedProviderEvent::None
+    ));
+    assert_eq!(
+        broker
+            .agent_coordinator
+            .task(&admission.task.id)
+            .unwrap()
+            .state,
+        before
+    );
+    let foreign = crate::provider::ExecutionOwner::root("foreign");
+    assert!(
+        broker
+            .apply_managed_agent_observation(
+                owner.clone(),
+                &admission.task.id,
+                status(foreign),
+                &mut Vec::new()
+            )
+            .is_err()
+    );
+    let diagnostic = ProviderEvent::Diagnostic {
+        scope: forge_provider_api::EventScope::Binding {
+            owner: owner.clone(),
+        },
+        diagnostic: crate::provider::ProviderDiagnostic {
+            kind: forge_provider_api::ProviderFailureKind::Runtime,
+            message: forge_provider_api::diagnostic::SanitizedMessage::new(
+                "Background terminal inventory is unavailable.",
+            )
+            .unwrap(),
+            fatal: false,
+        },
     };
-    broker.agent_registry.insert(admission.agent.clone());
-    Ok(admission)
+    assert!(matches!(
+        broker.apply_managed_agent_observation(
+            owner,
+            &admission.task.id,
+            diagnostic,
+            &mut Vec::new()
+        )?,
+        AppliedProviderEvent::Update(SessionUpdate::Diagnostic { .. })
+    ));
+    Ok(())
 }
 
 fn admitted_request_fixture(
@@ -332,93 +381,12 @@ fn admitted_request_fixture(
     }
 }
 
-fn child_address() -> crate::provider::TurnAddress {
-    crate::provider::test_support::address(
-        &crate::provider::test_support::scope(),
-        "durable-child-conversation",
-        "child-turn",
-    )
-}
-
-fn child_event(update: crate::provider::TurnUpdate) -> ProviderEvent {
-    ProviderEvent::Turn {
-        address: child_address(),
-        update,
-    }
-}
-
 fn child_message(
     id: impl Into<String>,
     role: crate::provider::MessageRole,
     text: impl Into<String>,
 ) -> Vec<ProviderEvent> {
     completed_message(&child_address(), id, role, text)
-}
-
-fn child_tool(output: String, status: crate::provider::ToolStatus) -> Vec<ProviderEvent> {
-    crate::provider::test_support::tool(
-        &child_address(),
-        "same-provider-call".into(),
-        crate::provider::ToolInvocation {
-            semantics: Default::default(),
-            kind: crate::provider::ToolActivityKind::Command,
-            name: "inspect".into(),
-            title: "Inspect compilation diagnostics".into(),
-            arguments: Value::Null,
-        },
-        crate::turn::test_support::tool_updates(status, Some(output), Default::default()),
-    )
-}
-
-impl HarnessBroker {
-    async fn observe_child_fixture(
-        &mut self,
-        owner: crate::provider::ExecutionOwner,
-        task_id: &str,
-        batch: impl Into<crate::provider::test_support::FixtureBatch>,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
-        use crate::provider::test_support::FixtureBatch;
-        let updates = match batch.into() {
-            FixtureBatch::Event(event) => vec![*event],
-            FixtureBatch::Sequence(event) => event,
-        };
-        let scope = crate::provider::InvocationScope {
-            owner: owner.clone(),
-            exchange_id: task_id.into(),
-            invocation_id: format!("fixture:{task_id}").into(),
-        };
-        for mut update in updates {
-            match &mut update {
-                ProviderEvent::Execution { .. }
-                | ProviderEvent::Settled { .. }
-                | ProviderEvent::SettlementFailed { .. }
-                | ProviderEvent::CapabilitiesChanged { .. }
-                | ProviderEvent::SessionIdentity { .. } => {
-                    anyhow::bail!("lifecycle fixture requires its original validated scope")
-                }
-                ProviderEvent::Message { address, .. } => address.turn.scope = scope.clone(),
-                ProviderEvent::Tool { address, .. } => address.turn.scope = scope.clone(),
-                ProviderEvent::Turn { address, .. }
-                | ProviderEvent::Usage { address, .. }
-                | ProviderEvent::Checklist { address, .. } => address.scope = scope.clone(),
-                ProviderEvent::Runtime { scope: binding, .. }
-                | ProviderEvent::Agent { scope: binding, .. }
-                | ProviderEvent::Approval { scope: binding, .. }
-                | ProviderEvent::DirectoryAccess { scope: binding, .. }
-                | ProviderEvent::InputAccepted { scope: binding, .. }
-                | ProviderEvent::Retry { scope: binding, .. }
-                | ProviderEvent::ParentBoundary { scope: binding, .. } => *binding = scope.clone(),
-                ProviderEvent::Compaction { scope: binding, .. }
-                | ProviderEvent::Diagnostic { scope: binding, .. } => {
-                    *binding = scope.clone().into()
-                }
-            }
-            self.observe_managed_agent(owner.clone(), task_id, update, event)
-                .await?;
-        }
-        Ok(())
-    }
 }
 
 async fn query_child(
@@ -2413,7 +2381,7 @@ async fn parent_cancellation_and_user_decision_prevent_child_continuation() -> R
             )
             .await??;
             assert_eq!(provider.root_turn.load(Ordering::Acquire), 1);
-            cancellation.request(false);
+            cancellation.request();
             Some(guard)
         } else {
             None

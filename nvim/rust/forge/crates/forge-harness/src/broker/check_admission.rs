@@ -1,12 +1,12 @@
 //! Capture and revalidate automatic check work independently of the broker lock.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use anyhow::{Result, ensure};
 
 use super::{
-    Exchange, ExchangeState, HarnessBroker, SessionEvent, TurnCancelled,
+    Exchange, ExchangeState, HarnessBroker, SessionEvent, TurnCancellationSignal, TurnCancelled,
     publication::SessionUpdateSink,
 };
 use crate::checks::{
@@ -24,7 +24,7 @@ pub(crate) struct AutomaticCheckRefresh {
     revision: Option<u64>,
     shell: crate::session::CheckShell,
     sink: Option<SessionUpdateSink>,
-    cancelled: Arc<AtomicBool>,
+    cancelled: Arc<TurnCancellationSignal>,
 }
 
 /// Record whether an existing check is still running or discovery is ready.
@@ -445,7 +445,7 @@ impl HarnessBroker {
             revision,
             shell: self.session.shell,
             sink: self.event_sink.clone(),
-            cancelled: self.turn_cancellation.requested.clone(),
+            cancelled: self.turn_cancellation.capture(),
         })
     }
 
@@ -458,7 +458,7 @@ impl HarnessBroker {
         if !self.automatic_check_current(interaction, &capture, true)? {
             return Ok(AutomaticCheckAdmission::Stale);
         }
-        if capture.cancelled.load(Ordering::Acquire) {
+        if capture.cancelled.requested.load(Ordering::Acquire) {
             return Err(TurnCancelled.into());
         }
         let mut run = capture.supervisor.prepare_request(
@@ -492,7 +492,7 @@ impl HarnessBroker {
             return Ok(None);
         }
         ensure!(
-            !result.capture.cancelled.load(Ordering::Acquire),
+            !result.capture.cancelled.requested.load(Ordering::Acquire),
             TurnCancelled
         );
         Ok(Some(result.run))
@@ -522,7 +522,7 @@ impl HarnessBroker {
 impl AutomaticCheckRefresh {
     /// Wait for an existing run or refresh discovery without holding the broker.
     pub(crate) async fn run(self) -> Result<AutomaticCheckRefreshResult> {
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.cancelled.requested.load(Ordering::Acquire) {
             return Err(TurnCancelled.into());
         }
         if let Some(id) = self.supervisor.active()?
@@ -539,13 +539,13 @@ impl AutomaticCheckRefresh {
 pub(crate) struct AutomaticCheckCancellation {
     supervisor: Arc<CheckSupervisor>,
     run_id: String,
-    cancelled: Arc<AtomicBool>,
+    cancelled: Arc<TurnCancellationSignal>,
 }
 
 impl AutomaticCheckCancellation {
     /// Close dispatch and request process interruption without claiming collection.
     pub(crate) fn cancel(&self) -> Result<()> {
-        self.cancelled.store(true, Ordering::Release);
+        self.cancelled.request();
         if self.supervisor.active()?.as_deref() == Some(self.run_id.as_str()) {
             self.supervisor.cancel(&self.run_id)?;
         }
@@ -571,7 +571,7 @@ impl AutomaticCheckRun {
             .run(
                 self.run,
                 self.capture.sink.clone(),
-                Some(self.capture.cancelled.clone()),
+                Some(self.capture.cancelled.subscribe()),
             )
             .await?;
         Ok(AutomaticCheckResult {
@@ -599,7 +599,7 @@ impl TaskCheckRun {
             .run(
                 self.run,
                 self.capture.sink.clone(),
-                Some(self.capture.cancelled.clone()),
+                Some(self.capture.cancelled.subscribe()),
             )
             .await?;
         Ok(TaskCheckResult {

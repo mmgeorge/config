@@ -35,9 +35,6 @@ pub(crate) struct AdmissionSnapshot {
     pub session: AdmissionSession,
     pub task_revision: Option<crate::task::TaskRevision>,
     pub task: Option<AdmissionTask>,
-    pub operation_state: Option<String>,
-    pub operation_id: Option<String>,
-    pub operation_action: Option<String>,
     pub has_elicitation: bool,
 }
 
@@ -53,7 +50,6 @@ struct PublishedAdmission {
 pub(crate) struct RuntimeSnapshot {
     pub active_task: Option<crate::task::Task>,
     pub plan: Option<crate::session::state_machine::PlanStatus>,
-    pub configuring: bool,
 }
 
 /// Read capability for a committed session projection. It cannot mutate session state.
@@ -354,16 +350,7 @@ impl SqliteStore {
                 .map(Into::into),
             _ => None,
         };
-        let configuring = snapshot.operation_action.as_deref() == Some("configure")
-            && matches!(
-                snapshot.operation_state.as_deref(),
-                Some("admitted" | "accepted" | "stopping" | "running" | "applying" | "verifying")
-            );
-        Ok(RuntimeSnapshot {
-            active_task,
-            plan,
-            configuring,
-        })
+        Ok(RuntimeSnapshot { active_task, plan })
     }
     pub(crate) fn session_admission(&self, session_id: &str) -> Result<Arc<SessionAdmission>> {
         self.admission.bind(self, session_id)
@@ -390,21 +377,20 @@ impl SqliteStore {
     }
 
     fn read_admission(&self, session_id: &str) -> Result<AdmissionSnapshot> {
-        let encoded: Option<String> = self.connection.query_row(
-            "SELECT json_object(
+        let encoded: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT json_object(
                 'session',json_object('id',s.id),
                 'task_revision',json_extract(s.payload,'$.session.active_task.revision'),
                 'task',NULL,
-                'operation_state',json_extract(o.payload,'$.state'),
-                'operation_id',o.id,
-                'operation_action',json_extract(o.payload,'$.action.action'),
                 'has_elicitation',json('false'))
              FROM session_record s
-             LEFT JOIN task_operation o ON o.rowid=(SELECT rowid FROM task_operation WHERE session_id=s.id ORDER BY rowid DESC LIMIT 1)
              WHERE s.id=?1 AND json_extract(s.payload,'$.format_version')=?2",
-            rusqlite::params![session_id, super::SESSION_FORMAT_VERSION],
-            |row| row.get(0),
-        ).optional()?;
+                rusqlite::params![session_id, super::SESSION_FORMAT_VERSION],
+                |row| row.get(0),
+            )
+            .optional()?;
         let mut snapshot: AdmissionSnapshot = serde_json::from_str(
             &encoded.context("admission session is missing or incompatible")?,
         )?;
@@ -520,13 +506,13 @@ mod tests {
         let admission = owner.session_admission(&session.id)?;
         owner
             .connection
-            .execute_batch("ALTER TABLE task_operation RENAME TO unavailable_operation")?;
+            .execute_batch("ALTER TABLE session_record RENAME TO unavailable_session")?;
         assert_eq!(admission.snapshot()?.session.id, session.id);
         assert!(owner.publish_admission(&session.id).is_err());
         assert!(admission.snapshot().is_err());
         owner
             .connection
-            .execute_batch("ALTER TABLE unavailable_operation RENAME TO task_operation")?;
+            .execute_batch("ALTER TABLE unavailable_session RENAME TO session_record")?;
         owner.publish_admission(&session.id)?;
         assert_eq!(admission.snapshot()?.session.id, session.id);
         Ok(())

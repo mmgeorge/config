@@ -19,6 +19,8 @@ use crate::{
 pub(crate) enum InputExecutionResult {
     /// Execution returned without an error; acceptance still requires receipt evidence.
     Completed,
+    /// Execution was intentionally cancelled; delivery evidence still determines consumption.
+    Cancelled,
     /// Execution failed; the receipt determines whether delivery is uncertain or accepted.
     Failed,
 }
@@ -35,6 +37,8 @@ pub(crate) enum InputDispatchActivity {
 /// Explain why a prepared input no longer needs its selected dispatch.
 #[derive(Clone, Copy)]
 pub(crate) enum InputAbandonment {
+    /// Intentional cancellation stopped this selected input before dispatch.
+    Cancelled,
     /// The question/task revision no longer owns the input.
     Superseded,
     /// Explicit delivery control prevented dispatch.
@@ -151,8 +155,8 @@ impl InputReceipts {
             .into_iter()
             .find(|message| {
                 message.id == input.id.as_str()
-                    && message.submission_id.as_deref() == Some(submission.as_str())
-                    && message.delivery == InputDelivery::Delivering
+                    && message.submission_id() == Some(submission.as_str())
+                    && message.delivery() == InputDelivery::Delivering
             })
             .ok_or(InputReceiptError::StaleInput)?;
         if !crate::input::input_purpose_is_current(
@@ -180,7 +184,7 @@ impl InputReceipts {
             .snapshot()
             .map_err(InputReceiptError::Queue)?;
         for message in snapshot.messages {
-            let Some(id) = &message.submission_id else {
+            let Some(id) = &message.submission_id() else {
                 continue;
             };
             let submission = services
@@ -199,12 +203,10 @@ impl InputReceipts {
             {
                 return Err(InputReceiptError::IdentityMismatch);
             }
-            if self.pending.len() >= forge_protocol::MAX_PENDING_FRAMES {
-                return Err(InputReceiptError::Capacity);
-            }
             let id = submission.receipt_id().clone();
             let acceptance = submission.acceptance();
             let task_permit = record.task_receipt.clone();
+            let route = message.route().ok_or(InputReceiptError::IdentityMismatch)?;
             self.pending.insert(
                 id.clone(),
                 TrackedInput {
@@ -215,7 +217,7 @@ impl InputReceipts {
                     },
                     purpose: message.purpose,
                     task_permit,
-                    route: message.route.unwrap_or(InputRoute::Turn),
+                    route,
                     submission,
                     binding: ReceiptBinding::Bound,
                     acceptance,
@@ -359,22 +361,26 @@ impl InputReceipts {
                 }
                 let delivery = match retirement {
                     SubmissionRetirement::Accepted => None,
-                    SubmissionRetirement::Prevented
+                    SubmissionRetirement::Cancelled
+                        if matches!(result, InputExecutionResult::Cancelled) =>
+                    {
+                        None
+                    }
+                    SubmissionRetirement::Cancelled
                         if tracked.route == InputRoute::Steering
                             && matches!(activity, InputDispatchActivity::Idle) =>
                     {
                         Some(InputDelivery::Queued)
                     }
-                    SubmissionRetirement::Prevented | SubmissionRetirement::AlreadyCancelled => {
-                        Some(InputDelivery::Failed)
-                    }
+                    SubmissionRetirement::Cancelled => Some(InputDelivery::Failed),
                     SubmissionRetirement::Sending => Some(InputDelivery::Unknown),
                 };
                 if delivery == Some(InputDelivery::Failed) {
                     tracked.pause_task(services)?;
                 }
                 let error = match (&delivery, result) {
-                    (Some(InputDelivery::Queued), _) | (None, InputExecutionResult::Completed) => {
+                    (Some(InputDelivery::Queued), _)
+                    | (None, InputExecutionResult::Completed | InputExecutionResult::Cancelled) => {
                         None
                     }
                     (Some(InputDelivery::Unknown), _) => {
@@ -390,7 +396,12 @@ impl InputReceipts {
                         unreachable!("settlement selects only terminal or safely queued delivery")
                     }
                 };
-                let update = tracked.commit_delivery(services, delivery, error)?;
+                let mut update = tracked.commit_delivery(services, delivery, error)?;
+                if matches!(result, InputExecutionResult::Cancelled)
+                    && retirement == SubmissionRetirement::Cancelled
+                {
+                    update.retracted = Some(tracked.input.id.as_str().into());
+                }
                 if retirement == SubmissionRetirement::Sending {
                     tracked.work = ReceiptWork::Unconfirmed;
                 } else {
@@ -414,17 +425,19 @@ impl InputReceipts {
                 let delivery = match retirement {
                     SubmissionRetirement::Accepted => None,
                     SubmissionRetirement::Sending => Some(InputDelivery::Unknown),
-                    SubmissionRetirement::Prevented | SubmissionRetirement::AlreadyCancelled => {
-                        match reason {
-                            InputAbandonment::Superseded => None,
-                            InputAbandonment::Paused
-                            | InputAbandonment::Retracted
-                            | InputAbandonment::Reconfigured => Some(InputDelivery::Queued),
+                    SubmissionRetirement::Cancelled => match reason {
+                        InputAbandonment::Cancelled
+                        | InputAbandonment::Superseded
+                        | InputAbandonment::Retracted => None,
+                        InputAbandonment::Paused | InputAbandonment::Reconfigured => {
+                            Some(InputDelivery::Queued)
                         }
-                    }
+                    },
                 };
-                let retracted = matches!(reason, InputAbandonment::Retracted)
-                    && delivery == Some(InputDelivery::Queued);
+                let retracted = matches!(
+                    reason,
+                    InputAbandonment::Cancelled | InputAbandonment::Retracted
+                ) && retirement == SubmissionRetirement::Cancelled;
                 let mut update = tracked.commit_delivery(
                     services,
                     delivery,
@@ -469,9 +482,6 @@ impl InputReceipts {
             return Err(InputReceiptError::IdentityMismatch);
         }
         self.release_reconciled(services)?;
-        if self.pending.len() >= forge_protocol::MAX_PENDING_FRAMES {
-            return Err(InputReceiptError::Capacity);
-        }
         if self.pending.contains_key(submission.receipt_id()) {
             return Err(InputReceiptError::AlreadyRegistered);
         }
@@ -484,10 +494,10 @@ impl InputReceipts {
             .find(|message| {
                 message.id == input.id.as_str()
                     && message.revision == input.revision
-                    && message.delivery == InputDelivery::Delivering
+                    && message.delivery() == InputDelivery::Delivering
             })
             .ok_or(InputReceiptError::StaleInput)?;
-        let route = message.route.ok_or(InputReceiptError::StaleInput)?;
+        let route = message.route().ok_or(InputReceiptError::StaleInput)?;
         let id = submission.receipt_id().clone();
         let acceptance = submission.acceptance();
         let task_permit = match record.task_receipt.clone() {
@@ -544,7 +554,7 @@ impl InputReceipts {
             }
             let still_bound = snapshot.messages.iter().any(|message| {
                 message.id == tracked.input.id.as_str()
-                    && message.submission_id.as_deref() == Some(id.as_str())
+                    && message.submission_id() == Some(id.as_str())
             });
             if !still_bound {
                 tracked.observe_acceptance(services)?;
@@ -753,9 +763,6 @@ pub(crate) enum InputReceiptError {
     /// This owner has no registered dispatch for the given receipt.
     #[error("input receipt is not registered with this exchange owner")]
     Unknown,
-    /// Retained unfinished receipts reached bounded owner capacity.
-    #[error("input receipt capacity is exhausted")]
-    Capacity,
     /// A producer tried to replace an already-bound receipt.
     #[error("input receipt is already registered")]
     AlreadyRegistered,
@@ -794,7 +801,6 @@ impl InputReceiptError {
             #[cfg(test)]
             Self::OwnerClosed | Self::ObservationLost => false,
             Self::Unknown
-            | Self::Capacity
             | Self::AlreadyRegistered
             | Self::IdentityMismatch
             | Self::StaleInput

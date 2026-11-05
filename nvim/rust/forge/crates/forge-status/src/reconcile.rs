@@ -14,6 +14,7 @@ pub(crate) fn reconcile(
 ) -> Result<Option<StatusDelta>> {
     document._admission.check()?;
     let before = document.snapshot();
+    let selection = crate::mutation::SelectionVersion::capture(document);
     let mut sequence = document.sequence;
     let (order, mut file, mut retained_bytes) =
         inventory(observed_path, &ignored, &document.file, &mut sequence)?;
@@ -66,6 +67,7 @@ pub(crate) fn reconcile(
         return Ok(None);
     }
     document.revision = next_revision;
+    crate::mutation::remember(document, selection);
     Ok(Some(delta(&before, &document.snapshot())))
 }
 

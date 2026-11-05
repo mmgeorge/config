@@ -211,12 +211,7 @@ impl SqliteStore {
                 transaction.execute("UPDATE plan_execution_record SET payload=json_set(payload,'$.check_runs',json(?2)) WHERE id=?1", params![execution.id,serde_json::to_string(&execution.check_runs)?])?;
             }
         }
-        let clearing: bool = transaction.query_row(
-            "SELECT COALESCE((SELECT json_extract(payload,'$.action.action')='clear' AND json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running') FROM task_operation WHERE session_id=?1 ORDER BY rowid DESC LIMIT 1),0)",
-            [session_id], |row| row.get(0))?;
-        transaction.execute("UPDATE task_operation SET payload=json_set(payload,'$.state','cancelled','$.error',NULL) WHERE session_id=?1 AND json_extract(payload,'$.action.action')='pause' AND (json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running') OR (json_extract(payload,'$.state')='outcome_unknown' AND json_extract(payload,'$.error')='Runtime stopped before the operation settled. Inspect task state before resuming'))", [session_id])?;
-        transaction.execute("UPDATE task_operation SET payload=json_set(payload,'$.state','outcome_unknown','$.error','Runtime stopped before the operation settled. Inspect task state before resuming') WHERE session_id=?1 AND json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running','applying','verifying','resuming')", [session_id])?;
-        super::task::recover_active_task(&transaction, session_id, clearing)?;
+        super::task::recover_active_task(&transaction, session_id)?;
         transaction.commit()?;
         self.refresh_admission_membership(session_id)
     }

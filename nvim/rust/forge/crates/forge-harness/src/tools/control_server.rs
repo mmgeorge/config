@@ -47,9 +47,12 @@ impl ControlServer {
             loop {
                 tokio::select! {
                     _ = &mut stopping => break,
-                    accepted = listener.accept() => {
-                        let Ok((socket, _)) = accepted else { break };
-                        let Ok(permit) = admission.clone().try_acquire_owned() else { continue };
+                    accepted = async {
+                        let permit = admission.clone().acquire_owned().await.ok()?;
+                        let (socket, _) = listener.accept().await.ok()?;
+                        Some((socket, permit))
+                    } => {
+                        let Some((socket, permit)) = accepted else { break };
                         let handler = handler.clone();
                         let path = path.clone();
                         let sessions = sessions.clone();
@@ -217,10 +220,6 @@ async fn respond(
         let mut known = sessions
             .lock()
             .map_err(|_| anyhow::anyhow!("MCP session registry poisoned"))?;
-        ensure!(
-            known.len() < forge_protocol::MAX_PENDING_FRAMES,
-            "MCP session capacity reached"
-        );
         known.insert(identity);
         Some(identity)
     } else {
@@ -376,6 +375,76 @@ mod tests {
     }
 
     struct IdentityHandler;
+
+    struct CapacityHandler {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ControlEndpoint for CapacityHandler {
+        async fn definitions(&self) -> Vec<ControlToolDefinition> {
+            Vec::new()
+        }
+
+        async fn call(&self, _: ToolCall) -> ToolResult<ControlReply> {
+            let _ = self.entered.send(());
+            let mut release = self.release.clone();
+            let _ = release.wait_for(|released| *released).await;
+            Ok(ControlReply {
+                message: "released".into(),
+            })
+        }
+    }
+
+    /// Retain connection overflow in listener backpressure instead of discarding its request.
+    #[tokio::test]
+    async fn saturated_connections_resume_after_inflight_calls_release() -> Result<()> {
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = tokio::sync::watch::channel(false);
+        let server = ControlServer::start(Arc::new(CapacityHandler {
+            entered,
+            release: released,
+        }))
+        .await?;
+        let client = reqwest::Client::builder().no_proxy().build()?;
+        let session = initialize(&client, &server.url).await?;
+        let mut calls = Vec::new();
+        for id in 0..16 {
+            let client = client.clone();
+            let url = server.url.clone();
+            let session = session.clone();
+            calls.push(tokio::spawn(async move {
+                client
+                    .post(url)
+                    .header("Mcp-Session-Id", session)
+                    .json(&json!({"id":id,"method":"tools/call","params":{"name":"fixture"}}))
+                    .send()
+                    .await
+            }));
+            entries
+                .recv()
+                .await
+                .context("control call was dropped before admission")?;
+        }
+        let overflow = client
+            .post(&server.url)
+            .json(&json!({"id":"overflow","method":"ping"}))
+            .send();
+        tokio::pin!(overflow);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut overflow)
+                .await
+                .is_err()
+        );
+        release.send_replace(true);
+        assert_eq!(overflow.await?.status(), reqwest::StatusCode::OK);
+        for call in calls {
+            assert_eq!(call.await??.status(), reqwest::StatusCode::OK);
+        }
+        server.close().await?;
+        Ok(())
+    }
 
     #[async_trait::async_trait]
     impl ControlEndpoint for IdentityHandler {

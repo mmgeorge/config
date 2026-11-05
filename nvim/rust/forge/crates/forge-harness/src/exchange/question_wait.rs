@@ -17,7 +17,7 @@ use crate::question::{
 };
 use crate::trace::TraceStore;
 
-const MAX_WAITS: usize = forge_protocol::MAX_ACTIVE_REQUESTS;
+const MAX_WAITS: usize = 1024;
 const RETIREMENT_BUDGET: usize = 32;
 
 /// Identify one process-local wait registration, independently of its persistent question identities.
@@ -178,6 +178,12 @@ impl Default for QuestionWaits {
 }
 
 impl QuestionWaits {
+    /// Get whether another waiting destination can be installed at this owner update.
+    /// Keep excess callbacks in the owner's staged queue until retirement frees capacity.
+    pub(super) fn has_capacity(&self) -> bool {
+        self.active.len() < MAX_WAITS
+    }
+
     /// Publish and install one wait only after proving capacity and validating its captured scope.
     pub(super) fn begin(
         &mut self,
@@ -191,7 +197,7 @@ impl QuestionWaits {
             WaitOwnerState::Closing => return Err(super::QuestionEventError::OwnerClosed),
             WaitOwnerState::Open => {}
         }
-        if self.active.len() >= MAX_WAITS {
+        if !self.has_capacity() {
             return Err(super::QuestionEventError::WaitCapacity);
         }
         let local = creation.prepare_wait(&services.questions, services)?;

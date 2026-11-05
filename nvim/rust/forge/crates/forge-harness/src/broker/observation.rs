@@ -2,8 +2,6 @@ use super::*;
 
 pub(crate) struct InputReadiness {
     pub session: crate::storage::admission::AdmissionSession,
-    /// Transitional fact from the legacy task-operation journal; remove with its write path.
-    pub operation_blocks_input: bool,
     pub has_elicitation: bool,
     pub has_approval: bool,
     pub checks_running: bool,
@@ -12,6 +10,8 @@ pub(crate) struct InputReadiness {
 
 /// Shares durable queries and published transient state without acquiring the execution owner.
 pub(crate) struct BrokerObserver {
+    pub(crate) input: Arc<crate::input::SessionInputQueue>,
+    pub(crate) activity: RwLock<crate::exchange::ActivitySnapshot>,
     pub(crate) questions: Arc<crate::question::QuestionController>,
     pub(crate) admission: Arc<crate::storage::admission::SessionAdmission>,
     pub(crate) input_schedule: tokio::sync::watch::Sender<crate::session::InputSchedule>,
@@ -113,12 +113,6 @@ impl BrokerObserver {
             session: state.session.clone(),
             has_elicitation: state.has_elicitation,
             has_approval,
-            operation_blocks_input: state.operation_state.as_deref().is_some_and(|state| {
-                matches!(
-                    state,
-                    "admitted" | "accepted" | "stopping" | "applying" | "verifying" | "resuming"
-                )
-            }),
             checks_running: self.check_runner.active()?.is_some(),
             native_steer,
         })
@@ -534,6 +528,10 @@ impl BrokerObserver {
             })
             .collect();
         Ok(BrokerSnapshot {
+            activity: *self
+                .activity
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
             questions: self.questions.snapshot()?,
             ask_model,
             access_preference: settings
@@ -553,16 +551,6 @@ impl BrokerObserver {
             automatic_checks,
             checks_deferred: self.completion_queue.deferred()?,
             active_check_run,
-            task_operation: store
-                .latest_task_operation(&source_session.id)?
-                .filter(|operation| {
-                    !matches!(
-                        operation.state.as_str(),
-                        "failed" | "cancelled" | "completed" | "superseded"
-                    ) || operation.exchange_id.as_deref()
-                        == interaction.last().map(|exchange| exchange.id.as_str())
-                })
-                .map(|operation| operation.view()),
             session,
             exchange: interaction,
             capability: metadata.capability.clone(),

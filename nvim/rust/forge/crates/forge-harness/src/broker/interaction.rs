@@ -523,7 +523,7 @@ impl HarnessBroker {
         self.session.active_task = self.task_controller.current()?;
         effects.push(AppliedProviderEvent::Update(
             SessionUpdate::ExecutionState {
-                session: Box::new(self.session_view()?),
+                snapshot: Box::new(self.snapshot()?),
             },
         ));
         Ok((interaction, new_interaction, events, effects))

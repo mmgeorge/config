@@ -3,7 +3,6 @@ local client = require("forge.client")
 local picker = require("forge.views.picker")
 local notifications = require("forge.infra.notifications")
 local diagnostic = require("forge.views.harness.diagnostic")
-local operation_sequence = 0
 
 ---@class ForgeHarnessActiveTask
 ---@field id string
@@ -60,155 +59,27 @@ end
 ---@param admitted? fun()
 ---@param method? string
 function M.transition(state, action, refresh, settled, admitted, method)
-  if state.host_error then notifications.error(state.host_error, "Harness task") return end
-  local session_id = state.session.id
-  local generation = client.host_get_generation()
-  operation_sequence = operation_sequence + 1
-  local identity = ("%s:%s:%s"):format(vim.fn.getpid(), vim.uv.hrtime(), operation_sequence)
+  if state.host_error then settled(state.host_error) return end
+  local session_id, generation = state.session.id, client.host_get_generation()
   action = vim.deepcopy(action)
-  action.operation_id = identity
-  if action.action == "pause" and state.input then state.input.pause_operation_id = identity end
-  local scope = session_id .. ":" .. tostring(generation)
-  if state.task_operation_scope ~= scope then
-    state.task_operation_by_id = {}
-    state.task_operation_scope = scope
-  end
-  local registry = state.task_operation_by_id
-  local operation = { id = identity, action = action.action, config = action.config, state = "submitting", sequence = operation_sequence }
-  registry[identity] = operation
-  if action.action == "configure" and state.configuration_completion then
-    operation.configuration_deferred = state.configuration_completion.deferred
-  end
-  state.task_operation = operation
-  state.execution_notice = nil
-  state.execution_notice_operation = nil
-  local function current()
-    return state.session and state.session.id == session_id and registry[identity] == operation
-      and client.host_get_generation() == generation
-  end
-  local function remove()
-    registry[identity] = nil
-    if state.task_operation ~= operation then return end
-    local latest
-    for _, pending in pairs(registry) do
-      if not latest or pending.sequence > latest.sequence then latest = pending end
-    end
-    state.task_operation = latest
-  end
-  local function receive(result, failure, detail)
-    if not current() then return end
-    if result and type(result.revision) == "number" then
-      if operation.server_revision and result.revision < operation.server_revision then return end
-      operation.server_revision = result.revision
-    end
-    if failure and detail and detail.code == "not_admitted" then
-      if state.task_operation == operation then
-        diagnostic.set(state, "execution_notice", "Waiting to submit task control: " .. failure,
-          { owner = identity, category = "admission", severity = "info" })
-        refresh()
-      end
-      vim.defer_fn(function()
-        if current() and not operation.admitted then
-          client.request({ session_id = session_id, method = method or "session.command.apply", params = action }, receive)
-        end
-      end, 1000)
+  action.operation_id = require("forge.command").identity()
+  if action.action == "pause" and state.input then state.input.pause_operation_id = action.operation_id end
+  client.request({ session_id = session_id, method = method or "session.command.apply", params = action }, function(result, failure, detail)
+    if not state.session or state.session.id ~= session_id or client.host_get_generation() ~= generation then
+      settled(failure or "The session changed before command completion", true)
       return
     end
-    if state.task_operation ~= operation then
-      if result then
-        operation.state = result.state
-        if result.state == "completed" or result.state == "cancelled" or result.state == "failed"
-          or result.state == "superseded" or result.state == "outcome_unknown" then
-          remove()
-          local message = result.error ~= vim.NIL and result.error or nil
-          if result.state == "failed" or result.state == "outcome_unknown" then
-            message = message or (result.state == "outcome_unknown"
-              and "Task outcome could not be confirmed. Inspect the original operation before retrying."
-              or "Task transition failed")
-            if result.state == "outcome_unknown" then
-              state.execution_notice_operation = { id = operation.id, message = message }
-            end
-            notifications.error(message, "Harness task")
-          end
-          settled(message, true)
-        end
-      elseif detail and detail.code ~= "not_admitted" then
-        remove()
-        notifications.error(failure, "Harness task")
-        settled(failure, true)
-      end
-      return
-    end
+    if not failure and not result then failure = "Task command returned no result" end
     if failure then
-      if detail and detail.code ~= "outcome_unknown" then
-        remove()
-        diagnostic.set(state, "execution_notice", "Not submitted: " .. failure,
-          { owner = identity, category = "admission", severity = "warning", recovery = "resubmit" })
-        notifications.error(state.execution_notice, "Harness task")
-        if state.task_operation then
-          state.task_config = state.task_operation.config
-          settled(state.execution_notice, true)
-          refresh()
-          return
-        end
-        settled(state.execution_notice)
-        return
-      end
-      -- Command recovery has finished with an uncertain outcome. Release this UI waiter;
-      -- the immutable command remains available for inspection under its original ID.
-      remove()
-      operation.state = "outcome_unknown"
-      diagnostic.set(state, "execution_notice", failure,
-        { owner = identity, category = "uncertain", severity = "warning", recovery = "inspect" })
-      state.execution_notice_operation = { id = identity, message = failure }
-      settled(failure, state.task_operation ~= nil)
-      refresh()
-      return
+      diagnostic.set(state, "execution_notice", failure, { owner = action.operation_id,
+        category = detail and detail.code or "command", severity = "error" })
+      notifications.error(failure, "Harness task")
+    elseif admitted then
+      admitted()
     end
-    if not result or result == vim.NIL then
-      operation.state = "outcome_unknown"
-      diagnostic.set(state, "execution_notice", "Task acknowledgement unknown. Check task status before retrying.",
-        { owner = identity, category = "uncertain", severity = "info" })
-      refresh()
-      return
-    end
-    diagnostic.set(state, "execution_notice", nil)
-    operation.state = result.state
-    if not operation.admitted then
-      operation.admitted = true
-      if admitted then admitted() end
-    end
-    if result.state == "completed" or result.state == "cancelled" or result.state == "failed" or result.state == "superseded" or result.state == "outcome_unknown" then
-      remove()
-      local message = result.error ~= vim.NIL and result.error or nil
-      if result.state == "failed" or result.state == "outcome_unknown" then
-        message = message or (result.state == "outcome_unknown"
-          and "Task outcome could not be confirmed. Inspect the original operation before retrying."
-          or "Task transition failed")
-        diagnostic.set(state, "execution_notice", message, { owner = identity, category = result.state,
-          severity = result.state == "failed" and "error" or "warning", recovery = "inspect" })
-        state.execution_notice_operation = { id = operation.id, message = message }
-        if result.state == "failed" then notifications.error(message, "Harness task") end
-      else
-        diagnostic.set(state, "execution_notice", nil)
-        state.execution_notice_operation = nil
-      end
-      settled(message, state.task_operation ~= nil)
-      if state.task_operation then refresh() end
-    else
-      refresh()
-    end
-  end
-  operation.receive = receive
-  client.request({ session_id = session_id, method = method or "session.command.apply", params = action }, receive)
-
-end
-
----@param state table
----@param payload table
-function M.receive(state, payload)
-  local operation = state.task_operation_by_id and state.task_operation_by_id[payload.id] or state.task_operation
-  if operation and payload.id == operation.id then operation.receive(payload) end
+    settled(failure)
+    refresh()
+  end)
 end
 
 ---@param host table

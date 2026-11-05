@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub const MAX_ACTIVE_CHILDREN: usize = 8;
-pub const MAX_PENDING_TASKS: usize = 32;
+pub const MAX_PENDING_TASKS: usize = 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -119,6 +119,7 @@ pub enum AgentCommand {
         authority: Option<AgentRequestAuthority>,
         target: Option<AgentTarget>,
         response: oneshot::Sender<Result<serde_json::Value>>,
+        task_admission: Option<tokio::sync::OwnedSemaphorePermit>,
     },
     Event {
         owner: ExecutionOwner,
@@ -146,10 +147,80 @@ pub struct AgentRequestAuthority {
 pub struct AgentCommandSender {
     sender: mpsc::Sender<AgentCommand>,
     revision: watch::Sender<u64>,
+    task_slots: Arc<tokio::sync::Semaphore>,
+    state: Arc<Mutex<AgentStateStore>>,
 }
 
 impl AgentCommandSender {
-    pub async fn send(&self, command: AgentCommand) -> Result<()> {
+    /// Reserve child task capacity before a public command enters its parent's FIFO.
+    /// Existing operation identities retain immediate observation. Dropping this await or its
+    /// acquired permit before command admission releases capacity without creating child work.
+    pub(crate) async fn acquire_task_admission(
+        &self,
+        operation: &str,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>> {
+        let mut revision = self.revision.subscribe();
+        let acquire = self.task_slots.clone().acquire_owned();
+        tokio::pin!(acquire);
+        loop {
+            if self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("agent state poisoned"))?
+                .admission_by_operation
+                .contains_key(operation)
+            {
+                return Ok(None);
+            }
+            tokio::select! {
+                permit = &mut acquire => return Ok(Some(permit.context("child task admission is closed")?)),
+                _ = self.sender.closed() => anyhow::bail!("agent coordinator is closed"),
+                changed = revision.changed() => { changed.context("agent coordinator is closed")?; }
+            }
+        }
+    }
+
+    pub async fn send(&self, mut command: AgentCommand) -> Result<()> {
+        if let AgentCommand::Request {
+            request,
+            authority,
+            response,
+            task_admission,
+            ..
+        } = &mut command
+        {
+            let creates_task = match &request.operation {
+                AgentOperation::Spawn(_) | AgentOperation::Followup { .. } => true,
+                AgentOperation::Message { .. }
+                | AgentOperation::Interrupt { .. }
+                | AgentOperation::InterruptAll
+                | AgentOperation::List { .. }
+                | AgentOperation::Activity { .. }
+                | AgentOperation::ToolOutput { .. } => false,
+            };
+            let retained = self
+                .state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("agent state poisoned"))?
+                .admission_by_operation
+                .contains_key(&request.operation_id);
+            if creates_task && !retained && task_admission.is_none() {
+                let mut expired = authority
+                    .as_ref()
+                    .map(|authority| authority.expired.clone());
+                let permit = tokio::select! {
+                    permit = self.acquire_task_admission(&request.operation_id) => permit?,
+                    _ = response.closed() => anyhow::bail!("child task caller is closed"),
+                    _ = async {
+                        match &mut expired {
+                            Some(expired) => { let _ = expired.wait_for(|expired| *expired).await; }
+                            None => std::future::pending().await,
+                        }
+                    } => anyhow::bail!("child task authority expired before admission"),
+                };
+                *task_admission = permit;
+            }
+        }
         self.sender
             .send(command)
             .await
@@ -166,6 +237,7 @@ impl AgentCommandSender {
             authority: None,
             target: None,
             response,
+            task_admission: None,
         })
         .await?;
         receiver
@@ -178,6 +250,7 @@ impl AgentCommandSender {
         &self,
         request: AgentRequest,
         target: Option<AgentTarget>,
+        task_admission: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<serde_json::Value> {
         let (response, receiver) = oneshot::channel();
         self.send(AgentCommand::Request {
@@ -185,6 +258,7 @@ impl AgentCommandSender {
             authority: None,
             target,
             response,
+            task_admission,
         })
         .await?;
         receiver
@@ -203,6 +277,7 @@ impl AgentCommandSender {
             authority: Some(authority),
             target: None,
             response,
+            task_admission: None,
         })
         .await?;
         receiver
@@ -298,7 +373,12 @@ impl AgentAdmission {
             .map_err(|_| anyhow::anyhow!("agent state poisoned"))?;
         let admission = &self.work;
         if state.task_by_id.contains_key(&admission.task.id) {
-            return Ok(AgentCommit::Existing(admission.committed()));
+            let mut work = admission.committed();
+            work.launch = state
+                .execution_by_agent
+                .get(&admission.agent.id)
+                .is_some_and(|execution| execution.active_task_id == admission.task.id);
+            return Ok(AgentCommit::Existing(work));
         }
         ensure!(
             state
@@ -307,11 +387,17 @@ impl AgentAdmission {
                 .is_some_and(|reserved| Arc::ptr_eq(reserved, admission)),
             "child reservation was cancelled"
         );
-        if admission.launch {
-            ensure!(
-                !state.execution_by_agent.contains_key(&admission.agent.id),
-                "child already owns an active provider turn"
-            );
+        let launch = !state.execution_by_agent.contains_key(&admission.agent.id)
+            && !state.pending_launches.iter().any(|id| {
+                state
+                    .task_by_id
+                    .get(id)
+                    .is_some_and(|task| task.agent_id == admission.agent.id)
+            })
+            && state.pending_launches.is_empty()
+            && state.execution_by_agent.len() < MAX_ACTIVE_CHILDREN
+            && state.quiescence_count == 0;
+        if launch {
             let (cancellation, _) = watch::channel(false);
             state.execution_by_agent.insert(
                 admission.agent.id.clone(),
@@ -322,13 +408,10 @@ impl AgentAdmission {
                     cleanup_failed: false,
                 },
             );
+        } else if let Some(execution) = state.execution_by_agent.get_mut(&admission.agent.id) {
+            execution.pending.push_back(admission.task.id.clone());
         } else {
-            state
-                .execution_by_agent
-                .get_mut(&admission.agent.id)
-                .context("queued task lost its active child")?
-                .pending
-                .push_back(admission.task.id.clone());
+            state.pending_launches.push_back(admission.task.id.clone());
         }
         state
             .agent_by_id
@@ -336,7 +419,9 @@ impl AgentAdmission {
         state
             .task_by_id
             .insert(admission.task.id.clone(), admission.task.clone());
-        Ok(AgentCommit::Admitted(admission.committed()))
+        let mut work = admission.committed();
+        work.launch = launch;
+        Ok(AgentCommit::Admitted(work))
     }
 
     pub fn cancel(self) -> Result<()> {
@@ -385,6 +470,8 @@ struct AgentStateStore {
     task_by_id: HashMap<String, AgentTask>,
     admission_by_operation: HashMap<String, Arc<ReservedAgentWork>>,
     execution_by_agent: HashMap<String, ChildExecution>,
+    pending_launches: VecDeque<String>,
+    pending_task_slots: HashMap<String, tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Owns one root's identities, admission capacity, task queues, and cancellation.
@@ -423,12 +510,18 @@ impl AgentCoordinator {
         let (sender, receiver) = mpsc::channel(64);
         let (revision, _) = watch::channel(0);
         let (activity, _) = watch::channel(0);
+        let state = Arc::new(Mutex::new(AgentStateStore::default()));
         Arc::new(Self {
             session_id,
             enabled: AtomicBool::new(false),
-            state: Arc::new(Mutex::new(AgentStateStore::default())),
+            state: state.clone(),
             receiver: Mutex::new(receiver),
-            sender: AgentCommandSender { sender, revision },
+            sender: AgentCommandSender {
+                sender,
+                revision,
+                task_slots: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_TASKS)),
+                state,
+            },
             activity,
             profiles: Mutex::new(None),
         })
@@ -436,6 +529,36 @@ impl AgentCoordinator {
 
     pub fn sender(&self) -> AgentCommandSender {
         self.sender.clone()
+    }
+
+    /// Transfer an intake permit only to durably committed work still awaiting execution.
+    /// Rejected work and active executions release intake capacity immediately. Keep this
+    /// transfer after durable commit even if a later publication or response fails.
+    pub(crate) fn retain_task_admission(
+        &self,
+        operation: &str,
+        admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
+        let Some(admission) = admission else {
+            return;
+        };
+        {
+            let mut state = self.state.lock().expect("agent state poisoned");
+            if let Some(reserved) = state.admission_by_operation.get(operation) {
+                let task = reserved.task.id.clone();
+                if state.task_by_id.contains_key(&task)
+                    && !state
+                        .execution_by_agent
+                        .get(&reserved.agent.id)
+                        .is_some_and(|execution| execution.active_task_id == task)
+                {
+                    state.pending_task_slots.entry(task).or_insert(admission);
+                }
+            }
+        }
+        self.sender
+            .revision
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -582,9 +705,11 @@ impl AgentCoordinator {
                     && !state.task_by_id.contains_key(&admission.task.id)
             })
             .count();
+        let launch = state.execution_by_agent.len() + reservation_count < MAX_ACTIVE_CHILDREN
+            && state.pending_launches.is_empty();
         ensure!(
-            state.execution_by_agent.len() + reservation_count < MAX_ACTIVE_CHILDREN,
-            "this session already has eight active children"
+            pending_task_count(&state) < MAX_PENDING_TASKS || launch,
+            "child task queue already has 1024 pending tasks"
         );
         let mut ordinal = 1;
         let task_name = loop {
@@ -627,7 +752,7 @@ impl AgentCoordinator {
         let admission = Arc::new(ReservedAgentWork {
             agent,
             task,
-            launch: true,
+            launch,
         });
         state
             .admission_by_operation
@@ -675,23 +800,24 @@ impl AgentCoordinator {
             !reserved_active,
             "child has an admission awaiting durable commit"
         );
-        let launch = !state.execution_by_agent.contains_key(&agent.id);
+        let reserved_launches = state
+            .admission_by_operation
+            .values()
+            .filter(|admission| {
+                admission.launch && !state.task_by_id.contains_key(&admission.task.id)
+            })
+            .count();
+        let launch = !state.execution_by_agent.contains_key(&agent.id)
+            && state.execution_by_agent.len() + reserved_launches < MAX_ACTIVE_CHILDREN
+            && state.pending_launches.is_empty();
         if let Some(execution) = state.execution_by_agent.get(&agent.id) {
             ensure!(
                 !*execution.cancellation.borrow(),
                 "child interruption has not settled"
             );
-            let reserved = state
-                .admission_by_operation
-                .values()
-                .filter(|admission| {
-                    admission.agent.id == agent.id
-                        && !state.task_by_id.contains_key(&admission.task.id)
-                })
-                .count();
             ensure!(
-                execution.pending.len() + reserved < MAX_PENDING_TASKS,
-                "child follow-up queue already has 32 pending tasks"
+                pending_task_count(&state) < MAX_PENDING_TASKS,
+                "child task queue already has 1024 pending tasks"
             );
         } else {
             let reserved = state
@@ -702,8 +828,9 @@ impl AgentCoordinator {
                 })
                 .count();
             ensure!(
-                state.execution_by_agent.len() + reserved < MAX_ACTIVE_CHILDREN,
-                "this session already has eight active children"
+                pending_task_count(&state) < MAX_PENDING_TASKS
+                    || state.execution_by_agent.len() + reserved < MAX_ACTIVE_CHILDREN,
+                "child task queue already has 1024 pending tasks"
             );
         }
         let ordinal = state
@@ -798,7 +925,13 @@ impl AgentCoordinator {
     pub(crate) fn target_collected(&self, target: &AgentTarget) -> Result<bool> {
         self.validate_target(target)?;
         let state = self.state.lock().expect("agent state poisoned");
-        Ok(!state.execution_by_agent.contains_key(&target.agent_id))
+        Ok(!state.execution_by_agent.contains_key(&target.agent_id)
+            && !state.pending_launches.iter().any(|id| {
+                state
+                    .task_by_id
+                    .get(id)
+                    .is_some_and(|task| task.agent_id == target.agent_id)
+            }))
     }
 
     pub fn resolve(&self, target: &str) -> Result<Agent> {
@@ -834,14 +967,38 @@ impl AgentCoordinator {
     pub fn interrupt(&self, target: &str) -> Result<Vec<AgentTask>> {
         let mut state = self.state.lock().expect("agent state poisoned");
         let agent = resolve_agent(&state, &self.session_id, target)?.clone();
+        let queued: Vec<_> = state
+            .pending_launches
+            .iter()
+            .filter_map(|id| {
+                state
+                    .task_by_id
+                    .get(id)
+                    .filter(|task| task.agent_id == agent.id)
+                    .cloned()
+            })
+            .collect();
+        let queued_ids: std::collections::HashSet<_> =
+            queued.iter().map(|task| task.id.clone()).collect();
+        state.pending_launches.retain(|id| !queued_ids.contains(id));
+        for id in &queued_ids {
+            state.pending_task_slots.remove(id);
+        }
         let Some(execution) = state.execution_by_agent.get_mut(&agent.id) else {
-            return Ok(Vec::new());
+            return Ok(queued);
         };
         execution.cancellation.send_replace(true);
         let pending: Vec<_> = execution.pending.drain(..).collect();
-        Ok(pending
+        for id in &pending {
+            state.pending_task_slots.remove(id);
+        }
+        Ok(queued
             .into_iter()
-            .filter_map(|id| state.task_by_id.get(&id).cloned())
+            .chain(
+                pending
+                    .into_iter()
+                    .filter_map(|id| state.task_by_id.get(&id).cloned()),
+            )
             .collect())
     }
 
@@ -942,6 +1099,7 @@ impl AgentCoordinator {
         if let Some(next) = next {
             execution.active_task_id = next.clone();
             execution.cleanup_failed = false;
+            state.pending_task_slots.remove(&next);
             let agent = state
                 .agent_by_id
                 .get(agent_id)
@@ -981,6 +1139,79 @@ impl AgentCoordinator {
             .len()
     }
 
+    /// Claim the next queued child for the exchange owner's launch path after a capacity wake.
+    /// Quiescence retains queued work without launching it. Its release wakes the owner, which
+    /// must poll this method again; no worker independently changes the launch lifecycle.
+    pub fn ready_launch(&self) -> Result<Option<AgentWork>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("agent state poisoned"))?;
+        if state.quiescence_count > 0 || state.execution_by_agent.len() >= MAX_ACTIVE_CHILDREN {
+            return Ok(None);
+        }
+        let Some(index) = state.pending_launches.iter().position(|id| {
+            state
+                .task_by_id
+                .get(id)
+                .is_some_and(|task| !state.execution_by_agent.contains_key(&task.agent_id))
+        }) else {
+            return Ok(None);
+        };
+        let task_id = state.pending_launches[index].clone();
+        let task = state
+            .task_by_id
+            .get(&task_id)
+            .context("queued child task missing")?
+            .clone();
+        let agent = state
+            .agent_by_id
+            .get(&task.agent_id)
+            .context("queued child identity missing")?
+            .clone();
+        let (cancellation, _) = watch::channel(false);
+        let mut pending = VecDeque::new();
+        state.pending_launches.remove(index);
+        state.pending_task_slots.remove(&task_id);
+        let followups: Vec<_> = state
+            .pending_launches
+            .iter()
+            .filter(|id| {
+                state
+                    .task_by_id
+                    .get(*id)
+                    .is_some_and(|task| task.agent_id == agent.id)
+            })
+            .cloned()
+            .collect();
+        for id in followups {
+            state.pending_launches.retain(|candidate| candidate != &id);
+            pending.push_back(id);
+        }
+        state.execution_by_agent.insert(
+            agent.id.clone(),
+            ChildExecution {
+                active_task_id: task.id.clone(),
+                pending,
+                cancellation,
+                cleanup_failed: false,
+            },
+        );
+        Ok(Some(AgentWork {
+            execution: AdmittedExecution {
+                owner: ExecutionOwner {
+                    session_id: self.session_id.clone().into(),
+                    agent_id: agent.id.clone().into(),
+                },
+                task: task.id.clone().into(),
+                exchange: task.id.clone().into(),
+            },
+            agent,
+            task,
+            launch: true,
+        }))
+    }
+
     pub fn snapshot(&self, prefix: Option<&str>) -> Vec<(Agent, Option<AgentTask>)> {
         let state = self.state.lock().expect("agent state poisoned");
         let mut result: Vec<_> = state
@@ -1016,6 +1247,23 @@ impl AgentCoordinator {
             .get(id)
             .cloned()
     }
+}
+
+/// Count queued tasks and uncommitted reservations without charging live executions twice.
+fn pending_task_count(state: &AgentStateStore) -> usize {
+    state.pending_launches.len()
+        + state
+            .execution_by_agent
+            .values()
+            .map(|execution| execution.pending.len())
+            .sum::<usize>()
+        + state
+            .admission_by_operation
+            .values()
+            .filter(|admission| {
+                !admission.launch && !state.task_by_id.contains_key(&admission.task.id)
+            })
+            .count()
 }
 
 fn validate_message(message: &str) -> Result<()> {

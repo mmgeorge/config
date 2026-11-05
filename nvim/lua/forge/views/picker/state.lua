@@ -4,6 +4,7 @@ local picker_filter = require("forge.views.picker.filter")
 
 --- Caller-owned pages and optional navigation presentation for one picker.
 ---@class ForgePickerSpec
+---@field on_dispose? fun() Release owned resources on every close, including silent close.
 ---@field owner? string Identity used to isolate resumed state.
 ---@field page_list ForgePickerPage[] Pages in display order.
 ---@field page_navigation? "tabs" Optional horizontal category navigation.

@@ -8,6 +8,7 @@
 --- the buffer the autocmd state machine (views/status/state.lua) last made current.
 ---@class ForgeSession
 local M = {}
+local harness_selection = 0
 
 --- The active status state — the buffer the current render, navigation, and action code
 --- operate on. Swapped on BufEnter by the status state machine.
@@ -66,11 +67,9 @@ M.empty_diff_rows = {}
 ---@field presentation? HarnessPresentation
 ---@field client table?
 ---@field ready boolean
----@field busy boolean
 ---@field switching_provider? boolean
----@field state_sync_pending? boolean
+---@field state_sync_pending? table Identity of the one active snapshot read.
 ---@field aborting_plan? boolean
----@field cancel_requested boolean
 ---@field session table?
 ---@field access_preference? ForgeDirectoryPolicy Saved choices before provider capability limits.
 ---@field questions? ForgeQuestionView
@@ -93,28 +92,23 @@ M.empty_diff_rows = {}
 ---@field render_fold_signature? string
 ---@field queue (string|ForgeQueuedPrompt)[]
 ---@field input? ForgeInputViewState
----@field execution_busy? boolean
----@field request_busy? boolean
+---@field activity? {revision: integer, phase: 'idle'|'working'|'unavailable'}
 ---@field status_thoughts? boolean
 ---@field ask_model? ForgeAskModel
 ---@field subagent_tools? boolean
 ---@field lsp_tools? boolean
 ---@field session_tools? boolean
----@field task_config? table
 ---@field check_editing? boolean
 ---@field check_timing? 'after_queue'|'between_work'
 ---@field automatic_checks? boolean
 ---@field check_settings_request? integer
 ---@field checks_deferred? boolean
----@field configuring? boolean
 ---@field initial_snapshot_pending? boolean Suppresses stale session presentation until startup synchronization.
 ---@field startup_trace? ForgeHarnessStartupTrace
----@field configuring_config? table
 ---@field configuration_revision? integer
 ---@field configuration_error? string
 ---@field pending_steer table[]
 ---@field pending_submit table[]
----@field execution_request_owner? table Opaque owner of the current execution callback.
 ---@field question_draft? {owner_id?:string, question_set_id:string, question_id:string, text:string} Rejected clarification retained for retry.
 ---@field transcript_buf integer?
 ---@field transcript_win integer?
@@ -160,8 +154,6 @@ M.empty_diff_rows = {}
 local function new_harness_state()
   return {
   ready = false,
-  busy = false,
-  cancel_requested = false,
   mode_restart_requested = false,
   session = nil,
   capability = {},
@@ -222,7 +214,20 @@ function M.new_harness_state() return new_harness_state() end
 
 --- Sets the active Harness presentation state used by the current window or tab.
 ---@param state ForgeHarnessPresentationState Target presentation state.
-function M.activate_harness(state) M.harness = state end
+function M.activate_harness(state)
+  M.harness = state
+end
+
+--- Select the user-visible session independently of temporary callback/rendering scopes.
+---@param state ForgeHarnessPresentationState
+function M.select_harness(state)
+  M.harness = state
+  harness_selection = harness_selection + 1
+end
+
+--- Get the generation of the last intentional session selection.
+---@return integer
+function M.harness_selection() return harness_selection end
 
 --- Registers a Harness presentation state record keyed by durable session ID.
 ---@param session_id string Unique session identifier.

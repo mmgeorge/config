@@ -88,6 +88,10 @@ pub(super) fn capture(
 ) -> Result<ReconnectSnapshot, ReconnectError> {
     let lease = services.publications.begin_reconciliation()?;
     let snapshot = broker.snapshot().map_err(ReconnectError::Snapshot)?;
+    let input = services
+        .input
+        .snapshot()
+        .map_err(ReconnectError::Snapshot)?;
     let page = services.publications.snapshot(cursor, limit)?;
     let high_water = page.high_water();
     let (records, receipt) = page.into_parts();
@@ -96,12 +100,16 @@ pub(super) fn capture(
         .iter()
         .map(|record| {
             serde_json::json!({
-                "sequence": record.sequence(), "event": record.event(), "delivery": record.state(),
+                "sequence": record.sequence(), "event": record.delivery_event(), "delivery": record.state(),
             })
         })
         .collect();
     let mut response =
         serde_json::to_value(snapshot).map_err(|error| ReconnectError::Snapshot(error.into()))?;
+    // Reconciliation may acknowledge input deltas carried only in this snapshot response.
+    // Include their authoritative queue state before that page can be confirmed.
+    response["input"] =
+        serde_json::to_value(input).map_err(|error| ReconnectError::Snapshot(error.into()))?;
     response["owner_publication"] = serde_json::json!({
         "receipt_id": uuid::Uuid::new_v4().to_string(),
         "after": cursor, "through": through, "high_water": high_water,

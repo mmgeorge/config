@@ -217,7 +217,7 @@ impl HarnessBroker {
                     let engine = transaction.engine.clone();
                     let scope = transaction.state.scope.clone();
                     let settlement = transaction.settlement.clone();
-                    transaction.native.restart(async move {
+                    transaction.native.restart_observation(async move {
                         let refreshed = engine.wait_ready(scope).await?;
                         settlement.set_batches(refreshed.batches)?;
                         checkout.replace(refreshed.ticket);
@@ -367,10 +367,8 @@ impl HarnessBroker {
                     self.prepare_provider_delivery(applied)?,
                 )))
             }
-            ForegroundSignal::Cleanup(ExecutionCleanup::Idle | ExecutionCleanup::Pending) => {
-                Ok(ForegroundAction::Wait)
-            }
             ForegroundSignal::CollectionStarted(disposition) => {
+                admission.begin_owner_collection(disposition)?;
                 transaction.collection = Some(disposition);
                 if let Some(finalization) = transaction.finalization.as_mut() {
                     finalization.set_collection(disposition);
@@ -378,6 +376,7 @@ impl HarnessBroker {
                 Ok(ForegroundAction::Wait)
             }
             ForegroundSignal::CollectionCompleted(disposition) => {
+                admission.complete_owner_collection(disposition)?;
                 transaction.collection = Some(disposition);
                 if let Some(finalization) = transaction.finalization.as_mut() {
                     finalization.set_collection(disposition);
@@ -392,11 +391,6 @@ impl HarnessBroker {
                 self.collect_foreground_observations(transaction)?;
                 Ok(ForegroundAction::Wait)
             }
-            #[cfg(test)]
-            ForegroundSignal::Cleanup(ExecutionCleanup::Failed(message)) => self.fail_foreground(
-                transaction,
-                anyhow::anyhow!("execution cleanup failed: {message}"),
-            ),
             ForegroundSignal::SessionObservationsReady
                 if transaction.observation_publication_in_flight =>
             {

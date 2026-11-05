@@ -28,6 +28,27 @@ struct StartupProvider {
 
 #[async_trait::async_trait]
 impl Provider for StartupProvider {
+    async fn model_list(
+        &self,
+        context: forge_provider_api::OperationContext,
+        _: forge_provider_api::QueryContext,
+    ) -> std::result::Result<Vec<forge_provider_api::ProviderModel>, ProviderError> {
+        context.check_admission(ProviderOperation::ModelList)?;
+        Ok(vec![forge_provider_api::ProviderModel {
+            id: "fixture-model".into(),
+            service_tiers: vec![forge_provider_api::ServiceTier::Ultrafast],
+            reasoning: vec!["high".into()],
+            default_reasoning: Some("high".into()),
+            selected_reasoning: None,
+            context_window: Vec::new(),
+            default_context_window: None,
+            selected_context_window: None,
+            vision: false,
+            description: None,
+            is_default: true,
+        }])
+    }
+
     async fn session_open(
         &self,
         context: forge_provider_api::OperationContext,
@@ -198,6 +219,80 @@ fn startup_failure(operation: ProviderOperation, kind: ProviderFailureKind) -> P
     ProviderError::Failure(ProviderFailure::new(operation, kind))
 }
 
+/// Discard an inherited context override before any native session or prompt can consume it.
+#[tokio::test]
+async fn saved_context_is_resolved_before_native_startup() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let initialize: InitializeRequest = serde_json::from_value(json!({
+        "workspace":fixture.path(), "data_root":fixture.path().join("data"),
+        "client_id":"saved-context", "provider":{"kind":"mock","command":[]},
+    }))?;
+    let broker = HarnessBroker::initialize(initialize.clone())?;
+    let workspace = broker.snapshot()?.session.workspace;
+    drop(broker);
+    let mut store = SqliteStore::open(&fixture.path().join("data"))?;
+    let mut preference = store.load_preference(&workspace, "mock")?.unwrap();
+    preference.model = "fixture-model".into();
+    preference.effort = "high".into();
+    preference.service_tier = forge_provider_api::ServiceTier::Ultrafast;
+    preference.model_setting.insert(
+        "fixture-model".into(),
+        crate::session::ModelSetting {
+            reasoning: Some("high".into()),
+            context_window: Some("default".into()),
+        },
+    );
+    store.save_preference(&workspace, "mock", &preference)?;
+    drop(store);
+    let mut initialize = initialize;
+    initialize.new_session_name = Some("fresh".into());
+    let mut broker = HarnessBroker::initialize(initialize)?;
+    assert_eq!(
+        broker.snapshot()?.session.context_window.as_deref(),
+        Some("default")
+    );
+    let provider = Arc::new(StartupProvider::new(false, 1));
+    let native =
+        ProviderTestSession::from_registered(forge_providers::registry::RegisteredProvider::new(
+            provider.descriptor(),
+            provider.clone(),
+            None,
+        ))?;
+    broker.set_provider_for_test(native.provider_handle());
+    let controller = SessionController::new(broker).await?;
+    let session = controller.observer.snapshot()?.session;
+    assert!(session.context_window.is_none());
+    assert_eq!(session.effort, "high");
+    assert_eq!(
+        session.service_tier,
+        forge_provider_api::ServiceTier::Ultrafast
+    );
+    assert_eq!(provider.calls.load(Ordering::Acquire), 0);
+    let request = controller
+        .broker
+        .lock()
+        .await
+        .initialization_request()?
+        .unwrap();
+    assert!(request.context_window.is_none());
+    let (sink, _output) = forge_protocol::outbound::channel();
+    controller.start_provider(&sink).await;
+    controller
+        .provider_startup
+        .lock()
+        .await
+        .take()
+        .unwrap()
+        .await?;
+    {
+        let opened = provider.request.lock().unwrap();
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].configuration.model.context_window.is_none());
+    }
+    controller.finish_exchange_owner().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn provider_startup_is_nonblocking_persists_ready_identity_and_reports_failure() -> Result<()>
 {
@@ -208,7 +303,7 @@ async fn provider_startup_is_nonblocking_persists_ready_identity_and_reports_fai
             "client_id":"startup-fixture", "provider":{"kind":"mock","command":[]},
         }))?;
         let broker = HarnessBroker::initialize(initialize)?;
-        let controller = SessionController::new(broker)?;
+        let controller = SessionController::new(broker).await?;
         let provider = Arc::new(StartupProvider::new(fail, 0));
         let provider_fixture = ProviderTestSession::from_registered(
             forge_providers::registry::RegisteredProvider::new(
@@ -263,8 +358,29 @@ async fn provider_startup_is_nonblocking_persists_ready_identity_and_reports_fai
             );
             continue;
         }
-        let frame = output.recv().await?.unwrap();
-        let event: Value = serde_json::from_slice(frame.bytes())?;
+        let expected_event = if fail {
+            "provider_event"
+        } else {
+            "session_configured"
+        };
+        let mut observed = Vec::new();
+        let event = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = output.recv().await?.context("startup output closed")?;
+                let event: Value = serde_json::from_slice(frame.bytes())?;
+                observed.push(event.clone());
+                if event["event"] == expected_event {
+                    return Ok::<_, anyhow::Error>(event);
+                }
+            }
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "startup event was not observed: {observed:?}; failure={:?}",
+                controller.provider_startup_error.lock().unwrap()
+            )
+        })??;
         if fail {
             assert_eq!(event["event"], "provider_event");
             assert!(event["payload"]["text"].as_str().is_some());
@@ -336,7 +452,7 @@ async fn provider_startup_recovers_only_missing_empty_sessions() -> Result<()> {
         }
         drop(store);
         let broker = HarnessBroker::initialize(serde_json::from_value(parameters)?)?;
-        let controller = SessionController::new(broker)?;
+        let controller = SessionController::new(broker).await?;
         let provider = Arc::new(StartupProvider::new(false, 2));
         let provider_fixture = ProviderTestSession::from_registered(
             forge_providers::registry::RegisteredProvider::new(
@@ -422,7 +538,7 @@ async fn rename_without_exchanges_is_local_and_survives_provider_replacement() -
         "client_id":"rename-fixture", "provider":{"kind":"mock","command":[]},
     });
     let broker = HarnessBroker::initialize(serde_json::from_value(parameters.clone())?)?;
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     let provider = Arc::new(StartupProvider::new(false, 0));
     let provider_fixture =
         ProviderTestSession::from_registered(forge_providers::registry::RegisteredProvider::new(
@@ -473,6 +589,7 @@ async fn rename_without_exchanges_is_local_and_survives_provider_replacement() -
             .list_exchange(&session_id)?
             .is_empty()
     );
+    controller.finish_exchange_owner().await?;
     drop(controller);
     let reopened = HarnessBroker::initialize(serde_json::from_value(parameters)?)?;
     let snapshot = reopened.snapshot()?;

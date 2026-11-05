@@ -649,6 +649,10 @@ pub enum ProviderFeature {
     EffortSelection,
     /// Explicit provider-default reasoning selection.
     ReasoningDefaultReset,
+    /// Native operating-system sandbox enforcement.
+    OsSandbox,
+    /// An explicitly selected native isolation mode.
+    IsolationMode,
     /// Normalized context-window tier selection.
     ContextWindowSelection,
     /// Normalized service-tier selection.

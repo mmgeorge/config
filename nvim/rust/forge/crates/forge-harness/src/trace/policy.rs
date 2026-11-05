@@ -15,12 +15,16 @@ pub(super) fn metadata_payload(payload: &Value) -> Value {
         return Value::Null;
     };
     let mut metadata = serde_json::Map::new();
-    for (key, value) in object.iter().take(32) {
+    for (key, value) in object.iter() {
         if !diagnostic_field(key) {
             continue;
         }
         let value = match value {
-            Value::String(text) => Value::String(bounded_text(text).to_owned()),
+            Value::String(text) => Value::String(if key.ends_with("_id") {
+                text.clone()
+            } else {
+                bounded_text(text).to_owned()
+            }),
             Value::Bool(_) | Value::Number(_) | Value::Null => value.clone(),
             _ => continue,
         };
@@ -47,16 +51,23 @@ fn diagnostic_field(key: &str) -> bool {
             | "publication_sequence"
             | "delivery"
             | "observed"
+            | "entry_accepted"
             | "error_code"
             | "outcome"
             | "operation"
             | "operation_id"
             | "message_id"
             | "submission_id"
+            | "invocation_id"
+            | "attempt_id"
+            | "event_sequence"
+            | "consumed_sequence"
+            | "response_id"
+            | "native_sequence"
             | "binding_id"
-            | "failure"
             | "kind"
             | "event"
+            | "signal"
             | "busy_ms"
             | "poll_count"
             | "from_state"
@@ -129,39 +140,4 @@ fn inspection_metadata(value: &Value) -> serde_json::Map<String, Value> {
         .filter(|(key, value)| diagnostic_field(key) && !value.is_object() && !value.is_array())
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
-}
-
-/// Redact credentials recursively before retaining private detailed diagnostics.
-pub(super) fn redact(value: &Value) -> Value {
-    match value {
-        Value::Object(object) => Value::Object(
-            object
-                .iter()
-                .map(|(key, value)| {
-                    let secret = matches!(
-                        key.to_ascii_lowercase().as_str(),
-                        "authorization"
-                            | "api_key"
-                            | "apikey"
-                            | "access_token"
-                            | "refresh_token"
-                            | "password"
-                            | "secret"
-                            | "mcp_servers"
-                            | "mcpservers"
-                    );
-                    (
-                        key.clone(),
-                        if secret {
-                            Value::String("[redacted]".into())
-                        } else {
-                            redact(value)
-                        },
-                    )
-                })
-                .collect(),
-        ),
-        Value::Array(array) => Value::Array(array.iter().map(redact).collect()),
-        _ => value.clone(),
-    }
 }

@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::writer::{Admission, TraceError, TraceResult, TraceWriter, session_path};
+use super::writer::{
+    Admission, TraceAdmission, TraceError, TraceResult, TraceWriter, session_path,
+};
 
 static WRITERS: OnceLock<Mutex<HashMap<PathBuf, Weak<TraceWriter>>>> = OnceLock::new();
 
@@ -16,6 +18,8 @@ pub struct TraceStatus {
     pub enabled: bool,
     pub path: String,
     pub configured: bool,
+    /// Count rejected optional diagnostics independently of execution outcomes.
+    pub rejected_record_count: u64,
 }
 
 /// Own one tracing lease while a bounded shared writer retains diagnostic files.
@@ -67,6 +71,7 @@ impl TraceStore {
                 .to_string_lossy()
                 .into_owned(),
             configured: self.writer.configured(),
+            rejected_record_count: self.writer.rejected_record_count(),
         }
     }
 
@@ -111,17 +116,17 @@ impl TraceStore {
     }
 
     /// Enqueue bounded owned diagnostics without waiting for filesystem operations.
-    pub fn record(&self, session_id: &str, event: &str, payload: Value) {
-        self.record_ref(session_id, event, &payload);
+    pub fn record(&self, session_id: &str, event: &str, payload: Value) -> TraceAdmission {
+        self.record_ref(session_id, event, &payload)
     }
 
     /// Capture bounded borrowed input and receipt time without filesystem operations.
-    pub fn record_ref(&self, session_id: &str, event: &str, payload: &Value) {
+    pub fn record_ref(&self, session_id: &str, event: &str, payload: &Value) -> TraceAdmission {
         if self.admission.is_closed() {
-            return;
+            return TraceAdmission::Closed;
         }
         self.writer
-            .record(&self.admission, session_id, event, payload);
+            .record(&self.admission, session_id, event, payload)
     }
 
     /// Finish preceding accepted writes and loss summaries before reading a snapshot.

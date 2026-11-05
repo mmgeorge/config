@@ -11,12 +11,7 @@ use futures_util::{
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::Duration,
 };
-
-const GENERATION_DEADLINE: Duration = Duration::from_secs(120);
-const MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-const MAX_MESSAGE_COUNT: usize = 1024;
 
 type Collection = Shared<BoxFuture<'static, Result<(), ProviderError>>>;
 
@@ -268,12 +263,10 @@ async fn generate(
     cancellation: api::OperationCancellation,
 ) -> Result<String, ProviderError> {
     // Resolve the model before opening temporary history.
-    let deadline = tokio::time::Instant::now() + GENERATION_DEADLINE;
     let catalog_operation = OperationControl::fresh(ProviderOperation::ModelList)?;
     let models = observe_operation(
         &catalog_operation,
         &cancellation,
-        deadline,
         api::ProviderPhase::Observation,
         api::FailureDisposition::Unchanged,
         provider.model_list(
@@ -325,7 +318,6 @@ async fn generate(
     let opened = observe_operation(
         &open_operation,
         &cancellation,
-        deadline,
         api::ProviderPhase::Preparation,
         api::FailureDisposition::Uncertain,
         provider.session_open(
@@ -399,7 +391,6 @@ async fn generate(
     let result = observe_operation(
         &submit_operation,
         &cancellation,
-        deadline,
         api::ProviderPhase::Observation,
         api::FailureDisposition::Uncertain,
         async {
@@ -421,7 +412,7 @@ async fn generate(
         submit_operation.cancel();
     }
 
-    // Closing revokes callbacks and collects even after validation or deadline failure.
+    // Closing revokes callbacks and collects even after validation or explicit cancellation.
     let close_operation = OperationControl::fresh(ProviderOperation::SessionClose)?;
     let closed = close(provider.as_ref(), &close_operation, &binding, &mut events).await;
     match (result, closed) {
@@ -434,26 +425,24 @@ async fn generate(
     }
 }
 
-/// Request explicit native interruption on the operation deadline or utility shutdown.
+/// Observe the operation policy and explicit utility shutdown without imposing a generation deadline.
 async fn observe_operation<T>(
     control: &OperationControl,
     cancellation: &api::OperationCancellation,
-    deadline: tokio::time::Instant,
     phase: api::ProviderPhase,
     disposition: api::FailureDisposition,
     work: impl std::future::Future<Output = Result<T, ProviderError>>,
 ) -> Result<T, ProviderError> {
     let context = control.context();
-    let deadline = deadline.min(context.deadline());
     tokio::select! {
         result = work => result,
         _ = cancellation.cancelled() => {
             control.cancel();
             Err(api::OperationInterruption::Cancelled.failure(control.operation(), phase, disposition))
         }
-        _ = tokio::time::sleep_until(deadline) => {
+        interruption = context.interrupted() => {
             control.cancel();
-            Err(api::OperationInterruption::DeadlineElapsed.failure(control.operation(), phase, disposition))
+            Err(interruption.failure(control.operation(), phase, disposition))
         }
     }
 }
@@ -542,15 +531,6 @@ async fn collect(
                     }
                     api::MessageUpdate::Interrupted => {}
                 }
-                if messages.len() > MAX_MESSAGE_COUNT
-                    || messages.values().map(|(_, text)| text.len()).sum::<usize>()
-                        > MAX_OUTPUT_BYTES
-                {
-                    return Err(failure(
-                        ProviderOperation::InputSubmit,
-                        ProviderFailureKind::Rejected,
-                    ));
-                }
             }
             api::ProviderEvent::Execution { observation } => {
                 if observation.scope() != scope {
@@ -622,7 +602,8 @@ async fn collect(
                     ProviderFailureKind::Policy,
                 ));
             }
-            api::ProviderEvent::CapabilitiesChanged { .. }
+            api::ProviderEvent::Terminals { .. }
+            | api::ProviderEvent::CapabilitiesChanged { .. }
             | api::ProviderEvent::SessionIdentity { .. }
             | api::ProviderEvent::Turn { .. }
             | api::ProviderEvent::Usage { .. }
@@ -653,6 +634,7 @@ mod tests {
     use super::*;
     use crate::provider::test_support::EventFixtureProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     struct Trace;
     impl api::trace::ProviderTrace for Trace {
@@ -816,10 +798,9 @@ mod tests {
         Ok(())
     }
 
-    /// Bound utility work and collect the exact temporary invocation when its deadline expires.
+    /// Keep utility work alive beyond the former implicit deadline until explicit shutdown.
     #[tokio::test(start_paused = true)]
-    async fn generation_deadline_closes_temporary_history_without_validating_output()
-    -> anyhow::Result<()> {
+    async fn generation_remains_active_until_explicit_shutdown() -> anyhow::Result<()> {
         let entered = Arc::new(tokio::sync::Notify::new());
         let entered_worker = entered.clone();
         let descriptor = forge_providers::registry::descriptor(
@@ -852,12 +833,14 @@ mod tests {
         let waiter =
             tokio::spawn(async move { running.generate(native, Arc::new(Trace), input).await });
         entered.notified().await;
-        tokio::time::advance(GENERATION_DEADLINE).await;
+        tokio::time::advance(Duration::from_secs(121)).await;
+        assert!(!waiter.is_finished());
+        assert_eq!(closed.load(Ordering::Acquire), 0);
+        jobs.shutdown().await?;
         let error = waiter.await?.unwrap_err();
         assert!(
-            matches!(error, ProviderError::Failure(problem) if problem.kind() == ProviderFailureKind::Timeout)
+            matches!(error, ProviderError::Failure(problem) if problem.kind() == ProviderFailureKind::Cancelled)
         );
-        jobs.shutdown().await?;
         assert_eq!(validated.load(Ordering::Acquire), 0);
         assert_eq!(closed.load(Ordering::Acquire), 1);
         Ok(())
@@ -909,10 +892,10 @@ mod tests {
         Ok(())
     }
 
-    /// Reject excess response content while continuing to drain and collect its temporary history.
+    /// Preserve large response content and message collections through host validation and cleanup.
     #[tokio::test]
-    async fn output_limit_collects_temporary_history_without_host_validation() -> anyhow::Result<()>
-    {
+    async fn large_output_and_many_messages_validate_and_collect_temporary_history()
+    -> anyhow::Result<()> {
         let descriptor = forge_providers::registry::descriptor(
             &forge_providers::registry::nonselectable_id().expect("fixture identity"),
         )?;
@@ -926,9 +909,19 @@ mod tests {
                 &address,
                 "oversized",
                 Some(api::MessageRole::Response),
-                "x".repeat(MAX_OUTPUT_BYTES + 1),
+                "x".repeat(1024 * 1024 + 1),
             ) {
                 sink.send_wait(event).await?;
+            }
+            for index in 0..1025 {
+                for event in crate::provider::test_support::message(
+                    &address,
+                    format!("extra-{index}"),
+                    Some(api::MessageRole::Response),
+                    "extra",
+                ) {
+                    sink.send_wait(event).await?;
+                }
             }
             finish(&request, &sink, false).await
         })
@@ -944,15 +937,14 @@ mod tests {
         });
         let validated = Arc::new(AtomicUsize::new(0));
         let jobs = TextGenerationJobs::default();
-        let error = jobs
+        let text = jobs
             .generate(native, Arc::new(Trace), request(validated.clone(), false))
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, ProviderError::Failure(problem) if problem.kind() == ProviderFailureKind::Rejected)
-        );
+            .await?;
+        assert!(text.starts_with(&"x".repeat(1024 * 1024 + 1)));
+        assert_eq!(text.matches("extra").count(), 1025);
+        assert!(text.ends_with("final text"));
         jobs.shutdown().await?;
-        assert_eq!(validated.load(Ordering::Acquire), 0);
+        assert_eq!(validated.load(Ordering::Acquire), 1);
         assert_eq!(closed.load(Ordering::Acquire), 1);
         Ok(())
     }

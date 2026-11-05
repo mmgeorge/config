@@ -89,7 +89,7 @@ end
 
 ---@param options {host: table, session_id: string}
 function M.open(options)
-  if session.harness.busy or session.harness.configuring then
+  if require("forge.views.harness.activity").busy(session.harness) then
     notifications.warn("Finish active work before provider setup", "Provider setup")
     return
   end
@@ -144,11 +144,9 @@ function M.open(options)
         local method = option.value
         if not method then return false end
         busy, failure, phase = true, nil, "Complete sign-in in the browser or terminal..."
-        session.harness.configuring = true
         require("forge.views.harness.controller").render()
         local function finished(success)
           if not current() then return end
-          session.harness.configuring = false
           require("forge.views.harness.controller").render()
           busy = false
           if success then
@@ -176,13 +174,11 @@ function M.open(options)
     generation = generation + 1
     local requested = generation
     busy, failure, phase = true, nil, "Loading provider setup..."
-    session.harness.configuring = true
     require("forge.views.harness.controller").render()
     if picker.is_open(owner) then picker.update(spec()) else picker.open(spec()) end
     client.request({ session_id = options.session_id, method = "session.provider.setup", params = {} }, function(result, error)
       if requested ~= generation or not current() then return end
       busy, failure = false, error
-      session.harness.configuring = false
       require("forge.views.harness.controller").render()
       if error then notifications.error(error, "Provider setup") else setup = result end
       if picker.is_open(owner) then picker.update(spec()) end

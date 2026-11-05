@@ -136,8 +136,7 @@ impl HarnessBroker {
                 super::AppliedProviderEvent::Timeline(thought_patch),
                 super::AppliedProviderEvent::Update(
                     super::publication::SessionUpdate::Configuration {
-                        session: Box::new(self.session_view()?),
-                        access_abbreviation: self.session.access.abbreviation().into(),
+                        snapshot: Box::new(self.snapshot()?),
                         operation_id: command.map(|command| command.as_str().to_owned()),
                         catalog: Box::new(self.provider_catalog_request()?),
                     },
@@ -223,10 +222,7 @@ impl HarnessBroker {
                 crate::task::TaskChange::Pause,
                 self.clock.now_ms(),
             )?;
-            events.push(self.event(
-                "session_changed",
-                serde_json::to_value(self.session_view()?)?,
-            )?);
+            events.push(self.event("session_changed", json!({"snapshot":self.snapshot()?}))?);
         }
         let Some(target) = target else {
             return Ok((None, events));
@@ -382,7 +378,10 @@ mod tests {
             .iter()
             .find(|event| event.event == "session_changed")
             .context("cancellation did not publish its paused task")?;
-        assert_eq!(event.payload["active_task"]["status"], "paused");
+        assert_eq!(
+            event.payload["snapshot"]["session"]["active_task"]["status"],
+            "paused"
+        );
         assert!(matches!(
             broker.owner_cancellation_outcome(None)?,
             CancellationOutcome::NoWork

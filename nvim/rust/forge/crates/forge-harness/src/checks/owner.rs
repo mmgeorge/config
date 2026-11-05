@@ -4,10 +4,7 @@ use super::{CheckRun, CheckSupervisor, PreparedCheckRun, RunRequest};
 use crate::{broker::publication::SessionUpdateSink, provider::InvocationScope};
 use forge_provider_api::control::ToolCallId;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 
 const CAPACITY: usize = forge_protocol::MAX_PENDING_FRAMES;
@@ -42,7 +39,7 @@ pub(crate) struct ToolCheckRequest {
     pub(crate) request: RunRequest,
     pub(crate) run: PreparedCheckRun,
     pub(crate) sink: Option<SessionUpdateSink>,
-    pub(crate) cancelled: Arc<AtomicBool>,
+    pub(crate) cancelled: tokio::sync::watch::Receiver<bool>,
     pub(crate) reply: oneshot::Sender<Result<String, CheckOwnerFailure>>,
 }
 
@@ -89,7 +86,7 @@ impl CheckOwnerSender {
         request: RunRequest,
         run: PreparedCheckRun,
         sink: Option<SessionUpdateSink>,
-        cancelled: Arc<AtomicBool>,
+        cancelled: tokio::sync::watch::Receiver<bool>,
     ) -> Result<String, CheckOwnerFailure> {
         let (reply, receiver) = oneshot::channel();
         self.send(CheckOwnerEvent::StartTool(Box::new(ToolCheckRequest {
@@ -248,7 +245,7 @@ impl CheckOwnerRuns {
             let _ = reply.send(Err(CheckOwnerFailure::Unavailable));
             return Ok(());
         }
-        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        if *cancelled.borrow() {
             let _ = reply.send(Err(CheckOwnerFailure::StaleScope));
             return Ok(());
         }

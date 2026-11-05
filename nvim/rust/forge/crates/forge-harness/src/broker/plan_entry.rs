@@ -43,22 +43,6 @@ impl HarnessBroker {
         command: crate::task::command::SessionCommand,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         let payload = command.action.to_params()?;
-        if let Some(previous) = self
-            .store
-            .load_task_operation(&self.session.id, &command.operation_id)?
-        {
-            anyhow::ensure!(
-                previous.action == payload,
-                "operation ID was reused for a different action"
-            );
-            let response = match command.response {
-                crate::task::command::CommandResponse::Snapshot => {
-                    serde_json::to_value(self.snapshot()?)?
-                }
-                crate::task::command::CommandResponse::Receipt => previous.view(),
-            };
-            return Ok((response, Vec::new()));
-        }
         let current = self.task_controller.current()?;
         let now_ms = self.clock.now_ms();
         let prepared = self.observer.prepare_task_change(
@@ -72,20 +56,8 @@ impl HarnessBroker {
         let event_name = command
             .action
             .event_name(lifecycle.as_ref().map(|record| record.kind));
-        let receipt = crate::task::TaskOperation {
-            revision: 0,
-            id: command.operation_id,
-            session_id: self.session.id.clone(),
-            action: payload,
-            permission_selection: None,
-            state: "completed".into(),
-            error: None,
-            exchange_id: None,
-            created_at_ms: now_ms,
-        };
-        self.task_controller.command_with_effects(
+        self.task_controller.change_with_effects(
             &mut self.store,
-            &receipt,
             current.as_ref().map(|task| &task.revision),
             prepared.change,
             prepared.effects,
@@ -100,11 +72,9 @@ impl HarnessBroker {
             .collect();
         let response = match command.response {
             crate::task::command::CommandResponse::Snapshot => snapshot,
-            crate::task::command::CommandResponse::Receipt => self
-                .store
-                .load_task_operation(&self.session.id, &receipt.id)?
-                .context("task receipt is missing")?
-                .view(),
+            crate::task::command::CommandResponse::Receipt => json!({
+                "id":command.operation_id,"state":"completed","action":payload.get("action")
+            }),
         };
         Ok((response, events))
     }
@@ -639,7 +609,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_acceptance_replay_preserves_replacement_without_provider_execution()
+    async fn uncoordinated_acceptance_preserves_replacement_without_provider_execution()
     -> Result<()> {
         let workspace = super::super::test::repository();
         let data = tempfile::tempdir()?;
@@ -658,18 +628,6 @@ mod tests {
                 1,
             )?
             .unwrap();
-        let receipt = crate::task::TaskOperation {
-            revision: 1,
-            id: "accepted-review".into(),
-            session_id: broker.session.id.clone(),
-            action: json!({"action":"complete_acceptance","plan_id":"earlier-plan","digest":"earlier-digest"}),
-            permission_selection: None,
-            state: "completed".into(),
-            error: None,
-            exchange_id: None,
-            created_at_ms: 1,
-        };
-        broker.store.admit_task_operation(&receipt)?;
         let before = broker.store.list_exchange(&broker.session.id)?.len();
         let result = broker
             .dispatch(Request {
@@ -679,7 +637,7 @@ mod tests {
             })
             .await;
         assert!(
-            result.response.error().is_none(),
+            result.response.error().is_some(),
             "{:?}",
             result.response.error()
         );

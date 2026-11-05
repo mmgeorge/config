@@ -48,10 +48,10 @@ pub struct BackgroundResult {
 /// Retain the native owner and its observer between tool-free generation requests.
 struct RetainedBackground {
     runtime: Arc<BrokerRuntime>,
-    cache_key: String,
     session_id: String,
     observer: Arc<crate::provider::session_execution::SessionObservationInbox>,
     leased: AtomicBool,
+    last_used: std::sync::Mutex<std::time::Instant>,
 }
 
 struct BackgroundLease {
@@ -76,6 +76,11 @@ impl BackgroundLease {
 
 impl Drop for BackgroundLease {
     fn drop(&mut self) {
+        *self
+            .retained
+            .last_used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
         self.retained.leased.store(false, Ordering::Release);
     }
 }
@@ -88,6 +93,8 @@ pub struct BackgroundManager {
     admission: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     tasks: Mutex<JoinSet<()>>,
     runtime_admission: Semaphore,
+    preparation: Mutex<()>,
+    shutdown: super::CancellationToken,
     retained: Mutex<HashMap<String, Arc<RetainedBackground>>>,
     cleanup_pending: std::sync::Mutex<Vec<Arc<RetainedBackground>>>,
     presentation:
@@ -108,6 +115,8 @@ impl BackgroundManager {
             admission: Mutex::new(HashMap::new()),
             tasks: Mutex::new(JoinSet::new()),
             runtime_admission: Semaphore::new(4),
+            preparation: Mutex::new(()),
+            shutdown: super::CancellationToken::new(),
             retained: Mutex::new(HashMap::new()),
             cleanup_pending: std::sync::Mutex::new(Vec::new()),
             presentation: Mutex::new(HashMap::new()),
@@ -122,6 +131,10 @@ impl BackgroundManager {
         let (sender, receiver) = oneshot::channel();
         let owner = Arc::clone(self);
         let mut tasks = self.tasks.lock().await;
+        ensure!(
+            !self.shutdown.is_cancelled(),
+            "Background manager is shutting down"
+        );
         while tasks.try_join_next().is_some() {}
         tasks.spawn(async move {
             owner.run(request, sender).await;
@@ -164,10 +177,14 @@ impl BackgroundManager {
                 let _ = sender.send(Err(anyhow::anyhow!("Background generation cancelled")));
                 return;
             }
+            _ = self.shutdown.cancelled() => {
+                let _ = sender.send(Err(anyhow::anyhow!("Background generation cancelled")));
+                return;
+            }
             admitted = admitted => admitted,
         };
         let prepared = self.prepare(&request, &key).await;
-        let (mut broker, runtime, _ownership) = match prepared {
+        let (mut broker, runtime, _ownership, model) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 let _ = sender.send(Err(error));
@@ -224,28 +241,25 @@ impl BackgroundManager {
                 .reason,
         };
         let cancellation = broker.turn_cancellation();
-        let deadline_cancellation = Arc::clone(&cancellation);
-        let timeout = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(120)).await;
-            deadline_cancellation.request(false);
-        });
         let input = request.purpose.background_input(&request.input);
         let result = {
-            let generation =
-                broker.generate_background(input, identity, request.config, policy, sink);
+            let generation = broker.generate_background(input, identity, model, policy, sink);
             tokio::pin!(generation);
             tokio::select! {
                 biased;
                 _ = request.cancellation.cancelled() => {
-                    cancellation.request(false);
+                    cancellation.request();
+                    let _ = generation.await;
+                    Err(anyhow::anyhow!("Background generation cancelled"))
+                }
+                _ = self.shutdown.cancelled() => {
+                    cancellation.request();
                     let _ = generation.await;
                     Err(anyhow::anyhow!("Background generation cancelled"))
                 }
                 result = &mut generation => result.and_then(|text| request.purpose.validate(&text)),
             }
         };
-        timeout.abort();
-        let _ = timeout.await;
         let forwarded = forward
             .await
             .context("Background publication worker failed")
@@ -282,11 +296,6 @@ impl BackgroundManager {
             let mut pending: Option<(crate::provider::EventScope, crate::provider::Compaction)> =
                 None;
             loop {
-                let until = if pending.is_some() {
-                    deadline
-                } else {
-                    tokio::time::Instant::now() + Duration::from_millis(10)
-                };
                 let observations = async {
                     inbox.notified().await?;
                     if inbox.is_closed() && !inbox.has_pending()? {
@@ -294,7 +303,15 @@ impl BackgroundManager {
                     }
                     inbox.drain().map(Some)
                 };
-                let observed = tokio::time::timeout_at(until, observations).await;
+                // Generation has settled through its event watermark; only explicit ongoing
+                // compaction justifies waiting for another event on the persistent stream.
+                let observed = if pending.is_some() {
+                    tokio::time::timeout_at(deadline, observations).await
+                } else if inbox.is_closed() || inbox.has_pending().unwrap_or(true) {
+                    Ok(observations.await)
+                } else {
+                    break;
+                };
                 // Drain every accepted observation before interpreting the typed
                 // owner end. Intentional collection is not a native terminal.
                 let observed = match observed {
@@ -436,6 +453,7 @@ impl BackgroundManager {
             .await;
         }
         if !succeeded || !settled {
+            let _preparation = self.preparation.lock().await;
             let removed = self.retained.lock().await.remove(&key);
             if let Some(removed) = removed
                 && let Err(error) = self.retire(removed).await
@@ -463,13 +481,25 @@ impl BackgroundManager {
         &self,
         request: &BackgroundRequest,
         key: &str,
-    ) -> Result<(HarnessBroker, BackgroundLease, fs::File)> {
+    ) -> Result<(
+        HarnessBroker,
+        BackgroundLease,
+        fs::File,
+        crate::settings::ValidatedModelSelection,
+    )> {
+        // Serialize cache selection, collection, and allocation so concurrent workspaces
+        // cannot each observe an available native-runtime slot before publishing it.
+        let _preparation = tokio::select! {
+            biased;
+            _ = request.cancellation.cancelled() => anyhow::bail!("Background generation cancelled"),
+            _ = self.shutdown.cancelled() => anyhow::bail!("Background generation cancelled"),
+            preparation = self.preparation.lock() => preparation,
+        };
         let pending: Vec<_> = self
             .cleanup_pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .filter(|runtime| runtime.cache_key == key)
             .cloned()
             .collect();
         for runtime in pending {
@@ -556,10 +586,11 @@ impl BackgroundManager {
             head: request.context.head.clone(),
             reason: reason.into(),
         };
+        // Explicit generation settings are validated before the broker commits them.
         let initialize: InitializeRequest = serde_json::from_value(json!({
             "data_root":request.config.data_root, "workspace":request.context.workspace,
             "client_id":format!("background-{}", uuid::Uuid::new_v4()), "provider":request.config.provider,
-            "model":request.config.model, "effort":request.config.reasoning_effort.as_deref().unwrap_or("default"),
+            "model":"default", "effort":"default",
             "session_id":session_id, "background":identity,
             "new_session_name":if reason.is_empty() { None } else { Some("Background") }
         }))?;
@@ -606,10 +637,10 @@ impl BackgroundManager {
                     broker.observer().replace_session_events(observer.clone());
                     let replacement = Arc::new(RetainedBackground {
                         runtime: retained.retained.runtime.clone(),
-                        cache_key: key.to_owned(),
                         session_id: retained.retained.session_id.clone(),
                         observer,
                         leased: AtomicBool::new(false),
+                        last_used: std::sync::Mutex::new(std::time::Instant::now()),
                     });
                     let replacement_lease = BackgroundLease::acquire(replacement.clone())?;
                     self.retained
@@ -633,7 +664,8 @@ impl BackgroundManager {
                     };
                 }
             };
-            return Ok((broker, retained, ownership));
+            let model = broker.configure_background_model(&request.config).await?;
+            return Ok((broker, retained, ownership, model));
         }
         let evicted = {
             let mut cache = self.retained.lock().await;
@@ -644,7 +676,13 @@ impl BackgroundManager {
             if cache.len() >= 4 {
                 let idle = cache
                     .iter()
-                    .find(|(_, runtime)| !runtime.leased.load(Ordering::Acquire))
+                    .filter(|(_, runtime)| !runtime.leased.load(Ordering::Acquire))
+                    .min_by_key(|(_, runtime)| {
+                        *runtime
+                            .last_used
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    })
                     .map(|(key, _)| key.clone())
                     .context("all retained Background runtimes are busy")?;
                 if let Some(previous) = cache.remove(&idle) {
@@ -688,15 +726,35 @@ impl BackgroundManager {
         let observer = registry.observer(owner)?;
         let retained = Arc::new(RetainedBackground {
             runtime,
-            cache_key: key.to_owned(),
             session_id,
             observer,
             leased: AtomicBool::new(false),
+            last_used: std::sync::Mutex::new(std::time::Instant::now()),
         });
         let lease = BackgroundLease::acquire(retained.clone())?;
-        self.retained.lock().await.insert(key.to_owned(), retained);
-        request.context.verify(&self.repositories).await?;
-        Ok((broker, lease, ownership))
+        self.retained
+            .lock()
+            .await
+            .insert(key.to_owned(), retained.clone());
+        let prepared = async {
+            let model = broker.configure_background_model(&request.config).await?;
+            request.context.verify(&self.repositories).await?;
+            Ok::<_, anyhow::Error>(model)
+        }
+        .await;
+        match prepared {
+            Ok(model) => Ok((broker, lease, ownership, model)),
+            Err(error) => {
+                drop(lease);
+                self.retained.lock().await.remove(key);
+                match self.retire(retained).await {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(error.context(format!(
+                        "Background preparation cleanup failed: {cleanup:#}"
+                    ))),
+                }
+            }
+        }
     }
 
     /// Retain native cleanup ownership until collection succeeds, including cancelled shutdown waits.
@@ -715,6 +773,7 @@ impl BackgroundManager {
 
     /// Drain admitted work and report every incomplete provider collection obligation.
     pub async fn shutdown(&self) -> Result<()> {
+        self.shutdown.cancel();
         let mut failure = None;
         let mut tasks = self.tasks.lock().await;
         while let Some(result) = tasks.join_next().await {
@@ -1001,7 +1060,7 @@ mod tests {
             let cancellation = super::super::CancellationToken::new();
             let initial = request("cancelled-old-generation", cancellation.clone());
             let key = format!("{}:{}", config.data_root.display(), context.workspace);
-            let (mut broker, retained, ownership) = manager.prepare(&initial, &key).await?;
+            let (mut broker, retained, ownership, _model) = manager.prepare(&initial, &key).await?;
             let session_id = retained.retained.session_id.clone();
             let provider = retained.retained.runtime.provider_handle();
             let control = provider.mock_response_control().context("mock response barrier is unavailable")?;
@@ -1049,6 +1108,84 @@ mod tests {
         }).await.context("Background supersession did not collect and reuse its owner")?
     }
 
+    /// Evict the oldest idle native runtime while preserving its durable logical conversation.
+    #[tokio::test]
+    async fn idle_runtime_lru_eviction_preserves_durable_background_history() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let diff = DiffEngine::new(Default::default(), 1);
+        let manager = BackgroundManager::new(
+            Arc::new(RepositoryStore::default()),
+            diff.clone(),
+            forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool()),
+        );
+        let config = TextGenerationConfig {
+            provider: crate::provider::ProviderLaunch {
+                kind: forge_providers::registry::nonselectable_id().expect("fixture identity"),
+                command: Vec::new(),
+            },
+            model: "mock-model".into(),
+            reasoning_effort: None,
+            service_tier: Default::default(),
+            data_root: fixture.path().join("state"),
+            auto_compaction: Default::default(),
+        };
+        let mut first = None;
+        for index in 0..5 {
+            let workspace = fixture.path().join(format!("workspace-{index}"));
+            fs::create_dir(&workspace)?;
+            let initialized = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&workspace)
+                .args(["init", "-q"])
+                .output()?;
+            ensure!(
+                initialized.status.success(),
+                "fixture Git initialization failed"
+            );
+            let context = BackgroundContext::read(
+                &manager.repositories,
+                workspace.to_str().context("fixture path is not Unicode")?,
+            )
+            .await?;
+            let key = format!("{}:{}", config.data_root.display(), context.workspace);
+            let request = BackgroundRequest {
+                cancellation: super::super::CancellationToken::new(),
+                purpose: crate::provider::TextGeneration::CommitMessage,
+                config: config.clone(),
+                context,
+                input: "Generate fixture text".into(),
+                delivery: None,
+            };
+            let result = manager.generate(request).await?;
+            let mut tasks = manager.tasks.lock().await;
+            while let Some(result) = tasks.join_next().await {
+                result?;
+            }
+            drop(tasks);
+            assert!(manager.retained.lock().await.len() <= 4);
+            if index == 0 {
+                first = Some((key, result.session_id));
+            }
+        }
+        let (key, session_id) = first.context("first workspace was not generated")?;
+        assert!(!manager.retained.lock().await.contains_key(&key));
+        assert_eq!(manager.retained.lock().await.len(), 4);
+        assert!(
+            SqliteStore::read_only(&config.data_root)?
+                .load_session(&session_id)?
+                .is_some()
+        );
+        assert_eq!(
+            SqliteStore::read_only(&config.data_root)?
+                .list_exchange(&session_id)?
+                .len(),
+            1
+        );
+        manager.shutdown().await?;
+        assert!(manager.retained.lock().await.is_empty());
+        Ok(())
+    }
+
     /// Recover a lost retained listener only when a new Background request arrives.
     #[tokio::test]
     async fn explicit_background_request_replaces_failed_observer() -> Result<()> {
@@ -1067,7 +1204,7 @@ mod tests {
             Arc::clone(&diff),
             forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool()),
         );
-        let request = BackgroundRequest {
+        let mut request = BackgroundRequest {
             cancellation: super::super::CancellationToken::new(),
             purpose: crate::provider::TextGeneration::CommitMessage,
             config: TextGenerationConfig {
@@ -1095,7 +1232,19 @@ mod tests {
             request.config.data_root.display(),
             request.context.workspace
         );
-        let (mut broker, retained, ownership) = manager.prepare(&request, &key).await?;
+        request.config.model = "unavailable-background-model".into();
+        assert!(manager.prepare(&request, &key).await.is_err());
+        assert!(manager.retained.lock().await.is_empty());
+        assert!(manager.cleanup_pending.lock().unwrap().is_empty());
+        let failed_sessions =
+            SqliteStore::read_only(&request.config.data_root)?.list_session(None)?;
+        assert!(
+            failed_sessions
+                .iter()
+                .all(|session| session.model == "default" && session.provider_session_id.is_none())
+        );
+        request.config.model = "mock-model".into();
+        let (mut broker, retained, ownership, _model) = manager.prepare(&request, &key).await?;
         let session_id = retained.retained.session_id.clone();
         let old_observer = retained.retained.observer.clone();
         let owner = crate::provider::ExecutionOwner::root(&session_id);
@@ -1119,7 +1268,7 @@ mod tests {
         broker.release_lease()?;
         drop(broker);
         drop(ownership);
-        let (mut broker, replacement, ownership) = manager.prepare(&request, &key).await?;
+        let (mut broker, replacement, ownership, _model) = manager.prepare(&request, &key).await?;
         assert_eq!(replacement.retained.session_id, session_id);
         assert!(!Arc::ptr_eq(&old_observer, &replacement.retained.observer));
         assert!(registry.owner(owner).await?.is_healthy().await);
@@ -1167,7 +1316,7 @@ mod tests {
                 .iter()
                 .any(|pending| Arc::ptr_eq(pending, &retiring))
         );
-        let (mut broker, recovered, ownership) = manager.prepare(&request, &key).await?;
+        let (mut broker, recovered, ownership, _model) = manager.prepare(&request, &key).await?;
         assert_eq!(recovered.retained.session_id, session_id);
         assert!(!Arc::ptr_eq(&recovered.retained.runtime, &retiring.runtime));
         assert!(manager.cleanup_pending.lock().unwrap().is_empty());
@@ -1193,54 +1342,61 @@ mod tests {
         assert!(error.to_string().contains("background worker failed"));
     }
 
+    /// Cancel queued generation on either caller interruption or shutdown before native preparation.
     #[tokio::test]
-    async fn cancelled_admission_never_starts_provider() {
-        let diff = DiffEngine::new(Default::default(), 1);
-        let manager = BackgroundManager::new(
-            Arc::new(RepositoryStore::default()),
-            Arc::clone(&diff),
-            forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool()),
-        );
-        let permits = manager.runtime_admission.acquire_many(4).await.unwrap();
-        let cancellation = super::super::CancellationToken::new();
-        let request = BackgroundRequest {
-            cancellation: cancellation.clone(),
-            purpose: crate::provider::TextGeneration::CommitMessage,
-            config: TextGenerationConfig {
-                provider: crate::provider::ProviderLaunch {
-                    kind: forge_providers::registry::nonselectable_id()
-                        .expect("registry supplies a nonselectable fixture identity"),
-                    command: vec![],
+    async fn cancelled_or_shutdown_admission_never_starts_provider() {
+        for shutdown in [false, true] {
+            let diff = DiffEngine::new(Default::default(), 1);
+            let manager = BackgroundManager::new(
+                Arc::new(RepositoryStore::default()),
+                Arc::clone(&diff),
+                forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool()),
+            );
+            let permits = manager.runtime_admission.acquire_many(4).await.unwrap();
+            let cancellation = super::super::CancellationToken::new();
+            let request = BackgroundRequest {
+                cancellation: cancellation.clone(),
+                purpose: crate::provider::TextGeneration::CommitMessage,
+                config: TextGenerationConfig {
+                    provider: crate::provider::ProviderLaunch {
+                        kind: forge_providers::registry::nonselectable_id()
+                            .expect("registry supplies a nonselectable fixture identity"),
+                        command: vec![],
+                    },
+                    model: "mock-model".into(),
+                    reasoning_effort: None,
+                    service_tier: Default::default(),
+                    data_root: PathBuf::new(),
+                    auto_compaction: Default::default(),
                 },
-                model: "mock-model".into(),
-                reasoning_effort: None,
-                service_tier: Default::default(),
-                data_root: PathBuf::new(),
-                auto_compaction: Default::default(),
-            },
-            context: BackgroundContext {
-                workspace: "not-a-repository".into(),
-                branch: None,
-                head: None,
-                history: String::new(),
-            },
-            input: "cancel before preparation".into(),
-            delivery: None,
-        };
-        let task = tokio::spawn({
-            let manager = Arc::clone(&manager);
-            async move { manager.generate(request).await }
-        });
-        tokio::task::yield_now().await;
-        cancellation.cancel();
-        let error = task
-            .await
-            .unwrap()
-            .err()
-            .expect("cancelled request succeeded");
-        assert_eq!(error.to_string(), "Background generation cancelled");
-        drop(permits);
-        manager.shutdown().await.unwrap();
+                context: BackgroundContext {
+                    workspace: "not-a-repository".into(),
+                    branch: None,
+                    head: None,
+                    history: String::new(),
+                },
+                input: "cancel before preparation".into(),
+                delivery: None,
+            };
+            let task = tokio::spawn({
+                let manager = Arc::clone(&manager);
+                async move { manager.generate(request).await }
+            });
+            tokio::task::yield_now().await;
+            if shutdown {
+                manager.shutdown().await.unwrap();
+            } else {
+                cancellation.cancel();
+            }
+            let error = task
+                .await
+                .unwrap()
+                .err()
+                .expect("cancelled request succeeded");
+            assert_eq!(error.to_string(), "Background generation cancelled");
+            drop(permits);
+            manager.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

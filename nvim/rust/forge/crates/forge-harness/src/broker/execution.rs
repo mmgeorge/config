@@ -18,13 +18,31 @@ pub(super) struct ExecutionCapture {
     pub(super) record: PlanExecutionRecord,
 }
 
+/// Fence control against ownership/finalization changes, not streamed presentation updates.
+#[derive(Clone, PartialEq)]
+struct ExecutionControlExchange {
+    id: crate::provider::ExchangeId,
+    phase: crate::exchange::ExchangePhase,
+    finalization_error: Option<String>,
+}
+
+impl ExecutionControlExchange {
+    fn capture(exchange: &Exchange) -> Self {
+        Self {
+            id: exchange.id.as_str().into(),
+            phase: exchange.phase.clone(),
+            finalization_error: exchange.finalization_error.clone(),
+        }
+    }
+}
+
 /// Immutable authority and workspace evidence for a single control operation.
 pub(crate) struct ExecutionControlJob {
     execution_id: String,
     generation: u64,
     permit: crate::task::TaskPermit,
     operation: Box<crate::plan::execution::ExecutionOperation>,
-    exchange_digest: String,
+    exchange: ExecutionControlExchange,
     execution_digest: String,
     plan_digest: String,
     evidence: Option<(
@@ -44,12 +62,12 @@ pub(crate) struct ExecutionControlEvidence {
 pub(super) struct ExecutionControlProposal {
     execution_id: String,
     permit: crate::task::TaskPermit,
-    exchange_digest: String,
+    exchange: ExecutionControlExchange,
     execution_digest: String,
     plan_digest: String,
     execution: PlanExecutionRecord,
     plan: crate::plan::PlanRecord,
-    interaction: Exchange,
+    nodes: Vec<ExchangeNode>,
     revised_manual: Vec<String>,
     title: String,
     phase_completion: bool,
@@ -447,7 +465,7 @@ impl HarnessBroker {
             execution,
             design,
             workspace: PathBuf::from(&self.session.workspace),
-            cancelled: self.turn_cancellation.requested.clone(),
+            cancelled: self.turn_cancellation.requested_flag(),
         })
     }
 
@@ -460,7 +478,7 @@ impl HarnessBroker {
         } = result;
         permit.validate(self.task_controller.current()?.as_ref())?;
         anyhow::ensure!(
-            !self.turn_cancellation.requested.load(Ordering::Acquire),
+            !self.turn_cancellation.is_requested(),
             "execution interrupted during semantic comparison"
         );
         execution.progress = progress;
@@ -508,7 +526,7 @@ impl HarnessBroker {
             "control belongs to another execution"
         );
         anyhow::ensure!(
-            !self.turn_cancellation.requested.load(Ordering::Acquire),
+            !self.turn_cancellation.is_requested(),
             "execution interrupted"
         );
         let plan = self
@@ -546,7 +564,7 @@ impl HarnessBroker {
             generation,
             permit: task_permit.clone(),
             operation: Box::new(operation),
-            exchange_digest: crate::plan::digest(&serde_json::to_vec(interaction)?),
+            exchange: ExecutionControlExchange::capture(interaction),
             execution_digest: crate::plan::digest(&serde_json::to_vec(&execution)?),
             plan_digest: crate::plan::digest(&serde_json::to_vec(&plan)?),
             evidence,
@@ -596,7 +614,7 @@ impl HarnessBroker {
             generation,
             permit,
             operation,
-            exchange_digest,
+            exchange,
             execution_digest,
             plan_digest,
             ..
@@ -604,7 +622,7 @@ impl HarnessBroker {
         let task_permit = &permit;
         let execution_id = execution_id.as_str();
         anyhow::ensure!(
-            crate::plan::digest(&serde_json::to_vec(&*current_interaction)?) == exchange_digest,
+            ExecutionControlExchange::capture(current_interaction) == exchange,
             "exchange changed during execution control"
         );
         let captured_execution = self
@@ -642,7 +660,7 @@ impl HarnessBroker {
             execution.response()
         );
         anyhow::ensure!(
-            !self.turn_cancellation.requested.load(Ordering::Acquire),
+            !self.turn_cancellation.is_requested(),
             "execution interrupted"
         );
         anyhow::ensure!(
@@ -925,7 +943,7 @@ impl HarnessBroker {
                     );
                 }
                 anyhow::ensure!(
-                    !self.turn_cancellation.requested.load(Ordering::Acquire),
+                    !self.turn_cancellation.is_requested(),
                     "execution interrupted during validation"
                 );
                 if execution.baseline_checkpoint.is_none() {
@@ -1005,12 +1023,16 @@ impl HarnessBroker {
         let proposal = ExecutionControlProposal {
             execution_id: execution_id.to_owned(),
             permit,
-            exchange_digest,
+            exchange,
             execution_digest,
             plan_digest,
             execution,
             plan,
-            interaction: proposed_interaction,
+            nodes: proposed_interaction
+                .node_list
+                .into_iter()
+                .skip(current_interaction.node_list.len())
+                .collect(),
             revised_manual,
             title: title.into(),
             phase_completion,
@@ -1052,12 +1074,12 @@ impl HarnessBroker {
         let ExecutionControlProposal {
             execution_id,
             permit,
-            exchange_digest,
+            exchange,
             execution_digest,
             plan_digest,
             mut execution,
             plan,
-            mut interaction,
+            nodes,
             revised_manual,
             title,
             phase_completion,
@@ -1074,13 +1096,13 @@ impl HarnessBroker {
             .load_plan(&current.plan_id)?
             .context("execution plan is missing")?;
         anyhow::ensure!(
-            crate::plan::digest(&serde_json::to_vec(&*current_interaction)?) == exchange_digest
+            ExecutionControlExchange::capture(current_interaction) == exchange
                 && crate::plan::digest(&serde_json::to_vec(&current)?) == execution_digest
                 && crate::plan::digest(&serde_json::to_vec(&current_plan)?) == plan_digest,
             "execution control changed before commit"
         );
         anyhow::ensure!(
-            !self.turn_cancellation.requested.load(Ordering::Acquire),
+            !self.turn_cancellation.is_requested(),
             "execution interrupted during validation"
         );
         anyhow::ensure!(
@@ -1132,6 +1154,10 @@ impl HarnessBroker {
                 );
             }
         }
+        // Apply only this control's additions to the latest exchange; stream events
+        // observed while evidence was collected remain owned by the foreground.
+        let mut interaction = current_interaction.clone();
+        interaction.node_list.extend(nodes);
         if let Some(report) = report {
             self.commit_implementation_report(&mut execution, &mut interaction, report)?;
         }
@@ -1241,7 +1267,7 @@ impl HarnessBroker {
         }
         anyhow::ensure!(
             execution.state != PlanExecutionState::Complete
-                || !self.turn_cancellation.requested.load(Ordering::Acquire),
+                || !self.turn_cancellation.is_requested(),
             "execution interrupted while capturing implementation report"
         );
         let reference = report.save(

@@ -91,7 +91,7 @@ async fn failed_session_observation_restarts_for_explicit_new_work() -> Result<(
     let _provider_fixture =
         crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
     broker.set_provider_for_test(_provider_fixture.provider_handle());
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     let (message_sink, mut output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&message_sink).await?;
     let old = provider.event_sink(&owner).await?;
@@ -179,7 +179,7 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
         ViewId("view:observation-loss".into()),
         WidthProfile::default(),
     )?;
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     let execution_registry = controller.broker.lock().await.execution_registry();
     let engine = execution_registry.owner(owner.clone()).await?;
     controller.trace.configure(true)?;
@@ -202,20 +202,14 @@ async fn accepted_observation_loss_publishes_failed_timeline_and_collects_input_
         control_revision: 0,
         after_control: None,
         action: InputAction::Submit {
-            message: Box::new(InputMessage {
+            message: Box::new(InputMessage::queued(crate::input::InputDraft {
                 id: "accepted-input".into(),
-                revision: 0,
                 text: "Keep this accepted instruction exactly once".into(),
                 purpose: crate::input::InputPurpose::User,
                 intent: InputIntent::Auto,
-                delivery: Default::default(),
-                route: None,
                 attachments: vec![],
                 config: None,
-                reservation: None,
-                submission_id: None,
-                error: None,
-            }),
+            })),
         },
     })?;
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -383,7 +377,7 @@ async fn session_observation_intake_does_not_block_on_foreground_broker() -> Res
     let _provider_fixture =
         crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
     broker.set_provider_for_test(_provider_fixture.provider_handle());
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     let (message_sink, mut output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&message_sink).await?;
     let broker_guard = controller.broker.lock().await;
@@ -503,7 +497,7 @@ async fn session_observation_overflow_retains_prefix_and_reports_loss() -> Resul
     let _provider_fixture =
         crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
     broker.set_provider_for_test(_provider_fixture.provider_handle());
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     let (output, _receiver) = forge_protocol::outbound::channel();
     controller.attach_session_events(&output).await?;
     let sink = provider
@@ -650,7 +644,7 @@ async fn shutdown_drains_background_terminal_evidence_before_releasing_lease() -
         .initialization_request()?
         .context("fixture initialization missing")?;
     let bridge = broker.provider_handle();
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     let (message_sink, _output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&message_sink).await?;
     // Persisted background work requires an opened native binding, not just attached UI output.
@@ -726,7 +720,7 @@ async fn cancelled_session_observation_join_retains_collector_for_retry() -> Res
         crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
     broker.set_provider_for_test(provider_fixture.provider_handle());
     let execution = broker.execution_registry();
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     let (message_sink, _output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&message_sink).await?;
     assert!(
@@ -760,7 +754,7 @@ async fn saturated_observer_transport_does_not_block_recovery() -> Result<()> {
     let _provider =
         crate::provider::test_support::ProviderTestSession::from_native(provider.clone())?;
     broker.set_provider_for_test(_provider.provider_handle());
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     let (messages, _blocked_output) = forge_protocol::outbound::channel();
     controller.attach_session_events(&messages).await?;
     for index in 0..forge_protocol::MAX_PENDING_FRAMES - forge_protocol::RESERVED_CONTROL_RECORDS {

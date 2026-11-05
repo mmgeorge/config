@@ -101,7 +101,7 @@ pub(crate) fn questions_block_task_work(
             matches!(
                 message.purpose,
                 InputPurpose::Question { .. } | InputPurpose::QuestionContinuation { .. }
-            ) && message.delivery != InputDelivery::Accepted
+            ) && message.delivery() != InputDelivery::Accepted
         }))
 }
 
@@ -114,7 +114,7 @@ pub(crate) fn select_pending_input(
     if input
         .messages
         .iter()
-        .any(|message| message.delivery == InputDelivery::Unknown)
+        .any(|message| message.delivery() == InputDelivery::Unknown)
         || input.suspended
             && !input.messages.iter().any(|message| {
                 matches!(
@@ -131,7 +131,7 @@ pub(crate) fn select_pending_input(
         .into_iter()
         .filter(|message| {
             !matches!(
-                message.delivery,
+                message.delivery(),
                 InputDelivery::Delivering | InputDelivery::Accepted
             )
         })
@@ -192,19 +192,19 @@ pub(crate) fn select_pending_input(
     if command.is_none()
         && matches!(policy, InputQueuePolicy::AllowSteering)
         && message.intent == InputIntent::Queue
-        && message.delivery == InputDelivery::Queued
+        && message.delivery() == InputDelivery::Queued
     {
         let Some(immediate) = pending.into_iter().find(|message| {
             !matches!(message.purpose, InputPurpose::TaskContinuation { .. })
                 && (message.intent != InputIntent::Queue
-                    || message.delivery != InputDelivery::Queued)
+                    || message.delivery() != InputDelivery::Queued)
         }) else {
             return Ok(PendingInput::WaitExecution);
         };
         message = immediate;
         command = SessionCommand::queued_input(&message).map_err(InputOfferError::Queue)?;
     }
-    if message.delivery != InputDelivery::Queued || message.reservation.is_some() {
+    if message.delivery() != InputDelivery::Queued || message.reservation().is_some() {
         return Ok(PendingInput::Waiting);
     }
     Ok(PendingInput::Ready(PendingInputSelection {

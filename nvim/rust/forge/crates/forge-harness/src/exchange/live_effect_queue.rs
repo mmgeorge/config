@@ -38,6 +38,5 @@ impl LiveEffectQueue {
 }
 
 #[cfg(test)]
-mod tests {
-    include!("live_effect_queue_test.rs");
-}
+#[path = "live_effect_queue_test.rs"]
+mod tests;

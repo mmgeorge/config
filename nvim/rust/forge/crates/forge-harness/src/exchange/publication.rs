@@ -85,6 +85,12 @@ pub(crate) struct RetainedPublication {
     state: PublicationState,
 }
 
+/// Identify the durable owner publication shared by live delivery and reconnect replay.
+#[derive(Serialize)]
+struct PublicationStamp {
+    sequence: PublicationSequence,
+}
+
 /// Capture a bounded publication prefix and its stable reconciliation boundary.
 pub(crate) struct PublicationSnapshot {
     records: Vec<RetainedPublication>,
@@ -119,6 +125,10 @@ impl RetainedPublication {
     /// Get the complete event without exposing mutation of committed content.
     pub(crate) fn event(&self) -> &SessionEvent {
         &self.event
+    }
+    /// Copy the retained event with its delivery identity without changing stored producer content.
+    pub(crate) fn delivery_event(&self) -> SessionEvent {
+        stamp_event(self.event.clone(), self.sequence)
     }
     /// Get delivery evidence without inferring remote receipt from channel admission.
     pub(crate) fn state(&self) -> PublicationState {
@@ -488,7 +498,7 @@ impl SessionPublications {
 
         // Keep local publication-before-output lock order; try_send_event performs no callbacks or waits.
         self.write_state(&connection, sequence, PublicationState::Offering)?;
-        let state = match transport.try_send_event(&retained.event) {
+        let state = match transport.try_send_event(&retained.delivery_event()) {
             Ok(()) => PublicationState::Admitted,
             Err(_) => PublicationState::Pending,
         };
@@ -968,7 +978,10 @@ impl PublicationDelivery {
         self.active = Some(ActiveDelivery::Sending {
             sequence,
             worker: tokio::spawn(async move {
-                match transport.send_event(publication.event).await {
+                match transport
+                    .send_event(stamp_event(publication.event, sequence))
+                    .await
+                {
                     Ok(()) => DeliveryOutcome::Admitted,
                     Err(_) => DeliveryOutcome::Uncertain,
                 }
@@ -1040,10 +1053,33 @@ impl PublicationError {
     }
 }
 
+/// Stamp only outbound copies so producer identity comparisons retain their original bytes.
+fn stamp_event(mut event: SessionEvent, sequence: PublicationSequence) -> SessionEvent {
+    event.payload["_publication"] = serde_json::json!(PublicationStamp { sequence });
+    event
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures_util::FutureExt;
+
+    /// Live delivery and reconnect replay expose one identity without changing retained bytes.
+    #[test]
+    fn delivery_stamp_preserves_retained_event_and_matches_replay() -> anyhow::Result<()> {
+        let original = event("retained delivery");
+        let retained = RetainedPublication {
+            sequence: PublicationSequence::try_from(7)?,
+            event: original.clone(),
+            state: PublicationState::Pending,
+        };
+        let replay = retained.delivery_event();
+        let live = stamp_event(original, retained.sequence());
+        assert_eq!(replay.payload, live.payload);
+        assert_eq!(replay.payload["_publication"]["sequence"], 7);
+        assert!(retained.event().payload.get("_publication").is_none());
+        Ok(())
+    }
 
     /// A transactional answer cannot overtake failed output, and a recovered epoch commits it after that prefix.
     #[test]
@@ -1520,6 +1556,18 @@ mod tests {
             publications.publish(invalid, None),
             Err(PublicationError::InvalidEvent)
         ));
+        for payload in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            serde_json::json!(7),
+        ] {
+            let mut nonobject = event("invalid payload");
+            nonobject.payload = payload;
+            assert!(matches!(
+                publications.publish(nonobject, None),
+                Err(PublicationError::InvalidEvent)
+            ));
+        }
         assert!(records(&publications).is_empty());
         assert_eq!(
             publications.publish(event("valid"), None)?.sequence().get(),

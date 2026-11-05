@@ -339,6 +339,57 @@ pub(crate) struct SelectionVersion {
 }
 
 impl SelectionVersion {
+    /// Get the inventory revision retained by this selection snapshot.
+    pub(crate) fn revision(&self) -> DocumentRevision {
+        self.revision
+    }
+
+    /// Preserve the original whole-file selection across unrelated inventory updates.
+    pub(crate) fn rebase_file_selection(
+        &self,
+        document: &StatusDocument,
+        input: &StatusInput,
+        selection: Option<&StatusSelection>,
+    ) -> Result<StatusSelection> {
+        let mut selected = HashMap::new();
+        if let Some(selection) = selection {
+            ensure!(
+                !selection.target.is_empty(),
+                "invalid status selection size"
+            );
+            for location in &selection.target {
+                self.select(location, &mut selected)?;
+            }
+        } else {
+            self.select(&input.location, &mut selected)?;
+        }
+        let mut target = Vec::with_capacity(selected.len());
+        for (id, selection) in selected {
+            ensure!(
+                selection.whole,
+                "selected hunk requires its original revision"
+            );
+            let original = &self.file[&id];
+            let current = document
+                .file
+                .get(&file_target(id))
+                .context("selected file disappeared during refresh")?;
+            ensure!(
+                original.section == current.section
+                    && original.generation == current.generation
+                    && original.observed == observed(current),
+                "selected file changed during refresh"
+            );
+            target.push(StatusLocation::File { id });
+        }
+        target.sort_by_key(|location| match location {
+            StatusLocation::File { id } => *id,
+            _ => unreachable!("rebased selections contain only validated files"),
+        });
+        ensure!(!target.is_empty(), "selected status section is empty");
+        Ok(StatusSelection { target })
+    }
+
     fn retained_bytes(&self) -> usize {
         self.file
             .values()
@@ -753,10 +804,8 @@ impl StatusService {
                     .map(|analysis| analysis.source().clone()),
             });
         }
-        ensure!(
-            !target.is_empty(),
-            "selection contains no applicable changes"
-        );
+        // The selected row can already be in the requested section after a prior action.
+        // Use the same no-write outcome as a selection whose edits were already applied.
         target.retain(|target| target.edit.as_ref().is_none_or(|edit| !edit.is_empty()));
         if target.is_empty() {
             let snapshot = self.snapshot(&input.document).await?;
@@ -1731,6 +1780,13 @@ fn prediction_copy(state: &WorktreeJournal) -> WorktreeJournal {
 }
 
 pub(crate) fn remember(document: &mut StatusDocument, before: SelectionVersion) {
+    if document
+        .history
+        .back()
+        .is_some_and(|previous| previous.revision == before.revision)
+    {
+        document.history.pop_back();
+    }
     document.history.push_back(before);
     let mut retained: usize = document
         .history

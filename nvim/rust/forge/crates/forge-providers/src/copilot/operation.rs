@@ -118,3 +118,74 @@ pub(super) async fn scope<T>(admission: Option<Admission>, work: impl Future<Out
         None => work.await,
     }
 }
+
+/// Bound an individual native wait by its caller's original deadline while retaining its owner.
+/// Cleanup without a caller deadline keeps waiting until its retained native work completes.
+pub(super) async fn wait<T>(work: impl Future<Output = T>) -> Result<T, ProviderError> {
+    let Some(admission) = current() else {
+        return Ok(work.await);
+    };
+    let Some(deadline) = admission.context.deadline() else {
+        return Ok(work.await);
+    };
+    tokio::time::timeout_at(deadline, work).await.map_err(|_| {
+        forge_provider_api::ProviderFailure::new(
+            admission.operation,
+            forge_provider_api::ProviderFailureKind::Timeout,
+        )
+        .at_phase(
+            forge_provider_api::ProviderPhase::Observation,
+            forge_provider_api::FailureDisposition::Uncertain,
+        )
+        .into()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Consecutive native phases share the caller's original budget instead of resetting it.
+    #[tokio::test(start_paused = true)]
+    async fn native_phases_preserve_original_operation_deadline() {
+        let (_source, cancellation) = forge_provider_api::OperationCancellation::channel();
+        let context = OperationContext::new(
+            OperationId::new("phases").unwrap(),
+            Duration::from_secs(30),
+            cancellation,
+        )
+        .unwrap();
+        Admission::new(context, ProviderOperation::SessionConfigure)
+            .scope(async {
+                wait(tokio::time::sleep(Duration::from_secs(20)))
+                    .await
+                    .unwrap();
+                let began = tokio::time::Instant::now();
+                let result = wait(std::future::pending::<()>()).await;
+                assert_eq!(began.elapsed(), Duration::from_secs(10));
+                assert!(matches!(result, Err(ProviderError::Failure(failure))
+                if failure.kind() == forge_provider_api::ProviderFailureKind::Timeout));
+            })
+            .await;
+    }
+
+    /// A caller without a generation deadline keeps its native acknowledgement wait alive.
+    #[tokio::test(start_paused = true)]
+    async fn unbounded_input_wait_survives_previous_acceptance_limit() {
+        let (_source, cancellation) = forge_provider_api::OperationCancellation::channel();
+        let context = OperationContext::unbounded(OperationId::new("input").unwrap(), cancellation);
+        Admission::new(context, ProviderOperation::InputSubmit)
+            .scope(async {
+                let (send, receive) = tokio::sync::oneshot::channel();
+                let waiting = wait(receive);
+                tokio::pin!(waiting);
+                assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+                tokio::time::advance(Duration::from_secs(3600)).await;
+                assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+                send.send(()).unwrap();
+                waiting.await.unwrap().unwrap();
+            })
+            .await;
+    }
+}

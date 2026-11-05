@@ -565,10 +565,18 @@ impl SourcePreparation {
                         .fold((0, 0), |(added, removed), (next_added, next_removed)| {
                             (added + next_added, removed + next_removed)
                         });
-                    if owner.is_none()
-                        && let Some(previous) = self.group_target.get(&display.raw_ids)
-                    {
-                        block.id = previous.header.clone();
+                    if owner.is_none() {
+                        block.id = match self.group_target.get(&display.raw_ids) {
+                            Some(previous) => previous.header.clone(),
+                            // A preserved group can move to another ordinal. Namespace new
+                            // headers by the body version so they cannot reuse its old ID.
+                            None => BlockId(format!(
+                                "{}:generation:{}:revision:{}",
+                                block.id.0,
+                                self.generation,
+                                self.body.revision().0
+                            )),
+                        };
                     }
                     let content_node = block.metadata.content_node.clone();
                     let source_anchor = block.metadata.source_anchor.clone();

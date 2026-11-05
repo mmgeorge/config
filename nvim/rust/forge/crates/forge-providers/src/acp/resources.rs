@@ -6,12 +6,15 @@ use forge_provider_api::{
 use serde_json::{Value, json};
 
 /// Encode admitted MCP launches only after checking native transport limitations.
-pub(super) fn mcp_launches(launches: &[McpLaunch]) -> Result<Vec<Value>, ProviderError> {
+pub(super) fn mcp_launches(
+    operation: forge_provider_api::ProviderOperation,
+    launches: &[McpLaunch],
+) -> Result<Vec<Value>, ProviderError> {
     let mut names = std::collections::HashSet::with_capacity(launches.len());
     launches.iter().map(|launch| {
         if launch.name == "forge-harness-control" || !names.insert(&launch.name) {
             return Err(ProviderError::Failure(forge_provider_api::ProviderFailure::new(
-                forge_provider_api::ProviderOperation::SessionOpen,
+                operation,
                 forge_provider_api::ProviderFailureKind::Rejected,
             )));
         }

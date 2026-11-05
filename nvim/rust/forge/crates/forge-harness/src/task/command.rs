@@ -173,8 +173,8 @@ impl SessionCommand {
     }
 
     pub(crate) fn queued_input(message: &crate::input::InputMessage) -> Result<Option<Self>> {
-        if message.delivery != crate::input::InputDelivery::Queued
-            || message.reservation.is_some()
+        if message.delivery() != crate::input::InputDelivery::Queued
+            || message.reservation().is_some()
             || !matches!(message.purpose, crate::input::InputPurpose::User)
         {
             return Ok(None);

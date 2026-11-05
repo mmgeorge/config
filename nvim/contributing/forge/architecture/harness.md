@@ -22,6 +22,8 @@ The broker runs once per Neovim process, inside the shared Forge host. `client.l
 
 Each session has a `SessionCoordinator`. Provider work needs its `ExecutionPermit`, while control commands and input admission do not, so one session never waits behind another's provider work and a busy session can still accept input. The permit lasts from request preparation through execution finalization and is released before the final response or input update publishes readiness. A delayed input snapshot must not leave the editor busy after native work has settled. The exchange owner serializes mutation commands and retains their asynchronous jobs, so dropping a request waiter cannot abandon cleanup or publish a later result out of order. Transport admission reserves capacity for control requests during saturation.
 
+Controller construction resolves inherited model tuning against the provider's workspace catalog before publishing the controller or its initial snapshot. An unavailable model fails construction. Unavailable saved reasoning, context-window, and service-tier choices fall back to advertised defaults; absence of a context-window override stays absent. This applies equally to initial opening, new conversations, and resumed controllers, so an early prompt cannot race native initialization with unchecked preferences. Explicit configuration commands continue to reject unsupported choices before committing them.
+
 `/new`, `/fork`, and `:ForgeHarnessNew` open their tab before provider work finishes. A fork first persists a child with `provider_fork_state = preparing`, the source's last completed provider turn, and a snapshot of the source's visible history. Provider preparation then runs outside the parent's lock, so a slow fork cannot stall the parent. A prompt sent early waits only on that child. The child inherits history for display only, without tasks, questions, or live agents.
 
 ## Commands and operations
@@ -123,7 +125,7 @@ Workflow changes never enable writing or widen filesystem scope. When a permissi
 
 Restart recovery keeps committed phases and completion evidence, suspends pending entries and continuations, and never starts a provider automatically. Explicit resume reactivates the retained task; a proven pending entry keeps its provider-input identity. Uncertain provider delivery remains governed by the submission journal rather than by the task's phase. Failure, disconnect, and unknown outcomes stop automatic queue draining.
 
-Session contract 61, preference format 44, and portable-settings format 5 omit workflow approval defaults. New conversations start in Ask; existing conversations retain their explicit approval mode, including across Plan → Execute. Storage retains older envelopes unchanged and excludes them from current loading; schema setup does not reconstruct obsolete task state. The current task decoder validates phase payloads instead of guessing transitions from an older representation.
+Session contract 63, preference format 44, and portable-settings format 5 omit workflow approval defaults. New conversations start in Ask; existing conversations retain their explicit approval mode, including across Plan → Execute. Storage retains older envelopes unchanged and excludes them from current loading; schema setup does not reconstruct obsolete task state. The current task decoder validates phase payloads instead of guessing transitions from an older representation.
 
 After exclusive runtime ownership is acquired, recovery also settles detached background tools inside already-completed exchanges. It preserves the foreground outcome, output, and last observed duration. On a fresh Copilot binding, native history is checked for unmatched tool calls; only a verified incomplete suffix can be truncated, and the retained prefix is checked again before new input is sent. The repaired session's provider prompt cautions that prior actions may have completed and must be inspected before repeating writes. Successful recovery does not emit an editor warning; ambiguous history blocks admission rather than discarding completed work.
 
@@ -191,3 +193,11 @@ admits a new discussion exchange instead of reopening the completed source excha
 Cancellation revokes unfinished chat continuations and retires their required
 questions. Optional chat questions remain answerable after cancellation or normal
 completion; late answers enter discussion without resuming the original work.
+
+### UI observation subscriptions
+
+Terminal inventories arrive through normalized provider events. Check catalog views subscribe to `checks_changed`, emitted after committed check updates, so ordinary streamed text does not reload the catalog. Resource toggles subscribe before command admission, match completion by operation identity, and perform one durable read after the receipt to cover attachment races. They do not repeatedly query settings. Host exits and failed requests provide connection diagnostics; the UI does not send health heartbeat queries. Local animation clocks, operation deadlines, and delayed retries after an actual failed request remain separate from state observation.
+
+Picker `on_dispose` releases owned subscriptions on every close, including confirmation and silent replacement. `on_close` remains the optional user-workflow callback.
+
+LSP requests observe cancellation, scope lease release, and tool-selection revisions through watch notifications. Structural analysis also observes the pending request lifetime, so dropping an editor request cancels its analysis without a periodic map lookup. Check workers consume the owner's cancellation stream and publish output only after new bytes arrive; the existing output coalescing delay does not wake or rewrite idle progress.

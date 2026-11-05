@@ -38,6 +38,12 @@ pub(super) enum QuestionTool {
 }
 
 impl QuestionTool {
+    /// Defer a waiting destination while letting replies and other callbacks make progress.
+    /// A closed admission gate must still consume and reject the original callback promptly.
+    pub(super) fn waits_for_capacity(&self, waits: &QuestionWaits) -> bool {
+        matches!(self, Self::Wait { .. }) && !waits.has_capacity()
+    }
+
     /// Reject excess staged work without dropping its caller's completion observation.
     pub(super) fn reject(self) {
         match self {

@@ -49,8 +49,8 @@ local success, failure = xpcall(function()
   vim.fn.writefile({ "after" }, workspace .. "/source.txt")
   controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = "ask" } })
   await(function()
-    return state.session.approval_mode == "ask" and not state.busy
-      and not state.task_operation and not state.state_sync_pending
+    return state.session.approval_mode == "ask" and not require("forge.views.harness.activity").busy(state)
+      and not state.state_sync_pending
   end, "resumed repair did not settle")
   local catalog
   client.request({ method = "session.check.list", params = {}, session_id = assert(require("forge.session").harness.session).id }, function(value, problem)

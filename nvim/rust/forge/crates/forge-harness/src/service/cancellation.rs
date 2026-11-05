@@ -61,12 +61,12 @@ mod tests {
     use crate::exchange::journal::CommandState;
 
     /// Create an idle real session owner without starting a native process or automatic input work.
-    fn controller(root: &std::path::Path) -> Result<Arc<SessionController>> {
+    async fn controller(root: &std::path::Path) -> Result<Arc<SessionController>> {
         let initialize: InitializeRequest = serde_json::from_value(json!({
             "workspace":root,"data_root":root.join("data"),"client_id":"owner-cancel",
             "provider":{"kind":"mock","command":[]},
         }))?;
-        SessionController::new(HarnessBroker::initialize(initialize)?)
+        SessionController::new(HarnessBroker::initialize(initialize)?).await
     }
 
     /// Create a durable cancellation whose result remains observable across RPC retries.
@@ -84,7 +84,7 @@ mod tests {
     #[tokio::test]
     async fn queued_cancel_survives_dropped_waiter_and_replays_one_result() -> Result<()> {
         let fixture = tempfile::tempdir()?;
-        let controller = controller(fixture.path())?;
+        let controller = controller(fixture.path()).await?;
         let gate = controller
             .coordinator
             .control
@@ -172,7 +172,7 @@ mod tests {
     async fn fresh_input_control_resolves_after_prior_fifo_cancellation() -> Result<()> {
         use crate::exchange::command::{CommandFailure, InputChange, InputCommand};
         let fixture = tempfile::tempdir()?;
-        let controller = controller(fixture.path())?;
+        let controller = controller(fixture.path()).await?;
         let gate = controller
             .coordinator
             .control
@@ -240,7 +240,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_cancel_request_preserves_input_control() -> Result<()> {
         let fixture = tempfile::tempdir()?;
-        let controller = controller(fixture.path())?;
+        let controller = controller(fixture.path()).await?;
         let (messages, _output) = forge_protocol::outbound::channel();
         for params in [
             json!({"restore_prompt_if_no_output":"true"}),

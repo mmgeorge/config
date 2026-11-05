@@ -1,15 +1,39 @@
 use forge_provider_api::access::AccessPolicy;
-use forge_provider_api::approval::ApprovalMode;
+use forge_provider_api::capability::{ProviderFeature, UnsupportedCapability};
 use serde_json::{Value, json};
 
-/// Projects approvals and isolation into separate native Codex controls.
+/// Keep validated native isolation choices inside the Codex adapter.
+#[derive(Clone, Copy)]
+enum IsolationMode {
+    Default,
+    #[cfg(windows)]
+    Elevated,
+    #[cfg(windows)]
+    Unelevated,
+    #[cfg(windows)]
+    Mxc,
+}
+
+/// Apply access settings only after validating native isolation support.
 pub struct CodexSecurity<'a> {
     access: &'a AccessPolicy,
+    isolation: IsolationMode,
 }
 
 impl<'a> CodexSecurity<'a> {
-    pub const fn new(_mode: ApprovalMode, access: &'a AccessPolicy) -> Self {
-        Self { access }
+    /// Create native security settings without interpreting unknown values as a default.
+    pub fn new(access: &'a AccessPolicy) -> Result<Self, UnsupportedCapability> {
+        let isolation = match access.isolation_mode.as_deref() {
+            None => IsolationMode::Default,
+            #[cfg(windows)]
+            Some("elevated") => IsolationMode::Elevated,
+            #[cfg(windows)]
+            Some("unelevated") => IsolationMode::Unelevated,
+            #[cfg(windows)]
+            Some("mxc") => IsolationMode::Mxc,
+            Some(_) => return Err(UnsupportedCapability(ProviderFeature::IsolationMode)),
+        };
+        Ok(Self { access, isolation })
     }
 
     fn approval_policy(&self) -> &'static str {
@@ -38,12 +62,25 @@ impl<'a> CodexSecurity<'a> {
         config["sandbox_workspace_write.network_access"] = json!(true);
         config["sandbox_workspace_write.exclude_tmpdir_env_var"] = json!(true);
         config["sandbox_workspace_write.exclude_slash_tmp"] = json!(true);
-        config["windows.sandbox"] = json!(match self.access.isolation_mode.as_deref() {
-            Some("unelevated") => "unelevated",
-            None | Some("elevated" | "mxc") => "elevated",
-            Some(_) => "elevated",
-        });
-        config["features.prefer_mxc"] = json!(self.access.isolation_mode.as_deref() == Some("mxc"));
+        match self.isolation {
+            IsolationMode::Default => {
+                #[cfg(windows)]
+                {
+                    config["windows.sandbox"] = json!("elevated");
+                    config["features.prefer_mxc"] = json!(false);
+                }
+            }
+            #[cfg(windows)]
+            IsolationMode::Elevated | IsolationMode::Mxc => {
+                config["windows.sandbox"] = json!("elevated");
+                config["features.prefer_mxc"] = json!(matches!(self.isolation, IsolationMode::Mxc));
+            }
+            #[cfg(windows)]
+            IsolationMode::Unelevated => {
+                config["windows.sandbox"] = json!("unelevated");
+                config["features.prefer_mxc"] = json!(false);
+            }
+        }
     }
 
     /// Override the turn policy using fields accepted by the app-server API.
@@ -67,32 +104,27 @@ impl<'a> CodexSecurity<'a> {
 mod tests {
     use super::*;
 
+    /// Native filesystem isolation remains independent of host approval decisions.
     #[test]
-    fn approval_changes_preserve_sandbox_and_directories() {
+    fn native_security_preserves_sandbox_and_directories() {
         let access = AccessPolicy {
             writable_directory: vec!["D:/shared".into()],
             ..Default::default()
         };
-        for (mode, approval) in [
-            (ApprovalMode::Ask, "untrusted"),
-            (ApprovalMode::Deny, "untrusted"),
-            (ApprovalMode::Allow, "untrusted"),
-        ] {
-            let security = CodexSecurity::new(mode, &access);
-            let mut turn = json!({});
-            security.apply_turn(&mut turn, "D:/repo");
-            assert_eq!(turn["approvalPolicy"], approval);
-            assert_eq!(turn["sandboxPolicy"]["type"], "workspaceWrite");
-            assert_eq!(
-                turn["sandboxPolicy"]["writableRoots"],
-                json!(["D:/repo", "D:/shared"])
-            );
-            assert!(turn.get("permissions").is_none());
-            let mut thread = json!({"config":{"model_reasoning_effort":"high"}});
-            security.apply_thread(&mut thread, "D:/repo");
-            assert_eq!(thread["sandbox"], "workspace-write");
-            assert_eq!(thread["config"]["model_reasoning_effort"], "high");
-        }
+        let security = CodexSecurity::new(&access).unwrap();
+        let mut turn = json!({});
+        security.apply_turn(&mut turn, "D:/repo");
+        assert_eq!(turn["approvalPolicy"], "untrusted");
+        assert_eq!(turn["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(
+            turn["sandboxPolicy"]["writableRoots"],
+            json!(["D:/repo", "D:/shared"])
+        );
+        assert!(turn.get("permissions").is_none());
+        let mut thread = json!({"config":{"model_reasoning_effort":"high"}});
+        security.apply_thread(&mut thread, "D:/repo");
+        assert_eq!(thread["sandbox"], "workspace-write");
+        assert_eq!(thread["config"]["model_reasoning_effort"], "high");
     }
 
     #[test]
@@ -102,27 +134,65 @@ mod tests {
             ..Default::default()
         };
         let mut turn = json!({});
-        CodexSecurity::new(ApprovalMode::Ask, &access).apply_turn(&mut turn, "D:/repo");
+        CodexSecurity::new(&access)
+            .unwrap()
+            .apply_turn(&mut turn, "D:/repo");
         assert_eq!(turn["sandboxPolicy"]["type"], "dangerFullAccess");
         assert_eq!(turn["approvalPolicy"], "untrusted");
     }
 
     #[test]
-    fn write_off_uses_native_read_only_for_every_approval_mode() {
+    fn write_off_uses_native_read_only() {
         let access = AccessPolicy {
             write_access: forge_provider_api::access::WriteScope::Off,
             ..Default::default()
         };
-        for mode in [ApprovalMode::Ask, ApprovalMode::Deny, ApprovalMode::Allow] {
-            let security = CodexSecurity::new(mode, &access);
+        let security = CodexSecurity::new(&access).unwrap();
+        let mut thread = json!({});
+        security.apply_thread(&mut thread, "D:/repo");
+        assert_eq!(thread["approvalPolicy"], "untrusted");
+        assert_eq!(thread["sandbox"], "read-only");
+        let mut turn = json!({});
+        security.apply_turn(&mut turn, "D:/repo");
+        assert_eq!(turn["sandboxPolicy"]["type"], "readOnly");
+        assert_eq!(turn["approvalPolicy"], "untrusted");
+    }
+
+    /// Invalid dormant isolation cannot silently select a different native sandbox.
+    #[test]
+    fn unknown_isolation_rejects_with_or_without_sandbox() {
+        for sandbox in [true, false] {
+            let access = AccessPolicy {
+                sandbox,
+                isolation_mode: Some("unknown-isolation".into()),
+                ..Default::default()
+            };
+            assert!(matches!(
+                CodexSecurity::new(&access),
+                Err(UnsupportedCapability(ProviderFeature::IsolationMode))
+            ));
+        }
+    }
+
+    /// Each advertised Windows choice has an explicit native encoding.
+    #[cfg(windows)]
+    #[test]
+    fn windows_isolation_preserves_each_advertised_choice() {
+        for (mode, native, prefer_mxc) in [
+            ("elevated", "elevated", false),
+            ("unelevated", "unelevated", false),
+            ("mxc", "elevated", true),
+        ] {
+            let access = AccessPolicy {
+                isolation_mode: Some(mode.into()),
+                ..Default::default()
+            };
             let mut thread = json!({});
-            security.apply_thread(&mut thread, "D:/repo");
-            assert_eq!(thread["approvalPolicy"], "untrusted");
-            assert_eq!(thread["sandbox"], "read-only");
-            let mut turn = json!({});
-            security.apply_turn(&mut turn, "D:/repo");
-            assert_eq!(turn["sandboxPolicy"]["type"], "readOnly");
-            assert_eq!(turn["approvalPolicy"], "untrusted");
+            CodexSecurity::new(&access)
+                .unwrap()
+                .apply_thread(&mut thread, "D:/repo");
+            assert_eq!(thread["config"]["windows.sandbox"], native);
+            assert_eq!(thread["config"]["features.prefer_mxc"], prefer_mxc);
         }
     }
 }

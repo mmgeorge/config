@@ -5,8 +5,8 @@ use tokio::time::Instant;
 
 use super::services::OwnerServices;
 use crate::input::{
-    InputAction, InputDelivery, InputIntent, InputMessage, InputOperation, InputPurpose,
-    InputRejection, InputUpdate,
+    InputAction, InputIntent, InputMessage, InputOperation, InputPurpose, InputRejection,
+    InputUpdate,
 };
 
 const ADMISSION_BUDGET: usize = 8;
@@ -101,9 +101,8 @@ impl QuestionInputs {
             let update = admit(
                 services,
                 format!("question:{}", message.id),
-                InputMessage {
+                InputMessage::queued(crate::input::InputDraft {
                     id: message.id,
-                    revision: 0,
                     text: message.text,
                     purpose: InputPurpose::Question {
                         content_revision: Some(message.reply.revision),
@@ -115,12 +114,7 @@ impl QuestionInputs {
                     attachments: Vec::new(),
                     config: None,
                     intent: InputIntent::Auto,
-                    delivery: InputDelivery::Queued,
-                    route: None,
-                    reservation: None,
-                    submission_id: None,
-                    error: None,
-                },
+                }),
             )?;
             publish_input(services, messages, &id, update)?;
             services
@@ -147,9 +141,8 @@ impl QuestionInputs {
             let update = admit(
                 services,
                 id.clone(),
-                InputMessage {
+                InputMessage::queued(crate::input::InputDraft {
                     id,
-                    revision: 0,
                     text: format!(
                         "Continue the original request using the recorded user answers. Do not repeat resolved questions.\n\nOriginal request:\n{}",
                         original.prompt
@@ -160,12 +153,7 @@ impl QuestionInputs {
                     attachments: Vec::new(),
                     config: None,
                     intent: InputIntent::Queue,
-                    delivery: InputDelivery::Queued,
-                    route: None,
-                    reservation: None,
-                    submission_id: None,
-                    error: None,
-                },
+                }),
             )?;
             let id = format!("question-continuation:{exchange}");
             publish_input(services, messages, &id, update)?;
@@ -391,15 +379,6 @@ fn publish_input(
     message_id: &str,
     update: InputUpdate,
 ) -> Result<(), QuestionInputError> {
-    let (revision, pending) = services
-        .input
-        .has_pending()
-        .map_err(QuestionInputError::InputState)?;
-    services
-        .observer
-        .completion_queue
-        .update(revision, pending)
-        .map_err(QuestionInputError::InputState)?;
     let payload = serde_json::to_value(update)?;
     services.publications.publish_once(
         super::publication::PublicationOrigin::QuestionInput(

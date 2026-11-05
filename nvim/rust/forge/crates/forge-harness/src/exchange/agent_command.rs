@@ -24,6 +24,14 @@ pub(crate) enum AgentCommand {
 }
 
 impl AgentCommand {
+    /// Get whether public admission must reserve a pending child-task slot before FIFO entry.
+    pub(crate) fn creates_task(&self) -> bool {
+        match self {
+            Self::Start(_) | Self::FollowUp(_) => true,
+            Self::SendMessage(_) | Self::Interrupt(_) => false,
+        }
+    }
+
     /// Capture stable child scope at the caller boundary.
     pub(crate) fn capture(
         operation: AgentOperation,
@@ -350,15 +358,21 @@ pub(super) struct AgentCommandRun {
 
 impl AgentCommandRun {
     /// Start finite child work only after the parent command's active record commits.
-    pub(super) fn start(command: QueuedCommand, services: &OwnerServices) -> Self {
+    pub(super) fn start(mut command: QueuedCommand, services: &OwnerServices) -> Self {
         let Command::Agent(request) = &command.record.request.command else {
             unreachable!("agent stages only own agent commands")
         };
         let request = request.clone();
         let children = Arc::clone(&services.children);
         let operation_id = command.record.request.id.as_str().to_owned();
+        let task_admission = command.task_admission.take();
         let worker = RetainedAgentCommand {
-            worker: Some(tokio::spawn(run(request, children, operation_id))),
+            worker: Some(tokio::spawn(run(
+                request,
+                children,
+                operation_id,
+                task_admission,
+            ))),
         };
         Self {
             command,
@@ -414,6 +428,7 @@ async fn run(
     command: AgentCommand,
     children: Arc<AgentCoordinator>,
     operation_id: String,
+    task_admission: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<AgentOutcome, AgentFailure> {
     match command {
         AgentCommand::Interrupt(targets) => {
@@ -448,6 +463,7 @@ async fn run(
                     text: start.text,
                 }),
                 None,
+                task_admission,
             )
             .await?;
             decode_admission(value)
@@ -461,6 +477,7 @@ async fn run(
                     message: message.text,
                 },
                 Some(message.target),
+                task_admission,
             )
             .await?;
             decode_admission(value)
@@ -475,6 +492,7 @@ async fn run(
                     message: message.text,
                 },
                 Some(message.target),
+                task_admission,
             )
             .await?;
             let message =
@@ -490,6 +508,7 @@ async fn request(
     operation_id: &str,
     operation: AgentOperation,
     target: Option<AgentTarget>,
+    task_admission: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<serde_json::Value, AgentFailure> {
     if let Some(target) = &target {
         children
@@ -505,6 +524,7 @@ async fn request(
                 operation,
             },
             target,
+            task_admission,
         )
         .await
         .map_err(|_| AgentFailure::Rejected)
@@ -539,6 +559,7 @@ async fn interrupt(
             target: target.agent_id().into(),
         },
         Some(target.clone()),
+        None,
     )
     .await?;
     loop {

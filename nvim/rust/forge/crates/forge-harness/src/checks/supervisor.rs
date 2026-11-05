@@ -88,31 +88,37 @@ impl CheckCancellation {
         self.changed.notify_waiters();
     }
 
-    async fn wait(&self, external: Option<&AtomicBool>) {
-        loop {
-            let changed = self.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if self.requested.load(Ordering::Acquire)
-                || external.is_some_and(|flag| flag.load(Ordering::Acquire))
+    async fn wait(&self, external: Option<tokio::sync::watch::Receiver<bool>>) {
+        let local = async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if self.requested.load(Ordering::Acquire) {
+                    return;
+                }
+                changed.await;
+            }
+        };
+        let external = async {
+            if let Some(mut cancelled) = external
+                && cancelled.wait_for(|cancelled| *cancelled).await.is_ok()
             {
                 return;
             }
-            tokio::select! {
-                _ = changed => {},
-                _ = tokio::time::sleep(std::time::Duration::from_millis(25)), if external.is_some() => {},
-            }
-        }
+            std::future::pending::<()>().await;
+        };
+        tokio::select! { _ = local => {}, _ = external => {} }
     }
 
     async fn read<Output>(
         &self,
-        external: Option<&Arc<AtomicBool>>,
+        external: Option<&tokio::sync::watch::Receiver<bool>>,
         read: impl std::future::Future<Output = Result<Output>>,
     ) -> Result<Option<Output>> {
         tokio::select! {
             biased;
-            _ = self.wait(external.map(AsRef::as_ref)) => Ok(None),
+            _ = self.wait(external.cloned()) => Ok(None),
             result = read => result.map(Some),
         }
     }
@@ -766,7 +772,7 @@ impl CheckSupervisor {
         self: &Arc<Self>,
         run: PreparedCheckRun,
         sink: Option<SessionUpdateSink>,
-        external_cancelled: Option<Arc<AtomicBool>>,
+        external_cancelled: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<CheckRun> {
         let (_, completed) = self.launch(run, sink, external_cancelled, None).await?;
         completed
@@ -923,7 +929,7 @@ impl CheckSupervisor {
         self: &Arc<Self>,
         admitted: AdmittedCheckRun,
         sink: Option<SessionUpdateSink>,
-        external_cancelled: Option<Arc<AtomicBool>>,
+        external_cancelled: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<CheckRun> {
         let AdmittedCheckRun {
             mut run,
@@ -986,13 +992,13 @@ impl CheckSupervisor {
         sink: Option<&SessionUpdateSink>,
         publication: &CheckPublication,
         cancelled: &Arc<CheckCancellation>,
-        external_cancelled: Option<&Arc<AtomicBool>>,
+        external_cancelled: Option<&tokio::sync::watch::Receiver<bool>>,
     ) -> Result<()> {
         self.update(&run.clone().into_record(), sink)?;
         publication.update(&run.clone().into_record());
         for index in 0..run.commands.len() {
             if cancelled.requested.load(Ordering::Acquire)
-                || external_cancelled.is_some_and(|value| value.load(Ordering::Acquire))
+                || external_cancelled.is_some_and(|value| *value.borrow())
             {
                 run.interrupt();
                 return Ok(());
@@ -1135,7 +1141,7 @@ impl CheckSupervisor {
                     return Err(error);
                 }
                 run.commands[index].state = if cancelled.requested.load(Ordering::Acquire)
-                    || external_cancelled.is_some_and(|value| value.load(Ordering::Acquire))
+                    || external_cancelled.is_some_and(|value| *value.borrow())
                 {
                     CheckState::Interrupted
                 } else {
@@ -1283,7 +1289,7 @@ impl CheckSupervisor {
         mut context: super::model::CheckCommand,
         target: CheckPublicationTarget<'_>,
         cancelled: &Arc<CheckCancellation>,
-        external_cancelled: Option<&Arc<AtomicBool>>,
+        external_cancelled: Option<&tokio::sync::watch::Receiver<bool>>,
     ) -> Result<()> {
         let CheckPublicationTarget { sink, publication } = target;
         let directory = self
@@ -1386,7 +1392,7 @@ impl CheckSupervisor {
         let worker = tokio::spawn(async move {
             let cancelled = async {
                 tokio::select! {
-                    _ = process_cancelled.wait(process_external.as_deref()) => {},
+                    _ = process_cancelled.wait(process_external) => {},
                     _ = stopped => {},
                 }
             };
@@ -1415,7 +1421,7 @@ impl CheckSupervisor {
             let mut status = None;
             let mut killed = false;
             let mut input_done = !scoped;
-            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+            let mut publication_deadline = None;
             while !stdout_done || !stderr_done || status.is_none() || !input_done {
                 tokio::select! {
                     result = &mut input_delivery, if !input_done => {
@@ -1425,19 +1431,27 @@ impl CheckSupervisor {
                     result = stdout.read(&mut stdout_buffer), if !stdout_done => {
                         let bytes = result?; stdout_done = bytes == 0;
                         if bytes > 0 { stdout_file.write_all(&stdout_buffer[..bytes]).await?; output.write_all(&stdout_buffer[..bytes]).await?;
-                            run.commands[index].output_bytes += bytes as u64; append_preview(&mut run.commands[index].preview, &stdout_buffer[..bytes]); }
+                            run.commands[index].output_bytes += bytes as u64; append_preview(&mut run.commands[index].preview, &stdout_buffer[..bytes]);
+                            publication_deadline.get_or_insert_with(|| tokio::time::Instant::now() + std::time::Duration::from_millis(250)); }
                     },
                     result = stderr.read(&mut stderr_buffer), if !stderr_done => {
                         let bytes = result?; stderr_done = bytes == 0;
                         if bytes > 0 { stderr_file.write_all(&stderr_buffer[..bytes]).await?; output.write_all(&stderr_buffer[..bytes]).await?;
-                            run.commands[index].output_bytes += bytes as u64; append_preview(&mut run.commands[index].preview, &stderr_buffer[..bytes]); }
+                            run.commands[index].output_bytes += bytes as u64; append_preview(&mut run.commands[index].preview, &stderr_buffer[..bytes]);
+                            publication_deadline.get_or_insert_with(|| tokio::time::Instant::now() + std::time::Duration::from_millis(250)); }
                     },
                     result = process.wait(), if status.is_none() => {
                         let (completed, interrupted) = result?;
                         status = Some(completed);
                         killed = interrupted;
                     },
-                    _ = ticker.tick() => {
+                    _ = async {
+                        match publication_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {
+                        publication_deadline = None;
                         output.flush().await?;
                         self.update(&run.clone().into_record(), sink)?;
                         publication.update(&run.clone().into_record());
@@ -1640,7 +1654,7 @@ impl CheckSupervisor {
         self: &Arc<Self>,
         run: PreparedCheckRun,
         sink: Option<SessionUpdateSink>,
-        external_cancelled: Option<Arc<AtomicBool>>,
+        external_cancelled: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<(
         String,
         tokio::sync::oneshot::Receiver<std::result::Result<CheckRun, String>>,
@@ -1655,7 +1669,7 @@ impl CheckSupervisor {
         self: &Arc<Self>,
         run: PreparedCheckRun,
         sink: Option<SessionUpdateSink>,
-        external_cancelled: Option<Arc<AtomicBool>>,
+        external_cancelled: Option<tokio::sync::watch::Receiver<bool>>,
         admission: Option<crate::command::ExecutionPermit>,
     ) -> Result<String> {
         let (id, _) = self
@@ -1668,7 +1682,7 @@ impl CheckSupervisor {
         self: &Arc<Self>,
         run: PreparedCheckRun,
         sink: Option<SessionUpdateSink>,
-        external_cancelled: Option<Arc<AtomicBool>>,
+        external_cancelled: Option<tokio::sync::watch::Receiver<bool>>,
         admission: Option<crate::command::ExecutionPermit>,
     ) -> Result<(
         String,
@@ -1682,7 +1696,7 @@ impl CheckSupervisor {
         self: &Arc<Self>,
         run: PreparedCheckRun,
         sink: Option<SessionUpdateSink>,
-        external_cancelled: Option<Arc<AtomicBool>>,
+        external_cancelled: Option<tokio::sync::watch::Receiver<bool>>,
         admission: Option<crate::command::ExecutionPermit>,
     ) -> Result<(
         String,
@@ -1790,6 +1804,26 @@ pub(crate) fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wake a blocked checkpoint read directly from the owning exchange's cancellation stream.
+    #[tokio::test]
+    async fn external_cancellation_releases_a_pending_checkpoint_read() -> Result<()> {
+        let cancellation = CheckCancellation {
+            requested: Arc::new(AtomicBool::new(false)),
+            changed: Default::default(),
+        };
+        let (source, receiver) = tokio::sync::watch::channel(false);
+        let read = cancellation.read(Some(&receiver), std::future::pending::<Result<()>>());
+        tokio::pin!(read);
+        assert!(futures_util::poll!(read.as_mut()).is_pending());
+        source.send_replace(true);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), read)
+                .await??
+                .is_none()
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn cancellation_releases_a_pending_checkpoint_read() -> Result<()> {

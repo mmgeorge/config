@@ -1,4 +1,23 @@
 use super::*;
+
+/// Replacing the current invocation must never reset an older worker's cancellation.
+#[tokio::test]
+async fn cancellation_signal_remains_bound_to_its_invocation() {
+    let controller = TurnCancellation::new();
+    let first = controller.capture();
+    controller.request();
+    controller.arm();
+    let second = controller.capture();
+    assert!(first.requested.load(Ordering::Acquire));
+    assert!(first.submission_cancelled.load(Ordering::Acquire));
+    assert!(!second.requested.load(Ordering::Acquire));
+    first.request();
+    assert!(!second.requested.load(Ordering::Acquire));
+    controller.request();
+    assert!(second.requested.load(Ordering::Acquire));
+    first.cancelled().await;
+    second.cancelled().await;
+}
 use crate::provider::{ProviderCompletion, TurnUpdate};
 use crate::turn::{ToolState, TurnOutcome, TurnState};
 use futures_util::FutureExt;
@@ -13,7 +32,7 @@ async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publicati
         let mut broker =
             super::test::planning_question_broker(workspace.path(), data.path(), false);
         broker.checkpoint = None;
-        broker.turn_cancellation.arm(true);
+        broker.turn_cancellation.arm();
         let (publication, _updates) = publication::channel();
         let ForegroundDispatch::Admitting(admission) = broker.begin_foreground_dispatch(
             Request {
@@ -54,7 +73,6 @@ async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publicati
         transaction.session_events =
             Arc::new(crate::provider::session_execution::SessionObservationInbox::default());
         transaction.question_enabled = false;
-        transaction.cleanup_open = false;
         transaction.execution_open = false;
         transaction.agent_revision.borrow_and_update();
         let turn = crate::provider::TurnAddress {
@@ -67,16 +85,45 @@ async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publicati
             update: TurnUpdate::Started { started_at_ms: 1 },
         }];
         let mut expected = String::new();
-        for index in 0..128 {
-            let text = format!("frame-{index:03}: α🦀\n");
+        // Keep the native-channel prefix non-coalescible so it fills the same staging budget.
+        for index in 0..80 {
+            let text = format!("prefix-{index:03}: α🦀\n");
             expected.push_str(&text);
             frames.extend(crate::provider::test_support::message(
                 &turn,
-                format!("message-{index}"),
+                format!("prefix-{index}"),
                 Some(crate::provider::MessageRole::Response),
                 text,
             ));
         }
+        let message = crate::provider::MessageAddress {
+            turn: turn.clone(),
+            message_id: crate::provider::MessageId::Native("streamed-prefix".into()),
+        };
+        frames.push(ProviderEvent::Message {
+            address: message.clone(),
+            update: crate::provider::MessageUpdate::Started {
+                classification: forge_provider_api::message::MessageClassification::Known(
+                    crate::provider::MessageRole::Response,
+                ),
+                text: "stream:\n".into(),
+            },
+        });
+        let mut streamed = String::from("stream:\n");
+        for index in 0..(forge_protocol::MAX_PENDING_FRAMES - 64) {
+            let text = format!("frame-{index:03}: α🦀\n");
+            streamed.push_str(&text);
+            frames.push(ProviderEvent::Message {
+                address: message.clone(),
+                update: crate::provider::MessageUpdate::Delta { text },
+            });
+        }
+        frames.push(ProviderEvent::Message {
+            address: message,
+            update: crate::provider::MessageUpdate::Completed {
+                text: streamed.clone(),
+            },
+        });
         frames.push(ProviderEvent::Turn {
             address: turn.clone(),
             update: TurnUpdate::Finished {
@@ -84,6 +131,7 @@ async fn foreground_prefix_transfer_preserves_order_and_waits_for_last_publicati
                 completed_at_ms: 2,
             },
         });
+        expected.push_str(&streamed);
         transaction
             .pending_session_observations
             .extend(frames[..64].iter().cloned());
@@ -446,7 +494,7 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
     let native = cancellation_fixture(failure, stats.clone());
     let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
     broker.provider = fixture.provider_handle();
-    broker.turn_cancellation.arm(true);
+    broker.turn_cancellation.arm();
     let result = broker
         .dispatch(Request {
             id: 1,
@@ -516,7 +564,7 @@ async fn assert_native_failure(failure: ProviderFailure) -> Result<()> {
             .any(|entry| matches!(entry, TimelineEntry::Exchange { id, .. } if id == &exchange.id))
     );
     // Service admission rearms cancellation only after the previous execution settles.
-    broker.turn_cancellation.arm(true);
+    broker.turn_cancellation.arm();
     let recovered = broker
         .dispatch(Request {
             id: 2,
@@ -551,7 +599,7 @@ async fn prepared_foreground_collection_prevents_native_submission() -> Result<(
     let data = tempfile::tempdir()?;
     let mut broker = super::test::planning_question_broker(workspace.path(), data.path(), false);
     broker.checkpoint = None;
-    broker.turn_cancellation.arm(true);
+    broker.turn_cancellation.arm();
     let (publication, _updates) = publication::channel();
     let ForegroundDispatch::Admitting(admission) = broker.begin_foreground_dispatch(
         Request {
@@ -594,7 +642,9 @@ async fn prepared_foreground_collection_prevents_native_submission() -> Result<(
     };
     broker.step_foreground(
         &mut dispatch,
-        ForegroundSignal::CollectionStarted(ForegroundCollection::Cancel),
+        ForegroundSignal::CollectionStarted(ForegroundCollection::Cancel(
+            crate::exchange::command::CancelledInputPolicy::Retain,
+        )),
     )?;
     // The ordinary phase can reopen after the command settles; this collected generation remains fenced.
     dispatch.authorize_submission();
@@ -636,12 +686,12 @@ async fn collected_foreground_retains_actual_native_success_and_failure() -> Res
                     ))
                 })
             },
-            cancellation.clone(),
+            cancellation.capture(),
             watchdog,
         );
         native.authorize_submission();
         started.notified().await;
-        cancellation.request(false);
+        cancellation.request();
         release.notify_one();
         let NativeForegroundSignal::NativeReady(result) = native.next_collected().await? else {
             anyhow::bail!(
@@ -660,6 +710,68 @@ async fn collected_foreground_retains_actual_native_success_and_failure() -> Res
     Ok(())
 }
 
+/// Keep a steering readiness refresh and its observation stream alive after cancellation.
+#[tokio::test]
+async fn cancelled_foreground_retains_readiness_refresh_and_observation_stream() -> Result<()> {
+    let cancellation = TurnCancellation::new();
+    let scope = crate::provider::InvocationScope::new(
+        crate::provider::ExecutionOwner::root("cancelled-refresh"),
+        "exchange",
+    );
+    let (sink, events) = crate::provider::events::channel(scope.clone());
+    let watchdog = Arc::new(crate::provider::tool_timeout::ToolWatchdog::new(
+        Default::default(),
+    )?);
+    let mut native = ForegroundWait::start(
+        events,
+        async { Ok(17u32) },
+        cancellation.capture(),
+        watchdog,
+    );
+    native.authorize_submission();
+    assert!(matches!(
+        native.next_collected().await?,
+        NativeForegroundSignal::NativeReady(17)
+    ));
+    native.acknowledge_result();
+    cancellation.request();
+    let (release, ready) = tokio::sync::oneshot::channel();
+    native.restart_observation(async move {
+        ready
+            .await
+            .context("retained readiness refresh was dropped")?;
+        Ok(23u32)
+    })?;
+    native.authorize_submission();
+    assert!(
+        native.has_dispatched_task(),
+        "cancellation discarded the retained readiness refresh"
+    );
+    sink.send(ProviderEvent::Turn {
+        address: crate::provider::TurnAddress {
+            scope,
+            thread_id: "refresh-thread".into(),
+            turn_id: "refresh-turn".into(),
+        },
+        update: TurnUpdate::Started { started_at_ms: 1 },
+    })?;
+    assert!(
+        matches!(
+            native.next_collected().await?,
+            NativeForegroundSignal::ProviderEvent(_)
+        ),
+        "refresh replaced the original observation stream"
+    );
+    release
+        .send(())
+        .map_err(|_| anyhow::anyhow!("refresh ownership was lost"))?;
+    assert!(matches!(
+        native.next_collected().await?,
+        NativeForegroundSignal::NativeReady(23)
+    ));
+    Ok(())
+}
+
 /// Collection through the complete foreground wait preserves late native evidence over level cancellation.
 #[tokio::test]
 async fn collected_transaction_drains_native_result_without_recancelling() -> Result<()> {
@@ -669,7 +781,7 @@ async fn collected_transaction_drains_native_result_without_recancelling() -> Re
         let mut broker =
             super::test::planning_question_broker(workspace.path(), data.path(), false);
         broker.checkpoint = None;
-        broker.turn_cancellation.arm(true);
+        broker.turn_cancellation.arm();
         let mut staged = broker.stage_foreground_interaction(
             "collect",
             PromptMode::Chat,
@@ -686,7 +798,6 @@ async fn collected_transaction_drains_native_result_without_recancelling() -> Re
         transaction.question_enabled = false;
         transaction.agent_command_active = true;
         transaction.execution_open = false;
-        transaction.cleanup_open = false;
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let worker_entered = entered.clone();
@@ -708,8 +819,10 @@ async fn collected_transaction_drains_native_result_without_recancelling() -> Re
         }));
         transaction.native.authorize_submission();
         entered.notified().await;
-        transaction.collection = Some(ForegroundCollection::Cancel);
-        broker.turn_cancellation.request(false);
+        transaction.collection = Some(ForegroundCollection::Cancel(
+            crate::exchange::command::CancelledInputPolicy::Retain,
+        ));
+        broker.turn_cancellation.request();
         release.notify_one();
         let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {

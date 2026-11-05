@@ -6,6 +6,12 @@ local picker = require("forge.views.picker")
 local picker_state = require("forge.views.picker.state")
 local checks = require("forge.views.harness.checks")
 local session = require("forge.session")
+local original_subscribe = client.session_events_subscribe
+local subscriber
+client.session_events_subscribe = function(callback)
+  subscriber = callback
+  return function() if subscriber == callback then subscriber = nil end end
+end
 local original = client.request
 local notifications = require("forge.infra.notifications")
 local original_error = notifications.error
@@ -39,6 +45,14 @@ session.harness.session = { id = "checks-fixture", workspace = "fixture" }
 local window = vim.api.nvim_get_current_win()
 local host = { window_list = { window }, control_win = window }
 checks.open(session.harness, host)
+
+local initial_calls = #calls
+subscriber("document_changed", {}, "checks-fixture")
+assert(#calls == initial_calls, "ordinary streamed text reloaded the checks catalog")
+subscriber("checks_changed", {}, "another-session")
+assert(#calls == initial_calls, "foreign checks event reloaded the catalog")
+subscriber("checks_changed", {}, "checks-fixture")
+assert(#calls == initial_calls + 1, "check update did not refresh the picker")
 
 local function row(id)
   local current = picker._state_for_test()
@@ -228,6 +242,8 @@ action("next")
 assert(#calls == call_count, "error rows must not run or change a previously selected check")
 picker.close(false)
 client.request = original
+assert(subscriber == nil, "closed picker retained its subscription")
+client.session_events_subscribe = original_subscribe
 notifications.error = original_error
 io.write("harness_checks OK\n")
 vim.cmd("qa!")

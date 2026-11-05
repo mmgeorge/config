@@ -81,6 +81,13 @@ impl CheckNotification {
                     }
                 }
                 if let Some((sink, patch)) = latest {
+                    if let Err(error) = sink.send_wait(SessionUpdate::ChecksChanged).await {
+                        worker_trace.record(
+                            &worker_session,
+                            "checks.catalog_delivery_failed",
+                            serde_json::json!({"error":error.to_string()}),
+                        );
+                    }
                     let event = SessionUpdate::DocumentChanged { patch };
                     // Finish an admitted multipart transfer before replacing pending progress.
                     if let Err(error) = sink.send_wait(event).await {

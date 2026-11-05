@@ -76,20 +76,19 @@ fn capacity_counts_uncommitted_and_cleanup_ownership_without_orphaning_ninth() {
         })
         .collect();
     let (ninth, spawn) = request("ninth", "ninth");
-    assert!(
-        coordinator
-            .reserve_spawn(
-                &ninth,
-                &spawn,
-                selection(
-                    forge_providers::registry::nonselectable_id()
-                        .expect("registry supplies a nonselectable fixture identity")
-                ),
-                "parent",
-                1
-            )
-            .is_err()
-    );
+    let ninth = coordinator
+        .reserve_spawn(
+            &ninth,
+            &spawn,
+            selection(
+                forge_providers::registry::nonselectable_id()
+                    .expect("registry supplies a nonselectable fixture identity"),
+            ),
+            "parent",
+            1,
+        )
+        .unwrap();
+    assert!(!ninth.launch);
     assert!(coordinator.snapshot(None).is_empty());
     let admitted = admitted
         .into_iter()
@@ -99,42 +98,24 @@ fn capacity_counts_uncommitted_and_cleanup_ownership_without_orphaning_ninth() {
         })
         .collect::<Vec<_>>();
     assert_eq!(coordinator.active_count(), 8);
+    let ninth = match ninth.commit().unwrap() {
+        AgentCommit::Admitted(work) => work,
+        AgentCommit::Existing(_) => panic!("ninth request reused an admission"),
+    };
+    assert!(!ninth.launch);
     let first = &admitted[0];
     coordinator
         .settled(&first.agent.id, &first.task.id, true)
         .unwrap();
     assert_eq!(coordinator.active_count(), 8);
-    assert!(
-        coordinator
-            .reserve_spawn(
-                &ninth,
-                &spawn,
-                selection(
-                    forge_providers::registry::nonselectable_id()
-                        .expect("registry supplies a nonselectable fixture identity")
-                ),
-                "parent",
-                1
-            )
-            .is_err()
-    );
+    assert!(coordinator.ready_launch().unwrap().is_none());
     coordinator
         .settled(&first.agent.id, &first.task.id, false)
         .unwrap();
-    assert!(
-        coordinator
-            .reserve_spawn(
-                &ninth,
-                &spawn,
-                selection(
-                    forge_providers::registry::nonselectable_id()
-                        .expect("registry supplies a nonselectable fixture identity")
-                ),
-                "parent",
-                1
-            )
-            .is_ok()
-    );
+    let launched = coordinator.ready_launch().unwrap().unwrap();
+    assert_eq!(launched.task.id, ninth.task.id);
+    assert!(launched.launch);
+    assert_eq!(coordinator.active_count(), 8);
 }
 
 #[test]
@@ -261,7 +242,7 @@ fn followups_serialize_and_interruption_cancels_pending_without_restarting() {
     let cancellation = coordinator
         .cancellation(&first.agent.id, &first.task.id)
         .unwrap();
-    for ordinal in 0..32 {
+    for ordinal in 0..MAX_PENDING_TASKS {
         let request = AgentRequest {
             operation_id: format!("followup-{ordinal}"),
             source: AgentSource::User,
@@ -290,7 +271,7 @@ fn followups_serialize_and_interruption_cancels_pending_without_restarting() {
             .is_err()
     );
     let cancelled = coordinator.interrupt(&first.agent.id).unwrap();
-    assert_eq!(cancelled.len(), 32);
+    assert_eq!(cancelled.len(), MAX_PENDING_TASKS);
     assert!(*cancellation.borrow());
     assert!(
         coordinator
@@ -553,4 +534,151 @@ fn captured_target_rejects_newer_followup() {
     next.commit().unwrap();
     assert!(coordinator.validate_target(&captured).is_err());
     assert!(coordinator.target_collected(&captured).is_err());
+}
+
+/// Keep queued identities through quiescence and remove interrupted work before capacity reopens.
+#[test]
+fn queued_children_resume_after_quiescence_without_launching_cancelled_work() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let active: Vec<_> = (0..MAX_ACTIVE_CHILDREN)
+        .map(|index| admit(&coordinator, &format!("active-{index}"), "worker"))
+        .collect();
+    let cancelled = admit(&coordinator, "cancelled-queue", "worker");
+    let queued = admit(&coordinator, "retained-queue", "worker");
+    assert!(!cancelled.launch);
+    assert!(!queued.launch);
+    let retired = coordinator.interrupt(&cancelled.agent.id).unwrap();
+    assert_eq!(retired.len(), 1);
+    assert_eq!(retired[0].id, cancelled.task.id);
+    let quiescence = coordinator.begin_quiescence();
+    coordinator
+        .settled(&active[0].agent.id, &active[0].task.id, false)
+        .unwrap();
+    assert!(coordinator.ready_launch().unwrap().is_none());
+    drop(quiescence);
+    let ready = coordinator.ready_launch().unwrap().unwrap();
+    assert_eq!(ready.task.id, queued.task.id);
+    assert_eq!(coordinator.active_count(), MAX_ACTIVE_CHILDREN);
+    assert!(coordinator.ready_launch().unwrap().is_none());
+}
+
+/// Recheck execution capacity when a reserved queued task commits after earlier work settled.
+#[test]
+fn queued_reservation_claims_capacity_released_before_commit() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let active: Vec<_> = (0..MAX_ACTIVE_CHILDREN)
+        .map(|index| admit(&coordinator, &format!("active-{index}"), "worker"))
+        .collect();
+    let (request, spawn) = request("delayed-commit", "worker");
+    let reservation = coordinator
+        .reserve_spawn(
+            &request,
+            &spawn,
+            selection(forge_providers::registry::default_id()),
+            "parent",
+            1,
+        )
+        .unwrap();
+    assert!(!reservation.launch);
+    coordinator
+        .settled(&active[0].agent.id, &active[0].task.id, false)
+        .unwrap();
+    let ready = match reservation.commit().unwrap() {
+        AgentCommit::Admitted(work) => work,
+        AgentCommit::Existing(_) => panic!("new task reused an admission"),
+    };
+    assert!(ready.launch);
+    assert_eq!(coordinator.active_count(), MAX_ACTIVE_CHILDREN);
+}
+
+/// Preserve a full task queue's waiting caller while interruption releases admission capacity.
+#[tokio::test]
+async fn task_capacity_backpressure_preserves_interrupt_and_waiting_request() {
+    let coordinator = AgentCoordinator::new("root".into());
+    let first = admit(&coordinator, "active", "worker");
+    let sender = coordinator.sender();
+    for ordinal in 0..MAX_PENDING_TASKS {
+        let request = AgentRequest {
+            operation_id: format!("queued-{ordinal}"),
+            source: AgentSource::User,
+            operation: AgentOperation::Followup {
+                target: first.agent.id.clone(),
+                message: "next".into(),
+            },
+        };
+        let operation = request.operation_id.clone();
+        let (response, _receiver) = tokio::sync::oneshot::channel();
+        sender
+            .send(AgentCommand::Request {
+                request: Box::new(request),
+                authority: None,
+                target: None,
+                response,
+                task_admission: None,
+            })
+            .await
+            .unwrap();
+        let Some(AgentCommand::Request {
+            request,
+            task_admission,
+            ..
+        }) = coordinator.try_receive()
+        else {
+            panic!("queued request was not retained");
+        };
+        let admission = coordinator
+            .reserve_followup(&request, &first.agent.id, "next", "parent", 1)
+            .unwrap();
+        admission.commit().unwrap();
+        coordinator.retain_task_admission(&operation, task_admission);
+    }
+    let (overflow_request, _) = request("waiting-spawn", "worker");
+    let mut overflow = Box::pin(sender.request(overflow_request));
+    assert!(futures_util::poll!(overflow.as_mut()).is_pending());
+    assert!(coordinator.try_receive().is_none());
+    let (response, _receiver) = tokio::sync::oneshot::channel();
+    sender
+        .send(AgentCommand::Request {
+            request: Box::new(AgentRequest {
+                operation_id: "interrupt".into(),
+                source: AgentSource::User,
+                operation: AgentOperation::Interrupt {
+                    target: first.agent.id.clone(),
+                },
+            }),
+            authority: None,
+            target: None,
+            response,
+            task_admission: None,
+        })
+        .await
+        .unwrap();
+    let Some(AgentCommand::Request {
+        request: control, ..
+    }) = coordinator.try_receive()
+    else {
+        panic!("task saturation blocked interruption");
+    };
+    assert!(matches!(
+        control.operation,
+        AgentOperation::Interrupt { .. }
+    ));
+    assert_eq!(
+        coordinator.interrupt(&first.agent.id).unwrap().len(),
+        MAX_PENDING_TASKS
+    );
+    assert!(futures_util::poll!(overflow.as_mut()).is_pending());
+    let Some(AgentCommand::Request {
+        request: waiting,
+        response,
+        ..
+    }) = coordinator.try_receive()
+    else {
+        panic!("released task capacity lost the waiting request");
+    };
+    assert_eq!(waiting.operation_id, "waiting-spawn");
+    response
+        .send(Ok(serde_json::json!({"admitted":true})))
+        .unwrap();
+    assert_eq!(overflow.await.unwrap()["admitted"], true);
 }

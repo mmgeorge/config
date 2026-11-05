@@ -38,11 +38,19 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 61;
+const SESSION_FORMAT_VERSION: u32 = 64;
 const PREFERENCE_FORMAT_VERSION: u32 = 44;
 
 /// Keeps storage failures explicit at the host boundary, including the configured contention wait.
 pub fn error_message(error: &anyhow::Error) -> String {
+    if let Some(provider) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<crate::provider::ProviderError>())
+    {
+        // Normalized provider errors already render their operation and cause.
+        // Expanding their source chain repeats that same failure at each layer.
+        return provider.to_string();
+    }
     let sqlite = error
         .chain()
         .find_map(|cause| cause.downcast_ref::<rusqlite::Error>());
@@ -155,83 +163,6 @@ impl SqliteStore {
         }
         Ok(owner)
     }
-    /// Records an intent before waiting for execution ownership. Duplicate IDs never replay.
-    pub fn admit_task_operation(&mut self, operation: &crate::task::TaskOperation) -> Result<bool> {
-        let changed = self.connection.execute(
-            "INSERT OR IGNORE INTO task_operation(id,session_id,payload) VALUES(?1,?2,?3)",
-            params![operation.id, operation.session_id, encode(operation)?],
-        )?;
-        if changed == 0 {
-            let previous = self
-                .load_task_operation(&operation.session_id, &operation.id)?
-                .context("operation ID belongs to another conversation")?;
-            anyhow::ensure!(
-                previous.action == operation.action,
-                "operation ID was reused for a different action"
-            );
-        }
-        if changed != 0 {
-            self.publish_admission(&operation.session_id)?;
-        }
-        Ok(changed != 0)
-    }
-
-    /// Claims one admitted intent without allowing duplicate requests to execute it again.
-    pub fn claim_task_operation(&mut self, session_id: &str, id: &str) -> Result<bool> {
-        let changed = self.connection.execute(
-            "UPDATE task_operation SET payload=json_set(payload,'$.state','accepted','$.revision',coalesce(json_extract(payload,'$.revision'),0)+1) WHERE session_id=?1 AND id=?2 AND json_extract(payload,'$.state')='admitted'",
-            params![session_id, id])? == 1;
-        if changed {
-            self.publish_admission(session_id)?;
-        }
-        Ok(changed)
-    }
-
-    /// Queries an intent by its original identity after uncertain delivery.
-    pub fn load_task_operation(
-        &self,
-        session_id: &str,
-        id: &str,
-    ) -> Result<Option<crate::task::TaskOperation>> {
-        self.load_payload(
-            "SELECT payload FROM task_operation WHERE session_id=?1 AND id=?2",
-            params![session_id, id],
-        )
-    }
-
-    /// Publishes a settled intent without dispatching its action again.
-    pub fn save_task_operation(
-        &mut self,
-        operation: &mut crate::task::TaskOperation,
-    ) -> Result<()> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let previous: Option<i64> = transaction.query_row(
-            "SELECT coalesce(json_extract(payload,'$.revision'),0) FROM task_operation WHERE id=?1 AND session_id=?2",
-            params![operation.id,operation.session_id], |row| row.get(0),
-        ).optional()?;
-        let revision = previous.unwrap_or(0) + 1;
-        let mut value = serde_json::to_value(&*operation)?;
-        value["revision"] = serde_json::json!(revision);
-        transaction.execute("INSERT INTO task_operation(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
-            params![operation.id,operation.session_id,encode(&value)?])?;
-        transaction.commit()?;
-        operation.revision = u64::try_from(revision)?;
-        self.publish_admission(&operation.session_id)
-    }
-
-    /// Tests whether a later intent has superseded this pending activation.
-    pub fn latest_task_operation(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<crate::task::TaskOperation>> {
-        self.load_payload(
-            "SELECT payload FROM task_operation WHERE session_id=?1 ORDER BY rowid DESC LIMIT 1",
-            [session_id],
-        )
-    }
-
     /// Opens storage and upgrades its schema only when its persisted version requires it.
     pub fn open(data_root: &Path) -> Result<Self> {
         fs::create_dir_all(data_root)

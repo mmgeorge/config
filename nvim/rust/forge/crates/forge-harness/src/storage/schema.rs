@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, TransactionBehavior};
 
-pub(super) const VERSION: i64 = 7;
+pub(super) const VERSION: i64 = 8;
 const APPLICATION: i64 = 0x464f5247;
 
 /// Serializes bootstrap pragmas across processes before SQLite can acquire its own write lock.
@@ -107,12 +107,6 @@ pub(super) fn initialize(
                 payload TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS task_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS task_operation (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
                 payload TEXT NOT NULL,
@@ -235,7 +229,6 @@ pub(super) fn initialize(
         "CREATE TABLE IF NOT EXISTS model_pin (backend TEXT NOT NULL, model TEXT NOT NULL, PRIMARY KEY(backend,model));
          CREATE TABLE IF NOT EXISTS session_deletion (session_id TEXT PRIMARY KEY REFERENCES session_record(id) ON DELETE CASCADE);
          CREATE INDEX IF NOT EXISTS task_session ON task_record(session_id);
-         CREATE INDEX IF NOT EXISTS task_operation_session ON task_operation(session_id);
          CREATE INDEX IF NOT EXISTS comment_exchange ON exchange_comment(interaction_id);
          CREATE INDEX IF NOT EXISTS plan_session ON plan_record(session_id);
          CREATE INDEX IF NOT EXISTS lifecycle_session ON plan_lifecycle_record(session_id);
@@ -362,6 +355,12 @@ fn initialize_owner_commands(connection: &Connection) -> Result<()> {
             PRIMARY KEY(session_id,id),
             UNIQUE(session_id,sequence)
         );
+        CREATE TABLE IF NOT EXISTS owner_core_log(
+            session_id TEXT NOT NULL REFERENCES session_record(id) ON DELETE CASCADE,
+            sequence INTEGER NOT NULL CHECK(sequence > 0),
+            record TEXT NOT NULL,
+            PRIMARY KEY(session_id,sequence)
+        );
         CREATE TABLE IF NOT EXISTS owner_publication(
             session_id TEXT NOT NULL REFERENCES session_record(id) ON DELETE CASCADE,
             sequence INTEGER NOT NULL CHECK(sequence > 0),
@@ -380,8 +379,7 @@ fn initialize_owner_commands(connection: &Connection) -> Result<()> {
         );
         CREATE TABLE IF NOT EXISTS input_submitted(
             session_id TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(session_id,id)
-        );
-        CREATE TABLE IF NOT EXISTS input_migration(session_id TEXT PRIMARY KEY);",
+        );",
     )?;
     Ok(())
 }

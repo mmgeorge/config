@@ -38,7 +38,7 @@ pub struct ReceivedMessage {
 /// Keep the socket reader alive independently of any RPC or foreground consumer.
 pub struct CodexConnection {
     commands: mpsc::Sender<Command>,
-    received: tokio::sync::Mutex<mpsc::Receiver<ReceivedMessage>>,
+    received: tokio::sync::Mutex<mpsc::UnboundedReceiver<ReceivedMessage>>,
     failure: watch::Receiver<Option<CodexConnectionError>>,
     task: tokio::sync::Mutex<Option<JoinHandle<()>>>,
 }
@@ -64,7 +64,7 @@ impl CodexConnection {
                     source: Arc::new(source),
                 })?;
         let (commands, receive_commands) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
-        let (publish, received) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+        let (publish, received) = mpsc::unbounded_channel();
         let (failure, failures) = watch::channel(None);
         let task = tokio::spawn(async move {
             if let Err(error) = run_socket(socket, receive_commands, publish).await {
@@ -150,7 +150,7 @@ impl Drop for CodexConnection {
 async fn run_socket(
     mut socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     mut commands: mpsc::Receiver<Command>,
-    publish: mpsc::Sender<ReceivedMessage>,
+    publish: mpsc::UnboundedSender<ReceivedMessage>,
 ) -> Result<(), CodexConnectionError> {
     loop {
         tokio::select! {
@@ -188,11 +188,7 @@ async fn run_socket(
                     Message::Close(close) => return Err(CodexConnectionError::Closed(format!("shared Codex app-server closed the session channel: {close:?}"))),
                 };
                 let message = ReceivedMessage { #[cfg(test)] encoded_bytes: encoded.len(), value: serde_json::from_str(&encoded) };
-                match publish.try_send(message) {
-                    Ok(()) => {},
-                    Err(mpsc::error::TrySendError::Full(_)) => return Err(CodexConnectionError::Overflow),
-                    Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
-                }
+                if publish.send(message).is_err() { return Ok(()); }
             },
         }
     }
@@ -285,18 +281,25 @@ mod tests {
         );
     }
 
-    /// A full data queue cannot hide the loss signal, and retained frames still drain in order.
+    /// Retain large output in order and expose connection closure only after the backlog drains.
     #[tokio::test]
-    async fn overflow_is_sticky_after_retained_frames_are_drained() {
+    async fn large_backlog_drains_before_transport_close() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
+        let padding = "x".repeat(forge_protocol::MAX_FRAME_BYTES);
+        let frame_bytes = json!({"sequence":0,"padding":padding}).to_string().len();
+        let retained = 20;
+        assert!(retained * frame_bytes > 8 * 1024 * 1024);
+        let server_padding = padding.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            for sequence in 0..=forge_protocol::MAX_PENDING_FRAMES {
+            for sequence in 0..retained {
                 if socket
                     .send(Message::Text(
-                        json!({"sequence":sequence}).to_string().into(),
+                        json!({"sequence":sequence,"padding":server_padding})
+                            .to_string()
+                            .into(),
                     ))
                     .await
                     .is_err()
@@ -304,7 +307,7 @@ mod tests {
                     break;
                 }
             }
-            let _ = socket.next().await;
+            socket.close(None).await.unwrap();
         });
         let mut connection = CodexConnection::connect(&format!("ws://{address}"))
             .await
@@ -316,19 +319,19 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        for sequence in 0..forge_protocol::MAX_PENDING_FRAMES {
+        for sequence in 0..retained {
             assert_eq!(
                 connection.receive().await.unwrap().value.unwrap(),
-                json!({"sequence":sequence})
+                json!({"sequence":sequence,"padding":padding})
             );
         }
         assert!(matches!(
             connection.receive().await,
-            Err(CodexConnectionError::Overflow)
+            Err(CodexConnectionError::Closed(_))
         ));
         assert!(matches!(
             connection.send("{}".into()).await,
-            Err(CodexConnectionError::Overflow)
+            Err(CodexConnectionError::Closed(_))
         ));
         server.await.unwrap();
     }

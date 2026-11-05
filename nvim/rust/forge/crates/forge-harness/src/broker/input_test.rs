@@ -1,3 +1,16 @@
+use super::super::{
+    ChecklistTracker, ExchangeAdmission, ExchangeNode, ExchangeRuntime, ExchangeState,
+    ForegroundAction, ForegroundCollection, ForegroundDispatch, ForegroundJob, ForegroundSignal,
+    HarnessBroker, NativeForegroundSignal, PromptMode, ProviderAttempt, ProviderCompletion,
+    ProviderError, ProviderEvent, ProviderInput, Request, SessionEventKind, SettlementRequirement,
+    SqliteStore, TimelineEntry, publication,
+};
+use super::test_support::{completed_message, planning_question_broker, repository};
+use anyhow::{Context, Result};
+use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
 #[tokio::test]
 async fn ordinary_input_does_not_activate_a_pending_plan_entry() -> Result<()> {
     let repository = repository();
@@ -50,7 +63,7 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(), data.path(), false);
     broker.checkpoint = None;
-    broker.turn_cancellation.arm(true);
+    broker.turn_cancellation.arm();
     let mut staged = broker.stage_foreground_interaction(
         "finish",
         PromptMode::Chat,
@@ -67,7 +80,6 @@ async fn native_ready_closes_foreground_steering_admission() -> Result<()> {
     transaction.question_enabled = false;
     transaction.agent_command_active = true;
     transaction.execution_open = false;
-    transaction.cleanup_open = false;
     transaction.native.pending_submission = Some(Box::pin(async {
         Ok(ProviderAttempt::Ready(Box::new(Ok(
             ProviderCompletion::default(),
@@ -575,8 +587,12 @@ impl BoundarySteeringProvider {
                     };
                     sink.send_wait(ProviderEvent::SessionIdentity {
                         scope: request.scope.clone().into(),
-                        provider_session_id: "boundary-history".to_owned().try_into().expect("fixture history is nonempty"),
-                    }).await?;
+                        provider_session_id: "boundary-history"
+                            .to_owned()
+                            .try_into()
+                            .expect("fixture history is nonempty"),
+                    })
+                    .await?;
                     sink.send_wait(ProviderEvent::Execution {
                         observation: forge_provider_api::lifecycle::ExecutionObservation::new(
                             request.scope.clone(),
@@ -709,7 +725,7 @@ async fn cancelled_terminal_releases_undispatched_steering_before_retention() ->
     broker.provider = session.provider_handle();
     let lane = broker.parent_input.clone();
     let catalog = broker.provider_catalog_request()?;
-    broker.turn_cancellation().arm(true);
+    broker.turn_cancellation().arm();
     let submission = broker.submission_store.prepare_input(
         &catalog,
         ProviderInput::from_text("Retain café 東京"),
@@ -781,7 +797,7 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
             let lane = broker.parent_input.clone();
             let catalog = broker.provider_catalog_request()?;
             let cancellation = broker.turn_cancellation();
-            cancellation.arm(true);
+            cancellation.arm();
             let journal = crate::provider::submission::SubmissionStore::open(
                 data.path(),
                 broker.trace.clone(),
@@ -811,14 +827,15 @@ async fn deferred_steering_cancellation_preserves_acceptance_boundary() -> Resul
             assert!(futures_util::poll!(steering.as_mut()).is_pending());
             await_boundary_barrier(&provider.steering_deferred, "native steering deferral").await?;
             provider.initial_release.add_permits(1);
-            await_boundary_barrier(&provider.continuation_started, "continuation preparation").await?;
+            await_boundary_barrier(&provider.continuation_started, "continuation preparation")
+                .await?;
             if accept_before_cancel {
                 provider.continuation_accept.add_permits(1);
                 tokio::time::timeout(std::time::Duration::from_secs(3), &mut steering)
                     .await
                     .context("boundary fixture timed out waiting for continuation acceptance")??;
             }
-            cancellation.request(false);
+            cancellation.request();
             let (broker, result) = tokio::time::timeout(std::time::Duration::from_secs(3), running)
                 .await
                 .context("boundary fixture timed out collecting cancelled invocation")??;
@@ -979,10 +996,13 @@ async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<
             anyhow::bail!("slow steering foreground ended before native steering admission: {:?}", finished?);
         }
     }
-    assert!(matches!(
-        submission.record()?.delivery,
-        crate::provider::submission::SubmissionState::Sending { .. }
-    ), "native steering admission did not preserve its unacknowledged transport boundary");
+    assert!(
+        matches!(
+            submission.record()?.delivery,
+            crate::provider::submission::SubmissionState::Sending { .. }
+        ),
+        "native steering admission did not preserve its unacknowledged transport boundary"
+    );
 
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(29)).await;
@@ -993,7 +1013,7 @@ async fn slow_native_steering_keeps_its_delivery_until_acknowledged() -> Result<
     provider.steering_release.add_permits(1);
     let delivered =
         tokio::time::timeout(std::time::Duration::from_secs(1), steering.as_mut()).await;
-    cancellation.request(false);
+    cancellation.request();
     provider.inner.initial_release.add_permits(1);
     let _cancelled = tokio::time::timeout(std::time::Duration::from_secs(10), running)
         .await

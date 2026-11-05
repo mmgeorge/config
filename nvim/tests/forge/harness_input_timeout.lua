@@ -43,7 +43,7 @@ client.request = function(request_specification, callback)
   elseif method == "background.settings" then callback({ revision = 0, settings = request_specification.params.defaults })
   else error(method) end
 end
-controller.configure = function(value, _, completed)
+controller.configure = function(value, completed)
   saved = saved + 1
   local function complete(applied)
     if applied then for key, entry in pairs(value) do configured[key] = entry end end

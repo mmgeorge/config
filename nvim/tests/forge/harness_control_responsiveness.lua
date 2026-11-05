@@ -41,7 +41,7 @@ local success, failure = xpcall(function()
     elseif method == "session.provider.model.list" then callback({})
     else error(method) end
   end
-  controller.configure = function(params, _, completed)
+  controller.configure = function(params, completed)
     configured[#configured + 1] = { params = params, completed = completed }
   end
   settings.open(state, { window_list = { state.composer_win }, control_win = state.composer_win })
@@ -101,7 +101,7 @@ local success, failure = xpcall(function()
   controller.configure = original_configure
   local transition_complete, applied
   controller.task_transition = function(_, _, completed) transition_complete = completed end
-  controller.configure({ effort = "high" }, true, function(result) applied = result end)
+  controller.configure({ effort = "high" }, function(result) applied = result end)
   transition_complete(true)
   assert(applied == true, "successful active configuration was reported as unsuccessful")
   state.busy, state.task_operation = false, nil
@@ -111,8 +111,8 @@ local success, failure = xpcall(function()
     configuration_request[#configuration_request + 1] = { params = action.config, callback = callback }
   end
   local first_applied, second_applied
-  controller.configure({ shell = "system" }, true, function(result) first_applied = result end)
-  controller.configure({ plan_compact = true }, true, function(result) second_applied = result end)
+  controller.configure({ shell = "system" }, function(result) first_applied = result end)
+  controller.configure({ plan_compact = true }, function(result) second_applied = result end)
   assert(#configuration_request == 2 and second_applied == nil)
   state.session.shell = "system"
   configuration_request[1].callback(true)

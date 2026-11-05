@@ -32,7 +32,8 @@ pub(crate) struct ForegroundAdmission {
     pub(crate) command_delivery: Option<PendingProviderDelivery>,
     pub(crate) admission_published: bool,
     task_preparation: Option<(crate::task::TaskPermit, crate::task::ExecutionEntry)>,
-    task_catalog_done: bool,
+    task_model_selection: Option<crate::settings::ValidatedModelSelection>,
+    task_configuration: Option<TaskInvocationConfiguration>,
     task_compaction: Option<TaskCompaction>,
     task_compaction_job: Option<TaskCompactionJob>,
     task_compacted: bool,
@@ -281,7 +282,7 @@ pub(crate) struct QuestionModelCatalogJob {
 
 /// Acquire the exact session execution owner without retaining broker state.
 pub(crate) struct ProviderPrepareJob {
-    cancellation: Arc<TurnCancellation>,
+    cancellation: Arc<TurnCancellationSignal>,
     registry: Arc<crate::provider::session_execution::SessionExecutionRegistry>,
     owner: crate::provider::ExecutionOwner,
 }
@@ -315,8 +316,30 @@ pub(crate) struct StagedInteraction {
     pub(crate) input: ProviderInput,
     pub(crate) submission: Arc<crate::provider::submission::Submission>,
     pub(super) reservation: Option<ForegroundReservation>,
+    task_configuration: Option<TaskInvocationConfiguration>,
     pub(crate) events: Vec<SessionEvent>,
     pub(crate) effects: Vec<AppliedProviderEvent>,
+}
+
+/// Keep executor choices on their selected invocation instead of persisted session defaults.
+struct TaskInvocationConfiguration {
+    model: Option<crate::settings::ValidatedModelSelection>,
+    approval: ApprovalMode,
+}
+
+impl TaskInvocationConfiguration {
+    /// Apply frozen task choices to one request while preserving saved session defaults.
+    fn apply(&self, session: &HarnessSession, request: &mut ProviderRequest) {
+        if let Some(selection) = self.model.as_ref() {
+            let mut selected = session.clone();
+            selection.apply(&mut selected);
+            request.model = selected.model;
+            request.effort = selected.effort;
+            request.context_window = selected.context_window;
+            request.service_tier = selected.service_tier;
+        }
+        request.approval_mode = self.approval;
+    }
 }
 
 /// Retain owner-issued cancellation authority before any native execution future is polled.
@@ -589,7 +612,7 @@ impl HarnessBroker {
         );
         if self
             .turn_cancellation
-            .submission_cancelled
+            .submission_flag()
             .load(Ordering::Acquire)
         {
             return Err(TurnCancelled.into());
@@ -652,7 +675,7 @@ impl HarnessBroker {
     pub(crate) fn prepare_provider_turn_job(&mut self) -> ProviderPrepareJob {
         let registry = self.execution_registry();
         ProviderPrepareJob {
-            cancellation: self.turn_cancellation.clone(),
+            cancellation: self.turn_cancellation.capture(),
             registry,
             owner: crate::provider::ExecutionOwner::root(&self.session.id),
         }
@@ -695,6 +718,7 @@ impl HarnessBroker {
             input,
             submission,
             reservation: None,
+            task_configuration: None,
             events,
             effects,
         })
@@ -845,31 +869,13 @@ impl HarnessBroker {
                     .as_ref()
                     .context("task preparation is missing")?;
                 permit.validate(self.task_controller.current()?.as_ref())?;
-                let model = preparation
-                    .executor
-                    .model
-                    .as_deref()
-                    .context("plan executor model is not configured")?;
-                let effort = preparation
-                    .executor
-                    .effort
-                    .as_deref()
-                    .context("plan executor thinking is not configured")?;
-                let selected = catalog
-                    .iter()
-                    .find(|candidate| candidate.id == model)
-                    .with_context(|| {
-                        format!("plan executor model {model} is unavailable for this provider")
-                    })?;
-                anyhow::ensure!(
-                    selected.reasoning.is_empty()
-                        || selected
-                            .reasoning
-                            .iter()
-                            .any(|candidate| candidate == effort),
-                    "plan executor thinking {effort} is unavailable for model {model}"
-                );
-                admission.task_catalog_done = true;
+                admission.task_model_selection =
+                    Some(crate::settings::ValidatedModelSelection::executor(
+                        &preparation.executor,
+                        self.session.service_tier,
+                        &self.capability,
+                        &catalog,
+                    )?);
                 admission.phase = AdmissionPhase::Prepared;
                 Ok(ForegroundAction::Wait)
             }
@@ -1139,7 +1145,8 @@ impl HarnessBroker {
                 command_delivery: None,
                 admission_published: false,
                 task_preparation: None,
-                task_catalog_done: false,
+                task_model_selection: None,
+                task_configuration: None,
                 task_compaction: None,
                 task_compaction_job: None,
                 task_compacted: false,
@@ -1261,6 +1268,9 @@ impl HarnessBroker {
             input = self.rollback_context(&staged.exchange.id, input)?;
         }
         let mut request = self.provider_request(input, staged.mode)?;
+        if let Some(configuration) = staged.task_configuration.as_ref() {
+            configuration.apply(&self.session, &mut request);
+        }
         request.submission = Some(staged.submission.clone());
         let owner = crate::provider::ExecutionOwner::root(&self.session.id);
         if let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? {
@@ -1285,7 +1295,7 @@ impl HarnessBroker {
             staged.exchange.id.clone(),
             PathBuf::from(&self.session.workspace),
             policy.clone(),
-            Arc::clone(&self.turn_cancellation.requested),
+            self.turn_cancellation.requested_flag(),
             Arc::clone(&self.repositories),
             Arc::clone(&self.diff),
         )?;
@@ -1298,7 +1308,7 @@ impl HarnessBroker {
                 .open()
                 .0,
             policy.clone(),
-            Arc::clone(&self.turn_cancellation.requested),
+            self.turn_cancellation.requested_flag(),
             self.trace.clone(),
         )?;
         let (lsp, lsp_lease) = self.lsp.scope(
@@ -1306,7 +1316,7 @@ impl HarnessBroker {
             staged.exchange.id.clone(),
             PathBuf::from(&self.session.workspace),
             policy,
-            self.turn_cancellation.requested.clone(),
+            self.turn_cancellation.subscribe(),
         );
         if let Some(context) = &mut request.control_context {
             context.lsp = Some(lsp);
@@ -1778,7 +1788,7 @@ impl HarnessBroker {
                         .expect("preparation captured");
                     captured.validate(Some(&task))?;
                     anyhow::ensure!(saved == &preparation, "task execution preparation changed");
-                    if preparation.executor.enabled && !admission.task_catalog_done {
+                    if preparation.executor.enabled && admission.task_model_selection.is_none() {
                         anyhow::ensure!(
                             self.capability.model_selection,
                             "current provider does not support model selection"
@@ -1805,22 +1815,19 @@ impl HarnessBroker {
                             delivery,
                         )));
                     }
-                    if preparation.executor.enabled {
-                        self.session.model = preparation
-                            .executor
-                            .model
-                            .clone()
-                            .context("executor model is missing")?;
-                        self.session.resolved_model = Some(self.session.model.clone());
-                        self.session.effort = preparation
-                            .executor
-                            .effort
-                            .clone()
-                            .context("executor thinking is missing")?;
-                        self.session.context_window = None;
-                    }
-                    self.session.approval_mode = preparation.approval_mode;
-                    self.save_session()?;
+                    admission.task_configuration = Some(TaskInvocationConfiguration {
+                        model: if preparation.executor.enabled {
+                            Some(
+                                admission
+                                    .task_model_selection
+                                    .take()
+                                    .context("executor model selection is not prepared")?,
+                            )
+                        } else {
+                            None
+                        },
+                        approval: preparation.approval_mode,
+                    });
                     self.task_controller.apply(
                         &mut self.store,
                         &permit,
@@ -1844,6 +1851,7 @@ impl HarnessBroker {
             if !admission.attachments.is_empty() {
                 staged.input = staged.input.with_attachments(admission.attachments.clone());
             }
+            staged.task_configuration = admission.task_configuration.take();
             admission.staged_interaction = Some(staged);
         }
         if !admission.admission_published {
@@ -2286,6 +2294,72 @@ impl HarnessBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SessionStore;
+
+    /// Executor configuration affects one invocation and cannot replace ordinary or reloaded defaults.
+    #[test]
+    fn task_invocation_configuration_preserves_session_defaults_after_reload() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let before = broker.session.clone();
+        let catalog = vec![crate::provider::ProviderModel {
+            id: "task-executor".into(),
+            reasoning: vec!["high".into()],
+            service_tiers: vec![crate::provider::ServiceTier::Standard],
+            default_reasoning: None,
+            selected_reasoning: None,
+            context_window: Vec::new(),
+            default_context_window: None,
+            selected_context_window: None,
+            vision: false,
+            description: None,
+            is_default: true,
+        }];
+        let capability = crate::provider::ProviderCapability {
+            model_selection: true,
+            effort_selection: true,
+            ..Default::default()
+        };
+        let model = crate::settings::ValidatedModelSelection::executor(
+            &crate::session::PlanExecutor {
+                enabled: true,
+                model: Some("task-executor".into()),
+                effort: Some("high".into()),
+            },
+            crate::provider::ServiceTier::Standard,
+            &capability,
+            &catalog,
+        )?;
+        let configuration = TaskInvocationConfiguration {
+            model: Some(model),
+            approval: ApprovalMode::Allow,
+        };
+        let mut task =
+            broker.provider_request(ProviderInput::from_text("task input"), PromptMode::Chat)?;
+        configuration.apply(&broker.session, &mut task);
+        assert_eq!(task.model, "task-executor");
+        assert_eq!(task.effort, "high");
+        assert_eq!(task.approval_mode, ApprovalMode::Allow);
+        let ordinary = broker
+            .provider_request(ProviderInput::from_text("ordinary input"), PromptMode::Chat)?;
+        assert_eq!(ordinary.model, before.model);
+        assert_eq!(ordinary.effort, before.effort);
+        assert_eq!(ordinary.approval_mode, before.approval_mode);
+        broker.save_session()?;
+        let reloaded = broker
+            .store
+            .load_session(&before.id)?
+            .context("saved session missing")?;
+        assert_eq!(reloaded.model, before.model);
+        assert_eq!(reloaded.resolved_model, before.resolved_model);
+        assert_eq!(reloaded.effort, before.effort);
+        assert_eq!(reloaded.approval_mode, before.approval_mode);
+        assert_eq!(reloaded.service_tier, before.service_tier);
+        assert_eq!(reloaded.context_window, before.context_window);
+        Ok(())
+    }
 
     /// Cancel exact retained preparation before any foreground or Execute future is polled.
     #[tokio::test]

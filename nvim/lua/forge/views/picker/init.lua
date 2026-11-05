@@ -1002,6 +1002,7 @@ function Picker.close(notify)
   close_input(instance)
   close_search(instance)
   popup_window.close(instance.win)
+  if instance.spec.on_dispose then instance.spec.on_dispose() end
   if notify ~= false and instance.spec.on_close then instance.spec.on_close(resume) end
 end
 

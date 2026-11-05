@@ -117,12 +117,8 @@ pub(super) async fn forward_signal(
 /// Retain a publication result even when an owned effect panics.
 pub(super) async fn run_foreground_job(
     job: crate::broker::ForegroundJob,
-    publication: bool,
-) -> (bool, Result<crate::broker::ForegroundSignal>) {
+) -> Result<crate::broker::ForegroundSignal> {
     use futures_util::FutureExt;
     let result = std::panic::AssertUnwindSafe(job.run()).catch_unwind().await;
-    (
-        publication,
-        result.unwrap_or_else(|_| Err(anyhow::anyhow!("foreground effect task panicked"))),
-    )
+    result.unwrap_or_else(|_| Err(anyhow::anyhow!("foreground effect task panicked")))
 }

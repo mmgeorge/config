@@ -76,6 +76,13 @@ struct InvocationCollection {
     >,
 }
 
+/// Select when the owner freezes the invocation targeted by collection.
+#[derive(Clone, Copy)]
+enum TargetCapture {
+    Admission,
+    Acquisition,
+}
+
 /// Keep legacy admission and child resource gates owned until cancellation settles.
 pub(super) struct ControlOwnership {
     control: Option<OwnedSemaphorePermit>,
@@ -89,11 +96,68 @@ pub(super) struct ExchangeTransition {
     stage: TransitionStage,
     generation: Option<ProviderGenerationPermit>,
     invocation: Option<InvocationCollection>,
+    target_capture: TargetCapture,
     uncommitted: Option<TransitionEvent>,
     foreground_signals: std::collections::VecDeque<crate::broker::ForegroundSignal>,
+    reporting: TransitionReporting,
 }
 
 impl ExchangeTransition {
+    /// Correlate retained cleanup evidence without exposing provider payloads or writable state.
+    pub(super) fn core_transition(
+        &self,
+        kind: super::core_log::CoreTransitionKind,
+        outcome: super::core_log::CoreOutcome,
+    ) -> super::core_log::CoreRecord {
+        super::core_log::CoreRecord::TransitionCommitted {
+            command: match &self.id {
+                TransitionIdentity::Command(id) => Some(id.clone()),
+                TransitionIdentity::Shutdown(_) | TransitionIdentity::Input(_) => None,
+            },
+            invocation: self
+                .invocation
+                .as_ref()
+                .map(|invocation| invocation.scope.clone()),
+            kind,
+            outcome,
+        }
+    }
+
+    /// Freeze the exact cancellation target before asynchronous control acquisition can time out.
+    pub(super) fn pin_cancellation_target(
+        &mut self,
+        foreground: &ForegroundStatus,
+        broker: &mut HarnessBroker,
+        session: &str,
+    ) -> Result<(), TransitionFailure> {
+        self.target_capture = TargetCapture::Admission;
+        let owner = crate::provider::ExecutionOwner::root(session);
+        let engine = broker
+            .execution_registry()
+            .existing_owner(&owner)
+            .map_err(|error| TransitionFailure::Domain(error.into()))?;
+        let Some(engine) = engine else {
+            if matches!(foreground, ForegroundStatus::Active(_)) {
+                return Err(TransitionFailure::Uncertain);
+            }
+            return Ok(());
+        };
+        let scope = match foreground {
+            ForegroundStatus::Active(scope) => Some(scope.clone()),
+            ForegroundStatus::Local
+            | ForegroundStatus::Quiescent
+            | ForegroundStatus::Unavailable => engine
+                .active_invocation_scope()
+                .map_err(|error| TransitionFailure::Domain(error.into()))?,
+        };
+        self.invocation = scope.map(|scope| InvocationCollection {
+            engine,
+            scope,
+            collection: Default::default(),
+        });
+        Ok(())
+    }
+
     /// Authorize a configured successor only after this exact reconfiguration has drained.
     pub(super) fn authorize_replacement(
         &self,
@@ -146,12 +210,32 @@ impl ExchangeTransition {
         generation: Option<ProviderGenerationPermit>,
         admitted_control: Option<OwnedSemaphorePermit>,
     ) -> Self {
+        Self::start_at(
+            id,
+            intent,
+            services,
+            generation,
+            admitted_control,
+            tokio::time::Instant::now(),
+        )
+    }
+
+    /// Preserve the active command admission boundary through every asynchronous phase.
+    pub(super) fn start_at(
+        id: CommandId,
+        intent: TransitionIntent,
+        services: &OwnerServices,
+        generation: Option<ProviderGenerationPermit>,
+        admitted_control: Option<OwnedSemaphorePermit>,
+        admitted_at: tokio::time::Instant,
+    ) -> Self {
         Self::begin(
             TransitionIdentity::Command(id),
             intent,
             services,
             generation,
             admitted_control,
+            admitted_at,
         )
     }
 
@@ -163,6 +247,7 @@ impl ExchangeTransition {
             services,
             None,
             None,
+            tokio::time::Instant::now(),
         )
     }
 
@@ -180,6 +265,7 @@ impl ExchangeTransition {
             services,
             generation,
             admitted_control,
+            tokio::time::Instant::now(),
         )
     }
 
@@ -190,7 +276,9 @@ impl ExchangeTransition {
         services: &OwnerServices,
         generation: Option<ProviderGenerationPermit>,
         admitted_control: Option<OwnedSemaphorePermit>,
+        admitted_at: tokio::time::Instant,
     ) -> Self {
+        let reporting = TransitionReporting::new(&id, intent, admitted_at);
         let control = services.control.clone();
         let children = services.children.clone();
         let worker_id = id.clone();
@@ -198,14 +286,9 @@ impl ExchangeTransition {
         let task = tokio::spawn(async move {
             let control = match admitted_control {
                 Some(control) => control,
-                None => match tokio::time::timeout(
-                    std::time::Duration::from_secs(60),
-                    control.acquire_owned(),
-                )
-                .await
-                {
-                    Ok(Ok(control)) => control,
-                    Ok(Err(_)) | Err(_) => return Acquisition::Unavailable,
+                None => match control.acquire_owned().await {
+                    Ok(control) => control,
+                    Err(_) => return Acquisition::Unavailable,
                 },
             };
             let ownership = ControlOwnership {
@@ -220,7 +303,7 @@ impl ExchangeTransition {
             {
                 return Acquisition::Ready(ownership);
             }
-            let result = tokio::time::timeout(std::time::Duration::from_secs(35), async {
+            let result = async {
                 let mut changed = children.activity();
                 children
                     .sender()
@@ -234,11 +317,11 @@ impl ExchangeTransition {
                     changed.changed().await?;
                 }
                 Ok::<(), anyhow::Error>(())
-            })
+            }
             .await;
             match result {
-                Ok(Ok(())) => Acquisition::Ready(ownership),
-                Ok(Err(_)) | Err(_) => Acquisition::Uncertain(ownership),
+                Ok(()) => Acquisition::Ready(ownership),
+                Err(_) => Acquisition::Uncertain(ownership),
             }
         });
         Self {
@@ -247,8 +330,10 @@ impl ExchangeTransition {
             stage: TransitionStage::Acquiring(task),
             generation,
             invocation: None,
+            target_capture: TargetCapture::Acquisition,
             uncommitted: None,
             foreground_signals: std::collections::VecDeque::new(),
+            reporting,
         }
     }
 
@@ -259,30 +344,43 @@ impl ExchangeTransition {
 
     /// Await identified facts while the driver keeps processing native events and queued intent.
     pub(super) async fn next(&mut self, foreground: ForegroundStatus) -> TransitionEvent {
+        let report_at = self.reporting.next_at();
+        tokio::select! {
+            biased;
+            event = self.next_stage(foreground) => event,
+            () = tokio::time::sleep_until(report_at) => self.reporting.event(),
+        }
+    }
+
+    /// Prefer already available authoritative facts over an elapsed reporting boundary.
+    async fn next_stage(&mut self, foreground: ForegroundStatus) -> TransitionEvent {
         match &mut self.stage {
             TransitionStage::Acquiring(task) => {
                 TransitionEvent::Acquired(task.await.unwrap_or(Acquisition::ObservationLost))
             }
-            TransitionStage::Collecting { task, deadline, .. } => tokio::select! {
-                result = task => TransitionEvent::Collected(result.unwrap_or(Err(ProviderError::DeliveryUncertain))),
-                () = tokio::time::sleep_until(*deadline) => TransitionEvent::CollectionDeadline,
-            },
-            TransitionStage::Draining { deadline, .. } => match foreground {
+            TransitionStage::Collecting { task, .. } => TransitionEvent::Collected(
+                task.await.unwrap_or(Err(ProviderError::DeliveryUncertain)),
+            ),
+            TransitionStage::Draining { .. } => match foreground {
                 ForegroundStatus::Active(_) | ForegroundStatus::Local => {
-                    tokio::time::sleep_until(*deadline).await;
-                    TransitionEvent::CollectionDeadline
+                    std::future::pending().await
                 }
                 ForegroundStatus::Quiescent => TransitionEvent::ForegroundSettled,
                 ForegroundStatus::Unavailable => TransitionEvent::ForegroundUnavailable,
             },
-            TransitionStage::Settling { job, deadline, .. } => tokio::select! {
-                event = async { match job {
+            TransitionStage::Settling { job, .. } => match job {
                 SettlementJob::Advance => TransitionEvent::AdvanceSettlement,
-                SettlementJob::Observation(task) => TransitionEvent::Observed(task.await.unwrap_or_else(|error| Err(error.into()))),
-                SettlementJob::Initial(task) => TransitionEvent::Initial(task.await.unwrap_or_else(|error| Err(error.into()))),
-                SettlementJob::Final(task) => TransitionEvent::Final(task.await.unwrap_or_else(|error| Err(error.into())).map(Box::new)),
-                } } => event,
-                () = tokio::time::sleep_until(*deadline) => TransitionEvent::CollectionDeadline,
+                SettlementJob::Observation(task) => {
+                    TransitionEvent::Observed(task.await.unwrap_or_else(|error| Err(error.into())))
+                }
+                SettlementJob::Initial(task) => {
+                    TransitionEvent::Initial(task.await.unwrap_or_else(|error| Err(error.into())))
+                }
+                SettlementJob::Final(task) => TransitionEvent::Final(
+                    task.await
+                        .unwrap_or_else(|error| Err(error.into()))
+                        .map(Box::new),
+                ),
             },
             TransitionStage::Preparing { .. }
             | TransitionStage::Ready { .. }
@@ -330,11 +428,12 @@ impl ExchangeTransition {
                 self.stage = TransitionStage::Preparing { ownership };
                 let view: crate::broker::ExchangeControlView =
                     broker.owner_control_view().map_err(transition_failure)?;
-                let restore = matches!(
-                    self.intent.input(),
-                    CancelledInputPolicy::RestoreIfUnconsumed
-                );
                 let input = match self.intent {
+                    TransitionIntent::Cancel(_)
+                        if matches!(self.target_capture, TargetCapture::Admission) =>
+                    {
+                        None
+                    }
                     TransitionIntent::Cancel(_) => {
                         let command = match &self.id {
                             TransitionIdentity::Command(id) => Some(id.as_str()),
@@ -373,20 +472,22 @@ impl ExchangeTransition {
                     | ForegroundStatus::Quiescent
                     | ForegroundStatus::Unavailable => view.steering_scope.clone(),
                 };
-                self.invocation = scope
-                    .map(|scope| {
-                        let engine = broker
-                            .execution_registry()
-                            .existing_owner(&scope.owner)
-                            .map_err(|error| TransitionFailure::Domain(error.into()))?
-                            .ok_or(TransitionFailure::Uncertain)?;
-                        Ok::<_, TransitionFailure>(InvocationCollection {
-                            engine,
-                            scope,
-                            collection: Default::default(),
+                if matches!(self.target_capture, TargetCapture::Acquisition) {
+                    self.invocation = scope
+                        .map(|scope| {
+                            let engine = broker
+                                .execution_registry()
+                                .existing_owner(&scope.owner)
+                                .map_err(|error| TransitionFailure::Domain(error.into()))?
+                                .ok_or(TransitionFailure::Uncertain)?;
+                            Ok::<_, TransitionFailure>(InvocationCollection {
+                                engine,
+                                scope,
+                                collection: Default::default(),
+                            })
                         })
-                    })
-                    .transpose()?;
+                        .transpose()?;
+                }
                 let native = matches!(
                     foreground,
                     ForegroundStatus::Active(_) | ForegroundStatus::Local
@@ -397,17 +498,14 @@ impl ExchangeTransition {
                     self.foreground_signals.push_back(
                         crate::broker::ForegroundSignal::CollectionStarted(match self.intent {
                             TransitionIntent::Cancel(_) => {
-                                crate::broker::ForegroundCollection::Cancel
+                                crate::broker::ForegroundCollection::Cancel(self.intent.input())
                             }
                             TransitionIntent::Reconfigure { .. } => {
                                 crate::broker::ForegroundCollection::Restart
                             }
                         }),
                     );
-                    if let Err(error) = services.cancellation.begin_cleanup(restore) {
-                        self.stage = TransitionStage::Preparing { ownership };
-                        return Err(TransitionFailure::Domain(error));
-                    }
+                    services.cancellation.block_submissions();
                     let services = services.clone();
                     let children = self.intent.children();
                     let generation = self.generation.clone();
@@ -419,13 +517,11 @@ impl ExchangeTransition {
                         target: view.selection,
                         ownership,
                         task,
-                        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
                     };
                 } else {
                     self.stage = TransitionStage::Draining {
                         target: view.selection,
                         ownership,
-                        deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
                     };
                 }
                 Ok(TransitionProgress::Waiting {
@@ -448,7 +544,6 @@ impl ExchangeTransition {
                 self.stage = TransitionStage::Draining {
                     target: target.clone(),
                     ownership,
-                    deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
                 };
                 let events = broker
                     .owner_collection_completed(
@@ -459,7 +554,9 @@ impl ExchangeTransition {
                     .map_err(transition_failure)?;
                 self.foreground_signals.push_back(
                     crate::broker::ForegroundSignal::CollectionCompleted(match self.intent {
-                        TransitionIntent::Cancel(_) => crate::broker::ForegroundCollection::Cancel,
+                        TransitionIntent::Cancel(_) => {
+                            crate::broker::ForegroundCollection::Cancel(self.intent.input())
+                        }
                         TransitionIntent::Reconfigure { .. } => {
                             crate::broker::ForegroundCollection::Restart
                         }
@@ -486,6 +583,27 @@ impl ExchangeTransition {
                 };
                 Err(TransitionFailure::Uncertain)
             }
+            TransitionEvent::CollectionPending => {
+                self.reporting.pending_published = true;
+                let policy = self
+                    .reporting
+                    .policy
+                    .expect("pending reports require a cleanup policy");
+                let update = crate::broker::publication::SessionUpdate::CleanupProgress {
+                    operation_id: self.id.operation_id(),
+                    policy,
+                    progress: forge_provider_api::CleanupProgress::Pending,
+                };
+                let event = crate::broker::publication::encode_session_event(
+                    services.observer.session_id(),
+                    &update,
+                )
+                .map_err(|error| TransitionFailure::Domain(error.into()))?;
+                Ok(TransitionProgress::Waiting {
+                    events: vec![event],
+                    input: None,
+                })
+            }
             TransitionEvent::CollectionDeadline => Err(TransitionFailure::Overdue),
             TransitionEvent::ForegroundUnavailable => Err(TransitionFailure::Uncertain),
             TransitionEvent::ForegroundSettled => {
@@ -495,7 +613,7 @@ impl ExchangeTransition {
                         return Err(TransitionFailure::Uncertain);
                     }
                 };
-                services.cancellation.arm(false);
+                services.cancellation.arm();
                 if matches!(self.intent, TransitionIntent::Reconfigure { .. }) {
                     let view = broker.owner_control_view().map_err(transition_failure)?;
                     if target.is_some()
@@ -553,11 +671,8 @@ impl ExchangeTransition {
                 } else {
                     None
                 };
-                let TransitionStage::Draining {
-                    ownership,
-                    deadline,
-                    ..
-                } = std::mem::replace(&mut self.stage, TransitionStage::Consumed)
+                let TransitionStage::Draining { ownership, .. } =
+                    std::mem::replace(&mut self.stage, TransitionStage::Consumed)
                 else {
                     unreachable!("local cancellation retained its ownership through commit")
                 };
@@ -568,7 +683,6 @@ impl ExchangeTransition {
                             ownership,
                             prior: Box::new(prior),
                             job: SettlementJob::Advance,
-                            deadline,
                         }
                     }
                     None => {
@@ -620,6 +734,7 @@ impl ExchangeTransition {
                     }
                     TransitionEvent::Acquired(_)
                     | TransitionEvent::Collected(_)
+                    | TransitionEvent::CollectionPending
                     | TransitionEvent::CollectionDeadline
                     | TransitionEvent::ForegroundSettled
                     | TransitionEvent::ForegroundUnavailable => {
@@ -838,12 +953,7 @@ impl RetainedTransition {
                         target, ownership, ..
                     } = std::mem::replace(&mut self.stage, TransitionStage::Consumed)
                     {
-                        self.stage = TransitionStage::Draining {
-                            target,
-                            ownership,
-                            deadline: tokio::time::Instant::now()
-                                + std::time::Duration::from_secs(60),
-                        };
+                        self.stage = TransitionStage::Draining { target, ownership };
                     }
                 }
                 event @ (TransitionEvent::Observed(_)
@@ -854,7 +964,8 @@ impl RetainedTransition {
                     }
                     self.uncommitted = Some(event);
                 }
-                TransitionEvent::CollectionDeadline
+                TransitionEvent::CollectionPending
+                | TransitionEvent::CollectionDeadline
                 | TransitionEvent::ForegroundSettled
                 | TransitionEvent::ForegroundUnavailable
                 | TransitionEvent::AdvanceSettlement => {}
@@ -912,11 +1023,7 @@ impl RetainedTransition {
                         "joined collection still retains its original target and ownership"
                     )
                 };
-                self.stage = TransitionStage::Draining {
-                    target,
-                    ownership,
-                    deadline: tokio::time::Instant::now() + std::time::Duration::from_secs(60),
-                };
+                self.stage = TransitionStage::Draining { target, ownership };
                 result
             }
             TransitionStage::Uncertain { .. }
@@ -956,7 +1063,9 @@ impl RetainedTransition {
     /// Report actual retained collection to the same foreground reducer as normal completion.
     pub(super) fn collection_completed_signal(&self) -> crate::broker::ForegroundSignal {
         crate::broker::ForegroundSignal::CollectionCompleted(match self.intent {
-            TransitionIntent::Cancel(_) => crate::broker::ForegroundCollection::Cancel,
+            TransitionIntent::Cancel(_) => {
+                crate::broker::ForegroundCollection::Cancel(self.intent.input())
+            }
             TransitionIntent::Reconfigure { .. } => crate::broker::ForegroundCollection::Restart,
         })
     }
@@ -1053,6 +1162,8 @@ pub(super) enum TransitionEvent {
     Acquired(Acquisition),
     /// Completed native, approval, check, and child collection attempt.
     Collected(Result<(), ProviderError>),
+    /// Publish one nonterminal notice without releasing cleanup ownership.
+    CollectionPending,
     /// The owned job remains retained after its observation deadline elapsed.
     CollectionDeadline,
     /// The driver has no remaining foreground transaction or prepared work.
@@ -1081,6 +1192,61 @@ pub(super) enum Acquisition {
     ObservationLost,
 }
 
+/// Keep one command's response clock separate from the lifetime of its cleanup workers.
+struct TransitionReporting {
+    admitted_at: tokio::time::Instant,
+    policy: Option<forge_provider_api::CleanupPolicy>,
+    pending_published: bool,
+}
+
+impl TransitionReporting {
+    /// Capture the operation policy once before any acquisition or collection work starts.
+    fn new(
+        id: &TransitionIdentity,
+        intent: TransitionIntent,
+        admitted_at: tokio::time::Instant,
+    ) -> Self {
+        let policy = match (id, intent) {
+            (TransitionIdentity::Shutdown(_), _) => Some(forge_provider_api::CleanupPolicy::Close),
+            (_, TransitionIntent::Cancel(_)) => {
+                Some(forge_provider_api::CleanupPolicy::Cancellation)
+            }
+            (_, TransitionIntent::Reconfigure { .. }) => None,
+        };
+        Self {
+            admitted_at,
+            policy,
+            pending_published: false,
+        }
+    }
+
+    /// Get the original response boundary without resetting it at a phase transition.
+    fn response_at(&self) -> tokio::time::Instant {
+        self.admitted_at
+            + self
+                .policy
+                .map_or(std::time::Duration::from_secs(30), |policy| {
+                    policy.response_after()
+                })
+    }
+
+    /// Get the next unpublished report while preserving the command's original deadline.
+    fn next_at(&self) -> tokio::time::Instant {
+        match self.policy {
+            Some(policy) if !self.pending_published => self.admitted_at + policy.pending_after(),
+            Some(_) | None => self.response_at(),
+        }
+    }
+
+    /// Observe the elapsed reporting boundary without deciding native settlement.
+    fn event(&self) -> TransitionEvent {
+        if tokio::time::Instant::now() >= self.response_at() {
+            return TransitionEvent::CollectionDeadline;
+        }
+        TransitionEvent::CollectionPending
+    }
+}
+
 enum TransitionStage {
     Acquiring(tokio::task::JoinHandle<Acquisition>),
     Preparing {
@@ -1090,19 +1256,16 @@ enum TransitionStage {
         target: Option<crate::broker::ExchangeControlSelection>,
         ownership: ControlOwnership,
         task: tokio::task::JoinHandle<Result<(), ProviderError>>,
-        deadline: tokio::time::Instant,
     },
     Draining {
         target: Option<crate::broker::ExchangeControlSelection>,
         ownership: ControlOwnership,
-        deadline: tokio::time::Instant,
     },
     Settling {
         target: Option<crate::broker::ExchangeControlSelection>,
         ownership: ControlOwnership,
         prior: Box<PriorFinalization>,
         job: SettlementJob,
-        deadline: tokio::time::Instant,
     },
     Ready {
         _ownership: ControlOwnership,
@@ -1121,11 +1284,53 @@ enum SettlementJob {
 }
 
 impl TransitionEvent {
+    /// Identify lifecycle evidence independently of its diagnostic label.
+    pub(super) fn core_transition(
+        &self,
+    ) -> Option<(
+        super::core_log::CoreTransitionKind,
+        super::core_log::CoreOutcome,
+    )> {
+        use super::core_log::{CoreOutcome, CoreTransitionKind};
+        match self {
+            Self::Acquired(Acquisition::Ready(_)) => {
+                Some((CoreTransitionKind::CollectionStarted, CoreOutcome::Pending))
+            }
+            Self::Collected(Ok(())) => {
+                Some((CoreTransitionKind::Collected, CoreOutcome::Succeeded))
+            }
+            Self::Collected(Err(_)) | Self::ForegroundUnavailable => Some((
+                CoreTransitionKind::CollectionFailed,
+                CoreOutcome::ObservationLost,
+            )),
+            Self::CollectionPending => Some((
+                CoreTransitionKind::CancellationPending,
+                CoreOutcome::Pending,
+            )),
+            Self::CollectionDeadline => Some((
+                CoreTransitionKind::CancellationTimedOut,
+                CoreOutcome::TimedOut,
+            )),
+            Self::ForegroundSettled => Some((
+                CoreTransitionKind::ForegroundSettled,
+                CoreOutcome::Succeeded,
+            )),
+            Self::Acquired(
+                Acquisition::Unavailable | Acquisition::ObservationLost | Acquisition::Uncertain(_),
+            )
+            | Self::AdvanceSettlement
+            | Self::Observed(_)
+            | Self::Initial(_)
+            | Self::Final(_) => None,
+        }
+    }
+
     /// Get the finite log label without exposing provider or caller payloads.
     pub(super) fn name(&self) -> &'static str {
         match self {
             Self::Acquired(_) => "ownership_acquired",
             Self::Collected(_) => "native_collected",
+            Self::CollectionPending => "collection_pending",
             Self::CollectionDeadline => "collection_deadline",
             Self::ForegroundSettled => "foreground_settled",
             Self::ForegroundUnavailable => "foreground_unavailable",
@@ -1228,5 +1433,97 @@ fn transition_failure(error: anyhow::Error) -> TransitionFailure {
         TransitionFailure::Uncertain
     } else {
         TransitionFailure::Domain(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    /// Keep resource acquisition alive across pending and timeout observation, then collect its late result.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_reporting_retains_acquisition_at_original_deadline() {
+        let admitted_at = Instant::now();
+        let id = TransitionIdentity::Command(CommandId::new("cancel-clock").unwrap());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let released = release.clone();
+        let task = tokio::spawn(async move {
+            released.notified().await;
+            Acquisition::Unavailable
+        });
+        let mut transition = ExchangeTransition {
+            id: id.clone(),
+            intent: TransitionIntent::Cancel(CancelledInputPolicy::Retain),
+            stage: TransitionStage::Acquiring(task),
+            generation: None,
+            invocation: None,
+            target_capture: TargetCapture::Acquisition,
+            uncommitted: None,
+            foreground_signals: std::collections::VecDeque::new(),
+            reporting: TransitionReporting::new(
+                &id,
+                TransitionIntent::Cancel(CancelledInputPolicy::Retain),
+                admitted_at,
+            ),
+        };
+        assert!(matches!(
+            transition.next(ForegroundStatus::Local).await,
+            TransitionEvent::CollectionPending
+        ));
+        assert_eq!(Instant::now() - admitted_at, Duration::from_secs(10));
+        transition.reporting.pending_published = true;
+        assert!(matches!(
+            transition.next(ForegroundStatus::Local).await,
+            TransitionEvent::CollectionDeadline
+        ));
+        assert_eq!(Instant::now() - admitted_at, Duration::from_secs(30));
+        let mut retained = transition.into_retained();
+        let TransitionStage::Acquiring(task) = &mut retained.stage else {
+            panic!("acquisition must remain owned")
+        };
+        assert!(!task.is_finished());
+        release.notify_one();
+        assert!(matches!(task.await.unwrap(), Acquisition::Unavailable));
+    }
+
+    /// A phase change must consume the original budget; completed work wins a simultaneous deadline.
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_phase_change_does_not_restart_reporting_and_completion_wins() {
+        let admitted_at = Instant::now();
+        let id = TransitionIdentity::Command(CommandId::new("cancel-phase-clock").unwrap());
+        let mut transition = ExchangeTransition {
+            id: id.clone(),
+            intent: TransitionIntent::Cancel(CancelledInputPolicy::Retain),
+            stage: TransitionStage::Draining {
+                target: None,
+                ownership: ControlOwnership {
+                    control: None,
+                    _children: None,
+                },
+            },
+            generation: None,
+            invocation: None,
+            target_capture: TargetCapture::Acquisition,
+            uncommitted: None,
+            foreground_signals: std::collections::VecDeque::new(),
+            reporting: TransitionReporting::new(
+                &id,
+                TransitionIntent::Cancel(CancelledInputPolicy::Retain),
+                admitted_at,
+            ),
+        };
+        tokio::time::advance(Duration::from_secs(20)).await;
+        transition.reporting.pending_published = true;
+        assert!(matches!(
+            transition.next(ForegroundStatus::Local).await,
+            TransitionEvent::CollectionDeadline
+        ));
+        assert_eq!(Instant::now() - admitted_at, Duration::from_secs(30));
+        assert!(matches!(
+            transition.next(ForegroundStatus::Quiescent).await,
+            TransitionEvent::ForegroundSettled
+        ));
     }
 }

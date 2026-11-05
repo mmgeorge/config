@@ -1,14 +1,14 @@
 use super::*;
 
 /// Create an unfinished, persisted source without introducing a native provider protocol into these tests.
-pub(super) fn fixture() -> Result<(tempfile::TempDir, Arc<SessionController>, String)> {
+pub(super) async fn fixture() -> Result<(tempfile::TempDir, Arc<SessionController>, String)> {
     let root = tempfile::tempdir()?;
     let controller = SessionController::new(HarnessBroker::initialize(serde_json::from_value(
         json!({
             "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"question-owner-events",
             "provider":{"kind":"mock","command":[]},
         }),
-    )?)?)?;
+    )?)?).await?;
     let session = controller.observer.session_id();
     let exchange = crate::exchange::Exchange {
         finalization_error: None,
@@ -85,7 +85,7 @@ pub(super) fn creation(
 #[tokio::test]
 async fn waiting_question_owner_publishes_before_barrier_and_allows_revision_and_answer()
 -> Result<()> {
-    let (_root, controller, exchange) = fixture()?;
+    let (_root, controller, exchange) = fixture().await?;
     let executor = crate::tools::ControlToolExecutor::new(context(&controller, &exchange));
     let broker = controller.broker.lock().await;
     let (barrier, published) = tokio::sync::oneshot::channel();
@@ -152,10 +152,51 @@ async fn waiting_question_owner_publishes_before_barrier_and_allows_revision_and
     Ok(())
 }
 
+/// Cancelling an admitted question wait still returns a publishable, owned tool outcome.
+#[tokio::test]
+async fn cancelled_question_wait_retains_its_tool_outcome_until_publication() -> Result<()> {
+    let (_root, controller, exchange) = fixture().await?;
+    let mut context = context(&controller, &exchange);
+    // Exercise the executor's cancellation outcome with the local question
+    // controller; authenticated owner routing is covered by live session tests.
+    context.question_events = None;
+    let executor = crate::tools::ControlToolExecutor::new(context);
+    let broker = controller.broker.lock().await;
+    let (barrier, published) = tokio::sync::oneshot::channel();
+    let mut waiting = Box::pin(executor.execute_with_barrier(crate::tools::ControlToolInvocation {
+        call_id: Some(forge_provider_api::control::ToolCallId::new("cancelled-question-wait")?),
+        task_permit: None,
+        name: "question_ask".into(),
+        arguments: json!({"wait":true,"questions":[{"header":"Scope","question":"Which scope?","options":[]}]}),
+    }, Some(barrier)));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            result = waiting.as_mut() => anyhow::bail!("wait returned before cancellation: {result:?}"),
+            ready = published => ready.context("question publication barrier was lost"),
+        }
+    }).await??;
+    executor.cancel();
+    let outcome = tokio::time::timeout(Duration::from_secs(2), waiting).await??;
+    assert!(
+        outcome
+            .result
+            .as_ref()
+            .unwrap_err()
+            .is::<crate::broker::TurnCancelled>()
+    );
+    let mut collected = Box::pin(executor.finish());
+    assert!(futures_util::poll!(collected.as_mut()).is_pending());
+    drop(outcome);
+    tokio::time::timeout(Duration::from_secs(2), collected).await?;
+    drop(broker);
+    controller.finish_exchange_owner().await?;
+    Ok(())
+}
+
 /// An enqueued tool request must revalidate its captured generation before writing question state.
 #[tokio::test]
 async fn queued_question_creation_rejects_revoked_taskless_authority() -> Result<()> {
-    let (_root, controller, exchange) = fixture()?;
+    let (_root, controller, exchange) = fixture().await?;
     let context = context(&controller, &exchange);
     let events = controller.exchange_owner.question_events();
     let mut requested = Box::pin(events.ask(creation(&context, &exchange, "before-replacement")?));
@@ -182,8 +223,8 @@ async fn queued_question_creation_rejects_revoked_taskless_authority() -> Result
 /// Scope validation must reject another session even when its taskless generation is otherwise valid.
 #[tokio::test]
 async fn question_creation_rejects_foreign_owner_and_completed_source() -> Result<()> {
-    let (_root, controller, exchange) = fixture()?;
-    let (_foreign_root, foreign, foreign_exchange) = fixture()?;
+    let (_root, controller, exchange) = fixture().await?;
+    let (_foreign_root, foreign, foreign_exchange) = fixture().await?;
     let foreign_context = context(&foreign, &foreign_exchange);
     let result = controller
         .exchange_owner
@@ -220,7 +261,7 @@ async fn question_creation_rejects_foreign_owner_and_completed_source() -> Resul
 /// A tool's weak handle cannot keep its owner alive or commit state after explicit closure.
 #[tokio::test]
 async fn question_event_handle_reports_owner_closed_without_reopening_state() -> Result<()> {
-    let (_root, controller, exchange) = fixture()?;
+    let (_root, controller, exchange) = fixture().await?;
     let events = controller.exchange_owner.question_events();
     let requested = creation(&context(&controller, &exchange), &exchange, "after-close")?;
     let questions = controller.questions.clone();
@@ -237,7 +278,7 @@ async fn question_event_handle_reports_owner_closed_without_reopening_state() ->
 /// Dropping an admitted answer's observation must not discard its committed decision or durable input.
 #[tokio::test]
 async fn dropped_question_answer_waiter_preserves_owner_commit() -> Result<()> {
-    let (_root, controller, exchange) = fixture()?;
+    let (_root, controller, exchange) = fixture().await?;
     let events = controller.exchange_owner.question_events();
     let ids = events
         .ask(creation(

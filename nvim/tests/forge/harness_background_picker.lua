@@ -18,6 +18,7 @@ picker.open = function(spec) opened = spec end
 notifications.info = function(message) messages[#messages + 1] = message end
 notifications.error = notifications.info
 state.session = { id = "background-test" }
+state.capability = { background_terminals = true }
 state.busy, state.queue = true, {}
 state.presentation = { terminals = { refresh = function() refreshed = refreshed + 1 end } }
 state.composer_buf = vim.api.nvim_create_buf(false, true)

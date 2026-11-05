@@ -102,6 +102,41 @@ pub fn handler(
     Arc::new(Callback { context })
 }
 
+/// Keep a helper permission wait interruptible after its main invocation is cancelled or closed.
+pub(super) fn shell_handler(
+    context: Arc<dyn super::provider::NativeCallbackRouter>,
+    cancellation: tokio::sync::watch::Receiver<()>,
+) -> Arc<dyn PermissionHandler> {
+    Arc::new(ShellPermission {
+        callback: Callback { context },
+        cancellation,
+    })
+}
+
+struct ShellPermission {
+    callback: Callback,
+    cancellation: tokio::sync::watch::Receiver<()>,
+}
+
+#[async_trait]
+impl PermissionHandler for ShellPermission {
+    /// Reject cancellation while retaining the native request's exact tool identity.
+    async fn handle(
+        &self,
+        session_id: SessionId,
+        request_id: RequestId,
+        data: PermissionRequestData,
+    ) -> PermissionResult {
+        let mut cancellation = self.cancellation.clone();
+        cancellation.borrow_and_update();
+        tokio::select! {
+            biased;
+            _ = cancellation.changed() => PermissionResult::reject(None),
+            result = self.callback.handle(session_id, request_id, data) => result,
+        }
+    }
+}
+
 /// Bind native pre-tool hooks to the host's checkpoint barrier.
 pub fn checkpoint_hooks(
     context: Arc<dyn super::provider::NativeCallbackRouter>,
@@ -158,7 +193,16 @@ impl PermissionHandler for Callback {
         {
             return PermissionResult::reject(None);
         }
-        match self.context.authorize_native(tool_call_id, request).await {
+        let response = self.context.authorize_native(tool_call_id, request).await;
+        if self
+            .context
+            .before_shell_native(tool_call_id)
+            .await
+            .is_err()
+        {
+            return PermissionResult::reject(None);
+        }
+        match response {
             PermissionResponse::Allow => PermissionResult::approve_once(),
             PermissionResponse::Deny { reason } => PermissionResult::reject(reason),
             PermissionResponse::Cancelled => PermissionResult::reject(None),

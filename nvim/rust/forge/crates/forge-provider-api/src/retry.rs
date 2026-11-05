@@ -1,6 +1,6 @@
 use crate::TurnAddress;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, time::Duration};
 
 /// Identify a retry-safe failure class without exposing native codes or payloads.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
@@ -29,6 +29,8 @@ pub struct RetryableFailure {
     pub address: TurnAddress,
     /// Normalized retry class selected by the provider adapter.
     pub category: RetryCategory,
+    /// Provider-required minimum wait before another attempt, absent when none was reported.
+    pub retry_after: Option<Duration>,
 }
 
 impl fmt::Display for RetryableFailure {

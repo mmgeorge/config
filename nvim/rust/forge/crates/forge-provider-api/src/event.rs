@@ -40,6 +40,11 @@ pub enum ProviderEvent {
         scope: EventScope,
         provider_session_id: crate::ProviderSessionId,
     },
+    /// Publish the complete adapter-normalized inventory when native terminal state changes.
+    Terminals {
+        scope: EventScope,
+        snapshot: crate::terminal::TerminalSnapshot,
+    },
     /// Carry validated execution lifecycle evidence independently of RPC completion.
     Execution {
         observation: crate::lifecycle::ExecutionObservation,
@@ -166,9 +171,9 @@ impl ProviderEvent {
         match self {
             Self::Settled { settlement } => settlement.scope.clone().into(),
             Self::SettlementFailed { scope, .. } => scope.clone().into(),
-            Self::CapabilitiesChanged { scope, .. } | Self::SessionIdentity { scope, .. } => {
-                scope.clone()
-            }
+            Self::CapabilitiesChanged { scope, .. }
+            | Self::SessionIdentity { scope, .. }
+            | Self::Terminals { scope, .. } => scope.clone(),
             Self::Execution { observation } => observation.scope().clone().into(),
             Self::Message { address, .. } => address.turn.scope.clone().into(),
             Self::Tool { address, .. } => address.turn.scope.clone().into(),

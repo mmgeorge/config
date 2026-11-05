@@ -22,6 +22,7 @@ end
 local original_request = client.request
 local skill_enabled = { walkthrough = true, imagegen = false }
 local mcp_enabled = false
+local workspace_mcp_enabled = false
 local request_method_list = {}
 
 client.request = function(request_specification, callback)
@@ -33,6 +34,7 @@ client.request = function(request_specification, callback)
     callback({
       {
         name = "walkthrough",
+        resource_id = "import:workspace-walkthrough",
         scope = "workspace",
         path = "D:/repo/.rulesync/skills/walkthrough/SKILL.md",
         description = "Build a review walkthrough",
@@ -55,12 +57,15 @@ client.request = function(request_specification, callback)
       },
     })
   elseif method == "settings.skill.set_enabled" then
+    assert_true(params.scope == "workspace" and params.resource_id == "import:workspace-walkthrough",
+      "skill toggle must preserve the selected resource identity and workspace scope")
     skill_enabled[params.name] = params.enabled
     callback({ name = params.name, enabled = params.enabled, restart_required = false })
   elseif method == "session.provider.mcp.list" then
     callback({
       {
         name = "github-mcp",
+        resource_id = "import:global-github",
         scope = "global",
         source_path = "D:/config/rulesync-global/.rulesync/mcp.json",
         transport = "stdio",
@@ -73,9 +78,24 @@ client.request = function(request_specification, callback)
           { name = "user_get" },
         },
       },
+      {
+        name = "github-mcp",
+        resource_id = "import:workspace-github",
+        scope = "workspace",
+        transport = "stdio",
+        enabled = workspace_mcp_enabled,
+        status = workspace_mcp_enabled and "connected" or "disabled",
+      },
     })
   elseif method == "settings.mcp.set_enabled" then
-    mcp_enabled = params.enabled
+    if params.resource_id == "import:workspace-github" then
+      assert_true(params.scope == "workspace", "workspace MCP toggle must write its displayed scope")
+      workspace_mcp_enabled = params.enabled
+    else
+      assert_true(params.scope == "global" and params.resource_id == "import:global-github",
+        "global MCP toggle must preserve the selected resource identity and scope")
+      mcp_enabled = params.enabled
+    end
     callback({ name = params.name, enabled = params.enabled, restart_required = false })
   else
     callback(nil, "unexpected request " .. method)
@@ -188,6 +208,12 @@ mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
 assert_true(mcp_page.option_list[1].label == "✓ github-mcp", "connected MCPs should use the check icon")
 assert_true(vim.tbl_contains(request_method_list, "settings.mcp.set_enabled"),
   "MCP toggles should use the normalized broker operation")
+assert_true(mcp_page.option_list[2].columns[2] == "Workspace", "workspace MCP must display its source scope")
+mcp_picker.spec.action_list[1].callback({ option = mcp_page.option_list[2] })
+mcp_picker = picker._state_for_test()
+mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
+assert_true(mcp_page.option_list[2].label == "✓ github-mcp" and workspace_mcp_enabled and mcp_enabled,
+  "workspace MCP toggle must enable that resource while preserving the same-name global resource")
 
 picker.close(false)
 client.request = original_request

@@ -85,7 +85,7 @@ local function context_label(model)
       return format_token_count(context.token_limit) or context.id
     end
   end
-  return nil
+  return format_token_count(model.observed_context_token_limit)
 end
 
 local function column_layout(model_list)
@@ -106,6 +106,8 @@ local function column_layout(model_list)
         vim.fn.strdisplaywidth(format_token_count(context.token_limit) or context.id)
       )
     end
+    layout.context_window.width = math.max(layout.context_window.width,
+      vim.fn.strdisplaywidth(format_token_count(model.observed_context_token_limit) or ""))
     if model.vision then layout.vision.width = vim.fn.strdisplaywidth("Vision") end
   end
   for _, column in pairs(layout) do

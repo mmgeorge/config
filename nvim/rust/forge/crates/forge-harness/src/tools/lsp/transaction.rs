@@ -666,7 +666,7 @@ fn reconcile(before: &BTreeMap<String, Node>, after: &BTreeMap<String, Node>) ->
 mod tests {
     use super::*;
     use crate::tools::lsp::{LspLease, LspService};
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::Arc;
 
     /// Create a live scope with ordinary workspace writes and no editor dependency.
     fn fixture(root: &Path) -> (Arc<LspScope>, LspLease, DirectoryPolicy) {
@@ -683,7 +683,7 @@ mod tests {
             "turn".into(),
             root.into(),
             compiled,
-            Arc::new(AtomicBool::new(false)),
+            tokio::sync::watch::channel(false).1,
         );
         let policy = DirectoryPolicy {
             access: Default::default(),

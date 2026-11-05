@@ -2,26 +2,40 @@ use super::connection::CodexConnection;
 use anyhow::{Context, Result};
 use forge_shell::process;
 use process_wrap::tokio::ChildWrapper;
-use std::collections::VecDeque;
 use std::net::TcpListener;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-const STDERR_LIMIT: usize = 16 * 1024;
-
 struct CodexAppServer {
     child: Box<dyn ChildWrapper>,
     endpoint: String,
-    stderr: Arc<std::sync::Mutex<VecDeque<u8>>>,
-    stderr_task: JoinHandle<()>,
+    stderr: Arc<std::sync::Mutex<Vec<u8>>>,
+    stderr_task: Option<JoinHandle<()>>,
 }
 
 impl CodexAppServer {
+    /// Stop the native process and join its owned diagnostic reader before releasing the server.
+    async fn collect(&mut self) -> Result<()> {
+        self.child
+            .start_kill()
+            .context("terminate shared Codex app-server")?;
+        self.child
+            .wait()
+            .await
+            .context("collect shared Codex app-server")?;
+        if let Some(task) = self.stderr_task.as_mut() {
+            let result = task.await;
+            self.stderr_task.take();
+            result.context("collect Codex diagnostic reader")?;
+        }
+        Ok(())
+    }
+
     fn diagnostic(&self) -> String {
         let bytes: Vec<u8> = self
             .stderr
@@ -37,7 +51,9 @@ impl CodexAppServer {
 impl Drop for CodexAppServer {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
-        self.stderr_task.abort();
+        if let Some(task) = &self.stderr_task {
+            task.abort();
+        }
     }
 }
 
@@ -99,20 +115,23 @@ impl CodexRuntime {
             None => false,
         };
         if !running {
+            if let Some(previous) = server.as_mut() {
+                previous.collect().await?;
+            }
             *server = Some(self.start()?);
         }
         let endpoint = server
             .as_ref()
             .map(|server| server.endpoint.clone())
             .context("shared Codex app-server did not retain its endpoint")?;
-        let started = Instant::now();
         loop {
+            super::operations::check().map_err(anyhow::Error::from)?;
             match CodexConnection::connect(&endpoint)
                 .await
                 .map_err(anyhow::Error::from)
             {
                 Ok(connection) => return Ok(connection),
-                Err(error) if started.elapsed() < Duration::from_secs(5) => {
+                Err(error) => {
                     if let Some(running) = server.as_mut()
                         && let Some(status) = running
                             .child
@@ -124,16 +143,9 @@ impl CodexRuntime {
                             running.diagnostic()
                         );
                     }
+                    // The websocket is not listening yet. Retry a failed connection inside
+                    // the adapter; established sessions use pushed native observations.
                     tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                Err(error) => {
-                    return Err(error.context(format!(
-                        "connect shared Codex app-server: {}",
-                        server
-                            .as_ref()
-                            .map(CodexAppServer::diagnostic)
-                            .unwrap_or_default()
-                    )));
                 }
             }
         }
@@ -154,15 +166,7 @@ impl CodexRuntime {
         self.closed.store(true, Ordering::Release);
         let mut server = self.server.lock().await;
         if let Some(running) = server.as_mut() {
-            running
-                .child
-                .start_kill()
-                .context("terminate shared Codex app-server")?;
-            running
-                .child
-                .wait()
-                .await
-                .context("collect shared Codex app-server")?;
+            running.collect().await?;
         }
         *server = None;
         Ok(())
@@ -196,7 +200,7 @@ impl CodexRuntime {
             .stderr
             .take()
             .context("owned Codex app-server has no stderr pipe")?;
-        let stderr = Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(STDERR_LIMIT)));
+        let stderr = Arc::new(std::sync::Mutex::new(Vec::new()));
         let stderr_output = Arc::clone(&stderr);
         let stderr_task = tokio::spawn(async move {
             let mut chunk = [0_u8; 4096];
@@ -207,8 +211,6 @@ impl CodexRuntime {
                 let mut retained = stderr_output
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                let overflow = (retained.len() + length).saturating_sub(STDERR_LIMIT);
-                retained.drain(..overflow);
                 retained.extend(&chunk[..length]);
             }
         });
@@ -217,7 +219,7 @@ impl CodexRuntime {
             child,
             endpoint,
             stderr,
-            stderr_task,
+            stderr_task: Some(stderr_task),
         })
     }
 }
@@ -228,17 +230,17 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[tokio::test]
-    async fn stderr_is_privately_drained_with_a_bounded_tail() {
+    async fn stderr_is_preserved_without_truncation_and_joined_at_shutdown() {
         let directory = tempfile::tempdir().unwrap();
         let script = directory.path().join("stderr.nu");
-        std::fs::write(&script, "def main [--listen: string] { print -e ('x' | fill -w 40000); print -e 'final stderr diagnostic'; sleep 30sec }").unwrap();
+        std::fs::write(&script, "def main [--listen: string] { print -e 'initial stderr diagnostic'; print -e ('x' | fill -w 40000); print -e 'final stderr diagnostic'; sleep 30sec }").unwrap();
         let runtime = CodexRuntime::new(vec![
             "nu".into(),
             "--no-config-file".into(),
             script.display().to_string(),
         ]);
         let server = runtime.start().unwrap();
-        let collector = server.stderr_task.abort_handle();
+        let collector = server.stderr_task.as_ref().unwrap().abort_handle();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !server.diagnostic().ends_with("final stderr diagnostic") {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -246,11 +248,45 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(server.stderr.lock().unwrap().len(), super::STDERR_LIMIT);
+        assert!(server.stderr.lock().unwrap().len() > 40_000);
+        assert!(server.diagnostic().contains("initial stderr diagnostic"));
         *runtime.server.lock().await = Some(server);
         runtime.shutdown().await.unwrap();
-        tokio::task::yield_now().await;
         assert!(collector.is_finished());
+    }
+
+    /// Process exit alone cannot release a server while its diagnostic reader still owns cleanup.
+    #[tokio::test]
+    async fn shutdown_waits_for_owned_diagnostic_reader() {
+        let runtime = CodexRuntime::new(Vec::new());
+        let mut command = tokio::process::Command::new("nu");
+        command.args(["--no-config-file", "-c", "exit 0"]);
+        let mut child = forge_shell::process::spawn_owned(command).unwrap();
+        child.wait().await.unwrap();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let reader = tokio::spawn(async move {
+            ready.send(()).unwrap();
+            released.await.unwrap();
+        });
+        started.await.unwrap();
+        *runtime.server.lock().await = Some(CodexAppServer {
+            child,
+            endpoint: String::new(),
+            stderr: Default::default(),
+            stderr_task: Some(reader),
+        });
+        let mut closing = Box::pin(runtime.shutdown());
+        assert!(
+            futures_util::poll!(closing.as_mut()).is_pending(),
+            "shutdown released a live diagnostic reader"
+        );
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), closing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(runtime.server.lock().await.is_none());
     }
 
     #[cfg(windows)]
@@ -380,7 +416,7 @@ mod tests {
             child,
             endpoint: String::new(),
             stderr: Default::default(),
-            stderr_task: tokio::spawn(async {}),
+            stderr_task: Some(tokio::spawn(async {})),
         });
         assert!(runtime.process_id().await.is_some());
         runtime.shutdown().await.unwrap();

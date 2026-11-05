@@ -33,6 +33,8 @@ client.request = function(request, callback)
       result = { transcript = document_snapshot(params.document, request.session_id .. " transcript"),
         status = document_snapshot(params.document .. ":status", "Waiting") }
     elseif params.operation == "background_terminals" then result = { supported = false }
+    elseif params.operation == "sync" then
+      result = { patch = {}, status = document_snapshot(params.document .. ":status", "Waiting") }
     elseif params.operation == "staging" then result = { updated = true }
     elseif params.operation == "close" then result = { closed = true }
     else result = { patch = {} } end
@@ -86,6 +88,21 @@ end
 local ok, failure = xpcall(function()
   local first = create_session("geometry-a")
   local second = create_session("geometry-b")
+  local pending = navigation.begin_new("delayed acknowledgement")
+  navigation.activate({ session = first.session }, { open_mode = "tab" })
+  local selected_tab, selected_window = vim.api.nvim_get_current_tabpage(), vim.api.nvim_get_current_win()
+  local selected_generation = session.harness_selection()
+  navigation.complete_pending(pending, { session = { id = "geometry-late", provider = "mock", model = "mock" } })
+  assert(session.harness == first, "background acknowledgement selected its pending session")
+  assert(vim.api.nvim_get_current_tabpage() == selected_tab and vim.api.nvim_get_current_win() == selected_window,
+    "background acknowledgement moved the user's window")
+  assert(session.harness_selection() == selected_generation, "background acknowledgement changed intentional selection")
+  assert(pending.state.session.id == "geometry-late", "background acknowledgement lost its session result")
+  settled(pending.state)
+  assert(session.harness == first and vim.api.nvim_get_current_win() == selected_window,
+    "background presentation completion stole focus")
+  require("forge.views.harness.workspace").release(pending.state)
+  assert(pending.state.presentation.close())
   transfer(first, second)
   transfer(second, first)
   transfer(first, second)

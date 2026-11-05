@@ -1096,6 +1096,28 @@ impl HarnessBroker {
                 finalization.checkpoint_completed(self, &mut transaction.state.interaction, result)
             }
             ForegroundSignal::SettlementCommitted(result) => {
+                let native_outcome = match &result {
+                    Ok(()) => "succeeded",
+                    Err(crate::provider::session_execution::SettlementError::Stale) => "stale",
+                    Err(crate::provider::session_execution::SettlementError::Unavailable) => {
+                        "unavailable"
+                    }
+                    Err(crate::provider::session_execution::SettlementError::Provider(_)) => {
+                        "provider_failed"
+                    }
+                };
+                let trace = self.trace.clone();
+                let session_id = self.session.id.clone();
+                let settlement_stage = |phase: &'static str| {
+                    trace.record(
+                        &session_id,
+                        "exchange.foreground.settlement",
+                        json!({
+                            "phase":phase, "outcome":native_outcome,
+                        }),
+                    );
+                };
+                settlement_stage("native_commit");
                 let action = finalization.settlement_committed(
                     transaction.engine.clone(),
                     transaction.state.scope.clone(),
@@ -1104,14 +1126,17 @@ impl HarnessBroker {
                 if !finalization.is_complete() {
                     return Ok(action);
                 }
+                settlement_stage("prepared_response");
                 anyhow::ensure!(
                     finalization.prepared_response.is_some(),
                     "settled response is missing"
                 );
+                settlement_stage("runtime_ownership");
                 anyhow::ensure!(
                     self.exchange_runtime.is_none(),
                     "another foreground runtime is already installed"
                 );
+                settlement_stage("background_observation");
                 if admission.idle_reopen {
                     self.reopened_execution
                         .end_settlement(&transaction.state.scope);
@@ -1122,6 +1147,7 @@ impl HarnessBroker {
                         self.provider.clone(),
                     )?;
                 }
+                settlement_stage("host_settlement_release");
                 self.clear_host_settlement(&transaction.settlement)?;
                 let response = finalization
                     .prepared_response
@@ -1145,6 +1171,7 @@ impl HarnessBroker {
                     unreachable!("finalization owner checked above")
                 };
                 let mut transaction = transaction;
+                settlement_stage("check_lifecycle_release");
                 transaction._check_lease.bind_lifecycle(None)?;
                 transaction.delivery_sink = None;
                 admission.sink = None;
@@ -1159,6 +1186,7 @@ impl HarnessBroker {
                     response,
                     event: events,
                 });
+                settlement_stage("completed");
                 Ok(ForegroundAction::Finish)
             }
             ForegroundSignal::SettlementReady { checkout, ready } => {
@@ -1405,7 +1433,7 @@ impl HarnessBroker {
             )?);
             finalization.exchange_event_staged = true;
         }
-        if finalization.repair_active {
+        if finalization.repair_active && finalization.collection.is_none() {
             let checks = finalization
                 .checks
                 .as_mut()
@@ -1414,7 +1442,11 @@ impl HarnessBroker {
             finalization.repair_active = false;
             return self.apply_final_check_action(finalization, admission.request.id, action);
         }
+        // Collection can race a successful native terminal. Its owner still
+        // forbids new work; waiting for newly admitted checks would deadlock
+        // the command that must release that admission gate.
         let (checks, action) = if admission.automatic_check_owner.is_some()
+            || finalization.collection.is_some()
             || matches!(finalization.outcome, Err(ProviderError::Cancelled))
         {
             (
@@ -1453,8 +1485,7 @@ impl HarnessBroker {
                 {
                     use crate::provider::submission::SubmissionRetirement;
                     requirement = match receipt.retire_prepared()? {
-                        SubmissionRetirement::Prevented
-                        | SubmissionRetirement::AlreadyCancelled => {
+                        SubmissionRetirement::Cancelled => {
                             SettlementRequirement::CollectedUndispatched
                         }
                         SubmissionRetirement::Sending | SubmissionRetirement::Accepted => {
@@ -1552,6 +1583,7 @@ impl HarnessBroker {
         mut result: (Value, Vec<SessionEvent>),
     ) -> Result<ForegroundAction> {
         if finalization.mode != PromptMode::Background
+            && finalization.collection.is_none()
             && !matches!(finalization.outcome, Err(ProviderError::Cancelled))
         {
             match self.prepare_automatic_compaction() {
@@ -2202,5 +2234,83 @@ impl HarnessBroker {
             .settlement
             .seal_effects(&staged.expected_effects)?;
         finalization.effects_applied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A successful native terminal racing collection cannot start checks behind its own gate.
+    #[tokio::test]
+    async fn collection_after_native_success_skips_new_automatic_work() -> Result<()> {
+        for disposition in [
+            ForegroundCollection::Cancel(crate::exchange::command::CancelledInputPolicy::Retain),
+            ForegroundCollection::Restart,
+        ] {
+            let workspace = super::super::test::repository();
+            let data = tempfile::tempdir()?;
+            let mut broker =
+                super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+            broker.checkpoint = None;
+            broker
+                .configure_session(json!({"automatic_checks":true}))
+                .await?;
+            std::fs::write(workspace.path().join(".forge.json"),
+                json!({"checks":{"verify":{"trigger":{"auto":true},"action":{"command":["nu","--no-config-file","-c","print ok"],"category":"test"}}}}).to_string())?;
+            let (sink, _updates) = publication::channel();
+            let ForegroundDispatch::Admitting(mut admission) = broker.begin_foreground_dispatch(
+                Request {
+                    id: 1,
+                    method: "session.prompt.submit".into(),
+                    params: json!({"text":"Finish the source change"}),
+                },
+                sink,
+            )?
+            else {
+                anyhow::bail!("missing admission");
+            };
+            let mut staged = broker.stage_foreground_interaction(
+                "Finish the source change",
+                PromptMode::Chat,
+                Some(&ExchangeAdmission::chat("Finish the source change".into())),
+                ProviderInput::from_text("Finish the source change"),
+            )?;
+            staged.exchange.check_owner = Some(staged.exchange.id.clone());
+            broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
+            let engine = broker
+                .execution_registry()
+                .owner(crate::provider::ExecutionOwner::root(&broker.session.id))
+                .await?;
+            let mut transaction = broker.construct_foreground_transaction(&staged, engine)?;
+            transaction.state.interaction.finish(
+                crate::exchange::ExchangeOutcome::Complete,
+                broker.clock.now_ms(),
+            )?;
+            broker.store.save_exchange(&transaction.state.interaction)?;
+            let mut finalization = ForegroundFinalization::new(
+                admission.take_submission()?,
+                PromptMode::Chat,
+                Vec::new(),
+                Ok(ProviderCompletion::default()),
+                transaction.settlement.clone(),
+                None,
+                Some(disposition),
+            );
+            finalization.phase = FinalizationPhase::ChecksRequested;
+            transaction.finalization = Some(finalization);
+            let action =
+                broker.prepare_foreground_final_checks(&mut transaction, &mut admission)?;
+            assert!(
+                matches!(
+                    action,
+                    ForegroundAction::Effect(ForegroundJob::FinalResponsePublication(_))
+                ),
+                "collection admitted new work after native success"
+            );
+            assert!(transaction.finalization.as_ref().unwrap().checks.is_none());
+            assert!(broker.check_runner.snapshot()?.history.is_empty());
+        }
+        Ok(())
     }
 }

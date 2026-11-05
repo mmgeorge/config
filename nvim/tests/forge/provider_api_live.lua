@@ -8,8 +8,12 @@ vim.loader.enable(false)
 ---@field root? string Fresh artifact directory; must not already exist.
 ---@field binary? string Rebuilt development Forge executable.
 ---@field command? string[] Explicit installed runtime override; otherwise use the provider registry.
+---@field model? string Explicit model for a targeted reproduction; ordinary verification uses Luna 6.
+---@field effort? string Explicit reasoning level for a targeted reproduction.
+---@field before_open? fun(paths: {workspace: string, data_root: string, config: string}) Prepare isolated persisted state before host startup.
 ---@field workspace_files? table<string,string> Relative fixture paths and UTF-8 contents installed before provider open.
 local options = assert(vim.g.forge_provider_api_live, "set vim.g.forge_provider_api_live before loading this driver")
+local requested_model, requested_effort = options.model or "gpt-6-luna", options.effort or "medium"
 assert(options.provider == "codex" or options.provider == "copilot", "select codex or copilot")
 assert(#vim.api.nvim_list_uis() > 0, "live verification requires a visible Terminal MCP Neovim")
 assert(vim.v.servername:find("forge-provider-api-live", 1, true), "use a dedicated --listen address containing forge-provider-api-live")
@@ -97,13 +101,13 @@ function M.info()
     pid = pid, socket = socket, repository = repository, root = root, workspace = workspace,
     data = data, data_root = vim.fs.joinpath(data, "forge", "harness"), config = config, artifacts = artifacts,
     source_binary = source_binary, binary = binary, case = options.case or "unspecified", provider = options.provider,
-    requested_model = "gpt-6-luna", requested_effort = "medium", phase = phase,
+    requested_model = requested_model, requested_effort = requested_effort, phase = phase,
     wire_version = contract.version,
     host_pid = client._client and client._client.process and client._client.process.pid,
     session_id = state.session and state.session.id, model = state.session and state.session.model,
     resolved_model = state.session and state.session.resolved_model, effort = state.session and state.session.effort,
-    runtime_model = runtime_model, ready = state.ready == true, busy = state.busy == true,
-    state_sync_pending = state.state_sync_pending == true, host_error = state.host_error,
+    runtime_model = runtime_model, ready = state.ready == true, busy = require("forge.views.harness.activity").busy(state),
+    state_sync_pending = state.state_sync_pending ~= nil, host_error = state.host_error,
     events = event_count, notices = #notices, composer_buffer = state.composer_buf, transcript_buffer = state.transcript_buf,
   }
 end
@@ -281,12 +285,13 @@ function M.stop(quit)
   end)
 end
 
-local notifications = require("forge.infra.notifications")
-local original_error = notifications.error
-notifications.error = function(message, title)
-  notices[#notices + 1] = { message = tostring(message), title = title, time_ms = now() }
-  append("notifications.jsonl", notices[#notices])
-  return original_error(message, title)
+local original_notify = vim.notify
+vim.notify = function(message, level, notify_options)
+  if level == vim.log.levels.ERROR then
+    notices[#notices + 1] = { message = tostring(message), title = notify_options and notify_options.title, time_ms = now() }
+    append("notifications.jsonl", notices[#notices])
+  end
+  return original_notify(message, level, notify_options)
 end
 client.session_events_subscribe(function(event, payload, session_id)
   event_count = event_count + 1
@@ -297,8 +302,9 @@ end)
 local function start_harness()
   phase = "opening_harness"
   vim.fn.chdir(workspace)
+  if options.before_open then options.before_open({ workspace = workspace, data_root = vim.fs.joinpath(data, "forge", "harness"), config = config }) end
   require("forge").setup({ harness_logging = true, text_correction = { enabled = false }, harness = {
-    provider = options.provider, model = "gpt-6-luna", effort = "medium", config_dir = config,
+    provider = options.provider, model = requested_model, effort = requested_effort, config_dir = config,
     providers = { [options.provider] = { command = options.command, selectable = true } },
   } })
   require("forge").open_harness()
@@ -309,7 +315,7 @@ local function start_harness()
       request("host.trace.configure", { enabled = true })
       request("session.state.get", {}, nil, function(record)
         local selected = record.result and record.result.session
-        local correct = selected and (selected.resolved_model or selected.model) == "gpt-6-luna" and selected.effort == "medium"
+        local correct = selected and (selected.resolved_model or selected.model) == requested_model and selected.effort == requested_effort
         phase = record.error and "startup_failed" or correct and "ready" or "selection_mismatch"
         M.capture("startup")
         print("ProviderApiLive " .. options.provider .. ": " .. phase .. " (details in ProviderApiLive.info())")
@@ -324,7 +330,7 @@ end
 
 local git_steps = {
   { "git", "init", "--quiet", workspace },
-  { "git", "-C", workspace, "add", "source.txt", ".forge.json" },
+  { "git", "-C", workspace, "add", "--all" },
   { "git", "-C", workspace, "-c", "core.hooksPath=" .. hooks, "-c", "user.name=Forge live fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Create isolated verification baseline" },
 }
 vim.fn.writefile({ "seed line" }, vim.fs.joinpath(workspace, "source.txt"))

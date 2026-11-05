@@ -145,7 +145,7 @@ mod tests {
             "workspace":fixture.path(),"data_root":fixture.path().join("data"),
             "client_id":"local-policy-order","provider":{"kind":"mock","command":[]},
         }))?;
-        let controller = SessionController::new(HarnessBroker::initialize(initialize)?)?;
+        let controller = SessionController::new(HarnessBroker::initialize(initialize)?).await?;
         let gate = controller
             .coordinator
             .control

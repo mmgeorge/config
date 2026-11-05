@@ -168,7 +168,7 @@ impl Command {
 }
 
 /// Select whether an unconsumed cancelled prompt returns to the editor draft.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CancelledInputPolicy {
     /// Keep accepted input and its delivery evidence in their existing journals.
@@ -500,20 +500,14 @@ impl CommandRequest {
         } = operation;
         let command = match action {
             InputAction::Submit { message } => {
-                let InputMessage {
+                let crate::input::InputDraft {
                     id,
-                    revision: _,
                     text,
                     purpose,
                     attachments,
                     config,
                     intent,
-                    delivery: _,
-                    route: _,
-                    reservation: _,
-                    submission_id: _,
-                    error: _,
-                } = *message;
+                } = message.into_draft();
                 if !matches!(purpose, InputPurpose::User) {
                     return Err(CommandDecodeError::HostOnlyInput);
                 }
@@ -611,9 +605,8 @@ impl CommandRequest {
         };
         let action = match command {
             InputCommand::Submit(input) => InputAction::Submit {
-                message: Box::new(InputMessage {
+                message: Box::new(InputMessage::queued(crate::input::InputDraft {
                     id: input.id.as_str().into(),
-                    revision: 0,
                     text: input.text.clone(),
                     purpose: InputPurpose::User,
                     attachments: input
@@ -623,12 +616,7 @@ impl CommandRequest {
                         .collect::<Result<_, _>>()?,
                     config: input.config.as_ref().map(QueuedModelSettings::encode),
                     intent: input.intent.clone(),
-                    delivery: crate::input::InputDelivery::Queued,
-                    route: None,
-                    reservation: None,
-                    submission_id: None,
-                    error: None,
-                }),
+                })),
             },
             InputCommand::Retry(input) => InputAction::Retry {
                 id: input.id.as_str().into(),
@@ -762,9 +750,7 @@ pub(crate) enum CommandFailure {
     #[error("execution collection did not establish quiescence; replacement remains blocked")]
     CollectionUncertain,
     /// Native collection still owns work after its observation deadline elapsed.
-    #[error(
-        "execution collection exceeded its deadline; cleanup remains owned and replacement is blocked"
-    )]
+    #[error("Exceeded cancellation timeout")]
     CollectionTimedOut,
     /// The selected current exchange changed before its command could commit.
     #[error("the selected exchange changed before the command could apply")]

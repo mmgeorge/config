@@ -1280,11 +1280,9 @@ impl AcpSessionState {
         let effort = catalog["configOptions"].as_array().is_some_and(|options| {
             options.iter().any(|option| {
                 matches!(
-                    option["category"]
-                        .as_str()
-                        .or_else(|| option["id"].as_str()),
+                    option["category"].as_str(),
                     Some("thought_level" | "effort")
-                )
+                ) || matches!(option["id"].as_str(), Some("thought_level" | "effort"))
             })
         });
         drop(catalog);
@@ -1411,6 +1409,48 @@ mod tests {
         assert!(manifest.capability.iter().any(|capability| capability.id
             == forge_provider_api::capability::CapabilityId::EffortSelection
             && capability.support == forge_provider_api::capability::Support::Unsupported));
+        Ok(())
+    }
+
+    /// A recognized option ID retains support even when the native category uses an open vocabulary.
+    #[tokio::test]
+    async fn effort_option_id_publishes_support_with_unrecognized_category() -> Result<()> {
+        use forge_provider_api::capability::{CapabilityId, CapabilityManifest, Support};
+        let state = AcpSessionState::new_native(ProviderKind::Claude);
+        let (sink, mut stream) = events::channel(
+            BindingId::new("effort-category")?,
+            EventScope::Binding {
+                owner: ExecutionOwner::root("host"),
+            },
+        );
+        let mut manifest = CapabilityManifest::from_descriptor(
+            crate::registry::descriptor(&ProviderKind::Claude.id()).unwrap(),
+        );
+        manifest
+            .capability
+            .iter_mut()
+            .find(|entry| entry.id == CapabilityId::EffortSelection)
+            .unwrap()
+            .support = Support::Unsupported;
+        state.install_capabilities("native", sink, manifest).await;
+        state
+            .update_catalog(json!({"configOptions":[{
+                "id":"effort","category":"provider-specific","options":[{"value":"high"}]
+            }]}))
+            .await;
+        let manifest = state.effective_capabilities().await.unwrap();
+        assert!(
+            manifest
+                .capability
+                .iter()
+                .any(|entry| entry.id == CapabilityId::EffortSelection
+                    && entry.support == Support::Supported)
+        );
+        assert_eq!(manifest.effective_revision, 1);
+        assert!(matches!(
+            stream.try_next()?.map(|event| event.event),
+            Some(ProviderEvent::CapabilitiesChanged { .. })
+        ));
         Ok(())
     }
 

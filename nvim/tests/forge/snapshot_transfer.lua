@@ -44,6 +44,15 @@ local ok, failure = xpcall(function()
   assert(replica.apply_snapshot_part(session, invalid[2]).kind == "Desynchronized")
   assert(session.revision == 3 and session.transfer.active == nil)
 
+  local json_transfer = require("forge.json_transfer")
+  local assembly = json_transfer.new()
+  local chunk = string.rep("x", 256 * 1024)
+  assert(json_transfer.accept(assembly, { sequence = 0, part_count = 2,
+    total_bytes = #chunk + 1, payload = chunk }) == nil)
+  assert(json_transfer.accept(assembly, { sequence = 1, part_count = 2,
+    total_bytes = #chunk + 1, payload = "y" }) == nil)
+  assert(json_transfer.finish(assembly) == chunk .. "y")
+
   for mode = 1, 5 do
     local state = transfer.new("document")
     local candidate = parts(snapshot(1, "test"), 1)

@@ -13,7 +13,7 @@ use super::{Provider, ProviderRequest};
 use crate::trace::TraceStore;
 use forge_provider_api::{DeliveryAttemptId, RecoveryToken, SubmissionId};
 
-const SUBMISSION_FORMAT_VERSION: u32 = 3;
+const SUBMISSION_FORMAT_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -32,13 +32,28 @@ pub enum SubmissionState {
     Cancelled,
 }
 
+impl SubmissionState {
+    /// Require unsent input while preserving cancellation and previous delivery evidence.
+    fn require_prepared(&self) -> Result<(), super::ProviderError> {
+        match self {
+            Self::Prepared => Ok(()),
+            Self::Cancelled => Err(super::ProviderError::Cancelled),
+            Self::Sending { .. } => Err(super::ProviderError::DeliveryUncertain),
+            Self::Accepted { .. } => Err(super::ProviderError::Failure(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::InputSubmit,
+                    forge_provider_api::ProviderFailureKind::WrongInvocation,
+                ),
+            )),
+        }
+    }
+}
+
 /// Certify the journal state at the atomic attempt to prevent prepared input dispatch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SubmissionRetirement {
-    /// Prepared input was durably cancelled before dispatch could begin.
-    Prevented,
-    /// An earlier cancellation already excluded this input from dispatch.
-    AlreadyCancelled,
+    /// Input is durably cancelled and cannot have been dispatched, including repeated retirement.
+    Cancelled,
     /// Dispatch may already have happened; retirement does not authorize replay.
     Sending,
     /// Durable native acceptance already proves delivery.
@@ -906,10 +921,7 @@ impl Submission {
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
-        ensure!(
-            self.record()?.delivery == SubmissionState::Prepared,
-            "input was already dispatched"
-        );
+        self.record()?.delivery.require_prepared()?;
         let mut dispatch = self
             .dispatch
             .lock()
@@ -1078,10 +1090,7 @@ impl Submission {
     /// Persists the uncertain state before polling the external send future.
     pub fn sending(&self, target: Option<RecoveryToken>) -> Result<()> {
         self.update(|record| {
-            ensure!(
-                record.delivery == SubmissionState::Prepared,
-                "submission already dispatched"
-            );
+            record.delivery.require_prepared()?;
             record.delivery = SubmissionState::Sending { target };
             Ok(())
         })
@@ -1275,9 +1284,9 @@ impl Submission {
             Ok(match record.delivery {
                 SubmissionState::Prepared => {
                     record.delivery = SubmissionState::Cancelled;
-                    SubmissionRetirement::Prevented
+                    SubmissionRetirement::Cancelled
                 }
-                SubmissionState::Cancelled => SubmissionRetirement::AlreadyCancelled,
+                SubmissionState::Cancelled => SubmissionRetirement::Cancelled,
                 SubmissionState::Sending { .. } => SubmissionRetirement::Sending,
                 SubmissionState::Accepted { .. } => SubmissionRetirement::Accepted,
             })
@@ -1400,6 +1409,24 @@ impl Submission {
             }
         }
         let pending = self.store.pending(request, provider_kind, Some(&self.id))?;
+        if request.mode == super::PromptMode::Background {
+            // Each background request contains the current complete snapshot. An older
+            // unconsumed snapshot is superseded, not another input to concatenate.
+            for previous in &pending {
+                if previous.id != self.id
+                    && previous.input_message_id.is_none()
+                    && previous.request.mode == super::PromptMode::Background
+                {
+                    let previous = self.store.submission(&previous.id)?;
+                    if matches!(previous.retire_prepared()?, SubmissionRetirement::Sending) {
+                        return Err(super::ProviderError::DeliveryUncertain.into());
+                    }
+                }
+            }
+        }
+        let pending = self
+            .store
+            .pending(request, provider.descriptor().kind, Some(&self.id))?;
         let earlier = pending
             .into_iter()
             .filter(|pending| pending.id != self.id && pending.input_message_id.is_none())
@@ -1488,10 +1515,13 @@ impl forge_provider_api::submission::InputReceipt for AttemptReceipt {
             .persist(move |submission| {
                 submission.update(|record| {
                     ensure!(
-                        record.attempt_id == attempt_id
-                            && record.delivery == SubmissionState::Prepared,
-                        "receipt no longer owns prepared input"
+                        record.attempt_id == attempt_id,
+                        super::ProviderError::Failure(forge_provider_api::ProviderFailure::new(
+                            forge_provider_api::ProviderOperation::InputSubmit,
+                            forge_provider_api::ProviderFailureKind::WrongInvocation,
+                        ))
                     );
+                    record.delivery.require_prepared()?;
                     record.delivery = SubmissionState::Sending { target: token };
                     Ok(())
                 })
@@ -1803,6 +1833,44 @@ mod tests {
         Ok(())
     }
 
+    /// Reject positive history evidence captured before a replacement attempt or history binding.
+    #[test]
+    fn stale_acceptance_cannot_bind_replacement_attempt_or_history() -> Result<()> {
+        for replaced_attempt in [true, false] {
+            let root = tempfile::tempdir()?;
+            let store =
+                SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+            let input = store.prepare(&request("same repeated text"), fixture_provider_id())?;
+            input.sending(None)?;
+            let snapshot = input.record()?;
+            if replaced_attempt {
+                input.rejected("positive nonconsumption".into())?;
+                input.sending(None)?;
+            } else {
+                input.update(|record| {
+                    record.request.provider_session_id = Some("replacement-history".try_into()?);
+                    Ok(())
+                })?;
+            }
+            let current = input.record()?;
+            let after = input.apply_reconciliation(SubmissionReconciliation {
+                snapshot,
+                evidence: forge_provider_api::SubmissionEvidence::Accepted {
+                    receipt: Some(token("stale-accepted")),
+                    provider_session_id: Some("stale-history".try_into()?),
+                },
+            })?;
+            assert_eq!(after.delivery, current.delivery);
+            assert_eq!(after.attempt_id, current.attempt_id);
+            assert_eq!(
+                after.request.provider_session_id,
+                current.request.provider_session_id
+            );
+            assert!(!*input.acceptance().borrow());
+        }
+        Ok(())
+    }
+
     /// Native callback authority cannot acknowledge input after positive rejection rotated its attempt.
     #[tokio::test]
     async fn retired_attempt_receipt_cannot_acknowledge_replacement_attempt() -> Result<()> {
@@ -2061,6 +2129,34 @@ mod tests {
         first.accepted(Some(token("late first acknowledgment")))?;
         third.sending(target)?;
         drop(third_flight);
+        Ok(())
+    }
+
+    /// Distinct typed owners cannot share a journal lane through concatenated string keys.
+    #[test]
+    fn pending_inputs_are_isolated_for_previously_colliding_owners() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let provider = forge_providers::registry::default_id();
+        let mut first = request("first owner");
+        first.harness_session_id = "a:agent:b".into();
+        first.execution_owner = Some(forge_provider_api::ExecutionOwner::root(
+            &first.harness_session_id,
+        ));
+        let mut second = request("second owner");
+        second.harness_session_id = "a".into();
+        second.execution_owner = Some(forge_provider_api::ExecutionOwner {
+            session_id: "a".into(),
+            agent_id: "b".into(),
+        });
+        let first_input = store.prepare(&first, provider.clone())?;
+        let second_input = store.prepare(&second, provider.clone())?;
+        let first_pending = store.pending(&first, provider.clone(), None)?;
+        let second_pending = store.pending(&second, provider, None)?;
+        assert_eq!(first_pending.len(), 1);
+        assert_eq!(second_pending.len(), 1);
+        assert_eq!(first_pending[0].id, first_input.record()?.id);
+        assert_eq!(second_pending[0].id, second_input.record()?.id);
         Ok(())
     }
 
@@ -2340,6 +2436,34 @@ mod tests {
         Ok(())
     }
 
+    /// Preserve cancellation at each dispatch gate, including a retained adapter receipt.
+    #[tokio::test]
+    async fn cancelled_input_preserves_cancellation_at_every_dispatch_gate() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let receipt = store.prepare(&request("cancelled input"), fixture_provider_id())?;
+        let adapter_receipt = receipt.receipt_for_attempt()?;
+        receipt.cancel()?;
+        let before = serde_json::to_value(receipt.record()?)?;
+        for result in [receipt.begin_prompt(), receipt.begin_steering()] {
+            let error = match result {
+                Ok(_) => panic!("cancelled input regained dispatch authority"),
+                Err(error) => error,
+            };
+            assert!(journal_failure(error).is_clean_cancellation());
+        }
+        assert!(journal_failure(receipt.sending(None).unwrap_err()).is_clean_cancellation());
+        assert!(
+            adapter_receipt
+                .record_sending(None)
+                .await
+                .unwrap_err()
+                .is_clean_cancellation()
+        );
+        assert_eq!(serde_json::to_value(receipt.record()?)?, before);
+        Ok(())
+    }
+
     /// Refuse late metadata changes once dispatch, acceptance, or cancellation has been committed.
     #[test]
     fn sealed_request_cannot_rewrite_delivery_evidence_or_owner() -> Result<()> {
@@ -2558,11 +2682,8 @@ mod tests {
             &request("not sent"),
             forge_providers::registry::default_id(),
         )?;
-        assert_eq!(prepared.retire_prepared()?, SubmissionRetirement::Prevented);
-        assert_eq!(
-            prepared.retire_prepared()?,
-            SubmissionRetirement::AlreadyCancelled
-        );
+        assert_eq!(prepared.retire_prepared()?, SubmissionRetirement::Cancelled);
+        assert_eq!(prepared.retire_prepared()?, SubmissionRetirement::Cancelled);
         prepared.cancel()?;
         assert_eq!(prepared.record()?.delivery, SubmissionState::Cancelled);
         let dispatched = store.prepare(
@@ -2588,6 +2709,58 @@ mod tests {
             dispatched.record()?.delivery,
             SubmissionState::Accepted { .. }
         ));
+        Ok(())
+    }
+
+    /// Keep a late native acknowledgment authoritative when cancellation follows durable dispatch.
+    #[tokio::test]
+    async fn cancellation_before_late_acceptance_preserves_durable_consumption() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let store = SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let input = store.prepare(&request("late accepted input"), fixture_provider_id())?;
+        let id = input.id().to_owned();
+        let adapter = input.receipt_for_attempt()?;
+        adapter
+            .clone()
+            .record_sending(Some(token("dispatch-target")))
+            .await?;
+        let (entered, captured) = tokio::sync::oneshot::channel();
+        let (release, resumed) = tokio::sync::oneshot::channel();
+        let acknowledgment = tokio::spawn(async move {
+            entered.send(()).expect("test owns the receipt barrier");
+            resumed.await.expect("test releases the receipt barrier");
+            adapter.record_accepted(Some(token("late-receipt"))).await
+        });
+        captured.await?;
+        input.cancel()?;
+        assert!(matches!(
+            input.record()?.delivery,
+            SubmissionState::Sending { .. }
+        ));
+        release
+            .send(())
+            .expect("acknowledgment retains its barrier");
+        acknowledgment.await??;
+        assert!(matches!(
+            input.record()?.delivery,
+            SubmissionState::Accepted { .. }
+        ));
+        drop(input);
+        drop(store);
+        let reopened =
+            SubmissionStore::open(root.path(), Arc::new(TraceStore::open(root.path())?))?;
+        let restored = reopened.submission(&id)?;
+        assert!(matches!(
+            restored.record()?.delivery,
+            SubmissionState::Accepted { .. }
+        ));
+        assert!(
+            restored
+                .receipt_for_attempt()?
+                .record_sending(None)
+                .await
+                .is_err()
+        );
         Ok(())
     }
 
@@ -2864,6 +3037,32 @@ mod tests {
         assert_eq!(
             original.record()?.error.as_deref(),
             Some("stream timed out")
+        );
+        Ok(())
+    }
+
+    /// Replace stale background snapshots without replaying obsolete generation requests.
+    #[tokio::test]
+    async fn background_recovery_supersedes_unconsumed_snapshots() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let store = SubmissionStore::open(directory.path(), trace)?;
+        let mut old = request("obsolete complete diff");
+        old.mode = crate::provider::PromptMode::Background;
+        let previous = store.prepare(&old, fixture_provider_id())?;
+        let mut current = request("current complete diff");
+        current.mode = crate::provider::PromptMode::Background;
+        let next = store.prepare(&current, fixture_provider_id())?;
+        let provider = recovery_bridge()?;
+        next.recover(provider.as_provider(), &mut current).await?;
+        assert!(current.recovered_input.is_empty());
+        assert!(matches!(
+            previous.record()?.delivery,
+            SubmissionState::Cancelled
+        ));
+        assert_eq!(
+            current.input,
+            ProviderInput::from_text("current complete diff")
         );
         Ok(())
     }

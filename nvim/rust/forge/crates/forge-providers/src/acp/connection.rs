@@ -45,14 +45,6 @@ pub enum AcpConnectionError {
         #[source]
         source: SourceError,
     },
-    /// A bounded non-prompt request did not finish.
-    #[error("ACP {method} exceeded {seconds} seconds")]
-    Timeout {
-        method: String,
-        seconds: u64,
-        #[source]
-        source: tokio::time::error::Elapsed,
-    },
     /// Independent process and reader collection phases failed; retain both typed causes.
     #[error("ACP resource collection failed")]
     Collection {
@@ -618,20 +610,13 @@ impl AcpConnection {
         });
         retained.driver = DriverState::Running(driver);
         drop(retained);
-        let connection = match tokio::time::timeout(std::time::Duration::from_secs(10), ready).await
-        {
-            Ok(Ok(connection)) => connection,
-            Ok(Err(source)) => {
-                let _ = resources.shutdown().await;
-                return Err(AcpConnectionError::Startup {
-                    message: "ACP driver exited before connection startup",
-                    source: Box::new(source),
-                });
-            }
+        // The retained operation owns the single deadline and keeps this driver collectible.
+        let connection = match ready.await {
+            Ok(connection) => connection,
             Err(source) => {
                 let _ = resources.shutdown().await;
                 return Err(AcpConnectionError::Startup {
-                    message: "ACP connection startup exceeded 10 seconds",
+                    message: "ACP driver exited before connection startup",
                     source: Box::new(source),
                 });
             }
@@ -651,7 +636,7 @@ impl AcpConnection {
             .get_or_insert(cause);
     }
 
-    /// Send a native request; interactive prompts remain unbounded.
+    /// Send a native request under the enclosing retained operation deadline.
     pub async fn request(
         &self,
         method: &str,
@@ -707,14 +692,8 @@ impl AcpConnection {
                     request.await
                 }
             } else {
-                let seconds = if method == "authenticate" { 120 } else { 30 };
-                tokio::time::timeout(std::time::Duration::from_secs(seconds), request)
-                    .await
-                    .map_err(|source| AcpConnectionError::Timeout {
-                        method: method.into(),
-                        seconds,
-                        source,
-                    })?
+                // A native subrequest must not reset or shorten its retained operation's budget.
+                request.await
             }
         };
         response.map_err(|source| {

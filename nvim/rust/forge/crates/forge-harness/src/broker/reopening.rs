@@ -313,7 +313,7 @@ impl HarnessBroker {
                 break;
             }
             let inbox = self.observer.session_events();
-            let cancellation = self.turn_cancellation.clone();
+            let cancellation = self.turn_cancellation.capture();
             tokio::select! {
                 result = inbox.notified() => result?,
                 _ = cancellation.cancelled() => return Err(forge_provider_api::error::TurnCancelled.into()),

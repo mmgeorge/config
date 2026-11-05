@@ -6,7 +6,6 @@ use github_copilot_sdk::session_events::McpServerStatus;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Start selected servers independently and retain failures for catalog inspection.
 /// Failure to enforce the selected server set still rejects the session.
@@ -15,11 +14,10 @@ pub async fn start(
     launch: &[(String, serde_json::Map<String, Value>)],
     _trace: &dyn ProviderTrace,
     _harness_session_id: &str,
-    timeout: Duration,
 ) -> Result<HashMap<String, String>> {
     let session = &session.inner;
     // Timed-out starts may remain active natively; exclude unselected servers before launching them.
-    let selected = tokio::time::timeout(timeout, async {
+    let selected = super::operation::wait(async {
         let loaded = session
             .rpc()
             .mcp()
@@ -68,7 +66,7 @@ pub async fn start(
     let mut startup = stream::iter(request)
         .map(|request| async move {
             let name = request.server_name.clone();
-            let result = tokio::time::timeout(timeout, session.rpc().mcp().start_server(request))
+            let result = super::operation::wait(session.rpc().mcp().start_server(request))
                 .await
                 .context("Copilot MCP startup timed out")
                 .and_then(|result| result.context("Copilot MCP startup failed"));
@@ -82,7 +80,7 @@ pub async fn start(
         }
     }
     // Recheck exclusion before exposing native status for the selected servers.
-    let verified = tokio::time::timeout(timeout, session.rpc().mcp().list_configured())
+    let verified = super::operation::wait(session.rpc().mcp().list_configured())
         .await
         .context("Copilot MCP status inspection timed out")?
         .context("inspect Copilot MCP status")?;

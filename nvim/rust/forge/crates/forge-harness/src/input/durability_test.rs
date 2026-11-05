@@ -17,20 +17,14 @@ fn queued_operation(id: &str) -> InputOperation {
         control_revision: 0,
         after_control: None,
         action: InputAction::Submit {
-            message: Box::new(InputMessage {
+            message: Box::new(InputMessage::queued(crate::input::InputDraft {
                 id: id.into(),
-                revision: 0,
                 text: format!("draft {id}"),
                 purpose: InputPurpose::User,
                 attachments: vec![serde_json::json!({"id":"attachment","name":"資料.txt"})],
                 config: Some(serde_json::json!({"model":"fixture","effort":"low"})),
                 intent: InputIntent::Queue,
-                delivery: InputDelivery::Queued,
-                route: None,
-                reservation: None,
-                submission_id: None,
-                error: None,
-            }),
+            })),
         },
     }
 }
@@ -111,11 +105,12 @@ fn task_input_reconciliation_preserves_uncertain_delivery() -> Result<()> {
         },
     };
     queue.reconcile_task_input(message.clone())?;
+    queue.claim(&message.id, 1, InputRoute::Turn)?.unwrap();
     queue.delivery(
         &message.id,
         Some(InputDelivery::Unknown),
         Some("provider-submission".into()),
-        None,
+        Some("Acceptance is unknown".into()),
     )?;
     message.purpose = InputPurpose::TaskEntry {
         revision: crate::task::TaskRevision::fresh(),
@@ -127,9 +122,9 @@ fn task_input_reconciliation_preserves_uncertain_delivery() -> Result<()> {
     };
     assert!(queue.reconcile_task_input(message)?.is_none());
     let retained = queue.snapshot()?;
-    assert_eq!(retained.messages[0].delivery, InputDelivery::Unknown);
+    assert_eq!(retained.messages[0].delivery(), InputDelivery::Unknown);
     assert_eq!(
-        retained.messages[0].submission_id.as_deref(),
+        retained.messages[0].submission_id(),
         Some("provider-submission")
     );
     Ok(())
@@ -164,7 +159,7 @@ fn accepted_queue_reopens_suspended_with_order_and_idempotency() -> Result<()> {
         before.messages[0].attachments
     );
     assert_eq!(restored.messages[0].config, before.messages[0].config);
-    assert!(restored.messages[0].reservation.is_none());
+    assert!(restored.messages[0].reservation().is_none());
     assert_eq!(
         restored.messages[0].revision,
         before.messages[0].revision + 1
@@ -243,18 +238,20 @@ fn queue_restart_reconciles_dispatch_cuts_without_replay() -> Result<()> {
         let restored = queue.snapshot()?;
         assert_eq!(
             restored.suspended,
-            !matches!(boundary, DispatchCut::Accepted)
+            !matches!(boundary, DispatchCut::Accepted | DispatchCut::Cancelled)
         );
-        if matches!(boundary, DispatchCut::Accepted) {
+        if matches!(boundary, DispatchCut::Accepted | DispatchCut::Cancelled) {
             assert!(restored.messages.is_empty());
         } else {
             let expected = match boundary {
                 DispatchCut::NoSubmission => InputDelivery::Queued,
                 DispatchCut::Sending => InputDelivery::Unknown,
-                DispatchCut::Prepared | DispatchCut::Cancelled => InputDelivery::Failed,
-                DispatchCut::Accepted => unreachable!("accepted input was removed"),
+                DispatchCut::Prepared => InputDelivery::Failed,
+                DispatchCut::Accepted | DispatchCut::Cancelled => {
+                    unreachable!("settled input was removed")
+                }
             };
-            assert_eq!(restored.messages[0].delivery, expected, "{boundary:?}");
+            assert_eq!(restored.messages[0].delivery(), expected, "{boundary:?}");
             assert!(
                 queue
                     .claim("message", restored.messages[0].revision, InputRoute::Turn)?
@@ -399,11 +396,12 @@ fn reconciled_retry_commits_one_revision_and_preserves_receipt_identity() -> Res
     };
     let submission = submissions.prepare(&request, forge_providers::registry::default_id())?;
     submission.sending(None)?;
+    queue.claim("message", 1, InputRoute::Turn)?.unwrap();
     queue.delivery(
         "message",
         Some(InputDelivery::Unknown),
         Some(submission.id().into()),
-        None,
+        Some("Acceptance is unknown".into()),
     )?;
     let before = queue.snapshot()?;
     let retry = InputOperation {
@@ -421,7 +419,7 @@ fn reconciled_retry_commits_one_revision_and_preserves_receipt_identity() -> Res
         Some(InputRejection::DeliveryUnconfirmed)
     );
     assert_eq!(
-        queue.snapshot()?.messages[0].delivery,
+        queue.snapshot()?.messages[0].delivery(),
         InputDelivery::Unknown
     );
     submission.rejected("native history proved non-delivery".into())?;
@@ -432,8 +430,8 @@ fn reconciled_retry_commits_one_revision_and_preserves_receipt_identity() -> Res
     assert!(accepted.error_code.is_none());
     assert_eq!(accepted.revision, revision + 1);
     let message = &accepted.upsert[0];
-    assert_eq!(message.delivery, InputDelivery::Queued);
-    assert!(message.submission_id.is_none());
+    assert_eq!(message.delivery(), InputDelivery::Queued);
+    assert!(message.submission_id().is_none());
     assert_eq!(message.revision, before.messages[0].revision + 1);
     assert!(
         queue

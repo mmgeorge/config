@@ -9,6 +9,7 @@ pub use forge_provider_api::compaction;
 pub type ProviderCompactionRequest =
     forge_provider_api::compaction::ProviderCompactionRequest<ProviderRequest>;
 mod bridge;
+mod session_opening;
 pub(crate) use bridge::{ConfigureReceipt, ConfiguredBindingReceipt};
 mod completion;
 mod live_host_effect;

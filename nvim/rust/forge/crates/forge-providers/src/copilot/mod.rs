@@ -23,6 +23,8 @@ mod runtime;
 mod session;
 mod session_directory;
 mod sessions;
+mod shell_session;
+mod shell_tools;
 mod terminal;
 mod turn;
 

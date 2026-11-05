@@ -1975,9 +1975,9 @@ Initial transport limits are proposals to validate, not benchmark results:
 |---|---:|---|
 | Outbound encoded frame | 512 KiB | Split transfers while preserving complete logical content |
 | Active requests per client | 64 | Return Busy before retaining the payload |
-| Host queued encoded bytes | 8 MiB | Stop producing optional output and apply receive credit |
-| Lua pending received bytes | 8 MiB | Pause consumption credit and retain one scheduled drain |
-| Pending frame count | 128 | Reject further admission or suspend the affected stream |
+| Host queued encoded bytes | No aggregate ceiling | Apply frame-count receive credit without truncating output |
+| Lua pending received bytes | No aggregate ceiling | Retain one scheduled drain and acknowledge consumed frames |
+| Pending frame count | 4096 (explicitly selected) | Wait for frame capacity where asynchronous admission is available |
 | Control records reserved | 32 | Preserve cancellation, failure, and shutdown progress |
 | Snapshot part | 256 KiB | Validate sequence and total size before applying |
 | Complete snapshot transfer | No content-size ceiling | Reconstruct all ordered parts |

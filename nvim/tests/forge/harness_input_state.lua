@@ -2,236 +2,124 @@ vim.loader.enable(false)
 local client = require("forge.client")
 local input = require("forge.views.harness.input_state")
 local submission = require("forge.views.harness.prompt_submission")
+local activity = require("forge.views.harness.activity")
 local requests, errors = {}, {}
-client.request = function(request_specification, callback)
-  local session_id = request_specification.session_id
-  local method = request_specification.method
-  local parameters = request_specification.params or {}
-
-  assert(session_id == "optimistic-input")
-  requests[#requests + 1] = { method = method, parameters = parameters, callback = callback }
+client.request = function(spec, callback)
+  requests[#requests + 1] = { method = spec.method, parameters = spec.params, callback = callback }
 end
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
-local state = { session = { id = "optimistic-input", active_task = { revision = "task", kind = "goal", phase = "work", status = "running", goal = { objective = "Fixture goal", state = "active" } } }, queue = {} }
+local generation = 1
+client.host_get_generation = function() return generation end
+local state = { session = { id = "input-projection" }, runtime_epoch = "first",
+  activity = { revision = 1, phase = "working" }, queue = {} }
 local renders = 0
 input.attach(state, function() renders = renders + 1 end)
-assert(requests[1].method == "session.input.get")
-requests[1].callback({ revision = 0, suspended = false, execution_busy = true, messages = {} })
-
+requests[1].callback({ revision = 0, suspended = false, messages = {} })
 state.composer_buf = vim.api.nvim_create_buf(false, true)
-local function compose(text)
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text })
-end
-local function text()
-  return vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1]
-end
 local context = { document = "composer", buffer = state.composer_buf, is_current = function() return true end }
-compose("first message")
-submission.start(state, { text = "first message", context = context }, function() end)
-assert(text() == "" and #state.queue == 0 and #state.pending_steer == 1,
-  "active submission did not enter the separate steering presentation immediately")
-local first = requests[2]
-assert(first.method == "session.input.apply" and first.parameters.action.kind == "submit")
-assert(first.parameters.action.message.purpose.kind == "user"
-  and first.parameters.action.message.task_id == nil, "user input retained workflow ownership")
-local first_id = first.parameters.action.message.id
-compose("newer unsent text")
-local second_id = input.submit(state, "queued message", {}, "queue")
-assert(#state.queue == 1 and #state.pending_steer == 1 and #requests == 2,
-  "explicit queue and pending steering were not separated or ordered")
-first.callback({ operation_id = first.parameters.id, revision = 1, suspended = false,
-  upsert = {}, removed = {}, error = "message rejected" })
-assert(text() == "newer unsent text", "rollback overwrote newer typing")
-assert(#errors == 1 and #state.input.rejected == 1)
-local second = requests[3]
-local accepted = vim.deepcopy(second.parameters.action.message)
-accepted.revision = 1
-second.callback({ operation_id = second.parameters.id, revision = 2, suspended = false,
-  upsert = { accepted }, removed = {} })
-assert(#state.input.pending == 0)
-assert(state.queue[1].id == second_id and state.queue[2].id == first_id)
+local function compose(text) vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text }) end
+local function text() return vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] end
+local function update(revision, messages, removed)
+  input.receive(state, { revision = revision, suspended = false, upsert = messages or {}, removed = removed or {},
+    execution_busy = false })
+end
+local function queued(request)
+  local message = vim.deepcopy(request.parameters.action.message)
+  assert(message.delivery == nil and message.submission_id == nil and message.route == nil,
+    "caller manufactured host delivery metadata")
+  message.revision, message.delivery = 1, "queued"
+  return message
+end
+
+compose("first prompt")
+local completed = 0
+submission.start(state, { context = context }, function() completed = completed + 1 end)
+local first = requests[#requests]
+assert(text() == "" and #state.pending_submit == 1 and #state.pending_steer == 0,
+  "unacknowledged editor draft was interpreted as steering")
+input.submit(state, "second prompt", {}, "queue")
+local second = requests[#requests]
+assert(#requests == 3, "Lua held an independent input command queue")
+local a, b = queued(first), queued(second)
+update(1, { a })
+update(2, { b })
+assert(#state.queue == 2 and #state.pending_submit == 0 and #state.pending_steer == 0)
+second.callback({ revision = 2, operation_id = second.parameters.id, upsert = {}, removed = {} })
 local identity = state.queue[1]
-input.perform(state, { kind = "reserve", id = second_id, revision = 1, reservation = "edit" })
-assert(state.queue[1] == identity and identity.reservation == "edit")
-local reservation = requests[4]
-accepted = vim.deepcopy(accepted)
-accepted.revision, accepted.reservation = 2, "edit"
-reservation.callback({ operation_id = reservation.parameters.id, revision = 3, suspended = false,
-  upsert = { accepted }, removed = {} })
+a.delivery, a.route, a.revision = "delivering", "steering", 2
+update(3, { a })
+assert(#state.pending_steer == 1 and state.pending_steer[1] == identity,
+  "host routing did not preserve the queue editor's entry identity")
+a.delivery, a.revision = "accepted", 3
+update(4, { a })
+update(5, {}, { a.id })
+first.callback({ revision = 1, operation_id = first.parameters.id, upsert = { queued(first) }, removed = {} })
+first.callback({ revision = 1, operation_id = first.parameters.id, upsert = { queued(first) }, removed = {} })
+assert(completed == 1 and #state.queue == 1 and state.queue[1].id == b.id,
+  "late or duplicate command reply resurrected accepted input")
+assert(activity.busy(state), "input projection changed authoritative activity")
+
+input.perform(state, { kind = "reserve", id = b.id, revision = 1, reservation = "edit" })
+local reserve = requests[#requests]
+assert(state.queue[1].reservation == nil, "Lua granted an edit reservation")
+b.reservation, b.revision = "edit", 2
+reserve.callback({ revision = 6, operation_id = reserve.parameters.id, upsert = { b }, removed = {} })
 input.perform(state, { kind = "commit", reservation = "edit", edits = {
-  { id = second_id, revision = 2, text = "changed", attachments = {} },
+  { id = b.id, revision = 2, text = "edited prompt", attachments = {} },
 } })
-assert(identity.text == "changed", "edit commit waited for a host reply")
-local commit = requests[5]
-input.submit(state, "later operation", {}, "queue")
-commit.callback({ operation_id = commit.parameters.id, revision = 4, suspended = false,
-  upsert = {}, removed = {}, error = "edit conflict" })
-assert(identity.text == "queued message", "failed edit was not rolled back")
-assert(state.queue[2].text == "later operation", "rollback discarded a later operation")
-assert(text() == "newer unsent text")
-input.receive(state, { revision = 3, suspended = false, upsert = {}, removed = { second_id } })
-assert(state.queue[1] == identity, "stale publication removed a current message")
-assert(renders > 0)
-local accepted_message = vim.deepcopy(identity)
-accepted_message.delivery = "accepted"
-input.receive(state, { revision = 5, suspended = false, execution_busy = true,
-  upsert = { accepted_message }, removed = {} })
-assert(state.busy and state.execution_busy, "acceptance prematurely completed execution")
-for _, queued in ipairs(state.queue) do
-  assert(queued.id ~= second_id, "accepted message remained labelled as queued or sending")
-end
-accepted_message.delivery = "delivering"
-input.receive(state, { revision = 6, suspended = false, execution_busy = true,
-  upsert = { accepted_message }, removed = {} })
-for _, queued in ipairs(state.queue) do
-  assert(queued.id ~= second_id, "dispatching message remained visible as queued input")
-end
+local commit = requests[#requests]
+assert(state.queue[1].text == "second prompt", "Lua committed input before host acknowledgement")
+commit.callback({ revision = 7, operation_id = commit.parameters.id, upsert = {}, removed = {}, error = "edit conflict" })
+assert(state.queue[1].text == "second prompt" and #errors == 1)
+
+compose("retain this rejected draft")
+submission.start(state, { context = context }, function() end)
+local rejected = requests[#requests]
+compose("newer typing")
+local before = #requests
+rejected.callback(nil, "not admitted", { code = "not_admitted" })
+assert(#requests == before, "feature-level recovery replayed a rejected command")
+assert(text() == "newer typing", "failure overwrote newer editor text")
+local draft = state.queue[#state.queue]
+assert(draft.local_only and draft.draft_state == "rejected" and draft.delivery == nil)
+input.retry(state, draft)
+local retried = requests[#requests]
+local recovered = queued(retried)
+assert(recovered.id == rejected.parameters.action.message.id)
+retried.callback({ revision = 8, operation_id = retried.parameters.id, upsert = { recovered }, removed = {} })
+
 local original_defer = vim.defer_fn
-local retry
-vim.defer_fn = function(callback) retry = callback end
-local pending = requests[#requests]
-local error_count = #errors
-pending.callback(nil, "Input storage is busy", { code = "not_admitted" })
-assert(retry and #errors == error_count, "temporary storage contention became a failed message")
-local pending_id = pending.parameters.id
-retry()
-assert(requests[#requests].parameters.id == pending_id, "storage retry changed the input operation identity")
+vim.defer_fn = function() error("input projection installed a retry timer") end
+update(11)
+assert(state.input.revision == 8 and requests[#requests].method == "session.input.get",
+  "a delta with a missing baseline was committed")
+local refresh = requests[#requests]
+update(12)
+assert(requests[#requests] == refresh, "missing baseline started competing refreshes")
+refresh.callback({ revision = 12, suspended = false, messages = { b, recovered } })
+assert(state.input.revision == 12 and state.input.required_revision == nil)
+update(9, {}, { b.id })
+assert(#state.queue == 2, "stale input event changed the current projection")
 vim.defer_fn = original_defer
-state.runtime_epoch = "replacement-host"
-input.refresh(state)
-local replacement = requests[#requests]
-assert(replacement.method == "session.input.get")
-replacement.callback({ revision = 0, suspended = false, execution_busy = false, messages = {} })
-assert(#state.input.pending == 0 and #state.queue > 0,
-  "host restart replayed pending operations or discarded recoverable text")
-for _, entry in ipairs(state.queue) do
-  assert(entry.delivery == "unknown" and entry.local_only, "recovery draft became runnable")
-end
-assert(#state.pending_steer == 0 and #state.pending_submit == 0)
-state.input.rejected = {}
-state.queue = {}
 
-compose("idle direct prompt")
-submission.start(state, { text = "idle direct prompt", context = context }, function() end)
-local direct = requests[#requests]
-assert(text() == "" and #state.pending_submit == 1 and #state.queue == 0 and #state.pending_steer == 0,
-  "idle submission flashed in a queue")
-local direct_message = vim.deepcopy(direct.parameters.action.message)
-direct_message.revision = 1
-direct.callback({ operation_id = direct.parameters.id, revision = 1, suspended = false,
-  execution_busy = true, upsert = { direct_message }, removed = {} })
-assert(#state.pending_submit == 1 and #state.queue == 0 and #state.pending_steer == 0,
-  "the acknowledgement reclassified an idle submission as steering")
-direct_message.delivery = "delivering"
-input.receive(state, { revision = 2, suspended = false, execution_busy = true,
-  upsert = { direct_message }, removed = {} })
-assert(#state.pending_submit == 1 and #state.queue == 0 and #state.pending_steer == 0)
-direct_message.delivery = "accepted"
-input.receive(state, { revision = 3, suspended = false, execution_busy = true,
-  upsert = { direct_message }, removed = {} })
-assert(#state.pending_submit == 0, "accepted direct submission retained its pending presentation")
-input.receive(state, { revision = 4, suspended = false, execution_busy = false,
-  upsert = {}, removed = { direct_message.id } })
-assert(next(state.input.direct_submission) == nil, "settled direct presentation identity leaked")
-
-compose("rejected direct prompt")
-submission.start(state, { text = "rejected direct prompt", context = context }, function() end)
-local rejected_direct = requests[#requests]
-compose("newer draft")
-rejected_direct.callback({ operation_id = rejected_direct.parameters.id, revision = 5, suspended = false,
-  upsert = {}, removed = {}, error = "direct submission rejected" })
-assert(text() == "newer draft" and #state.pending_submit == 0 and #state.queue == 1,
-  "rejected direct submission lost its recovery entry or overwrote newer typing")
-assert(state.queue[1].text == "rejected direct prompt" and state.queue[1].delivery == "failed")
-local failed_id = state.queue[1].id
-input.retry(state, state.queue[1])
-local resubmit = requests[#requests]
-assert(resubmit.parameters.action.message.id == failed_id, "retry replaced the message identity")
-resubmit.callback({ operation_id = resubmit.parameters.id, revision = 9,
-  snapshot = { revision = 9, suspended = false, messages = {}, control_revision = 0 },
-  execution_busy = false, upsert = {}, removed = {} })
-assert(state.input.revision == 9 and #state.queue == 0, "complete snapshot failed to bridge revision gap")
-input.receive(state, { revision = 8, execution_busy = true, upsert = {}, removed = {} })
-assert(not state.execution_busy, "stale input update changed execution state")
-input.receive(state, { revision = 12, upsert = {}, removed = {} })
-assert(state.input.revision == 9, "incomplete delta advanced the confirmed baseline")
-assert(requests[#requests].method == "session.input.get")
-local recovery = requests[#requests]
-input.receive(state, { revision = 10, execution_busy = true, upsert = {}, removed = {} })
-input.receive(state, { revision = 13, execution_busy = true, upsert = {}, removed = {} })
-assert(state.input.revision == 9 and not state.execution_busy, "delta advanced a replica with a missing baseline")
-recovery.callback({ revision = 13, suspended = false, execution_busy = false, messages = {} })
-assert(state.input.revision == 13 and not state.input.required_revision, "snapshot did not repair the revision gap")
-local previous_errors = #errors
-input.refresh(state)
-local closing_refresh = requests[#requests]
-state.switching_provider = true
-closing_refresh.callback(nil, "Harness session is closing")
-assert(#errors == previous_errors and not state.input.refreshing,
-  "retired input refresh published a provider-switch error")
-local previous_requests = #requests
-input.refresh(state)
-assert(#requests == previous_requests, "input refresh submitted while switching providers")
-state.switching_provider = false
-input.refresh(state)
-requests[#requests].callback({ revision = 13, suspended = false, execution_busy = false, messages = {} })
-
--- A cancelled followup blocks FIFO without making a later idle draft an active steer.
-local failed_followup = { id = "cancelled-followup", revision = 4, text = "Retain café 東京",
-  intent = "auto", delivery = "failed", route = "steering", attachments = {}, error = "Turn cancelled" }
-input.receive(state, { revision = 14, suspended = false, execution_busy = false,
-  upsert = { failed_followup }, removed = {} })
-assert(#state.queue == 1 and #state.pending_steer == 0 and #state.pending_submit == 0)
-compose("new idle draft Δ")
-submission.start(state, { text = "new idle draft Δ", context = context }, function() end)
-local queued_submission = requests[#requests]
-local queued_message = vim.deepcopy(queued_submission.parameters.action.message)
-local queued_identity = state.pending_steer[1]
-assert(queued_identity and queued_identity.id == queued_message.id,
-  "local optimistic submission lost its identity before acknowledgment")
-queued_message.revision = 1
-queued_submission.callback({ operation_id = queued_submission.parameters.id, revision = 15,
-  suspended = false, execution_busy = false, upsert = { queued_message }, removed = {} })
-assert(not state.busy and not state.execution_busy and #state.pending_steer == 0 and #state.pending_submit == 0,
-  "confirmed queued draft was labelled as steering while the provider was idle")
-assert(#state.queue == 2 and state.queue[1].id == failed_followup.id and state.queue[2] == queued_identity,
-  "host queue acknowledgment changed FIFO or entry identity")
-assert(state.queue[2].text == "new idle draft Δ" and text() == "",
-  "queue presentation lost the submitted draft or restored it over the composer")
-queued_message.delivery, queued_message.route, queued_message.revision = "delivering", "steering", 2
-input.receive(state, { revision = 16, suspended = false, execution_busy = true,
-  upsert = { queued_message }, removed = {} })
-assert(#state.pending_steer == 1 and state.pending_steer[1] == queued_identity and #state.queue == 1,
-  "authoritative steering dispatch did not move the existing entry into steering")
-local clarification_target = { owner = "question", question_id = "selected-question", revision = 3 }
-input.submit(state, "Clarify this question", {}, "queue", nil, nil, nil, clarification_target)
-local clarification = requests[#requests]
-clarification.callback(nil, "Try again", { code = "state_unavailable" })
-local rejected_clarification = state.input.rejected[#state.input.rejected]
-input.retry(state, rejected_clarification)
-local retried_clarification = requests[#requests]
-assert(vim.deep_equal(retried_clarification.parameters.target, clarification_target),
-  "explicit retry dropped the selected question source")
-assert(retried_clarification.parameters.action.message.submission_target == nil
-  and retried_clarification.parameters.action.message.operation_id == nil,
-  "local recovery metadata leaked into the message wire shape")
-retried_clarification.callback({ operation_id = retried_clarification.parameters.id,
-  revision = state.input.revision, suspended = false, upsert = {}, removed = {} })
-local uncertain_callbacks = 0
-input.submit(state, "uncertain input", {}, "queue", nil, function(failure)
-  assert(failure == "Collection outcome unknown")
-  uncertain_callbacks = uncertain_callbacks + 1
-end)
+input.submit(state, "unconfirmed", {}, "queue")
 local uncertain = requests[#requests]
-local uncertain_request_count = #requests
-uncertain.callback(nil, "Collection outcome unknown", { code = "outcome_unknown" })
-assert(uncertain_callbacks == 1 and not state.input.sending and #state.input.pending == 0,
-  "terminal uncertainty retained the input waiter")
-assert(#requests == uncertain_request_count, "terminal uncertainty replayed an input command")
-local retained = state.input.rejected[#state.input.rejected]
-assert(retained.delivery == "unknown" and retained.operation_id == uncertain.parameters.id,
-  "terminal uncertainty lost its original command identity or claimed definite rejection")
-uncertain.callback(nil, "Collection outcome unknown", { code = "outcome_unknown" })
-assert(uncertain_callbacks == 1, "late uncertainty completed the input waiter twice")
+before = #requests
+uncertain.callback(nil, "outcome unconfirmed", { code = "outcome_unknown" })
+local unknown = state.queue[#state.queue]
+assert(unknown.local_only and unknown.draft_state == "unknown" and #requests == before)
+input.retry(state, unknown)
+assert(#requests == before, "uncertain submission was blindly resent")
+input.submit(state, "pending at restart", {}, "queue")
+local pending = requests[#requests]
+generation, state.runtime_epoch = 2, "second"
+input.refresh(state)
+requests[#requests].callback({ revision = 0, suspended = true, messages = {} })
+pending.callback(nil, "old host response", { code = "outcome_unknown" })
+assert(#state.pending_submit == 0 and #state.pending_steer == 0)
+for _, entry in ipairs(state.queue) do
+  assert(entry.local_only and entry.draft_state == "unknown", "host replacement replayed a draft")
+end
+assert(renders > 0)
 print("harness_input_state: passed")
 vim.cmd("qa!")

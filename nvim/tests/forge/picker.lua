@@ -407,6 +407,15 @@ local ok, failure = pcall(function()
   invoke("<CR>")
   assert_equals(#multiple_result, 2, "multiple-choice submission should return every selected option")
 
+  local disposed = 0
+  picker.open({
+    page_list = { { id = "dispose", option_list = {} } },
+    on_dispose = function() disposed = disposed + 1 end,
+  })
+  picker.close(false)
+  picker.close(false)
+  assert_equals(disposed, 1, "silent close must release owned subscriptions exactly once")
+
   local replaced_closed = false
   picker.open({
     owner = "first",
@@ -558,6 +567,7 @@ local ok, failure = pcall(function()
   picker.close(false)
 
   require("forge.views.harness.model_picker").open({
+    provider = "fixture",
     host = { window_list = { origin_win, composer_win }, control_win = composer_win },
     model_list = { { id = "example", reasoning = { "medium", "high" },
       context_window = { { id = "small", token_limit = 100000 } }, description = "Example model" } },

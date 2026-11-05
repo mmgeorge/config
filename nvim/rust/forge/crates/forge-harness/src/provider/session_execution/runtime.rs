@@ -1165,9 +1165,8 @@ impl CancellationReply {
 }
 
 /// Distinguish a proven unsent input from native work whose own settlement must be observed.
-#[derive(Clone, Copy)]
 enum CancellationKind {
-    Prevented,
+    Prevented(PreventedInput),
     Native,
 }
 
@@ -1721,54 +1720,29 @@ impl SessionExecution {
                 driver.cleanup_finished(Some(result));
             }
             let delivery = driver.delivery.take();
-            let drained = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-                if let Some(delivery) = delivery {
-                    while let Some(retained) = driver.pending_delivery.pop_front() {
-                        if let Err(error) = delivery.send(retained).await {
-                            error.0.fail(ObservationFailure::Disconnected);
-                            driver.retain_collection_failure(
-                                forge_provider_api::ProviderOperation::InputSubmit,
-                                Arc::new(ProviderError::Observation(
-                                    ObservationFailure::Disconnected,
-                                )),
-                            );
-                        }
-                    }
-                    drop(delivery);
-                }
-                while let Some(result) = driver.deliveries.join_next().await {
-                    match result {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => driver.retain_collection_failure(
-                            forge_provider_api::error::ProviderOperation::InputSubmit,
-                            Arc::new(error),
-                        ),
-                        Err(error) => driver.retain_collection_failure(
-                            forge_provider_api::error::ProviderOperation::InputSubmit,
-                            Arc::new(error),
-                        ),
-                    }
-                }
-            })
-            .await;
-            if let Err(source) = drained {
-                for delivery in driver.pending_delivery.drain(..) {
-                    delivery.fail(ObservationFailure::Disconnected);
-                }
-                driver.retain_collection_failure(
-                    forge_provider_api::error::ProviderOperation::InputSubmit,
-                    Arc::new(source),
-                );
-                driver.deliveries.abort_all();
-                while let Some(result) = driver.deliveries.join_next().await {
-                    if let Err(error) = result
-                        && !error.is_cancelled()
-                    {
+            if let Some(delivery) = delivery {
+                while let Some(retained) = driver.pending_delivery.pop_front() {
+                    if let Err(error) = delivery.send(retained).await {
+                        error.0.fail(ObservationFailure::Disconnected);
                         driver.retain_collection_failure(
-                            forge_provider_api::error::ProviderOperation::InputSubmit,
-                            Arc::new(error),
+                            forge_provider_api::ProviderOperation::InputSubmit,
+                            Arc::new(ProviderError::Observation(ObservationFailure::Disconnected)),
                         );
                     }
+                }
+                drop(delivery);
+            }
+            while let Some(result) = driver.deliveries.join_next().await {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => driver.retain_collection_failure(
+                        forge_provider_api::error::ProviderOperation::InputSubmit,
+                        Arc::new(error),
+                    ),
+                    Err(error) => driver.retain_collection_failure(
+                        forge_provider_api::error::ProviderOperation::InputSubmit,
+                        Arc::new(error),
+                    ),
                 }
             }
             driver.idle.close(
@@ -2281,6 +2255,26 @@ impl Driver {
             self.fail_observation(ObservationFailure::OwnershipConflict);
             return;
         }
+        if native.is_some()
+            && let Err(failure) = self.validate_native_event(&event)
+        {
+            self.fail_observation(failure);
+            return;
+        }
+        if let Some((binding, sequence)) = &native {
+            let core = crate::exchange::core_log::CoreRecord::provider_event_metadata(
+                binding.clone(),
+                *sequence,
+                &event,
+            );
+            if let Err(error) = self.provider.record_core_event(&self.owner, &core) {
+                self.fail_observation_with_origin(
+                    ObservationFailure::LifecycleUnavailable,
+                    FailureOrigin::Error(error),
+                );
+                return;
+            }
+        }
         // Identity reducers consult consumed binding metadata; publish only after that metadata advances.
         // Native terminal and settlement events retain their reducer-before-watermark ordering.
         let after_consumption = if identity_first {
@@ -2307,6 +2301,142 @@ impl Driver {
         {
             self.event(event);
         }
+    }
+
+    /// Validate immutable lifecycle preconditions before durable consumption evidence or publication.
+    fn validate_native_event(&self, event: &ProviderEvent) -> Result<(), ObservationFailure> {
+        let scope = event.scope();
+        let Some(scope) = scope.invocation() else {
+            return Ok(());
+        };
+        if !self.state.contains(scope) {
+            return Err(ObservationFailure::OwnershipConflict);
+        }
+        let invocation = self
+            .invocations
+            .get(&scope.invocation_id)
+            .filter(|invocation| &invocation.scope == scope);
+        if let ProviderEvent::Settled { settlement } = event {
+            let invocation = invocation
+                .or_else(|| {
+                    self.committed_invocations
+                        .get(&scope.invocation_id)
+                        .filter(|invocation| &invocation.scope == scope)
+                })
+                .ok_or(ObservationFailure::OwnershipConflict)?;
+            if invocation
+                .native_settlement
+                .as_ref()
+                .is_some_and(|previous| {
+                    previous.binding_id != settlement.binding_id
+                        || previous.result != settlement.result
+                })
+                || matches!(&invocation.terminal, Some(Ok(result)) if result != &settlement.result)
+            {
+                return Err(ObservationFailure::Protocol);
+            }
+        }
+        let ProviderEvent::Execution { observation } = event else {
+            return Ok(());
+        };
+        if matches!(observation.update(), ExecutionUpdate::Started { .. })
+            && (invocation.is_none()
+                || invocation.is_some_and(|invocation| invocation.native_settlement.is_some()))
+        {
+            return Err(ObservationFailure::OwnershipConflict);
+        }
+        if invocation.is_some_and(|invocation| invocation.revision.checked_add(1).is_none()) {
+            return Err(ObservationFailure::Protocol);
+        }
+        let state = self
+            .state
+            .invocations
+            .get(&scope.invocation_id)
+            .ok_or(ObservationFailure::OwnershipConflict)?;
+        match observation.update() {
+            ExecutionUpdate::Finished {
+                address,
+                covered_submissions,
+                result,
+                ..
+            }
+            | ExecutionUpdate::PublicationFailed {
+                address,
+                covered_submissions,
+                result,
+                ..
+            } => {
+                let previous = state
+                    .executions
+                    .get(&ExecutionState::key(address.clone()))
+                    .ok_or(ObservationFailure::Protocol)?;
+                if covered_submissions
+                    .iter()
+                    .any(|id| !state.submissions.contains_key(id))
+                {
+                    return Err(ObservationFailure::Protocol);
+                }
+                let publication = if let ExecutionUpdate::PublicationFailed { failure, .. } =
+                    observation.update()
+                {
+                    Some(*failure)
+                } else {
+                    None
+                };
+                let current_covered: std::collections::HashSet<_> =
+                    covered_submissions.iter().cloned().collect();
+                if let super::NativeExecution::Finished {
+                    result: prior,
+                    covered,
+                    publication_failure,
+                } = previous
+                    && (prior.as_ref() != result
+                        || covered != &current_covered
+                        || publication_failure != &publication)
+                {
+                    return Err(ObservationFailure::Protocol);
+                }
+            }
+            ExecutionUpdate::ResolvedWithoutExecution {
+                covered_submissions,
+                result,
+                ..
+            }
+            | ExecutionUpdate::ResolutionPublicationFailed {
+                covered_submissions,
+                result,
+                ..
+            } => {
+                if covered_submissions
+                    .iter()
+                    .any(|id| !state.submissions.contains_key(id))
+                {
+                    return Err(ObservationFailure::Protocol);
+                }
+                let covered: std::collections::HashSet<_> =
+                    covered_submissions.iter().cloned().collect();
+                let publication =
+                    if let ExecutionUpdate::ResolutionPublicationFailed { failure, .. } =
+                        observation.update()
+                    {
+                        Some(*failure)
+                    } else {
+                        None
+                    };
+                for previous in &state.without_execution {
+                    if previous.covered == covered {
+                        if previous.result != *result || previous.publication_failure != publication
+                        {
+                            return Err(ObservationFailure::Protocol);
+                        }
+                    } else if !previous.covered.is_disjoint(&covered) {
+                        return Err(ObservationFailure::Protocol);
+                    }
+                }
+            }
+            ExecutionUpdate::Started { .. } | ExecutionUpdate::ObservationLost { .. } => {}
+        }
+        Ok(())
     }
     /// Preserve a failed owned task while keeping the first observation cause immutable.
     fn retain_collection_failure(
@@ -2364,16 +2494,10 @@ impl Driver {
         let owner = self.owner.clone();
         self.cleanup.spawn(async move {
             use forge_provider_api::error::{CleanupFailure, ObservationCleanup};
-            let deadline = std::time::Duration::from_secs(15);
-            let collection =
-                tokio::time::timeout(deadline, provider.session_close_owner(&owner)).await;
-            let classify = |result: Result<
-                Result<(), ProviderError>,
-                tokio::time::error::Elapsed,
-            >| match result {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(CleanupFailure::Failed(Box::new(error))),
-                Err(_) => Some(CleanupFailure::TimedOut),
+            let collection = provider.session_close_owner(&owner).await;
+            let classify = |result: Result<(), ProviderError>| match result {
+                Ok(()) => None,
+                Err(error) => Some(CleanupFailure::Failed(Box::new(error))),
             };
             ObservationCleanup::new(
                 ObservationFailure::LifecycleUnavailable,
@@ -2440,6 +2564,11 @@ impl Driver {
                     || !current_fence
                     || !latest
                 {
+                    self.trace.record(self.owner.session_id.as_str(), "provider.replacement.rejected", serde_json::json!({
+                        "scope":scope, "fence_id":collection.fence_id, "owner_failed":self.failed,
+                        "admitted":admitted, "previous_collected":previous_collected,
+                        "current_fence":current_fence, "latest_reservation":latest,
+                    }));
                     let _ = reply.send(Err(ProviderError::Failure(
                         forge_provider_api::ProviderFailure::new(
                             forge_provider_api::ProviderOperation::SessionConfigure,
@@ -2563,10 +2692,7 @@ impl Driver {
                             .submission
                             .retire_prepared_attempt(&reservation.attempt_id)
                         {
-                            Ok(
-                                crate::provider::submission::SubmissionRetirement::Prevented
-                                | crate::provider::submission::SubmissionRetirement::AlreadyCancelled,
-                            ) => {
+                            Ok(crate::provider::submission::SubmissionRetirement::Cancelled) => {
                                 self.prevented_invocations.insert(
                                     scope,
                                     PreventedInput {
@@ -2608,10 +2734,12 @@ impl Driver {
                 let mut dispatch = attempt.dispatch.clone();
                 let mut finished = attempt.finished.clone();
                 let kind = match retirement {
-                    crate::provider::submission::SubmissionRetirement::Prevented
-                    | crate::provider::submission::SubmissionRetirement::AlreadyCancelled => {
+                    crate::provider::submission::SubmissionRetirement::Cancelled => {
                         attempt.task.abort();
-                        CancellationKind::Prevented
+                        CancellationKind::Prevented(PreventedInput {
+                            submission_id: attempt.submission.receipt_id().clone(),
+                            attempt_id: attempt.attempt_id.clone(),
+                        })
                     }
                     crate::provider::submission::SubmissionRetirement::Sending
                     | crate::provider::submission::SubmissionRetirement::Accepted => {
@@ -2620,8 +2748,8 @@ impl Driver {
                 };
                 let commands = self.commands.clone();
                 self.deliveries.spawn(async move {
-                    let result = match kind {
-                        CancellationKind::Prevented => {
+                    let result = match &kind {
+                        CancellationKind::Prevented(_) => {
                             let stopped = finished.wait_for(|finished| *finished).await.map(drop);
                             match stopped {
                                 Ok(()) => {
@@ -2636,7 +2764,7 @@ impl Driver {
                         }
                         CancellationKind::Native => match dispatch.wait().await {
                             Ok(confirmation) if confirmation.scope() == &scope => {
-                                provider.cancel_invocation(scope.clone()).await.map(|_| ())
+                                provider.collect_invocation(scope.clone()).await.map(|_| ())
                             }
                             Ok(_) => Err(protocol("cancellation dispatch identity changed")),
                             Err(_) => Err(ProviderError::DeliveryUncertain),
@@ -2659,16 +2787,14 @@ impl Driver {
                 result,
                 reply,
             } => {
-                if matches!(outcome, CancellationKind::Prevented) && result.is_ok() {
-                    if let Some(attempt) = self.attempts.get(&scope) {
-                        self.prevented_invocations.insert(
-                            scope.clone(),
-                            PreventedInput {
-                                submission_id: attempt.submission.receipt_id().clone(),
-                                attempt_id: attempt.attempt_id.clone(),
-                            },
-                        );
-                        if self
+                if let CancellationKind::Prevented(prevented) = outcome
+                    && result.is_ok()
+                {
+                    // Completion can remove the attempt while collection awaits its worker.
+                    // The successful collection result owns the proof needed for replacement.
+                    self.prevented_invocations.insert(scope.clone(), prevented);
+                    if let Some(attempt) = self.attempts.get(&scope)
+                        && self
                             .state
                             .delivery(
                                 &scope,
@@ -2676,12 +2802,11 @@ impl Driver {
                                 DeliveryState::NotConsumed,
                             )
                             .is_err()
-                        {
-                            reply.complete(Err(protocol(
-                                "prevented cancellation conflicts with delivery",
-                            )));
-                            return;
-                        }
+                    {
+                        reply.complete(Err(protocol(
+                            "prevented cancellation conflicts with delivery",
+                        )));
+                        return;
                     }
                     if let Some(invocation) = self
                         .invocations
@@ -2964,10 +3089,7 @@ impl Driver {
                     || self.cancelled_exchanges.contains_key(&scope.exchange_id)
                 {
                     match receipt.retire_prepared_attempt(&attempt_id) {
-                        Ok(
-                            crate::provider::submission::SubmissionRetirement::Prevented
-                            | crate::provider::submission::SubmissionRetirement::AlreadyCancelled,
-                        ) => {
+                        Ok(crate::provider::submission::SubmissionRetirement::Cancelled) => {
                             self.prevented_invocations.insert(
                                 scope.clone(),
                                 PreventedInput {
@@ -3860,14 +3982,11 @@ async fn collect_failed_execution(
 ) -> forge_provider_api::error::ObservationCleanup {
     use forge_provider_api::error::{CleanupFailure, ObservationCleanup};
 
-    let deadline = std::time::Duration::from_secs(15);
-    let collection = tokio::time::timeout(deadline, provider.session_close_owner(owner)).await;
-    let classify =
-        |result: Result<Result<(), ProviderError>, tokio::time::error::Elapsed>| match result {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(CleanupFailure::Failed(Box::new(error))),
-            Err(_) => Some(CleanupFailure::TimedOut),
-        };
+    let collection = provider.session_close_owner(owner).await;
+    let classify = |result: Result<(), ProviderError>| match result {
+        Ok(()) => None,
+        Err(error) => Some(CleanupFailure::Failed(Box::new(error))),
+    };
     ObservationCleanup::new(failure, None, None, classify(collection))
 }
 
@@ -3941,6 +4060,7 @@ fn event_category(event: &ProviderEvent) -> &'static str {
         ProviderEvent::SettlementFailed { .. } => "settlement_failed",
         ProviderEvent::CapabilitiesChanged { .. } => "capabilities_changed",
         ProviderEvent::SessionIdentity { .. } => "session_identity",
+        ProviderEvent::Terminals { .. } => "terminals",
         ProviderEvent::Execution { .. } => "execution",
         ProviderEvent::Message { .. } => "message",
         ProviderEvent::Tool { .. } => "tool",
@@ -3982,6 +4102,91 @@ mod owner_conformance;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed required consumption record cannot publish an event or advance its native watermark.
+    #[tokio::test]
+    async fn core_persistence_failure_prevents_native_event_forwarding() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        drop(crate::storage::SqliteStore::open(directory.path())?);
+        let database = rusqlite::Connection::open(directory.path().join("harness.sqlite3"))?;
+        database.execute("INSERT INTO session_record(id,workspace,updated_at_ms,payload) VALUES('session','workspace',1,'{}')", [])?;
+        database.execute_batch("CREATE TRIGGER reject_consumption BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='provider_event_consumed' BEGIN SELECT RAISE(ABORT,'fixture consumption evidence failure'); END;")?;
+        let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
+        trace.configure(false)?;
+        let provider = crate::provider::build(
+            ProviderLaunch {
+                kind: forge_providers::registry::nonselectable_id().unwrap(),
+                command: Vec::new(),
+            },
+            crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
+            trace.clone(),
+            directory.path().into(),
+        )?;
+        let owner = ExecutionOwner::root("session");
+        let (delivery, mut pending) = mpsc::channel(8);
+        let (commands, _receive) = mpsc::channel(1);
+        let mut driver = Driver {
+            owner: owner.clone(),
+            provider: provider.clone(),
+            trace,
+            queue_loss_reported: AtomicBool::new(false),
+            state: ExecutionState::new(owner.clone()),
+            invocations: HashMap::new(),
+            committed_invocations: HashMap::new(),
+            submissions: JoinSet::new(),
+            deliveries: JoinSet::new(),
+            delivery: Some(delivery),
+            pending_delivery: VecDeque::new(),
+            delivery_pressure: tokio::sync::watch::channel(false).0,
+            cleanup: JoinSet::new(),
+            failed_waiters: Vec::new(),
+            commands,
+            next_ticket_nonce: 1,
+            committed_tickets: HashMap::new(),
+            failed: false,
+            healthy: Arc::new(AtomicBool::new(true)),
+            first_failure: None,
+            cleanup_failure: None,
+            retiring: None,
+            idle: SessionObserver::Inbox(Arc::default()),
+            activity: Default::default(),
+            admitted: Default::default(),
+            attempts: HashMap::new(),
+            cancelled_admissions: Default::default(),
+            cancelled_exchanges: HashMap::new(),
+            prevented_invocations: HashMap::new(),
+            reservations: HashMap::new(),
+            latest_reservations: HashMap::new(),
+            submission_exits: Default::default(),
+        };
+        driver
+            .native_event(crate::provider::bridge::HostEvent {
+                event: ProviderEvent::Diagnostic {
+                    scope: forge_provider_api::EventScope::Binding { owner },
+                    diagnostic: forge_provider_api::ProviderDiagnostic {
+                        kind: forge_provider_api::ProviderFailureKind::Unknown,
+                        message: forge_provider_api::SanitizedMessage::new("not published")?,
+                        fatal: false,
+                    },
+                },
+                native: Some((
+                    forge_provider_api::BindingId::new("binding")?,
+                    forge_provider_api::EventSequence::new(1),
+                )),
+            })
+            .await;
+        assert!(driver.failed);
+        assert!(matches!(
+            pending.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(driver.pending_delivery.is_empty());
+        assert_eq!(database.query_row("SELECT COUNT(*) FROM owner_core_log WHERE json_extract(record,'$.record')='provider_event_consumed'", [], |row| row.get::<_, i64>(0))?, 0);
+        let cleanup = driver.cleanup.join_next().await;
+        driver.cleanup_finished(cleanup);
+        provider.shutdown().await?;
+        Ok(())
+    }
     use crate::provider::mock_response::MockResponseCommand;
     use crate::provider::{PromptMode, ProviderInput, ProviderLaunch};
     use anyhow::Context;
@@ -4372,6 +4577,98 @@ mod tests {
         next.ticket.commit().await?;
         next.ticket.commit().await?;
         registry.close().await?;
+        provider.shutdown().await?;
+        Ok(())
+    }
+
+    /// Retain positive prevention even when completion removed the attempt before collection replied.
+    #[tokio::test]
+    async fn prevented_collection_after_attempt_removal_authorizes_exact_replacement()
+    -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
+        let provider = crate::provider::build(
+            ProviderLaunch {
+                kind: forge_providers::registry::nonselectable_id().unwrap(),
+                command: Vec::new(),
+            },
+            crate::provider::approval::PermissionCoordinator::transient(directory.path())?,
+            trace.clone(),
+            directory.path().into(),
+        )?;
+        let owner = ExecutionOwner::root("collected-prevention");
+        let scope = InvocationScope::new(owner.clone(), "exchange");
+        let (commands, _receive) = mpsc::channel(1);
+        let collection = ExchangeCollection {
+            scope: scope.clone(),
+            fence_id: forge_provider_api::OperationId::new("collection")?,
+            commands: commands.clone(),
+        };
+        let mut driver = Driver {
+            owner: owner.clone(),
+            provider: provider.clone(),
+            trace,
+            queue_loss_reported: AtomicBool::new(false),
+            state: ExecutionState::new(owner),
+            invocations: HashMap::new(),
+            committed_invocations: HashMap::new(),
+            submissions: JoinSet::new(),
+            deliveries: JoinSet::new(),
+            delivery: None,
+            pending_delivery: VecDeque::new(),
+            delivery_pressure: tokio::sync::watch::channel(false).0,
+            cleanup: JoinSet::new(),
+            failed_waiters: Vec::new(),
+            commands,
+            next_ticket_nonce: 1,
+            committed_tickets: HashMap::new(),
+            failed: false,
+            healthy: Arc::new(AtomicBool::new(true)),
+            first_failure: None,
+            cleanup_failure: None,
+            retiring: None,
+            idle: SessionObserver::Inbox(Arc::default()),
+            activity: Default::default(),
+            admitted: Arc::new(Mutex::new(std::collections::HashSet::from([scope.clone()]))),
+            attempts: HashMap::new(),
+            cancelled_admissions: Default::default(),
+            cancelled_exchanges: HashMap::from([(scope.exchange_id.clone(), collection.clone())]),
+            prevented_invocations: HashMap::new(),
+            reservations: HashMap::new(),
+            latest_reservations: HashMap::from([(scope.exchange_id.clone(), scope.clone())]),
+            submission_exits: Default::default(),
+        };
+        let submission_id = SubmissionId::try_from("prevented-input".to_owned())?;
+        let attempt_id = forge_provider_api::DeliveryAttemptId::new("prevented-attempt")?;
+        let (reply, result) = oneshot::channel();
+        driver.command(Command::CancellationFinished {
+            scope: scope.clone(),
+            outcome: CancellationKind::Prevented(PreventedInput {
+                submission_id: submission_id.clone(),
+                attempt_id: attempt_id.clone(),
+            }),
+            result: Ok(()),
+            reply: CancellationReply::Exchange {
+                collection: collection.clone(),
+                reply,
+            },
+        });
+        let collected = result.await??;
+        let proof = driver.prevented_invocations.get(&scope).unwrap();
+        assert_eq!(proof.submission_id, submission_id);
+        assert_eq!(proof.attempt_id, attempt_id);
+        let (reply, result) = oneshot::channel();
+        driver.command(Command::ResumeExchange {
+            collection: collected,
+            reply,
+        });
+        result.await??;
+        assert!(!driver.cancelled_exchanges.contains_key(&scope.exchange_id));
+        // Consuming collection once must still reject a delayed duplicate resume.
+        let (reply, result) = oneshot::channel();
+        driver.command(Command::ResumeExchange { collection, reply });
+        assert!(matches!(result.await?, Err(ProviderError::Failure(failure))
+            if failure.kind() == forge_provider_api::ProviderFailureKind::WrongInvocation));
         provider.shutdown().await?;
         Ok(())
     }

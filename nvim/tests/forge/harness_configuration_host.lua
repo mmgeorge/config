@@ -20,7 +20,7 @@ local task = require("forge.views.harness.task")
 local errors, starts = {}, 0
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 client.session_events_subscribe(function(event, payload)
-  if event == "provider_event" and payload.kind == "execution_state" then starts = starts + 1 end
+  if event == "provider_event" and payload.kind == "turn_started" then starts = starts + 1 end
 end)
 local function await(predicate, message)
   assert(vim.wait(10000, function() return #errors > 0 or predicate() end, 10),
@@ -35,16 +35,16 @@ local success, failure = xpcall(function()
   await(function() return state.ready and state.session end, "Harness did not open")
 
   local idle_applied
-  controller.configure({ effort = "low" }, true, function(applied) idle_applied = applied end)
+  controller.configure({ effort = "low" }, function(applied) idle_applied = applied end)
   await(function() return idle_applied ~= nil end, "idle configuration did not settle")
   assert(idle_applied and state.session.effort == "low" and starts == 0)
 
   controller.task_transition({ action = "goal", text = "Wait for configuration changes" })
   await(function() return starts == 1 and task.current(state) end, "goal did not start")
   local task_id = task.current(state).id
-  state.busy, state.task_operation = false, nil
+  require("forge.views.harness.activity").busy(state), state.task_operation = false, nil
   local applied
-  controller.configure({ effort = "high" }, true, function(value) applied = value end)
+  controller.configure({ effort = "high" }, function(value) applied = value end)
   await(function() return applied ~= nil and starts == 2 end, "configuration did not resume active work")
   assert(applied and state.session.effort == "high", "stale idle state rejected thinking selection")
   assert(task.current(state).id == task_id, "configuration replaced the running task")
@@ -63,12 +63,12 @@ local success, failure = xpcall(function()
   end, "permission notice replaced the task lifecycle heading")
 
   controller.task_transition({ action = "pause" })
-  await(function() return not state.busy and not state.task_operation and not state.state_sync_pending end,
+  await(function() return not require("forge.views.harness.activity").busy(state) and not state.state_sync_pending end,
     "pause did not settle")
   assert(task.status(task.current(state)) == "paused")
   local paused_applied
-  controller.configure({ effort = "low" }, true, function(value) paused_applied = value end)
-  await(function() return paused_applied ~= nil and not state.task_operation and not state.state_sync_pending end,
+  controller.configure({ effort = "low" }, function(value) paused_applied = value end)
+  await(function() return paused_applied ~= nil and not state.state_sync_pending end,
     "paused configuration did not settle")
   assert(paused_applied and state.session.effort == "low")
   assert(starts == 4 and task.status(task.current(state)) == "paused", "configuration restarted a paused task")

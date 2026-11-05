@@ -9,12 +9,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::policy::{bounded_text, metadata_payload, redact};
+use super::policy::{bounded_text, metadata_payload};
 
-pub(super) const MAX_TRACE_BYTES: u64 = 15 * 1024 * 1024;
-pub(super) const MAX_PENDING_RECORDS: usize = 256;
-pub(super) const MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
-pub(super) const MAX_RECORD_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const MAX_TRACE_BYTES: u64 = 100 * 1024 * 1024;
+pub(super) const MAX_PENDING_RECORDS: usize = 4096;
+pub(super) const ROTATED_TRACE_FILES: usize = 10;
+
+/// Describe optional diagnostic admission independently of command execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TraceAdmission {
+    /// The owned writer accepted the diagnostic record.
+    Queued,
+    /// Optional diagnostics were disabled.
+    Disabled,
+    /// The producing lease or writer was closed.
+    Closed,
+    /// The approved record queue was full.
+    Saturated,
+    /// Another producer held this lease's admission boundary.
+    Contended,
+    /// The logging period changed before admission.
+    Obsolete,
+    /// Encoding or allocation failed before admission.
+    EncodingFailed,
+}
 
 /// Preserve diagnostic writer failures independently of execution outcomes.
 #[derive(Debug)]
@@ -148,7 +166,8 @@ impl Admission {
         }
         match sender.try_send(Command::Record(record)) {
             Ok(()) => Commit::Accepted,
-            Err(_) => Commit::Full,
+            Err(mpsc::TrySendError::Full(_)) => Commit::Full,
+            Err(mpsc::TrySendError::Disconnected(_)) => Commit::Obsolete,
         }
     }
 
@@ -203,7 +222,7 @@ enum Commit {
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct TraceEpoch(u64);
 
-/// Own one bounded diagnostic queue and its filesystem thread.
+/// Own one record-bounded diagnostic queue and its filesystem thread.
 pub(super) struct TraceWriter {
     sender: mpsc::SyncSender<Command>,
     shared: Arc<Shared>,
@@ -250,25 +269,51 @@ impl TraceWriter {
         self.shared.configured.load(Ordering::Acquire)
     }
 
-    /// Accept bounded owned input without waiting for the filesystem owner.
+    /// Accept safe owned metadata without waiting for the filesystem owner.
     pub(super) fn record(
         &self,
         admission: &Admission,
         session_id: &str,
         event: &str,
         payload: &Value,
-    ) {
+    ) -> TraceAdmission {
+        let result = self.admit(admission, session_id, event, payload);
+        if matches!(
+            result,
+            TraceAdmission::Saturated
+                | TraceAdmission::Contended
+                | TraceAdmission::Obsolete
+                | TraceAdmission::EncodingFailed
+        ) {
+            self.shared
+                .rejected_record_count
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        result
+    }
+
+    /// Serialize optional metadata without blocking the lifecycle owner.
+    fn admit(
+        &self,
+        admission: &Admission,
+        session_id: &str,
+        event: &str,
+        payload: &Value,
+    ) -> TraceAdmission {
         let epoch = TraceEpoch(self.shared.epoch.load(Ordering::Acquire));
         let received_at = timestamp_ms();
-        if !self.enabled() || self.shared.closed.load(Ordering::Acquire) {
-            return;
+        if self.shared.closed.load(Ordering::Acquire) {
+            return TraceAdmission::Closed;
+        }
+        if !self.enabled() {
+            return TraceAdmission::Disabled;
         }
         let Some(mut buffer) = RecordBuffer::reserve(self.shared.clone()) else {
             self.shared
                 .losses
                 .queue_full
                 .fetch_add(1, Ordering::Relaxed);
-            return;
+            return TraceAdmission::Saturated;
         };
         #[cfg(test)]
         admission.serialization_barrier();
@@ -276,43 +321,46 @@ impl TraceWriter {
             timestamp_ms: received_at,
             session_id,
             event,
-            payload,
+            payload: &metadata_payload(payload),
         };
         if serde_json::to_writer(&mut buffer, &record).is_err() {
-            match buffer.rejected {
-                Some(Rejected::Oversize) => &self.shared.losses.oversize,
-                Some(Rejected::Budget) => &self.shared.losses.queue_full,
-                None => &self.shared.losses.encoding,
-            }
-            .fetch_add(1, Ordering::Relaxed);
+            self.shared.losses.encoding.fetch_add(1, Ordering::Relaxed);
             self.shared.losses.bytes.fetch_add(
                 u64::try_from(buffer.bytes.len()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
-            return;
+            return TraceAdmission::EncodingFailed;
         }
         if epoch != TraceEpoch(self.shared.epoch.load(Ordering::Acquire)) {
             self.shared.losses.obsolete.fetch_add(1, Ordering::Relaxed);
-            return;
+            return TraceAdmission::Obsolete;
         }
         match admission.enqueue(&self.sender, EncodedRecord { epoch, buffer }) {
-            Commit::Accepted => {}
+            Commit::Accepted => TraceAdmission::Queued,
             Commit::Obsolete => {
                 self.shared.losses.obsolete.fetch_add(1, Ordering::Relaxed);
+                TraceAdmission::Closed
             }
             Commit::Contended => {
                 self.shared
                     .losses
                     .contention
                     .fetch_add(1, Ordering::Relaxed);
+                TraceAdmission::Contended
             }
             Commit::Full => {
                 self.shared
                     .losses
                     .queue_full
                     .fetch_add(1, Ordering::Relaxed);
+                TraceAdmission::Saturated
             }
         }
+    }
+
+    /// Get cumulative rejected diagnostics without consuming loss summaries.
+    pub(super) fn rejected_record_count(&self) -> u64 {
+        self.shared.rejected_record_count.load(Ordering::Acquire)
     }
 
     /// Order a persisted enablement update after preceding accepted records.
@@ -453,6 +501,7 @@ struct Shared {
     configured: AtomicBool,
     closed: AtomicBool,
     record_count: AtomicUsize,
+    rejected_record_count: AtomicU64,
     bytes: AtomicUsize,
     losses: Losses,
     epoch: AtomicU64,
@@ -466,6 +515,7 @@ impl Shared {
             configured: AtomicBool::new(configured),
             closed: AtomicBool::new(false),
             record_count: AtomicUsize::new(0),
+            rejected_record_count: AtomicU64::new(0),
             bytes: AtomicUsize::new(0),
             losses: Losses::default(),
             epoch: AtomicU64::new(0),
@@ -499,16 +549,10 @@ struct OwnedRecord {
     payload: Value,
 }
 
-enum Rejected {
-    Oversize,
-    Budget,
-}
-
 struct RecordBuffer {
     shared: Arc<Shared>,
     bytes: Vec<u8>,
     charged_bytes: usize,
-    rejected: Option<Rejected>,
 }
 
 impl RecordBuffer {
@@ -524,42 +568,18 @@ impl RecordBuffer {
             shared,
             bytes: Vec::new(),
             charged_bytes: 0,
-            rejected: None,
         })
     }
 }
 
 impl Write for RecordBuffer {
-    /// Charge every encoded byte before retaining it in the bounded queue.
+    /// Account retained encoded bytes without imposing an unapproved byte cap.
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.bytes.len().saturating_add(bytes.len()) > MAX_RECORD_BYTES {
-            self.rejected = Some(Rejected::Oversize);
-            return Err(io::Error::other("diagnostic record exceeds its byte limit"));
-        }
-        let required = self.bytes.len() + bytes.len();
-        if required > self.charged_bytes {
-            let capacity = required
-                .max(self.charged_bytes.saturating_mul(2))
-                .clamp(256, MAX_RECORD_BYTES);
-            let additional = capacity - self.charged_bytes;
-            if self
-                .shared
-                .bytes
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    count
-                        .checked_add(additional)
-                        .filter(|total| *total <= MAX_PENDING_BYTES)
-                })
-                .is_err()
-            {
-                self.rejected = Some(Rejected::Budget);
-                return Err(io::Error::other("diagnostic queue exceeds its byte budget"));
-            }
-            self.charged_bytes = capacity;
-            self.bytes
-                .try_reserve_exact(capacity - self.bytes.len())
-                .map_err(io::Error::other)?;
-        }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(io::Error::other)?;
+        self.shared.bytes.fetch_add(bytes.len(), Ordering::AcqRel);
+        self.charged_bytes += bytes.len();
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -736,7 +756,7 @@ impl Files {
         let path = session_path(&self.root, session_id);
         let lock = detail_lock(&path)?;
         let result = (|| {
-            for generation in 1..=3 {
+            for generation in 1..=ROTATED_TRACE_FILES {
                 remove_if_present(&path.with_extension(format!("jsonl.{generation}")))?;
             }
             OpenOptions::new()
@@ -753,7 +773,7 @@ impl Files {
         result.and(unlocked)
     }
 
-    /// Decode owned bounded input away from the provider event reducer.
+    /// Decode owned metadata away from the provider event reducer.
     fn write_encoded(&mut self, bytes: &[u8]) -> TraceResult<()> {
         let mut decoder = serde_json::Deserializer::from_slice(bytes);
         decoder.disable_recursion_limit();
@@ -767,7 +787,7 @@ impl Files {
         self.write_record(timestamp_ms, &session_id, &event, &payload)
     }
 
-    /// Preserve full redacted details and bounded public metadata with one receipt timestamp.
+    /// Preserve safe diagnostic metadata with one receipt timestamp.
     fn write_record(
         &mut self,
         timestamp_ms: i64,
@@ -800,40 +820,11 @@ impl Files {
         let result = (|| {
             let line =
                 serde_json::to_vec(&json!({"timestamp_ms":timestamp_ms,"session_id":session_id,
-                "event":event,"payload":redact(payload)}))
+                "event":event,"payload":metadata_payload(payload)}))
                 .map_err(TraceError::Encoding)?;
-            if path.metadata().is_ok_and(|metadata| {
-                metadata
-                    .len()
-                    .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
-                    .saturating_add(1)
-                    > MAX_TRACE_BYTES
-            }) {
-                remove_if_present(&path.with_extension("jsonl.3"))?;
-                for generation in (1..=3).rev() {
-                    let source = if generation == 1 {
-                        path.clone()
-                    } else {
-                        path.with_extension(format!("jsonl.{}", generation - 1))
-                    };
-                    let destination = path.with_extension(format!("jsonl.{generation}"));
-                    match fs::rename(&source, destination) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == ErrorKind::NotFound => {}
-                        Err(source_error) => {
-                            return Err(io_error("rotate session trace", &source, source_error));
-                        }
-                    }
-                }
-            }
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|source| io_error("open session trace", &path, source))?;
-            file.write_all(&line)
-                .and_then(|()| file.write_all(b"\n"))
-                .map_err(|source| io_error("append session trace", &path, source))
+            physical_records(&line, MAX_TRACE_BYTES, |part| {
+                append_detail(&path, part, MAX_TRACE_BYTES)
+            })
         })();
         let unlocked = lock
             .unlock()
@@ -945,24 +936,109 @@ fn remove_if_present(path: &Path) -> TraceResult<()> {
 fn append_global(file: &mut File, path: &Path, line: &[u8]) -> TraceResult<()> {
     file.lock()
         .map_err(|source| io_error("lock Harness trace", path, source))?;
-    let result = (|| -> io::Result<()> {
-        if file
-            .metadata()?
+    let result = physical_records(line, MAX_TRACE_BYTES, |part| {
+        let result = (|| -> io::Result<()> {
+            if file
+                .metadata()?
+                .len()
+                .saturating_add(u64::try_from(part.len()).unwrap_or(u64::MAX))
+                .saturating_add(1)
+                > MAX_TRACE_BYTES
+            {
+                file.set_len(0)?;
+            }
+            file.seek(SeekFrom::End(0))?;
+            file.write_all(part)?;
+            file.write_all(b"\n")
+        })();
+        result.map_err(|source| io_error("append Harness trace", path, source))
+    });
+    let unlocked = file.unlock();
+    let unlocked = unlocked.map_err(|source| io_error("unlock Harness trace", path, source));
+    result.and(unlocked)
+}
+
+/// Emit bounded physical records while preserving an oversized logical JSON record losslessly.
+fn physical_records(
+    line: &[u8],
+    file_limit: u64,
+    mut append: impl FnMut(&[u8]) -> TraceResult<()>,
+) -> TraceResult<()> {
+    if u64::try_from(line.len())
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+        <= file_limit
+    {
+        return append(line);
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let envelope = |sequence: usize, part_count: usize, payload_hex: String| {
+        json!({"trace_chunk":{
+            "id":id,"sequence":sequence,"part_count":part_count,"payload_hex":payload_hex,
+        }})
+    };
+    let overhead = serde_json::to_vec(&envelope(usize::MAX, usize::MAX, String::new()))
+        .map_err(TraceError::Encoding)?
+        .len()
+        + 1;
+    let available = usize::try_from(file_limit)
+        .unwrap_or(usize::MAX)
+        .checked_sub(overhead)
+        .filter(|available| *available >= 2)
+        .ok_or_else(|| {
+            io_error(
+                "split Harness trace",
+                Path::new("trace_chunk"),
+                io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "trace file budget cannot hold a chunk envelope",
+                ),
+            )
+        })?;
+    let part_bytes = (available / 2).min(256 * 1024);
+    let part_count = line.len().div_ceil(part_bytes);
+    for (sequence, payload) in line.chunks(part_bytes).enumerate() {
+        let part = serde_json::to_vec(&envelope(sequence, part_count, hex::encode(payload)))
+            .map_err(TraceError::Encoding)?;
+        append(&part)?;
+    }
+    Ok(())
+}
+
+/// Rotate one physical record without exceeding the selected file budget.
+fn append_detail(path: &Path, line: &[u8], file_limit: u64) -> TraceResult<()> {
+    if path.metadata().is_ok_and(|metadata| {
+        metadata
             .len()
             .saturating_add(u64::try_from(line.len()).unwrap_or(u64::MAX))
             .saturating_add(1)
-            > MAX_TRACE_BYTES
-        {
-            file.set_len(0)?;
+            > file_limit
+    }) {
+        remove_if_present(&path.with_extension(format!("jsonl.{ROTATED_TRACE_FILES}")))?;
+        for generation in (1..=ROTATED_TRACE_FILES).rev() {
+            let source = if generation == 1 {
+                path.to_owned()
+            } else {
+                path.with_extension(format!("jsonl.{}", generation - 1))
+            };
+            let destination = path.with_extension(format!("jsonl.{generation}"));
+            match fs::rename(&source, destination) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(source_error) => {
+                    return Err(io_error("rotate session trace", &source, source_error));
+                }
+            }
         }
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(line)?;
-        file.write_all(b"\n")
-    })();
-    let unlocked = file.unlock();
-    result
-        .and(unlocked)
-        .map_err(|source| io_error("append Harness trace", path, source))
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| io_error("open session trace", path, source))?;
+    file.write_all(line)
+        .and_then(|()| file.write_all(b"\n"))
+        .map_err(|source| io_error("append session trace", path, source))
 }
 
 /// Resolve private session detail paths without permitting traversal.
@@ -977,4 +1053,47 @@ pub(super) fn session_path(root: &Path, session_id: &str) -> PathBuf {
         format!("_{}", hex::encode(session_id.as_bytes()))
     };
     root.join("logs").join(format!("{name}.jsonl"))
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    /// Reassemble every chunk across rotations without allocating a production-sized fixture.
+    #[test]
+    fn oversized_record_chunks_fit_each_rotated_file_and_preserve_utf8() -> TraceResult<()> {
+        let root = tempfile::tempdir().expect("fixture directory opens");
+        let path = root.path().join("chunked.jsonl");
+        let original = serde_json::to_vec(&json!({"operation_id":"\u{754c}\u{1f642}".repeat(800)}))
+            .map_err(TraceError::Encoding)?;
+        physical_records(&original, 2048, |part| append_detail(&path, part, 2048))?;
+        let mut reconstructed = Vec::new();
+        let mut expected_sequence = 0_u64;
+        let mut record_id = None;
+        let mut expected_count = 0;
+        for generation in (0..=ROTATED_TRACE_FILES).rev() {
+            let segment = if generation == 0 {
+                path.clone()
+            } else {
+                path.with_extension(format!("jsonl.{generation}"))
+            };
+            let Ok(contents) = fs::read_to_string(&segment) else {
+                continue;
+            };
+            assert!(u64::try_from(contents.len()).unwrap() <= 2048);
+            for line in contents.lines() {
+                let value: Value = serde_json::from_str(line).map_err(TraceError::Encoding)?;
+                let chunk = &value["trace_chunk"];
+                assert_eq!(chunk["sequence"], expected_sequence);
+                expected_sequence += 1;
+                expected_count = chunk["part_count"].as_u64().unwrap();
+                let id = chunk["id"].as_str().unwrap();
+                assert_eq!(record_id.get_or_insert_with(|| id.to_owned()).as_str(), id);
+                reconstructed.extend(hex::decode(chunk["payload_hex"].as_str().unwrap()).unwrap());
+            }
+        }
+        assert_eq!(expected_sequence, expected_count);
+        assert_eq!(reconstructed, original);
+        Ok(())
+    }
 }

@@ -101,6 +101,7 @@ impl ProviderTestSession {
     }
 
     /// Read the exact cached active invocation without initializing or polling a provider binding.
+    /// Observe only work submitted through this fixture's registry; controllers retain their own registry.
     pub(crate) fn active_invocation_scope(
         &self,
         owner: &ExecutionOwner,

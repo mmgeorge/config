@@ -125,12 +125,6 @@ impl SqliteStore {
                 [session_id],
             )?;
         }
-        // Preserve the import tombstone even when this session never opened its old
-        // input journal. Retained legacy files cannot resurrect explicitly deleted input.
-        transaction.execute(
-            "INSERT OR IGNORE INTO input_migration(session_id) VALUES(?1)",
-            [session_id],
-        )?;
         transaction.execute("DELETE FROM session_record WHERE id=?1", [session_id])?;
         transaction.commit()?;
         Ok(())

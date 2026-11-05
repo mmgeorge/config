@@ -1,8 +1,15 @@
-struct PreparationProbe {
-    started: Notify,
-    release: Notify,
-    fail: bool,
-}
+use super::super::{
+    ExchangeAdmission, ExchangeState, PromptMode, Request, SessionUpdate, SqliteStore,
+    TurnCancelled, publication,
+};
+use super::test_support::{
+    PreparationProbe, checkpoint_fixture, planning_question_broker, repository,
+};
+use anyhow::Result;
+use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::Notify;
 
 /// Preserve a required tool question's exchange when clarification has released its native waiter.
 #[tokio::test]
@@ -298,7 +305,7 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
         broker.event_sink = Some(sink);
         let session_id = broker.session.id.clone();
         let cancellation = broker.turn_cancellation();
-        cancellation.arm(true);
+        cancellation.arm();
         let observe = async {
             preparation.started.notified().await;
             let mut published = false;
@@ -313,7 +320,7 @@ async fn admission_precedes_preparation_and_settles_success_failure_and_cancella
             assert_eq!(exchange[0].prompt, "Visible before provider preparation");
             assert!(!tool_ran.load(Ordering::SeqCst));
             if outcome == "cancel" {
-                cancellation.request(false);
+                cancellation.request();
             } else {
                 preparation.release.notify_one();
             }

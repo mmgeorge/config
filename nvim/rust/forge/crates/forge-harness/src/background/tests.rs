@@ -56,6 +56,38 @@ async fn generate(
         .await
 }
 
+/// Generate through the real background workflow after upgrading the previously deployed schema.
+#[tokio::test]
+async fn commit_generation_upgrades_version_seven_operation_storage() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("repository");
+    std::fs::create_dir(&root)?;
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.name", "Fixture"]);
+    git(&root, &["config", "user.email", "fixture@example.test"]);
+    let data = fixture.path().join("state");
+    drop(SqliteStore::open(&data)?);
+    let database = rusqlite::Connection::open(data.join("harness.sqlite3"))?;
+    database.execute_batch("DROP TABLE owner_core_log; PRAGMA user_version=7;")?;
+    drop(database);
+
+    let manager = manager();
+    let result = generate(&manager, &root, &data).await;
+    manager.shutdown().await?;
+    let generated = result?;
+    assert!(!generated.text.trim().is_empty());
+    let database = rusqlite::Connection::open(data.join("harness.sqlite3"))?;
+    let recorded: i64 = database.query_row(
+        "SELECT count(*) FROM owner_core_log WHERE session_id=?1 AND json_extract(record,'$.record')='operation_completed' AND json_extract(record,'$.operation.kind')='session_open'",
+        [&generated.session_id], |row| row.get(0),
+    )?;
+    assert!(
+        recorded > 0,
+        "commit generation must retain its successful provider-open evidence"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
     let fixture = tempfile::tempdir()?;
@@ -74,6 +106,7 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
     let first = generate(&first_manager, &root, &data).await?;
     first_manager.shutdown().await?;
     assert!(!first.text.is_empty());
+    let first_manager = manager();
     let second = generate(&first_manager, &root, &data).await?;
     first_manager.shutdown().await?;
     assert_eq!(first.session_id, second.session_id);
@@ -81,12 +114,14 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
         &root,
         &["commit", "-q", "--allow-empty", "-m", "feat: initial"],
     );
+    let first_manager = manager();
     let third = generate(&first_manager, &root, &data).await?;
     first_manager.shutdown().await?;
     assert_eq!(
         first.session_id, third.session_id,
         "first commit should advance an unborn branch"
     );
+    let first_manager = manager();
     let (left, right) = tokio::join!(
         generate(&first_manager, &root, &data),
         generate(&first_manager, &root, &data)
@@ -130,6 +165,7 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
     assert!(events.iter().any(|event| matches!(&event.detail,crate::timeline::SessionEventKind::Compaction { compaction } if compaction.state == crate::provider::CompactionState::Unconfirmed)));
 
     git(&root, &["switch", "-q", "-c", "feature"]);
+    let resumed_manager = manager();
     let branch = generate(&resumed_manager, &root, &data).await?;
     resumed_manager.shutdown().await?;
     assert_ne!(first.session_id, branch.session_id);
@@ -144,6 +180,7 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
             "feat: rewritten",
         ],
     );
+    let resumed_manager = manager();
     let rewritten = generate(&resumed_manager, &root, &data).await?;
     resumed_manager.shutdown().await?;
     assert_ne!(branch.session_id, rewritten.session_id);

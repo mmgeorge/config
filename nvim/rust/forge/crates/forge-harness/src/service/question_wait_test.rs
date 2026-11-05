@@ -50,7 +50,7 @@ async fn await_input(
 /// A fast answer cannot disappear when its tool observer abandons the wait before reading it.
 #[tokio::test]
 async fn abandoned_wait_recovers_a_previously_suppressed_answer_once() -> Result<()> {
-    let (_root, controller, exchange) = fixture()?;
+    let (_root, controller, exchange) = fixture().await?;
     let wait = controller
         .exchange_owner
         .question_events()
@@ -100,7 +100,7 @@ async fn abandoned_wait_recovers_a_previously_suppressed_answer_once() -> Result
 /// Owner retirement must distinguish already observed answers from corrections committed afterward.
 #[tokio::test]
 async fn observed_wait_recovers_only_a_later_unobserved_correction() -> Result<()> {
-    let (_root, controller, exchange) = fixture()?;
+    let (_root, controller, exchange) = fixture().await?;
     let wait = controller
         .exchange_owner
         .question_events()
@@ -151,7 +151,7 @@ async fn observed_wait_recovers_only_a_later_unobserved_correction() -> Result<(
 #[tokio::test]
 async fn wait_retirement_retries_observation_storage_without_queuing_an_answer_copy() -> Result<()>
 {
-    let (_root, controller, exchange) = fixture()?;
+    let (_root, controller, exchange) = fixture().await?;
     controller.trace.configure(true)?;
     let wait = controller
         .exchange_owner
@@ -256,7 +256,7 @@ async fn wait_retirement_retries_observation_storage_without_queuing_an_answer_c
 /// Closing the owner must release a still-live guard without requiring the caller to poll or drop it.
 #[tokio::test]
 async fn owner_close_seals_live_question_waits_and_preserves_answer_history() -> Result<()> {
-    let (_root, controller, exchange) = fixture()?;
+    let (_root, controller, exchange) = fixture().await?;
     let wait = controller
         .exchange_owner
         .question_events()
@@ -288,17 +288,16 @@ async fn owner_close_seals_live_question_waits_and_preserves_answer_history() ->
     Ok(())
 }
 
-/// Capacity rejection must precede question publication, and shutdown must retire a full resource set.
+/// Queue excess wait admission while answers and shutdown retain their control paths.
 #[tokio::test]
-async fn question_wait_capacity_rejects_before_publication_and_close_retires_live_guards()
--> Result<()> {
-    let (_root, controller, exchange) = fixture()?;
+async fn question_wait_capacity_backpressures_without_blocking_answers_or_close() -> Result<()> {
+    const WAIT_CAPACITY: usize = 1024;
+    let (_root, controller, exchange) = fixture().await?;
     let context = context(&controller, &exchange);
     let events = controller.exchange_owner.question_events();
-    let mut waits = Vec::new();
-    for index in 0..forge_protocol::MAX_ACTIVE_REQUESTS {
-        let creation = crate::exchange::QuestionCreation::new(
-            crate::exchange::QuestionOperationId::new(format!("wait-{index}"))?,
+    let create = |operation: String| -> Result<crate::exchange::QuestionCreation> {
+        Ok(crate::exchange::QuestionCreation::new(
+            crate::exchange::QuestionOperationId::new(operation)?,
             exchange.as_str().into(),
             None,
             vec![crate::question::QuestionDraft {
@@ -309,21 +308,75 @@ async fn question_wait_capacity_rejects_before_publication_and_close_retires_liv
             }],
             crate::exchange::QuestionCreationOrigin::Discussion,
             crate::tools::TaskAuthority::capture(&context).unwrap(),
-        )?;
-        waits.push(events.begin_wait(creation).await?);
+        )?)
+    };
+    let mut waits = Vec::new();
+    for index in 0..WAIT_CAPACITY {
+        waits.push(events.begin_wait(create(format!("wait-{index}"))?).await?);
     }
-    let rejected = events
-        .begin_wait(creation(&context, &exchange, "over-capacity")?)
-        .await;
+    assert_eq!(
+        controller.questions.snapshot()?.questions.len(),
+        WAIT_CAPACITY
+    );
+    let mut overflow = Box::pin(events.begin_wait(create("over-capacity".into())?));
+    assert!(futures_util::poll!(overflow.as_mut()).is_pending());
+    controller
+        .exchange_owner
+        .command_status(crate::exchange::command::CommandId::new(
+            "capacity-observation",
+        )?)
+        .await?;
+    assert!(futures_util::poll!(overflow.as_mut()).is_pending());
+    assert_eq!(
+        controller.questions.snapshot()?.questions.len(),
+        WAIT_CAPACITY,
+        "backpressured wait published a question before a slot was released"
+    );
+
+    let first = waits.remove(0);
+    let question = first.question_ids()[0].clone();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        answer(&controller, &question, "capacity-answer"),
+    )
+    .await
+    .context("full wait capacity blocked a user answer")??;
+    let answers = tokio::time::timeout(Duration::from_secs(3), first.answers()).await??;
+    assert_eq!(answers.len(), 1);
+    let admitted = tokio::time::timeout(Duration::from_secs(3), overflow)
+        .await
+        .context("retiring one wait did not admit the retained overflow request")??;
+    assert_eq!(admitted.question_ids().len(), 1);
+    waits.push(admitted);
+    assert_eq!(waits.len(), WAIT_CAPACITY);
+    assert_eq!(
+        controller.questions.snapshot()?.questions.len(),
+        WAIT_CAPACITY + 1,
+        "overflow admission did not publish exactly one additional question"
+    );
+
+    let mut closing = Box::pin(events.begin_wait(create("waiting-at-close".into())?));
+    assert!(futures_util::poll!(closing.as_mut()).is_pending());
+    controller
+        .exchange_owner
+        .command_status(crate::exchange::command::CommandId::new(
+            "close-capacity-observation",
+        )?)
+        .await?;
+    assert!(futures_util::poll!(closing.as_mut()).is_pending());
+    tokio::time::timeout(Duration::from_secs(10), controller.finish_exchange_owner())
+        .await
+        .context("staged wait admission blocked owner shutdown")??;
     assert!(matches!(
-        rejected,
-        Err(crate::exchange::QuestionEventError::WaitCapacity)
+        closing.await,
+        Err(crate::exchange::QuestionEventError::OwnerClosed
+            | crate::exchange::QuestionEventError::AdmissionClosed)
     ));
     assert_eq!(
         controller.questions.snapshot()?.questions.len(),
-        forge_protocol::MAX_ACTIVE_REQUESTS
+        WAIT_CAPACITY + 1,
+        "closing admitted a question that was still waiting for capacity"
     );
-    tokio::time::timeout(Duration::from_secs(3), controller.finish_exchange_owner()).await??;
     for wait in waits {
         assert!(matches!(
             wait.answers().await,
@@ -337,7 +390,7 @@ async fn question_wait_capacity_rejects_before_publication_and_close_retires_liv
 #[tokio::test]
 async fn observed_shared_wait_prevents_an_abandoned_guard_from_queuing_duplicate_answer()
 -> Result<()> {
-    let (_root, controller, exchange) = fixture()?;
+    let (_root, controller, exchange) = fixture().await?;
     controller.trace.configure(true)?;
     let context = context(&controller, &exchange);
     let creation = || -> Result<crate::exchange::QuestionCreation> {
@@ -403,7 +456,7 @@ async fn observed_shared_wait_prevents_an_abandoned_guard_from_queuing_duplicate
 /// Retirement of an old task's wait cannot restore delivery work that task clearing already revoked.
 #[tokio::test]
 async fn abandoned_wait_does_not_restore_an_answer_after_its_task_is_cleared() -> Result<()> {
-    let (_root, controller, exchange) = fixture()?;
+    let (_root, controller, exchange) = fixture().await?;
     let task = controller
         .task_controller
         .change(

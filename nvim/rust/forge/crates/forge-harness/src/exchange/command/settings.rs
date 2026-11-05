@@ -13,9 +13,7 @@ impl SessionConfigurationPatch {
     pub(crate) fn queued_model(
         settings: super::QueuedModelSettings,
     ) -> Result<Self, serde_json::Error> {
-        let mut encoded = settings.encode();
-        encoded["validate"] = serde_json::Value::Bool(true);
-        serde_json::from_value(encoded)
+        serde_json::from_value(settings.encode())
     }
     /// Require native authority only for invocation changes or provider-backed validation.
     pub(crate) fn requires_native_authority(&self) -> bool {
@@ -44,7 +42,6 @@ impl SessionConfigurationPatch {
             ask_model,
             setting_fields: _,
             session_policy: _,
-            validate: _,
         } = &self.0;
         model.is_some()
             || effort.is_some()
@@ -126,7 +123,6 @@ impl TryFrom<SettingsFields> for SessionConfigurationPatch {
             ask_model,
             setting_fields: _,
             session_policy: _,
-            validate: _,
         } = &fields;
         if model.is_none()
             && effort.is_none()
@@ -428,7 +424,6 @@ struct SettingsFields {
     )]
     setting_fields: Option<Vec<String>>,
     session_policy: bool,
-    validate: bool,
 }
 
 /// Reject explicit null for settings that have no clear/inherit operation.

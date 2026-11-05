@@ -22,6 +22,17 @@ use super::{
     },
 };
 
+/// Read the single owner's complete boundary for installing task input.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum TaskDeliveryGate {
+    /// No foreground, steering, or queued preparation occupies the delivery slot.
+    Open,
+    /// Retain acquired resources while the owner finishes earlier work.
+    Waiting,
+    /// Surface a finite failure when earlier cleanup cannot restore the delivery slot.
+    Unavailable,
+}
+
 /// Retain one task command and its resources independently of response observers.
 pub(super) struct TaskCommandRun {
     pub(super) command: QueuedCommand,
@@ -248,7 +259,11 @@ impl TaskCommandRun {
     }
 
     /// Await one retained fact while provider observations and caller intake continue to advance.
-    pub(super) async fn next(&mut self, foreground: ForegroundStatus) -> TaskCommandEvent {
+    pub(super) async fn next(
+        &mut self,
+        foreground: ForegroundStatus,
+        delivery: TaskDeliveryGate,
+    ) -> TaskCommandEvent {
         match &mut self.stage {
             TaskStage::Preflight => TaskCommandEvent::Preflight,
             TaskStage::Acquiring(task) => TaskCommandEvent::Control(
@@ -278,6 +293,10 @@ impl TaskCommandRun {
                     .await,
             ),
             TaskStage::Commit(_) => TaskCommandEvent::Commit,
+            // A ready semaphore acquisition does not imply that the owner released all prior work.
+            TaskStage::AcquiringDelivery(_) if delivery == TaskDeliveryGate::Waiting => {
+                std::future::pending().await
+            }
             TaskStage::AcquiringDelivery(task) => TaskCommandEvent::Delivery(
                 task.await
                     .unwrap_or(Err(CommandFailure::OwnershipUnavailable)),
@@ -2019,6 +2038,7 @@ mod tests {
             },
             reply,
             None,
+            None,
             &trace,
             "session",
             1,
@@ -2033,6 +2053,22 @@ mod tests {
             control: None,
             transition: None,
         };
+        run.stage = TaskStage::AcquiringDelivery(tokio::spawn(async {
+            Err(CommandFailure::OwnershipUnavailable)
+        }));
+        tokio::task::yield_now().await;
+        assert!(
+            futures_util::FutureExt::now_or_never(
+                run.next(ForegroundStatus::Local, TaskDeliveryGate::Waiting)
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            run.next(ForegroundStatus::Quiescent, TaskDeliveryGate::Open)
+                .await,
+            TaskCommandEvent::Delivery(Err(CommandFailure::OwnershipUnavailable))
+        ));
+        run.stage = TaskStage::AwaitingInput(input.clone());
         let work = uuid::Uuid::new_v4();
         let receipt = forge_provider_api::SubmissionId::try_from("original-receipt".to_owned())?;
         let scope = crate::provider::InvocationScope::new(
@@ -2066,7 +2102,8 @@ mod tests {
         run.dispatch_lost(work);
         run.input_ended(&input);
         assert!(matches!(
-            run.next(ForegroundStatus::Quiescent).await,
+            run.next(ForegroundStatus::Quiescent, TaskDeliveryGate::Open)
+                .await,
             TaskCommandEvent::Ready
         ));
         assert!(matches!(&run.stage, TaskStage::Ready(outcome)

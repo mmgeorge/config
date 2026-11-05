@@ -2136,11 +2136,11 @@ async fn provider_turn_cancellation_collects_its_background_checks() -> Result<(
         crate::session::CheckShell::Nushell,
         "Agent requested".into(),
     )?;
-    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancelled = tokio::sync::watch::channel(false).0;
     let id = runner
-        .start(run, None, Some(Arc::clone(&cancelled)), None)
+        .start(run, None, Some(cancelled.subscribe()), None)
         .await?;
-    cancelled.store(true, std::sync::atomic::Ordering::Release);
+    cancelled.send_replace(true);
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while runner.active()?.is_some() {
             runner.status(&id, 500, false).await?;

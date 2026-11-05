@@ -90,10 +90,6 @@ pub(super) async fn apply(
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         )
     });
-    ensure!(
-        workers.tasks.len() < forge_protocol::MAX_PENDING_FRAMES,
-        "prompt presentation observers are full"
-    );
     let mut admission = None;
     if prior.is_none()
         && let Some(ComposerSubmission {
@@ -285,20 +281,14 @@ fn normalize(
         control_revision: 0,
         after_control: None,
         action: InputAction::Submit {
-            message: Box::new(InputMessage {
+            message: Box::new(InputMessage::queued(crate::input::InputDraft {
                 id: input_id.as_str().into(),
-                revision: 0,
                 text,
                 purpose: InputPurpose::User,
                 attachments,
                 config: (!config.is_empty()).then_some(Value::Object(config)),
                 intent,
-                delivery: crate::input::InputDelivery::Queued,
-                route: None,
-                reservation: None,
-                submission_id: None,
-                error: None,
-            }),
+            })),
         },
     })?;
     command.input_control = InputControl::AtExecution;

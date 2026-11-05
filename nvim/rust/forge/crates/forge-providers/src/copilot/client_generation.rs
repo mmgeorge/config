@@ -2,7 +2,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
 
 use forge_provider_api::ProviderError;
 use forge_provider_api::error::{CleanupFailure, ObservationCleanup};
@@ -196,16 +195,14 @@ impl ClientGeneration {
             }));
         }
         if let Collection::Running(task) = &mut *collection {
-            let result = tokio::time::timeout(Duration::from_secs(30), task)
-                .await
-                .map_err(|_| {
-                    ProviderError::Cleanup(Arc::new(ObservationCleanup::new(
-                        failed.failure(),
-                        None,
-                        None,
-                        Some(CleanupFailure::TimedOut),
-                    )))
-                })?;
+            let result = super::operation::wait(task).await.map_err(|_| {
+                ProviderError::Cleanup(Arc::new(ObservationCleanup::new(
+                    failed.failure(),
+                    None,
+                    None,
+                    Some(CleanupFailure::TimedOut),
+                )))
+            })?;
             *collection = Collection::Complete(result.unwrap_or_else(|_| {
                 Err(Arc::new(native_failure(
                     forge_provider_api::error::ProviderOperation::Shutdown,
@@ -270,9 +267,12 @@ mod tests {
             })
         }));
         assert!(
-            tokio::time::timeout(Duration::from_millis(1), generation.collect(&failed))
-                .await
-                .is_err()
+            tokio::time::timeout(
+                std::time::Duration::from_millis(1),
+                generation.collect(&failed)
+            )
+            .await
+            .is_err()
         );
         assert!(matches!(
             *generation.0.collection.lock().await,

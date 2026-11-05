@@ -338,7 +338,7 @@ impl SessionTaskController {
         );
         let rollback = store.prepare_rollback(replacement, roots)?;
         store
-            .commit_task_effects(&self.session_id, expected, now_ms, None, |active| {
+            .commit_task_effects(&self.session_id, expected, now_ms, |active| {
                 let mut effects = clear_effect(&self.session_id, active.as_ref(), None, now_ms);
                 effects.rollback = Some(Box::new(rollback));
                 *active = None;
@@ -485,7 +485,6 @@ impl SessionTaskController {
                 &self.session_id,
                 Some(permit.revision()),
                 now_ms,
-                None,
                 |active| {
                     let task = active.as_mut().context("session has no active task")?;
                     permit.validate(Some(task))?;
@@ -518,7 +517,6 @@ impl SessionTaskController {
                 &self.session_id,
                 Some(permit.revision()),
                 now_ms,
-                None,
                 |active| {
                     let task = active.as_ref().context("session has no active task")?;
                     permit.validate(Some(task))?;
@@ -1324,7 +1322,7 @@ impl SessionTaskController {
         };
         let result = match permit {
             Some(permit) => store.commit_task_observation(&self.session_id, permit, now_ms, commit),
-            None => store.commit_task_effects(&self.session_id, None, now_ms, None, commit),
+            None => store.commit_task_effects(&self.session_id, None, now_ms, commit),
         };
         result
             .map_err(|error| {
@@ -1449,7 +1447,7 @@ impl SessionTaskController {
         };
         let result = match permit {
             Some(permit) => store.commit_task_observation(&self.session_id, permit, now_ms, commit),
-            None => store.commit_task_effects(&self.session_id, None, now_ms, None, commit),
+            None => store.commit_task_effects(&self.session_id, None, now_ms, commit),
         };
         result
             .map_err(|error| {
@@ -1611,7 +1609,7 @@ impl SessionTaskController {
         };
         let result = match permit {
             Some(permit) => store.commit_task_observation(&self.session_id, permit, now_ms, commit),
-            None => store.commit_task_effects(&self.session_id, None, now_ms, None, commit),
+            None => store.commit_task_effects(&self.session_id, None, now_ms, commit),
         };
         result
             .map_err(|error| {
@@ -1717,20 +1715,14 @@ impl SessionTaskController {
                     )
                 }
             };
-            let message = crate::input::InputMessage {
+            let message = crate::input::InputMessage::admitted(crate::input::InputDraft {
                 id: input.as_str().into(),
-                revision: 1,
                 text: instruction,
                 purpose,
                 attachments: Vec::new(),
                 config: None,
                 intent: crate::input::InputIntent::Auto,
-                delivery: crate::input::InputDelivery::Queued,
-                route: None,
-                reservation: None,
-                submission_id: None,
-                error: None,
-            };
+            });
             effects.owner_task_commit =
                 Some(crate::exchange::journal::TaskCommandCommit::WorkflowInput {
                     command: id.clone(),
@@ -1747,7 +1739,7 @@ impl SessionTaskController {
         };
         let result = match permit {
             Some(permit) => store.commit_task_observation(&self.session_id, permit, now_ms, commit),
-            None => store.commit_task_effects(&self.session_id, None, now_ms, None, commit),
+            None => store.commit_task_effects(&self.session_id, None, now_ms, commit),
         };
         result
             .map_err(|error| {
@@ -1797,7 +1789,7 @@ impl SessionTaskController {
         };
         let result = match permit {
             Some(permit) => store.commit_task_observation(&self.session_id, permit, now_ms, commit),
-            None => store.commit_task_effects(&self.session_id, None, now_ms, None, commit),
+            None => store.commit_task_effects(&self.session_id, None, now_ms, commit),
         };
         result
             .map_err(|error| {
@@ -1820,7 +1812,7 @@ impl SessionTaskController {
             TaskChange::Install(_) | TaskChange::Clear | TaskChange::ResumeWithEntry(_)
         );
         store
-            .commit_task_effects(&self.session_id, expected, now_ms, None, |active| {
+            .commit_task_effects(&self.session_id, expected, now_ms, |active| {
                 let previous = active.clone();
                 let changed = Self::apply_change(active, change, now_ms)?;
                 let mut effects =
@@ -1831,52 +1823,29 @@ impl SessionTaskController {
             .context("task change unexpectedly reused a command")
     }
 
-    #[cfg(test)]
-    pub(crate) fn command(
+    pub(crate) fn change_with_effects(
         &self,
         store: &mut SqliteStore,
-        receipt: &super::TaskOperation,
-        expected: Option<&TaskRevision>,
-        change: TaskChange,
-        now_ms: i64,
-    ) -> Result<Option<Task>> {
-        self.command_with_effects(store, receipt, expected, change, Default::default(), now_ms)
-    }
-
-    pub(crate) fn command_with_effects(
-        &self,
-        store: &mut SqliteStore,
-        receipt: &super::TaskOperation,
         expected: Option<&TaskRevision>,
         change: TaskChange,
         mut effects: crate::storage::TaskEffects,
         now_ms: i64,
     ) -> Result<Option<Task>> {
-        ensure!(
-            receipt.session_id == self.session_id,
-            "task command belongs to another session"
-        );
         let retire_questions = matches!(
             &change,
             TaskChange::Install(_) | TaskChange::Clear | TaskChange::ResumeWithEntry(_)
         );
-        store.commit_task_effects(
-            &self.session_id,
-            expected,
-            now_ms,
-            Some(receipt),
-            |active| {
-                let previous = active.clone();
-                let changed = Self::apply_change(active, change, now_ms)?;
-                let terminal =
-                    clear_effect(&self.session_id, previous.as_ref(), active.as_ref(), now_ms);
-                effects.event.extend(terminal.event);
-                effects.plan.extend(terminal.plan);
-                effects.execution.extend(terminal.execution);
-                effects.retire_questions |= retire_questions;
-                Ok((changed, effects))
-            },
-        )?;
+        store.commit_task_effects(&self.session_id, expected, now_ms, |active| {
+            let previous = active.clone();
+            let changed = Self::apply_change(active, change, now_ms)?;
+            let terminal =
+                clear_effect(&self.session_id, previous.as_ref(), active.as_ref(), now_ms);
+            effects.event.extend(terminal.event);
+            effects.plan.extend(terminal.plan);
+            effects.execution.extend(terminal.execution);
+            effects.retire_questions |= retire_questions;
+            Ok((changed, effects))
+        })?;
         self.current()
     }
 
@@ -2514,21 +2483,9 @@ mod tests {
         let previous = controller.current()?.unwrap();
         let mut task = Task::goal("New goal".into(), Default::default(), 2);
         task.request_entry("Work on the new goal".into(), 2)?;
-        let command = super::super::TaskOperation {
-            revision: 0,
-            id: "install".into(),
-            session_id: "session".into(),
-            action: serde_json::json!({"action":"goal","text":"New goal"}),
-            permission_selection: None,
-            state: "completed".into(),
-            error: None,
-            exchange_id: None,
-            created_at_ms: 2,
-        };
         let installed = controller
-            .command(
+            .change(
                 &mut store,
-                &command,
                 Some(&previous.revision),
                 TaskChange::Install(Box::new(task.clone())),
                 2,
@@ -2539,50 +2496,10 @@ mod tests {
         assert!(!controller.acknowledge_entry(&mut store, &previous.revision, &entry.id, 3)?);
         assert!(controller.acknowledge_entry(&mut store, &installed.revision, &entry.id, 3)?);
         controller.admit_goal_control(true)?;
-        let replay = controller
-            .command(
-                &mut store,
-                &command,
-                Some(&previous.revision),
-                TaskChange::Install(Box::new(task)),
-                4,
-            )?
-            .unwrap();
-        assert_eq!(replay.revision, installed.revision);
-        assert_eq!(
-            replay.entry.as_ref().unwrap().delivery,
-            crate::task::TaskInputDelivery::Accepted
-        );
-        let mut conflicting = command.clone();
-        conflicting.action["text"] = serde_json::json!("Different");
         assert!(
             controller
-                .command(
-                    &mut store,
-                    &conflicting,
-                    Some(&installed.revision),
-                    TaskChange::Clear,
-                    4
-                )
+                .change(&mut store, Some(&previous.revision), TaskChange::Clear, 4,)
                 .is_err()
-        );
-        let mut failed = command;
-        failed.id = "stale-clear".into();
-        assert!(
-            controller
-                .command(
-                    &mut store,
-                    &failed,
-                    Some(&previous.revision),
-                    TaskChange::Clear,
-                    4
-                )
-                .is_err()
-        );
-        assert!(
-            store
-                .load_task_operation("session", "stale-clear")?
-                .is_none()
         );
         assert_eq!(controller.current()?.unwrap().revision, installed.revision);
         Ok(())

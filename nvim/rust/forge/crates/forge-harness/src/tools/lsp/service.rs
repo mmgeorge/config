@@ -1,14 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
-use tokio::sync::{Semaphore, oneshot};
+use tokio::sync::{Semaphore, oneshot, watch};
 
 use crate::permissions::{
     document::PermissionDecision,
@@ -19,16 +16,25 @@ use forge_protocol::{message::SessionEvent, outbound::MessageSender};
 use super::render::Reply;
 use super::request::Arguments;
 
-#[derive(Default)]
-struct Selection {
-    enabled: AtomicBool,
-    generation: AtomicU64,
+#[derive(Clone, Copy, Default)]
+struct SelectionState {
+    enabled: bool,
+    generation: u64,
+}
+
+struct Selection(watch::Sender<SelectionState>);
+
+impl Default for Selection {
+    fn default() -> Self {
+        Self(watch::channel(SelectionState::default()).0)
+    }
 }
 
 struct Pending {
     session: String,
     scope: Arc<LspScope>,
     result: oneshot::Sender<Result<Value>>,
+    lifetime: watch::Sender<()>,
     upload: Option<AnalysisUpload>,
     response_upload: String,
     mutation: bool,
@@ -104,9 +110,17 @@ impl LspService {
             .entry(session.into())
             .or_default()
             .clone();
-        if selection.enabled.swap(enabled, Ordering::AcqRel) != enabled {
-            selection.generation.fetch_add(1, Ordering::AcqRel);
-        }
+        selection.0.send_if_modified(|state| {
+            if state.enabled == enabled {
+                return false;
+            }
+            state.enabled = enabled;
+            state.generation = state
+                .generation
+                .checked_add(1)
+                .expect("LSP selection generation does not exhaust u64");
+            true
+        });
     }
 
     /// Return the current preference for snapshots and transport initialization.
@@ -115,7 +129,7 @@ impl LspService {
             .lock()
             .unwrap()
             .get(session)
-            .is_some_and(|selection| selection.enabled.load(Ordering::Acquire))
+            .is_some_and(|selection| selection.0.borrow().enabled)
     }
 
     /// Cancel editor work before the host connection drains.
@@ -131,7 +145,7 @@ impl LspService {
         interaction: String,
         workspace: PathBuf,
         policy: Arc<CompiledPermissionDocument>,
-        cancelled: Arc<AtomicBool>,
+        cancelled: watch::Receiver<bool>,
     ) -> (Arc<LspScope>, LspLease) {
         let selection = self
             .selection
@@ -140,7 +154,7 @@ impl LspService {
             .entry(session.clone())
             .or_default()
             .clone();
-        let generation = selection.generation.load(Ordering::Acquire);
+        let generation = selection.0.borrow().generation;
         let scope = Arc::new(LspScope {
             service: self.clone(),
             session,
@@ -151,7 +165,7 @@ impl LspService {
             protected_path: std::sync::RwLock::new(None),
             changes: super::changes::ChangePublication::default(),
             cancelled,
-            active: AtomicBool::new(true),
+            active: watch::channel(true).0,
             authority: std::sync::RwLock::new(None),
             selection,
             generation,
@@ -271,14 +285,14 @@ impl LspService {
         source: String,
         syntax: &Arc<forge_diff::syntax::SyntaxEngine>,
     ) -> Result<Value> {
-        let scope = {
+        let (scope, mut lifetime) = {
             let pending = self.pending.lock().unwrap();
             let request = pending.get(id).context("LSP request is no longer active")?;
             ensure!(
                 request.session == session,
                 "LSP request belongs to another session"
             );
-            request.scope.clone()
+            (request.scope.clone(), request.lifetime.subscribe())
         };
         scope.authorize(path).await?;
         let language = forge_diff::syntax::SyntaxLanguage::for_path(path)
@@ -305,15 +319,10 @@ impl LspService {
         };
         let analysis = syntax.analyze(request);
         tokio::pin!(analysis);
-        let mut tick = tokio::time::interval(Duration::from_millis(25));
-        let handle = loop {
-            tokio::select! {
-                result = &mut analysis => break result.map_err(|failure| anyhow::anyhow!("source analysis failed: {failure:?}"))?,
-                _ = tick.tick() => {
-                    scope.check()?;
-                    ensure!(self.pending.lock().unwrap().contains_key(id), "LSP request is no longer active");
-                }
-            }
+        let handle = tokio::select! {
+            result = &mut analysis => result.map_err(|failure| anyhow::anyhow!("source analysis failed: {failure:?}"))?,
+            failure = scope.invalidated() => return Err(failure),
+            _ = lifetime.changed() => anyhow::bail!("LSP request is no longer active"),
         };
         scope.check()?;
         let declarations: Vec<_> = handle.declarations().into_iter().map(|declaration| json!({
@@ -386,8 +395,8 @@ pub(crate) struct LspScope {
     pub(super) protected_path: std::sync::RwLock<Option<PathBuf>>,
     pub(super) mutation_policy:
         std::sync::RwLock<Option<Arc<crate::permissions::directory::DirectoryPolicy>>>,
-    cancelled: Arc<AtomicBool>,
-    active: AtomicBool,
+    cancelled: watch::Receiver<bool>,
+    active: watch::Sender<bool>,
     authority: std::sync::RwLock<Option<crate::tools::TaskAuthority>>,
     selection: Arc<Selection>,
     generation: u64,
@@ -401,7 +410,7 @@ impl LspScope {
 
     pub(super) fn check(&self) -> Result<()> {
         ensure!(
-            self.active.load(Ordering::Acquire) && !self.cancelled.load(Ordering::Acquire),
+            *self.active.borrow() && !*self.cancelled.borrow(),
             "cancelled: LSP request cancelled."
         );
         if let Some(authority) = self
@@ -413,11 +422,30 @@ impl LspScope {
             authority.validate_scope()?;
         }
         ensure!(
-            self.selection.enabled.load(Ordering::Acquire)
-                && self.selection.generation.load(Ordering::Acquire) == self.generation,
+            self.selection.0.borrow().enabled
+                && self.selection.0.borrow().generation == self.generation,
             "cancelled: LSP tools were disabled or their configuration changed."
         );
         Ok(())
+    }
+
+    /// Wait for cancellation, lease release, or a changed tool-selection generation.
+    async fn invalidated(&self) -> anyhow::Error {
+        let mut cancelled = self.cancelled.clone();
+        let mut active = self.active.subscribe();
+        let mut selection = self.selection.0.subscribe();
+        tokio::select! {
+            _ = async {
+                if cancelled.wait_for(|cancelled| *cancelled).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            } => {},
+            _ = active.wait_for(|active| !*active) => {},
+            _ = selection.wait_for(|selection| selection.generation != self.generation || !selection.enabled) => {},
+        }
+        self.check()
+            .err()
+            .unwrap_or_else(|| anyhow::anyhow!("cancelled: LSP request cancelled."))
     }
 
     async fn authorize(&self, path: &str) -> Result<PathBuf> {
@@ -519,6 +547,7 @@ impl LspScope {
                 session: self.session.clone(),
                 scope: self.clone(),
                 result: complete,
+                lifetime: watch::channel(()).0,
                 upload: None,
                 response_upload: String::new(),
                 mutation: true,
@@ -537,13 +566,14 @@ impl LspScope {
         };
         let received = tokio::time::timeout(Duration::from_secs(75), async {
             sender.send_event(event).await?;
-            tokio::pin!(result);
-            let mut tick = tokio::time::interval(Duration::from_millis(25));
-            loop { tokio::select! {
-                result = &mut result => break result.context("disconnected: Editor closed during rename.")?,
-                _ = tick.tick() => self.check()?,
-            } }
-        }).await.context("timeout: Editor rename request expired.").and_then(|result| result);
+            tokio::select! {
+                result = result => result.context("disconnected: Editor closed during rename.")?,
+                failure = self.invalidated() => Err(failure),
+            }
+        })
+        .await
+        .context("timeout: Editor rename request expired.")
+        .and_then(|result| result);
         drop(flight);
         received
     }
@@ -603,6 +633,7 @@ impl LspScope {
                 session: self.session.clone(),
                 scope: self.clone(),
                 result: complete,
+                lifetime: watch::channel(()).0,
                 upload: None,
                 response_upload: String::new(),
                 mutation: false,
@@ -626,12 +657,10 @@ impl LspScope {
         };
         let received = tokio::time::timeout(Duration::from_secs(timeout), async {
             sender.send_event(event).await?;
-            tokio::pin!(result);
-            let mut tick = tokio::time::interval(Duration::from_millis(25));
-            loop { tokio::select! {
-                result = &mut result => break result.context("disconnected: Editor connection closed during LSP request.")?,
-                _ = tick.tick() => self.check()?,
-            } }
+            tokio::select! {
+                result = result => result.context("disconnected: Editor connection closed during LSP request.")?,
+                failure = self.invalidated() => Err(failure),
+            }
         }).await.context("timeout: Editor did not complete LSP startup and query within its deadline.").and_then(|result| result);
         drop(flight);
         self.check()?;
@@ -665,7 +694,7 @@ impl LspLease {
 }
 impl Drop for LspLease {
     fn drop(&mut self) {
-        self.0.active.store(false, Ordering::Release);
+        self.0.active.send_replace(false);
     }
 }
 
@@ -747,7 +776,7 @@ mod tests {
             "interaction".into(),
             directory.path().into(),
             policy,
-            Arc::new(AtomicBool::new(false)),
+            watch::channel(false).1,
         );
         (directory, service, scope, lease, receiver)
     }
@@ -817,6 +846,47 @@ mod tests {
             "reenabling revived old request authority"
         );
         drop(lease);
+    }
+
+    /// Revoke pending editor waits directly from cancellation, lease, and preference events.
+    #[tokio::test]
+    async fn pending_queries_wake_on_each_revocation_source() {
+        for source in 0..3 {
+            let (directory, service, original, original_lease, mut receiver) = fixture().await;
+            let (cancelled, cancellation) = watch::channel(false);
+            let (scope, lease) = service.scope(
+                "session".into(),
+                "revocation".into(),
+                directory.path().into(),
+                original.policy.clone(),
+                cancellation,
+            );
+            let mut lease = Some(lease);
+            drop(original_lease);
+            let task = tokio::spawn(async move { scope.invoke("lsp_status", json!({})).await });
+            receiver.recv().await.unwrap().unwrap();
+            match source {
+                0 => {
+                    cancelled.send_replace(true);
+                }
+                1 => drop(lease.take()),
+                2 => {
+                    service.set_enabled("session", false);
+                    service.set_enabled("session", true);
+                }
+                _ => unreachable!(),
+            }
+            let result = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                result.is_err(),
+                "revocation source {source} did not cancel pending query"
+            );
+            assert!(service.pending.lock().unwrap().is_empty());
+            assert_eq!(service.slots.available_permits(), 4);
+        }
     }
 
     #[tokio::test]

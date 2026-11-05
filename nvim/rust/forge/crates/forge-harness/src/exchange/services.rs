@@ -31,6 +31,8 @@ pub(crate) struct OwnerServices {
     pub(crate) questions: Arc<crate::question::QuestionController>,
     /// Published host state used to notify input scheduling and rendering.
     pub(crate) observer: Arc<crate::broker::BrokerObserver>,
+    /// Project committed owner task changes into the existing session document lifetime.
+    pub(crate) presentation: Arc<std::sync::Mutex<crate::buffer::session::SessionPresentation>>,
     /// Existing execution permit source retained during the remaining migration.
     pub(crate) execution: Arc<crate::command::ExecutionAdmission>,
     /// Legacy request admission, retained only until all callers enter the owner FIFO.

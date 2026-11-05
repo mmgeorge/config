@@ -1,3 +1,4 @@
+local activity = require("forge.views.harness.activity")
 local M = {}
 
 ---@param active_elicitation table?
@@ -15,7 +16,7 @@ end
 ---@return boolean
 function M.should_present(state)
   local key = M.key(state.active_elicitation)
-  return not state.busy and key ~= nil and key ~= state.presented_question_key
+  return not activity.busy(state) and key ~= nil and key ~= state.presented_question_key
 end
 
 function M.receive(state, incoming, replace)

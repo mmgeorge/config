@@ -101,19 +101,76 @@ local test_success, failure = pcall(function()
   for _ = 1, 10000 do perf.event("harness", "bounded", cyclic) end
   local bytes = 0
   for _, line in ipairs(perf.queue.harness or {}) do bytes = bytes + #line + 1 end
-  assert_true(bytes <= 256 * 1024, "pending logging queue exceeded its bound")
+  assert_equals(#(perf.queue.harness or {}), 4096, "pending logging queue exceeded its record bound")
+  assert_true(perf.rejected_record_count.harness >= 5904, "saturation was not accounted")
   perf.flush("harness")
   assert_true(vim.wait(1000, function() return #(perf.queue.harness or {}) == 0 end, 10))
 
-  vim.fn.writefile({ string.rep("x", 15 * 1024 * 1024) }, harness_log_path)
+  assert_true(vim.wait(1500, function()
+    local found = 0
+    for _, line in ipairs(log_lines(harness_log_path)) do
+      local decoded = vim.json.decode(line)
+      if decoded.event == "bounded" then found = found + 1 end
+    end
+    return found == 4096
+  end, 10), "accepted diagnostic records did not flush before rotation")
+  perf._test_file_limit_bytes = 2048
+  local fd = assert(vim.uv.fs_open(harness_log_path, "w", 438))
+  assert(vim.uv.fs_ftruncate(fd, perf._test_file_limit_bytes))
+  assert(vim.uv.fs_close(fd))
   perf.event("harness", "harness.log_rollover", { source = "test" })
   assert_true(vim.wait(1000, function()
     local lines = log_lines(harness_log_path)
-    local decoded = #lines == 1 and { pcall(vim.json.decode, lines[1]) } or nil
-    return decoded and decoded[1] and decoded[2].event == "harness.log_rollover"
-  end, 10), "Harness log did not replace data beyond the per-scope retention limit")
+    for _, line in ipairs(lines) do
+      local decoded, record = pcall(vim.json.decode, line)
+      if decoded and record.event == "harness.log_rollover" then return true end
+    end
+    return false
+  end, 10), "Harness log did not rotate data beyond the per-scope retention limit")
+  assert_true(vim.uv.fs_stat(harness_log_path .. ".1") ~= nil, "rotation erased the previous segment")
+  local chunk_path = vim.fs.joinpath(test_root, "chunks.jsonl")
+  perf.setup({ harness = { log_path = chunk_path } })
+  perf._test_file_limit_bytes = 2048
+  local operation_id = string.rep("\206\187\240\159\153\130", 600)
+  perf.event("harness", "chunked.record", { operation_id = operation_id })
+  perf.event("harness", "after.chunk", { operation_id = "next" })
+  perf.flush("harness")
+  assert_true(vim.wait(1500, function()
+    for _, line in ipairs(log_lines(chunk_path)) do
+      local value = vim.json.decode(line)
+      if value.event == "after.chunk" then return true end
+    end
+    return false
+  end, 10), "chunked records did not finish writing")
+  local parts, expected_sequence, record_id, part_count = {}, 0, nil, nil
+  local found_successor = false
+  for generation = 10, 0, -1 do
+    local path = generation == 0 and chunk_path or chunk_path .. "." .. generation
+    local stat = vim.uv.fs_stat(path)
+    if stat then
+      assert_true(stat.size <= 2048, "physical diagnostic file exceeded injected budget")
+      for _, line in ipairs(log_lines(path)) do
+        local record = vim.json.decode(line)
+        if record.trace_chunk then
+          local chunk = record.trace_chunk
+          record_id = record_id or chunk.id
+          assert_equals(chunk.id, record_id)
+          assert_equals(chunk.sequence, expected_sequence)
+          expected_sequence = expected_sequence + 1
+          part_count = chunk.part_count
+          parts[#parts + 1] = chunk.payload_hex:gsub("..", function(pair) return string.char(tonumber(pair, 16)) end)
+        elseif record.event == "after.chunk" then found_successor = true end
+      end
+    end
+  end
+  assert_equals(expected_sequence, part_count, "chunk rotation lost part of the logical record")
+  assert_equals(vim.json.decode(table.concat(parts)).operation_id, operation_id)
+  assert_true(found_successor, "batch splitting lost the following ordinary record")
+  perf._test_file_limit_bytes = nil
+
 end)
 
+perf._test_file_limit_bytes = nil
 perf.setup({ harness = { enabled = false }, diff = { enabled = false } })
 pcall(vim.fn.delete, test_root, "rf")
 

@@ -29,7 +29,7 @@ end
 
 ---@param state ForgeHarnessPresentationState
 local function activate_state(state)
-  session.activate_harness(state)
+  session.select_harness(state)
 end
 
 ---@param state ForgeHarnessPresentationState
@@ -101,6 +101,7 @@ end
 ---@field state? ForgeHarnessPresentationState
 ---@field open_mode? "current"|"tab"
 ---@field interaction_mode? "reconcile"
+---@field focus? boolean Preserve the selected session when completing a background request.
 
 ---@param result table
 ---@param options? ForgeHarnessSessionActivation
@@ -151,12 +152,12 @@ function M.activate(result, options)
   attach_activation(state)
   register(state, next_session.id)
   state.ready = source_state.ready
-  activate_state(state)
-  controller().activate_snapshot(result)
+  if options.focus == false then session.activate_harness(state) else activate_state(state) end
+  controller().activate_snapshot(result, { present_questions = options.focus ~= false })
   controller().attach()
   controller().attach_transcript(state.transcript_buf)
   controller().refresh_winbar()
-  focus_state(state)
+  if options.focus == false then session.activate_harness(source_state) else focus_state(state) end
 
   if options.open_mode == "current"
     and source_state ~= state
@@ -245,7 +246,8 @@ end
 ---@param pending ForgeHarnessPendingSession
 ---@param result table
 function M.complete_pending(pending, result)
-  M.activate(result, { state = pending.state })
+  if not valid_view(pending.state) then return end
+  M.activate(result, { state = pending.state, focus = session.harness == pending.state })
 end
 
 M.complete_fork = M.complete_pending

@@ -245,7 +245,6 @@ pub async fn run(
         forge_provider_api::TurnAddress,
         forge_provider_api::retry::RetryCategory,
     )> = None;
-    let mut retry_idle_deadline = None;
     let mut rejection = rejection::RejectionState::default();
     let mut provider_aborted = false;
     let processing: std::result::Result<super::turn::IdleOutcome, ProviderError> = async {
@@ -255,14 +254,6 @@ pub async fn run(
                     normalize_internal(settled, ProviderOperation::InputSubmit, ProviderFailureKind::Protocol)?;
                     return normalize_internal(turn_event.terminal_outcome(), ProviderOperation::InputSubmit, ProviderFailureKind::Protocol);
                 },
-                _ = async {
-                    match retry_idle_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => {
-                    return Err(native_failure(ProviderOperation::InputSubmit, ProviderFailureKind::Transport));
-                }
                 provider_event = subscription.recv() => {
                     let provider_event = provider_event.map_err(|_| native_failure(ProviderOperation::SessionClose, ProviderFailureKind::Transport))?;
                     if let Some(call_id) = provider_event.data.get("toolCallId").and_then(Value::as_str) {
@@ -324,7 +315,6 @@ pub async fn run(
                         && let Some(address) = decoder.root_address()
                     {
                         transient_failure = Some((address, category));
-                        retry_idle_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
                         continue;
                     }
                     decoder.decode(&provider_event, output, sink).await?;
@@ -396,7 +386,11 @@ pub async fn run(
         )
         .await?;
         return Err(ProviderError::Retryable(Box::new(
-            forge_provider_api::retry::RetryableFailure { address, category },
+            forge_provider_api::retry::RetryableFailure {
+                address,
+                category,
+                retry_after: None,
+            },
         )));
     }
     if native_cancelled || host_status.cancelled {
@@ -572,6 +566,7 @@ async fn publish_terminal_executions(
                 failure: forge_provider_api::lifecycle::ExecutionFailure::Retryable {
                     address: address.clone(),
                     category: *category,
+                    retry_after: None,
                 },
             },
             TerminalPublication::Settled | TerminalPublication::Retryable { .. } => result,
@@ -817,7 +812,10 @@ fn normalize_internal<T>(
 }
 
 pub fn completes_exchange(event: &github_copilot_sdk::SessionEvent) -> bool {
-    event.agent_id.is_none() && event.event_type == "session.idle"
+    // Session-wide idle waits for background terminals. Root assistant idle
+    // settles the foreground loop while those terminals retain their own owner.
+    event.agent_id.is_none()
+        && matches!(event.event_type.as_str(), "assistant.idle" | "session.idle")
 }
 
 #[cfg(test)]
@@ -1055,13 +1053,13 @@ mod tests {
 
     /// Finish the main agent independently from attached background work.
     #[test]
-    fn only_root_session_idle_finishes_the_provider_invocation() {
+    fn root_assistant_idle_finishes_without_waiting_for_background_terminals() {
         let mut event: github_copilot_sdk::SessionEvent =
             serde_json::from_value(serde_json::json!({
                 "id":"idle", "type":"assistant.idle", "timestamp":"2026-09-18T00:00:00Z", "data":{}
             }))
             .unwrap();
-        assert!(!completes_exchange(&event));
+        assert!(completes_exchange(&event));
         event.agent_id = Some("child".into());
         assert!(!completes_exchange(&event));
         event.agent_id = None;

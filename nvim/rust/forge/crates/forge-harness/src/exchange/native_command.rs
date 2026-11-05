@@ -32,6 +32,7 @@ pub(super) struct NativeCommandRun {
     execution: Option<ExecutionPermit>,
     generation: Option<ProviderGenerationPermit>,
     control: Option<tokio::sync::OwnedSemaphorePermit>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl NativeCommandRun {
@@ -84,6 +85,7 @@ impl NativeCommandRun {
                 NativeWork::Settings(Box::new(SettingsRun::new(
                     command.record.request.id.clone(),
                     patch.clone(),
+                    command.admitted_at,
                 ))),
                 patch.requires_native_authority(),
             ),
@@ -110,19 +112,16 @@ impl NativeCommandRun {
         let stage = if native_authority {
             let control = services.control.clone();
             NativeCommandStage::AcquiringControl(tokio::spawn(async move {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(60),
-                    control.acquire_owned(),
-                )
-                .await
-                {
-                    Ok(Ok(control)) => Ok(control),
-                    Ok(Err(_)) | Err(_) => Err(CommandFailure::OwnershipUnavailable),
-                }
+                control
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| CommandFailure::OwnershipUnavailable)
             }))
         } else {
             NativeCommandStage::Work
         };
+        let deadline = matches!(command.record.request.command, Command::ConfigureSession(_))
+            .then_some(command.admitted_at + std::time::Duration::from_secs(30));
         Self {
             command,
             transition: None,
@@ -132,11 +131,25 @@ impl NativeCommandRun {
             execution: None,
             generation: None,
             control: None,
+            deadline,
         }
     }
 
     /// Await one fact while the session driver continues consuming provider events and commands.
     pub(super) async fn next(&mut self, foreground: ForegroundStatus) -> NativeCommandEvent {
+        let deadline = self.deadline;
+        tokio::select! {
+            biased;
+            event = self.next_stage(foreground) => event,
+            () = async { match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
+            } } => NativeCommandEvent::Deadline,
+        }
+    }
+
+    /// Consume available stage evidence before observing configuration expiry.
+    async fn next_stage(&mut self, foreground: ForegroundStatus) -> NativeCommandEvent {
         match &mut self.stage {
             NativeCommandStage::AcquiringControl(task) => NativeCommandEvent::Control(
                 task.await
@@ -197,6 +210,7 @@ impl NativeCommandRun {
         };
         self.consume_completed_worker(&event);
         match event {
+            NativeCommandEvent::Deadline => Err(OperationFailure::JobDeadline),
             NativeCommandEvent::Control(result) => {
                 self.control = Some(result.map_err(|error| {
                     OperationFailure::Transition(TransitionFailure::Rejected(error))
@@ -205,12 +219,7 @@ impl NativeCommandRun {
                 // Preserve that order until those writers have moved into this owner.
                 let observation = services.clone();
                 self.stage = NativeCommandStage::AcquiringObservation(tokio::spawn(async move {
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(60),
-                        observation.observe_provider_generation(),
-                    )
-                    .await
-                    .map_err(|_| CommandFailure::OwnershipUnavailable)
+                    Ok(observation.observe_provider_generation().await)
                 }));
                 Ok(NativeCommandProgress::Waiting {
                     events: Vec::new(),
@@ -236,6 +245,7 @@ impl NativeCommandRun {
                     self.work = NativeWork::Settings(Box::new(SettingsRun::new(
                         self.command.record.request.id.clone(),
                         patch,
+                        self.command.admitted_at,
                     )));
                 }
                 self.stage = NativeCommandStage::Work;
@@ -301,15 +311,10 @@ impl NativeCommandRun {
                     self.selected = exchange;
                     let execution = services.execution.clone();
                     self.stage = NativeCommandStage::AcquiringExecution(tokio::spawn(async move {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(60),
-                            execution.acquire_owned(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(permit)) => Ok(permit),
-                            Ok(Err(_)) | Err(_) => Err(CommandFailure::OwnershipUnavailable),
-                        }
+                        execution
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| CommandFailure::OwnershipUnavailable)
                     }));
                     Ok(NativeCommandProgress::Waiting {
                         events,
@@ -472,12 +477,13 @@ impl NativeCommandRun {
                 CommandFailure::CollectionUncertain,
             )));
         }
-        self.transition = Some(ExchangeTransition::start(
+        self.transition = Some(ExchangeTransition::start_at(
             self.command.record.request.id.clone(),
             TransitionIntent::Reconfigure { children },
             services,
             self.generation.clone(),
             self.control.take(),
+            self.command.admitted_at,
         ));
         self.stage = NativeCommandStage::Collecting;
         Ok(NativeCommandProgress::Waiting {
@@ -574,6 +580,8 @@ impl NativeCommandRun {
 
 /// Carry one identified native policy stage result back to the session owner.
 pub(super) enum NativeCommandEvent {
+    /// End command observation while every stage retains its native or host worker.
+    Deadline,
     Control(Result<tokio::sync::OwnedSemaphorePermit, CommandFailure>),
     Observation(Result<ProviderGenerationPermit, CommandFailure>),
     Settings(SettingsEvent),
@@ -591,6 +599,7 @@ impl NativeCommandEvent {
     /// Get the finite log label without permission/prompt payloads.
     pub(super) fn name(&self) -> &'static str {
         match self {
+            Self::Deadline => "configuration_deadline",
             Self::Control(_) => "configuration_control_acquired",
             Self::Observation(_) => "configuration_observation_acquired",
             Self::Settings(event) => event.name(),

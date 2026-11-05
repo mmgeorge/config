@@ -30,6 +30,14 @@ assert(state.selected_agent_run_id == nil and state.timeline_revision == 3)
 assert(type(state.capability) == "table" and #state.approval == 0)
 assert(response.goal == vim.NIL and response.session.context_usage == vim.NIL,
   "snapshot projection mutated the transport response")
+state.session.model, state.session.context_window = "old-model", "large"
+response.session.model, response.session.context_window = "new-model", "small"
+snapshot.apply(state, response)
+assert(state.session.context_usage == nil, "new model inherited old model context observations")
+state.session.context_usage = { used = 1, size = 1000000 }
+response.runtime_epoch = "new-epoch"
+snapshot.apply(state, response)
+assert(state.session.context_usage == nil, "new runtime inherited old runtime context observations")
 response.session.active_task = { revision = "goal", kind = "goal", phase = "work", status = "running", goal = { state = "paused", objective = "Test" } }
 response.active_elicitation = { elicitation = { question_set = { id = "new" }, response = vim.NIL } }
 snapshot.apply(state, response)
@@ -40,40 +48,18 @@ snapshot.apply(state, response)
 local stale = vim.deepcopy(response)
 stale.snapshot_revision, stale.session.name = 4, "stale"
 assert(snapshot.apply(state, stale) == false and state.session.name ~= "stale")
-state.task_operation, state.busy = { id = "old-operation" }, true
+state.activity = { revision = 9, phase = "working" }
 response.runtime_epoch, response.snapshot_revision = "restarted-runtime", 1
-response.task_operation = { state = "outcome_unknown", error = "Interrupted before confirmation" }
-assert(snapshot.apply(state, response))
-assert(not state.busy and not state.task_operation and state.execution_notice == "Interrupted before confirmation")
-response.snapshot_revision = 2
-response.task_operation = nil
-response.status = { kind = "awaiting_plan_review", revision = 1 }
-assert(snapshot.apply(state, response))
-assert(state.execution_notice == nil, "settled operation failure survived the authoritative snapshot")
-response.snapshot_revision = 3
-response.task_operation = { id = "failed", state = "failed", error = "Provider failed" }
+response.activity = { revision = 0, phase = "idle" }
+state.execution_notice = "Command failed"
 snapshot.apply(state, response)
-state.execution_notice = "Connection lost"
-response.snapshot_revision = 4
-response.task_operation = nil
-snapshot.apply(state, response)
-assert(state.execution_notice == "Connection lost", "clearing an old operation hid a newer error")
-local configuration_completions = 0
-state.configuring, state.busy = true, true
-state.configuring_config, state.task_config = { model = "old" }, { model = "old" }
-state.task_operation = { id = "old-configuration", action = "configure" }
-state.configuration_completion = { complete = function(applied)
-  assert(not applied, "switching sessions completed an old configuration as successful")
-  configuration_completions = configuration_completions + 1
-end }
+assert(state.execution_notice == "Command failed", "session projection cleared an independently owned command diagnostic")
 state.question_drafts = { choice = { ask = "Explain the tradeoff" } }
 state.question_picker_resume = { page_id = "choice" }
 response.session.id = "replacement-session"
 response.snapshot_revision = 1
 assert(snapshot.apply(state, response))
-assert(not state.configuring and not state.busy and not state.task_operation)
-assert(not state.configuring_config and not state.task_config and not state.configuration_completion)
-assert(configuration_completions == 1, "session replacement did not retire its pending configuration")
+assert(not require("forge.views.harness.activity").busy(state), "replacement session inherited activity")
 assert(state.question_drafts == nil, "a different session inherited question drafts")
 state.question_drafts = { choice = { ask = "A different question" } }
 response.session.id = "snapshot-test"
@@ -112,5 +98,48 @@ assert(snapshot.confirm_publication(state, {
 response.session.id, response.snapshot_revision, response.owner_publication = "new-publication-session", 1, nil
 assert(snapshot.apply(state, response) and state.publication_cursor == nil and state.publication_received == nil,
   "another session inherited publication authority")
+-- Reconnect admits a publication page and its authoritative input baseline together.
+local client = require("forge.client")
+local input_state = require("forge.views.harness.input_state")
+local original_request = client.request
+local reconnect = { session = { id = "approval-reconnect" }, runtime_epoch = "approval-owner",
+  snapshot_revision = 1, publication_cursor = 61 }
+local submitted
+client.request = function(request, reply)
+  if request.method == "session.input.get" then
+    reply({ revision = 62, control_revision = 7, suspended = false, messages = {} })
+  else
+    assert(request.method == "session.input.apply", "reconnect introduced an extra input read")
+    submitted = request.params
+  end
+end
+input_state.attach(reconnect, function() end)
+local resynchronized = { session = reconnect.session, runtime_epoch = reconnect.runtime_epoch,
+  snapshot_revision = 2, approval = { { id = "active-approval" } },
+  input = { revision = 65, control_revision = 10, suspended = true, messages = {} },
+  owner_publication = { receipt_id = "approval-page", after = 61, through = 65, more = false,
+    events = { { sequence = 63, event = { session_id = "approval-reconnect", event = "input_changed",
+      payload = { revision = 63, _publication = { sequence = 63 } } } } } } }
+assert(snapshot.apply(reconnect, resynchronized))
+assert(reconnect.input.revision == 65 and reconnect.input.control_revision == 10 and reconnect.input.suspended,
+  "active-approval reconnect did not adopt the authoritative input baseline")
+assert(reconnect.approval[1].id == "active-approval" and reconnect.publication_cursor == 61,
+  "reconnect lost its approval or prematurely confirmed publication")
+assert(snapshot.confirm_publication(reconnect, { receipt_id = "approval-page", runtime_epoch = reconnect.runtime_epoch,
+  after = 61, through = 65 }))
+input_state.submit(reconnect, "continue after cancellation", {}, "auto")
+assert(submitted.control_revision == 10, "post-reconnect submit used a stale control revision")
+resynchronized.snapshot_revision = 3
+resynchronized.input = { revision = 64, control_revision = 9, suspended = false, messages = {} }
+assert(snapshot.apply(reconnect, resynchronized))
+assert(reconnect.input.revision == 65 and reconnect.input.control_revision == 10 and reconnect.input.suspended,
+  "newer session snapshot regressed its independently ordered input projection")
+local previous_input = reconnect.input
+resynchronized.runtime_epoch, resynchronized.snapshot_revision = "replacement-owner", 1
+resynchronized.input = { revision = 1, control_revision = 1, suspended = false, messages = {} }
+assert(snapshot.apply(reconnect, resynchronized))
+assert(reconnect.input == previous_input and reconnect.input.revision == 65,
+  "replacement runtime input was applied to the previous runtime's input owner")
+client.request = original_request
 package.loaded["forge.lsp.startup"] = original_startup
 print("harness_snapshot: passed")

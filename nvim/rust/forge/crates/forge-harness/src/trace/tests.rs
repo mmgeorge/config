@@ -11,7 +11,7 @@ fn inspection_preserves_command_wait_and_publication_correlation() {
         "session_id":"session","event":"exchange.question_wait.retirement_failed","timestamp_ms":1,
         "payload":{"command_id":"command","sequence":2,"update_step":3,"work_id":"work","wait_id":"wait",
             "question_id":"question","question_revision":4,"question_count":1,"input_id":"input","input_revision":5,
-            "publication_sequence":6,"delivery":"pending","observed":false,"error_code":"question_wait_retirement_failed","outcome":"abandoned",
+            "publication_sequence":6,"delivery":"pending","observed":false,"entry_accepted":false,"signal":"publication_completed","error_code":"question_wait_retirement_failed","outcome":"abandoned",
             "text":"private answer","reason":"private storage detail","question_ids":["private list"],"params":{"body":"private request"}}
     }));
     let payload = &record["payload"];
@@ -23,6 +23,8 @@ fn inspection_preserves_command_wait_and_publication_correlation() {
     assert_eq!(payload["publication_sequence"], 6);
     assert_eq!(payload["error_code"], "question_wait_retirement_failed");
     assert_eq!(payload["observed"], false);
+    assert_eq!(payload["entry_accepted"], false);
+    assert_eq!(payload["signal"], "publication_completed");
     assert!(payload.get("text").is_none());
     assert!(payload.get("reason").is_none());
     assert!(payload.get("question_ids").is_none());
@@ -30,7 +32,7 @@ fn inspection_preserves_command_wait_and_publication_correlation() {
 }
 
 #[test]
-fn detailed_logs_preserve_bodies_isolate_sessions_and_redact_credentials() {
+fn detailed_logs_exclude_bodies_isolate_sessions_and_redact_credentials() {
     let directory = tempdir().unwrap();
     let trace = TraceStore::open(directory.path()).unwrap();
     trace.configure(true).unwrap();
@@ -49,8 +51,8 @@ fn detailed_logs_preserve_bodies_isolate_sessions_and_redact_credentials() {
     );
     trace.flush().unwrap();
     let contents = std::fs::read_to_string(trace.session_status("session-a").path).unwrap();
-    assert!(contents.contains("full prompt"));
-    assert!(contents.contains("[redacted]"));
+    assert!(!contents.contains("full prompt"));
+    assert!(!contents.contains("params"));
     assert!(!contents.contains("secret"));
     assert!(!contents.contains("credential-value") && !contents.contains("header-value"));
     assert!(!contents.contains("other conversation"));
@@ -93,28 +95,24 @@ fn detailed_log_rotates_without_silently_erasing_the_previous_segment() {
     assert!(path.metadata().unwrap().len() < 1024);
 }
 
+/// Preserve correlation while excluding arbitrarily large native error details.
 #[test]
-fn retry_error_larger_than_rotation_budget_is_retained_in_full() {
+fn retry_diagnostic_excludes_raw_error_and_retains_typed_outcome() {
     let directory = tempdir().unwrap();
     let trace = TraceStore::open(directory.path()).unwrap();
     trace.configure(true).unwrap();
-    let message = "network detail ".repeat(MAX_TRACE_BYTES as usize / 15 + 1);
     trace.record(
         "session",
         "provider.retry",
-        json!({"status":"failed", "detail":{"error":message}}),
+        json!({"status":"failed", "operation_id":"operation",
+        "detail":{"error":"network detail ".repeat(100_000)}}),
     );
     trace.flush().unwrap();
     let contents = std::fs::read_to_string(trace.session_path("session")).unwrap();
     let record: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
-    assert_eq!(
-        record["payload"]["detail"]["error"].as_str(),
-        Some(message.as_str())
-    );
-    trace.record("session", "provider.retry", json!({"status":"exhausted"}));
-    trace.flush().unwrap();
-    let rotated = trace.session_path("session").with_extension("jsonl.1");
-    assert_eq!(std::fs::read_to_string(rotated).unwrap(), contents);
+    assert_eq!(record["payload"]["operation_id"], "operation");
+    assert_eq!(record["payload"]["status"], "failed");
+    assert!(record["payload"].get("detail").is_none());
 }
 
 #[test]
@@ -218,7 +216,7 @@ fn independent_handles_append_after_another_owner_clears() {
 /// Keep record producers independent of a held filesystem owner and bound record count.
 #[test]
 fn held_writer_bounds_records_without_blocking_producers_and_reports_loss() {
-    use crate::trace::writer::{MAX_PENDING_BYTES, MAX_PENDING_RECORDS};
+    use crate::trace::writer::MAX_PENDING_RECORDS;
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
     let directory = tempdir().unwrap();
@@ -239,7 +237,8 @@ fn held_writer_bounds_records_without_blocking_producers_and_reports_loss() {
     producer.join().unwrap();
     progressed_while_held.expect("record production must finish before the writer is released");
     assert_eq!(record_count, MAX_PENDING_RECORDS);
-    assert!(bytes <= MAX_PENDING_BYTES);
+    assert_eq!(trace.status().rejected_record_count, 17);
+    assert!(bytes > 0);
     trace.flush().unwrap();
     assert_eq!(trace.pending(), (0, 0));
     let contents = std::fs::read_to_string(trace.status().path).unwrap();
@@ -267,42 +266,72 @@ fn held_writer_bounds_records_without_blocking_producers_and_reports_loss() {
     trace.close().unwrap();
 }
 
-/// Bound retained allocation as well as record count and report oversized diagnostics.
+/// Return saturation without blocking and keep the rejected count after loss publication.
 #[test]
-fn held_writer_bounds_bytes_and_reports_oversize_before_any_following_record() {
-    use crate::trace::writer::{MAX_PENDING_BYTES, MAX_PENDING_RECORDS, MAX_RECORD_BYTES};
+fn held_writer_exposes_saturation_without_losing_accepted_correlations() {
+    use crate::trace::writer::{MAX_PENDING_RECORDS, TraceAdmission};
     let directory = tempdir().unwrap();
     let trace = std::sync::Arc::new(TraceStore::open(directory.path()).unwrap());
     trace.configure(true).unwrap();
     let hold = trace.hold_writer().unwrap();
-    trace.record(
-        "session",
-        "too-large",
-        json!({"text":"x".repeat(MAX_RECORD_BYTES + 1)}),
-    );
-    let payload = json!({"text":"y".repeat(24 * 1024 * 1024)});
-    for _ in 0..4 {
-        trace.record_ref("session", "large", &payload);
+    for sequence in 0..MAX_PENDING_RECORDS {
+        assert_eq!(
+            trace.record(
+                "session",
+                "event.consumed",
+                json!({"consumed_sequence": sequence,
+            "operation_id":"operation", "invocation_id":"invocation", "attempt_id":"attempt"})
+            ),
+            TraceAdmission::Queued
+        );
     }
-    let (record_count, bytes) = trace.pending();
-    assert!(record_count < MAX_PENDING_RECORDS);
-    assert!(bytes <= MAX_PENDING_BYTES);
-    assert!(bytes >= 48 * 1024 * 1024);
+    assert_eq!(
+        trace.record("session", "rejected", json!({})),
+        TraceAdmission::Saturated
+    );
     drop(hold);
     trace.flush().unwrap();
-    let contents = std::fs::read_to_string(trace.status().path).unwrap();
+    assert_eq!(trace.status().rejected_record_count, 1);
+    let contents = std::fs::read_to_string(trace.session_path("session")).unwrap();
     let records: Vec<serde_json::Value> = contents
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    let loss = records
-        .iter()
-        .find(|record| record["event"] == "trace.loss")
-        .unwrap();
-    assert_eq!(loss["payload"]["oversize_count"], 1);
-    assert!(loss["payload"]["queue_full_count"].as_u64().unwrap() >= 1);
-    assert!(records.iter().all(|record| record["event"] != "too-large"));
-    trace.close().unwrap();
+    assert_eq!(records.len(), MAX_PENDING_RECORDS);
+    assert_eq!(
+        records.last().unwrap()["payload"]["consumed_sequence"],
+        MAX_PENDING_RECORDS - 1
+    );
+    assert_eq!(records.last().unwrap()["payload"]["attempt_id"], "attempt");
+}
+
+/// Retain ten diagnostic generations and clear every retained segment explicitly.
+#[test]
+fn session_rotation_retains_ten_generations_and_clear_removes_them() {
+    use crate::trace::writer::ROTATED_TRACE_FILES;
+    let directory = tempdir().unwrap();
+    let trace = TraceStore::open(directory.path()).unwrap();
+    trace.configure(true).unwrap();
+    let path = trace.session_path("session");
+    for sequence in 0..ROTATED_TRACE_FILES + 2 {
+        trace.record("session", "segment", json!({"sequence": sequence}));
+        trace.flush().unwrap();
+        if sequence < ROTATED_TRACE_FILES + 1 {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(MAX_TRACE_BYTES)
+                .unwrap();
+        }
+    }
+    assert!(path.with_extension("jsonl.10").exists());
+    assert!(!path.with_extension("jsonl.11").exists());
+    trace.clear_session("session").unwrap();
+    assert_eq!(path.metadata().unwrap().len(), 0);
+    for generation in 1..=ROTATED_TRACE_FILES {
+        assert!(!path.with_extension(format!("jsonl.{generation}")).exists());
+    }
 }
 
 /// Keep another lease writable after one host explicitly collects its own callbacks.
@@ -401,7 +430,7 @@ fn inflight_private_record_cannot_cross_disable_or_reenable_epoch() {
             assert!(
                 std::fs::read_to_string(trace.session_status("session").path)
                     .unwrap()
-                    .contains("current-period")
+                    .contains("new-period")
             );
         }
         trace.close().unwrap();
@@ -437,7 +466,7 @@ fn closed_shared_lease_rejects_inflight_record_without_stopping_live_lease() {
     producer.join().unwrap();
     second.flush().unwrap();
     let details = std::fs::read_to_string(second.session_status("session").path).unwrap();
-    assert!(details.contains("accepted-before-close") && details.contains("still-active"));
+    assert!(details.contains("accepted-before-close") && details.contains("live-lease"));
     assert!(!details.contains("obsolete-after-close") && !details.contains("private-late-input"));
     let metadata = std::fs::read_to_string(second.status().path).unwrap();
     assert!(
@@ -448,4 +477,21 @@ fn closed_shared_lease_rejects_inflight_record_without_stopping_live_lease() {
                 && record["payload"]["obsolete_count"] == 1)
     );
     second.close().unwrap();
+}
+
+/// Preserve identity fields even after many disallowed keys and without truncation.
+#[test]
+fn metadata_preserves_complete_owner_identity_after_disallowed_fields() {
+    let mut payload = serde_json::Map::new();
+    for index in 0..64 {
+        payload.insert(format!("a_private_{index}"), json!("private"));
+    }
+    let operation_id = "operation".repeat(100);
+    payload.insert("operation_id".into(), json!(operation_id));
+    payload.insert("consumed_sequence".into(), json!(71));
+    payload.insert("failure".into(), json!("raw provider diagnostic"));
+    let metadata = metadata_payload(&serde_json::Value::Object(payload));
+    assert_eq!(metadata["operation_id"], operation_id);
+    assert_eq!(metadata["consumed_sequence"], 71);
+    assert_eq!(metadata.as_object().unwrap().len(), 2);
 }

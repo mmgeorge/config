@@ -12,7 +12,7 @@ use forge_provider_api::control::{ControlToolDefinition, ProviderTools};
 use forge_provider_api::permissions::ProviderPermissions;
 use forge_provider_api::terminal::TerminalSnapshot;
 use forge_provider_api::trace::ProviderTrace;
-use forge_provider_api::{Compaction, ProviderError, ProviderEventSink};
+use forge_provider_api::{Compaction, ExecutionOwner, ProviderError, ProviderEventSink};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::future::Future;
@@ -38,8 +38,6 @@ pub enum ClientShutdown {
 pub struct SessionSelection {
     /// Retain callback authority even when this preparation has no event subscriber yet.
     pub execution_owner: forge_provider_api::ExecutionOwner,
-    /// Identify the host execution owner whose native binding may be reused.
-    pub runtime_key: String,
     /// Correlate diagnostics with the host session.
     pub correlation_id: String,
     /// Resume this native conversation only when no binding is retained.
@@ -72,16 +70,16 @@ type StartupTask =
 
 /// Own native session replacement, history boundaries, and background readers.
 pub struct CopilotSessions<P> {
-    slots: Mutex<HashMap<String, SessionSlot<P>>>,
-    provisional: Arc<std::sync::Mutex<HashMap<String, Arc<CopilotSession>>>>,
-    leases: Arc<std::sync::Mutex<HashMap<String, Arc<P>>>>,
-    startups: std::sync::Mutex<HashMap<String, StartupTask>>,
-    failed_startups: std::sync::Mutex<HashMap<String, Arc<ProviderError>>>,
-    terminals: Mutex<HashMap<String, CopilotTerminalMonitor>>,
-    subscriptions: Mutex<HashMap<String, CompactionSubscription>>,
-    turns: Mutex<HashMap<String, Arc<CopilotTurnEvent>>>,
+    slots: Mutex<HashMap<ExecutionOwner, SessionSlot<P>>>,
+    provisional: Arc<std::sync::Mutex<HashMap<ExecutionOwner, Arc<CopilotSession>>>>,
+    leases: Arc<std::sync::Mutex<HashMap<ExecutionOwner, Arc<P>>>>,
+    startups: std::sync::Mutex<HashMap<ExecutionOwner, StartupTask>>,
+    failed_startups: std::sync::Mutex<HashMap<ExecutionOwner, Arc<ProviderError>>>,
+    terminals: Mutex<HashMap<ExecutionOwner, CopilotTerminalMonitor>>,
+    subscriptions: Mutex<HashMap<ExecutionOwner, CompactionSubscription>>,
+    turns: Mutex<HashMap<ExecutionOwner, Arc<CopilotTurnEvent>>>,
     trace: Arc<dyn ProviderTrace>,
-    generations: Mutex<HashMap<String, GenerationBinding>>,
+    generations: Mutex<HashMap<ExecutionOwner, GenerationBinding>>,
     collections: Mutex<Vec<SessionCollection>>,
 }
 
@@ -149,20 +147,16 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         Fut: Future<Output = Result<PreparedSession<P>>> + Send,
         V: FnOnce(&CopilotSession) -> Result<()> + Send,
     {
-        anyhow::ensure!(
-            selection.execution_owner.runtime_key() == selection.runtime_key,
-            "Copilot session selection crosses execution ownership"
-        );
-        let slot = self.slot(&selection.runtime_key).await;
-        let turn = self.turn(&selection.runtime_key).await;
+        let slot = self.slot(&selection.execution_owner).await;
+        let turn = self.turn(&selection.execution_owner).await;
         let mut active = slot.lock().await;
-        self.ensure_startup_collected(&selection.runtime_key)?;
-        let _ = self.collect_startup(&selection.runtime_key).await?;
+        self.ensure_startup_collected(&selection.execution_owner)?;
+        let _ = self.collect_startup(&selection.execution_owner).await?;
         let prior = self
             .provisional
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot provisional session registry poisoned"))?
-            .get(&selection.runtime_key)
+            .get(&selection.execution_owner)
             .cloned();
         if let Some(previous) = prior {
             previous
@@ -178,11 +172,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             self.provisional
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Copilot provisional session registry poisoned"))?
-                .remove(&selection.runtime_key);
+                .remove(&selection.execution_owner);
             self.leases
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Copilot resource lease registry poisoned"))?
-                .remove(&selection.runtime_key);
+                .remove(&selection.execution_owner);
         }
         if let Some(binding) = active.as_mut().filter(|binding| {
             selection.reuse == SessionReuse::Compatible
@@ -215,13 +209,16 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         let fresh_resume = active.is_none() && selection.session_id.is_some();
         let previous_repair = active.as_ref().and_then(|binding| binding.repair.clone());
         let retained_id = match active.as_ref() {
-            Some(binding) => Some(binding.session.id().to_owned()),
+            Some(binding) => match binding.history {
+                SessionHistory::Prepared => None,
+                SessionHistory::Submitted => Some(binding.session.id().to_owned()),
+            },
             None => selection.session_id.clone(),
         };
         let (client, reasoning_effort) = client.await?;
         client.ensure_healthy()?;
         self.bind_generation(
-            &selection.runtime_key,
+            &selection.execution_owner,
             client.generation.clone(),
             selection.execution_owner.clone(),
         )
@@ -239,9 +236,10 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             super::operation::dispatch_for(
                 forge_provider_api::ProviderOperation::SessionConfigure,
             )?;
-            self.disconnect(&selection.runtime_key, &mut active).await?;
+            self.disconnect(&selection.execution_owner, &mut active)
+                .await?;
         }
-        let startup_key = selection.runtime_key.clone();
+        let startup_key = selection.execution_owner.clone();
         let provisional = self.provisional.clone();
         let trace = self.trace.clone();
         let correlation_id = selection.correlation_id.clone();
@@ -252,7 +250,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             self.leases
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Copilot resource lease registry poisoned"))?
-                .insert(selection.runtime_key.clone(), profile.clone());
+                .insert(selection.execution_owner.clone(), profile.clone());
         }
         let worker_profile = profile.clone();
         let native_operation = super::operation::current();
@@ -277,9 +275,9 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         self.startups
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot startup registry poisoned"))?
-            .insert(selection.runtime_key.clone(), startup);
+            .insert(selection.execution_owner.clone(), startup);
         let session = self
-            .collect_startup(&selection.runtime_key)
+            .collect_startup(&selection.execution_owner)
             .await?
             .context("Copilot startup task missing")?;
         let configuration = async {
@@ -300,13 +298,13 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                     &mcp,
                     self.trace.as_ref(),
                     &selection.correlation_id,
-                    std::time::Duration::from_secs(30),
                 )
                 .await?
             } else {
                 HashMap::new()
             };
-            self.disconnect(&selection.runtime_key, &mut active).await?;
+            self.disconnect(&selection.execution_owner, &mut active)
+                .await?;
             validate(&session)?;
             Ok::<_, anyhow::Error>((repair, failures))
         }
@@ -330,11 +328,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
                 self.provisional
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Copilot provisional session registry poisoned"))?
-                    .remove(&selection.runtime_key);
+                    .remove(&selection.execution_owner);
                 self.leases
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Copilot resource lease registry poisoned"))?
-                    .remove(&selection.runtime_key);
+                    .remove(&selection.execution_owner);
                 return Err(cause.into());
             }
         };
@@ -355,16 +353,16 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         self.provisional
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot provisional session registry poisoned"))?
-            .remove(&selection.runtime_key);
+            .remove(&selection.execution_owner);
         self.leases
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot resource lease registry poisoned"))?
-            .remove(&selection.runtime_key);
+            .remove(&selection.execution_owner);
         Ok(session)
     }
 
     /// Get the currently published native binding without creating one.
-    pub async fn active(&self, key: &str) -> Option<Arc<CopilotSession>> {
+    pub async fn active(&self, key: &ExecutionOwner) -> Option<Arc<CopilotSession>> {
         let slot = self.slots.lock().await.get(key).cloned()?;
         slot.lock()
             .await
@@ -375,7 +373,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     /// Record possible native input only against the binding that will receive it.
     pub async fn mark_submitted(
         &self,
-        key: &str,
+        key: &ExecutionOwner,
         session: &Arc<CopilotSession>,
     ) -> Result<(), ProviderError> {
         let slot = self.slot(key).await;
@@ -394,7 +392,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Get the repair caution associated with the published history.
-    pub async fn repair(&self, key: &str) -> Option<HistoryRepair> {
+    pub async fn repair(&self, key: &ExecutionOwner) -> Option<HistoryRepair> {
         self.slot(key)
             .await
             .lock()
@@ -404,7 +402,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Get startup failures without exposing mutable native session state.
-    pub async fn mcp_failures(&self, key: &str) -> HashMap<String, String> {
+    pub async fn mcp_failures(&self, key: &ExecutionOwner) -> HashMap<String, String> {
         self.slot(key)
             .await
             .lock()
@@ -415,7 +413,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Get the control lane shared by native prompt and cancellation operations.
-    pub async fn turn(&self, key: &str) -> Arc<CopilotTurnEvent> {
+    pub async fn turn(&self, key: &ExecutionOwner) -> Arc<CopilotTurnEvent> {
         self.turns
             .lock()
             .await
@@ -425,7 +423,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Bind background compaction observations before creating a native session.
-    pub async fn subscribe(&self, key: String, sink: ProviderEventSink) {
+    pub async fn subscribe(&self, key: ExecutionOwner, sink: ProviderEventSink) {
         self.subscriptions
             .lock()
             .await
@@ -501,18 +499,16 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         };
         let entry = &mut collections[index];
         if let SessionCollectionState::Running(task) = &mut entry.state {
-            let joined = tokio::time::timeout(std::time::Duration::from_secs(30), task)
-                .await
-                .map_err(|_| {
-                    ProviderError::Cleanup(Arc::new(
-                        forge_provider_api::error::ObservationCleanup::new(
-                            client.failed_generation().failure(),
-                            None,
-                            None,
-                            Some(forge_provider_api::error::CleanupFailure::TimedOut),
-                        ),
-                    ))
-                })?;
+            let joined = super::operation::wait(task).await.map_err(|_| {
+                ProviderError::Cleanup(Arc::new(
+                    forge_provider_api::error::ObservationCleanup::new(
+                        client.failed_generation().failure(),
+                        None,
+                        None,
+                        Some(forge_provider_api::error::CleanupFailure::TimedOut),
+                    ),
+                ))
+            })?;
             entry.state = SessionCollectionState::Complete(joined.unwrap_or_else(|_error| {
                 Err(Arc::new(super::error::native_failure(
                     forge_provider_api::ProviderOperation::InputSubmit,
@@ -542,11 +538,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     /// Preserve idle failure delivery independently of active invocation contexts or queue capacity.
     async fn bind_generation(
         &self,
-        key: &str,
+        key: &ExecutionOwner,
         generation: ClientGeneration,
         owner: forge_provider_api::ExecutionOwner,
     ) -> Result<(), ProviderError> {
-        if owner.runtime_key() != key {
+        if &owner != key {
             return Err(super::error::native_failure(
                 forge_provider_api::ProviderOperation::InputSubmit,
                 forge_provider_api::ProviderFailureKind::Rejected,
@@ -743,7 +739,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Correlate one manual compaction with native notifications around its RPC.
-    pub async fn compact(&self, key: &str, id: String) -> Result<Compaction, ProviderError> {
+    pub async fn compact(
+        &self,
+        key: &ExecutionOwner,
+        id: String,
+    ) -> Result<Compaction, ProviderError> {
         let slot = self.slot(key).await;
         let (session, manual) = {
             let active = slot.lock().await;
@@ -771,44 +771,51 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         result
     }
 
-    /// Get a nonblocking snapshot while another caller prepares the session.
-    pub async fn terminals(&self, key: &str, correlation: &str) -> Result<TerminalSnapshot> {
+    /// Prove a refresh retains the submitted native identity before preserving its shell helper.
+    pub(super) async fn retains_identity_on_refresh(&self, key: &ExecutionOwner) -> bool {
         let slot = self.slot(key).await;
-        let active = match slot.try_lock() {
-            Ok(active) => active,
-            Err(_) => {
-                return Ok(TerminalSnapshot {
-                    supported: true,
-                    starting: true,
-                    terminal: Vec::new(),
-                });
-            }
-        };
-        let Some(binding) = active.as_ref() else {
-            return Ok(TerminalSnapshot {
-                supported: true,
-                starting: false,
-                terminal: Vec::new(),
-            });
-        };
+        let retained = slot
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|binding| matches!(binding.history, SessionHistory::Submitted));
+        retained
+    }
+
+    /// Attach native terminal notifications before publishing a new or configured binding.
+    pub async fn observe_terminals(
+        &self,
+        publication: super::terminal::TerminalPublication,
+    ) -> Result<()> {
+        let session = self
+            .active(&publication.owner)
+            .await
+            .context("terminal session is not attached")?;
         let mut monitors = self.terminals.lock().await;
-        let monitor = monitors.entry(key.to_owned()).or_insert_with(|| {
-            CopilotTerminalMonitor::new(
-                &binding.session,
-                self.trace.clone(),
-                correlation.to_owned(),
-            )
-        });
-        if !monitor.observes(&binding.session) {
+        if let Some(monitor) = monitors.get_mut(&publication.owner) {
+            if monitor.observes(&session) {
+                return Ok(());
+            }
             monitor.shutdown().await?;
-            *monitor = CopilotTerminalMonitor::new(
-                &binding.session,
-                self.trace.clone(),
-                correlation.to_owned(),
-            );
+            *publication.registry.lock().await = super::terminal::TerminalRegistry::default();
         }
-        match monitor.snapshot() {
-            Some(result) => result.map_err(anyhow::Error::msg),
+        monitors.insert(
+            publication.owner.clone(),
+            CopilotTerminalMonitor::new(&session, self.trace.clone(), publication),
+        );
+        Ok(())
+    }
+
+    /// Get the latest streamed inventory without issuing a native request.
+    pub async fn terminals(&self, key: &ExecutionOwner) -> Result<TerminalSnapshot> {
+        match self
+            .terminals
+            .lock()
+            .await
+            .get(key)
+            .and_then(CopilotTerminalMonitor::snapshot)
+        {
+            Some(result) => result.map_err(anyhow::Error::from),
             None => Ok(TerminalSnapshot {
                 supported: true,
                 starting: true,
@@ -818,13 +825,12 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Stop one native command and invalidate its retained snapshot.
-    pub async fn terminate(&self, key: &str, id: &str) -> Result<()> {
+    pub async fn terminate(&self, key: &ExecutionOwner, id: &str) -> Result<()> {
         self.active(key)
             .await
             .context("Copilot session is not attached")?
             .terminate_terminal(id)
             .await?;
-        self.terminals.lock().await.remove(key);
         Ok(())
     }
 
@@ -898,14 +904,14 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Retain the native profile independently until binding cleanup has joined every foreground worker.
-    pub async fn resources(&self, key: &str) -> Option<Arc<P>> {
+    pub async fn resources(&self, key: &ExecutionOwner) -> Option<Arc<P>> {
         let slot = self.slots.lock().await.get(key).cloned()?;
         let active = slot.lock().await;
         active.as_ref().and_then(|binding| binding._profile.clone())
     }
 
     /// Disconnect one collected owner before allowing its history to be resumed.
-    pub async fn retire(&self, key: &str) -> Result<()> {
+    pub async fn retire(&self, key: &ExecutionOwner) -> Result<()> {
         self.ensure_startup_collected(key)?;
         let slot = self.slots.lock().await.get(key).cloned();
         if let Some(slot) = slot {
@@ -937,7 +943,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Join a healthy owner's failure relay before removing its generation registration.
-    async fn retire_generation_observer(&self, key: &str) -> Result<(), ProviderError> {
+    async fn retire_generation_observer(&self, key: &ExecutionOwner) -> Result<(), ProviderError> {
         let mut generations = self.generations.lock().await;
         if let Some(binding) = generations.get_mut(key)
             && let Some(observer) = binding.observer.as_mut()
@@ -984,7 +990,10 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
             .iter()
             .map(|(key, error)| (key.clone(), error.as_ref().clone()))
             .collect();
-        failed_startups.sort_by(|left, right| left.0.cmp(&right.0));
+        failed_startups.sort_by(|left, right| {
+            (left.0.session_id.as_str(), left.0.agent_id.as_str())
+                .cmp(&(right.0.session_id.as_str(), right.0.agent_id.as_str()))
+        });
         let mut failures: Vec<_> = failed_startups
             .into_iter()
             .map(|(_, error)| error)
@@ -1144,7 +1153,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Get the preparation lock for one native session owner.
-    async fn slot(&self, key: &str) -> SessionSlot<P> {
+    async fn slot(&self, key: &ExecutionOwner) -> SessionSlot<P> {
         self.slots
             .lock()
             .await
@@ -1154,7 +1163,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Join one owned startup without surrendering its handle when the waiter is cancelled.
-    async fn collect_startup(&self, key: &str) -> Result<Option<Arc<CopilotSession>>> {
+    async fn collect_startup(&self, key: &ExecutionOwner) -> Result<Option<Arc<CopilotSession>>> {
         let startup = self
             .startups
             .lock()
@@ -1168,7 +1177,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         let task = guard
             .as_mut()
             .context("Copilot startup already collected")?;
-        let result = match tokio::time::timeout(std::time::Duration::from_secs(30), task).await {
+        let result = match super::operation::wait(task).await {
             Ok(result) => result,
             Err(_) => {
                 return Err(ProviderError::PreparationCleanup {
@@ -1219,7 +1228,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Fence reuse while a startup failed without proving its cleanup.
-    fn ensure_startup_collected(&self, key: &str) -> Result<()> {
+    fn ensure_startup_collected(&self, key: &ExecutionOwner) -> Result<()> {
         if let Some(error) = self
             .failed_startups
             .lock()
@@ -1248,7 +1257,7 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
         self.subscriptions
             .lock()
             .await
-            .get(&selection.runtime_key)
+            .get(&selection.execution_owner)
             .cloned()
             .map(|subscription| {
                 CompactionMonitor::new(
@@ -1262,7 +1271,11 @@ impl<P: Send + Sync + 'static> CopilotSessions<P> {
     }
 
     /// Join old observers and retire its native router while retaining every unfinished handle.
-    async fn disconnect(&self, key: &str, active: &mut Option<SessionBinding<P>>) -> Result<()> {
+    async fn disconnect(
+        &self,
+        key: &ExecutionOwner,
+        active: &mut Option<SessionBinding<P>>,
+    ) -> Result<()> {
         let Some(binding) = active.as_mut() else {
             return Ok(());
         };
@@ -1293,11 +1306,44 @@ mod tests {
     use async_trait::async_trait;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    include!("sessions_recovery_test.rs");
-    include!("completion_ancestry_test.rs");
-    include!("startup_loss_test.rs");
+    mod completion_ancestry;
+    mod recovery;
+    mod startup_loss;
+    mod support;
 
     struct Trace;
+
+    /// Distinct structured owners cannot alias a native slot, turn, or event subscription.
+    #[tokio::test]
+    async fn structured_owners_keep_colliding_text_labels_independent() {
+        let sessions = CopilotSessions::<()>::new(Arc::new(Trace));
+        let child = ExecutionOwner {
+            session_id: "a".into(),
+            agent_id: "b".into(),
+        };
+        let root = ExecutionOwner::root("a:agent:b");
+        assert_ne!(child, root);
+        assert!(!Arc::ptr_eq(
+            &sessions.slot(&child).await,
+            &sessions.slot(&root).await
+        ));
+        assert!(!Arc::ptr_eq(
+            &sessions.turn(&child).await,
+            &sessions.turn(&root).await
+        ));
+        for owner in [child, root] {
+            let (sink, _) = forge_provider_api::events::channel(
+                forge_provider_api::BindingId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+                forge_provider_api::EventScope::Binding {
+                    owner: owner.clone(),
+                },
+            );
+            sessions.subscribe(owner, sink).await;
+        }
+        assert_eq!(sessions.subscriptions.lock().await.len(), 2);
+        sessions.close_observers().await.unwrap();
+    }
+
     impl ProviderTrace for Trace {
         /// Discard fixture diagnostics independently of the native transport assertions.
         fn record(&self, _: forge_provider_api::trace::ProviderTraceRecord) {}
@@ -1376,10 +1422,7 @@ mod tests {
     #[tokio::test]
     async fn inherited_mcp_is_disabled_before_create_and_resume() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            for mode in [
-                forge_provider_api::PromptMode::Chat,
-                forge_provider_api::PromptMode::Background,
-            ] {
+            for isolated_text in [false, true] {
                 for resumed in [false, true] {
                     for selected in [false, true] {
                         let (client_write, mut peer_read) = tokio::io::duplex(1 << 20);
@@ -1416,9 +1459,7 @@ mod tests {
                                     "session.create"
                                 }
                             );
-                            let expected = if mode == forge_provider_api::PromptMode::Background
-                                || !selected
-                            {
+                            let expected = if isolated_text || !selected {
                                 serde_json::json!(["github", "selected", "workspace-extra"])
                             } else {
                                 serde_json::json!(["github", "workspace-extra"])
@@ -1469,15 +1510,14 @@ mod tests {
                         let session = super::super::session::open(
                             &client,
                             SessionOptions {
-                                isolated_text: false,
+                                isolated_text,
                                 session_id: resumed.then(|| "saved-session".to_owned()),
                                 model: None,
                                 reasoning_effort: None,
                                 context_tier: None,
                                 workspace: std::env::temp_dir(),
-                                mode,
                                 system_message: String::new(),
-                                resources: super::super::session::ResourceDiscovery::Managed {
+                                resources: super::super::session::SessionResources {
                                     skill_directories: Vec::new(),
                                     selected_mcp: if selected {
                                         vec!["selected".to_owned()]
@@ -1578,10 +1618,10 @@ mod tests {
                         .provisional
                         .lock()
                         .unwrap()
-                        .insert("owner".into(), session.clone());
+                        .insert(ExecutionOwner::root("owner"), session.clone());
                 } else {
                     sessions.slots.lock().await.insert(
-                        "owner".into(),
+                        ExecutionOwner::root("owner"),
                         Arc::new(Mutex::new(Some(SessionBinding {
                             session: session.clone(),
                             history: SessionHistory::Prepared,
@@ -1594,8 +1634,11 @@ mod tests {
                     );
                 }
                 if !provisional {
-                    sessions.mark_submitted("owner", &session).await.unwrap();
-                    let slot = sessions.slot("owner").await;
+                    sessions
+                        .mark_submitted(&ExecutionOwner::root("owner"), &session)
+                        .await
+                        .unwrap();
+                    let slot = sessions.slot(&ExecutionOwner::root("owner")).await;
                     assert!(matches!(
                         slot.lock().await.as_ref().unwrap().history,
                         SessionHistory::Submitted
@@ -1662,7 +1705,6 @@ mod tests {
                     async move { Ok((client, None)) },
                     SessionSelection {
                         execution_owner: forge_provider_api::ExecutionOwner::root("owner"),
-                        runtime_key: "owner".into(),
                         correlation_id: "owner".into(),
                         session_id: None,
                         model: None,
@@ -1681,9 +1723,8 @@ mod tests {
                                 reasoning_effort: None,
                                 context_tier: None,
                                 workspace: std::env::temp_dir(),
-                                mode: forge_provider_api::PromptMode::Chat,
                                 system_message: String::new(),
-                                resources: super::super::session::ResourceDiscovery::Managed {
+                                resources: super::super::session::SessionResources {
                                     skill_directories: Vec::new(),
                                     selected_mcp: Vec::new(),
                                 },
@@ -1829,7 +1870,6 @@ mod tests {
                     async move { Ok((client, None)) },
                     SessionSelection {
                         execution_owner: forge_provider_api::ExecutionOwner::root("owner"),
-                        runtime_key: "owner".into(),
                         correlation_id: "owner".into(),
                         session_id: None,
                         model: None,
@@ -1848,9 +1888,8 @@ mod tests {
                                 reasoning_effort: None,
                                 context_tier: None,
                                 workspace: std::env::temp_dir(),
-                                mode: forge_provider_api::PromptMode::Chat,
                                 system_message: String::new(),
-                                resources: super::super::session::ResourceDiscovery::Managed {
+                                resources: super::super::session::SessionResources {
                                     skill_directories: vec![profile_path.clone()],
                                     selected_mcp: Vec::new(),
                                 },
@@ -1877,16 +1916,19 @@ mod tests {
             .leases
             .lock()
             .unwrap()
-            .get("owner")
+            .get(&ExecutionOwner::root("owner"))
             .unwrap()
             .path()
             .to_owned();
         assert!(path.exists());
         release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(5), sessions.retire("owner"))
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sessions.retire(&ExecutionOwner::root("owner")),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(!path.exists(), "profile survived completed retirement");
         assert!(
             !methods
@@ -1909,7 +1951,7 @@ mod tests {
             .leases
             .lock()
             .unwrap()
-            .insert("owner".into(), profile.clone());
+            .insert(ExecutionOwner::root("owner"), profile.clone());
         let worker_profile = profile.clone();
         drop(profile);
         let (release, wait) = tokio::sync::oneshot::channel::<()>();
@@ -1926,9 +1968,13 @@ mod tests {
             .startups
             .lock()
             .unwrap()
-            .insert("owner".into(), startup.clone());
+            .insert(ExecutionOwner::root("owner"), startup.clone());
         let waiter_sessions = sessions.clone();
-        let waiter = tokio::spawn(async move { waiter_sessions.collect_startup("owner").await });
+        let waiter = tokio::spawn(async move {
+            waiter_sessions
+                .collect_startup(&ExecutionOwner::root("owner"))
+                .await
+        });
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while startup.try_lock().is_ok() {
                 tokio::task::yield_now().await;
@@ -1938,13 +1984,22 @@ mod tests {
         .expect("startup waiter did not reach the held worker");
         waiter.abort();
         let _ = waiter.await;
-        assert!(sessions.startups.lock().unwrap().contains_key("owner"));
+        assert!(
+            sessions
+                .startups
+                .lock()
+                .unwrap()
+                .contains_key(&ExecutionOwner::root("owner"))
+        );
         assert!(
             profile_path.exists(),
             "resource lease disappeared while startup was owned"
         );
         release.send(()).unwrap();
-        let error = match sessions.collect_startup("owner").await {
+        let error = match sessions
+            .collect_startup(&ExecutionOwner::root("owner"))
+            .await
+        {
             Err(error) => error,
             Ok(_) => panic!("startup failure was lost"),
         };
@@ -1953,7 +2008,13 @@ mod tests {
             Some(ProviderError::Failure(failure))
                 if failure.kind() == forge_provider_api::ProviderFailureKind::Rejected
         ));
-        assert!(!sessions.startups.lock().unwrap().contains_key("owner"));
+        assert!(
+            !sessions
+                .startups
+                .lock()
+                .unwrap()
+                .contains_key(&ExecutionOwner::root("owner"))
+        );
         assert!(
             !profile_path.exists(),
             "resource lease was not released after collection"
@@ -1970,7 +2031,7 @@ mod tests {
             ("second", ProviderFailureKind::Transport),
         ] {
             sessions.failed_startups.lock().unwrap().insert(
-                key.into(),
+                ExecutionOwner::root(key),
                 Arc::new(super::super::error::native_failure(
                     ProviderOperation::SessionOpen,
                     kind,
@@ -1999,7 +2060,7 @@ mod tests {
             .leases
             .lock()
             .unwrap()
-            .insert("owner".into(), profile);
+            .insert(ExecutionOwner::root("owner"), profile);
         let task = tokio::spawn(async {
             Err(ProviderError::PreparationCleanup {
                 cause: Box::new(crate::copilot::error::native_failure(
@@ -2012,13 +2073,21 @@ mod tests {
                 )),
             })
         });
-        sessions
-            .startups
-            .lock()
-            .unwrap()
-            .insert("owner".into(), Arc::new(Mutex::new(Some(task))));
-        assert!(sessions.collect_startup("owner").await.is_err());
-        assert!(sessions.ensure_startup_collected("owner").is_err());
+        sessions.startups.lock().unwrap().insert(
+            ExecutionOwner::root("owner"),
+            Arc::new(Mutex::new(Some(task))),
+        );
+        assert!(
+            sessions
+                .collect_startup(&ExecutionOwner::root("owner"))
+                .await
+                .is_err()
+        );
+        assert!(
+            sessions
+                .ensure_startup_collected(&ExecutionOwner::root("owner"))
+                .is_err()
+        );
         assert!(path.exists(), "failed cleanup released its resource lease");
         assert!(sessions.clear(ClientShutdown::Uncertain).await.is_err());
         assert!(

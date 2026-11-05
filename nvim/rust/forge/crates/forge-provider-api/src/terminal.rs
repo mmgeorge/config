@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Provider-owned shell processes whose lifetime is independent of a Harness exchange.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct TerminalSnapshot {
     /// Whether this adapter implements terminal inventory for the exact binding.
     pub supported: bool,
@@ -12,7 +12,7 @@ pub struct TerminalSnapshot {
 }
 
 /// A live shell identity and its display command, scoped to one provider session.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub struct BackgroundTerminal {
     /// Adapter-issued identity resolved only within the binding supplied to terminal operations.
     pub id: TerminalId,

@@ -207,7 +207,7 @@ impl SqliteStore {
         now_ms: i64,
         change: impl FnOnce(&mut Option<Task>) -> Result<Output>,
     ) -> Result<Output> {
-        self.commit_task_effects(session_id, expected, now_ms, None, |task| {
+        self.commit_task_effects(session_id, expected, now_ms, |task| {
             Ok((change(task)?, TaskEffects::default()))
         })?
         .context("task change unexpectedly reused a command")
@@ -218,16 +218,9 @@ impl SqliteStore {
         session_id: &str,
         expected: Option<&TaskRevision>,
         now_ms: i64,
-        command: Option<&crate::task::TaskOperation>,
         change: impl FnOnce(&mut Option<Task>) -> Result<(Output, TaskEffects)>,
     ) -> Result<Option<Output>> {
-        self.commit_task_effects_fenced(
-            session_id,
-            TaskFence::Revision(expected),
-            now_ms,
-            command,
-            change,
-        )
+        self.commit_task_effects_fenced(session_id, TaskFence::Revision(expected), now_ms, change)
     }
 
     /// Count one admitted turn after its own phase transition without weakening mutation fencing.
@@ -238,13 +231,7 @@ impl SqliteStore {
         now_ms: i64,
         change: impl FnOnce(&mut Option<Task>) -> Result<(Output, TaskEffects)>,
     ) -> Result<Option<Output>> {
-        self.commit_task_effects_fenced(
-            session_id,
-            TaskFence::Observation(permit),
-            now_ms,
-            None,
-            change,
-        )
+        self.commit_task_effects_fenced(session_id, TaskFence::Observation(permit), now_ms, change)
     }
 
     /// Commit a task and its effects against an unchanged working document in the same fence.
@@ -264,7 +251,6 @@ impl SqliteStore {
                     session_id,
                     TaskFence::Revision(Some(permit.revision())),
                     now_ms,
-                    None,
                     Some(document),
                     |active| {
                         permit.validate(active.as_ref())?;
@@ -281,12 +267,11 @@ impl SqliteStore {
         session_id: &str,
         fence: TaskFence<'_>,
         now_ms: i64,
-        command: Option<&crate::task::TaskOperation>,
         change: impl FnOnce(&mut Option<Task>) -> Result<(Output, TaskEffects)>,
     ) -> Result<Option<Output>> {
         let admission = self.session_admission(session_id)?;
         admission.with_task_mutation(|| {
-            self.commit_task_effects_locked(session_id, fence, now_ms, command, None, change)
+            self.commit_task_effects_locked(session_id, fence, now_ms, None, change)
         })
     }
 
@@ -296,7 +281,6 @@ impl SqliteStore {
         session_id: &str,
         fence: TaskFence<'_>,
         now_ms: i64,
-        command: Option<&crate::task::TaskOperation>,
         document: Option<&crate::plan::WorkingDocumentCommit<'_>>,
         change: impl FnOnce(&mut Option<Task>) -> Result<(Output, TaskEffects)>,
     ) -> Result<Option<Output>> {
@@ -304,28 +288,6 @@ impl SqliteStore {
             crate::plan::PlanFileStore::new(self.data_root.clone(), std::path::PathBuf::new());
         let mut affected_plans = Vec::new();
         let result = (|| {
-            if let Some(command) = command {
-                let existing: Option<String> = self
-                    .connection
-                    .query_row(
-                        "SELECT payload FROM task_operation WHERE id=?1 AND session_id=?2",
-                        params![command.id, session_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(existing) = existing {
-                    let existing: crate::task::TaskOperation = super::decode(&existing)?;
-                    ensure!(
-                        existing.action == command.action,
-                        "operation ID was reused for a different action"
-                    );
-                    ensure!(
-                        existing.state == "completed",
-                        "task command has an unfinished legacy operation"
-                    );
-                    return Ok(None);
-                }
-            }
             let observed_payload: Option<String> = self.connection.query_row(
             "SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1 AND json_extract(payload,'$.format_version')=?2",
             params![session_id, super::SESSION_FORMAT_VERSION], |row| row.get(0),
@@ -369,27 +331,6 @@ impl SqliteStore {
                 .connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             Self::ensure_no_configuration_intent(&transaction, session_id)?;
-            if let Some(command) = command {
-                let existing: Option<String> = transaction
-                    .query_row(
-                        "SELECT payload FROM task_operation WHERE id=?1 AND session_id=?2",
-                        params![command.id, session_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if let Some(existing) = existing {
-                    let existing: crate::task::TaskOperation = super::decode(&existing)?;
-                    ensure!(
-                        existing.action == command.action,
-                        "operation ID was reused for a different action"
-                    );
-                    ensure!(
-                        existing.state == "completed",
-                        "task command has an unfinished legacy operation"
-                    );
-                    return Ok(None);
-                }
-            }
             let payload: Option<String> = transaction
             .query_row(
                 "SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1 AND json_extract(payload,'$.format_version')=?2",
@@ -613,15 +554,6 @@ impl SqliteStore {
             "UPDATE session_record SET updated_at_ms=max(updated_at_ms,?2), payload=json_set(payload,'$.session.active_task',json(?3),'$.session.updated_at_ms',max(updated_at_ms,?2)) WHERE id=?1",
             params![session_id, now_ms, encoded],
         )?;
-            if let Some(command) = command {
-                let mut receipt = command.clone();
-                receipt.state = "completed".into();
-                receipt.revision += 1;
-                transaction.execute(
-                    "INSERT INTO task_operation(id,session_id,payload) VALUES(?1,?2,?3)",
-                    params![receipt.id, session_id, super::encode(&receipt)?],
-                )?;
-            }
             if let Some(commit) = effects.owner_task_commit {
                 crate::exchange::journal::commit_task_command(&transaction, session_id, commit)?;
             }
@@ -649,7 +581,6 @@ impl SqliteStore {
 pub(super) fn recover_active_task(
     connection: &rusqlite::Connection,
     session_id: &str,
-    clearing: bool,
 ) -> Result<()> {
     let payload: Option<String> = connection.query_row(
         "SELECT json_extract(payload,'$.session.active_task') FROM session_record WHERE id=?1",
@@ -661,10 +592,6 @@ pub(super) fn recover_active_task(
     else {
         return Ok(());
     };
-    if clearing {
-        connection.execute("UPDATE session_record SET payload=json_set(payload,'$.session.active_task',NULL) WHERE id=?1", [session_id])?;
-        return Ok(());
-    }
     let mut draft = active.draft();
     match &mut draft.workflow {
         WorkflowSnapshot::Goal { goal } => {

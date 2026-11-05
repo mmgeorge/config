@@ -19,6 +19,8 @@ local host_drain_timeout_ms = 3000
 local host_unix_collection_timeout_ms = 1000
 local host_windows_collection_timeout_ms = 2000
 local send_request
+local pump_admission
+local max_active_requests, reserved_control_requests = 256, 4
 
 ---@alias ForgeCallback fun(result?: any, error?: string, error_detail?: table)
 ---@alias ForgeSubscriber fun(event: string, payload: any, session_id?: string)
@@ -44,6 +46,8 @@ local send_request
 ---@field session_id? string
 ---@field timing? table
 ---@field dispatched? boolean
+---@field admitted? boolean
+---@field start? fun()
 
 ---@class ForgeClient
 ---@field process table?
@@ -51,6 +55,7 @@ local send_request
 ---@field launch_token integer
 ---@field next_id integer
 ---@field pending table<integer, ForgePendingRequest>
+---@field admission_queue integer[]
 ---@field transfer table<integer, ForgeJsonTransfer>
 ---@field transfer_bytes integer
 ---@field subscriber table<integer, ForgeSubscriber>
@@ -79,6 +84,7 @@ local send_request
 ---@field runtime_initialize_callback ForgeCallback[]
 ---@field snapshot_by_id table<string, table>
 ---@field snapshot table?
+---@field publication_by_session table<string, {generation: integer, cursor: integer, seen: table<integer, boolean>}>
 
 ---@type ForgeClient?
 M._client = nil
@@ -92,6 +98,7 @@ local function host_state()
     launch_token = 0,
     next_id = 0,
     pending = {},
+    admission_queue = {},
     transfer = {},
     transfer_bytes = 0,
     subscriber = {},
@@ -111,6 +118,7 @@ local function host_state()
     initialize_callback = {},
     snapshot = nil,
     snapshot_by_id = {},
+    publication_by_session = {},
     harness_ready = false,
     harness_starting = false,
     harness_initialize_callback = {},
@@ -132,6 +140,26 @@ local function protect_consumer(callback, context)
   end
 end
 
+local function admission_counts(client)
+  local count, ordinary = 0, 0
+  for _, pending in pairs(client.pending) do
+    if pending.admitted ~= false then
+      count = count + 1
+      if contract.method_policy(pending.method).admission ~= "control" then ordinary = ordinary + 1 end
+    end
+  end
+  return count, ordinary
+end
+
+local function release_request(client, id)
+  local pending = client.pending[id]
+  client.pending[id] = nil
+  if #client.admission_queue > 0 then
+    vim.schedule(function() if M._client == client then pump_admission(client) end end)
+  end
+  return pending
+end
+
 ---@param method string
 ---@param callback ForgeCallback
 ---@return integer?
@@ -139,18 +167,49 @@ local function host_admit_request(method, callback)
   local client = host_state()
   if exiting then callback(nil, "Forge host is exiting", { code = "not_admitted" }) return nil end
   if client.draining then callback(nil, "Forge host is draining", { code = "not_admitted" }) return nil end
-  local count, ordinary = 0, 0
-  for _, pending in pairs(client.pending) do
-    count = count + 1
-    if contract.method_policy(pending.method).admission ~= "control" then ordinary = ordinary + 1 end
-  end
-  if count >= 64 or (contract.method_policy(method).admission ~= "control" and ordinary >= 60) or client.next_id >= 9007199254740991 then
-    callback(nil, "Forge request admission is full", { code = "not_admitted" })
+  if client.next_id >= 9007199254740991 then
+    callback(nil, "Forge request identity space is exhausted", { code = "not_admitted" })
     return nil
   end
   client.next_id = client.next_id + 1
-  client.pending[client.next_id] = { method = method, callback = callback }
+  client.pending[client.next_id] = { method = method, callback = callback, admitted = false }
   return client.next_id
+end
+
+local function queue_ready_request(client, id)
+  local index = #client.admission_queue + 1
+  if contract.method_policy(client.pending[id].method).admission == "control" then
+    index = 1
+    while index <= #client.admission_queue do
+      local pending = client.pending[client.admission_queue[index]]
+      if pending and contract.method_policy(pending.method).admission ~= "control" then break end
+      index = index + 1
+    end
+  end
+  table.insert(client.admission_queue, index, id)
+  pump_admission(client)
+end
+
+pump_admission = function(client)
+  if client.draining or exiting then return end
+  local index = 1
+  while index <= #client.admission_queue do
+    local count, ordinary = admission_counts(client)
+    if count >= max_active_requests then break end
+    local id = client.admission_queue[index]
+    local pending = client.pending[id]
+    local control = pending and contract.method_policy(pending.method).admission == "control"
+    if not pending then
+      table.remove(client.admission_queue, index)
+    elseif control or ordinary < max_active_requests - reserved_control_requests then
+      table.remove(client.admission_queue, index)
+      pending.admitted = true
+      local start = pending.start
+      pending.start = nil
+      start()
+      index = 1
+    else index = index + 1 end
+  end
 end
 
 ---@param id integer
@@ -168,8 +227,7 @@ local function host_write_request(id, method, params, session_id)
     client.process:write(encoded)
   end)
   if not ok and client.pending[id] then
-    local pending = client.pending[id]
-    client.pending[id] = nil
+    local pending = release_request(client, id)
     pending.callback(nil, "Failed to write Forge request: " .. tostring(failure))
   end
 end
@@ -441,6 +499,31 @@ local function host_cancel_shutdown_timer(client, launch_token)
   end
 end
 
+---Consume each retained publication once, including live events received ahead of a reconnect gap.
+---@param client ForgeClient
+---@param message table
+---@return boolean
+local function accept_publication(client, message)
+  local publication = type(message.payload) == "table" and message.payload._publication
+  if not publication then return true end
+  local sequence = publication.sequence
+  assert(type(message.session_id) == "string" and type(sequence) == "number"
+    and sequence >= 1 and sequence <= 9007199254740991 and sequence == math.floor(sequence),
+    "Invalid Forge publication identity")
+  local retained = client.publication_by_session[message.session_id]
+  if not retained or retained.generation ~= client.generation then
+    retained = { generation = client.generation, cursor = sequence - 1, seen = {} }
+    client.publication_by_session[message.session_id] = retained
+  end
+  if sequence <= retained.cursor or retained.seen[sequence] then return false end
+  retained.seen[sequence] = true
+  while retained.seen[retained.cursor + 1] do
+    retained.cursor = retained.cursor + 1
+    retained.seen[retained.cursor] = nil
+  end
+  return true
+end
+
 ---@param message table
 local function host_dispatch_message(message, timing)
   local client = host_state()
@@ -512,6 +595,7 @@ local function host_dispatch_message(message, timing)
       return
     end
   end
+  if message.event and not accept_publication(client, message) then return end
   if message.event == "lsp.request" or message.event == "lsp.cancel" or message.event == "lsp.mutation" then
     require("forge.lsp.bridge").handle(message.event, message.payload, message.session_id, client.generation)
     return
@@ -556,7 +640,7 @@ local function host_dispatch_message(message, timing)
     client.transfer[message.id] = nil
     client.transfer_bytes = client.transfer_bytes - transfer.total_bytes
   end
-  client.pending[message.id] = nil
+  release_request(client, message.id)
   if message.error then
     pending.callback(
       nil,
@@ -571,6 +655,28 @@ local function host_dispatch_message(message, timing)
     local result_session_id = message.result and message.result.session and message.result.session.id
     if result_session_id then client.snapshot_by_id[result_session_id] = message.result end
     pending.callback(message.result, nil)
+  end
+end
+
+---Recover missing retained events through the live dispatch path before adopting the final snapshot.
+---@param snapshot table
+function M.replay_publication(snapshot)
+  local page = snapshot.owner_publication
+  if not page then return end
+  local client = host_state()
+  local session_id = snapshot.session.id
+  local retained = client.publication_by_session[session_id]
+  if not retained or retained.generation ~= client.generation then
+    -- A newly attached view adopts current state without replaying historical one-shot effects.
+    client.publication_by_session[session_id] = {
+      generation = client.generation, cursor = page.high_water or page.through or page.after or 0, seen = {},
+    }
+    return
+  end
+  for _, entry in ipairs(page.events or {}) do
+    assert(entry.event.session_id == session_id and entry.event.payload._publication.sequence == entry.sequence,
+      "Forge publication page belongs to a different event")
+    host_dispatch_message(entry.event)
   end
 end
 
@@ -742,11 +848,12 @@ local function host_spawn(binary, callback, launch_token, lease)
     end
     local pending_list = current.pending
     current.pending = {}
+    current.admission_queue = {}
     current.transfer = {}
     current.transfer_bytes = 0
     for id, pending in pairs(pending_list) do
       pending.callback(nil, (current.stop_reason or "Forge host stopped") .. ": unresolved request " .. id .. " (" .. pending.method .. ")", {
-        code = "outcome_unknown", request_id = id, method = pending.method,
+        code = pending.dispatched and "outcome_unknown" or "not_admitted", request_id = id, method = pending.method,
       })
     end
     session_fail_initialization(current, stop_reason)
@@ -1019,7 +1126,7 @@ function M.generation_request(params, callback, on_model, selection)
     local pending = owner.pending[request_id]
     if not pending then return end
     if not pending.dispatched then
-      owner.pending[request_id] = nil
+      release_request(owner, request_id)
       callback(nil, "Background generation cancelled")
       return
     end
@@ -1060,8 +1167,11 @@ local function session_scope_callback(request_state, callback)
   return function(result, request_error, error_detail)
     local active_state = session.harness
     session.activate_harness(request_state)
+    local selection = session.harness_selection()
     deliver(result, request_error, error_detail)
-    if active_state ~= request_state then session.activate_harness(active_state) end
+    if active_state ~= request_state and session.harness_selection() == selection then
+      session.activate_harness(active_state)
+    end
   end
 end
 
@@ -1084,24 +1194,30 @@ send_request = function(session_id, method, params, callback, sending, progress)
   local receive = owner and session_scope_callback(owner, callback) or protect_consumer(callback, method)
   local id = host_admit_request(method, receive)
   if not id then return end
-  host_state().pending[id].progress = progress
-  host_state().pending[id].session_id = session_id
+  local client = host_state()
+  params = vim.deepcopy(params or {})
+  client.pending[id].progress = progress
+  client.pending[id].session_id = session_id
   local function ready(_, failure, detail)
-    local client = host_state()
-    if not client.pending[id] then return end
+    if M._client ~= client or not client.pending[id] then return end
     if failure then
-      client.pending[id] = nil
+      release_request(client, id)
       receive(nil, failure, detail)
       return
     end
     local generation = client.generation
-    vim.schedule(function()
-      if host_state() ~= client or client.generation ~= generation or not client.pending[id] then return end
-      if sending then sending(generation) end
-      client.pending[id].dispatched = true
-      host_write_request(id, method, params or {}, session_id)
-    end)
+    client.pending[id].start = function()
+      vim.schedule(function()
+        if M._client ~= client or client.generation ~= generation or not client.pending[id] then return end
+        if sending then sending(generation) end
+        if not client.pending[id] then return end
+        client.pending[id].dispatched = true
+        host_write_request(id, method, params, session_id)
+      end)
+    end
+    queue_ready_request(client, id)
   end
+  -- Readiness may issue prerequisite RPCs, so it must not reserve a transport slot.
   if method == "session.initialize" or contract.method_policy(method).readiness == "host" then
     M.host_start(ready)
   else
@@ -1210,6 +1326,14 @@ function M.host_stop(reason, on_stopped)
   local process = client.process
   if client.draining then return end
   client.draining = true
+  local waiting = {}
+  for id, pending in pairs(client.pending) do
+    if pending.admitted == false then waiting[#waiting + 1] = { id = id, request = pending } client.pending[id] = nil end
+  end
+  client.admission_queue = {}
+  for _, entry in ipairs(waiting) do
+    entry.request.callback(nil, reason, { code = "not_admitted", request_id = entry.id, method = entry.request.method })
+  end
   client.stop_reason = reason
   client.ready = false
   client.harness_ready = false
@@ -1260,9 +1384,13 @@ function M.host_stop(reason, on_stopped)
   session.harness.ready = false
   local pending_list = client.pending
   client.pending = {}
+  client.admission_queue = {}
   client.transfer = {}
   client.transfer_bytes = 0
-  for _, pending in pairs(pending_list) do pending.callback(nil, reason) end
+  for id, pending in pairs(pending_list) do
+    pending.callback(nil, reason, { code = pending.dispatched and "outcome_unknown" or "not_admitted",
+      request_id = id, method = pending.method })
+  end
   if client.start_callback then host_finish_start(client.start_callback, nil, reason) end
   local callback_list = client.initialize_callback
   client.initialize_callback = {}

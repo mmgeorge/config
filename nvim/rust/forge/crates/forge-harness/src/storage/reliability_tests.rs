@@ -3,6 +3,85 @@ use crate::session::SessionStore;
 use anyhow::Result;
 use rusqlite::TransactionBehavior;
 
+/// Render a normalized provider failure once even when orchestration adds error context.
+#[test]
+fn provider_failure_display_does_not_repeat_its_source_chain() {
+    use forge_provider_api::{
+        ProviderError, ProviderFailure, ProviderFailureKind, ProviderOperation,
+    };
+    let failure =
+        ProviderError::PreparationFailed(Box::new(ProviderError::Failure(ProviderFailure::new(
+            ProviderOperation::SessionOpen,
+            ProviderFailureKind::Persistence,
+        ))));
+    let expected = failure.to_string();
+    let error = anyhow::Error::new(failure).context("commit generation failed");
+    let displayed = super::error_message(&error);
+    assert_eq!(displayed, expected);
+    assert_eq!(displayed.matches("SessionOpen").count(), 1);
+    assert_eq!(displayed.matches("Persistence").count(), 1);
+}
+
+/// Upgrade existing version-seven databases before provider admission needs durable operation evidence.
+#[test]
+fn version_seven_upgrade_adds_core_log_without_rewriting_sessions() -> Result<()> {
+    use crate::exchange::core_log::{CoreEventLog, CoreOperation, CoreRecord};
+    use forge_provider_api::{EventScope, ExecutionOwner, OperationId, ProviderOperation};
+
+    let root = tempfile::tempdir()?;
+    let mut store = SqliteStore::open(root.path())?;
+    store.save_session(&session("existing-session", "workspace"))?;
+    let original: String = store.connection.query_row(
+        "SELECT payload FROM session_record WHERE id='existing-session'",
+        [],
+        |row| row.get(0),
+    )?;
+    store.connection.execute_batch(
+        "DROP TABLE owner_core_log; PRAGMA user_version=7;
+         CREATE TRIGGER preserve_existing_sessions BEFORE UPDATE ON session_record
+         BEGIN SELECT RAISE(ABORT,'unexpected session rewrite'); END;",
+    )?;
+    drop(store);
+
+    let upgraded = SqliteStore::open(root.path())?;
+    assert_eq!(
+        upgraded
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?,
+        super::schema::VERSION
+    );
+    let retained: String = upgraded.connection.query_row(
+        "SELECT payload FROM session_record WHERE id='existing-session'",
+        [],
+        |row| row.get(0),
+    )?;
+    assert_eq!(retained, original);
+    let log = CoreEventLog::new(root.path().to_owned());
+    let record = CoreRecord::OperationStarted {
+        operation: CoreOperation::Provider {
+            id: OperationId::new("first-provider-open")?,
+            kind: ProviderOperation::SessionOpen,
+            binding: None,
+            scope: EventScope::Binding {
+                owner: ExecutionOwner::root("existing-session"),
+            },
+            invocation: None,
+        },
+    };
+    assert_eq!(log.append("existing-session", &record)?, Some(1));
+    assert_eq!(log.append("utility-without-history", &record)?, None);
+    drop(upgraded);
+    let reopened = SqliteStore::open(root.path())?;
+    assert_eq!(
+        reopened
+            .connection
+            .query_row("SELECT count(*) FROM owner_core_log", [], |row| row
+                .get::<_, i64>(0))?,
+        1
+    );
+    Ok(())
+}
+
 /// Preserve review data and flattened task records while removing the old lifecycle storage path.
 #[test]
 fn legacy_review_upgrade_preserves_answers_and_requires_new_execution_authority() -> Result<()> {

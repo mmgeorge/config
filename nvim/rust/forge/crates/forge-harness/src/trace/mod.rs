@@ -10,4 +10,4 @@ mod tests;
 pub(crate) use future::future_bytes;
 pub(crate) use policy::inspection_record;
 pub use store::{TraceStatus, TraceStore};
-pub use writer::{TraceError, TraceResult};
+pub use writer::{TraceAdmission, TraceError, TraceResult};

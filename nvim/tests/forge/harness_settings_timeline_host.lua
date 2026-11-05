@@ -28,7 +28,7 @@ end
 require("forge").open_harness()
 wait(function() return state.ready and state.session end, "Harness did not start")
 local configured
-require("forge.views.harness.controller").configure({ service_tier = "fast" }, true, function(applied)
+require("forge.views.harness.controller").configure({ service_tier = "fast" }, function(applied)
   configured = applied
 end)
 wait(function() return configured ~= nil end, "Service tier validation did not finish")

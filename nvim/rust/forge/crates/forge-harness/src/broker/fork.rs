@@ -62,7 +62,8 @@ pub fn prepare_provider_fork(
     let target_session_id = Uuid::new_v4().to_string();
     let fork_point = ProviderForkPoint {
         provider_session_id: source.provider_session_id.clone(),
-        checkpoint_id: source.provider_checkpoint_id.clone(),
+        // This action copies the current conversation, not an explicitly selected historical checkpoint.
+        checkpoint_id: None,
     };
     let existing_name_set = store
         .list_session(Some(&source.workspace))?
@@ -227,7 +228,7 @@ impl HarnessBroker {
         Ok(SessionEvent {
             session_id: self.session.id.clone(),
             event: event.into(),
-            payload: json!({ "session": self.session_view()?, "timing": timing }),
+            payload: json!({ "snapshot": self.snapshot()?, "timing": timing }),
         })
     }
 }

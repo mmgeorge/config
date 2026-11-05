@@ -25,13 +25,14 @@ local attachment = require("forge.views.harness.attachment")
 local prompt_submission = require("forge.views.harness.prompt_submission")
 local tabline = require("forge.views.harness.tabline")
 local input_state = require("forge.views.harness.input_state")
+local activity = require("forge.views.harness.activity")
+local cleanup_progress = require("forge.views.harness.cleanup_progress")
 
 local queue_namespace = vim.api.nvim_create_namespace("ForgeHarnessQueue")
 local render_observer_for_test = nil
 local begin_request
 local submit_immediate
 local configure_now
-local finish_execution
 local render_status_hint
 local queue_only_commands = { ["/plan"] = true }
 local workflow_action = {
@@ -51,8 +52,6 @@ end
 ---@param field "model"|"effort"|"service_tier"
 ---@return string
 local function selected_setting(state, field)
-  if state.task_config and state.task_config[field] ~= nil then return state.task_config[field] end
-  if state.configuring_config and state.configuring_config[field] ~= nil then return state.configuring_config[field] end
   return applied_setting(state, field)
 end
 
@@ -86,16 +85,19 @@ end
 ---Cancel the root exchange independently of the selected child timeline.
 ---@param state table
 local function cancel_exchange(state)
-  if state.cancel_requested then return end
   local session_id = state.session and state.session.id
   if not session_id then return end
-  state.cancel_requested = true
+  local operation_id = require("forge.command").identity()
+  if state.input then state.input.pause_operation_id = operation_id end
+  cleanup_progress.begin(state, operation_id)
   client.request({ session_id = session_id, method = "session.turn.cancel",
-    params = { restore_prompt_if_no_output = true } }, function(_, failure)
-    if harness_state() ~= state or not state.session or state.session.id ~= session_id then return end
-    state.cancel_requested = false
-    if failure then notifications.error(failure, "Harness cancellation") end
-    M.render()
+    params = { operation_id = operation_id, restore_prompt_if_no_output = true } }, function(_, failure, detail)
+    if not state.session or state.session.id ~= session_id then return end
+    if failure then
+      if detail and detail.code == "execution_collection_timeout" then cleanup_progress.timeout(state, operation_id) end
+      notifications.error(failure, "Harness cancellation")
+    else cleanup_progress.settled(state, operation_id) end
+    if harness_state() == state then M.render() end
   end)
 end
 
@@ -226,13 +228,7 @@ local function status_text()
   if selected_model ~= configured_model then model = selected_model end
   local tier = selected_setting(state, "service_tier")
   local speed_icon = ({ fast = "󱐌", ultrafast = "󱐋" })[tier]
-  local deferred = state.configuration_completion and state.configuration_completion.deferred
-  if deferred == nil and state.task_operation and state.task_operation.action == "configure" then
-    deferred = state.task_operation.configuration_deferred
-  end
-  local model_pending = deferred == true and (selected_model ~= configured_model
-    or effort ~= (active_session.effort or config.options.harness.effort)
-    or tier ~= (active_session.service_tier or "default"))
+  local model_pending = false
   local model_text = ("%s %s%s"):format(model, effort, model_pending and "*" or "")
   local segment_list = {}
   local function append_status(text, group)
@@ -302,8 +298,8 @@ end
 ---@return integer?
 local function working_seconds()
   local state = harness_state()
-  if not state.busy or not state.working_started_ns then return nil end
-  return math.floor((vim.uv.hrtime() - state.working_started_ns) / 1000000000)
+  if not activity.busy(state) then return nil end
+  return math.floor(((state.status or {}).duration_ms or 0) / 1000)
 end
 
 render_status_hint = function(state)
@@ -403,43 +399,6 @@ local function schedule_render()
   end)
 end
 
----@param busy boolean
----@return table? owner
-local function set_busy(busy)
-  local state = harness_state()
-  state.request_busy = busy
-  state.busy = busy or state.execution_busy == true
-  state.execution_request_owner = busy and {} or nil
-  if busy then
-    state.execution_notice = nil
-    state.execution_notice_operation = nil
-    if state.working_started_ns then return state.execution_request_owner end
-    state.working_started_ns = vim.uv.hrtime()
-    state.working_timer = vim.uv.new_timer()
-    state.working_timer:start(1000, 1000, function()
-      vim.schedule(function()
-        local active_state = session.harness
-        session.activate_harness(state)
-        if state.busy then schedule_render() end
-        if active_state ~= state then session.activate_harness(active_state) end
-      end)
-    end)
-  else
-    state.working_started_ns = nil
-    state.cancel_requested = false
-    if state.working_timer then
-      state.working_timer:stop()
-      state.working_timer:close()
-      state.working_timer = nil
-    end
-  end
-  schedule_render()
-  return state.execution_request_owner
-end
-
----@param state table
----@param approval_id string
----@return boolean
 local function remove_approval(state, approval_id)
   for index, approval in ipairs(state.approval or {}) do
     if approval.id == approval_id then
@@ -478,15 +437,16 @@ local function synchronize_state(callback, target_state)
     table.insert(synchronized_state.state_sync_callback, callback)
   end
   if synchronized_state.state_sync_pending then
-    synchronized_state.state_sync_again = true
     return
   end
-  synchronized_state.state_sync_pending = true
+  local observation = {}
+  synchronized_state.state_sync_pending = observation
   local invalidation = synchronized_state.state_invalidation or 0
   client.request({ session_id = synchronized_session, method = "session.state.get", params = {
     publication_cursor = synchronized_state.publication_cursor,
   } }, function(result, request_error, error_detail)
-    synchronized_state.state_sync_pending = false
+    if synchronized_state.state_sync_pending ~= observation then return end
+    synchronized_state.state_sync_pending = nil
     if client.host_get_generation() ~= synchronized_generation or not synchronized_state.session
       or synchronized_state.session.id ~= synchronized_session then return end
     if result and invalidation ~= (synchronized_state.state_invalidation or 0) then
@@ -505,13 +465,11 @@ local function synchronize_state(callback, target_state)
     end
     if result and result.runtime_epoch == synchronized_state.runtime_epoch
       and (result.timeline_revision or 0) < (synchronized_state.timeline_revision or 0) then
-      synchronized_state.state_sync_again = nil
       vim.schedule(function() synchronize_state(nil, synchronized_state) end)
       return
     end
     if result and result.runtime_epoch == synchronized_state.runtime_epoch
       and (result.snapshot_revision or 0) < (synchronized_state.snapshot_revision or 0) then
-      synchronized_state.state_sync_again = nil
       vim.schedule(function() synchronize_state(nil, synchronized_state) end)
       return
     end
@@ -524,25 +482,17 @@ local function synchronize_state(callback, target_state)
       diagnostic.set(synchronized_state, "sync_error", failure,
         { owner = synchronized_session, category = "snapshot", recovery = "retry",
           severity = (not request_error or error_detail and code ~= "not_admitted" and code ~= "outcome_unknown") and "error" or "info" })
-      synchronized_state.state_sync_again = nil
       if harness_state() == synchronized_state then M.render() end
-      local retry = (synchronized_state.state_sync_retry or 0) + 1
-      synchronized_state.state_sync_retry = retry
-      vim.defer_fn(function()
-        if harness_state() == synchronized_state and client.host_get_generation() == synchronized_generation then synchronize_state(nil, synchronized_state) end
-      end, math.min(8000, 1000 * 2 ^ math.min(retry - 1, 3)))
+      local callbacks = synchronized_state.state_sync_callback or {}
+      synchronized_state.state_sync_callback = nil
+      for _, completed in ipairs(callbacks) do completed(nil, failure) end
       return
     end
     diagnostic.set(synchronized_state, "sync_error", nil)
-    synchronized_state.state_sync_retry = nil
-    if synchronized_state.state_sync_again then
-      synchronized_state.state_sync_again = nil
-      synchronize_state(nil, synchronized_state)
-      return
-    end
     local state = synchronized_state
     snapshot.apply(state, result)
-    input_state.refresh(state)
+    if state.input and (state.input.runtime_epoch ~= state.runtime_epoch
+      or state.input.host_generation ~= client.host_get_generation()) then input_state.refresh(state) end
     if harness_state() ~= state then state.state_sync_callback = nil return end
     M.attach_transcript(state.transcript_buf)
     require("forge.views.harness.agent_picker").refresh()
@@ -558,17 +508,6 @@ local function synchronize_state(callback, target_state)
     if #state.approval > 0 then vim.schedule(M.present_approval) end
     M.render()
     if result.owner_publication then
-      local receipt = synchronized_state.publication_received
-      if receipt then
-        -- Retry from the last confirmed cursor if lease confirmation or its notification is lost.
-        vim.defer_fn(function()
-          if synchronized_state.publication_received == receipt
-            and harness_state() == synchronized_state
-            and client.host_get_generation() == synchronized_generation then
-            synchronize_state(nil, synchronized_state)
-          end
-        end, 1000)
-      end
       if result.owner_publication.more then return end
     end
     local callbacks = synchronized_state.state_sync_callback or {}
@@ -590,27 +529,30 @@ local function on_event(event, payload)
     end
     return
   end
-  if event ~= "provider_event" and event ~= "input_changed" and event ~= "task_operation" then
+  local changes_session = event ~= "provider_event" and event ~= "input_changed"
+    and event ~= "activity_changed" and event ~= "command_completed"
+  if event == "provider_event" then
+    changes_session = payload.kind == "runtime_resolved" or payload.kind == "context_usage"
+      or payload.kind == "approval_requested" or payload.kind == "approval_resolved"
+      or payload.kind == "approval_cancelled" or payload.kind == "agent_updated"
+  end
+  if changes_session then
     state.state_invalidation = (state.state_invalidation or 0) + 1
   end
-  if event == "task_operation" then task_control.receive(state, payload) return end
   if event == "input_changed" then input_state.receive(state, payload) return end
+  if event == "activity_changed" then
+    if activity.receive(state, payload.activity, payload.runtime_epoch) then schedule_render() end
+    return
+  end
   if event == "host_stopped" then
     diagnostic.set(state, "host_error", payload.message,
       { owner = tostring(client.host_get_generation()), category = "host", severity = payload.expected and "info" or "error",
         recovery = "reconnect", clear_when = "new host generation" })
     state.execution_notice = payload.message .. ". Reopen Harness to reconnect."
-    state.cancel_requested = false
-    state.state_sync_pending, state.state_sync_again, state.state_sync_callback = nil, nil, nil
-    state.configuring = false
-    state.configuring_config = nil
-    if state.configuration_completion then state.configuration_completion.complete(false) end
-    state.configuration_completion, state.task_config = nil, nil
+    state.state_sync_pending, state.state_sync_callback = nil, nil
     state.approval, state.active_wait, state.dismissed_approval_id = {}, nil, nil
     state.ready = false
-    state.execution_busy = false
     if state.presentation and state.presentation.terminals then state.presentation.terminals.close() end
-    set_busy(false)
     M.refresh_winbar()
     return
   end
@@ -646,21 +588,16 @@ local function on_event(event, payload)
     schedule_render()
   elseif event == "provider_event" then
     if require("forge.event_contract").route("provider", payload.kind) == "ignore" then return end
-    if payload.kind == "checks_configuration_error" then
+    if payload.kind == "cleanup_progress" then
+      cleanup_progress.receive(state, payload.data)
+      schedule_render()
+    elseif payload.kind == "checks_configuration_error" then
       notifications.error((payload.data or {}).error or "Fix the project check configuration", "Harness checks")
     elseif payload.kind == "turn_started" then
       recap.clear(state)
-    elseif payload.kind == "execution_state" then
-      local execution = payload.data or {}
-      if type(execution.session) ~= "table" or not state.session or execution.session.id ~= state.session.id then return end
-      state.session = execution.session
-      state.execution_busy = true
-      state.busy = true
-      M.refresh_winbar()
     elseif payload.kind == "prompt_submission" then
       schedule_render()
     elseif payload.kind == "approval_requested" then
-      if state.state_sync_pending then state.state_sync_again = true end
       local request = payload.data or payload
       state.approval = state.approval or {}
       if not vim.iter(state.approval):any(function(approval) return approval.id == request.id end) then
@@ -670,7 +607,6 @@ local function on_event(event, payload)
       render_status_hint(state)
       vim.schedule(M.present_approval)
     elseif payload.kind == "approval_resolved" or payload.kind == "approval_cancelled" then
-      if state.state_sync_pending then state.state_sync_again = true end
       local request = payload.data or payload
       remove_approval(state, request.id)
       reconcile_approval_presentation(state)
@@ -747,43 +683,20 @@ local function on_event(event, payload)
   elseif event == "goal_changed" or event == "goal_continue_requested" then
     synchronize_state()
   elseif event == "context_compacted" then
-    synchronize_state()
+    if snapshot.apply(state, payload) then M.refresh_winbar() schedule_render() end
   elseif event == "session_fork_ready" or event == "session_fork_failed" then
-    state.session = payload.session or state.session
+    if not snapshot.apply(state, payload.snapshot) then return end
     M.refresh_winbar()
     if event == "session_fork_failed" then
       local provider_fork_state = state.session and state.session.provider_fork_state or {}
       notifications.error(provider_fork_state.message or "Provider fork preparation failed", "Harness fork")
     end
-  elseif event == "session_changed" or event == "session_configured"
-  then
-    local next_session = payload.session or payload
-    if event == "session_changed" and state.session and next_session.id ~= state.session.id then
-      recap.clear(state)
-      state.queue = {}
-      state.queue_edit = nil
-      state.active_plan = nil
-      state.active_elicitation = nil
-      state.active_wait = nil
-      state.timeline = {}
-      state.artifact = {}
-      state.plan_question_open = false
-      question_presentation.reset(state)
-      prompt_history.reset_navigation()
+  elseif event == "session_configured" or event == "session_changed" then
+    if snapshot.apply(state, payload.snapshot) then
+      if state.input and state.input.runtime_epoch ~= state.runtime_epoch then input_state.refresh(state) end
+      M.refresh_winbar()
+      schedule_render()
     end
-    state.session = next_session
-    if payload.access_abbreviation then state.access_abbreviation = payload.access_abbreviation end
-    local configuration = state.configuration_completion
-    if configuration and state.task_operation and payload.operation_id == state.task_operation.id then
-      if state.task_config and type(state.task_config.lsp_tools) == "boolean" then state.lsp_tools = state.task_config.lsp_tools end
-      if state.task_config and type(state.task_config.subagent_tools) == "boolean" then
-        state.subagent_tools = state.task_config.subagent_tools
-      end
-      state.configuration_completion = nil
-      state.task_config = nil
-      configuration.complete(true)
-    end
-    M.refresh_winbar()
   elseif event == "agent_updated" then
     state.agent = vim.deepcopy(payload)
     require("forge.views.harness.agent_picker").refresh()
@@ -834,12 +747,7 @@ function M.present_approval(reopen)
           callback(false)
           return
         end
-        remove_approval(state, approval_id)
-        state.approval_open = false
-        state.presented_approval_id = nil
         callback(true)
-        M.refresh_winbar()
-        if #state.approval > 0 then vim.schedule(M.present_approval) end
       end)
     end,
     closed = function()
@@ -857,7 +765,7 @@ end
 function M.present_plan_question(force)
   local state = harness_state()
   local elicitation = state.active_elicitation and state.active_elicitation.elicitation
-  if state.question_clarification or (state.busy and not force) or state.plan_question_open or not elicitation then return end
+  if state.question_clarification or (activity.busy(state) and not force) or state.plan_question_open or not elicitation then return end
   local owner = state.active_elicitation.owner
   local owner_id = state.active_elicitation.exchange_id or state.active_elicitation.plan_id
   local session_id = state.session.id
@@ -930,22 +838,12 @@ function M.present_plan_question(force)
     continue = function()
       state.plan_question_open = false
       state.execution_notice = nil
-      local request_owner = set_busy(true)
       client.request({ session_id = session_id, method = "session.question.continue", params = { target = question_target } }, function(_, request_error, error_detail)
-        if request_error and error_detail and error_detail.code == "not_admitted" then
-          set_busy(false)
-          synchronize_state()
-          return
+        if harness_state() ~= state or not state.session or state.session.id ~= session_id then return end
+        if request_error and not (error_detail and error_detail.code == "turn_cancelled") then
+          notifications.error(request_error, "Planning continuation")
         end
-        if finish_execution(request_error, error_detail, request_owner) then return end
-        if request_error then
-          if not error_detail or error_detail.code ~= "not_admitted" then
-            notifications.error(request_error, "Planning continuation")
-          end
-          synchronize_state()
-          return
-        end
-        synchronize_state()
+        M.render()
       end)
     end,
     closed = function()
@@ -972,34 +870,6 @@ function M.reopen_question()
   M.present_plan_question(true)
 end
 
----@param request_error string?
----@param error_detail {code: string}?
----@param request_owner table?
----@return boolean
-finish_execution = function(request_error, error_detail, request_owner)
-  local state = harness_state()
-  if request_owner and state.execution_request_owner ~= request_owner then return true end
-  if state.host_error then set_busy(false) return true end
-  if state.task_operation then return true end
-  if request_error and error_detail and error_detail.code == "turn_cancelled" then
-    diagnostic.set(state, "execution_notice", "Paused", { owner = state.session.id, category = "cancelled", severity = "info", recovery = "resume" })
-    set_busy(false)
-    synchronize_state()
-    return true
-  end
-  if request_error and not (error_detail and error_detail.code == "turn_retracted") then
-    local code = error_detail and error_detail.code
-    local message = code == "not_admitted" and ("Not submitted · " .. request_error)
-      or code == "outcome_unknown" and ("Checking submission · " .. request_error)
-      or ("Stopped · " .. request_error)
-    diagnostic.set(state, "execution_notice", message, { owner = state.session.id, category = code or "execution",
-      severity = code == "not_admitted" and "info" or code == "outcome_unknown" and "warning" or "error",
-      recovery = code == "not_admitted" and "resubmit" or "inspect" })
-  end
-  set_busy(false)
-  return false
-end
-
 ---@param text string
 begin_request = function(text, from_composer, attachments, captured_prompt, queue_entry)
   local state = harness_state()
@@ -1013,7 +883,6 @@ begin_request = function(text, from_composer, attachments, captured_prompt, queu
   end
   recap.clear(state)
   if from_composer then dismiss_composer_completion(state.composer_buf) end
-  state.cancel_requested = false
   prompt_submission.start(state, {
     text = text, attachments = attachments, context = context,
     source = captured_prompt and captured_prompt.source,
@@ -1264,7 +1133,7 @@ local function confirm_restore_preview(preview, interaction)
       end)
       return
     end
-    if state.restore_applying or state.busy then return end
+    if state.restore_applying or activity.busy(state) then return end
     local operation = {}
     state.restore_applying = operation
     client.request({ session_id = session_id, method = "session.exchange.rollback.apply", params = { preview_id = preview.preview_id } }, function(_, err)
@@ -1292,7 +1161,7 @@ end
 local function confirm_rollback(interaction, latest_exchange_id)
   local state = harness_state()
   local session_id, generation = state.session.id, client.host_get_generation()
-  if state.busy or state.restore_applying then return end
+  if activity.busy(state) or state.restore_applying then return end
   local choices = {
     { label = "Cancel", value = "cancel" },
     { label = "Conversation only", detail = "Keep all current files", value = "conversation" },
@@ -1303,7 +1172,7 @@ local function confirm_rollback(interaction, latest_exchange_id)
   open_choice_picker(state, "Rollback interaction", "Choose what to roll back", choices, function(choice)
     if harness_state() ~= state or not state.session or state.session.id ~= session_id
       or client.host_get_generation() ~= generation then return end
-    if not choice or choice == "cancel" or state.busy or state.restore_applying then return end
+    if not choice or choice == "cancel" or activity.busy(state) or state.restore_applying then return end
     if choice == "workspace" then
       client.request({ session_id = session_id, method = "session.exchange.rollback.prepare", params = { exchange_id = interaction.id } }, function(preview, err)
         if harness_state() ~= state or not state.session or state.session.id ~= session_id
@@ -1331,7 +1200,7 @@ end
 ---Open settled interaction history before choosing a rollback scope.
 local function open_exchange_undo_picker(recovery)
   local state = harness_state()
-  if state.busy then
+  if activity.busy(state) then
     notifications.warn("Cancel or finish the active turn before undoing an exchange", "Harness undo")
     return
   end
@@ -1389,7 +1258,7 @@ end
 ---Open interaction history directly unless an unfinished file restore needs recovery.
 function M.open_undo_picker()
   local state = harness_state()
-  if state.busy or state.restore_applying then
+  if activity.busy(state) or state.restore_applying then
     notifications.warn("Cancel or finish the active turn before restoring files", "Harness undo")
     return
   end
@@ -1458,7 +1327,7 @@ end
 function M.agent_action(action, run_id, message)
   local state = harness_state()
   local params = { target = run_id, message = message }
-  if action == "tools" then M.configure({ subagent_tools = state.subagent_tools ~= true }, true) return end
+  if action == "tools" then M.configure({ subagent_tools = state.subagent_tools ~= true }) return end
   if action == "message" or action == "followup" then
     if not message or message:match("^%s*$") then return end
   end
@@ -1598,7 +1467,6 @@ function M.submit()
   local text = composer_text(state.composer_buf)
   if state.queue_edit then finish_queue_edit(state, text) return end
   if text == "/task refresh" then
-    state.state_sync_retry = nil
     synchronize_state()
     return
   end
@@ -1764,7 +1632,7 @@ function M.submit()
   local agent_tools_action = text:match("^/agents%s+(%S+)%s*$")
   if agent_tools_action == "on" or agent_tools_action == "off" then
     set_composer_text(state.composer_buf, "")
-    M.configure({ subagent_tools = agent_tools_action == "on" }, true)
+    M.configure({ subagent_tools = agent_tools_action == "on" })
     return
   end
   local edit_profile = text:match("^/agents%s+edit%s+(%S+)%s*$")
@@ -1858,7 +1726,7 @@ function M.submit()
       notifications.warn("The current provider does not support reasoning effort selection", "ForgeHarness")
       return
     end
-    M.configure({ model = model, effort = model_effort }, true)
+    M.configure({ model = model, effort = model_effort })
     return
   end
   local effort = text:match("^/effort%s+(%S+)$")
@@ -1868,7 +1736,7 @@ function M.submit()
       notifications.warn("The current provider does not support reasoning effort selection", "ForgeHarness")
       return
     end
-    M.configure({ effort = effort }, true)
+    M.configure({ effort = effort })
     return
   end
   if text == "/fast" or text == "/ultrafast" then
@@ -1882,7 +1750,7 @@ function M.submit()
     M.refresh_winbar()
     return
   end
-  if state.busy and not state.checks_running and queue_only_commands[text:match("^%s*(%S+)")] then
+  if activity.busy(state) and not state.checks_running and queue_only_commands[text:match("^%s*(%S+)")] then
     M.queue_submit()
     return
   end
@@ -2004,7 +1872,7 @@ function M.change_effort(direction)
         local index = 1
         for candidate_index, candidate in ipairs(choice) do if candidate == current then index = candidate_index end end
         index = math.max(1, math.min(#choice, index + direction))
-        M.configure({ effort = choice[index] }, true)
+        M.configure({ effort = choice[index] })
         return
       end
     end
@@ -2050,7 +1918,7 @@ function M.select_effort()
       return { label = effort, detail = detail_list[effort] or "Provider-advertised reasoning choice", value = effort }
     end, choice)
     open_choice_picker(state, "Select Reasoning Effort", nil, options, function(effort)
-      M.configure({ effort = effort }, true)
+      M.configure({ effort = effort })
     end, "The selected model advertises no reasoning choices.")
   end)
 end
@@ -2271,46 +2139,17 @@ end
 ---@param method? string
 function M.task_transition(action, submitted_text, completed, method)
   local state = harness_state()
-  local policy_change = action.action == "plan_accept"
   if submitted_text then action.attachments = attachment.capture(state.composer_buf).attachments end
   if state.host_error then notifications.error(state.execution_notice or state.host_error, "Harness task") return end
   if not state.session then notifications.warn("Harness is still initializing", "Harness task") return end
-  if action.action ~= "configure" and not policy_change then
-    state.task_config = nil
-    if state.configuration_completion then
-      state.configuration_completion.complete(false)
-      state.configuration_completion = nil
-    end
-  end
-  if not policy_change then set_busy(true) end
-  task_control.transition(state, action, M.render, function(failure, background)
-    if background then
-      if completed then completed(not failure) end
-      return
-    end
-    if harness_state() ~= state then
-      if not policy_change then state.busy = false end
-      if state.presentation and state.presentation.transcript then
-        state.presentation.status_view:resize()
-      end
-      synchronize_state(nil, state)
-      return
-    end
-    if not policy_change then
-      set_busy(false)
-      state.cancel_requested = false
-    end
+  task_control.transition(state, action, M.render, function(failure)
     if completed then completed(not failure) end
-    synchronize_state(function(_, sync_failure)
-      if sync_failure then return end
-      M.render()
-    end)
+    if harness_state() == state then M.render() end
   end, function()
     if submitted_text and harness_state() == state and composer_text(state.composer_buf) == submitted_text then
       set_composer_text(state.composer_buf, "")
     end
   end, method)
-  M.refresh_winbar()
 end
 
 function M.toggle_write()
@@ -2318,106 +2157,25 @@ function M.toggle_write()
 end
 
 ---@param next_config table
----@param validate_selection? boolean
 ---@param completed? fun(applied: boolean)
-configure_now = function(next_config, validate_selection, completed)
+configure_now = function(next_config, completed)
   local state = harness_state()
-  local deferred
-  if state.configuration_completion then
-    deferred = state.configuration_completion.deferred
-  elseif state.task_operation and state.task_operation.action == "configure" then
-    deferred = state.task_operation.configuration_deferred == true
-  else
-    deferred = state.busy == true
-  end
-  local request_config = vim.tbl_extend("force", state.task_config or {}, next_config, { validate = validate_selection == true })
-  state.task_config = request_config
-  state.configuring = true
-  state.configuring_config = request_config
-  state.configuration_error = nil
-  local finished = false
-  local configuration = { deferred = deferred, complete = function(applied)
-    if finished then return end
-    finished = true
-    if state.configuring_config == request_config then
-      state.configuring = false
-      state.configuring_config = nil
+  local session_id, generation = state.session.id, client.host_get_generation()
+  client.request({ session_id = session_id, method = "session.configure", params = vim.deepcopy(next_config) }, function(_, failure)
+    if not state.session or state.session.id ~= session_id or client.host_get_generation() ~= generation then
+      if completed then completed(false) end
+      return
     end
-    if applied then
-      if next_config.model and not state.session.resolved_model then M.resolve_runtime_model() end
-    end
-    M.refresh_winbar()
-    if completed then completed(applied) end
-  end }
-  state.configuration_completion = configuration
-  M.task_transition({ action = "configure", config = vim.tbl_extend("force", {}, next_config, { validate = validate_selection == true }) }, nil, function(applied)
-    if state.task_config == request_config then state.task_config = nil end
-    if state.configuration_completion == configuration then state.configuration_completion = nil end
-    configuration.complete(applied)
+    if failure then report_configuration_error(failure) end
+    if completed then completed(not failure) end
+    if harness_state() == state then M.render() end
   end)
 end
 
 ---@param next_config table
----@param validate_selection? boolean
 ---@param completed? fun(applied: boolean)
-function M.configure(next_config, validate_selection, completed)
-  local state = harness_state()
-  local only_field = next(next_config)
-  if (only_field == "check_timing" or only_field == "automatic_checks") and next(next_config, only_field) == nil then
-    local session_id, epoch = state.session.id, state.runtime_epoch
-    state.check_settings_request = (state.check_settings_request or 0) + 1
-    local revision = state.check_settings_request
-    client.request({ session_id = session_id, method = "session.configure", params = next_config }, function(result, failure)
-      if not state.session or state.session.id ~= session_id or state.runtime_epoch ~= epoch then return end
-      if state.check_settings_request ~= revision then
-        if completed then completed(false) end
-        return
-      end
-      if failure then
-        report_configuration_error(failure)
-        if completed then completed(false) end
-        return
-      end
-      state.check_timing = result.check_timing
-      state.automatic_checks = result.automatic_checks == true
-      if result.checks_deferred ~= nil then state.checks_deferred = result.checks_deferred end
-      M.render()
-      if completed then completed(true) end
-    end)
-    return
-  end
-  if only_field == "status_thoughts" and next(next_config, only_field) == nil then
-    local session_id = state.session.id
-    local generation = client.host_get_generation()
-    state.status_thoughts_request = (state.status_thoughts_request or 0) + 1
-    local request_revision = state.status_thoughts_request
-    client.request({ session_id = session_id, method = "session.configure", params = next_config }, function(result, failure)
-      if harness_state() ~= state or not state.session or state.session.id ~= session_id
-        or client.host_get_generation() ~= generation then return end
-      if state.status_thoughts_request ~= request_revision then
-        if completed then completed(false) end
-        return
-      end
-      if failure then
-        report_configuration_error(failure)
-        if completed then completed(false) end
-        return
-      end
-      state.status_thoughts = result.status_thoughts == true
-      M.render()
-      if completed then completed(true) end
-    end)
-    return
-  end
-  local timeout_only = next(next_config) ~= nil
-  for field in pairs(next_config) do
-    if field ~= "approval_timeout" and field ~= "tool_timeout" then timeout_only = false end
-  end
-  if timeout_only then
-    require("forge.views.harness.timeout_configuration").configure(state, next_config, completed, report_configuration_error)
-    return
-  end
-  configure_now(next_config, validate_selection, completed)
+function M.configure(next_config, completed)
+  configure_now(next_config, completed)
 end
 
 local function close()
@@ -2450,7 +2208,8 @@ local function close()
 end
 
 ---@param result table
-function M.activate_snapshot(result)
+---@param options? {present_questions?: boolean}
+function M.activate_snapshot(result, options)
   local state = harness_state()
   local previous_session = state.session and state.session.id
   if not snapshot.apply(state, result) then
@@ -2460,17 +2219,16 @@ function M.activate_snapshot(result)
   end
   if state.input and state.input.session_id == state.session.id then input_state.refresh(state) end
   state.initial_snapshot_pending = nil
-  require("forge.views.harness.health").watch(state, function()
-    if harness_state() == state then M.render() end
-  end)
   if previous_session ~= state.session.id then state.queue, state.queue_edit = {}, nil end
   M.render()
   M.resolve_runtime_model()
-  if state.active_elicitation and state.active_elicitation.elicitation then
-    state.presented_question_key = nil
-    vim.schedule(M.present_plan_question)
+  if not options or options.present_questions ~= false then
+    if state.active_elicitation and state.active_elicitation.elicitation then
+      state.presented_question_key = nil
+      vim.schedule(M.present_plan_question)
+    end
+    if #state.approval > 0 then vim.schedule(M.present_approval) end
   end
-  if #state.approval > 0 then vim.schedule(M.present_approval) end
 end
 
 ---@return ForgeViewCommandSet
@@ -2495,7 +2253,7 @@ function M.command_set()
       return
     end
     for _, entry in ipairs(state.queue or {}) do
-      if entry.delivery == "failed" or entry.delivery == "unknown" then
+      if entry.local_only or entry.delivery == "failed" or entry.delivery == "unknown" then
         input_state.retry(state, entry)
         return
       end
@@ -2581,9 +2339,6 @@ function M.attach()
       if event.event == "TextChanged" or event.event == "TextChangedI" then render_status_hint(state) end
     end,
   })
-  require("forge.views.harness.health").watch(state, function()
-    if harness_state() == state then M.render() end
-  end)
   if client.host_is_accepting() then state.host_error = nil end
   state.command_set = M.command_set()
   M.attach_transcript(state.transcript_buf)
@@ -2603,7 +2358,6 @@ function M.attach()
     if not ok then
       diagnostic.set(state, "sync_error", "Presentation failed: " .. tostring(failure),
         { owner = state.session and state.session.id or "presentation", category = "internal", severity = "error", recovery = "reconnect" })
-      state.busy = false
       notifications.error(state.sync_error, "ForgeHarness")
       pcall(M.refresh_winbar)
     end

@@ -50,36 +50,26 @@ function Checks.open(state, host)
   local busy = false
   local closed = false
   local load_error
-  local timer
+  local unsubscribe
+  local refresh_pending = false
   local build_spec
   local refresh
-  local poll
-
-  local function stop_poll()
-    if timer then timer:stop() timer:close() timer = nil end
-  end
-
-  poll = function()
-    if closed or timer then return end
-    timer = vim.defer_fn(function()
-      timer = nil
-      if closed or not picker.is_open(owner) then return end
-      if busy then poll() else refresh() end
-    end, 1000)
-  end
 
   local function request(method, params, callback, on_failure)
-    if busy then return end
+    if closed then return end
+    if busy then refresh_pending = true return end
     busy = true
     client.request({ session_id = session_id, method = method, params = params }, function(result, failure)
       busy = false
+      if closed or not state.session or state.session.id ~= session_id then return end
       if failure then
         notifications.error(failure, "Harness checks")
-        if not closed and on_failure then on_failure(failure) end
-        return
+        if on_failure then on_failure(failure) end
+      elseif callback then callback(result) else refresh() end
+      if refresh_pending and not closed then
+        refresh_pending = false
+        refresh()
       end
-      if closed or not state.session or state.session.id ~= session_id then return end
-      if callback then callback(result) else refresh() end
     end)
   end
 
@@ -303,7 +293,7 @@ function Checks.open(state, host)
           vim.schedule(function() if picker.is_open(owner) then picker.update(build_spec()) end end)
         end
       end,
-      on_cancel = function() closed = true stop_poll() end,
+      on_dispose = function() closed = true if unsubscribe then unsubscribe() end end,
       on_confirm = function(result)
         local option = result.option
         if option.id == "cancel" then request("session.turn.cancel", {}) return false end
@@ -320,12 +310,19 @@ function Checks.open(state, host)
     request("session.check.list", {}, function(result)
       adopt(result)
       if picker.is_open(owner) then picker.update(build_spec()) else picker.open(build_spec()) end
-      if type(catalog.active_run) == "string" then poll() end
     end, function(failure)
       load_error = failure
       if picker.is_open(owner) then picker.update(build_spec()) else picker.open(build_spec()) end
     end)
   end
+  unsubscribe = client.session_events_subscribe(function(event, payload, event_session_id)
+    if closed or event_session_id ~= session_id then return end
+    if event == "checks_changed" or event == "state_invalidated" or event == "session_configured"
+      or event == "plan_checks_updated"
+      or event == "provider_event" and payload.kind == "checks_configuration_error" then
+      refresh()
+    end
+  end)
   refresh()
 end
 

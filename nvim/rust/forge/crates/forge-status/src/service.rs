@@ -836,8 +836,8 @@ impl StatusService {
 
     pub async fn act(
         &self,
-        input: StatusInput,
-        selection: Option<StatusSelection>,
+        mut input: StatusInput,
+        mut selection: Option<StatusSelection>,
     ) -> Result<StatusAction> {
         let private_unignore = if input.action == "unstage" {
             let owner = self.get(&input.document)?;
@@ -863,6 +863,18 @@ impl StatusService {
             document.comparison.is_none(),
             "comparison documents are read-only"
         );
+        if (input.action == "ignore" || private_unignore) && input.revision != document.revision {
+            let captured = document
+                .history
+                .iter()
+                .rev()
+                .find(|version| version.revision() == input.revision)
+                .context("selected status revision expired")?;
+            let rebased = captured.rebase_file_selection(&document, &input, selection.as_ref())?;
+            input.location = rebased.target[0].clone();
+            input.revision = document.revision;
+            selection = Some(rebased);
+        }
         let target = validate_input(&mut document, &input)?;
         ensure!(
             matches!(

@@ -109,7 +109,7 @@ mod tests {
             "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"permission-fifo",
             "provider":{"kind":"mock","command":[]},
         }))?;
-        let controller = SessionController::new(HarnessBroker::initialize(initialize)?)?;
+        let controller = SessionController::new(HarnessBroker::initialize(initialize)?).await?;
         let original = controller.observer.snapshot()?.session.access.write_access;
         let gate = controller
             .coordinator

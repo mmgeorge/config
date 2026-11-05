@@ -141,15 +141,12 @@ impl HostProcess {
         self.input.take();
         tokio::time::timeout(Duration::from_secs(5), async {
             let mut messages = Vec::new();
-            let mut received_bytes = 0;
             loop {
                 let mut frame = Vec::new();
                 if self.output.read_until(b'\n', &mut frame).await.unwrap() == 0 {
                     break;
                 }
-                received_bytes += frame.len();
                 assert!(frame.len() <= forge_protocol::MAX_FRAME_BYTES);
-                assert!(received_bytes <= forge_protocol::MAX_QUEUED_BYTES);
                 assert!(messages.len() < forge_protocol::MAX_PENDING_FRAMES * 2);
                 messages.push(serde_json::from_slice(&frame).unwrap());
             }
@@ -195,7 +192,7 @@ async fn exhausted_receive_credit_cannot_hold_an_eof_connection_open() {
             .await;
         assert_eq!(host.read(false).await["id"].as_u64(), Some(id as u64));
     }
-    host.send(json!({"id":1000,"method":"session.state.get","params":{}}))
+    host.send(json!({"id":forge_protocol::MAX_PENDING_FRAMES + 2,"method":"session.state.get","params":{}}))
         .await;
     let (messages, status, error) = host.finish().await;
     assert!(!status.success());

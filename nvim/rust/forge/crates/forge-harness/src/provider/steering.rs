@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
-const MAX_STEERING_REQUESTS: usize = 32;
+const MAX_STEERING_REQUESTS: usize = 256;
 
 use super::{ProviderError, ProviderEvent, ProviderEventSink};
 
@@ -243,12 +243,17 @@ impl SteeringLane {
         input: Option<SteeringInput>,
     ) -> Result<()> {
         let admission = match operation {
-            ActiveTurnOperation::Steer => sender.ordinary,
+            ActiveTurnOperation::Steer => sender
+                .ordinary
+                .acquire_owned()
+                .await
+                .context("active turn control admission is closed")?,
             #[cfg(test)]
-            ActiveTurnOperation::Interrupt | ActiveTurnOperation::Cancel => sender.interrupt,
-        }
-        .try_acquire_owned()
-        .context("active turn control admission is full")?;
+            ActiveTurnOperation::Interrupt | ActiveTurnOperation::Cancel => sender
+                .interrupt
+                .try_acquire_owned()
+                .context("active turn control admission is full")?,
+        };
         let (completion, response) = oneshot::channel();
         let publish_input = input
             .as_ref()
@@ -293,7 +298,11 @@ impl ActiveSteering {
         self.receiver.close();
         let mut state = self.lane.state.lock().expect("steering lane lock poisoned");
         if state.generation == self.generation {
-            state.sender = None;
+            if let Some(sender) = state.sender.take() {
+                sender.ordinary.close();
+                #[cfg(test)]
+                sender.interrupt.close();
+            }
         }
     }
     /// Drains input already admitted before a provider-turn boundary.
@@ -320,7 +329,11 @@ impl Drop for ActiveSteering {
     fn drop(&mut self) {
         let mut state = self.lane.state.lock().expect("steering lane lock poisoned");
         if state.generation == self.generation {
-            state.sender = None;
+            if let Some(sender) = state.sender.take() {
+                sender.ordinary.close();
+                #[cfg(test)]
+                sender.interrupt.close();
+            }
         }
     }
 }
@@ -714,15 +727,10 @@ mod test {
             assert!(futures_util::poll!(request.as_mut()).is_pending());
             pending.push(request);
         }
-        assert!(
-            lane.steer("overflow".into())
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("admission is full")
-        );
+        let mut overflow = Box::pin(lane.steer("overflow".into()));
+        assert!(futures_util::poll!(overflow.as_mut()).is_pending());
         let first = active.receive().await.unwrap();
-        assert!(lane.steer("still full".into()).await.is_err());
+        assert!(futures_util::poll!(overflow.as_mut()).is_pending());
         let mut interrupt = Box::pin(lane.submit(super::ActiveTurnOperation::Interrupt, None));
         assert!(futures_util::poll!(interrupt.as_mut()).is_pending());
         assert!(
@@ -740,6 +748,11 @@ mod test {
         command.complete(Ok(())).await;
         interrupt.await.unwrap();
         first.complete(Ok(())).await;
+        assert!(futures_util::poll!(overflow.as_mut()).is_pending());
+        let command = active.receive().await.unwrap();
+        assert_eq!(command.text, "overflow");
+        command.complete(Ok(())).await;
+        overflow.await.unwrap();
         for request in pending {
             request.await.unwrap();
         }
@@ -748,6 +761,28 @@ mod test {
         drop(active);
         assert!(request.await.is_err());
         assert!(lane.activate(None).is_ok());
+    }
+
+    /// Retire capacity waiters with their captured invocation instead of admitting a successor.
+    #[tokio::test]
+    async fn saturated_steering_waiter_cannot_enter_replacement_lane() {
+        let lane = SteeringLane::default();
+        let active = lane.activate(None).unwrap();
+        let mut pending = Vec::new();
+        for sequence in 0..super::MAX_STEERING_REQUESTS {
+            let mut request = Box::pin(lane.steer(sequence.to_string().into()));
+            assert!(futures_util::poll!(request.as_mut()).is_pending());
+            pending.push(request);
+        }
+        let mut waiting = Box::pin(lane.steer("waiting".into()));
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        drop(active);
+        let mut replacement = lane.activate(None).unwrap();
+        assert!(waiting.await.is_err());
+        for request in pending {
+            assert!(request.await.is_err());
+        }
+        assert!(replacement.try_receive().is_none());
     }
 
     #[tokio::test]

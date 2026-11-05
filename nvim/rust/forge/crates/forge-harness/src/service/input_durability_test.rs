@@ -4,7 +4,7 @@ use super::*;
 #[tokio::test]
 async fn question_input_owner_admits_headlessly_without_waiting_for_legacy_locks() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let execution = controller.coordinator.execution.acquire().await?;
     let control = controller.coordinator.control.acquire().await?;
     let broker = controller.broker.lock().await;
@@ -75,7 +75,7 @@ async fn question_input_owner_admits_headlessly_without_waiting_for_legacy_locks
 async fn question_input_acknowledgment_retry_reuses_immutable_receipt_and_publication() -> Result<()>
 {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let questions = controller.questions.ask(
         "retry-question",
         "question-exchange",
@@ -156,7 +156,7 @@ async fn question_input_acknowledgment_retry_reuses_immutable_receipt_and_public
 #[tokio::test]
 async fn question_input_owner_does_not_revive_a_cancelled_answer() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let questions = controller.questions.ask(
         "cancelled-question",
         "question-exchange",
@@ -201,7 +201,7 @@ async fn question_input_owner_does_not_revive_a_cancelled_answer() -> Result<()>
 #[tokio::test]
 async fn task_input_producer_reuses_original_entry_without_dispatch() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let mut task = crate::task::Task::goal("Produce once".into(), Default::default(), 1);
     task.request_entry("Original task instruction".into(), 1)?;
     let input = task.entry.as_ref().unwrap().id.clone();
@@ -222,8 +222,8 @@ async fn task_input_producer_reuses_original_entry_without_dispatch() -> Result<
     let queued = &snapshot.messages[0];
     assert_eq!(queued.id, input.as_str());
     assert_eq!(queued.text, "Original task instruction");
-    assert_eq!(queued.delivery, crate::input::InputDelivery::Queued);
-    assert!(queued.submission_id.is_none());
+    assert_eq!(queued.delivery(), crate::input::InputDelivery::Queued);
+    assert!(queued.submission_id().is_none());
     assert_eq!(
         controller
             .task_controller
@@ -251,7 +251,7 @@ async fn task_creation_without_transport_retains_publications_and_confirms_dispa
     for kind in [crate::task::TaskKind::Goal, crate::task::TaskKind::Plan] {
         let root = tempfile::tempdir()?;
         crate::checks::configure_fixture(root.path());
-        let controller = receipt_test_controller(root.path())?;
+        let controller = receipt_test_controller(root.path()).await?;
         let session = controller.observer.session_id().to_owned();
         let provider = controller.provider_handle();
         let script = provider.mock_response_control().unwrap();
@@ -331,7 +331,7 @@ async fn plan_source_rejection_precedes_collection_and_task_mutation() -> Result
         PlanRevisionSelection, PlanSelection, TaskCommand, TaskCommandFailure,
     };
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let mut store = SqliteStore::open(&controller.data_root)?;
     let task = controller
         .task_controller
@@ -467,7 +467,7 @@ async fn waiting_plan_attachment_completes_without_dispatch_and_preserves_decisi
         PlanSelection, TaskCommand, TaskCommandOutcome,
     };
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let mut store = SqliteStore::open(&controller.data_root)?;
     controller.task_controller.change(
         &mut store,
@@ -600,7 +600,7 @@ async fn task_policy_commits_with_control_and_execution_held_without_replaying_l
         TaskCommand, TaskCommandOutcome, TaskSelection,
     };
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let plan: crate::plan::PlanRecord = serde_json::from_value(json!({
         "id":"owned-policy-plan","session_id":controller.observer.session_id(),"request":"Plan a change",
         "state":"configuring_checks","working_path":"working.json","model_revision":0,"user_revision":0,"created_at_ms":1,"updated_at_ms":1,
@@ -682,7 +682,7 @@ async fn task_control_rejects_replaced_task_before_suspending_or_collecting_work
         TaskSelection,
     };
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let mut store = SqliteStore::open(&controller.data_root)?;
     let original = controller
         .task_controller
@@ -742,7 +742,7 @@ async fn task_controls_replay_original_target_after_clear_without_nested_admissi
         TaskCommandOutcome, TaskSelection,
     };
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let mut store = SqliteStore::open(&controller.data_root)?;
     let task = controller
         .task_controller
@@ -818,7 +818,7 @@ async fn task_controls_replay_original_target_after_clear_without_nested_admissi
 #[tokio::test]
 async fn input_readiness_owns_steering_burst_without_waiting_for_acknowledgments() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     controller.coordinator.submissions.apply(serde_json::from_value(json!({
         "id":"submit-draft","action":{"kind":"submit","message":{"id":"draft","text":"Wait for a new turn","intent":"queue"}},
     }))?)?;
@@ -879,7 +879,7 @@ async fn input_readiness_owns_steering_burst_without_waiting_for_acknowledgments
             if queue.messages.len() == 1 {
                 assert_eq!(queue.messages[0].id, "draft");
                 assert_eq!(
-                    queue.messages[0].delivery,
+                    queue.messages[0].delivery(),
                     crate::input::InputDelivery::Queued
                 );
                 return Ok::<(), anyhow::Error>(());
@@ -900,7 +900,7 @@ async fn input_readiness_owns_steering_burst_without_waiting_for_acknowledgments
 #[tokio::test]
 async fn input_readiness_does_not_steer_through_closed_execution_admission() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     queued_offer_input(&controller, "fenced", "Preserve this input", None)?;
     let mut active = controller.parent_input.activate(None)?;
     controller.coordinator.execution.close();
@@ -911,7 +911,7 @@ async fn input_readiness_does_not_steer_through_closed_execution_admission() -> 
     ));
     assert!(futures_util::poll!(std::pin::pin!(active.receive())).is_pending());
     assert_eq!(
-        controller.coordinator.submissions.snapshot()?.messages[0].delivery,
+        controller.coordinator.submissions.snapshot()?.messages[0].delivery(),
         crate::input::InputDelivery::Queued
     );
     assert_eq!(controller.coordinator.control.available_permits(), 1);
@@ -930,7 +930,7 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
     }
     for change in [ControlChange::Unchanged, ControlChange::Cancellation] {
         let root = tempfile::tempdir()?;
-        let controller = receipt_test_controller(root.path())?;
+        let controller = receipt_test_controller(root.path()).await?;
         let input_id = "owned-steering";
         let input = queued_offer_input(&controller, input_id, "Keep the captured target", None)?;
         let execution = controller.coordinator.execution.acquire().await?;
@@ -989,7 +989,7 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
                     .iter()
                     .any(|message| {
                         message.id == input_id
-                            && message.delivery == crate::input::InputDelivery::Accepted
+                            && message.delivery() == crate::input::InputDelivery::Accepted
                     })
                 {
                     return Ok::<(), anyhow::Error>(());
@@ -1002,7 +1002,7 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
         // The original receipt remains observable after dispatch authority changes.
         match change {
             ControlChange::Unchanged => {}
-            ControlChange::Cancellation => controller.cancellation.request_native_cancel(false),
+            ControlChange::Cancellation => controller.cancellation.request_native_cancel(),
         }
         command.complete(Ok(())).await;
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1013,7 +1013,7 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
                     snapshot
                         .messages
                         .iter()
-                        .all(|message| message.delivery != crate::input::InputDelivery::Failed),
+                        .all(|message| message.delivery() != crate::input::InputDelivery::Failed),
                     "accepted receipt completion failed its input"
                 );
                 if snapshot.messages.is_empty() {
@@ -1024,7 +1024,7 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
         })
         .await
         .with_context(|| format!("{change:?}: settle original accepted receipt"))??;
-        controller.cancellation.arm(false);
+        controller.cancellation.arm();
 
         // Reuse the same captured lane after receipt settlement, rather than recovering a fenced owner.
         let input = queued_offer_input(
@@ -1080,7 +1080,7 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
                     snapshot
                         .messages
                         .iter()
-                        .all(|message| message.delivery != crate::input::InputDelivery::Failed)
+                        .all(|message| message.delivery() != crate::input::InputDelivery::Failed)
                 );
                 if snapshot.messages.is_empty() {
                     return Ok::<(), anyhow::Error>(());
@@ -1126,7 +1126,7 @@ async fn steering_owner_retains_dropped_offer_and_settles_receipt_after_handoff(
 #[tokio::test]
 async fn steering_owner_rejects_stale_offer_without_claiming_input() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let mut input = queued_offer_input(
         &controller,
         "stale-steering",
@@ -1160,7 +1160,7 @@ async fn steering_owner_rejects_stale_offer_without_claiming_input() -> Result<(
     assert_eq!(ordering.available_permits(), 1);
     assert_eq!(controller.coordinator.control.available_permits(), 1);
     assert_eq!(
-        controller.coordinator.submissions.snapshot()?.messages[0].delivery,
+        controller.coordinator.submissions.snapshot()?.messages[0].delivery(),
         crate::input::InputDelivery::Queued
     );
     drop(active);
@@ -1172,7 +1172,7 @@ async fn steering_owner_rejects_stale_offer_without_claiming_input() -> Result<(
 #[tokio::test]
 async fn legacy_steering_uses_durable_input_command_without_direct_dispatch() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let execution = controller.coordinator.execution.acquire().await?;
     let mut active = controller.parent_input.activate(None)?;
     let (sink, mut output) = forge_protocol::outbound::channel();
@@ -1206,7 +1206,7 @@ async fn legacy_steering_uses_durable_input_command_without_direct_dispatch() ->
     assert_eq!(stored.messages.len(), 1);
     assert_eq!(stored.messages[0].id, "legacy-input:steering-command");
     assert_eq!(
-        stored.messages[0].delivery,
+        stored.messages[0].delivery(),
         crate::input::InputDelivery::Queued
     );
     {
@@ -1245,7 +1245,7 @@ async fn legacy_steering_uses_durable_input_command_without_direct_dispatch() ->
 #[tokio::test]
 async fn receipt_owner_activates_task_before_exposing_acceptance() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let mut task = crate::task::Task::goal(
         "Receipt owner".into(),
         crate::session::continuation::ContinuationBudget::new(20, 2),
@@ -1354,7 +1354,7 @@ async fn receipt_owner_activates_task_before_exposing_acceptance() -> Result<()>
 #[tokio::test]
 async fn owner_retains_uncertain_receipts_and_does_not_lose_ready_siblings() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let (first, first_receipt) =
         registered_receipt(&controller, "first", crate::input::InputPurpose::User).await?;
     let (second, second_receipt) =
@@ -1381,7 +1381,7 @@ async fn owner_retains_uncertain_receipts_and_does_not_lose_ready_siblings() -> 
             .snapshot()?
             .messages
             .iter()
-            .all(|input| input.delivery == crate::input::InputDelivery::Unknown)
+            .all(|input| input.delivery() == crate::input::InputDelivery::Unknown)
     );
     first_receipt.accepted(None).context("first accepted")?;
     second_receipt.accepted(None).context("second accepted")?;
@@ -1412,7 +1412,7 @@ async fn owner_retains_uncertain_receipts_and_does_not_lose_ready_siblings() -> 
 #[tokio::test]
 async fn owner_recovers_stored_acceptance_without_dispatching_input() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let session = controller.observer.session_id().to_owned();
     let (_, submission) =
         registered_receipt(&controller, "recover", crate::input::InputPurpose::User).await?;
@@ -1426,7 +1426,8 @@ async fn owner_recovers_stored_acceptance_without_dispatching_input() -> Result<
             "workspace":root.path(),"data_root":root.path().join("data"),
             "session_id":session,"client_id":"receipt-recovery",
             "provider":{"kind":"mock","command":[]},
-        }))?)?)?;
+        }))?)?)
+        .await?;
     controller
         .exchange_owner
         .command_status(crate::exchange::command::CommandId::new(
@@ -1449,7 +1450,7 @@ async fn owner_recovers_stored_acceptance_without_dispatching_input() -> Result<
 #[tokio::test]
 async fn input_offer_after_fifo_cancel_preserves_suspended_queue() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let input = queued_offer_input(&controller, "interrupted", "Queued input", None)?;
     controller
         .exchange_owner
@@ -1481,7 +1482,7 @@ async fn input_offer_after_fifo_cancel_preserves_suspended_queue() -> Result<()>
     let input = controller.coordinator.submissions.snapshot()?;
     assert!(input.suspended);
     assert_eq!(
-        input.messages[0].delivery,
+        input.messages[0].delivery(),
         crate::input::InputDelivery::Queued
     );
     assert_eq!(controller.coordinator.execution.available_permits(), 1);
@@ -1493,7 +1494,7 @@ async fn input_offer_after_fifo_cancel_preserves_suspended_queue() -> Result<()>
 #[tokio::test]
 async fn input_offer_rejects_stale_revision_without_claiming() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let mut input = queued_offer_input(&controller, "stale", "Queued input", None)?;
     input.revision += 1;
     let execution = controller.coordinator.execution.acquire().await?;
@@ -1518,7 +1519,7 @@ async fn input_offer_rejects_stale_revision_without_claiming() -> Result<()> {
             .await?
     );
     assert_eq!(
-        controller.coordinator.submissions.snapshot()?.messages[0].delivery,
+        controller.coordinator.submissions.snapshot()?.messages[0].delivery(),
         crate::input::InputDelivery::Queued
     );
     assert!(
@@ -1535,7 +1536,7 @@ async fn input_offer_rejects_stale_revision_without_claiming() -> Result<()> {
 #[tokio::test]
 async fn input_owner_commits_queued_settings_before_local_completion() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let input = queued_offer_input(
         &controller,
         "model-only",
@@ -1597,7 +1598,7 @@ async fn input_owner_commits_queued_settings_before_local_completion() -> Result
 async fn input_owner_captures_receipt_after_queued_model_settings() -> Result<()> {
     use rusqlite::OptionalExtension;
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let input = queued_offer_input(
         &controller,
         "queued-choice",
@@ -1648,7 +1649,7 @@ async fn input_owner_captures_receipt_after_queued_model_settings() -> Result<()
                 .snapshot()?
                 .messages
                 .iter()
-                .any(|input| input.delivery == crate::input::InputDelivery::Failed)
+                .any(|input| input.delivery() == crate::input::InputDelivery::Failed)
             {
                 anyhow::bail!("queued model preparation failed before receipt capture");
             }
@@ -1682,7 +1683,7 @@ async fn input_owner_captures_receipt_after_queued_model_settings() -> Result<()
 #[tokio::test]
 async fn queued_compaction_preflight_does_not_fence_later_commands() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let input = queued_offer_input(&controller, "compact", "/compact", None)?;
     let execution = controller.coordinator.execution.acquire().await?;
     let control = controller
@@ -1772,12 +1773,59 @@ fn queued_offer_input(
     })
 }
 
+/// Retire cancelled input without erasing accepted or uncertain native delivery facts.
+#[tokio::test]
+async fn cancelled_input_settlement_preserves_acceptance_and_uncertainty() -> Result<()> {
+    for (sent, accepted) in [(false, false), (true, false), (true, true)] {
+        let root = tempfile::tempdir()?;
+        let controller = receipt_test_controller(root.path()).await?;
+        let (_, submission) =
+            registered_receipt(&controller, "cancelled", crate::input::InputPurpose::User).await?;
+        if sent {
+            submission.sending(None)?;
+        }
+        if accepted {
+            submission.accepted(None)?;
+        }
+        let update = controller
+            .exchange_owner
+            .observe_input_receipt(
+                crate::exchange::InputReceiptFact::Settled {
+                    submission: submission.receipt_id().clone(),
+                    result: crate::exchange::InputExecutionResult::Cancelled,
+                    activity: crate::exchange::InputDispatchActivity::Idle,
+                },
+                None,
+            )
+            .await?
+            .context("cancelled receipt returned no update")?;
+        let snapshot = controller.coordinator.submissions.snapshot()?;
+        if sent && !accepted {
+            assert_eq!(
+                snapshot.messages[0].delivery(),
+                crate::input::InputDelivery::Unknown
+            );
+            assert!(update.retracted.is_none());
+        } else {
+            assert!(
+                snapshot.messages.is_empty(),
+                "settled cancellation retained blocking input"
+            );
+            assert!(update.error.is_none());
+            assert_eq!(update.retracted.as_deref(), (!sent).then_some("cancelled"));
+        }
+        controller.finish_exchange_owner().await?;
+    }
+    Ok(())
+}
+
 /// Create the real session owner without starting input dispatch or a live native process.
-fn receipt_test_controller(root: &std::path::Path) -> Result<Arc<SessionController>> {
+async fn receipt_test_controller(root: &std::path::Path) -> Result<Arc<SessionController>> {
     SessionController::new(HarnessBroker::initialize(serde_json::from_value(json!({
         "workspace":root,"data_root":root.join("data"),"client_id":"owner-receipts",
         "provider":{"kind":"mock","command":[]},
     }))?)?)
+    .await
 }
 
 /// Register the real input journal and receipt binding used by owner observation tests.
@@ -1789,28 +1837,20 @@ async fn registered_receipt(
     crate::exchange::command::InputRevision,
     Arc<crate::provider::submission::Submission>,
 )> {
-    use crate::input::{
-        InputAction, InputDelivery, InputIntent, InputMessage, InputOperation, InputRoute,
-    };
+    use crate::input::{InputAction, InputIntent, InputMessage, InputOperation, InputRoute};
     controller.coordinator.submissions.apply(InputOperation {
         id: format!("submit-{id}"),
         control_revision: 0,
         after_control: None,
         action: InputAction::Submit {
-            message: Box::new(InputMessage {
+            message: Box::new(InputMessage::queued(crate::input::InputDraft {
                 id: id.into(),
-                revision: 0,
                 text: "Owned receipt".into(),
                 purpose: purpose.clone(),
                 attachments: Vec::new(),
                 config: None,
                 intent: InputIntent::Auto,
-                delivery: InputDelivery::Queued,
-                route: None,
-                reservation: None,
-                submission_id: None,
-                error: None,
-            }),
+            })),
         },
     })?;
     let message = controller
@@ -1859,7 +1899,7 @@ async fn controller_reopens_acknowledged_queue_suspended() -> Result<()> {
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
         "client_id":"input-durability", "provider":{"kind":"mock","command":[]},
     }))?;
-    let controller = SessionController::new(HarnessBroker::initialize(initialize.clone())?)?;
+    let controller = SessionController::new(HarnessBroker::initialize(initialize.clone())?).await?;
     let session_id = controller.observer.session_id().to_owned();
     let (sink, mut output) = forge_protocol::outbound::channel();
     for (request_id, message_id) in [(1, "first"), (2, "second")] {
@@ -1886,7 +1926,7 @@ async fn controller_reopens_acknowledged_queue_suspended() -> Result<()> {
     drop(controller);
     let mut reopened = initialize;
     reopened.session_id = Some(session_id);
-    let controller = SessionController::new(HarnessBroker::initialize(reopened)?)?;
+    let controller = SessionController::new(HarnessBroker::initialize(reopened)?).await?;
     let restored = controller.coordinator.submissions.snapshot()?;
     assert!(restored.suspended);
     assert_eq!(
@@ -1918,7 +1958,7 @@ async fn interrupted_session_deletion_retries_queue_cleanup() -> Result<()> {
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
         "client_id":"input-deletion", "provider":{"kind":"mock","command":[]},
     }))?;
-    let controller = SessionController::new(HarnessBroker::initialize(initialize)?)?;
+    let controller = SessionController::new(HarnessBroker::initialize(initialize)?).await?;
     let session_id = controller.observer.session_id().to_owned();
     let root = controller.data_root.clone();
     let submissions = controller.submission_store.clone();
@@ -1948,7 +1988,7 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
         "workspace":fixture.path(), "data_root":fixture.path().join("data"),
         "client_id":"input-gap", "provider":{"kind":"mock","command":[]},
     }))?;
-    let controller = SessionController::new(HarnessBroker::initialize(initialize.clone())?)?;
+    let controller = SessionController::new(HarnessBroker::initialize(initialize.clone())?).await?;
     let session_id = controller.observer.session_id().to_owned();
     controller.coordinator.submissions.apply(serde_json::from_value(json!({
         "id":"submit-gap", "action":{"kind":"submit","message":{"id":"gap","text":"once","intent":"queue"}}
@@ -1970,7 +2010,7 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
     drop(controller);
     let mut resumed = initialize;
     resumed.session_id = Some(session_id);
-    let controller = SessionController::new(HarnessBroker::initialize(resumed)?)?;
+    let controller = SessionController::new(HarnessBroker::initialize(resumed)?).await?;
     assert!(controller.coordinator.submissions.snapshot()?.suspended);
     let again = journal.prepare_input(
         &catalog,
@@ -2010,7 +2050,7 @@ async fn queue_claim_preparation_gap_reuses_only_one_native_submission() -> Resu
 #[tokio::test]
 async fn targeted_clarification_uses_scoped_input_and_rejects_changed_question() -> Result<()> {
     let root = tempfile::tempdir()?;
-    let controller = receipt_test_controller(root.path())?;
+    let controller = receipt_test_controller(root.path()).await?;
     let ids = controller.questions.ask(
         "clarification-source",
         "source-exchange",

@@ -45,15 +45,14 @@ assert(#warnings == 1 and state.queue_edit, "invalid effort committed the edit")
 assert(queued.config.model == "chosen")
 compose("/model another high revised prompt")
 controller.submit()
-assert(queued.config.model == "another" and queued.text == "revised prompt")
-assert(state.session.model == "old", "optimistic edit changed provider configuration")
+assert(queued.config.model == "chosen" and queued.text == "explain this\nand this")
+assert(state.session.model == "old", "pending input edit changed provider configuration")
 host.flush()
 assert(queued.config.model == "another" and queued.config.effort == "high")
 assert(queued.text == "revised prompt")
 local configured
-controller.task_transition = function(action)
-  assert(action.action == "configure")
-  configured = action.config
+controller.configure = function(config)
+  configured = config
 end
 state.busy, state.execution_busy = true, true
 compose("/model settings-only high")

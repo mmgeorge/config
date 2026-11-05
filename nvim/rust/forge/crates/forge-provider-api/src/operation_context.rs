@@ -1,4 +1,4 @@
-//! Host-issued identities, bounded deadlines, and explicit cancellation for retained operations.
+//! Host-issued identities, optional deadlines, and explicit cancellation for retained operations.
 
 use crate::{
     FailureDisposition, OperationId, ProviderError, ProviderFailure, ProviderFailureKind,
@@ -18,7 +18,7 @@ use tokio::time::Instant;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationContext {
     id: OperationId,
-    deadline: Instant,
+    deadline: Option<Instant>,
     cancellation: OperationCancellation,
 }
 
@@ -39,9 +39,19 @@ impl OperationContext {
             .ok_or(OperationContextError::TimerRange)?;
         Ok(Self {
             id,
-            deadline,
+            deadline: Some(deadline),
             cancellation,
         })
+    }
+
+    /// Create an operation without an implicit duration limit, retaining explicit cancellation.
+    /// Use this for generation and input acceptance unless the caller selected a finite limit.
+    pub fn unbounded(id: OperationId, cancellation: OperationCancellation) -> Self {
+        Self {
+            id,
+            deadline: None,
+            cancellation,
+        }
     }
 
     /// Get the host-issued identity retained for the entire operation retry lifetime.
@@ -49,9 +59,27 @@ impl OperationContext {
         &self.id
     }
 
-    /// Get the bounded monotonic deadline; retries keep this original instant.
-    pub const fn deadline(&self) -> Instant {
+    /// Get the original monotonic deadline, or None when duration is explicitly unbounded.
+    pub const fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    /// Get the remaining original budget without restarting a timer at an internal phase.
+    /// None means no implicit expiry; Some(Duration::ZERO) means the finite budget elapsed.
+    pub fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    /// Restrict a fresh context to an enclosing command's original deadline before dispatch.
+    /// Call this before exposing any clone to retained admission. Re-observations must reuse
+    /// the resulting context unchanged; changing an already admitted context is a conflict.
+    pub fn bounded_by(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(
+            self.deadline
+                .map_or(deadline, |existing| existing.min(deadline)),
+        );
+        self
     }
 
     /// Get the explicit interruption observer without acquiring cancellation authority.
@@ -70,7 +98,10 @@ impl OperationContext {
                 FailureDisposition::Unchanged,
             ));
         }
-        if Instant::now() >= self.deadline {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
             return Err(OperationInterruption::DeadlineElapsed.failure(
                 operation,
                 ProviderPhase::Admission,
@@ -87,15 +118,20 @@ impl OperationContext {
         tokio::select! {
             biased;
             _ = self.cancellation.cancelled() => OperationInterruption::Cancelled,
-            _ = tokio::time::sleep_until(self.deadline) => OperationInterruption::DeadlineElapsed,
+            _ = async {
+                match self.deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => OperationInterruption::DeadlineElapsed,
         }
     }
 }
 
-/// Reject an absent deadline or a duration outside the runtime timer range.
+/// Reject an invalid finite deadline or a duration outside the runtime timer range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum OperationContextError {
-    /// Every retained operation requires a positive bounded timeout.
+    /// A finite operation timeout must be positive; use unbounded for no expiry.
     #[error("provider operation timeout must be greater than zero")]
     ExpiryRequired,
     /// The configured timeout cannot be represented by the monotonic runtime clock.
@@ -131,6 +167,68 @@ impl OperationInterruption {
             .at_phase(phase, disposition)
             .into()
     }
+}
+
+/// Select the reporting policy while cleanup ownership outlives its command response.
+/// Start elapsed time at the original command admission. Closing a binding must not restart
+/// or replace the response deadline of an already pending cancellation command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupPolicy {
+    /// Interrupt one invocation and retain its collection after the cancellation response.
+    Cancellation,
+    /// Collect an entire binding or runtime outside an existing cancellation command.
+    Close,
+}
+
+impl CleanupPolicy {
+    /// Get the elapsed boundary for publishing one pending indication.
+    pub const fn pending_after(self) -> Duration {
+        match self {
+            Self::Cancellation => Duration::from_secs(10),
+            Self::Close => Duration::from_secs(30),
+        }
+    }
+
+    /// Get the elapsed boundary for the sole unresolved command response.
+    /// This ends observation, never native cleanup ownership or the reuse fence.
+    pub const fn response_after(self) -> Duration {
+        match self {
+            Self::Cancellation => Duration::from_secs(30),
+            Self::Close => Duration::from_secs(120),
+        }
+    }
+
+    /// Classify elapsed cleanup reporting without claiming settlement or input non-consumption.
+    /// The command owner publishes each transition once and suppresses a second response
+    /// when a late authoritative result arrives. Check successful completion before this policy.
+    pub fn progress(self, elapsed: Duration) -> Option<CleanupProgress> {
+        if elapsed >= self.response_after() {
+            return Some(CleanupProgress::TimedOut);
+        }
+        if elapsed >= self.pending_after() {
+            return Some(CleanupProgress::Pending);
+        }
+        None
+    }
+
+    /// Get the safe user-facing message for a cleanup observation.
+    pub const fn message(self, progress: CleanupProgress) -> &'static str {
+        match (self, progress) {
+            (Self::Cancellation, CleanupProgress::Pending) => "Cancellation still pending",
+            (Self::Cancellation, CleanupProgress::TimedOut) => "Exceeded cancellation timeout",
+            (Self::Close, CleanupProgress::Pending) => "Cleanup still pending",
+            (Self::Close, CleanupProgress::TimedOut) => "Cleanup remains unresolved",
+        }
+    }
+}
+
+/// Observe unfinished cleanup independently of acceptance, execution outcome, and settlement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupProgress {
+    /// Publish progress while retaining the command's original response deadline.
+    Pending,
+    /// Respond once while retaining cleanup resources and blocking unsafe reuse.
+    TimedOut,
 }
 
 /// Observe explicit host cancellation; source or observer disposal never requests it.
@@ -198,6 +296,111 @@ impl OperationCancellationSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Keep unbounded acceptance pending until explicit cancellation, preserving cloned identity.
+    #[tokio::test]
+    async fn unbounded_acceptance_waits_for_explicit_interruption() {
+        let (source, cancellation) = OperationCancellation::channel();
+        let context = OperationContext::unbounded(
+            OperationId::new("unbounded-acceptance").unwrap(),
+            cancellation,
+        );
+        assert_eq!(context.deadline(), None);
+        assert_eq!(context.remaining(), None);
+        let clone = context.clone();
+        assert_eq!(context, clone);
+        context
+            .check_admission(ProviderOperation::InputSubmit)
+            .unwrap();
+        let interrupted = context.interrupted();
+        tokio::pin!(interrupted);
+        tokio::select! {
+            biased;
+            reason = &mut interrupted => panic!("unbounded acceptance expired: {reason:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        source.cancel();
+        assert_eq!(interrupted.await, OperationInterruption::Cancelled);
+    }
+
+    /// Preserve the same finite budget through a cloned context after its timer elapses.
+    #[tokio::test]
+    async fn finite_remaining_budget_does_not_restart_after_expiry() {
+        let (_, cancellation) = OperationCancellation::channel();
+        let context = OperationContext::new(
+            OperationId::new("propagated-budget").unwrap(),
+            Duration::from_millis(1),
+            cancellation,
+        )
+        .unwrap();
+        let clone = context.clone();
+        assert_eq!(context.deadline(), clone.deadline());
+        assert_eq!(
+            context.interrupted().await,
+            OperationInterruption::DeadlineElapsed
+        );
+        assert_eq!(clone.remaining(), Some(Duration::ZERO));
+    }
+
+    /// Propagate an enclosing deadline without extending an already shorter operation budget.
+    #[test]
+    fn enclosing_deadline_only_shortens_fresh_operation_context() {
+        let (_, cancellation) = OperationCancellation::channel();
+        let context = OperationContext::new(
+            OperationId::new("enclosing-budget").unwrap(),
+            Duration::from_secs(2),
+            cancellation.clone(),
+        )
+        .unwrap();
+        let deadline = context.deadline().unwrap();
+        assert_eq!(
+            context
+                .clone()
+                .bounded_by(deadline + Duration::from_secs(1))
+                .deadline(),
+            Some(deadline)
+        );
+        let enclosing = deadline - Duration::from_secs(1);
+        assert_eq!(context.bounded_by(enclosing).deadline(), Some(enclosing));
+        let unbounded =
+            OperationContext::unbounded(OperationId::new("explicit-budget").unwrap(), cancellation);
+        assert_eq!(unbounded.bounded_by(enclosing).deadline(), Some(enclosing));
+    }
+
+    /// Report cancellation overdue without substituting the longer close observation budget.
+    #[test]
+    fn cleanup_reporting_preserves_cancellation_response_boundary() {
+        let cancellation = CleanupPolicy::Cancellation;
+        assert_eq!(cancellation.progress(Duration::from_secs(9)), None);
+        assert_eq!(
+            cancellation.progress(Duration::from_secs(10)),
+            Some(CleanupProgress::Pending)
+        );
+        assert_eq!(
+            cancellation.progress(Duration::from_secs(29)),
+            Some(CleanupProgress::Pending)
+        );
+        assert_eq!(
+            cancellation.progress(Duration::from_secs(30)),
+            Some(CleanupProgress::TimedOut)
+        );
+        assert_eq!(
+            cancellation.message(CleanupProgress::TimedOut),
+            "Exceeded cancellation timeout"
+        );
+        assert_eq!(
+            CleanupPolicy::Close.progress(Duration::from_secs(30)),
+            Some(CleanupProgress::Pending)
+        );
+        assert_eq!(
+            CleanupPolicy::Close.progress(Duration::from_secs(119)),
+            Some(CleanupProgress::Pending)
+        );
+        assert_eq!(
+            CleanupPolicy::Close.progress(Duration::from_secs(120)),
+            Some(CleanupProgress::TimedOut)
+        );
+    }
 
     /// Keep operation cancellation explicit when every source is dropped before its observer.
     #[tokio::test]

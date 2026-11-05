@@ -283,11 +283,11 @@ fn capability(id: &str) -> ProviderCapability {
                 background_generation: true, isolated_generation: true, terminal_termination: true,
                 native_agent_suppression: true, mcp_runtime_status: true, mcp_tool_catalog: true,
                 tracked_submission: true, resource_target: Some("codexcli".into()),
-                isolation_modes: vec![
+                isolation_modes: if cfg!(windows) { vec![
                     forge_provider_api::model::IsolationMode { id: "elevated".into(), label: "Elevated".into(), description: "Dedicated low-privilege users and filesystem ACLs. Setup needs admin approval; sandboxed commands do not run as administrator.".into() },
                     forge_provider_api::model::IsolationMode { id: "unelevated".into(), label: "Unelevated".into(), description: "Restricted token for the current user without admin setup. Weaker network isolation; denied-read paths are unsupported.".into() },
                     forge_provider_api::model::IsolationMode { id: "mxc".into(), label: "MXC".into(), description: "Prefer Microsoft Execution Containers where supported; falls back to Elevated. Child processes stop when the command exits.".into() },
-                ],
+                ] } else { Vec::new() },
                 limitations: vec![FeatureLimitation { id: CapabilityId::FilesystemAccess, support: Support::Limited { restrictions: vec![CapabilityRestriction::PermissionCallbacksOnly] }, reason: "Scopes and write-off apply to reported file operations. Shell commands, MCP internals, and operations without permission callbacks retain provider-native restrictions. The selected read scope is not enforced as OS read confinement.".into() }],
                 ..Default::default()
             },
@@ -320,7 +320,8 @@ fn capability(id: &str) -> ProviderCapability {
                         FeatureLimitation { id: CapabilityId::FileDiff, support: Support::Limited { restrictions: vec![CapabilityRestriction::UnstructuredDiffs] }, reason: "Edit tools can complete without structured diffs; checkpoint review remains available".into() },
                         FeatureLimitation { id: CapabilityId::ApprovalRules, support: Support::Limited { restrictions: vec![CapabilityRestriction::EnterpriseTerminalPolicy] }, reason: "Enterprise terminal policy may execute without approval callbacks".into() },
                         FeatureLimitation { id: CapabilityId::SkillCatalog, support: Support::Limited { restrictions: vec![CapabilityRestriction::InheritedSkills] }, reason: "Project-native skills cannot be excluded by this integration".into() },
-                        FeatureLimitation { id: CapabilityId::SkillMutation, support: Support::Limited { restrictions: vec![CapabilityRestriction::InheritedSkills] }, reason: "Project-native skills cannot be excluded by this integration".into() },
+                        FeatureLimitation { id: CapabilityId::SkillMutation, support: Support::Unsupported, reason: "This integration cannot replace skill selections on an existing binding".into() },
+                        FeatureLimitation { id: CapabilityId::McpMutation, support: Support::Unsupported, reason: "This integration cannot replace MCP selections on an existing binding".into() },
                     ] }, ..Default::default()
                 },
                 native_fork: claude, native_compact: claude, native_steer: claude,
@@ -342,5 +343,40 @@ fn capability(id: &str) -> ProviderCapability {
             ..Default::default()
         },
         _ => unreachable!("registry only calls capability for known identities"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Discovery support must not advertise mutations the adapter always rejects.
+    #[test]
+    fn antigravity_catalog_discovery_does_not_imply_resource_mutation() {
+        use forge_provider_api::capability::{CapabilityId, CapabilityManifest, Support};
+        let id = forge_provider_api::ProviderId::new("antigravity").unwrap();
+        let manifest = CapabilityManifest::from_descriptor(descriptor(&id).unwrap());
+        for id in [CapabilityId::SkillMutation, CapabilityId::McpMutation] {
+            assert!(matches!(
+                manifest
+                    .capability
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .unwrap()
+                    .support,
+                Support::Unsupported
+            ));
+        }
+        for id in [CapabilityId::SkillCatalog, CapabilityId::McpCatalog] {
+            assert!(!matches!(
+                manifest
+                    .capability
+                    .iter()
+                    .find(|entry| entry.id == id)
+                    .unwrap()
+                    .support,
+                Support::Unsupported
+            ));
+        }
     }
 }

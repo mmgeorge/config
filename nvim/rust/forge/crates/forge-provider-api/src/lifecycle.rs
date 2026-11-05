@@ -222,6 +222,8 @@ pub enum ExecutionFailure {
     Retryable {
         address: TurnAddress,
         category: crate::retry::RetryCategory,
+        /// Provider-required minimum wait, preserved when translating this terminal result.
+        retry_after: Option<std::time::Duration>,
     },
 }
 

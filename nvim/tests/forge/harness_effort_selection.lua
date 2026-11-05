@@ -198,7 +198,7 @@ assert(state.configuration_error:find("does not support ultrafast", 1, true))
 assert(#transition == count and not state.task_config)
 assert(#errors == 0, table.concat(errors, "\n"))
 local applied
-controller.configure({ effort = "unavailable" }, true, function(value) applied = value end)
+controller.configure({ effort = "unavailable" }, function(value) applied = value end)
 transition[#transition].callback({ state = "failed", error = "reasoning effort unavailable" })
 assert(applied == false and #errors == 1 and errors[1] == "reasoning effort unavailable")
 assert(state.session.effort == "medium" and not state.task_config and not state.configuring,

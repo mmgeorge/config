@@ -318,7 +318,6 @@ impl HarnessBroker {
         if let Some(timeout) = transaction.native.watchdog.timeout()? {
             return self.handle_foreground_timeout(transaction, timeout);
         }
-        transaction.native.cancellation.native_cancel_settled();
         let (mut output, question_override) = match outcome {
             ForegroundOutcome::NativeReady(Ok(output)) => (output, None),
             ForegroundOutcome::NativeReady(Err(error)) if error.is_clean_cancellation() => {

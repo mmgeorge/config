@@ -27,7 +27,7 @@ function M.new(state)
       local action = parameters.action
       if action.kind == "submit" then
         local message = vim.deepcopy(action.message)
-        message.revision = 1
+        message.revision, message.delivery = 1, "queued"
         host.messages[#host.messages + 1] = message
         update.upsert[1] = vim.deepcopy(message)
       elseif action.kind == "reserve" then

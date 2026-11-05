@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::VecDeque;
 use std::fs::File;
@@ -19,12 +20,22 @@ struct LogSegment {
     pending: bool,
 }
 
+/// Decode the physical envelope used when one logical record spans log segments.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TraceChunk {
+    id: String,
+    sequence: usize,
+    part_count: usize,
+    payload_hex: String,
+}
+
 impl LogSnapshot {
     /// Open the current log before older rotations, retaining their captured byte lengths.
     pub(super) fn open(current: &Path) -> Result<Option<Self>> {
         let mut segments = VecDeque::new();
         for path in std::iter::once(current.to_owned())
-            .chain((1..=3).map(|generation| current.with_extension(format!("jsonl.{generation}"))))
+            .chain((1..=10).map(|generation| current.with_extension(format!("jsonl.{generation}"))))
         {
             let file = match File::open(&path) {
                 Ok(file) => file,
@@ -45,6 +56,52 @@ impl LogSnapshot {
 
     /// Read the newest remaining record without following later appends.
     pub(super) fn next(
+        &mut self,
+        mut check_active: impl FnMut() -> Result<()>,
+    ) -> Result<Option<Value>> {
+        let Some(mut record) = self.next_physical(&mut check_active)? else {
+            return Ok(None);
+        };
+        let Some(envelope) = record.get_mut("trace_chunk") else {
+            return Ok(Some(record));
+        };
+        let chunk: TraceChunk =
+            serde_json::from_value(envelope.take()).context("decode session log chunk")?;
+        ensure!(
+            chunk.part_count > 0 && chunk.sequence == chunk.part_count - 1,
+            "session log record is incomplete after rotation"
+        );
+        let mut fragments =
+            vec![hex::decode(&chunk.payload_hex).context("decode session log chunk bytes")?];
+        for expected in (0..chunk.sequence).rev() {
+            check_active()?;
+            let mut next = self
+                .next_physical(&mut check_active)?
+                .context("session log record is incomplete after rotation")?;
+            let envelope = next
+                .get_mut("trace_chunk")
+                .context("session log chunk sequence was interrupted")?;
+            let next: TraceChunk =
+                serde_json::from_value(envelope.take()).context("decode session log chunk")?;
+            ensure!(
+                next.id == chunk.id
+                    && next.part_count == chunk.part_count
+                    && next.sequence == expected,
+                "session log chunk sequence does not match its retained record"
+            );
+            fragments
+                .push(hex::decode(&next.payload_hex).context("decode session log chunk bytes")?);
+        }
+        let bytes: Vec<u8> = fragments.into_iter().rev().flatten().collect();
+        crate::codec::from_str(
+            std::str::from_utf8(&bytes).context("session log record is not UTF-8")?,
+        )
+        .context("decode reassembled session log record")
+        .map(Some)
+    }
+
+    /// Read one captured physical line, advancing across rotated segments.
+    fn next_physical(
         &mut self,
         mut check_active: impl FnMut() -> Result<()>,
     ) -> Result<Option<Value>> {
@@ -175,7 +232,7 @@ mod tests {
     fn snapshot_reads_newest_first_across_blocks_and_rotations() -> Result<()> {
         let root = tempfile::tempdir()?;
         let current = root.path().join("session.jsonl");
-        for generation in 1..=3 {
+        for generation in 1..=10 {
             std::fs::write(
                 current.with_extension(format!("jsonl.{generation}")),
                 format!("{{\"generation\":{generation}}}\n"),
@@ -187,7 +244,7 @@ mod tests {
         let mut snapshot = LogSnapshot::open(&current)?.unwrap();
         assert_eq!(snapshot.next(|| Ok(()))?, Some(records[1].clone()));
         assert_eq!(snapshot.next(|| Ok(()))?, Some(records[0].clone()));
-        for generation in 1..=3 {
+        for generation in 1..=10 {
             assert_eq!(
                 snapshot.next(|| Ok(()))?,
                 Some(json!({"generation":generation}))
@@ -195,6 +252,39 @@ mod tests {
         }
         assert!(!snapshot.has_remaining());
         assert_eq!(snapshot.next(|| Ok(()))?, None);
+        Ok(())
+    }
+
+    /// Reassemble one logical UTF-8 record across rotation boundaries and reject missing chunks.
+    #[test]
+    fn snapshot_reassembles_chunked_records_across_rotations() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let current = root.path().join("session.jsonl");
+        let record = json!({"event":"large", "payload":{"text":"界🙂"}});
+        let bytes = serde_json::to_vec(&record)?;
+        let split = bytes.iter().position(|byte| *byte >= 128).unwrap() + 1;
+        let part = |sequence, payload: &[u8]| {
+            json!({"trace_chunk":{
+                "id":"retained-record", "sequence":sequence,"part_count":2,
+                "payload_hex":hex::encode(payload)
+            }})
+            .to_string()
+                + "\n"
+        };
+        std::fs::write(current.with_extension("jsonl.1"), part(0, &bytes[..split]))?;
+        std::fs::write(&current, part(1, &bytes[split..]))?;
+        let mut snapshot = LogSnapshot::open(&current)?.unwrap();
+        assert_eq!(snapshot.next(|| Ok(()))?, Some(record));
+        assert_eq!(snapshot.next(|| Ok(()))?, None);
+        std::fs::remove_file(current.with_extension("jsonl.1"))?;
+        let mut incomplete = LogSnapshot::open(&current)?.unwrap();
+        assert!(
+            incomplete
+                .next(|| Ok(()))
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete")
+        );
         Ok(())
     }
 

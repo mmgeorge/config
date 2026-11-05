@@ -166,12 +166,17 @@ impl ControlTurnContext {
                         *kind,
                     ),
                 )),
-                ExecutionFailure::Retryable { address, category } => Err(ProviderError::Retryable(
-                    Box::new(forge_provider_api::retry::RetryableFailure {
+                ExecutionFailure::Retryable {
+                    address,
+                    category,
+                    retry_after,
+                } => Err(ProviderError::Retryable(Box::new(
+                    forge_provider_api::retry::RetryableFailure {
                         address: address.clone(),
                         category: *category,
-                    }),
-                )),
+                        retry_after: *retry_after,
+                    },
+                ))),
             },
         }
     }

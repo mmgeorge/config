@@ -69,12 +69,11 @@ impl McpDiscovery {
         {
             let configured = match configured {
                 Some(configured) => configured,
-                None => tokio::time::timeout(
-                    Duration::from_secs(10),
-                    provider.mcp_list(McpQuery::Configured(context.clone())),
-                )
-                .await
-                .context("MCP configuration discovery timed out")??,
+                None => {
+                    provider
+                        .mcp_list(McpQuery::Configured(context.clone()))
+                        .await?
+                }
             };
             let previous = std::mem::replace(&mut self.servers, configured);
             if self.servers.is_empty() {
@@ -107,12 +106,7 @@ impl McpDiscovery {
             }
             let configured = self.servers.clone();
             self.pending = Some(tokio::spawn(async move {
-                let observed = tokio::time::timeout(
-                    Duration::from_secs(120),
-                    provider.mcp_list(McpQuery::Observed(context)),
-                )
-                .await
-                .context("MCP startup discovery timed out after 120 seconds")??;
+                let observed = provider.mcp_list(McpQuery::Observed(context)).await?;
                 Ok(merge_configured(configured, observed))
             }));
         }

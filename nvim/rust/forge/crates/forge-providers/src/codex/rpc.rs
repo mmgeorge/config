@@ -16,24 +16,36 @@ use tokio::task::JoinHandle;
 
 /// Share native RPC methods without serializing their independent send and receive paths.
 #[derive(Clone)]
-pub(super) struct RpcHandle(Arc<tokio::sync::RwLock<Arc<NativeRpc>>>);
+pub(super) struct RpcHandle {
+    current: Arc<tokio::sync::RwLock<Arc<NativeRpc>>>,
+    replacements: tokio::sync::watch::Sender<()>,
+}
 
 pub(super) struct RpcGuard(Arc<NativeRpc>);
 
 impl RpcHandle {
     #[cfg(test)]
     pub(super) fn new(rpc: NativeRpc) -> Self {
-        Self(Arc::new(tokio::sync::RwLock::new(Arc::new(rpc))))
+        Self::from_shared(Arc::new(rpc))
     }
     /// Retain an already shared native dispatcher through binding replacement.
     pub(super) fn from_shared(rpc: Arc<NativeRpc>) -> Self {
-        Self(Arc::new(tokio::sync::RwLock::new(rpc)))
+        Self {
+            current: Arc::new(tokio::sync::RwLock::new(rpc)),
+            replacements: tokio::sync::watch::channel(()).0,
+        }
     }
     pub(super) async fn lock(&self) -> RpcGuard {
-        RpcGuard(self.0.read().await.clone())
+        RpcGuard(self.current.read().await.clone())
     }
     pub(super) async fn replace_shared(&self, rpc: Arc<NativeRpc>) -> Arc<NativeRpc> {
-        std::mem::replace(&mut *self.0.write().await, rpc)
+        let previous = std::mem::replace(&mut *self.current.write().await, rpc);
+        self.replacements.send_replace(());
+        previous
+    }
+    /// Observe dispatcher replacements without querying its current identity repeatedly.
+    pub(super) fn replacements(&self) -> tokio::sync::watch::Receiver<()> {
+        self.replacements.subscribe()
     }
 }
 
@@ -60,8 +72,12 @@ pub(super) struct NativeRpc {
     waiters: RpcWaiters,
     responses: Mutex<HashMap<u64, oneshot::Receiver<Result<Value, ProviderError>>>>,
     methods: Mutex<HashMap<u64, String>>,
-    notifications: Mutex<mpsc::Receiver<Result<Value, ProviderError>>>,
+    notifications: Mutex<mpsc::UnboundedReceiver<Result<ReceivedMessage, ProviderError>>>,
     reader: Mutex<Option<JoinHandle<()>>>,
+    terminal_changes: tokio::sync::watch::Sender<()>,
+    closed_threads: tokio::sync::watch::Sender<
+        std::collections::HashMap<forge_provider_api::ProviderSessionId, uuid::Uuid>,
+    >,
 }
 
 impl NativeRpc {
@@ -72,9 +88,13 @@ impl NativeRpc {
             u64,
             oneshot::Sender<Result<Value, ProviderError>>,
         >::new()));
-        let (notification_tx, notifications) = mpsc::channel(forge_protocol::MAX_PENDING_FRAMES);
+        let (notification_tx, notifications) = mpsc::unbounded_channel();
         let reader_connection = connection.clone();
         let reader_waiters = waiters.clone();
+        let (terminal_changes, _) = tokio::sync::watch::channel(());
+        let terminal_updates = terminal_changes.clone();
+        let (closed_threads, _) = tokio::sync::watch::channel(std::collections::HashMap::new());
+        let thread_updates = closed_threads.clone();
         let reader = tokio::spawn(async move {
             loop {
                 let received = match reader_connection.receive().await {
@@ -85,41 +105,45 @@ impl NativeRpc {
                         for (_, waiter) in pending {
                             let _ = waiter.send(Err(error.clone()));
                         }
-                        let _ = notification_tx.send(Err(error)).await;
+                        let _ = notification_tx.send(Err(error));
                         break;
                     }
                 };
-                let value = match decode_frame(received) {
+                let value = match &received.value {
                     Ok(value) => value,
-                    Err(error) => {
-                        let pending = std::mem::take(&mut *reader_waiters.lock().await);
-                        for (_, waiter) in pending {
-                            let _ = waiter.send(Err(error.clone()));
-                        }
-                        let _ = notification_tx.send(Err(error)).await;
-                        break;
-                    }
-                };
-                if let Some(id) = response_id(&value) {
-                    if let Some(waiter) = reader_waiters.lock().await.remove(&id) {
-                        let _ = waiter.send(Ok(value));
-                    }
-                    continue;
-                }
-                match notification_tx.try_send(Ok(value)) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        let error = ProviderError::Observation(
-                            forge_provider_api::lifecycle::ObservationFailure::Overflow,
+                    Err(_) => {
+                        let error = failure(
+                            ProviderOperation::InputSubmit,
+                            ProviderFailureKind::Protocol,
                         );
                         let pending = std::mem::take(&mut *reader_waiters.lock().await);
                         for (_, waiter) in pending {
                             let _ = waiter.send(Err(error.clone()));
                         }
-                        let _ = notification_tx.send(Err(error)).await;
+                        let _ = notification_tx.send(Err(error));
                         break;
                     }
-                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                };
+                if let Some(id) = response_id(value) {
+                    if let Some(waiter) = reader_waiters.lock().await.remove(&id) {
+                        let _ = waiter.send(decode_frame(received));
+                    }
+                    continue;
+                }
+                if terminal_inventory_changed(value) {
+                    terminal_updates.send_replace(());
+                }
+                if value.get("method").and_then(Value::as_str) == Some("thread/closed")
+                    && let Some(id) = value.pointer("/params/threadId").and_then(Value::as_str)
+                    && let Ok(id) = forge_provider_api::ProviderSessionId::try_from(id.to_owned())
+                {
+                    thread_updates.send_modify(|closed| {
+                        closed.insert(id, uuid::Uuid::new_v4());
+                    });
+                }
+                // RPC responses stay dispatchable while notification consumption is paused.
+                if notification_tx.send(Ok(received)).is_err() {
+                    break;
                 }
             }
         });
@@ -131,7 +155,23 @@ impl NativeRpc {
             methods: Mutex::new(HashMap::new()),
             notifications: Mutex::new(notifications),
             reader: Mutex::new(Some(reader)),
+            terminal_changes,
+            closed_threads,
         }
+    }
+
+    /// Subscribe to native events that can change independently owned terminal inventory.
+    pub(super) fn terminal_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.terminal_changes.subscribe()
+    }
+
+    /// Subscribe before unsubscribe so an immediate native close cannot be missed.
+    pub(super) fn closed_threads(
+        &self,
+    ) -> tokio::sync::watch::Receiver<
+        std::collections::HashMap<forge_provider_api::ProviderSessionId, uuid::Uuid>,
+    > {
+        self.closed_threads.subscribe()
     }
 
     /// Send a correlated request while the dispatcher routes its response independently.
@@ -178,11 +218,11 @@ impl NativeRpc {
             .remove(&id)
             .ok_or_else(|| failure(operation, ProviderFailureKind::Protocol))?;
         let method = self.methods.lock().await.remove(&id).unwrap_or_default();
-        let response = tokio::time::timeout(std::time::Duration::from_secs(30), receiver).await;
+        // The retained operation owns any observation deadline. Native acknowledgements
+        // may arrive at turn end, and cleanup must retain correlation until collection.
+        let response = receiver.await;
         self.waiters.lock().await.remove(&id);
-        let result = response
-            .map_err(|_| failure(operation, ProviderFailureKind::Timeout))?
-            .map_err(|_| failure(operation, ProviderFailureKind::Transport))??;
+        let result = response.map_err(|_| failure(operation, ProviderFailureKind::Transport))??;
         decode_result(&result, operation, &method)
     }
 
@@ -217,7 +257,8 @@ impl NativeRpc {
         method: &str,
         params: Value,
     ) -> Result<u64, ProviderError> {
-        if !matches!(
+        super::operations::check()?;
+        let mutates = !matches!(
             method,
             "initialize"
                 | "config/read"
@@ -230,10 +271,7 @@ impl NativeRpc {
                 | "thread/items/list"
                 | "mcpServerStatus/list"
                 | "thread/backgroundTerminals/list"
-        ) {
-            super::operations::mark_changed();
-        }
-        super::operations::check()?;
+        );
         let id = self
             .next_id
             .fetch_add(1, Ordering::Relaxed)
@@ -250,6 +288,13 @@ impl NativeRpc {
         self.waiters.lock().await.insert(id, sender);
         self.responses.lock().await.insert(id, receiver);
         self.methods.lock().await.insert(id, method.to_owned());
+        if let Err(error) = super::operations::check() {
+            self.abandon_response(id).await;
+            return Err(error);
+        }
+        if mutates {
+            super::operations::mark_changed();
+        }
         if self.connection.send(encoded).await.is_err() {
             self.waiters.lock().await.remove(&id);
             self.responses.lock().await.remove(&id);
@@ -276,6 +321,7 @@ impl NativeRpc {
                         ProviderFailureKind::Transport,
                     )
                 })?
+                .and_then(decode_frame)
         };
         match super::operations::current() {
             Some(context) => tokio::select! {
@@ -360,6 +406,21 @@ impl NativeRpc {
             }),
         }
     }
+}
+
+/// Select native lifecycle notifications without copying streamed output into another queue.
+fn terminal_inventory_changed(message: &Value) -> bool {
+    matches!(
+        message.get("method").and_then(Value::as_str),
+        Some(
+            "item/started"
+                | "item/completed"
+                | "item/commandExecution/terminalInteraction"
+                | "process/exited"
+                | "thread/status/changed"
+                | "thread/closed"
+        )
+    )
 }
 
 fn decode_frame(received: ReceivedMessage) -> Result<Value, ProviderError> {
@@ -453,6 +514,68 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+    /// A turn-end acknowledgement must survive beyond the former blanket RPC deadline.
+    #[tokio::test]
+    async fn unbounded_turn_acknowledgement_survives_thirty_seconds() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started, observed) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let request: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            started.send(()).unwrap();
+            wait.await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"id":request["id"],"result":{"turnId":"late-turn"}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if message.is_close() {
+                    break;
+                }
+            }
+        });
+        let rpc = Arc::new(NativeRpc::new(
+            CodexConnection::connect(&format!("ws://{address}"))
+                .await
+                .unwrap(),
+        ));
+        let request_rpc = rpc.clone();
+        let (_, cancellation) = forge_provider_api::OperationCancellation::channel();
+        let context = forge_provider_api::OperationContext::unbounded(
+            forge_provider_api::OperationId::new("late-turn-acknowledgement").unwrap(),
+            cancellation,
+        );
+        let native =
+            super::super::operations::NativeContext::new(context, ProviderOperation::InputSubmit);
+        let request = tokio::spawn(async move {
+            super::super::operations::scope(native, async move {
+                request_rpc
+                    .request("turn/start", json!({}), ProviderOperation::InputSubmit)
+                    .await
+            })
+            .await
+        });
+        observed.await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert!(!request.is_finished());
+        tokio::time::resume();
+        release.send(()).unwrap();
+        assert_eq!(request.await.unwrap().unwrap()["turnId"], "late-turn");
+        rpc.close().await.unwrap();
+        peer.await.unwrap();
+    }
+
     /// A known durable writer conflict retains a safe resource reason instead of native error text.
     #[test]
     fn active_writer_resume_rejection_is_a_normalized_resource_conflict() {
@@ -461,6 +584,33 @@ mod tests {
             matches!(&error, ProviderError::Failure(failure) if failure.operation() == ProviderOperation::SessionOpen && failure.kind() == ProviderFailureKind::ResourceConflict && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
         );
         assert!(!error.to_string().contains("private-thread-id"));
+    }
+
+    /// Ordinary token/tool chunks must not exhaust transport capacity before a control reply.
+    #[tokio::test]
+    async fn small_notification_burst_preserves_control_replies() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let count = forge_protocol::MAX_PENDING_FRAMES * 4;
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = accept_async(stream).await.unwrap();
+                let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                for sequence in 0..count {
+                    socket.send(Message::Text(json!({"method":"item/commandExecution/outputDelta","params":{"threadId":"thread","itemId":"tool","delta":format!("line {sequence}\n"),"sequence":sequence}}).to_string().into())).await.unwrap();
+                }
+                socket.send(Message::Text(json!({"id":request["id"],"result":{"ok":true}}).to_string().into())).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await { if message.is_close() { break; } }
+            });
+            let rpc = NativeRpc::new(CodexConnection::connect(&format!("ws://{address}")).await.unwrap());
+            assert_eq!(rpc.request("fixture/ping", json!({}), ProviderOperation::InputSubmit).await.unwrap(), json!({"ok":true}));
+            for sequence in 0..count {
+                assert_eq!(rpc.receive().await.unwrap()["params"]["sequence"], sequence);
+            }
+            rpc.close().await.unwrap();
+            peer.await.unwrap();
+        }).await.expect("small notification burst blocked native control replies");
     }
 
     /// Create a fully collected transport for isolated dispatcher-collection tests.
@@ -484,6 +634,33 @@ mod tests {
         rpc.close().await.unwrap();
         peer.await.unwrap();
         rpc
+    }
+
+    /// Rejection before native dispatch cannot turn a cancelled request into an uncertain mutation.
+    #[tokio::test]
+    async fn cancelled_rpc_admission_preserves_unchanged_mutation_evidence() {
+        let rpc = closed_rpc().await;
+        let (source, cancellation) = forge_provider_api::OperationCancellation::channel();
+        let context = forge_provider_api::OperationContext::unbounded(
+            forge_provider_api::OperationId::new("cancelled-before-native-dispatch").unwrap(),
+            cancellation,
+        );
+        let native =
+            super::super::operations::NativeContext::new(context, ProviderOperation::InputSubmit);
+        source.cancel();
+        let error = super::super::operations::scope(
+            native.clone(),
+            rpc.send_request("turn/start", json!({})),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ProviderError::Failure(failure)
+            if failure.kind() == ProviderFailureKind::Cancelled
+                && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged));
+        assert!(!native.changed());
+        assert!(rpc.waiters.lock().await.is_empty());
+        assert!(rpc.responses.lock().await.is_empty());
+        assert!(rpc.methods.lock().await.is_empty());
     }
 
     /// Explicit close releases a status observation even when the native endpoint never replies.

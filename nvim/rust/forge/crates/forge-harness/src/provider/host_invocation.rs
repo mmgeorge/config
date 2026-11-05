@@ -305,8 +305,16 @@ impl HostInvocation {
     /// Commit the native-call boundary while this exact host invocation still permits admission.
     pub(crate) fn request_native_input(&self) -> Result<(), ProviderError> {
         let mut state = self.state.lock().map_err(|_| rejected())?;
-        if !matches!(state.admission, Admission::Open) {
-            return Err(ProviderError::PreparationFailed(Box::new(rejected())));
+        match state.admission {
+            Admission::Open => {}
+            Admission::Cancelled => {
+                return Err(ProviderError::PreparationFailed(Box::new(
+                    ProviderError::Cancelled,
+                )));
+            }
+            Admission::Finishing => {
+                return Err(ProviderError::PreparationFailed(Box::new(rejected())));
+            }
         }
         state.native_input = NativeInputAdmission::Requested;
         Ok(())
@@ -587,9 +595,6 @@ impl ProviderTools for HostInvocation {
                 }
                 (record.clone(), false)
             } else {
-                if calls.len() >= forge_protocol::MAX_PENDING_FRAMES {
-                    return Err(rejected());
-                }
                 let record = Arc::new(HostCall {
                     name: call.name.clone(),
                     arguments: call.arguments.clone(),

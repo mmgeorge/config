@@ -1,3 +1,10 @@
+use super::super::CopilotSessions;
+use super::Trace;
+use super::support::{RecoveryPeer, recovery_session};
+use async_trait::async_trait;
+use forge_provider_api::ProviderError;
+use std::sync::Arc;
+
 struct CompletionControl;
 
 #[async_trait]
@@ -30,27 +37,26 @@ impl forge_provider_api::turn_control::TurnControl for CompletionControl {
     }
 }
 
-/// Complete real SDK Chat and Background turns when live ancestry omits its durable usage node.
+/// Complete repeated real SDK turns when live ancestry omits its durable usage node.
 #[tokio::test]
 async fn sdk_turn_completion_survives_omitted_ancestry_and_reused_zero_turn_id() {
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        for mode in [forge_provider_api::PromptMode::Chat, forge_provider_api::PromptMode::Background] {
-            let runtime = super::super::runtime::CopilotRuntime::new(vec!["ancestry-peer".into()]);
+            let runtime = crate::copilot::runtime::CopilotRuntime::new(vec!["ancestry-peer".into()]);
             let peer = RecoveryPeer::attach_with_turns(&runtime, "1.0.103", true).await;
             let client = runtime.client(".").await.unwrap();
             let sessions = Arc::new(CopilotSessions::<tempfile::TempDir>::new(Arc::new(Trace)));
             let owner = forge_provider_api::ExecutionOwner::root("ancestry-owner");
-            let session = recovery_session_mode(&sessions, client.clone(), &owner, mode).await;
-            let turn = sessions.turn(&owner.runtime_key()).await;
+            let session = recovery_session(&sessions, client.clone(), &owner).await;
+            let turn = sessions.turn(&owner.clone()).await;
             let capability = crate::registry::descriptor(&crate::registry::select("copilot").unwrap()).unwrap().capability;
             let mut completed = Vec::new();
             for ordinal in 0..2 {
-                let scope = forge_provider_api::InvocationScope::new(owner.clone(), format!("ancestry-{mode:?}-{ordinal}"));
+                let scope = forge_provider_api::InvocationScope::new(owner.clone(), format!("ancestry-{ordinal}"));
                 let binding_id = forge_provider_api::BindingId::new(format!("ancestry-binding-{ordinal}")).unwrap();
                 let (sink, mut stream) = forge_provider_api::events::channel(binding_id.clone(), scope.clone());
                 let guard = turn.activate(Some(sink.clone()), None).unwrap();
                 let submission_id = forge_provider_api::SubmissionId::try_from(format!("submission-{ordinal}")).unwrap();
-                let options = super::super::prompt::TurnOptions {
+                let options = crate::copilot::prompt::TurnOptions {
                     scope: scope.clone(),
                     workspace: std::env::temp_dir().to_string_lossy().into_owned(),
                     model: None,
@@ -67,14 +73,14 @@ async fn sdk_turn_completion_survives_omitted_ancestry_and_reused_zero_turn_id()
                     background_compaction_observed: true,
                     accepted: None,
                 };
-                let result = super::super::prompt::run(
+                let result = crate::copilot::prompt::run(
                     &session,
                     &turn,
                     &guard,
                     options,
                     &sink,
                     &CompletionControl,
-                    &super::super::provider::NoopNativeCallbacks,
+                    &crate::copilot::provider::NoopNativeCallbacks,
                 ).await.unwrap();
                 drop(guard);
                 assert_eq!(result.completion.provider_session_id.as_ref().unwrap().as_str(), session.id());
@@ -103,10 +109,9 @@ async fn sdk_turn_completion_survives_omitted_ancestry_and_reused_zero_turn_id()
             for index in methods.iter().enumerate().filter_map(|(index, method)| (method == "session.send").then_some(index)) {
                 assert_eq!(&methods[index - 2..index], ["session.eventLog.tail", "session.eventLog.read"], "journal boundary was not captured before native input");
             }
-            sessions.retire(&owner.runtime_key()).await.unwrap();
+            sessions.retire(&owner.clone()).await.unwrap();
             runtime.shutdown().await.unwrap();
             let _ = peer.stop.send(());
             peer.task.await.unwrap();
-        }
     }).await.expect("incomplete-ancestry SDK regression fixture timed out");
 }

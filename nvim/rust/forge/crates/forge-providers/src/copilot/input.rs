@@ -104,7 +104,7 @@ mod tests {
             let scope = forge_provider_api::InvocationScope::new(forge_provider_api::ExecutionOwner::root("post-dispatch"), "invocation");
             let (sink, _events) = forge_provider_api::events::channel(forge_provider_api::BindingId::new("binding").unwrap(), scope.clone());
             let guard = turn.activate(Some(sink.clone()), None).unwrap();
-            turn.steer_native(None, |authority| async {
+            turn.steer_native(None, None, |authority| async {
                 send(&session, MessageOptions::new("accepted request"), None, authority).await.map_err(anyhow::Error::new)
             }).await.unwrap();
             let mut decoder = super::super::event_decoder::CopilotEventDecoder::new(scope, ".".into());
@@ -174,7 +174,7 @@ mod tests {
                 submission.clone(),
                 forge_provider_api::DeliveryAttemptId::new("attempt").unwrap(),
             );
-            let sending = turn.steer_native(Some(submission), |authority| async {
+            let sending = turn.steer_native(None, Some(submission), |authority| async {
                 send(
                     &session,
                     MessageOptions::new("request"),

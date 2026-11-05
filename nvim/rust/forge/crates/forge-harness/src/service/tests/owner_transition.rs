@@ -1,3 +1,20 @@
+use super::super::{HarnessBroker, SessionController, prepare_new_session, prompt};
+use super::super::{native_permission, native_settings};
+use super::bootstrap::initialize;
+use super::owner_fixture::{
+    owner_transition_fixture, retain_cleanup_failure, retain_owner_transition_failure,
+};
+use crate::session::SessionStore;
+use crate::storage::SqliteStore;
+use anyhow::{Context, Result, ensure};
+use forge_protocol::message::Request;
+use serde_json::Value;
+use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
 /// Select the point at which the second configuration must collect its predecessor.
 #[derive(Clone, Copy)]
 enum SessionToolToggleBoundary {
@@ -7,145 +24,6 @@ enum SessionToolToggleBoundary {
     VirginPreparedResume,
 }
 
-/// Keep real owner admission and held generic provider work under deterministic test control.
-struct OwnerTransitionFixture {
-    root: tempfile::TempDir,
-    service: HarnessService,
-    controller: Arc<SessionController>,
-    session: String,
-    provider: Arc<crate::provider::Provider>,
-    engine: Arc<crate::provider::session_execution::SessionExecution>,
-    sink: MessageSender,
-    reader: tokio::task::JoinHandle<Result<()>>,
-    original: String,
-}
-
-/// Start one held root invocation without using retired restart or cancellation flags.
-async fn owner_transition_fixture() -> Result<OwnerTransitionFixture> {
-    use crate::provider::mock_response::MockResponseCommand;
-    let root = tempfile::tempdir()?;
-    crate::checks::configure_fixture(root.path());
-    let service = service();
-    service.open_session(1, initialize(&root, "mock")).await?;
-    let registry = service.registry().await?;
-    let session = registry.initial_session_id().to_owned();
-    let controller = registry.resolve(&session).await?;
-    controller.trace.configure_default(true)?;
-    controller.task_controller.change(
-        &mut SqliteStore::open(&controller.data_root)?,
-        None,
-        crate::task::TaskChange::Install(Box::new(crate::task::Task::goal(
-            "Preserve the original task".into(),
-            Default::default(),
-            1,
-        ))),
-        1,
-    )?;
-    let provider = controller.provider_handle();
-    let script = provider
-        .mock_response_control()
-        .context("fixture controls missing")?;
-    let hold = script
-        .dispatch(
-            &session,
-            MockResponseCommand::Hold {
-                mode: None,
-                any_session: false,
-            },
-        )
-        .await?;
-    let (sink, mut output) = forge_protocol::outbound::channel();
-    let reader = tokio::spawn(async move {
-        while output.recv().await?.is_some() {}
-        Ok(())
-    });
-    controller.attach_input(&sink).await?;
-    service.dispatch(Some(session.clone()), Request { id: 2, method: "session.input.apply".into(),
-        params: json!({"id":"original-owner-input","action":{"kind":"submit","message":{"id":"original-owner-input","text":"Keep this transcript through configuration","intent":"auto","attachments":[]}}}) }, &sink).await?;
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        script.dispatch(
-            &session,
-            MockResponseCommand::Wait {
-                id: hold["id"].as_str().unwrap().into(),
-            },
-        ),
-    )
-    .await??;
-    let original = SqliteStore::read_only(&controller.data_root)?
-        .latest_exchange(&session)?
-        .unwrap()
-        .id;
-    let execution_registry = controller.broker.lock().await.execution_registry();
-    let engine = execution_registry
-        .owner(crate::provider::ExecutionOwner::root(&session))
-        .await?;
-    Ok(OwnerTransitionFixture {
-        root,
-        service,
-        controller,
-        session,
-        provider,
-        engine,
-        sink,
-        reader,
-        original,
-    })
-}
-
-/// Preserve failed race fixtures and their final owner trace instead of losing timeout evidence.
-fn retain_owner_transition_failure(
-    fixture: OwnerTransitionFixture,
-    error: anyhow::Error,
-) -> anyhow::Error {
-    let trace_path = fixture
-        .controller
-        .trace
-        .session_status(&fixture.session)
-        .path;
-    let trace = std::fs::read_to_string(&trace_path)
-        .unwrap_or_else(|failure| format!("trace unavailable: {failure}"));
-    let tail = trace
-        .lines()
-        .rev()
-        .take(80)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let root = fixture.root.keep();
-    error.context(format!(
-        "retained owner fixture: {}; trace: {trace_path}\n{tail}",
-        root.display()
-    ))
-}
-
-/// Retain a custom provider fixture with the stage that stopped progressing.
-fn retain_cleanup_failure(
-    root: tempfile::TempDir,
-    controller: &SessionController,
-    error: anyhow::Error,
-) -> anyhow::Error {
-    let session = controller.observer.session_id();
-    let trace_path = controller.trace.session_status(session).path;
-    let trace = std::fs::read_to_string(&trace_path)
-        .unwrap_or_else(|failure| format!("trace unavailable: {failure}"));
-    let tail = trace
-        .lines()
-        .rev()
-        .take(80)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n");
-    let retained = root.keep();
-    error.context(format!(
-        "retained cleanup fixture: {}; trace: {trace_path}\n{tail}",
-        retained.display()
-    ))
-}
 /// Keep invocation tool changes on the initialized binding through collection and later input.
 #[tokio::test]
 async fn owner_session_tool_toggles_preserve_binding_and_observation() -> Result<()> {
@@ -161,7 +39,8 @@ async fn owner_session_tool_toggles_collect_prepared_continuation_and_reuse_bind
 
 /// Certify a same-binding history replacement that the real owner persists before configure returns.
 #[tokio::test]
-async fn owner_configuration_commits_ordered_identity_before_result_and_reuses_binding() -> Result<()> {
+async fn owner_configuration_commits_ordered_identity_before_result_and_reuses_binding()
+-> Result<()> {
     session_tool_toggle_boundary(SessionToolToggleBoundary::IdentityBeforeResult).await
 }
 
@@ -183,7 +62,8 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
     let dispatched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
     let (prepared, mut preparation) = tokio::sync::mpsc::unbounded_channel();
-    let identity_controller: Arc<std::sync::Mutex<std::sync::Weak<SessionController>>> = Arc::default();
+    let identity_controller: Arc<std::sync::Mutex<std::sync::Weak<SessionController>>> =
+        Arc::default();
     let descriptor = forge_providers::registry::descriptor(
         &forge_providers::registry::nonselectable_id().unwrap(),
     )
@@ -207,10 +87,17 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
                     .collect::<Vec<_>>(),
             ));
             async move {
-                let thread_id = identity_controller.lock().unwrap().upgrade()
+                let thread_id = identity_controller
+                    .lock()
+                    .unwrap()
+                    .upgrade()
                     .expect("native execution retains its session owner")
-                    .observer.snapshot().expect("fixture session snapshot remains readable")
-                    .session.provider_session_id.expect("opened fixture history is observed before input");
+                    .observer
+                    .snapshot()
+                    .expect("fixture session snapshot remains readable")
+                    .session
+                    .provider_session_id
+                    .expect("opened fixture history is observed before input");
                 let address = crate::provider::TurnAddress {
                     scope: request.scope.clone(),
                     thread_id,
@@ -263,7 +150,8 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
                 let completion = forge_provider_api::completion::ProviderCompletion {
                     provider_session_id: Some(address.thread_id.clone().try_into().unwrap()),
                     ..Default::default()
-                }.into();
+                }
+                .into();
                 sink.send_wait(crate::provider::ProviderEvent::Execution {
                     observation: ExecutionObservation::new(
                         request.scope,
@@ -284,11 +172,19 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
             }
         }
     });
-    if matches!(boundary, SessionToolToggleBoundary::Prepared | SessionToolToggleBoundary::VirginPreparedResume) {
+    native.with_models(vec![serde_json::from_value(json!({
+        "id":"fixture-model", "reasoning":["low","medium","high"],
+        "context_window":[], "vision":false, "is_default":true,
+    }))?]);
+    if matches!(
+        boundary,
+        SessionToolToggleBoundary::Prepared | SessionToolToggleBoundary::VirginPreparedResume
+    ) {
         let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         native.with_pre_dispatch(move |request| {
             let ordinal = preparations.fetch_add(1, Ordering::AcqRel);
-            let hold = matches!(boundary, SessionToolToggleBoundary::VirginPreparedResume) || ordinal == 1;
+            let hold =
+                matches!(boundary, SessionToolToggleBoundary::VirginPreparedResume) || ordinal == 1;
             let prepared = prepared.clone();
             async move {
                 if hold {
@@ -312,28 +208,51 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
         let native = Arc::downgrade(&native);
         let controller = identity_controller.clone();
         let configured = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        native.upgrade().unwrap().with_session_configure(move |binding, _| {
-            let native = native.upgrade().expect("configuration retains its adapter");
-            let controller = controller.lock().unwrap().upgrade().expect("configuration retains its session owner");
-            let history = format!("configured-tool-history-{}", configured.fetch_add(1, Ordering::AcqRel));
-            async move {
-                let owner = crate::provider::ExecutionOwner::root(controller.observer.session_id());
-                let sink = native.event_sink(&owner).await?;
-                if sink.binding_id() != &binding { return Err(crate::provider::ProviderError::DeliveryUncertain); }
-                sink.send_wait(crate::provider::ProviderEvent::SessionIdentity {
-                    scope: crate::provider::EventScope::Binding { owner },
-                    provider_session_id: history.clone().try_into().unwrap(),
-                }).await?;
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        let snapshot = controller.observer.snapshot().map_err(|_| crate::provider::ProviderError::DeliveryUncertain)?;
-                        if snapshot.session.provider_session_id.as_deref() == Some(history.as_str()) { break Ok::<(), crate::provider::ProviderError>(()); }
-                        tokio::task::yield_now().await;
+        native
+            .upgrade()
+            .unwrap()
+            .with_session_configure(move |binding, _| {
+                let native = native.upgrade().expect("configuration retains its adapter");
+                let controller = controller
+                    .lock()
+                    .unwrap()
+                    .upgrade()
+                    .expect("configuration retains its session owner");
+                let history = format!(
+                    "configured-tool-history-{}",
+                    configured.fetch_add(1, Ordering::AcqRel)
+                );
+                async move {
+                    let owner =
+                        crate::provider::ExecutionOwner::root(controller.observer.session_id());
+                    let sink = native.event_sink(&owner).await?;
+                    if sink.binding_id() != &binding {
+                        return Err(crate::provider::ProviderError::DeliveryUncertain);
                     }
-                }).await.map_err(|_| crate::provider::ProviderError::DeliveryUncertain)??;
-                Ok(())
-            }
-        });
+                    sink.send_wait(crate::provider::ProviderEvent::SessionIdentity {
+                        scope: crate::provider::EventScope::Binding { owner },
+                        provider_session_id: history.clone().try_into().unwrap(),
+                    })
+                    .await?;
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let snapshot = controller
+                                .observer
+                                .snapshot()
+                                .map_err(|_| crate::provider::ProviderError::DeliveryUncertain)?;
+                            if snapshot.session.provider_session_id.as_deref()
+                                == Some(history.as_str())
+                            {
+                                break Ok::<(), crate::provider::ProviderError>(());
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .map_err(|_| crate::provider::ProviderError::DeliveryUncertain)??;
+                    Ok(())
+                }
+            });
     }
     native.with_session_open({
         let opened = opened.clone();
@@ -353,7 +272,7 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
         crate::provider::test_support::ProviderTestSession::from_native(native.clone())?;
     let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
     broker.set_provider_for_test(provider_fixture.provider_handle());
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     *identity_controller.lock().unwrap() = Arc::downgrade(&controller);
     controller.trace.configure_default(true)?;
     let (sink, mut output) = forge_protocol::outbound::channel();
@@ -446,26 +365,52 @@ async fn session_tool_toggle_boundary(boundary: SessionToolToggleBoundary) -> Re
     let cleanup = async {
         controller.input_stopping.store(true, Ordering::Release);
         controller.coordinator.submissions.changed.notify_one();
-        tokio::time::timeout(Duration::from_secs(5), controller.finish_exchange_owner()).await
+        tokio::time::timeout(Duration::from_secs(5), controller.finish_exchange_owner())
+            .await
             .context("tool toggle owner shutdown did not settle")??;
-        provider_fixture.provider_handle().shutdown().await.context("tool toggle provider shutdown failed")?;
-        controller.finish_session_events().await.context("tool toggle observation shutdown failed")?;
+        provider_fixture
+            .provider_handle()
+            .shutdown()
+            .await
+            .context("tool toggle provider shutdown failed")?;
+        controller
+            .finish_session_events()
+            .await
+            .context("tool toggle observation shutdown failed")?;
         if matches!(boundary, SessionToolToggleBoundary::VirginPreparedResume) {
-        let session_id = controller.observer.session_id().to_owned();
-        let before = SqliteStore::read_only(&controller.data_root)?.list_exchange(&session_id)?;
-        ensure!(!before.is_empty(), "close removed the retained exchange");
-        controller.broker.lock().await.release_lease()?;
-        let mut request = initialize(&root, "mock");
-        request.session_id = Some(session_id.clone());
-        let resumed = HarnessBroker::initialize(request)?;
-        let snapshot = resumed.snapshot()?;
-        ensure!(snapshot.session.provider_session_id.is_none(), "positive nonconsumption retained an unusable native history");
-        ensure!(!snapshot.session_tools, "resume lost committed tool configuration");
-        let after = SqliteStore::read_only(resumed.data_root())?.list_exchange(&session_id)?;
-        ensure!(before.len() == after.len() && before.iter().zip(&after).all(|(before, after)| before.id == after.id && before.prompt == after.prompt && before.input_message_id == after.input_message_id && before.checkpoint_before == after.checkpoint_before), "native identity reset changed retained host history");
+            let session_id = controller.observer.session_id().to_owned();
+            let before =
+                SqliteStore::read_only(&controller.data_root)?.list_exchange(&session_id)?;
+            ensure!(!before.is_empty(), "close removed the retained exchange");
+            controller.broker.lock().await.release_lease()?;
+            let mut request = initialize(&root, "mock");
+            request.session_id = Some(session_id.clone());
+            let resumed = HarnessBroker::initialize(request)?;
+            let snapshot = resumed.snapshot()?;
+            ensure!(
+                snapshot.session.provider_session_id.is_none(),
+                "positive nonconsumption retained an unusable native history"
+            );
+            ensure!(
+                !snapshot.session_tools,
+                "resume lost committed tool configuration"
+            );
+            let after = SqliteStore::read_only(resumed.data_root())?.list_exchange(&session_id)?;
+            ensure!(
+                before.len() == after.len()
+                    && before
+                        .iter()
+                        .zip(&after)
+                        .all(|(before, after)| before.id == after.id
+                            && before.prompt == after.prompt
+                            && before.input_message_id == after.input_message_id
+                            && before.checkpoint_before == after.checkpoint_before),
+                "native identity reset changed retained host history"
+            );
         }
         Ok::<(), anyhow::Error>(())
-    }.await;
+    }
+    .await;
     if let Err(error) = cleanup {
         return Err(retain_cleanup_failure(root, &controller, error));
     }
@@ -562,6 +507,158 @@ async fn owner_model_changes_precede_pause_and_preserve_transcript() -> Result<(
     fixture.service.shutdown(Duration::from_secs(5)).await?;
     fixture.reader.abort();
     Ok(())
+}
+
+/// A fresh conversation must accept new input after cancellation proves its first input was unsent.
+#[tokio::test]
+async fn owner_cancel_before_first_acceptance_allows_immediate_new_input() -> Result<()> {
+    use crate::exchange::command::{CancelExchangeRequest, CancelledInputPolicy, Command};
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let (prepared, mut preparation) = tokio::sync::mpsc::unbounded_channel();
+    let (dispatched, mut dispatches) = tokio::sync::mpsc::unbounded_channel();
+    let owner: Arc<std::sync::Mutex<std::sync::Weak<SessionController>>> = Arc::default();
+    let observed_owner = owner.clone();
+    let descriptor = forge_providers::registry::descriptor(
+        &forge_providers::registry::nonselectable_id().unwrap(),
+    )
+    .unwrap();
+    let native = crate::provider::test_support::EventFixtureProvider::new(
+        descriptor,
+        move |request, sink, _cancelled| {
+            let dispatched = dispatched.clone();
+            let owner = observed_owner.clone();
+            async move {
+                use forge_provider_api::lifecycle::{
+                    ExecutionObservation, ExecutionResult, ExecutionUpdate,
+                };
+                let thread_id = owner
+                    .lock()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap()
+                    .observer
+                    .snapshot()
+                    .unwrap()
+                    .session
+                    .provider_session_id
+                    .unwrap();
+                let address = crate::provider::TurnAddress {
+                    scope: request.scope.clone(),
+                    thread_id,
+                    turn_id: request.scope.invocation_id.as_str().into(),
+                };
+                sink.send_wait(crate::provider::ProviderEvent::Execution {
+                    observation: ExecutionObservation::new(
+                        request.scope.clone(),
+                        ExecutionUpdate::Started {
+                            address: address.clone(),
+                        },
+                    )?,
+                })
+                .await?;
+                sink.send_wait(crate::provider::ProviderEvent::Turn {
+                    address: address.clone(),
+                    update: crate::provider::TurnUpdate::Started { started_at_ms: 1 },
+                })
+                .await?;
+                let _ = dispatched.send(request.input);
+                for event in crate::provider::test_support::message(
+                    &address,
+                    "reply",
+                    Some(crate::provider::MessageRole::Response),
+                    "New input completed",
+                ) {
+                    sink.send_wait(event).await?;
+                }
+                sink.send_wait(crate::provider::ProviderEvent::Turn {
+                    address: address.clone(),
+                    update: crate::provider::TurnUpdate::Finished {
+                        outcome: forge_provider_api::turn::TurnOutcome::Completed,
+                        completed_at_ms: 2,
+                    },
+                })
+                .await?;
+                sink.send_wait(crate::provider::ProviderEvent::Execution {
+                    observation: ExecutionObservation::new(
+                        request.scope,
+                        ExecutionUpdate::Finished {
+                            address: address.clone(),
+                            covered_submissions: vec![request.submission_id],
+                            completed_at_ms: 2,
+                            result: ExecutionResult::Completed {
+                                completion: forge_provider_api::completion::ProviderCompletion {
+                                    provider_session_id: Some(
+                                        address.thread_id.try_into().unwrap(),
+                                    ),
+                                    ..Default::default()
+                                }
+                                .into(),
+                            },
+                        },
+                    )?,
+                })
+                .await?;
+                Ok(())
+            }
+        },
+    );
+    native.with_models(vec![serde_json::from_value(json!({
+        "id":"fixture-model", "reasoning":["low","medium","high"],
+        "context_window":[], "vision":false, "is_default":true,
+    }))?]);
+    let preparations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    native.with_pre_dispatch(move |_| {
+        let first = preparations.fetch_add(1, Ordering::AcqRel) == 0;
+        let prepared = prepared.clone();
+        async move {
+            if first {
+                let _ = prepared.send(());
+                return std::future::pending().await;
+            }
+            Ok(())
+        }
+    });
+    let provider = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+    let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
+    broker.set_provider_for_test(provider.provider_handle());
+    let controller = SessionController::new(broker).await?;
+    *owner.lock().unwrap() = Arc::downgrade(&controller);
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    let scenario = async {
+        controller.start_provider(&sink).await;
+        controller.attach_input(&sink).await?;
+        prompt::apply(&controller, Request {
+            id: 700, method: "session.prompt.submit".into(),
+            params: json!({"operation_id":"first-before-acceptance","text":"First prompt"}),
+        }, &sink).await?;
+        tokio::time::timeout(Duration::from_secs(5), preparation.recv()).await?
+            .context("first input never reached pre-acceptance preparation")?;
+        controller.exchange_owner.execute_command(Command::CancelExchange(CancelExchangeRequest {
+            input: CancelledInputPolicy::RestoreIfUnconsumed,
+        })).await?;
+        prompt::apply(&controller, Request {
+            id: 701, method: "session.prompt.submit".into(),
+            params: json!({"operation_id":"new-after-early-cancel","text":"New prompt after cancellation"}),
+        }, &sink).await?;
+        let received = tokio::time::timeout(Duration::from_secs(5), dispatches.recv()).await;
+        ensure!(received.is_ok(), "new prompt was blocked after clean pre-acceptance cancellation: {:?}",
+            controller.coordinator.submissions.snapshot()?);
+        assert!(matches!(received?, Some(forge_provider_api::input::PromptInput::Text(text))
+            if text == "New prompt after cancellation"));
+        Ok::<(), anyhow::Error>(())
+    }.await;
+    controller.input_stopping.store(true, Ordering::Release);
+    controller.coordinator.submissions.changed.notify_one();
+    controller.finish_exchange_owner().await?;
+    provider.provider_handle().shutdown().await?;
+    controller.finish_session_events().await?;
+    reader.abort();
+    scenario
 }
 
 /// Two queued model changes must finish locally before cancellation settles their retained replacement.
@@ -770,7 +867,7 @@ async fn owner_model_changes_then_cancel_collects_undispatched_replacement() -> 
     let provider_fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
     let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
     broker.set_provider_for_test(provider_fixture.provider_handle());
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     controller.trace.configure_default(true)?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let reader = tokio::spawn(async move {
@@ -1115,6 +1212,10 @@ async fn owner_permission_timeout_retains_cleanup_and_prior_policy() -> Result<(
             }
         }
     });
+    native.with_models(vec![serde_json::from_value(json!({
+        "id":"fixture-model", "reasoning":["low","medium","high"],
+        "context_window":[], "vision":false, "is_default":true,
+    }))?]);
     native.with_cleanup({
         let started = started.clone();
         let release = release.clone();
@@ -1136,7 +1237,7 @@ async fn owner_permission_timeout_retains_cleanup_and_prior_policy() -> Result<(
     let provider_fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
     let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
     broker.set_provider_for_test(provider_fixture.provider_handle());
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     controller.trace.configure_default(true)?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let reader = tokio::spawn(async move {
@@ -1200,7 +1301,12 @@ async fn owner_permission_timeout_retains_cleanup_and_prior_policy() -> Result<(
         ));
     }
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(31)).await;
+    for _ in 0..=forge_provider_api::CleanupPolicy::Cancellation
+        .response_after()
+        .as_secs()
+    {
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
     let result = operation.await;
     tokio::time::resume();
     assert!(

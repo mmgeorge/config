@@ -1,3 +1,15 @@
+use super::super::native_permission;
+use super::super::{HarnessBroker, SessionController, prompt};
+use super::bootstrap::initialize;
+use super::owner_fixture::retain_cleanup_failure;
+use anyhow::{Context, Result};
+use forge_protocol::message::Request;
+use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
 /// Permanent command-result failure releases observers without dropping native cleanup ownership.
 #[tokio::test]
 async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() -> Result<()> {
@@ -92,7 +104,7 @@ async fn owner_permanent_storage_failure_releases_waiters_and_retains_cleanup() 
     let provider_fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
     let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
     broker.set_provider_for_test(provider_fixture.provider_handle());
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     controller.trace.configure_default(true)?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let reader = tokio::spawn(async move {
@@ -285,7 +297,7 @@ async fn owner_close_retries_failed_retirement_of_same_binding() -> Result<()> {
     let provider_fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
     let mut broker = HarnessBroker::initialize(initialize(&root, "mock"))?;
     broker.set_provider_for_test(provider_fixture.provider_handle());
-    let controller = SessionController::new(broker)?;
+    let controller = SessionController::new(broker).await?;
     controller.trace.configure_default(true)?;
     let (sink, mut output) = forge_protocol::outbound::channel();
     let reader = tokio::spawn(async move {

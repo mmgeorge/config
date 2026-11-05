@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use forge_provider_api::catalog::{McpDefinition, McpStatus, McpToolDefinition, SkillDefinition};
 use forge_provider_api::input::MessageInput;
 use forge_provider_api::submission::InputReceipt;
-use forge_provider_api::{Compaction, CompactionState, ProviderError, ProviderModel, ServiceTier};
+use forge_provider_api::{Compaction, CompactionState, ProviderError, ProviderModel};
 use github_copilot_sdk::rpc::*;
 use github_copilot_sdk::session_events::ReasoningSummary;
 use github_copilot_sdk::types::ContextTier;
@@ -86,16 +86,12 @@ impl CopilotClient {
                 .list_models()
                 .await
                 .context("list Copilot models")?;
-            if models.is_empty() {
-                Ok(vec![default_model_descriptor()])
-            } else {
-                let mut models: Vec<_> = models
-                    .into_iter()
-                    .map(super::catalog::model_descriptor)
-                    .collect();
-                super::catalog::order_models(&mut models);
-                Ok(models)
-            }
+            let mut models: Vec<_> = models
+                .into_iter()
+                .map(super::catalog::model_descriptor)
+                .collect();
+            super::catalog::order_models(&mut models);
+            Ok(models)
         }
         .await;
         result.map_err(|_| {
@@ -346,7 +342,7 @@ impl CopilotSession {
         context: Option<&str>,
     ) -> Result<(), ProviderError> {
         self.inner
-            .set_model(model, Some(model_options(effort, context)))
+            .set_model(model, Some(model_options(effort, context)?))
             .await
             .map(|_| ())
             .map_err(|_| {
@@ -355,6 +351,35 @@ impl CopilotSession {
                     forge_provider_api::error::ProviderFailureKind::Transport,
                 )
             })
+    }
+
+    /// Confirm that an idle configuration update applied instead of accepting a queued switch.
+    pub async fn set_model_confirmed(
+        &self,
+        model: &str,
+        effort: Option<String>,
+        context: Option<&str>,
+    ) -> Result<(), ProviderError> {
+        let options = model_options(effort, context)?;
+        let result = self
+            .inner
+            .rpc()
+            .model()
+            .switch_to(ModelSwitchToRequest {
+                model_id: model.to_owned(),
+                reasoning_effort: options.reasoning_effort,
+                reasoning_summary: options.reasoning_summary,
+                context_tier: options.context_tier,
+                ..Default::default()
+            })
+            .await
+            .map_err(|_| {
+                native_failure(
+                    forge_provider_api::ProviderOperation::SessionConfigure,
+                    forge_provider_api::ProviderFailureKind::Transport,
+                )
+            })?;
+        confirm_model_switch(model, &result)
     }
     pub async fn skills(&self) -> Result<Vec<SkillDefinition>, ProviderError> {
         let result: Result<Vec<SkillDefinition>> = async {
@@ -884,7 +909,7 @@ impl CopilotSession {
     pub async fn reconcile_skills(&self, selected: &[SkillSelection]) -> Result<(), ProviderError> {
         let result: Result<()> = async {
             let mut stage = "inspect Copilot skill selection";
-            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            super::operation::wait(async {
                 let loaded = self
                     .inner
                     .rpc()
@@ -946,39 +971,46 @@ impl CopilotSession {
     }
 }
 
-pub fn default_model_descriptor() -> ProviderModel {
-    ProviderModel {
-        service_tiers: vec![ServiceTier::Standard],
-        is_default: true,
-        id: "default".into(),
-        reasoning: Vec::new(),
-        default_reasoning: None,
-        selected_reasoning: None,
-        context_window: Vec::new(),
-        default_context_window: None,
-        selected_context_window: None,
-        vision: false,
-        description: None,
+/// Admit only an authoritative applied acknowledgement for the requested model.
+fn confirm_model_switch(model: &str, result: &ModelSwitchToResult) -> Result<(), ProviderError> {
+    if result.persistence_error.is_some() {
+        return Err(native_failure(
+            forge_provider_api::ProviderOperation::SessionConfigure,
+            forge_provider_api::ProviderFailureKind::Runtime,
+        ));
     }
+    if result.status.as_deref() != Some("applied")
+        || result.deferred == Some(true)
+        || result.model_id.as_deref() != Some(model)
+    {
+        return Err(native_failure(
+            forge_provider_api::ProviderOperation::SessionConfigure,
+            forge_provider_api::ProviderFailureKind::Protocol,
+        ));
+    }
+    Ok(())
 }
 
 pub fn model_options(
     reasoning_effort: Option<String>,
     context_window: Option<&str>,
-) -> SetModelOptions {
+) -> Result<SetModelOptions, ProviderError> {
     let mut options = SetModelOptions::default().with_reasoning_summary(ReasoningSummary::Concise);
     if let Some(reasoning_effort) = reasoning_effort {
         options = options.with_reasoning_effort(reasoning_effort);
     }
-    if let Some(context_window) = context_window {
-        let context_tier = match context_window {
-            "default" => ContextTier::Default,
-            "long_context" => ContextTier::LongContext,
-            _ => return options,
-        };
-        options = options.with_context_tier(context_tier);
-    }
-    options
+    let context_tier = match context_window {
+        None | Some("default") => ContextTier::Default,
+        Some("long_context") => ContextTier::LongContext,
+        Some(_) => {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::ContextWindowSelection,
+            )
+            .into());
+        }
+    };
+    options = options.with_context_tier(context_tier);
+    Ok(options)
 }
 
 /// Compare a native history message with the private digest in a Sending checkpoint.
@@ -1026,29 +1058,52 @@ fn native_failure(
 mod tests {
     use super::*;
 
+    /// A deferred or unconfirmed native model change must not become committed host configuration.
     #[test]
-    fn provides_an_auto_model_when_native_discovery_is_empty() {
-        let model = default_model_descriptor();
-        assert!(model.is_default);
-        assert_eq!(model.id, "default");
-        assert!(model.reasoning.is_empty());
-        assert!(model.context_window.is_empty());
+    fn confirms_only_applied_native_model_switches() {
+        let applied = ModelSwitchToResult {
+            status: Some("applied".into()),
+            deferred: Some(false),
+            model_id: Some("requested".into()),
+            ..Default::default()
+        };
+        assert!(confirm_model_switch("requested", &applied).is_ok());
+        for result in [
+            ModelSwitchToResult {
+                deferred: Some(true),
+                ..applied.clone()
+            },
+            ModelSwitchToResult {
+                status: Some("confirmation_required".into()),
+                ..applied.clone()
+            },
+            ModelSwitchToResult {
+                model_id: Some("previous".into()),
+                ..applied.clone()
+            },
+            ModelSwitchToResult::default(),
+        ] {
+            assert!(
+                matches!(confirm_model_switch("requested", &result), Err(ProviderError::Failure(error)) if error.kind() == forge_provider_api::ProviderFailureKind::Protocol)
+            );
+        }
+        assert!(
+            matches!(confirm_model_switch("requested", &ModelSwitchToResult { persistence_error:Some("fixture".into()), ..applied }), Err(ProviderError::Failure(error)) if error.kind() == forge_provider_api::ProviderFailureKind::Runtime)
+        );
     }
 
     #[test]
     fn applies_reasoning_and_context_to_a_native_model_switch() {
-        let options = model_options(Some("high".into()), Some("long_context"));
+        let options = model_options(Some("high".into()), Some("long_context")).unwrap();
         assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(options.reasoning_summary, Some(ReasoningSummary::Concise));
         assert!(matches!(
             options.context_tier,
             Some(ContextTier::LongContext)
         ));
-        for context in [None, Some("unknown")] {
-            assert_eq!(
-                model_options(None, context).reasoning_summary,
-                Some(ReasoningSummary::Concise)
-            );
-        }
+        let defaults = model_options(None, None).unwrap();
+        assert!(matches!(defaults.context_tier, Some(ContextTier::Default)));
+        assert_eq!(defaults.reasoning_summary, Some(ReasoningSummary::Concise));
+        assert!(model_options(None, Some("unknown")).is_err());
     }
 }

@@ -812,43 +812,45 @@ mod tests {
     /// Uncorrelated native work does not borrow a settled invocation's authority.
     #[tokio::test]
     async fn unsolicited_idle_turn_fails_observation() {
-        let (intake, sender, context, mut observed) = fixture().await;
-        drop(intake.attach(context).await.unwrap());
-        sender
-            .send(event(
-                "unowned-start",
-                "assistant.turn_start",
-                json!({"turnId":"second"}),
-            ))
+        for native_id in ["first", "second"] {
+            let (intake, sender, context, mut observed) = fixture().await;
+            drop(intake.attach(context).await.unwrap());
+            sender
+                .send(event(
+                    "unowned-start",
+                    "assistant.turn_start",
+                    json!({"turnId":native_id}),
+                ))
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let event = observed.recv().await.unwrap().unwrap();
+                    assert!(
+                        !matches!(event.event, ProviderEvent::Turn { .. }),
+                        "unadmitted work reached the host before ownership validation"
+                    );
+                    if let ProviderEvent::Execution { observation } = event.event
+                        && matches!(
+                            observation.update(),
+                            ExecutionUpdate::ObservationLost {
+                                failure: ObservationFailure::UnexpectedExecution,
+                                ..
+                            }
+                        )
+                    {
+                        break;
+                    }
+                }
+            })
             .await
             .unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let event = observed.recv().await.unwrap().unwrap();
-                assert!(
-                    !matches!(event.event, ProviderEvent::Turn { .. }),
-                    "unadmitted work reached the host before ownership validation"
-                );
-                if let ProviderEvent::Execution { observation } = event.event
-                    && matches!(
-                        observation.update(),
-                        ExecutionUpdate::ObservationLost {
-                            failure: ObservationFailure::UnexpectedExecution,
-                            ..
-                        }
-                    )
-                {
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert!(matches!(
-            *intake.failure.borrow(),
-            Some(ObservationFailure::UnexpectedExecution)
-        ));
-        intake.close().await.unwrap();
+            assert!(matches!(
+                *intake.failure.borrow(),
+                Some(ObservationFailure::UnexpectedExecution)
+            ));
+            intake.close().await.unwrap();
+        }
     }
 
     /// One failed reader wakes all active sessions sharing its native client, even under decoder locks.

@@ -6,7 +6,8 @@ use super::transition::ChildCollectionPolicy;
 use crate::broker::publication::SessionUpdate;
 use crate::broker::{
     ConfigurationCandidate, ConfigurationCatalogResult, ConfigurationEffect,
-    ConfigurationPreparation, ConfigurationReconcileResult, HarnessBroker,
+    ConfigurationPreparation, ConfigurationReconcileJob, ConfigurationReconcileResult,
+    HarnessBroker,
 };
 use crate::provider::ProviderModel;
 
@@ -16,16 +17,22 @@ pub(super) struct SettingsRun {
     owner: SettingsOwner,
     stage: SettingsStage,
     resource_notices: ResourceNoticePolicy,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl SettingsRun {
     /// Create a preflight phase that validates intent before interrupting any work.
-    pub(super) fn new(command: CommandId, patch: SessionConfigurationPatch) -> Self {
+    pub(super) fn new(
+        command: CommandId,
+        patch: SessionConfigurationPatch,
+        admitted_at: tokio::time::Instant,
+    ) -> Self {
         Self {
             patch,
             owner: SettingsOwner::Command(command),
             stage: SettingsStage::Preparing(PreparationPurpose::Inspect),
             resource_notices: ResourceNoticePolicy::Preserve,
+            deadline: Some(admitted_at + std::time::Duration::from_secs(30)),
         }
     }
 
@@ -38,6 +45,7 @@ impl SettingsRun {
             owner: SettingsOwner::Input,
             stage: SettingsStage::Preparing(PreparationPurpose::Inspect),
             resource_notices: ResourceNoticePolicy::Preserve,
+            deadline: None,
         })
     }
 
@@ -47,16 +55,26 @@ impl SettingsRun {
         self.stage = SettingsStage::Preparing(PreparationPurpose::Apply);
     }
 
+    /// Start internal settings timing only once it has acquired its enclosing execution admission.
+    fn operation_deadline(&mut self) -> tokio::time::Instant {
+        *self
+            .deadline
+            .get_or_insert_with(|| tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+    }
+
     /// Await one correlated settings fact without holding the broker or choosing a transition.
     pub(super) async fn next(&mut self) -> SettingsEvent {
+        let deadline = self.operation_deadline();
         match &mut self.stage {
-            SettingsStage::Catalog { task, deadline, .. } => tokio::select! {
+            SettingsStage::Catalog { task, .. } => tokio::select! {
+                biased;
                 result = task => SettingsEvent::Catalog(result.unwrap_or_else(|error| Err(OperationFailure::JobObservationLost(error)))),
-                _ = tokio::time::sleep_until(*deadline) => SettingsEvent::Deadline,
+                _ = tokio::time::sleep_until(deadline) => SettingsEvent::Deadline,
             },
-            SettingsStage::Reconcile { task, deadline, .. } => tokio::select! {
+            SettingsStage::Reconcile { task, .. } => tokio::select! {
+                biased;
                 result = task => SettingsEvent::Reconciled(result.unwrap_or_else(|error| Err(OperationFailure::JobObservationLost(error)))),
-                _ = tokio::time::sleep_until(*deadline) => SettingsEvent::Deadline,
+                _ = tokio::time::sleep_until(deadline) => SettingsEvent::Deadline,
             },
             SettingsStage::Preparing(_)
             | SettingsStage::Committing(_)
@@ -75,10 +93,18 @@ impl SettingsRun {
         can_commit: bool,
     ) -> Result<SettingsProgress, OperationFailure> {
         match self.advance(event, broker, can_commit) {
+            Err(OperationFailure::Reconciliation(source))
+                if ConfigurationReconcileJob::unchanged_failure(&source) =>
+            {
+                Err(OperationFailure::Validation(source.into()))
+            }
             Err(OperationFailure::Domain(source))
                 if source
                     .downcast_ref::<super::command::ConfigurationRejection>()
-                    .is_some() =>
+                    .is_some()
+                    || source
+                        .downcast_ref::<crate::provider::ProviderError>()
+                        .is_some_and(ConfigurationReconcileJob::unchanged_failure) =>
             {
                 Err(OperationFailure::Validation(source))
             }
@@ -114,16 +140,16 @@ impl SettingsRun {
                         )
                         .map_err(OperationFailure::Domain)?;
                     if preparation.needs_catalog(broker) {
-                        let job = broker
+                        let mut job = broker
                             .prepare_configuration_catalog()
                             .map_err(OperationFailure::Domain)?;
+                        job.restrict_deadline(self.operation_deadline());
                         self.stage = SettingsStage::Catalog {
                             purpose,
                             preparation,
                             task: tokio::spawn(async move {
                                 job.run().await.map_err(OperationFailure::Domain)
                             }),
-                            deadline: deadline(30),
                         };
                         return Ok(SettingsProgress::Waiting);
                     }
@@ -174,7 +200,6 @@ impl SettingsRun {
                     purpose,
                     preparation,
                     task: _,
-                    deadline: _,
                 } = stage
                 else {
                     unreachable!("catalog facts belong to the retained catalog task")
@@ -188,7 +213,6 @@ impl SettingsRun {
                 let SettingsStage::Reconcile {
                     mut candidate,
                     task: _,
-                    deadline: _,
                 } = stage
                 else {
                     unreachable!("reconciliation facts belong to the retained candidate task")
@@ -225,6 +249,11 @@ impl SettingsRun {
                 let _candidate = candidate;
                 match task.await {
                     Ok(Ok(_)) => Ok(()),
+                    Ok(Err(OperationFailure::Reconciliation(error)))
+                        if ConfigurationReconcileJob::unchanged_failure(&error) =>
+                    {
+                        Ok(())
+                    }
                     Ok(Err(_)) | Err(_) => Err(crate::provider::ProviderError::DeliveryUncertain),
                 }
             })),
@@ -277,20 +306,22 @@ impl SettingsRun {
             .prepare_candidate_reconcile(&candidate)
             .map_err(OperationFailure::Domain)?
         {
-            Some(job) => SettingsStage::Reconcile {
-                candidate,
-                task: tokio::spawn(async move {
-                    job.run().await.map_err(|error| {
-                        OperationFailure::Reconciliation(
-                            crate::provider::lifecycle_error::classify(
-                                forge_provider_api::ProviderOperation::SessionConfigure,
-                                error,
-                            ),
-                        )
-                    })
-                }),
-                deadline: deadline(60),
-            },
+            Some(mut job) => {
+                job.restrict_deadline(self.operation_deadline());
+                SettingsStage::Reconcile {
+                    candidate,
+                    task: tokio::spawn(async move {
+                        job.run().await.map_err(|error| {
+                            OperationFailure::Reconciliation(
+                                crate::provider::lifecycle_error::classify(
+                                    forge_provider_api::ProviderOperation::SessionConfigure,
+                                    error,
+                                ),
+                            )
+                        })
+                    }),
+                }
+            }
             None => SettingsStage::Committing(candidate),
         };
         Ok(SettingsProgress::Waiting)
@@ -348,20 +379,13 @@ enum SettingsStage {
         purpose: PreparationPurpose,
         preparation: Box<ConfigurationPreparation>,
         task: tokio::task::JoinHandle<Result<ConfigurationCatalogResult, OperationFailure>>,
-        deadline: tokio::time::Instant,
     },
     AwaitingCollection,
     Reconcile {
         candidate: Box<ConfigurationCandidate>,
         task: tokio::task::JoinHandle<Result<ConfigurationReconcileResult, OperationFailure>>,
-        deadline: tokio::time::Instant,
     },
     Committing(Box<ConfigurationCandidate>),
     Finalizing,
     Consumed,
-}
-
-/// Create an observation deadline; expiry does not abort the owned I/O task.
-fn deadline(seconds: u64) -> tokio::time::Instant {
-    tokio::time::Instant::now() + std::time::Duration::from_secs(seconds)
 }

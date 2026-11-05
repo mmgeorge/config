@@ -1,9 +1,77 @@
+use super::super::{HarnessBroker, foreground_goal_effect};
+use super::test_support::{check_fixture, planning_question_broker, repository};
+use anyhow::{Context, Result};
+use serde_json::{Value, json};
+use std::sync::Arc;
+
 /// Build a real persisted execution gate without an external model or platform-specific command.
 async fn workflow_gate_fixture() -> Result<(tempfile::TempDir, tempfile::TempDir, HarnessBroker)> {
     let workspace = repository();
     let data = tempfile::tempdir()?;
     let broker = check_fixture(workspace.path(), data.path(), vec!["exit 0".into()], true).await;
     Ok((workspace, data, broker))
+}
+
+/// A completed execution turn must schedule its next phase, including local checks.
+#[tokio::test]
+async fn execution_turn_completion_reserves_check_continuation_once() -> Result<()> {
+    let (_workspace, _data, mut broker) = workflow_gate_fixture().await?;
+    let task = broker.task_controller.current()?.unwrap();
+    assert_eq!(task.phase(), crate::task::TaskPhase::Check);
+    let turn = crate::task::TaskTurnId {
+        exchange_ordinal: 1,
+        turn_ordinal: 1,
+    };
+    let mut events = Vec::new();
+    assert!(broker.apply_goal_evidence_strict(
+        crate::goal::TurnEvidence {
+            workspace_changed: true,
+            ..Default::default()
+        },
+        Some(task.permit()),
+        turn.clone(),
+        &mut events,
+    )?);
+    let current = broker.task_controller.current()?.unwrap();
+    let continuation = current
+        .turn
+        .as_ref()
+        .unwrap()
+        .continuation
+        .as_ref()
+        .unwrap();
+    assert!(continuation.work.is_checks());
+    assert_eq!(
+        continuation.delivery,
+        crate::task::TaskInputDelivery::Pending
+    );
+    let id = continuation.id.clone();
+    assert!(!broker.apply_goal_evidence_strict(
+        Default::default(),
+        Some(current.permit()),
+        turn,
+        &mut events,
+    )?);
+    assert_eq!(
+        broker
+            .task_controller
+            .current()?
+            .unwrap()
+            .turn
+            .as_ref()
+            .unwrap()
+            .continuation
+            .as_ref()
+            .unwrap()
+            .id,
+        id
+    );
+    broker.run_checks().await?;
+    assert_eq!(
+        broker.task_controller.current()?.unwrap().phase(),
+        crate::task::TaskPhase::Verify
+    );
+    Ok(())
 }
 
 /// Invalidate automated evidence for changed files, configuration, task selection, and contracts.
@@ -411,6 +479,53 @@ async fn execution_control_rejects_exchange_changed_during_evidence_capture() ->
     assert_eq!(
         exchange.finalization_error.as_deref(),
         Some("newer exchange state")
+    );
+    Ok(())
+}
+
+/// Streamed timing updates do not revoke phase authority or get overwritten by its commit.
+#[tokio::test]
+async fn execution_control_preserves_progress_during_evidence_capture() -> Result<()> {
+    let (_workspace, _data, mut broker) = workflow_gate_fixture().await?;
+    broker.run_checks().await?;
+    let mut record = broker.current_execution()?.unwrap();
+    record.phase = crate::plan::PlanPhase::Resolve;
+    record.generation += 1;
+    let task = broker.task_controller.current()?.unwrap();
+    broker.task_controller.apply(
+        &mut broker.store,
+        &task.permit(),
+        crate::task::TaskEvent::ExecutionUpdated(Box::new(record.clone())),
+        3,
+    )?;
+    let task = broker.task_controller.current()?.unwrap();
+    let mut exchange = broker.store.latest_exchange(&broker.session.id)?.unwrap();
+    let job = broker.prepare_execution_control(
+        &record.id,
+        record.generation,
+        &task.permit(),
+        crate::plan::execution::ExecutionOperation::Phase(crate::plan::execution::PlanPhaseDone {
+            phase: record.phase,
+            revision: record.revision,
+            summary: "Resolved without source changes".into(),
+            verification: None,
+        }),
+        &exchange,
+    )?;
+    let evidence = job.run().await?;
+    exchange.metrics.observe_elapsed(123456);
+    let progress = serde_json::to_value(&exchange.metrics)?;
+    let stage = broker.apply_execution_control(evidence, &mut exchange)?;
+    match stage {
+        super::super::execution::ExecutionControlStage::Complete(_) => {}
+        super::super::execution::ExecutionControlStage::Report(job) => {
+            broker.commit_execution_control_report(job.run().await?, &mut exchange)?;
+        }
+    }
+    assert_eq!(serde_json::to_value(&exchange.metrics)?, progress);
+    assert_eq!(
+        broker.current_execution()?.unwrap().phase,
+        crate::plan::PlanPhase::Verify
     );
     Ok(())
 }

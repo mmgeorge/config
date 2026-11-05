@@ -112,12 +112,12 @@ mod tests {
     }
 
     /// Build a host session with generic provider behavior and independently retained storage.
-    fn controller(root: &std::path::Path) -> Result<Arc<SessionController>> {
+    async fn controller(root: &std::path::Path) -> Result<Arc<SessionController>> {
         let initialize: InitializeRequest = serde_json::from_value(json!({
             "workspace":root,"data_root":root.join("data"),"client_id":"settings-owner",
             "provider":{"kind":"mock","command":[]},
         }))?;
-        SessionController::new(HarnessBroker::initialize(initialize)?)
+        SessionController::new(HarnessBroker::initialize(initialize)?).await
     }
 
     /// Commit presentation policy without acquiring execution, and never reapply a durable replay.
@@ -125,7 +125,7 @@ mod tests {
     async fn host_setting_commits_while_execution_is_held_and_replay_does_not_write() -> Result<()>
     {
         let fixture = tempfile::tempdir()?;
-        let controller = controller(fixture.path())?;
+        let controller = controller(fixture.path()).await?;
         let execution = controller.coordinator.execution.acquire().await?;
         let control = controller
             .coordinator
@@ -179,7 +179,7 @@ mod tests {
     #[tokio::test]
     async fn model_and_effort_settings_apply_in_fifo_without_losing_fields() -> Result<()> {
         let fixture = tempfile::tempdir()?;
-        let controller = controller(fixture.path())?;
+        let controller = controller(fixture.path()).await?;
         let gate = controller
             .coordinator
             .control
@@ -216,7 +216,7 @@ mod tests {
     #[tokio::test]
     async fn question_model_override_and_clear_are_ordered_and_do_not_restart_root() -> Result<()> {
         let fixture = tempfile::tempdir()?;
-        let controller = controller(fixture.path())?;
+        let controller = controller(fixture.path()).await?;
         let root_model = controller.observer.snapshot()?.session.model;
         let execution = controller.coordinator.execution.acquire().await?;
         let control = controller
@@ -285,16 +285,13 @@ mod tests {
     #[tokio::test]
     async fn rejected_selection_does_not_fence_later_configuration() -> Result<()> {
         let fixture = tempfile::tempdir()?;
-        let controller = controller(fixture.path())?;
+        let controller = controller(fixture.path()).await?;
         let original = controller.observer.snapshot()?.session.model;
         let (messages, _output) = forge_protocol::outbound::channel();
         let rejected = controller
             .exchange_owner
             .execute_identified(
-                selection(
-                    "unavailable-model",
-                    json!({"model":"unavailable-choice","validate":true}),
-                )?,
+                selection("unavailable-model", json!({"model":"unavailable-choice"}))?,
                 messages.clone(),
             )
             .await;

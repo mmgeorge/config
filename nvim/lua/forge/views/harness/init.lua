@@ -1,3 +1,4 @@
+local activity = require("forge.views.harness.activity")
 local M = {}
 
 local client = require("forge.client")
@@ -123,9 +124,8 @@ end
 ---@return boolean
 function M.provider_switch_available()
   local state = session.harness
-  return state.session ~= nil and not state.busy and not state.switching_provider
-    and not state.configuring and not state.state_sync_pending
-    and not state.aborting_plan
+  return state.session ~= nil and not activity.busy(state) and not state.switching_provider
+    and not state.state_sync_pending
     and not (state.status and state.status.kind == "finalizing")
     and #(state.queue or {}) == 0 and #(state.pending_steer or {}) == 0
     and #(state.pending_submit or {}) == 0

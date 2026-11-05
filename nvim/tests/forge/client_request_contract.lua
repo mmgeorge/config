@@ -17,6 +17,8 @@ client._host_set_launcher_for_test(function(_, options, exited)
       requests[#requests + 1] = request
       if request.method == "host.initialize" then
         respond(request, { protocol_version = protocol.VERSION })
+      elseif request.method == "provider.registry.list" then
+        respond(request, dofile("nvim/tests/forge/support/provider_catalog.lua").registry())
       elseif request.method == "session.initialize" then
         if request.params.services_only then respond(request, { initialized = true })
         else initialize_request = request end
@@ -29,7 +31,7 @@ client._host_set_launcher_for_test(function(_, options, exited)
 end)
 
 local function await(predicate)
-  assert(vim.wait(1000, predicate, 5), "request contract fixture timed out")
+  assert(vim.wait(1000, predicate, 5), "request contract fixture timed out: " .. vim.inspect(requests))
 end
 local function last_request(method)
   for index = #requests, 1, -1 do
@@ -77,9 +79,11 @@ local succeeded, failure = xpcall(function()
   local tracing_complete = false
   client.request({ method = "host.trace.configure", session_id = "origin", params = { enabled = true } }, function()
     assert(session.harness == origin, "trace callback lost its explicit session context")
+    session.activate_harness(origin)
     tracing_complete = true
   end)
   await(function() return tracing_complete end)
+  assert(session.harness == active, "temporary rendering activation stole the selected session")
   assert(last_request("host.trace.configure").session_id == "origin")
   local order = {}
   client.request({ method = "session.state.get", session_id = "origin" }, function(result)

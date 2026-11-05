@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -13,68 +13,77 @@ pub enum CheckTiming {
     BetweenWork,
 }
 
-#[derive(Default)]
-/// Shares editor queue admission with the completion gate without the broker lock.
+/// Retain a check obligation while reading pending input from its canonical queue.
 pub(crate) struct CompletionQueue {
-    state: Mutex<QueueState>,
+    input: Arc<crate::input::SessionInputQueue>,
+    state: Mutex<CompletionObligation>,
 }
 
 #[derive(Default)]
-struct QueueState {
-    revision: u64,
-    pending: bool,
-    deferred: bool,
-    owner: Option<String>,
+enum CompletionObligation {
+    #[default]
+    None,
+    Deferred(String),
+    Ready(String),
 }
 
 impl CompletionQueue {
-    /// Adopts a newer editor queue snapshot and ignores reordered publications.
-    pub(crate) fn update(&self, revision: u64, pending: bool) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("completion queue lock poisoned"))?;
-        if revision > state.revision {
-            state.revision = revision;
-            state.pending = pending;
+    /// Read the same queue used by input admission; no mirrored pending flag is retained.
+    pub(crate) fn new(input: Arc<crate::input::SessionInputQueue>) -> Self {
+        Self {
+            input,
+            state: Mutex::new(CompletionObligation::None),
         }
-        Ok(())
     }
 
     /// Retains the completion obligation while later queued work can change its inputs.
     pub(crate) fn defer(&self, timing: CheckTiming, owner: &str) -> Result<bool> {
+        let pending = self.input.has_pending()?.1;
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("completion queue lock poisoned"))?;
-        if timing == CheckTiming::AfterQueue && state.pending {
-            state.deferred = true;
-            state.owner.get_or_insert_with(|| owner.to_owned());
+        if timing == CheckTiming::AfterQueue && pending {
+            let owner = match &*state {
+                CompletionObligation::None => owner.to_owned(),
+                CompletionObligation::Deferred(owner) | CompletionObligation::Ready(owner) => {
+                    owner.clone()
+                }
+            };
+            *state = CompletionObligation::Deferred(owner);
             return Ok(true);
         }
-        state.deferred = false;
+        if let CompletionObligation::Deferred(owner) = &*state {
+            *state = CompletionObligation::Ready(owner.clone());
+        }
         Ok(false)
     }
 
     /// Gets the outstanding queue completion obligation for the editor snapshot.
     pub(crate) fn deferred(&self) -> Result<bool> {
-        Ok(self
-            .state
-            .lock()
-            .ok()
-            .context("completion queue lock poisoned")?
-            .deferred)
+        Ok(matches!(
+            &*self
+                .state
+                .lock()
+                .ok()
+                .context("completion queue lock poisoned")?,
+            CompletionObligation::Deferred(_)
+        ))
     }
 
     /// Gets the first queued change owner until the batch completes validation.
     pub(crate) fn owner(&self) -> Result<Option<String>> {
-        Ok(self
+        let state = self
             .state
             .lock()
             .ok()
-            .context("completion queue lock poisoned")?
-            .owner
-            .clone())
+            .context("completion queue lock poisoned")?;
+        Ok(match &*state {
+            CompletionObligation::None => None,
+            CompletionObligation::Deferred(owner) | CompletionObligation::Ready(owner) => {
+                Some(owner.clone())
+            }
+        })
     }
 
     /// Releases a validated batch without dropping subsequently queued work.
@@ -83,8 +92,7 @@ impl CompletionQueue {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("completion queue lock poisoned"))?;
-        state.deferred = false;
-        state.owner = None;
+        *state = CompletionObligation::None;
         Ok(())
     }
 }

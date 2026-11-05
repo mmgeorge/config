@@ -1272,27 +1272,6 @@ fn creation_request(
     .map_err(Into::into)
 }
 
-/// Restore a legacy input reply from canonical question history using a read-only connection.
-pub(crate) fn restore_input_reply(
-    root: &Path,
-    session_id: &str,
-    question_id: &QuestionId,
-    message_id: &str,
-    kind: QuestionMessageKind,
-) -> Result<forge_provider_api::QuestionReply> {
-    let connection = Connection::open_with_flags(
-        root.join("harness.sqlite3"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
-    let (version, encoded): (u32, String) = connection.query_row(
-        "SELECT format_version,payload FROM session_question_state WHERE session_id=?1",
-        [session_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let state = decode_question_state(version, &encoded)?;
-    saved_reply(&state, question_id, message_id, kind)
-}
-
 /// Reconstruct one admitted reply without interpreting its old provider-rendered text.
 fn saved_reply(
     state: &QuestionState,

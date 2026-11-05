@@ -6,7 +6,7 @@ Optional fields serialize as JSON null unless an explicit skip rule says otherwi
 
 Session and snapshot revisions belong to one `runtime_epoch`. An asynchronous callback must still own the captured session, host generation, and epoch before applying these values. A snapshot does not transfer ownership of an interactive session. Exchange and timeline content arrive through their document or exchange APIs, rather than the skipped native fields below.
 
-`SessionPurpose` defaults to `conversation` for newly constructed session values. Stored sessions must still carry current host contract version 61; a missing or older version rejects before changed payloads decode. Internal Plan Review answer forks use `plan_review_answer`, remain available through explicit session access, and do not compete with user conversations during automatic startup selection. This purpose is selected by the native fork caller, not by the public request payload.
+`SessionPurpose` defaults to `conversation` for newly constructed session values. Stored sessions must still carry current host contract version 62; a missing or older version rejects before changed payloads decode. Internal Plan Review answer forks use `plan_review_answer`, remain available through explicit session access, and do not compete with user conversations during automatic startup selection. This purpose is selected by the native fork caller, not by the public request payload.
 
 ## InitializeRequest
 

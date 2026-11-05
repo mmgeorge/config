@@ -10,6 +10,8 @@ Settings that change mid-turn, or credentials copied into provider files, would 
 
 New sessions resolve saved defaults, and resumed sessions keep their own model and tuning. Native forks copy explicit session overrides into an independent layer.
 
+Executor and Background admission retain a catalog-validated model selection before committing it. Explicit model, reasoning, and service-tier requests must be supported; an empty reasoning catalog permits the provider default, not arbitrary levels. An executor inherits an accelerated tier only when its target model supports it, otherwise it uses standard processing. Both flows clear context-window overrides from the prior model. Background setup stores only default placeholders until validation succeeds, and generation requires the validated selection rather than raw configuration.
+
 Direct field edits merge into the latest settings layer inside an immediate SQLite transaction. They do not reuse a revision read before another request can commit. Whole-layer replacement retains its expected-revision check. Timeout edits serialize persistence and runtime publication per session without acquiring the active task or broker lock.
 
 ## Resources
@@ -27,8 +29,16 @@ A missing credential or stdio command marks only that server unavailable and log
 
 `ResourceProfile` links directories with NTFS junctions or symlinks and rejects traversing names. MCP launch values are redacted from traces. Selected skills receive read and script grants covering one canonical bundle, revoked when the execution ends.
 
+Antigravity supports initial resource selection and discovery, but its adapter cannot replace skill or MCP selections on an existing binding. The capability manifest marks those mutation operations unsupported independently of discovery.
+
+## ACP instructions
+
+ACP base instructions use the negotiated session-level `systemPrompt` append capability when available. The retained native configuration carries those instructions through endpoint and resource reloads; a fork supplies its target instructions rather than copying its source's instructions. Resumed conversations also receive a prompt prelude because the native CLI may retain its original system prompt until compaction. Without native append support, the adapter retains base instructions and prepends them to ordinary prompts. Dynamic invocation instructions remain separate. Native fork support is advertised only when target instructions can be preserved; unsupported instruction-bearing forks reject before native dispatch.
+
 ## Models
 
 `ProviderModel` is the provider-neutral picker contract: identifier, reasoning choices, context-window tiers, vision capability, and description. Opening the picker reloads the read-only catalog for an explicit workspace or exact live binding. Discovery cannot open a writable session or apply settings. Complete configuration writes go through `session_configure` after invocation settlement; its confirmed settings and capabilities publish together after the owner consumes the returned observation watermark. Codex resolves `default` through its catalog and sends the resolved model explicitly on thread creation, resume, and turn start, so the displayed and running models match. Copilot takes context capacity from `capabilities.limits.max_context_window_tokens`, never from billing thresholds.
 
 Codex maps each model's `serviceTiers` `priority` ID to Forge's `fast` choice, and selectors offer only tiers the model advertises. `ModelPinStore` keeps pins per backend, changed through `provider.model.pin.set` outside the broker lock.
+
+Known unsupported controls reject before adapter allocation or native changes. Inheritance resolves unavailable access choices against capabilities; explicit changes reject unsupported choices. Copilot requires a discovered default-model entry for omitted model selection. Empty discovery cannot manufacture a model or authorize unverified session creation.

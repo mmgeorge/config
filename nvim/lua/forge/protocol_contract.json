@@ -1,5 +1,5 @@
 {
-  "version": 35,
+  "version": 39,
   "node": {
     "kind": [
       "exchange",
@@ -23,6 +23,22 @@
     ]
   },
   "session": {
+    "command_completed": {
+      "route": "ignore",
+      "required": {
+        "id": "string",
+        "revision": "integer"
+      }
+    },
+    "activity_changed": {
+      "route": "handle",
+      "required": {
+        "runtime_epoch": "string",
+        "activity": "object",
+        "activity.revision": "integer",
+        "activity.phase": "string"
+      }
+    },
     "questions_changed": {
       "route": "handle",
       "required": {
@@ -40,13 +56,6 @@
       "route": "handle",
       "required": {
         "error": "string"
-      }
-    },
-    "task_operation": {
-      "route": "handle",
-      "required": {
-        "id": "string",
-        "state": "string"
       }
     },
     "document_changed": {
@@ -104,19 +113,23 @@
     },
     "session_fork_ready": {
       "route": "handle",
-      "required": {}
+      "required": { "snapshot": "object" }
     },
     "session_fork_failed": {
       "route": "handle",
-      "required": {}
+      "required": { "snapshot": "object" }
     },
     "session_changed": {
       "route": "handle",
-      "required": {}
+      "required": {
+        "snapshot": "object"
+      }
     },
     "session_configured": {
       "route": "handle",
-      "required": {}
+      "required": {
+        "snapshot": "object"
+      }
     },
     "agent_updated": {
       "route": "handle",
@@ -252,18 +265,25 @@
         "receipt_id": "string",
         "runtime_epoch": "string"
       }
+    },
+    "checks_changed": {
+      "route": "ignore",
+      "required": {}
     }
   },
   "provider": {
+    "cleanup_progress": {
+      "route": "handle",
+      "required": {
+        "data.operation_id": "string",
+        "data.policy": "string",
+        "data.state": "string",
+        "data.message": "string"
+      }
+    },
     "turn_started": {
       "route": "handle",
       "required": {}
-    },
-    "execution_state": {
-      "route": "handle",
-      "required": {
-        "data.session.id": "string"
-      }
     },
     "prompt_submission": {
       "route": "handle",
@@ -328,6 +348,12 @@
       "required": {
         "data.run_id": "string",
         "data.error": "string"
+      }
+    },
+    "terminals_changed": {
+      "route": "ignore",
+      "required": {
+        "data": "object"
       }
     }
   },

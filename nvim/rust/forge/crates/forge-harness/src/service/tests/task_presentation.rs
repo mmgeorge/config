@@ -1,3 +1,11 @@
+use super::bootstrap::{initialize, service};
+use super::reviewed_plan::reviewed_execution_fixture;
+use crate::storage::SqliteStore;
+use anyhow::Result;
+use forge_protocol::message::Request;
+use serde_json::json;
+use std::time::Duration;
+
 /// Retire review status when cancellation finishes without another provider turn.
 #[tokio::test]
 async fn plan_cancellation_retires_open_status_and_reopens_idle() -> Result<()> {
@@ -30,6 +38,13 @@ async fn plan_cancellation_retires_open_status_and_reopens_idle() -> Result<()> 
         !opened.status.block.is_empty(),
         "completed planning lost its review status"
     );
+    let publications =
+        crate::exchange::SessionPublications::open(&controller.data_root, &session_id)?;
+    let publication_limit = std::num::NonZeroU16::new(u16::MAX).unwrap();
+    let before_cancel = publications
+        .after(None, publication_limit)?
+        .last()
+        .map(|publication| publication.sequence());
     let cancellation = Request {
         id: 32,
         method: "session.plan.cancel".into(),
@@ -45,6 +60,22 @@ async fn plan_cancellation_retires_open_status_and_reopens_idle() -> Result<()> 
         crate::session::state_machine::SessionPhase::Idle
     ));
     assert!(snapshot.active_plan.is_none() && snapshot.active_elicitation.is_none());
+    let cancelled_publications = publications.after(before_cancel, publication_limit)?;
+    let document_position = cancelled_publications
+        .iter()
+        .position(|publication| publication.event().event == "document_changed")
+        .expect("cancellation must invalidate the open document without another provider turn");
+    assert!(document_position > 0);
+    let preceding = cancelled_publications[document_position - 1].event();
+    assert_eq!(preceding.event, "session_changed");
+    assert_eq!(preceding.payload["snapshot"]["status"]["kind"], "idle");
+    assert_eq!(
+        cancelled_publications[document_position].event().payload["status"]["kind"],
+        "idle"
+    );
+    let after_cancel = cancelled_publications
+        .last()
+        .map(|publication| publication.sequence());
     let cancelled_status = {
         let mut presentation = controller.presentation.lock().unwrap();
         let settled = presentation.sync(&document, opened.transcript.revision)?;
@@ -59,6 +90,13 @@ async fn plan_cancellation_retires_open_status_and_reopens_idle() -> Result<()> 
         .dispatch(Some(session_id), cancellation, &sink)
         .await?;
     assert!(controller.task_controller.current()?.is_none());
+    assert!(
+        publications
+            .after(after_cancel, publication_limit)?
+            .iter()
+            .all(|publication| publication.event().event != "document_changed"),
+        "replaying cancellation republished the document invalidation"
+    );
     {
         let mut presentation = controller.presentation.lock().unwrap();
         let replayed = presentation.sync(&document, opened.transcript.revision)?;

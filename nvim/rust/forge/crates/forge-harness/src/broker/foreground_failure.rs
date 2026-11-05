@@ -281,8 +281,37 @@ impl HarnessBroker {
         transaction: &mut ForegroundTransaction,
         error: anyhow::Error,
     ) -> Result<ForegroundAction> {
+        self.trace.record(&self.session.id, "exchange.foreground.failure_classified", json!({
+            "exchange_id":transaction.state.scope.exchange_id,
+            "error_code": if error.is::<crate::task::StaleTask>() { "task_authority_revoked" }
+                else if error.is::<TurnCancelled>() { "turn_cancelled" }
+                else if error.downcast_ref::<ProviderError>().is_some_and(ProviderError::is_clean_cancellation) { "provider_cancelled" }
+                else { "foreground_failure" },
+        }));
+        // Cancellation revokes the old task authority before its final worker results drain.
+        // Preserve scoped cancellation instead of closing the binding for that expected revocation.
+        let error = if matches!(
+            transaction.collection,
+            Some(ForegroundCollection::Cancel(_))
+        ) && (error.is::<crate::task::StaleTask>()
+            || error
+                .downcast_ref::<ProviderError>()
+                .is_some_and(ProviderError::is_clean_cancellation))
+        {
+            TurnCancelled.into()
+        } else {
+            error
+        };
         transaction.fail_live_host_observer(&self.trace, &self.session.id);
         if transaction.failure_cleanup_active {
+            if error.is::<TurnCancelled>()
+                && matches!(
+                    transaction.collection,
+                    Some(ForegroundCollection::Cancel(_))
+                )
+            {
+                return Ok(ForegroundAction::Wait);
+            }
             let message = format!("additional foreground failure: {error:#}");
             if let Some(failure) = &mut transaction.failure {
                 failure.secondary.push(message);
@@ -850,8 +879,7 @@ impl HarnessBroker {
             "tools_blocked":transaction.state.runtime.as_ref().is_some_and(ExchangeRuntime::tools_blocked),
             "retraction_eligible":transaction.state.runtime.as_ref().is_some_and(|runtime| runtime.retraction_eligible),
             "native_rollback":self.capability.native_turn_rollback,
-            "restore_prompt":transaction.native.cancellation.restore_prompt.load(Ordering::Acquire),
-            "retraction_allowed":transaction.native.cancellation.retraction_allowed.load(Ordering::Acquire),
+            "restore_unconsumed_prompt":matches!(transaction.collection, Some(ForegroundCollection::Cancel(crate::exchange::command::CancelledInputPolicy::RestoreIfUnconsumed))),
         }));
         if matches!(failure.baseline_cleanup, FailureBaselinePhase::Pending) {
             return Ok(ForegroundAction::Wait);
@@ -863,24 +891,19 @@ impl HarnessBroker {
                 .runtime
                 .as_ref()
                 .is_some_and(|runtime| runtime.retraction_eligible)
-            && transaction
-                .native
-                .cancellation
-                .restore_prompt
-                .load(Ordering::Acquire)
-            && transaction
-                .native
-                .cancellation
-                .retraction_allowed
-                .load(Ordering::Acquire);
+            && matches!(
+                transaction.collection,
+                Some(ForegroundCollection::Cancel(
+                    crate::exchange::command::CancelledInputPolicy::RestoreIfUnconsumed
+                ))
+            );
         let never_consumed = if restoration_authorized
             && matches!(failure.baseline_cleanup, FailureBaselinePhase::Unexamined)
             && let Some(submission) = &transaction.request.submission
         {
             if matches!(
                 submission.retire_prepared()?,
-                crate::provider::submission::SubmissionRetirement::Prevented
-                    | crate::provider::submission::SubmissionRetirement::AlreadyCancelled
+                crate::provider::submission::SubmissionRetirement::Cancelled
             ) {
                 Some((submission.clone(), submission.record()?.attempt_id))
             } else {
@@ -1844,7 +1867,7 @@ mod tests {
                 super::super::test::planning_question_broker(workspace.path(), data.path(), false);
             broker.checkpoint = None;
             broker.capability.native_turn_rollback = false;
-            broker.turn_cancellation.arm(true);
+            broker.turn_cancellation.arm();
             let original_model = broker.session.resolved_model.clone();
             let prompt = "Keep this exact draft: α\nsecond line";
             let (sink, _updates) = publication::channel();
@@ -1883,7 +1906,7 @@ mod tests {
                 Boundary::Prepared => {}
                 Boundary::AlreadyPrevented => assert_eq!(
                     submission.retire_prepared()?,
-                    SubmissionRetirement::Prevented
+                    SubmissionRetirement::Cancelled
                 ),
                 Boundary::Sending => submission.sending(None)?,
             }
@@ -1892,8 +1915,11 @@ mod tests {
             transaction.native.pending_submission.take();
             transaction.native_open = false;
             broker.session.resolved_model = Some("discard this temporary admission value".into());
-            broker.turn_cancellation.begin_cleanup(true)?;
-            broker.turn_cancellation.request(true);
+            broker.turn_cancellation.block_submissions();
+            broker.turn_cancellation.request();
+            transaction.collection = Some(ForegroundCollection::Cancel(
+                crate::exchange::command::CancelledInputPolicy::RestoreIfUnconsumed,
+            ));
             let mut dispatch = ForegroundDispatch::Running {
                 transaction: Box::new(transaction),
                 admission,
@@ -1976,6 +2002,85 @@ mod tests {
             }
             engine.close().await?;
         }
+        Ok(())
+    }
+
+    /// Running cancellation carries positive collection into failure settlement and ignores repeated task revocation.
+    #[tokio::test]
+    async fn running_cancellation_retains_collection_proof_and_deduplicates_revocation()
+    -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.checkpoint = None;
+        let (sink, _updates) = publication::channel();
+        let ForegroundDispatch::Admitting(admission) = broker.begin_foreground_dispatch(
+            Request {
+                id: 97,
+                method: "session.prompt.submit".into(),
+                params: json!({"text":"cancel running task"}),
+            },
+            sink,
+        )?
+        else {
+            anyhow::bail!("fixture admission missing")
+        };
+        let mut staged = broker.stage_foreground_interaction(
+            "cancel running task",
+            PromptMode::Chat,
+            Some(&ExchangeAdmission::chat("cancel running task".into())),
+            ProviderInput::from_text("cancel running task"),
+        )?;
+        broker.begin_exchange_runtime(&mut staged.exchange, broker.clock.now_ms())?;
+        let engine = broker
+            .execution_registry()
+            .owner(crate::provider::ExecutionOwner::root(&broker.session.id))
+            .await?;
+        let transaction = broker.construct_foreground_transaction(&staged, engine.clone())?;
+        let mut dispatch = ForegroundDispatch::Running {
+            transaction: Box::new(transaction),
+            admission,
+        };
+        let collection =
+            ForegroundCollection::Cancel(crate::exchange::command::CancelledInputPolicy::Retain);
+        assert!(matches!(
+            broker.step_foreground(
+                &mut dispatch,
+                ForegroundSignal::CollectionStarted(collection)
+            )?,
+            ForegroundAction::Wait
+        ));
+        let ForegroundDispatch::Running {
+            transaction,
+            admission,
+        } = &mut dispatch
+        else {
+            unreachable!()
+        };
+        assert!(admission.owner_collection_pending());
+        let first = broker.fail_foreground(transaction, crate::task::StaleTask.into())?;
+        assert!(
+            matches!(&first, ForegroundAction::CancelJobsAndEffect(ForegroundJob::CleanupForeground { original, .. }) if original.is::<TurnCancelled>())
+        );
+        assert!(matches!(
+            broker.fail_foreground(transaction, crate::task::StaleTask.into())?,
+            ForegroundAction::Wait
+        ));
+        assert!(transaction.failure_secondary.is_empty());
+        drop(first);
+        assert!(matches!(
+            broker.step_foreground(
+                &mut dispatch,
+                ForegroundSignal::CollectionCompleted(collection)
+            )?,
+            ForegroundAction::Wait
+        ));
+        let ForegroundDispatch::Running { admission, .. } = &dispatch else {
+            unreachable!()
+        };
+        assert!(admission.owner_collection_complete());
+        engine.close().await?;
         Ok(())
     }
 

@@ -48,7 +48,7 @@ impl AskModel {
             .clone()
             .or_else(|| selected.default_reasoning.clone());
         if let Some(effort) = &effort
-            && !selected.reasoning.is_empty()
+            && effort != "default"
             && !selected.reasoning.contains(effort)
         {
             return Err(AskModelError::EffortUnavailable);

@@ -51,8 +51,14 @@ impl From<SessionUpdate> for LiveUpdate {
 
 #[derive(Clone, Debug)]
 pub enum SessionUpdate {
+    /// Invalidate check catalogs after a committed check update.
+    ChecksChanged,
+    /// Publish adapter-owned terminal inventory independently of foreground work.
+    Terminals {
+        snapshot: forge_provider_api::terminal::TerminalSnapshot,
+    },
     ExecutionState {
-        session: Box<crate::session::HarnessSession>,
+        snapshot: Box<super::BrokerSnapshot>,
     },
     Submission {
         transition: SubmissionUpdate,
@@ -87,14 +93,19 @@ pub enum SessionUpdate {
         patch: crate::timeline::stream::TimelinePatch,
     },
     Configuration {
-        session: Box<crate::session::HarnessSession>,
-        access_abbreviation: String,
+        snapshot: Box<super::BrokerSnapshot>,
         operation_id: Option<String>,
         catalog: Box<crate::provider::ProviderCatalogRequest>,
     },
     ConfigurationProgress {
         operation_id: String,
         state: ConfigurationProgressState,
+    },
+    /// Publish cleanup observation without claiming execution failure or settlement.
+    CleanupProgress {
+        operation_id: String,
+        policy: forge_provider_api::CleanupPolicy,
+        progress: forge_provider_api::CleanupProgress,
     },
     Diagnostic {
         diagnostic: ProviderDiagnostic,
@@ -160,6 +171,9 @@ pub struct PlanProgressUpdate {
 impl SessionUpdate {
     pub fn from_observation(event: &ProviderEvent) -> Option<Self> {
         match event {
+            ProviderEvent::Terminals { snapshot, .. } => Some(Self::Terminals {
+                snapshot: snapshot.clone(),
+            }),
             ProviderEvent::Approval { update, .. } => Some(Self::Approval {
                 update: Box::new(update.clone()),
             }),
@@ -212,8 +226,12 @@ impl SessionUpdate {
 
 pub fn encode_session_update(update: &SessionUpdate) -> Result<Value, serde_json::Error> {
     let (kind, text, data) = match update {
-        SessionUpdate::ExecutionState { session } => {
-            ("execution_state", None, json!({"session":session}))
+        SessionUpdate::ChecksChanged => ("checks_changed", None, json!({})),
+        SessionUpdate::Terminals { snapshot } => {
+            ("terminals_changed", None, serde_json::to_value(snapshot)?)
+        }
+        SessionUpdate::ExecutionState { snapshot } => {
+            ("execution_state", None, json!({"snapshot":snapshot}))
         }
         SessionUpdate::Submission { transition } => {
             ("prompt_submission", None, serde_json::to_value(transition)?)
@@ -268,14 +286,13 @@ pub fn encode_session_update(update: &SessionUpdate) -> Result<Value, serde_json
         ),
         SessionUpdate::DocumentChanged { patch } => return Ok(patch.notification()),
         SessionUpdate::Configuration {
-            session,
-            access_abbreviation,
+            snapshot,
             operation_id,
-            catalog,
+            catalog: _,
         } => (
             "configuration_applied",
             None,
-            json!({"session":session,"access_abbreviation":access_abbreviation,"operation_id":operation_id,"catalog":catalog}),
+            json!({"snapshot":snapshot,"operation_id":operation_id}),
         ),
         SessionUpdate::ConfigurationProgress {
             operation_id,
@@ -284,6 +301,26 @@ pub fn encode_session_update(update: &SessionUpdate) -> Result<Value, serde_json
             "configuration_progress",
             None,
             json!({"operation_id":operation_id,"state":state}),
+        ),
+        SessionUpdate::CleanupProgress {
+            operation_id,
+            policy,
+            progress,
+        } => (
+            "cleanup_progress",
+            Some(policy.message(*progress).to_owned()),
+            json!({
+                "operation_id": operation_id,
+                "policy": match policy {
+                    forge_provider_api::CleanupPolicy::Cancellation => "cancellation",
+                    forge_provider_api::CleanupPolicy::Close => "close",
+                },
+                "state": match progress {
+                    forge_provider_api::CleanupProgress::Pending => "pending",
+                    forge_provider_api::CleanupProgress::TimedOut => "timed_out",
+                },
+                "message": policy.message(*progress),
+            }),
         ),
         SessionUpdate::Diagnostic { diagnostic } => (
             "error",
@@ -307,9 +344,11 @@ pub(crate) fn encode_session_event(
     let payload = encode_session_update(update)?;
     let (event, payload) = match update {
         SessionUpdate::ContextCompacted { .. } => ("context_compacted", payload["data"].clone()),
+        SessionUpdate::ExecutionState { .. } => ("session_changed", payload["data"].clone()),
         SessionUpdate::Configuration { .. } => ("session_configured", payload["data"].clone()),
         SessionUpdate::DocumentChanged { .. } => ("document_changed", payload),
-        SessionUpdate::ExecutionState { .. }
+        SessionUpdate::ChecksChanged => ("checks_changed", json!({})),
+        SessionUpdate::Terminals { .. }
         | SessionUpdate::Submission { .. }
         | SessionUpdate::Approval { .. }
         | SessionUpdate::Agent { .. }
@@ -319,6 +358,7 @@ pub(crate) fn encode_session_event(
         | SessionUpdate::Timeline { .. }
         | SessionUpdate::PlanProgress { .. }
         | SessionUpdate::ConfigurationProgress { .. }
+        | SessionUpdate::CleanupProgress { .. }
         | SessionUpdate::Diagnostic { .. }
         | SessionUpdate::CheckFailure { .. } => ("provider_event", payload),
     };

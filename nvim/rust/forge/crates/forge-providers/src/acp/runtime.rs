@@ -15,6 +15,8 @@ pub struct RuntimeStatus {
     pub adapter_version: Option<String>,
     pub command: Vec<String>,
     pub environment: BTreeMap<String, String>,
+    #[serde(skip)]
+    native_command: Option<Vec<String>>,
 }
 
 /// Resolve configured ACP adapters or the supported managed installation.
@@ -22,6 +24,7 @@ pub struct AcpRuntime {
     kind: ProviderKind,
     command: Vec<String>,
     root: PathBuf,
+    native_command: Option<Vec<String>>,
 }
 
 impl AcpRuntime {
@@ -32,11 +35,37 @@ impl AcpRuntime {
         } else {
             "antigravity"
         };
-        Self {
+        let mut runtime = Self {
             kind,
             command,
             root: root.join("provider-runtime").join(name),
+            native_command: None,
+        };
+        if kind == ProviderKind::Claude {
+            let executable = std::env::var_os("CLAUDE_CODE_EXECUTABLE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+                .or_else(|| forge_shell::process::executable("claude"));
+            if let Some(executable) = executable {
+                runtime.select_native_command(vec![executable.to_string_lossy().into_owned()]);
+            }
         }
+        runtime
+    }
+
+    /// Get the adapter identity whose native launch this resolver owns.
+    pub(super) fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+
+    /// Select an explicit native executable and its fixed launcher arguments before resolution.
+    pub(super) fn select_native_command(&mut self, mut command: Vec<String>) {
+        if let Some(program) = command.first_mut()
+            && let Some(resolved) = forge_shell::process::executable(program)
+        {
+            *program = resolved.to_string_lossy().into_owned();
+        }
+        self.native_command = Some(command);
     }
 
     fn managed_version(&self) -> &'static str {
@@ -106,6 +135,14 @@ impl AcpRuntime {
                 );
             }
         }
+        let native_command = self.native_command.clone().or_else(|| {
+            environment
+                .get("CLAUDE_CODE_EXECUTABLE")
+                .map(|program| vec![program.clone()])
+        });
+        if let Some(program) = native_command.as_ref().and_then(|command| command.first()) {
+            environment.insert("CLAUDE_CODE_EXECUTABLE".into(), program.clone());
+        }
         if program.is_none()
             && self.default_command()
             && let Some(command) = self.managed_command(&self.root.join(self.managed_version()))
@@ -116,6 +153,7 @@ impl AcpRuntime {
                 adapter_version: Some(self.managed_version().into()),
                 command,
                 environment,
+                native_command,
             };
         }
         RuntimeStatus {
@@ -124,6 +162,7 @@ impl AcpRuntime {
             adapter_version: None,
             command,
             environment,
+            native_command,
         }
     }
 
@@ -139,33 +178,99 @@ impl AcpRuntime {
 }
 
 impl RuntimeStatus {
+    /// Validate slash-command suppression against the exact selected native executable before opening history.
+    pub(super) async fn validate_native_claude(
+        &self,
+        context: &forge_provider_api::OperationContext,
+    ) -> Result<forge_provider_api::version::ValidatedRuntime, forge_provider_api::ProviderError>
+    {
+        // Pinned contract: @anthropic-ai/claude-agent-sdk@0.3.312 sdk.d.ts, verbatimPrompts.
+        // Older native CLIs ignore client_composed and can dispatch /goal from ordinary input.
+        let requirement = forge_provider_api::version::RuntimeRequirement::new(
+            ProviderKind::Claude.id(),
+            self.native_command
+                .as_ref()
+                .and_then(|command| command.first())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("claude")),
+            semver::Version::new(2, 1, 248),
+        );
+        let reported = self.provider_version(context).await.map_err(|_| {
+            forge_provider_api::ProviderError::from(
+                requirement
+                    .probe_failed(forge_provider_api::version::RuntimeProbeFailure::Unavailable),
+            )
+        })?;
+        Ok(requirement.validate(reported.as_deref())?)
+    }
+
     /// Report the native executable selected for ACP and terminal authentication.
     pub async fn provider_version(
         &self,
+        context: &forge_provider_api::OperationContext,
     ) -> Result<Option<String>, forge_provider_api::ProviderError> {
-        let Some(program) = self.environment.get("CLAUDE_CODE_EXECUTABLE") else {
+        let Some((program, arguments)) = self
+            .native_command
+            .as_ref()
+            .and_then(|command| command.split_first())
+        else {
             return Ok(None);
         };
-        let mut command = forge_shell::process::command(program, &["--version".into()]);
+        context.check_admission(forge_provider_api::ProviderOperation::Inspect)?;
+        use tokio::io::AsyncReadExt;
+        let mut command = forge_shell::process::command(program, arguments);
+        command.arg("--version");
         command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let child = forge_shell::process::spawn_owned(command)
+            .stderr(std::process::Stdio::null());
+        let mut child = forge_shell::process::spawn_owned(command)
             .map_err(|_| version_failure(forge_provider_api::ProviderFailureKind::Runtime))?;
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            Box::into_pin(child.wait_with_output()),
-        )
-        .await
-        .map_err(|_| version_failure(forge_provider_api::ProviderFailureKind::Timeout))?
-        .map_err(|_| version_failure(forge_provider_api::ProviderFailureKind::Runtime))?;
-        if !output.status.success() {
+        // SAFETY: Taking stdout preserves the wrapped child's identity and collection ownership.
+        let mut stdout = unsafe { child.try_inner_child_mut() }
+            .and_then(|child| child.stdout.take())
+            .ok_or_else(|| version_failure(forge_provider_api::ProviderFailureKind::Runtime))?;
+        let mut reader = tokio::spawn(async move {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output).await.map(|_| output)
+        });
+        // Keep process collection in the retained worker after the original budget expires.
+        let result = tokio::select! {
+            biased;
+            result = async {
+                let status = child.wait().await;
+                let output = (&mut reader).await;
+                (status, output)
+            } => Some(result),
+            _ = context.interrupted() => None,
+        };
+        let (status, output) = match result {
+            Some(result) => result,
+            None => {
+                let collected = Box::into_pin(child.kill()).await;
+                let _ = reader.await;
+                collected.map_err(|_| {
+                    version_failure(forge_provider_api::ProviderFailureKind::Runtime)
+                })?;
+                return Err(context.interrupted().await.failure(
+                    forge_provider_api::ProviderOperation::Inspect,
+                    forge_provider_api::ProviderPhase::Observation,
+                    forge_provider_api::FailureDisposition::Unchanged,
+                ));
+            }
+        };
+        let output = output
+            .map_err(|_| version_failure(forge_provider_api::ProviderFailureKind::Runtime))?
+            .map_err(|_| version_failure(forge_provider_api::ProviderFailureKind::Runtime))?;
+        if !status
+            .map_err(|_| version_failure(forge_provider_api::ProviderFailureKind::Runtime))?
+            .success()
+        {
             return Err(version_failure(
                 forge_provider_api::ProviderFailureKind::Runtime,
             ));
         }
-        parse_claude_version(&output.stdout).map(Some)
+        parse_claude_version(&output).map(Some)
     }
 }
 

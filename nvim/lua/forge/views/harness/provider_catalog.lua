@@ -76,8 +76,7 @@ function M.models(force, callback)
     local active = state.session or {}
     local active_model = active.model == "default" and active.resolved_model or active.model
     local context_size = active.context_usage and tonumber(active.context_usage.size)
-    local selected = vim.tbl_extend("force", state.session or {}, state.configuring_config or {},
-      state.task_config or {})
+    local selected = state.session or {}
     for _, model in ipairs(models) do
       if model.id == selected.model or (selected.model == "default" and model.is_default) then
         if selected.effort and selected.effort ~= "default" then model.selected_reasoning = selected.effort end
@@ -86,17 +85,13 @@ function M.models(force, callback)
       if context_size and context_size > 0
         and (model.id == active_model or (active_model == "default" and model.is_default)) then
         local context_id = active.context_window or model.default_context_window or "default"
-        model.context_window = model.context_window or {}
         ---@type {id: string, token_limit: integer?}?
         local active_context
-        for _, context in ipairs(model.context_window) do
+        for _, context in ipairs(model.context_window or {}) do
           if context.id == context_id then active_context = context break end
         end
-        if not active_context then
-          active_context = { id = context_id }
-          model.context_window[#model.context_window + 1] = active_context
-        end
-        active_context.token_limit = context_size
+        if active_context then active_context.token_limit = context_size
+        else model.observed_context_token_limit = context_size end
       end
     end
     callback(models, nil)
@@ -115,47 +110,13 @@ function M.models(force, callback)
   end)
 end
 
-local function mutate(method, cache, name, enabled, callback, resource_id)
+local function mutate(method, cache, name, enabled, callback, resource_id, scope)
   local owner_session_id = session.harness.session and session.harness.session.id
   local key = cache_key()
-  client.request({ session_id = owner_session_id, method = method, params = { name = name, enabled = enabled, resource_id = resource_id } }, function(result, request_error)
+  client.request({ session_id = owner_session_id, method = method,
+    params = { name = name, enabled = enabled, resource_id = resource_id, scope = scope } }, function(result, failure)
     cache[key] = nil
-    if request_error or type(result) ~= "table" or not result.id then
-      callback(result, request_error)
-      return
-    end
-    local deadline = vim.uv.now() + 60000
-    local function inspect()
-      if cache_key() ~= key then
-        callback(nil, "The selected session changed. Configuration continues in its original session.")
-        return
-      end
-      client.request({ session_id = owner_session_id, method = "settings.get", params = {} }, function(snapshot, snapshot_error)
-        if snapshot_error then callback(nil, snapshot_error) return end
-        local application = snapshot and snapshot.application or {}
-        if application.operation_id == result.id and application.state == "applied" then
-          cache[key] = nil
-          callback({ id = result.id, name = name, enabled = enabled, restart_required = false }, nil)
-          return
-        end
-        if application.operation_id and application.operation_id ~= result.id then
-          callback(nil, "A newer configuration superseded this selection.")
-          return
-        end
-        if vim.tbl_contains({ "failed", "cancelled", "outcome_unknown", "superseded" }, application.state) then
-          client.request({ session_id = owner_session_id, method = "session.command.operation.get", params = { operation_id = result.id } }, function(operation, operation_error)
-            callback(nil, operation_error or (operation and operation.error) or "Configuration " .. application.state)
-          end)
-          return
-        end
-        if vim.uv.now() >= deadline then
-          callback(nil, "Configuration is still pending. Check the timeline for its outcome.")
-          return
-        end
-        vim.defer_fn(inspect, 100)
-      end)
-    end
-    inspect()
+    callback(result, failure)
   end)
 end
 
@@ -163,16 +124,18 @@ end
 ---@param enabled boolean
 ---@param callback fun(result: table?, error: string?)
 ---@param resource_id string?
-function M.set_skill_enabled(name, enabled, callback, resource_id)
-  mutate("settings.skill.set_enabled", skill_cache, name, enabled, callback, resource_id)
+---@param scope ForgeResourceScope?
+function M.set_skill_enabled(name, enabled, callback, resource_id, scope)
+  mutate("settings.skill.set_enabled", skill_cache, name, enabled, callback, resource_id, scope)
 end
 
 ---@param name string
 ---@param enabled boolean
 ---@param callback fun(result: table?, error: string?)
 ---@param resource_id string?
-function M.set_mcp_enabled(name, enabled, callback, resource_id)
-  mutate("settings.mcp.set_enabled", mcp_cache, name, enabled, callback, resource_id)
+---@param scope ForgeResourceScope?
+function M.set_mcp_enabled(name, enabled, callback, resource_id, scope)
+  mutate("settings.mcp.set_enabled", mcp_cache, name, enabled, callback, resource_id, scope)
 end
 
 function M.clear()

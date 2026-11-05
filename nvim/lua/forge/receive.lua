@@ -1,7 +1,6 @@
 local M = {}
-local MAX_FRAME_BYTES = 512 * 1024
-local MAX_PENDING_BYTES = 8 * 1024 * 1024
-local MAX_PENDING_FRAMES = 128
+local MAX_FRAME_BYTES = 16 * 1024 * 1024
+local MAX_PENDING_FRAMES = 4096
 local MAX_BATCH_BYTES = 256 * 1024
 local MAX_BATCH_FRAMES = 16
 
@@ -37,8 +36,7 @@ function M.push(state, chunk)
     local newline = chunk:find("\n", offset, true)
     local finish = newline and newline - 1 or #chunk
     local length = finish - offset + 1
-    if state.partial_bytes + length > MAX_FRAME_BYTES
-      or state.bytes + length + (newline and 1 or 0) > MAX_PENDING_BYTES
+    if state.partial_bytes + length + (newline and 1 or 0) > MAX_FRAME_BYTES
       or state.tail - state.head + 1 >= MAX_PENDING_FRAMES
     then
       fail(state, "Forge receive admission limit exceeded")

@@ -4,6 +4,7 @@ local client = require("forge.client")
 local session = require("forge.session")
 local original_ensure = builder.ensure
 local event_count, result, failure
+local event_total = 4095
 
 local ok, error_message = xpcall(function()
   require("forge").setup({ harness = { provider = "mock" }, harness_logging = false })
@@ -29,12 +30,14 @@ local ok, error_message = xpcall(function()
         end
         if request.method == "host.initialize" then
           emit({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } })
+        elseif request.method == "provider.registry.list" then
+          emit({ id = request.id, result = dofile("nvim/tests/forge/support/provider_catalog.lua").registry() })
         elseif request.method == "session.initialize" then
           emit({ id = request.id, result = { session = { id = "receive-test" } } })
         elseif request.method == "host.trace.configure" then
           emit({ id = request.id, result = { enabled = request.params.enabled } })
-        elseif request.method == "receive.test" then
-          for sequence = 1, 40 do
+        elseif request.method == "session.exchange.list" then
+          for sequence = 1, event_total do
             emit({ session_id = "receive-test", event = "exchange_updated", payload = { sequence = sequence } })
           end
           emit({ id = request.id, result = { complete = true } })
@@ -56,13 +59,13 @@ local ok, error_message = xpcall(function()
       assert(payload.sequence == event_count)
     end
   end)
-  client.request({ session_id = "receive-test", method = "receive.test", params = {} }, function(value, request_error)
+  client.request({ session_id = "receive-test", method = "session.exchange.list", params = {} }, function(value, request_error)
     result, failure = value, request_error
-    assert(event_count == 40, "response overtook earlier events")
+    assert(event_count == event_total, "response overtook earlier events")
   end)
   assert(vim.wait(1000, function() return result ~= nil or failure ~= nil end, 1))
   assert(not failure, failure)
-  assert(result.complete and event_count == 40)
+  assert(result.complete and event_count == event_total)
   assert(vim.wait(1000, function() return client._client.process == nil end, 1))
   assert(not client._client.ready)
   assert(vim.tbl_isempty(client._client.pending))

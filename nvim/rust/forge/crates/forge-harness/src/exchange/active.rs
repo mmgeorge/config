@@ -84,18 +84,94 @@ impl ActiveCommand {
                 | ConfigurationChange::InputTimeouts(_),
             ) => Self::Configuration(command),
             Command::CancelExchange(request) => {
-                let transition = ExchangeTransition::start(
+                let transition = ExchangeTransition::start_at(
                     command.record.request.id.clone(),
                     TransitionIntent::Cancel(request.input),
                     services,
                     None,
                     None,
+                    command.admitted_at,
                 );
                 Self::Cancel {
                     command,
                     transition: Box::new(transition),
                 }
             }
+        }
+    }
+
+    /// Commit cancellation's local intent before any asynchronous acquisition can time out.
+    pub(super) fn pin_cancellation_target(
+        &mut self,
+        foreground: &ForegroundStatus,
+        dispatch: Option<&mut crate::broker::ForegroundDispatch>,
+        broker: &mut crate::broker::HarnessBroker,
+        services: &OwnerServices,
+    ) -> Result<
+        (
+            Vec<forge_protocol::message::SessionEvent>,
+            Option<crate::input::InputUpdate>,
+        ),
+        super::transition::TransitionFailure,
+    > {
+        match self {
+            Self::Cancel {
+                command,
+                transition,
+            } => {
+                transition.pin_cancellation_target(
+                    foreground,
+                    broker,
+                    services.observer.session_id(),
+                )?;
+                let Command::CancelExchange(request) = &command.record.request.command else {
+                    unreachable!("the active cancellation retains its cancellation request")
+                };
+                // Mark the canonical foreground before pausing its task revokes callback authority.
+                // Otherwise the same update can misclassify that intentional revocation as failure.
+                if let Some(dispatch) = dispatch {
+                    match dispatch {
+                        crate::broker::ForegroundDispatch::Admitting(_)
+                        | crate::broker::ForegroundDispatch::Running { .. }
+                        | crate::broker::ForegroundDispatch::Finalizing { .. } => {
+                            let action = broker
+                                .step_foreground(
+                                    dispatch,
+                                    crate::broker::ForegroundSignal::CollectionStarted(
+                                        crate::broker::ForegroundCollection::Cancel(request.input),
+                                    ),
+                                )
+                                .map_err(super::transition::TransitionFailure::Domain)?;
+                            if !matches!(action, crate::broker::ForegroundAction::Wait) {
+                                return Err(super::transition::TransitionFailure::Uncertain);
+                            }
+                        }
+                        crate::broker::ForegroundDispatch::Done(_)
+                        | crate::broker::ForegroundDispatch::Transitioning => {}
+                    }
+                }
+                broker
+                    .cancel_question_delivery()
+                    .map_err(|error| super::transition::TransitionFailure::Domain(error))?;
+                let input = services
+                    .input
+                    .suspend(true, Some(command.record.request.id.as_str()))
+                    .map_err(|error| super::transition::TransitionFailure::Domain(error.into()))?;
+                let (prior, events) = broker
+                    .owner_cancel_local(None)
+                    .map_err(|error| super::transition::TransitionFailure::Domain(error))?;
+                debug_assert!(
+                    prior.is_none(),
+                    "task-only cancellation has no exchange finalization"
+                );
+                Ok((events, Some(input)))
+            }
+            Self::Agent(_)
+            | Self::Rollback(_)
+            | Self::Task(_)
+            | Self::Input(_)
+            | Self::Configuration(_)
+            | Self::NativeCommand(_) => Ok((Vec::new(), None)),
         }
     }
 
@@ -143,11 +219,15 @@ impl ActiveCommand {
     }
 
     /// Await one fact without blocking the driver's provider event or command intake.
-    pub(super) async fn next(&mut self, foreground: ForegroundStatus) -> CommandEvent {
+    pub(super) async fn next(
+        &mut self,
+        foreground: ForegroundStatus,
+        delivery: super::task_command::TaskDeliveryGate,
+    ) -> CommandEvent {
         match self {
             Self::Agent(run) => CommandEvent::Agent(run.next().await),
             Self::Rollback(run) => CommandEvent::Rollback(run.next(foreground.clone()).await),
-            Self::Task(run) => CommandEvent::Task(run.next(foreground.clone()).await),
+            Self::Task(run) => CommandEvent::Task(run.next(foreground.clone(), delivery).await),
             Self::Input(run) => CommandEvent::Input(run.next().await),
             Self::Configuration(_) => CommandEvent::Configuration,
             Self::NativeCommand(run) => {

@@ -14,7 +14,7 @@ local operation, starts, current_session = {}, 0, nil
 local model_frames, original_refresh = {}, nil
 client.session_events_subscribe(function(event, payload)
   if event == "task_operation" then operation[payload.id] = payload end
-  if event == "provider_event" and payload.kind == "execution_state" then starts = starts + 1 end
+  if event == "provider_event" and payload.kind == "turn_started" then starts = starts + 1 end
   if event == "session_configured" then current_session = payload.session or payload end
 end)
 local function await(predicate, message)
@@ -106,7 +106,7 @@ local success, failure = xpcall(function()
   end
   model_frames = {}
   local idle_applied
-  controller.configure({ effort = "high" }, false, function(value) idle_applied = value end)
+  controller.configure({ effort = "high" }, function(value) idle_applied = value end)
   await(function() return idle_applied and not state.task_operation and not state.busy end, "idle model configuration")
   assert_model_frames(false)
   local initial_response = mock.hold(session_id)
@@ -118,7 +118,7 @@ local success, failure = xpcall(function()
     readable_directory = { data }, writable_directory = { workspace }, isolation_mode = "elevated" }
   local applied
   model_frames = {}
-  require("forge.views.harness.controller").configure({ access = access, effort = "low" }, false, function(value) applied = value end)
+  require("forge.views.harness.controller").configure({ access = access, effort = "low" }, function(value) applied = value end)
   assert_configuration_presentation(state)
   await(function() return starts == 2 end, "configuration did not resume goal")
   assert(applied == true and state.session.access.sandbox == false, "configuration waited for goal completion")
@@ -185,7 +185,7 @@ local success, failure = xpcall(function()
       persisted = request(session_id, "session.task.get", {}) }))
   model_frames = {}
   local paused_applied
-  controller.configure({ effort = "high" }, false, function(value) paused_applied = value end)
+  controller.configure({ effort = "high" }, function(value) paused_applied = value end)
   await(function() return paused_applied and not state.task_operation and not state.busy end, "paused model configuration")
   assert_model_frames(false)
   submit("/yolo")

@@ -1,3 +1,12 @@
+use super::super::{CopilotSessions, PreparedSession, SessionReuse, SessionSelection};
+use super::support::recovery_frame;
+use super::{Host, read_frame, reply_frame};
+use crate::copilot::session::SessionOptions;
+use forge_provider_api::ProviderError;
+use forge_provider_api::trace::ProviderTrace;
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+
 /// Observe producer failure independently of the startup RPC held by the peer.
 struct StartupOverflowTrace {}
 
@@ -24,12 +33,6 @@ async fn startup_notification(
     writer.flush().await.unwrap();
 }
 
-const _: () = assert!(
-    github_copilot_sdk::session::DEFAULT_EVENT_BUFFER_CAPACITY
-        > forge_protocol::MAX_PENDING_FRAMES + 1,
-    "fixture must overflow Forge's queue before the public SDK buffer"
-);
-
 /// Fence startup overflow before create/resume responds and collect every retained startup owner.
 #[tokio::test]
 async fn startup_overflow_fails_generation_before_create_or_resume_response() {
@@ -37,7 +40,7 @@ async fn startup_overflow_fails_generation_before_create_or_resume_response() {
         for _ in 0..10 {
             for resumed in [false, true] {
                 let runtime =
-                    super::super::runtime::CopilotRuntime::new(vec!["startup-peer".into()]);
+                    crate::copilot::runtime::CopilotRuntime::new(vec!["startup-peer".into()]);
                 let (client_write, mut peer_read) = tokio::io::duplex(1 << 20);
                 let (mut peer_write, client_read) = tokio::io::duplex(1 << 20);
                 runtime
@@ -56,6 +59,15 @@ async fn startup_overflow_fails_generation_before_create_or_resume_response() {
                         serde_json::json!({"version":"1.0.103"}),
                     )
                     .await;
+                    let discovery = read_frame(&mut peer_read).await;
+                    assert_eq!(discovery["method"], "mcp.discover");
+                    recorded.lock().unwrap().push("mcp.discover".to_owned());
+                    reply_frame(
+                        &mut peer_write,
+                        &discovery,
+                        serde_json::json!({"servers":[]}),
+                    )
+                    .await;
                     let create = read_frame(&mut peer_read).await;
                     let method = create["method"].as_str().unwrap();
                     assert_eq!(
@@ -68,8 +80,8 @@ async fn startup_overflow_fails_generation_before_create_or_resume_response() {
                     );
                     recorded.lock().unwrap().push(method.to_owned());
                     let native = create["params"]["sessionId"].as_str().unwrap();
-                    // The public SDK buffer holds 512 events; only Forge's 128-event startup
-                    // channel can overflow in this trace. No SDK-hidden loss is injected.
+                    // Overflow the configured startup window before its native response.
+                    // Every intake stage must preserve the same typed loss and collection.
                     for sequence in 0..=forge_protocol::MAX_PENDING_FRAMES {
                         startup_notification(&mut peer_write, native, sequence).await;
                     }
@@ -95,18 +107,18 @@ async fn startup_overflow_fails_generation_before_create_or_resume_response() {
                         owner: owner.clone(),
                     },
                 );
-                sessions.subscribe(owner.runtime_key(), sink).await;
+                sessions.subscribe(owner.clone(), sink).await;
                 let profile = tempfile::tempdir().unwrap();
                 let profile_path = profile.path().to_owned();
                 let acquiring = sessions.clone();
-                let key = owner.runtime_key();
+                let key = owner.clone();
                 let startup = tokio::spawn(async move {
                     acquiring
                         .acquire(
                             async move { Ok((client, None)) },
                             SessionSelection {
                                 execution_owner: owner.clone(),
-                                runtime_key: owner.runtime_key(),
+
                                 correlation_id: owner.session_id.to_string(),
                                 session_id: resumed.then(|| "native-startup-resume".to_owned()),
                                 model: None,
@@ -125,9 +137,9 @@ async fn startup_overflow_fails_generation_before_create_or_resume_response() {
                                         reasoning_effort: None,
                                         context_tier: None,
                                         workspace: std::env::temp_dir(),
-                                        mode: forge_provider_api::PromptMode::Chat,
                                         system_message: String::new(),
-                                        resources: super::super::session::ResourceDiscovery::Native,
+                                        resources:
+                                            crate::copilot::session::SessionResources::default(),
                                         excluded_tools: Vec::new(),
                                         tools: Vec::new(),
                                         native_callbacks: None,

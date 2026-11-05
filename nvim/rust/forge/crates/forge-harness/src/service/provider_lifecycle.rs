@@ -130,15 +130,10 @@ impl SessionController {
             let initialized = controller
                 .prepare_provider_initialization(provider, Some(sink.clone()))
                 .await;
-            let result = match initialized {
-                Ok(initialized) => {
-                    controller
-                        .exchange_owner
-                        .initialize_provider(initialized, Some(sink.clone()))
-                        .await
-                }
-                Err(error) => Err(error),
-            };
+            let result = controller
+                .exchange_owner
+                .initialize_provider(initialized, Some(sink.clone()))
+                .await;
             if let Err(error) = result {
                 if matches!(
                     error,
@@ -235,10 +230,22 @@ impl SessionController {
                         let Some(controller) = controller.upgrade() else {
                             return Ok(());
                         };
-                        controller
+                        match controller
                             .exchange_owner
                             .observe_provider_retained(messages.clone())
-                            .await?;
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(error)
+                                if error.owner_closed()
+                                    && controller.input_stopping.load(Ordering::Acquire) =>
+                            {
+                                // Explicit shutdown keeps the final inbox drain with the owner.
+                                // A late wake cannot turn that completed owner lifetime into a failure.
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
                         continue;
                     }
                     if events.is_closed() {

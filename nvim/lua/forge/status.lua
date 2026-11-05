@@ -84,7 +84,8 @@ end
 ---@param state ForgeNativeStatus
 ---@param params table
 ---@param callback fun(result: table?, failure: string?)
-local function request(state, params, callback, method)
+---@param prepare? fun() Refresh read-only target metadata after earlier queued requests finish.
+local function request(state, params, callback, method, prepare)
   local queued_at = vim.uv.hrtime()
   state.request_queue = state.request_queue or {}
   local function start()
@@ -127,6 +128,7 @@ local function request(state, params, callback, method)
     end
     if not host_current(state) then receive(nil) return end
     local ok, failure = pcall(function()
+      if prepare then prepare() end
       if runner_for_test then runner_for_test(method or "repository.status.document", params, receive)
       else require("forge.client").request({ method = method or "repository.status.document", params = params }, receive, function(progress)
         require("forge.startup_log").write("status.native.timing", {
@@ -681,6 +683,7 @@ function M.action(state, action, visual)
   local captured, failure = buffer.capture(state.replica, view, action, selection)
   log.write("status.action.captured", { document = state.document, action_id = action_id, action = action,
     elapsed_us = math.floor((vim.uv.hrtime() - action_started) / 1000), location = captured and captured.location,
+    revision = captured and captured.revision, view = captured and captured.view, sequence = captured and captured.sequence,
     error = failure })
   if not captured then notice(failure or "Cannot capture status input") return end
   if action == "open" and state.context and captured.location.kind == "context" then
@@ -688,13 +691,32 @@ function M.action(state, action, visual)
     return
   end
   if action == "open" then
-    request(state, { operation = "open_target", input = captured }, function(effect, request_failure)
-      if request_failure or not effect then notice(request_failure or "Missing file target") return end
-      if effect.kind == "open_file" or effect.kind == "open_source" then
-        effect.layout = require("forge.infra.config").options.status_open_target == "buffer" and "current" or "tab"
+    local file = captured.location.kind == "file" and state.replica.file[captured.location.id]
+    local function open()
+      request(state, { operation = "open_target", input = captured }, function(effect, request_failure)
+        if request_failure or not effect then notice(request_failure or "Missing file target") return end
+        if effect.kind == "open_file" or effect.kind == "open_source" then
+          effect.layout = require("forge.infra.config").options.status_open_target == "buffer" and "current" or "tab"
+        end
+        buffer.apply_effect(state.replica, view, effect)
+      end, nil, function()
+        -- File identities survive refresh. Keep the clicked file, but use the
+        -- revision committed by requests ahead of this read in the queue.
+        local current = file and state.replica.file[captured.location.id]
+        if current and captured.document == state.document
+          and current.record.path == file.record.path and current.record.section == file.record.section then
+          captured.revision = state.replica.revision
+        end
+      end)
+    end
+    if state.refresh_active then
+      -- Refresh may require a second snapshot request and asynchronous rendering.
+      -- Wait for that commit, not merely the first transport response.
+      state.refresh_callback = state.refresh_callback or {}
+      state.refresh_callback[#state.refresh_callback + 1] = function(success)
+        if success and state.active then open() end
       end
-      buffer.apply_effect(state.replica, view, effect)
-    end)
+    else open() end
     return
   end
   if visual then

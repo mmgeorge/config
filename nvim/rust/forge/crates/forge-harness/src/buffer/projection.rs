@@ -2464,6 +2464,7 @@ impl TimelineRenderer<'_> {
     fn workspace_changes(&mut self, identity: &str, exchange: &Exchange) -> Result<()> {
         use crate::exchange::ExchangeChangeResult;
         match exchange.change_result() {
+            ExchangeChangeResult::NotStarted => Ok(()),
             ExchangeChangeResult::Captured(comparison) => {
                 self.workspace_comparison(identity, comparison, "")
             }

@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use serde::Deserialize;
 use tokio::sync::Notify;
 
-use crate::{MAX_FRAME_BYTES, MAX_PENDING_FRAMES, MAX_QUEUED_BYTES};
+use crate::{MAX_FRAME_BYTES, MAX_PENDING_FRAMES};
 
 const MAX_COUNTER: u64 = 9_007_199_254_740_991;
 
@@ -58,9 +58,7 @@ impl ReceiveCredit {
                         "consumer credit counter exhausted",
                     ));
                 }
-                if window.outstanding.len() < MAX_PENDING_FRAMES
-                    && window.bytes + bytes <= MAX_QUEUED_BYTES
-                {
+                if window.outstanding.len() < MAX_PENDING_FRAMES {
                     window.outstanding.push_back(bytes);
                     window.bytes += bytes;
                     return Ok(());
@@ -155,10 +153,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn byte_window_and_close_bound_a_slow_consumer() {
+    async fn large_byte_window_preserves_frame_credit_and_close() {
         let credit = ReceiveCredit::default();
-        for _ in 0..MAX_QUEUED_BYTES / MAX_FRAME_BYTES {
+        for _ in 0..32 {
             credit.reserve(MAX_FRAME_BYTES).await.unwrap();
+        }
+        assert!(credit.window.lock().unwrap().bytes > 8 * 1024 * 1024);
+        for _ in 32..MAX_PENDING_FRAMES {
+            credit.reserve(1).await.unwrap();
         }
         let pending = credit.reserve(1);
         tokio::pin!(pending);

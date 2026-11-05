@@ -2,6 +2,8 @@ local workspace = vim.fn.getcwd()
 vim.opt.runtimepath:prepend(workspace .. "/nvim")
 require("forge.infra.config").setup({})
 local session = require("forge.session")
+local client = require("forge.client")
+local original_client = client._client
 local original_controller = package.loaded["forge.views.harness.controller"]
 package.loaded["forge.views.harness.controller"] = {
   activate_snapshot = function(result) session.harness.session = result.session end,
@@ -46,13 +48,30 @@ local succeeded, failure = xpcall(function()
   local retained_transcript, retained_composer = state.transcript_buf, state.composer_buf
   vim.cmd("tabclose")
   assert(not vim.api.nvim_tabpage_is_valid(state.timeline_tab))
-  navigation.activate({ session = { id = durable_id } })
+  navigation.activate({ session = { id = "source-identity-fixture" } })
+  assert(session.harness == source, "source session was not active before resuming")
+  client.host_get_generation()
+  local transport = client._client
+  local replied = false
+  transport.ready, transport.runtime_ready = true, true
+  transport.provider_registry_generation = transport.generation
+  transport.process = { write = function(_, encoded)
+    local request = vim.json.decode(encoded)
+    assert(request.method == "session.resume" and request.session_id == durable_id)
+    local pending = assert(transport.pending[request.id])
+    transport.pending[request.id] = nil
+    pending.callback({ session = { id = durable_id } }, nil)
+    replied = true
+  end }
+  navigation.resume(durable_id)
+  assert(vim.wait(3000, function() return replied end), "resume callback was not delivered")
   assert(session.harness == state, "resume replaced the retained session owner")
   assert(state.transcript_buf == retained_transcript and state.composer_buf == retained_composer,
     "resume replaced retained buffers or collided with their durable names")
   assert(vim.api.nvim_tabpage_is_valid(state.timeline_tab))
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, true)[1] == "Unsent draft")
 end, debug.traceback)
+client._client = original_client
 package.loaded["forge.views.harness.controller"] = original_controller
 if not succeeded then
   io.stderr:write(tostring(failure), "\n")

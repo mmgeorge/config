@@ -278,6 +278,13 @@ impl CopilotRuntime {
         self.client.lock().await.take();
         Ok(())
     }
+
+    /// Create an independent cleanup owner using the same native command.
+    ///
+    /// The caller must collect this owner's client even when history deletion fails.
+    pub(super) fn cleanup_runtime(&self) -> Self {
+        Self::new(self.command.clone())
+    }
 }
 
 fn provider_failure(
@@ -307,10 +314,8 @@ pub(crate) async fn validate_version(
             .unwrap_or_else(|| "SDK-managed Copilot".into()),
         semver::Version::new(1, 0, 103),
     );
-    let deadline = std::time::Duration::from_secs(30);
-    let status = tokio::time::timeout(deadline, client.call("status.get", None))
-        .await
-        .map_err(|_| requirement.probe_timed_out(deadline))?
+    let status = super::operation::wait(client.call("status.get", None))
+        .await?
         .map_err(|_| {
             requirement.probe_failed(forge_provider_api::version::RuntimeProbeFailure::Unavailable)
         })?;

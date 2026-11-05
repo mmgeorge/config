@@ -18,6 +18,8 @@ impl<'exchange> CheckpointComparison<'exchange> {
 /// Classifies committed workspace evidence without reading the current workspace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExchangeChangeResult<'exchange> {
+    /// The exchange ended before its initial workspace checkpoint was captured.
+    NotStarted,
     Pending {
         previous: Option<CheckpointComparison<'exchange>>,
     },
@@ -53,6 +55,13 @@ impl Exchange {
         ) || self.completed_at_ms().is_none()
         {
             return ExchangeChangeResult::Pending { previous };
+        }
+        if self.state() == ExchangeState::Cancelled
+            && self.checkpoint_before.is_none()
+            && self.checkpoint_after.is_none()
+            && self.turn.is_empty()
+        {
+            return ExchangeChangeResult::NotStarted;
         }
         match previous {
             Some(comparison) => ExchangeChangeResult::Captured(comparison),
@@ -146,5 +155,28 @@ mod tests {
                 serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
             assert_eq!(exchange.change_result(), reopened.change_result());
         }
+    }
+
+    #[test]
+    fn cancellation_before_initial_capture_has_no_missing_checkpoint_failure() {
+        let mut exchange = exchange();
+        exchange.phase =
+            super::super::ExchangePhase::fixture(ExchangeState::Cancelled, Some(10), None);
+        exchange.checkpoint_before = None;
+        exchange.checkpoint_after = None;
+        exchange.checkpoint_diff_text = None;
+        assert_eq!(exchange.change_result(), ExchangeChangeResult::NotStarted);
+        exchange.finalization_error = Some("capture storage failed".into());
+        assert!(matches!(
+            exchange.change_result(),
+            ExchangeChangeResult::Unavailable { .. }
+        ));
+        exchange.finalization_error = None;
+        exchange.phase =
+            super::super::ExchangePhase::fixture(ExchangeState::Failed, Some(10), None);
+        assert!(matches!(
+            exchange.change_result(),
+            ExchangeChangeResult::Unavailable { .. }
+        ));
     }
 }

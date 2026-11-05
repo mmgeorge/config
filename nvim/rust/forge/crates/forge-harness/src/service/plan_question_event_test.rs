@@ -1,8 +1,8 @@
 use super::*;
 
 /// Install normalized plan questions without depending on a provider's question protocol.
-fn fixture() -> Result<(tempfile::TempDir, Arc<SessionController>, Value)> {
-    let (root, controller, _) = super::question_event_test::fixture()?;
+async fn fixture() -> Result<(tempfile::TempDir, Arc<SessionController>, Value)> {
+    let (root, controller, _) = super::question_event_test::fixture().await?;
     let session = controller.observer.session_id();
     let questions =
         crate::plan::PlanQuestionSet::freeform("Which scope should be implemented?".into())
@@ -34,7 +34,7 @@ fn fixture() -> Result<(tempfile::TempDir, Arc<SessionController>, Value)> {
 /// Answers must commit headlessly while compatibility execution/control/broker lanes are occupied.
 #[tokio::test]
 async fn plan_answers_commit_under_owner_and_replay_original_publication() -> Result<()> {
-    let (_root, controller, request) = fixture()?;
+    let (_root, controller, request) = fixture().await?;
     let session = controller.observer.session_id();
     let publications = crate::exchange::SessionPublications::open(&controller.data_root, session)?;
     let execution = controller.coordinator.execution.acquire().await?;
@@ -105,7 +105,7 @@ async fn plan_answers_commit_under_owner_and_replay_original_publication() -> Re
 #[tokio::test]
 async fn dropped_plan_answer_waiter_retains_commit_and_one_publication() -> Result<()> {
     use std::{future::Future, task::Poll};
-    let (_root, controller, request) = fixture()?;
+    let (_root, controller, request) = fixture().await?;
     let publications = crate::exchange::SessionPublications::open(
         &controller.data_root,
         controller.observer.session_id(),
@@ -144,7 +144,7 @@ async fn dropped_plan_answer_waiter_retains_commit_and_one_publication() -> Resu
 /// A late answer cannot recreate questions after the selected planning task has been cleared.
 #[tokio::test]
 async fn plan_answer_event_rejects_replaced_task_without_restoring_questions() -> Result<()> {
-    let (_root, controller, request) = fixture()?;
+    let (_root, controller, request) = fixture().await?;
     let mut store = SqliteStore::open(&controller.data_root)?;
     let current = controller.task_controller.current()?.unwrap();
     controller.task_controller.change(
@@ -176,7 +176,7 @@ async fn plan_answer_event_rejects_replaced_task_without_restoring_questions() -
 /// Failure retaining the notification must roll back the answer, task update, and receipt together.
 #[tokio::test]
 async fn plan_answer_publication_failure_rolls_back_decision_and_receipt() -> Result<()> {
-    let (_root, controller, request) = fixture()?;
+    let (_root, controller, request) = fixture().await?;
     let session = controller.observer.session_id();
     let database = rusqlite::Connection::open(controller.data_root.join("harness.sqlite3"))?;
     database.execute_batch("CREATE TRIGGER fail_plan_answer_publication BEFORE INSERT ON owner_publication WHEN json_extract(NEW.event,'$.event')='question_updated' BEGIN SELECT RAISE(ABORT,'publication failed'); END;")?;
@@ -236,7 +236,7 @@ async fn plan_answer_publication_failure_rolls_back_decision_and_receipt() -> Re
 #[tokio::test]
 async fn legacy_plan_answer_receipt_backfills_publication_without_reapplying_answer() -> Result<()>
 {
-    let (_root, controller, request) = fixture()?;
+    let (_root, controller, request) = fixture().await?;
     let events = controller.exchange_owner.question_events();
     let original = events
         .answer_plan(crate::plan::PlanQuestionAnswerRequest::parse(

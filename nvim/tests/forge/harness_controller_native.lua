@@ -14,17 +14,27 @@ local generation, submitted, receive, navigated, sync_count = 1, nil, nil, nil, 
 local initial = {}
 local goal_request = {}
 local status_thought_request = {}
+local configuration_request = {}
 local timeline_source = { "Native transcript" }
 local staged_response, staged_request
 local hold_staging, staging_reply, staging_count, fail_selection = false, nil, 0, false
-local submitted_callback
+local submitted_callback, cancellation_callback
 local function snapshot(document, text, composer)
   return { document = document, revision = 0, block = { { id = "body", text = type(text) == "table" and text or { text },
     metadata = { target = {}, decoration = {}, editable_region = composer and { { id = "composer", revision = 0,
       range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = #text } } } } or {} } } } }
 end
 client.host_get_generation = function() return generation end
-client.session_events_subscribe = function(callback) receive = callback return function() end end
+local subscribers = {}
+receive = function(event, payload, owner)
+  local current = {}
+  for callback in pairs(subscribers) do current[#current + 1] = callback end
+  for _, callback in ipairs(current) do callback(event, payload, owner) end
+end
+client.session_events_subscribe = function(callback)
+  subscribers[callback] = true
+  return function() subscribers[callback] = nil end
+end
 client.request = function(request_specification, callback)
   local session_id = request_specification.session_id
   local method = request_specification.method
@@ -32,13 +42,14 @@ client.request = function(request_specification, callback)
 
   assert(session_id == "native-controller")
   if method == "session.input.get" then
-    callback({ revision = state.input and state.input.revision or 0, messages = {}, suspended = false, execution_busy = false })
+    callback({ revision = state.input and state.input.revision or 0, messages = {}, suspended = false })
     return
   end
   if method == "session.input.apply" then submitted = params submitted_callback = callback return end
+  if method == "session.turn.cancel" then cancellation_callback = callback return end
   if method == "session.configure" then
-    assert(type(params.status_thoughts) == "boolean")
-    status_thought_request[#status_thought_request + 1] = { params = params, callback = callback }
+    local requests = type(params.status_thoughts) == "boolean" and status_thought_request or configuration_request
+    requests[#requests + 1] = { params = params, callback = callback }
     return
   end
   if method == "session.command.apply" then
@@ -83,6 +94,7 @@ client.request = function(request_specification, callback)
   elseif params.operation == "sync" then
     sync_count = sync_count + 1
     local result = staged_response and { snapshot = staged_response } or { patch = {} }
+    result.status = snapshot(params.document .. ":status", "Idle")
     staged_response = nil
     vim.schedule(function() callback(result) end)
   else vim.schedule(function() callback({ patch = {} }) end) end
@@ -153,7 +165,7 @@ local success, failure = xpcall(function()
   local method = request_specification.method
 
     if method == "session.input.get" then
-      callback({ revision = 0, messages = {}, suspended = false, execution_busy = false })
+      callback({ revision = 0, messages = {}, suspended = false })
       return
     end
     assert(method == "session.state.get")
@@ -173,7 +185,7 @@ local success, failure = xpcall(function()
   local method = request_specification.method
 
     if method == "session.input.get" then
-      callback({ revision = 0, messages = {}, suspended = false, execution_busy = false })
+      callback({ revision = 0, messages = {}, suspended = false })
       return
     end
     assert(method == "session.state.get")
@@ -214,7 +226,7 @@ local success, failure = xpcall(function()
   receive("provider_event", { kind = "approval_requested", data = permission }, "native-controller")
   assert(vim.wait(1000, approval_view.is_open), "approval did not open")
   stale_snapshot(approval_snapshot({}))
-  assert(#state.approval == 1 and pending_snapshot ~= stale_snapshot,
+  assert(#state.approval == 1 and vim.wait(500, function() return pending_snapshot ~= stale_snapshot end, 1),
     "a snapshot captured before approval erased the pending request")
   pending_snapshot(approval_snapshot({ permission }))
   vim.fn.maparg("q", "n", false, true).callback()
@@ -310,32 +322,12 @@ local success, failure = xpcall(function()
     end
   end
   state.session.effort, state.session.service_tier = previous_effort, nil
-  local previous_operation = state.task_operation
-  for _, action in ipairs({ "permission", "configure", "compact" }) do
-    for _, operation_state in ipairs({ "submitting", "accepted", "stopping", "applying", "verifying", "resuming" }) do
-      state.task_operation = { action = action, state = operation_state }
-      controller.refresh_winbar()
-      local displayed = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
-        { use_winbar = true, maxwidth = 200 }).str
-      assert(not displayed:find("Task ", 1, true), "configuration was presented as a task: " .. displayed)
-      assert(displayed:find("rxw · ", 1, true), "pending configuration replaced the confirmed policy")
-    end
-  end
-  for _, action in ipairs({ "plan", "goal", "execute", "resume", "pause", "clear" }) do
-    state.task_operation = { action = action, state = "submitting" }
-    controller.refresh_winbar()
-    local displayed = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
-      { use_winbar = true, maxwidth = 200 }).str
-    assert(not displayed:find("Task submitting", 1, true), "workflow activity remains in the winbar")
-  end
-  state.task_operation = { action = "configure", state = "failed" }
   state.configuration_error = "fixture rejected"
   controller.refresh_winbar()
   assert(vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
     { use_winbar = true, maxwidth = 200 }).str:find("Settings rejected: fixture rejected", 1, true),
     "configuration failure was hidden")
   state.configuration_error = nil
-  state.task_operation = previous_operation
   controller.refresh_winbar()
   assert(not title:find("Mock CLI", 1, true), "winbar still shows the CLI provider")
   assert(not title:find("Parser 100% coverage", 1, true), "session name remains in top bar")
@@ -354,7 +346,7 @@ local success, failure = xpcall(function()
     { use_tabline = true, maxwidth = 200 }).str
   assert(tab_title:find("123456789012345678901234567890", 1, true) and not tab_title:find("extra", 1, true),
     "tab must show only the first 30 session-name characters")
-  state.busy = true
+  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
   local long_timeline = { "Native transcript" }
   for index = 1, vim.api.nvim_win_get_height(state.transcript_win) + 80 do
     long_timeline[#long_timeline + 1] = "Earlier response " .. index
@@ -369,7 +361,6 @@ local success, failure = xpcall(function()
   vim.api.nvim_set_current_win(state.composer_win)
   state.presentation.follow_tail()
   local staging_cursor = vim.api.nvim_win_get_cursor(state.transcript_win)
-  state.execution_busy = true
   state.queue = { { text = "queued follow-up" } }
   for index = 1, vim.api.nvim_win_get_height(state.transcript_win) + 5 do
     state.queue[#state.queue + 1] = { text = "queued extra " .. index }
@@ -429,7 +420,7 @@ local success, failure = xpcall(function()
     "status thought configuration entered the task-transition path")
   status_thought_request[2].callback({ status_thoughts = false })
   status_thought_request[1].callback({ status_thoughts = true })
-  assert(state.status_thoughts == false and state.busy,
+  assert(state.status_thoughts == false and require("forge.views.harness.activity").busy(state),
     "a superseded status thought response changed the preference or interrupted work")
   state.session.model, state.session.resolved_model = "default", nil
   receive("provider_event", { kind = "runtime_resolved", data = {
@@ -446,15 +437,16 @@ local success, failure = xpcall(function()
   state.session.model, state.session.resolved_model = "mock", nil
   state.recap = { text = "Old recap" }
   receive("provider_event", { kind = "turn_started" }, "native-controller")
-  assert(state.recap == nil and state.busy, "provider continuation retained recap or changed busy state")
+  assert(state.recap == nil and require("forge.views.harness.activity").busy(state), "provider continuation retained recap or changed busy state")
   controller.refresh_winbar()
   assert(vim.wo[state.composer_win].winbar == "", "busy composer restored key hints")
-  receive("provider_event", { kind = "execution_state", data = {
+  receive("session_changed", { snapshot = { runtime_epoch = state.runtime_epoch, snapshot_revision = (state.snapshot_revision or 0) + 1, activity = state.activity,
+    access_abbreviation = state.access_abbreviation, capability = state.capability,
     session = { id = "native-controller", provider = "mock", model = "mock", approval_mode = "ask",
       active_task = { revision = "execution", kind = "execute", phase = "implement", status = "running", execution = {
         title = "Implement the design", record = { state = "active", phase = "implement" } } } },
   } }, "native-controller")
-  assert(state.busy and state.session.active_task.kind == "execute" and state.session.approval_mode == "ask")
+  assert(require("forge.views.harness.activity").busy(state) and state.session.active_task.kind == "execute" and state.session.approval_mode == "ask")
   title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
     { use_winbar = true, maxwidth = 200 }).str
   assert(title:find(" · exec", 1, true))
@@ -475,7 +467,7 @@ local success, failure = xpcall(function()
     end
   end
   state.access_abbreviation, state.check_editing = "rxw", false
-  state.busy = false
+  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "idle" }
   for _, status in ipairs({ "paused", "blocked" }) do
     state.session.active_task.execution.record.state = status
     state.session.active_task.status = status
@@ -524,7 +516,7 @@ local success, failure = xpcall(function()
   assert(vim.wait(1000, function() return state.presentation.views[original_window] == nil end))
   assert(not state.presentation.closed and state.presentation.views[secondary])
   local sync_before_submission = sync_count
-  state.busy, state.execution_busy = false, false
+  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "idle" }
   vim.api.nvim_set_current_win(state.composer_win)
   completion_visible = true
   controller.submit()
@@ -540,10 +532,10 @@ local success, failure = xpcall(function()
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
   submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
     suspended = false, upsert = {}, removed = {}, error = "simulated admission failure" })
-  assert(#state.input.rejected == 1, "failed optimistic input was not retained")
+  assert(#state.input.drafts == 1, "failed input draft was not retained")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "native draft")
   local input_state = require("forge.views.harness.input_state")
-  local failed_id = state.input.rejected[1].id
+  local failed_id = state.input.drafts[1].id
   local retry_key = vim.fn.maparg("<M-r>", "i", false, true)
   assert(type(retry_key.callback) == "function", "retry input shortcut is missing")
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "newer unsent draft" })
@@ -553,17 +545,20 @@ local success, failure = xpcall(function()
     "retry shortcut overwrote newer typing")
   submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
     suspended = false, upsert = {}, removed = {}, error = "still rejected" })
-  input_state.discard_rejected(state, state.input.rejected[1].id)
-  state.busy, state.execution_busy = true, true
+  input_state.discard_rejected(state, state.input.drafts[1].id)
+  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "explicit queued followup" })
   controller.queue_submit()
   local queued_message = vim.deepcopy(submitted.action.message)
   queued_message.revision = 1
   submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
-    suspended = false, execution_busy = true, upsert = { queued_message }, removed = {} })
+    suspended = false, upsert = { queued_message }, removed = {} })
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "steer the current turn" })
   controller.steer_submit()
   local steering_message = vim.deepcopy(submitted.action.message)
+  steering_message.revision, steering_message.delivery, steering_message.route = 1, "delivering", "steering"
+  submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
+    suspended = false, upsert = { steering_message }, removed = {} })
   assert(steering_message.intent == "auto" and #state.queue == 1 and #state.pending_steer == 1,
     "Ctrl-S behind a queued message joined the explicit queue")
   assert(vim.wait(2500, function()
@@ -573,19 +568,16 @@ local success, failure = xpcall(function()
     return steering and queue and steering < queue and text:find("steer the current turn", 1, true)
       and text:find("explicit queued followup", 1, true)
   end, 20), "the separate steering section did not render above the explicit queue")
-  steering_message.revision = 1
-  submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
-    suspended = false, execution_busy = true, upsert = { steering_message }, removed = {} })
   steering_message.delivery = "delivering"
   receive("input_changed", { revision = state.input.revision + 1, suspended = false,
-    execution_busy = true, upsert = { steering_message }, removed = {} }, "native-controller")
+    upsert = { steering_message }, removed = {} }, "native-controller")
   assert(#state.pending_steer == 1 and #state.queue == 1, "in-flight steering vanished before acceptance")
   steering_message.delivery = "accepted"
   receive("input_changed", { revision = state.input.revision + 1, suspended = false,
-    execution_busy = true, upsert = { steering_message }, removed = {} }, "native-controller")
+    upsert = { steering_message }, removed = {} }, "native-controller")
   assert(#state.pending_steer == 0 and #state.queue == 1, "steering acceptance changed the explicit queue")
   receive("input_changed", { revision = state.input.revision + 1, suspended = false,
-    execution_busy = false, upsert = {}, removed = { steering_message.id, queued_message.id } }, "native-controller")
+    upsert = {}, removed = { steering_message.id, queued_message.id } }, "native-controller")
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "" })
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "draft after host collection" })
   generation = 2
@@ -594,7 +586,7 @@ local success, failure = xpcall(function()
   assert(initial[2].initial == nil, "new host received an unsent draft")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "draft after host collection")
   submitted = nil
-  state.busy = false
+  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "idle" }
   state.queue = { "queued while finalizing" }
   state.status = { kind = "finalizing", exchange_id = "exchange-1", error = "cleanup pending" }
   controller.render()
@@ -603,6 +595,16 @@ local success, failure = xpcall(function()
   controller.render()
   assert(#state.queue == 1 and submitted == nil, "Lua independently dispatched host-owned input")
   state.queue = {}
+  state.selected_agent_run_id = nil
+  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
+  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
+  controller.cancel_turn()
+  assert(cancellation_callback and require("forge.views.harness.activity").busy(state), "cancellation cleared busy state before settlement")
+  cancellation_callback({})
+  assert(require("forge.views.harness.activity").busy(state), "command reply manufactured idle activity")
+  receive("activity_changed", { runtime_epoch = state.runtime_epoch,
+    activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "idle" } }, "native-controller")
+  assert(not require("forge.views.harness.activity").busy(state), "owner idle event did not settle cancellation")
   local original_plain_request = client.request
   local child_request_for = client.request
   client.request = function(request_specification, callback)
@@ -622,7 +624,7 @@ local success, failure = xpcall(function()
     child_request[#child_request + 1] = { method = method, params = params }
     if method == "session.agent.interrupt" then callback({ status = "interrupting" }) end
   end
-  state.busy = true
+  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
   state.capability.native_steer = true
   state.selected_agent_run_id = "child"
   state.agent = { run = { { id = "child", definition = "explorer", state = "ready" } }, exchange = {} }
@@ -688,20 +690,23 @@ local success, failure = xpcall(function()
   receive("provider_event", {kind="approval_cancelled",data={id=root_permission.id}},"native-controller")
   client.request = original_plain_request
   client.request = child_request_for
-  state.busy, state.task_operation, state.task_config = true, nil, nil
   state.subagent_tools = false
   for _, enabled in ipairs({true,false}) do
-    local applied = nil
-    controller.configure({subagent_tools=enabled},false,function(result)
-      assert(state.subagent_tools == enabled,"configuration callback observed stale subagent tools")
-      applied = result
-    end)
-    local operation_id = state.task_operation.id
-    receive("session_configured", {session=state.session,operation_id="stale-configuration"},"native-controller")
-    assert(applied == nil and state.subagent_tools ~= enabled,"unrelated operation applied pending tools")
-    receive("session_configured", {session=state.session,operation_id=operation_id},"native-controller")
-    assert(applied == true and state.subagent_tools == enabled,"active configuration did not adopt tools")
-    state.task_operation = nil
+    local applied
+    controller.configure({subagent_tools=enabled},function(result) applied = result end)
+    local request = configuration_request[#configuration_request]
+    assert(applied == nil and state.subagent_tools ~= enabled, "unacknowledged command changed committed tools")
+    local revision = (state.snapshot_revision or 0) + 1
+    local committed = { session=vim.deepcopy(state.session), runtime_epoch=state.runtime_epoch,
+      snapshot_revision=revision, subagent_tools=enabled, capability=state.capability }
+    receive("session_configured", {snapshot=committed},"native-controller")
+    assert(state.subagent_tools == enabled and applied == nil, "configuration event did not update tools independently of its waiter")
+    local stale = vim.deepcopy(committed)
+    stale.snapshot_revision, stale.subagent_tools = revision - 1, not enabled
+    receive("session_configured", {snapshot=stale},"native-controller")
+    assert(state.subagent_tools == enabled, "stale configuration replaced committed tools")
+    request.callback({})
+    assert(applied == true, "configuration command did not notify its waiter")
   end
   require("forge.views.harness.workspace").release(state)
   state.presentation.close()
@@ -709,7 +714,8 @@ local success, failure = xpcall(function()
   state.composer_buf = vim.api.nvim_create_buf(false, true)
   state.composer_win = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(state.composer_win, state.composer_buf)
-  state.busy, state.active_wait, state.selected_agent_run_id = true, {}, "child"
+  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
+  state.active_wait, state.selected_agent_run_id = {}, "child"
   state.queue = {}
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "explicit follow-up" })
   require("forge.shared.keymaps").setup_view_keymaps(state.composer_buf, "harness", controller.command_set())
@@ -719,7 +725,7 @@ local success, failure = xpcall(function()
   assert(vim.fn.maparg("<C-s>", "i", false, true).desc == "Submit the composer")
   state.active_wait = nil
   state.selected_agent_run_id = nil
-  state.busy = true
+  state.activity = { revision = (state.activity and state.activity.revision or 0) + 1, phase = "working" }
   state.queue = { "keep queued work" }
   for _, command in ipairs({ "pause", "clear" }) do
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/goal " .. command })
@@ -727,9 +733,9 @@ local success, failure = xpcall(function()
     assert(goal_request[#goal_request] and goal_request[#goal_request].params.action == command,
       "goal control was queued behind active work")
     assert(#state.queue == 1 and state.queue[1] == "keep queued work")
-    assert(state.busy, "goal control cleared the running turn state")
+    assert(require("forge.views.harness.activity").busy(state), "goal control cleared the running turn state")
     goal_request[#goal_request].callback({ state = "accepted" })
-    assert(state.busy, "goal acknowledgement cleared the running turn state")
+    assert(require("forge.views.harness.activity").busy(state), "goal acknowledgement cleared the running turn state")
   end
   receive("goal_changed", { state = "cleared" }, "native-controller")
   local profiles = require("forge.views.harness.subagent_profiles")
@@ -742,16 +748,16 @@ local success, failure = xpcall(function()
   controller.open_spawn_picker = function(profile) routed = { "spawn_picker", profile } end
   controller.open_agent_picker = function() routed = { "agents" } end
   controller.select_agent = function(name) routed = { "select", name } end
-  controller.configure = function(params, validate)
+  controller.configure = function(params)
     assert(vim.deep_equal(params, { subagent_tools = params.subagent_tools }))
-    routed = { "tools", params.subagent_tools, validate }
+    routed = { "tools", params.subagent_tools }
   end
   state.selected_agent_run_id = "child"
   for _, command in ipairs({
-    { "/agents on", { "tools", true, true } },
-    { "/agents on", { "tools", true, true } },
-    { "/agents off", { "tools", false, true } },
-    { "/agents off", { "tools", false, true } },
+    { "/agents on", { "tools", true } },
+    { "/agents on", { "tools", true } },
+    { "/agents off", { "tools", false } },
+    { "/agents off", { "tools", false } },
     { "/agents edit", { "edit" } },
     { "/agents edit reviewer", { "edit", "reviewer" } },
     { "/agents spawn reviewer Inspect parser", { "spawn", "reviewer", "Inspect parser" } },

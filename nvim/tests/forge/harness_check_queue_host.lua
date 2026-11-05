@@ -24,14 +24,14 @@ local controller = require("forge.views.harness.controller")
 local starts, failures = 0, {}
 require("forge.infra.notifications").error = function(message) failures[#failures + 1] = message end
 client.session_events_subscribe(function(event, payload)
-  if event == "provider_event" and payload.kind == "execution_state" then starts = starts + 1 end
+  if event == "provider_event" and payload.kind == "turn_started" then starts = starts + 1 end
 end)
 local function await(predicate, message)
   assert(vim.wait(15000, function() return #failures > 0 or predicate() end, 10),
     message .. "\n" .. vim.inspect({ queue = state.queue, task = state.session.active_task,
       operation = state.task_operation, input = state.input and { revision = state.input.revision,
         pending = state.input.pending, suspended = state.input.suspended }, status = state.status,
-      busy = state.busy, state_sync_pending = state.state_sync_pending, checks_running = state.checks_running,
+      busy = require("forge.views.harness.activity").busy(state), state_sync_pending = state.state_sync_pending, checks_running = state.checks_running,
       checks_deferred = state.checks_deferred, automatic_checks = state.automatic_checks }))
   assert(#failures == 0, table.concat(failures, "\n"))
 end
@@ -47,7 +47,7 @@ local function submit(text, queued)
   if queued then controller.queue_submit() else controller.submit() end
 end
 local function completed()
-  return not state.busy and not state.state_sync_pending and not state.task_operation
+  return not require("forge.views.harness.activity").busy(state) and not state.state_sync_pending
     and not state.checks_running and not state.checks_deferred and #state.queue == 0
 end
 local function executed()
@@ -78,9 +78,9 @@ local success, failure = xpcall(function()
   submit("First queued change")
   await(function() return starts == 1 end, "first item did not start")
   local live_setting
-  controller.configure({ check_timing = "after_queue" }, false, function(value) live_setting = value end)
+  controller.configure({ check_timing = "after_queue" }, function(value) live_setting = value end)
   await(function() return live_setting end, "active timing configuration failed")
-  assert(starts == 1 and state.busy, "changing timing restarted the active provider")
+  assert(starts == 1 and require("forge.views.harness.activity").busy(state), "changing timing restarted the active provider")
   local baseline = data .. "/forge/harness/" .. state.session.id .. "/checks/change-baseline.json"
   await(function() return vim.fn.filereadable(baseline) == 1 end, "change baseline missing")
   local owner = vim.json.decode(table.concat(vim.fn.readfile(baseline), "\n")).owner
@@ -95,7 +95,7 @@ local success, failure = xpcall(function()
   if vim.g.forge_check_queue_first_batch then return end
 
   local applied
-  controller.configure({ check_timing = "between_work" }, false, function(value) applied = value end)
+  controller.configure({ check_timing = "between_work" }, function(value) applied = value end)
   await(function() return applied end, "timing configuration failed")
   assert(request("settings.get").desired.check_timing == "between_work", "timing was not persisted")
   submit("First item with intermediate checks")
@@ -110,7 +110,7 @@ local success, failure = xpcall(function()
   await(completed, "intermediate batch did not finish")
 
   applied = nil
-  controller.configure({ check_timing = "after_queue" }, false, function(value) applied = value end)
+  controller.configure({ check_timing = "after_queue" }, function(value) applied = value end)
   await(function() return applied end, "default timing could not be restored")
   owner = vim.json.decode(table.concat(vim.fn.readfile(baseline), "\n")).owner
   submit("Change before deleting queued work")
@@ -120,7 +120,7 @@ local success, failure = xpcall(function()
   submit("Remove this pending item", true)
   controller.edit_queued(-1)
   vim.fn.writefile({ "third batch edit" }, workspace .. "/source.txt")
-  await(function() return not state.busy and state.checks_deferred end, "editing did not retain the deferred gate")
+  await(function() return not require("forge.views.harness.activity").busy(state) and state.checks_deferred end, "editing did not retain the deferred gate")
   assert(executed() == 2, "checks ran while queued work remained")
   submit("")
   await(completed, "removing the final queued item did not run checks")
@@ -130,9 +130,9 @@ local success, failure = xpcall(function()
   submit("Work with automatic checks disabled")
   await(function() return starts == 6 end, "disabled-check work did not start")
   applied = nil
-  controller.configure({ automatic_checks = false }, false, function(value) applied = value end)
+  controller.configure({ automatic_checks = false }, function(value) applied = value end)
   await(function() return applied end, "automatic checks could not be disabled during work")
-  assert(starts == 6 and state.busy, "disabling checks restarted the provider")
+  assert(starts == 6 and require("forge.views.harness.activity").busy(state), "disabling checks restarted the provider")
   assert(request("session.state.get").automatic_checks == false and state.automatic_checks == false)
   assert(request("settings.get").desired.automatic_checks == false, "disabled setting was not persisted")
   assert(request("session.check.list").automatic_checks == false, "check catalog did not observe live disablement")
@@ -143,7 +143,7 @@ local success, failure = xpcall(function()
   local checked = request("session.check.status", { run_id = explicit.run_id, wait_for_completion = true })
   assert(checked.state == "passed" and executed() == 4, "disabling automatic checks disabled explicit runs")
   applied = nil
-  controller.configure({ automatic_checks = true }, false, function(value) applied = value end)
+  controller.configure({ automatic_checks = true }, function(value) applied = value end)
   await(function() return applied end, "automatic checks could not be enabled")
   assert(request("session.check.list").automatic_checks == true, "check catalog did not observe live enablement")
   owner = vim.json.decode(table.concat(vim.fn.readfile(baseline), "\n")).owner

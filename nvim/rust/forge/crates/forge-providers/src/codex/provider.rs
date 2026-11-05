@@ -110,13 +110,15 @@ impl CodexProvider {
             let discovery = self.discovery.clone();
             let version = self.catalog_version.clone();
             let command = self.command.clone();
+            let native = super::operations::current();
             *catalog = Some(CatalogConnection::Starting(tokio::spawn(async move {
-                let connection = runtime.connect().await.map_err(|_| {
-                    failure(ProviderOperation::Inspect, ProviderFailureKind::Transport)
-                })?;
-                let rpc = Arc::new(NativeRpc::new(connection));
-                discovery.lock().await.push(rpc.clone());
-                let initialized = async {
+                let connect = async move {
+                    let connection = runtime.connect().await.map_err(|_| {
+                        failure(ProviderOperation::Inspect, ProviderFailureKind::Transport)
+                    })?;
+                    let rpc = Arc::new(NativeRpc::new(connection));
+                    discovery.lock().await.push(rpc.clone());
+                    let initialized = async {
                     let initialized = rpc.request("initialize", json!({
                         "clientInfo":{"name":"forge","title":"Forge","version":env!("CARGO_PKG_VERSION")},
                         "capabilities":{"experimentalApi":true}
@@ -127,16 +129,21 @@ impl CodexProvider {
                     *version.lock().await = reported.map_or(forge_provider_api::VersionObservation::NotReported, |version| forge_provider_api::VersionObservation::Known { version: version.to_owned() });
                     rpc.notify("initialized", Value::Null).await
                 }.await;
-                if let Err(primary) = initialized {
-                    return Err(match rpc.close().await {
-                        Ok(()) => primary,
-                        Err(secondary) => ProviderError::Combined {
-                            primary: Box::new(primary),
-                            secondary: vec![secondary],
-                        },
-                    });
+                    if let Err(primary) = initialized {
+                        return Err(match rpc.close().await {
+                            Ok(()) => primary,
+                            Err(secondary) => ProviderError::Combined {
+                                primary: Box::new(primary),
+                                secondary: vec![secondary],
+                            },
+                        });
+                    }
+                    Ok(rpc)
+                };
+                match native {
+                    Some(native) => super::operations::scope(native, connect).await,
+                    None => connect.await,
                 }
-                Ok(rpc)
             })));
         }
         let result = match catalog.as_mut().expect("catalog initialization installed") {
@@ -254,6 +261,8 @@ impl CodexProvider {
                 ProviderFailureKind::Policy,
             ));
         }
+        validate_model_selection(&request.configuration.model)?;
+        let security = CodexSecurity::new(&request.configuration.access)?;
         let binding_id = BindingId::new(uuid::Uuid::new_v4().to_string())
             .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Unknown))?;
         let session_scope = forge_provider_api::EventScope::Binding {
@@ -432,11 +441,7 @@ impl CodexProvider {
             ProviderOperation::SessionOpen,
         )
         .await?;
-        CodexSecurity::new(
-            request.configuration.approval,
-            &request.configuration.access,
-        )
-        .apply_thread(&mut parameters, &request.workspace);
+        security.apply_thread(&mut parameters, &request.workspace);
         if isolated {
             parameters["approvalPolicy"] = json!("never");
             parameters["sandbox"] = json!("read-only");
@@ -517,6 +522,7 @@ impl CodexProvider {
             active: Mutex::new(None),
             admitting: Mutex::new(None),
             background_reader: Mutex::new(None),
+            terminal_observer: Mutex::new(None),
             admission: Mutex::new(()),
             observations: Arc::new(tokio::sync::RwLock::new(false)),
             fenced: AtomicBool::new(false),
@@ -539,7 +545,8 @@ impl CodexProvider {
         self.bindings
             .lock()
             .await
-            .insert(binding_id.clone(), retained);
+            .insert(binding_id.clone(), retained.clone());
+        *retained.terminal_observer.lock().await = Some(start_terminal_observer(&retained));
         self.pending.lock().await.remove(&binding_id);
         self.owners.lock().await.insert(request.owner, binding_id);
         Ok(binding)
@@ -576,6 +583,8 @@ impl CodexProvider {
                 ProviderFailureKind::WrongInvocation,
             ));
         }
+        validate_model_selection(&request.configuration.model)?;
+        let security = CodexSecurity::new(&request.configuration.access)?;
         if session.isolated
             && (!request.tools.is_empty()
                 || request.tool_endpoint.is_some()
@@ -677,8 +686,6 @@ impl CodexProvider {
             native_input.push(json!({"type":"skill","name":name,"path":path}));
         }
         let model = request.configuration.model.clone();
-        let approval = request.configuration.approval;
-        let access = request.configuration.access.clone();
         let mut params = json!({
             "threadId":session.history_id().as_str(),
             "input":native_input.clone(),
@@ -713,7 +720,7 @@ impl CodexProvider {
                 "developer_instructions":instructions
             }
         });
-        CodexSecurity::new(approval, &access).apply_turn(&mut params, &session.workspace);
+        security.apply_turn(&mut params, &session.workspace);
         params["config"]["features.goals"] = json!(false);
         if session.isolated {
             params["approvalPolicy"] = json!("never");
@@ -907,12 +914,8 @@ impl CodexProvider {
     ) -> Result<forge_provider_api::ConfiguredSession, ProviderError> {
         let session = self.binding(binding).await?;
         let resources = configuration.resources.clone();
-        if configuration.model.context_window.is_some() {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::ContextWindowSelection,
-            )
-            .into());
-        }
+        validate_model_selection(&configuration.model)?;
+        let security = CodexSecurity::new(&configuration.access)?;
         if session.isolated {
             return Err(failure(
                 ProviderOperation::SessionConfigure,
@@ -1072,7 +1075,7 @@ impl CodexProvider {
             parameters["serviceTier"] = model_parameters["serviceTier"].clone();
             parameters["config"]["model_reasoning_effort"] =
                 model_parameters["config"]["model_reasoning_effort"].clone();
-            CodexSecurity::new(approval, &access).apply_thread(&mut parameters, &session.workspace);
+            security.apply_thread(&mut parameters, &session.workspace);
             // Loaded native threads ignore resume overrides; virgin threads have no
             // rollout at all. Collect the old writer before applying complete settings.
             release_native_thread_writer(&current_rpc, &thread_id, ProviderOperation::SessionConfigure).await?;
@@ -1145,8 +1148,8 @@ impl CodexProvider {
                 forge_provider_api::ProviderPhase::Collection,
             ));
         }
-        if &next_history != history.id() {
-            if let Err(error) = session
+        if &next_history != history.id()
+            && let Err(error) = session
                 .sink
                 .send_wait(ProviderEvent::SessionIdentity {
                     scope: forge_provider_api::EventScope::Binding {
@@ -1155,13 +1158,12 @@ impl CodexProvider {
                     provider_session_id: next_history,
                 })
                 .await
-            {
-                return Err(invalidate_configuration(
-                    &session,
-                    error.into(),
-                    forge_provider_api::ProviderPhase::Observation,
-                ));
-            }
+        {
+            return Err(invalidate_configuration(
+                &session,
+                error.into(),
+                forge_provider_api::ProviderPhase::Observation,
+            ));
         }
         match start_background_reader(&session).await {
             Ok(Some(start)) => {
@@ -1567,10 +1569,17 @@ impl CodexProvider {
         let session = self.binding(binding).await?;
         let observation = session.observations.read().await;
         let admission = session.admission.lock().await;
-        if *observation || session.is_fenced() || request.scope.owner() != &session.owner {
+        session.check_input_admission(ProviderOperation::SessionCompact)?;
+        if *observation {
             return Err(failure(
                 ProviderOperation::SessionCompact,
-                ProviderFailureKind::Rejected,
+                ProviderFailureKind::BindingClosed,
+            ));
+        }
+        if request.scope.owner() != &session.owner {
+            return Err(failure(
+                ProviderOperation::SessionCompact,
+                ProviderFailureKind::WrongInvocation,
             ));
         }
         // A terminal event can arrive before its reader returns. Join only a
@@ -1579,36 +1588,13 @@ impl CodexProvider {
         if session.active.lock().await.is_some() {
             return Err(failure(
                 ProviderOperation::SessionCompact,
-                ProviderFailureKind::Rejected,
+                ProviderFailureKind::ExecutionActive,
             ));
         }
         // Transfer exclusive notification consumption from the idle reader.
         super::operations::check()?;
         stop_background_reader(&session).await?;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            compact_session(&session, request),
-        )
-        .await
-        .unwrap_or_else(|_| {
-            let (phase, disposition) = if operation.changed() {
-                (
-                    forge_provider_api::ProviderPhase::Observation,
-                    forge_provider_api::FailureDisposition::Uncertain,
-                )
-            } else {
-                (
-                    forge_provider_api::ProviderPhase::Admission,
-                    forge_provider_api::FailureDisposition::Unchanged,
-                )
-            };
-            Err(ProviderFailure::new(
-                ProviderOperation::SessionCompact,
-                ProviderFailureKind::Timeout,
-            )
-            .at_phase(phase, disposition)
-            .into())
-        });
+        let result = compact_session(&session, request).await;
         if matches!(&result, Err(ProviderError::Failure(failure))
             if matches!(failure.kind(), ProviderFailureKind::Timeout | ProviderFailureKind::Transport | ProviderFailureKind::Protocol | ProviderFailureKind::Cancelled)
                 && failure.disposition() != forge_provider_api::FailureDisposition::Unchanged)
@@ -1677,6 +1663,8 @@ impl CodexProvider {
             ));
         }
         let session = self.binding(binding).await?;
+        let _admission = session.admission.lock().await;
+        super::operations::check()?;
         if session.is_fenced() {
             return Err(failure(
                 ProviderOperation::TerminalTerminate,
@@ -1880,6 +1868,8 @@ impl CodexProvider {
         &self,
         request: forge_provider_api::SessionForkRequest,
     ) -> Result<forge_provider_api::ProviderForkResult, ProviderError> {
+        validate_model_selection(&request.target.configuration.model)?;
+        let security = CodexSecurity::new(&request.target.configuration.access)?;
         let (rpc, thread_id, checkpoint, session) = match &request.source {
             forge_provider_api::ForkSource::Binding(id) => {
                 let session = self.binding(id).await?;
@@ -1902,8 +1892,9 @@ impl CodexProvider {
             None => None,
         };
         if let Some(session) = &session {
+            session.check_input_admission(ProviderOperation::SessionFork)?;
             collect_settled_execution(session).await?;
-            if session.is_fenced() || session.active.lock().await.is_some() {
+            if session.active.lock().await.is_some() {
                 return Err(failure(
                     ProviderOperation::SessionFork,
                     ProviderFailureKind::ExecutionActive,
@@ -1921,11 +1912,7 @@ impl CodexProvider {
             ProviderOperation::SessionFork,
         )
         .await?;
-        CodexSecurity::new(
-            request.target.configuration.approval,
-            &request.target.configuration.access,
-        )
-        .apply_thread(&mut parameters, &request.target.workspace);
+        security.apply_thread(&mut parameters, &request.target.workspace);
         let result = async {
             let value = rpc
                 .request("thread/fork", parameters, ProviderOperation::SessionFork)
@@ -2288,75 +2275,9 @@ impl CodexProvider {
         binding: &BindingId,
     ) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
         let session = self.binding(binding).await?;
-        if session.is_fenced() {
-            return Err(failure(
-                ProviderOperation::TerminalList,
-                ProviderFailureKind::BindingClosed,
-            ));
-        }
-        let observation = session.observations.clone().read_owned().await;
-        if *observation {
-            return Err(failure(
-                ProviderOperation::TerminalList,
-                ProviderFailureKind::SessionMissing,
-            ));
-        }
-        async move {
-            let _observation = observation;
-            let thread_id = session.history_id();
-            let mut cursor = None::<String>;
-            let mut seen = std::collections::HashSet::new();
-            let mut terminal = Vec::new();
-            loop {
-                let page = session
-                    .rpc
-                    .lock()
-                    .await
-                    .request(
-                        "thread/backgroundTerminals/list",
-                        json!(
-                            {"threadId":thread_id,"limit":100,"cursor":cursor}
-                        ),
-                        ProviderOperation::TerminalList,
-                    )
-                    .await?;
-                let parsed = crate::terminal::parse_snapshot(&page, false).map_err(|_| {
-                    failure(
-                        ProviderOperation::TerminalList,
-                        ProviderFailureKind::Protocol,
-                    )
-                })?;
-                for mut row in parsed.terminal {
-                    row.id = forge_provider_api::terminal::TerminalId::new(
-                        serde_json::to_string(&[session.binding.id.as_str(), row.id.as_str()])
-                            .map_err(|_| {
-                                failure(
-                                    ProviderOperation::TerminalList,
-                                    ProviderFailureKind::Protocol,
-                                )
-                            })?,
-                    )?;
-                    terminal.push(row);
-                }
-                let Some(next) = page.get("nextCursor").and_then(Value::as_str) else {
-                    break;
-                };
-                if !seen.insert(next.to_owned()) {
-                    return Err(failure(
-                        ProviderOperation::TerminalList,
-                        ProviderFailureKind::Protocol,
-                    ));
-                }
-                cursor = Some(next.to_owned());
-            }
-            Ok(forge_provider_api::terminal::TerminalSnapshot {
-                supported: true,
-                starting: false,
-                terminal,
-            })
-        }
-        .await
+        read_binding_terminals(&session).await
     }
+
     /// Collect only an interrupted open's exclusive native resources and late installed binding.
     async fn collect_open_operation(
         &self,
@@ -2416,10 +2337,13 @@ impl CodexProvider {
                 ),
                 ProviderOperation::SessionOpen
                 | ProviderOperation::SessionConfigure
-                | ProviderOperation::SessionCompact
                 | ProviderOperation::InputRetract => (
                     forge_provider_api::ProviderPhase::Collection,
                     forge_provider_api::FailureDisposition::Invalidated,
+                ),
+                ProviderOperation::SessionCompact => (
+                    forge_provider_api::ProviderPhase::Observation,
+                    forge_provider_api::FailureDisposition::Uncertain,
                 ),
                 ProviderOperation::Inspect
                 | ProviderOperation::Authenticate
@@ -2499,16 +2423,11 @@ impl CodexProvider {
         if let Some(admitting) = admitting {
             admitting.cancel.store(true, Ordering::Release);
             let mut done = admitting.done.subscribe();
-            tokio::time::timeout(std::time::Duration::from_secs(35), async {
-                while !*done.borrow() {
-                    done.changed().await.map_err(|_| {
-                        failure(ProviderOperation::Cancel, ProviderFailureKind::Transport)
-                    })?;
-                }
-                Ok::<_, ProviderError>(())
-            })
-            .await
-            .map_err(|_| failure(ProviderOperation::Cancel, ProviderFailureKind::Timeout))??;
+            while !*done.borrow() {
+                done.changed().await.map_err(|_| {
+                    failure(ProviderOperation::Cancel, ProviderFailureKind::Transport)
+                })?;
+            }
         }
         if let Some(settlement) = session.settlements.lock().await.get(scope).cloned() {
             return settlement;
@@ -2540,12 +2459,7 @@ impl CodexProvider {
             }
             task
         };
-        tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            collect_invocation(session.clone(), scope.clone(), task),
-        )
-        .await
-        .map_err(|_| failure(ProviderOperation::Cancel, ProviderFailureKind::Timeout))??;
+        collect_invocation(session.clone(), scope.clone(), task).await?;
         session
             .settlements
             .lock()
@@ -2565,6 +2479,19 @@ impl CodexProvider {
         session.fenced.store(true, Ordering::Release);
         self.pending_inputs.cancel_binding(binding).await;
         let _close = session.close_lock.lock().await;
+        let mut errors = Vec::new();
+        if let Some(observer) = session.terminal_observer.lock().await.take() {
+            observer.abort();
+            if let Err(error) = observer.await
+                && !error.is_cancelled()
+            {
+                errors.push(failure(
+                    ProviderOperation::SessionClose,
+                    ProviderFailureKind::Runtime,
+                ));
+            }
+        }
+
         let pending_scope = session
             .admitting
             .lock()
@@ -2580,14 +2507,11 @@ impl CodexProvider {
                 .as_ref()
                 .map(|execution| execution.scope.clone()),
         };
-        let mut errors = Vec::new();
         if let Some(scope) = scope
             && let Err(error) = self.cancel_invocation(binding, &scope).await
+            && !matches!(&error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::WrongInvocation && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
         {
-            if !matches!(&error, ProviderError::Failure(failure) if failure.kind() == ProviderFailureKind::WrongInvocation && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged)
-            {
-                errors.push(error);
-            }
+            errors.push(error);
         }
         let _admission = session.admission.lock().await;
         if let Err(error) = stop_background_reader(&session).await {
@@ -3441,6 +3365,7 @@ struct CodexBinding {
     active: Mutex<Option<ActiveExecution>>,
     admitting: Mutex<Option<Arc<AdmittingInput>>>,
     background_reader: Mutex<Option<BackgroundReader>>,
+    terminal_observer: Mutex<Option<tokio::task::JoinHandle<()>>>,
     rollback: Mutex<Option<RollbackAuthorization>>,
     admission: Mutex<()>,
     observations: Arc<tokio::sync::RwLock<bool>>,
@@ -4030,6 +3955,158 @@ async fn collect_settled_execution(session: &Arc<CodexBinding>) -> Result<(), Pr
     Ok(())
 }
 
+/// Read one binding inventory under the same admission guard used by configuration changes.
+async fn read_binding_terminals(
+    session: &Arc<CodexBinding>,
+) -> Result<forge_provider_api::terminal::TerminalSnapshot, ProviderError> {
+    // Rollback fences are provisional while the lifecycle owner holds admission.
+    // Observe the resulting binding, never that intermediate fenced state.
+    let _admission = session.admission.lock().await;
+    super::operations::check()?;
+    if session.is_fenced() {
+        return Err(failure(
+            ProviderOperation::TerminalList,
+            ProviderFailureKind::BindingClosed,
+        ));
+    }
+    let observation = session.observations.clone().read_owned().await;
+    if *observation {
+        return Err(failure(
+            ProviderOperation::TerminalList,
+            ProviderFailureKind::SessionMissing,
+        ));
+    }
+    async {
+        let _observation = observation;
+        let thread_id = session.history_id();
+        let mut cursor = None::<String>;
+        let mut seen = std::collections::HashSet::new();
+        let mut terminal = Vec::new();
+        loop {
+            let page = session
+                .rpc
+                .lock()
+                .await
+                .request(
+                    "thread/backgroundTerminals/list",
+                    json!(
+                        {"threadId":thread_id,"limit":100,"cursor":cursor}
+                    ),
+                    ProviderOperation::TerminalList,
+                )
+                .await?;
+            let parsed = crate::terminal::parse_snapshot(&page, false).map_err(|_| {
+                failure(
+                    ProviderOperation::TerminalList,
+                    ProviderFailureKind::Protocol,
+                )
+            })?;
+            for mut row in parsed.terminal {
+                row.id = forge_provider_api::terminal::TerminalId::new(
+                    serde_json::to_string(&[session.binding.id.as_str(), row.id.as_str()])
+                        .map_err(|_| {
+                            failure(
+                                ProviderOperation::TerminalList,
+                                ProviderFailureKind::Protocol,
+                            )
+                        })?,
+                )?;
+                terminal.push(row);
+            }
+            let Some(next) = page.get("nextCursor").and_then(Value::as_str) else {
+                break;
+            };
+            if !seen.insert(next.to_owned()) {
+                return Err(failure(
+                    ProviderOperation::TerminalList,
+                    ProviderFailureKind::Protocol,
+                ));
+            }
+            cursor = Some(next.to_owned());
+        }
+        Ok(forge_provider_api::terminal::TerminalSnapshot {
+            supported: true,
+            starting: false,
+            terminal,
+        })
+    }
+    .await
+}
+
+/// Retain event-driven terminal observation independently of foreground consumption.
+fn start_terminal_observer(session: &Arc<CodexBinding>) -> tokio::task::JoinHandle<()> {
+    let weak = Arc::downgrade(session);
+    let rpc = session.rpc.clone();
+    tokio::spawn(async move {
+        let mut replacements = rpc.replacements();
+        let mut changes = rpc.lock().await.terminal_changes();
+        let mut previous = None;
+        loop {
+            changes.borrow_and_update();
+            let Some(session) = weak.upgrade() else {
+                return;
+            };
+            if session.closing.load(Ordering::Acquire) {
+                return;
+            }
+            match read_binding_terminals(&session).await {
+                Ok(snapshot) => {
+                    if previous.as_ref() != Some(&snapshot) {
+                        if session
+                            .sink
+                            .send_wait(ProviderEvent::Terminals {
+                                scope: forge_provider_api::EventScope::Binding {
+                                    owner: session.owner.clone(),
+                                },
+                                snapshot: snapshot.clone(),
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        previous = Some(snapshot);
+                    }
+                }
+                Err(_) => {
+                    if session.closing.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let diagnostic = forge_provider_api::ProviderDiagnostic {
+                        kind: ProviderFailureKind::Runtime,
+                        message: forge_provider_api::diagnostic::SanitizedMessage::new(
+                            "Background terminal inventory is unavailable.",
+                        )
+                        .expect("nonempty diagnostic"),
+                        fatal: false,
+                    };
+                    if session
+                        .sink
+                        .send_wait(ProviderEvent::Diagnostic {
+                            scope: forge_provider_api::EventScope::Binding {
+                                owner: session.owner.clone(),
+                            },
+                            diagnostic,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            drop(session);
+            tokio::select! {
+                result = changes.changed() => if result.is_err() { return; },
+                result = replacements.changed() => {
+                    if result.is_err() { return; }
+                    changes = rpc.lock().await.terminal_changes();
+                }
+            }
+        }
+    })
+}
+
 /// Unsubscribe the exact native writer and prove it finished before another runtime resumes its history.
 /// The source's ordered notification reader remains untouched throughout this read-only verification.
 async fn release_native_thread_writer(
@@ -4043,7 +4120,9 @@ async fn release_native_thread_writer(
             forge_provider_api::FailureDisposition::Uncertain,
         ))
     };
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    let release = async {
+        let mut closed = rpc.closed_threads();
+        let prior_close = closed.borrow_and_update().get(target).copied();
         let response = rpc
             .request(
                 "thread/unsubscribe",
@@ -4057,45 +4136,60 @@ async fn release_native_thread_writer(
         ) {
             return Err(uncertain(ProviderFailureKind::Protocol));
         }
-        loop {
-            let mut cursor = None::<String>;
-            let mut seen = std::collections::HashSet::new();
-            let loaded = loop {
-                let page = rpc
-                    .request(
-                        "thread/loaded/list",
-                        json!({"limit":100,"cursor":cursor}),
-                        operation,
-                    )
-                    .await?;
-                let rows = page
-                    .get("data")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| uncertain(ProviderFailureKind::Protocol))?;
-                if rows.iter().any(|row| row.as_str().is_none()) {
-                    return Err(uncertain(ProviderFailureKind::Protocol));
-                }
-                if rows.iter().any(|row| row.as_str() == Some(target.as_str())) {
-                    break true;
-                }
-                let next = match page.get("nextCursor") {
-                    None | Some(Value::Null) => break false,
-                    Some(Value::String(next)) if !next.is_empty() => next,
-                    Some(_) => return Err(uncertain(ProviderFailureKind::Protocol)),
-                };
-                if !seen.insert(next.to_owned()) {
-                    return Err(uncertain(ProviderFailureKind::Protocol));
-                }
-                cursor = Some(next.to_owned());
+        let mut cursor = None::<String>;
+        let mut seen = std::collections::HashSet::new();
+        let loaded = loop {
+            let page = rpc
+                .request(
+                    "thread/loaded/list",
+                    json!({"limit":100,"cursor":cursor}),
+                    operation,
+                )
+                .await?;
+            let rows = page
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or_else(|| uncertain(ProviderFailureKind::Protocol))?;
+            if rows.iter().any(|row| row.as_str().is_none()) {
+                return Err(uncertain(ProviderFailureKind::Protocol));
+            }
+            if rows.iter().any(|row| row.as_str() == Some(target.as_str())) {
+                break true;
+            }
+            let next = match page.get("nextCursor") {
+                None | Some(Value::Null) => break false,
+                Some(Value::String(next)) if !next.is_empty() => next,
+                Some(_) => return Err(uncertain(ProviderFailureKind::Protocol)),
             };
-            if !loaded {
+            if !seen.insert(next.to_owned()) {
+                return Err(uncertain(ProviderFailureKind::Protocol));
+            }
+            cursor = Some(next.to_owned());
+        };
+        if !loaded {
+            return Ok(());
+        }
+        loop {
+            if closed.borrow_and_update().get(target).copied() != prior_close {
                 return Ok(());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            closed
+                .changed()
+                .await
+                .map_err(|_| uncertain(ProviderFailureKind::Transport))?;
         }
-    })
-    .await
-    .map_err(|_| uncertain(ProviderFailureKind::Timeout))?
+    };
+    match super::operations::current() {
+        Some(context) => tokio::select! {
+            result = release => result,
+            reason = context.context.interrupted() => Err(reason.failure(
+                operation,
+                forge_provider_api::ProviderPhase::Collection,
+                forge_provider_api::FailureDisposition::Uncertain,
+            )),
+        },
+        None => release.await,
+    }
 }
 
 /// Run native compaction while admission and notification consumption are exclusively owned.
@@ -4529,6 +4623,7 @@ async fn observe_execution(
                         failure: ExecutionFailure::Retryable {
                             address: address.clone(),
                             category,
+                            retry_after: None,
                         },
                     },
                     Some(kind),
@@ -4651,6 +4746,11 @@ async fn lose_observation(
     primary: ProviderError,
     failure_kind: forge_provider_api::lifecycle::ObservationFailure,
 ) -> ProviderError {
+    let failure_kind = if let ProviderError::Observation(observed) = &primary {
+        observed.clone()
+    } else {
+        failure_kind
+    };
     let mut errors = vec![primary];
     let mut active_turns = descendants.active_turns();
     active_turns.push((
@@ -5170,18 +5270,25 @@ fn input_text(input: &PromptInput) -> String {
     }
 }
 
-async fn apply_model_selection(
-    rpc: &NativeRpc,
-    parameters: &mut Value,
-    selection: &ModelSelection,
-    operation: ProviderOperation,
-) -> Result<Option<String>, ProviderError> {
+/// Reject model controls absent from the native protocol before acquiring resources.
+fn validate_model_selection(selection: &ModelSelection) -> Result<(), ProviderError> {
     if selection.context_window.is_some() {
         return Err(forge_provider_api::capability::UnsupportedCapability(
             forge_provider_api::capability::ProviderFeature::ContextWindowSelection,
         )
         .into());
     }
+    Ok(())
+}
+
+/// Resolve native catalog defaults and encode validated model controls.
+async fn apply_model_selection(
+    rpc: &NativeRpc,
+    parameters: &mut Value,
+    selection: &ModelSelection,
+    operation: ProviderOperation,
+) -> Result<Option<String>, ProviderError> {
+    validate_model_selection(selection)?;
     parameters["serviceTier"] = json!(selection.service_tier);
     let catalog = rpc.request("model/list", json!({}), operation).await?;
     let models = crate::codex::catalog::parse_model_catalog(&catalog);
@@ -5278,7 +5385,6 @@ async fn await_admission(
                     && params.get("threadId").and_then(Value::as_str) == Some(thread_id.as_str()) {
                     params.pointer("/turn/id").or_else(|| params.get("turnId")).and_then(Value::as_str).filter(|id| !id.is_empty()).map(str::to_owned)
                 } else { None };
-                if initial_messages.len() == forge_protocol::MAX_PENDING_FRAMES { return Err(ProviderError::Observation(forge_provider_api::ObservationFailure::Overflow)); }
                 initial_messages.push(message);
                 if let Some(turn_id) = turn_id {
                     // Admission owns a previously settled slot and its sole ordered reader. The preceding
@@ -5611,6 +5717,7 @@ mod continuation_tests {
             active: Mutex::new(None),
             admitting: Mutex::new(None),
             background_reader: Mutex::new(None),
+            terminal_observer: Mutex::new(None),
             rollback: Mutex::new(None),
             admission: Mutex::new(()),
             observations: Arc::new(tokio::sync::RwLock::new(false)),
@@ -5714,6 +5821,7 @@ mod continuation_tests {
                             false
                         );
                         assert_eq!(request["params"]["config"]["thread_unload_delay_secs"], 0);
+                        assert_eq!(request["params"]["config"]["features.goals"], false);
                         assert_eq!(
                             request["params"]["config"]["model_reasoning_effort"],
                             if state.applied == 0 { "low" } else { "medium" }
@@ -5894,9 +6002,9 @@ mod continuation_tests {
         }).await.unwrap();
     }
 
-    /// The adapter's own completion bound collects dispatched compaction before the longer host deadline.
+    /// Compaction preserves the caller's complete budget and collects uncertain work at that deadline.
     #[tokio::test]
-    async fn local_compaction_timeout_preserves_uncertainty_and_collects_native_binding() {
+    async fn caller_compaction_timeout_preserves_uncertainty_and_collects_native_binding() {
         use futures_util::{SinkExt, StreamExt};
         let (provider, session, mut events, mut socket) = compaction_fixture().await;
         let native = tokio::spawn(async move {
@@ -5922,8 +6030,8 @@ mod continuation_tests {
         });
         let (_, cancellation) = forge_provider_api::OperationCancellation::channel();
         let operation = OperationContext::new(
-            forge_provider_api::OperationId::new("local-compaction-timeout").unwrap(),
-            std::time::Duration::from_secs(600),
+            forge_provider_api::OperationId::new("caller-compaction-timeout").unwrap(),
+            std::time::Duration::from_secs(150),
             cancellation,
         )
         .unwrap();
@@ -5952,6 +6060,9 @@ mod continuation_tests {
         }).await.unwrap();
         tokio::time::pause();
         tokio::time::advance(std::time::Duration::from_secs(121)).await;
+        tokio::task::yield_now().await;
+        assert!(!compacting.is_finished());
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
         tokio::time::resume();
         let error = tokio::time::timeout(std::time::Duration::from_secs(5), compacting)
             .await
@@ -5965,7 +6076,7 @@ mod continuation_tests {
         assert!(
             operation
                 .check_admission(ProviderOperation::SessionCompact)
-                .is_ok()
+                .is_err()
         );
         assert!(session.invalidated.load(Ordering::Acquire));
         assert!(provider.closed_bindings.lock().await.contains(&binding));
@@ -6097,12 +6208,57 @@ mod continuation_tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ProviderError::Failure(failure)
-            if failure.operation() == ProviderOperation::SessionCompact && failure.kind() == ProviderFailureKind::Rejected));
+            if failure.operation() == ProviderOperation::SessionCompact && failure.kind() == ProviderFailureKind::ExecutionActive));
         assert!(session.active.lock().await.is_some());
         assert!(cancelled.try_recv().is_err());
         release.send(()).unwrap();
         task.join().await.unwrap();
         session.rpc.lock().await.close().await.unwrap();
+    }
+
+    /// Compaction and fork distinguish revoked binding authority without dispatching native reads.
+    #[tokio::test]
+    async fn history_mutations_preserve_revoked_binding_preconditions() {
+        for closing in [false, true] {
+            let (provider, session, _events, _socket) = compaction_fixture().await;
+            session.invalidated.store(!closing, Ordering::Release);
+            session.closing.store(closing, Ordering::Release);
+            let expected = if closing {
+                ProviderFailureKind::BindingClosed
+            } else {
+                ProviderFailureKind::BindingInvalidated
+            };
+            let operation = context();
+            let compact = forge_provider_api::CompactionRequest {
+                scope: forge_provider_api::EventScope::SessionOperation {
+                    owner: session.owner.clone(),
+                    operation_id: operation.id().clone(),
+                },
+            };
+            let error = provider
+                .session_compact(operation, &session.binding.id, compact)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ProviderError::Failure(failure)
+                if failure.kind() == expected
+                    && failure.operation() == ProviderOperation::SessionCompact));
+            let fork = forge_provider_api::SessionForkRequest {
+                source: forge_provider_api::ForkSource::Binding(session.binding.id.clone()),
+                target: forge_provider_api::ForkTarget {
+                    owner: forge_provider_api::ExecutionOwner::root("revoked-fork-target"),
+                    workspace: "workspace".into(),
+                    configuration: session.configuration.lock().await.clone(),
+                    system_instructions: String::new(),
+                },
+            };
+            let error = provider.session_fork(context(), fork).await.unwrap_err();
+            assert!(matches!(error, ProviderError::Failure(failure)
+                if failure.kind() == expected
+                    && failure.operation() == ProviderOperation::SessionFork));
+            assert_eq!(session.sink.watermark().get(), 0);
+            assert!(provider.fork_targets.lock().await.is_empty());
+            session.rpc.lock().await.close().await.unwrap();
+        }
     }
 
     /// Collect the shared runtime even when catalog initialization has already failed.
@@ -6176,6 +6332,219 @@ mod continuation_tests {
         assert_eq!(provider.bindings.lock().await.len(), 1);
         assert!(provider.pending.lock().await.is_empty());
         assert!(provider.runtime.process_id().await.is_none());
+        session.rpc.lock().await.close().await.unwrap();
+    }
+
+    /// Queue loss must retain its actual category instead of becoming a false disconnect.
+    #[tokio::test]
+    async fn observation_loss_preserves_overflow_in_events_and_return() {
+        use futures_util::{SinkExt, StreamExt};
+        let (provider, session, mut events, mut wire) = compaction_fixture().await;
+        let peer = tokio::spawn(async move {
+            let request: Value =
+                serde_json::from_str(wire.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(request["method"], "turn/interrupt");
+            wire.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"id":request["id"],"result":{}}).to_string().into(),
+            ))
+            .await
+            .unwrap();
+            while let Some(Ok(message)) = wire.next().await {
+                if message.is_close() {
+                    break;
+                }
+            }
+        });
+        let input = request();
+        let address = forge_provider_api::TurnAddress {
+            scope: input.scope.clone(),
+            thread_id: session.history_id().to_string(),
+            turn_id: "overflow-turn".into(),
+        };
+        let error = lose_observation(
+            &session,
+            &input,
+            &address,
+            &super::super::descendants::DescendantTracker::default(),
+            ProviderError::Observation(forge_provider_api::ObservationFailure::Overflow),
+            forge_provider_api::ObservationFailure::Disconnected,
+        )
+        .await;
+        assert!(matches!(
+            error,
+            ProviderError::Observation(forge_provider_api::ObservationFailure::Overflow)
+        ));
+        let event = events.recv().await.unwrap().unwrap();
+        assert!(
+            matches!(event.event, ProviderEvent::Execution { observation }
+            if matches!(observation.update(), ExecutionUpdate::ObservationLost { failure: forge_provider_api::ObservationFailure::Overflow, .. }))
+        );
+        assert!(matches!(
+            events.recv().await,
+            Err(events::EventDeliveryError::Observation(
+                forge_provider_api::ObservationFailure::Overflow
+            ))
+        ));
+        session.rpc.lock().await.close().await.unwrap();
+        peer.await.unwrap();
+        drop(provider);
+    }
+
+    /// Wait out provisional rollback fences before observing or terminating a shell.
+    #[tokio::test]
+    async fn terminal_operations_wait_for_lifecycle_admission_before_checking_fences() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        let (provider, session, _events, mut wire) = compaction_fixture().await;
+        let admission = session.admission.lock().await;
+        session.fenced.store(true, Ordering::Release);
+        let querying = provider.clone();
+        let binding = session.binding.id.clone();
+        let mut list = tokio::spawn(async move { querying.read_terminals(&binding).await });
+        let stopping = provider.clone();
+        let binding = session.binding.id.clone();
+        let terminal = forge_provider_api::terminal::TerminalId::new(
+            json!([binding.as_str(), "process"]).to_string(),
+        )
+        .unwrap();
+        let mut terminate = tokio::spawn(async move {
+            stopping
+                .terminate_binding_terminal(&binding, &terminal)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut list)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut terminate)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), wire.next())
+                .await
+                .is_err()
+        );
+        let peer = tokio::spawn(async move {
+            for _ in 0..2 {
+                let request: Value =
+                    serde_json::from_str(wire.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "thread/backgroundTerminals/list" => json!({"data":[]}),
+                    "thread/backgroundTerminals/terminate" => json!({"terminated":true}),
+                    method => panic!("unexpected terminal method: {method}"),
+                };
+                wire.send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"id":request["id"],"result":result})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            }
+            while let Some(Ok(message)) = wire.next().await {
+                if message.is_close() {
+                    break;
+                }
+            }
+        });
+        session.fenced.store(false, Ordering::Release);
+        drop(admission);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), list)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .terminal
+                .is_empty()
+        );
+        tokio::time::timeout(Duration::from_secs(2), terminate)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        session.fenced.store(true, Ordering::Release);
+        assert!(matches!(provider.read_terminals(&session.binding.id).await,
+            Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::BindingClosed));
+        session.rpc.lock().await.close().await.unwrap();
+        peer.await.unwrap();
+    }
+
+    /// Reject unsupported settings at every ingress before touching native or profile ownership.
+    #[tokio::test]
+    async fn unsupported_options_reject_before_native_or_profile_changes() {
+        use forge_provider_api::capability::{ProviderFeature, UnsupportedCapability};
+        use futures_util::StreamExt;
+        let (mut provider, session, _events, mut wire) = compaction_fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        provider.runtime_root = directory.path().to_owned();
+        let mut cases = Vec::new();
+        let mut context_window = session.configuration.lock().await.clone();
+        context_window.model.context_window = Some("unavailable".into());
+        cases.push((context_window, ProviderFeature::ContextWindowSelection));
+        let mut isolation = session.configuration.lock().await.clone();
+        isolation.access.isolation_mode = Some("unsupported".into());
+        cases.push((isolation, ProviderFeature::IsolationMode));
+        for (configuration, expected) in cases {
+            let request = SessionRequest {
+                owner: forge_provider_api::ExecutionOwner::root("invalid-open"),
+                mode: forge_provider_api::SessionMode::Interactive,
+                workspace: directory.path().to_string_lossy().into_owned(),
+                history: forge_provider_api::SessionHistory::Durable { resume: None },
+                configuration: configuration.clone(),
+                resource_lease: None,
+                tools: Vec::new(),
+                tool_endpoint: None,
+                system_instructions: String::new(),
+                trace: Arc::new(FixtureAuthority),
+            };
+            assert!(matches!(provider.session_open(context(), request).await,
+                Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected));
+            assert!(
+                matches!(provider.session_configure(context(), &session.binding.id, configuration.clone()).await,
+                Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
+            );
+            assert!(
+                matches!(provider.session_fork(context(), forge_provider_api::SessionForkRequest {
+                source: forge_provider_api::ForkSource::Checkpoint { provider_session_id: "unknown".try_into().unwrap(), checkpoint: forge_provider_api::CheckpointId::new("checkpoint").unwrap() },
+                target: forge_provider_api::ForkTarget { owner: forge_provider_api::ExecutionOwner::root("invalid-fork"),
+                    workspace: directory.path().to_string_lossy().into_owned(), system_instructions: String::new(), configuration: configuration.clone() },
+            }).await, Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
+            );
+            let mut prompt = self::request();
+            prompt.configuration.model = configuration.model;
+            prompt.configuration.access = configuration.access;
+            prompt.dispatch = forge_provider_api::submission::DispatchReporter::channel(
+                session.binding.id.clone(),
+                prompt.scope.clone(),
+                prompt.submission_id.clone(),
+                prompt.attempt_id.clone(),
+            )
+            .0;
+            assert!(
+                matches!(provider.input_submit(context(), &session.binding.id, prompt).await,
+                Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
+            );
+            assert!(!session.is_fenced());
+            assert!(session.admitting.lock().await.is_none());
+            assert!(session.active.lock().await.is_none());
+            assert!(session.retired_profiles.lock().await.is_empty());
+            assert!(provider.preparing.lock().await.is_empty());
+            assert!(provider.pending.lock().await.is_empty());
+            assert!(provider.catalog.lock().await.is_none());
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), wire.next())
+                .await
+                .is_err(),
+            "preflight sent native I/O"
+        );
         session.rpc.lock().await.close().await.unwrap();
     }
 
@@ -6343,6 +6712,48 @@ mod continuation_tests {
         assert!(provider.pending.lock().await.is_empty());
     }
 
+    /// Publish shell transitions and dispatcher replacement without periodic inventory requests.
+    #[tokio::test]
+    async fn terminal_inventory_streams_changes_and_rpc_replacements_without_polling() {
+        use futures_util::{SinkExt, StreamExt};
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (_provider, session, mut events, mut socket) = compaction_fixture().await;
+            let observer = start_terminal_observer(&session);
+            for (index, native) in [None, Some("native-shell"), None].into_iter().enumerate() {
+                let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], "thread/backgroundTerminals/list");
+                let rows = native.map(|id| vec![json!({"processId":id,"command":"echo working"})]).unwrap_or_default();
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":{"data":rows}}).to_string().into())).await.unwrap();
+                let event = events.recv().await.unwrap().unwrap();
+                let ProviderEvent::Terminals { snapshot, .. } = event.event else { panic!("expected inventory"); };
+                assert_eq!(snapshot.terminal.len(), usize::from(native.is_some()));
+                if let Some(native) = native { assert_ne!(snapshot.terminal[0].id.as_str(), native); }
+                if native == Some("native-shell") {
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"process/exited","params":{}}).to_string().into())).await.unwrap();
+                } else if index == 0 {
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"item/completed","params":{}}).to_string().into())).await.unwrap();
+                }
+            }
+            let (_other_provider, other, _other_events, mut replacement_socket) = compaction_fixture().await;
+            let retired = session.rpc.replace_shared(other.rpc.lock().await.shared()).await;
+            let request: Value = serde_json::from_str(replacement_socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "thread/backgroundTerminals/list");
+            replacement_socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":{"data":[{"processId":"replacement-shell","command":"echo next"}]}}).to_string().into())).await.unwrap();
+            let ProviderEvent::Terminals { snapshot, .. } = events.recv().await.unwrap().unwrap().event else { panic!("expected replacement inventory"); };
+            assert_eq!(snapshot.terminal.len(), 1);
+            let rpc = session.rpc.lock().await.shared();
+            let querying = tokio::spawn(async move { rpc.request("model/list", json!({}), ProviderOperation::ModelList).await });
+            let request: Value = serde_json::from_str(replacement_socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "model/list", "idle observer queried inventory again");
+            replacement_socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":{"data":[]}}).to_string().into())).await.unwrap();
+            querying.await.unwrap().unwrap();
+            observer.abort();
+            assert!(observer.await.unwrap_err().is_cancelled());
+            retired.close().await.unwrap();
+            session.rpc.lock().await.close().await.unwrap();
+        }).await.unwrap();
+    }
+
     /// Native fork acknowledgement cannot expose a target while its writer remains loaded on any listing page.
     #[tokio::test]
     async fn fork_collects_target_writer_before_returning_and_preserves_source() {
@@ -6359,15 +6770,15 @@ mod continuation_tests {
                     ("thread/unsubscribe", json!({"status":"unsubscribed"})),
                     ("thread/loaded/list", json!({"data":["compaction-thread"],"nextCursor":"first-page"})),
                     ("thread/loaded/list", json!({"data":["fork-target"]})),
-                    ("thread/loaded/list", json!({"data":["compaction-thread"],"nextCursor":"last-page"})),
                 ] {
                     let received: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap(); assert_eq!(received["method"], method);
                     if method == "thread/fork" { assert_eq!(received["params"]["config"]["thread_unload_delay_secs"], 0); }
                     if method == "thread/unsubscribe" { assert_eq!(received["params"]["threadId"], "fork-target"); }
                     socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":received["id"],"result":result}).to_string().into())).await.unwrap();
                 }
-                let final_page: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap(); assert_eq!(final_page["method"], "thread/loaded/list"); assert_eq!(final_page["params"]["cursor"], "last-page"); waiting.send(()).unwrap(); released.await.unwrap();
-                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":final_page["id"],"result":{"data":["other-history"]}}).to_string().into())).await.unwrap();
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"thread/closed","params":{"threadId":"unrelated"}}).to_string().into())).await.unwrap();
+                waiting.send(()).unwrap(); released.await.unwrap();
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"method":"thread/closed","params":{"threadId":"fork-target"}}).to_string().into())).await.unwrap();
                 let source_read: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap(); assert_eq!(source_read["method"], "model/list");
                 socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":source_read["id"],"result":{"data":[]}}).to_string().into())).await.unwrap();
                 while let Some(message) = socket.next().await { if matches!(message, Ok(tokio_tungstenite::tungstenite::Message::Close(_))) { break; } }
@@ -6714,6 +7125,72 @@ mod continuation_tests {
         }).await.unwrap();
     }
 
+    /// Pre-admission observations have no total-message cap borrowed from transport queue capacity.
+    #[tokio::test]
+    async fn admission_preserves_more_than_4096_ordered_native_messages() {
+        use futures_util::{SinkExt, StreamExt};
+        let (provider, session, _events, mut socket) = compaction_fixture().await;
+        let input = request();
+        let count = 4097;
+        let peer = tokio::spawn(async move {
+            let sent: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(sent["method"], "turn/start");
+            for sequence in 0..count {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"method":"thread/status/changed","params":{
+                            "threadId":"compaction-thread","sequence":sequence
+                        }})
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"method":"turn/started","params":{
+                        "threadId":"compaction-thread","turnId":"admitted-after-observations"
+                    }})
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                if message.is_close() {
+                    break;
+                }
+            }
+        });
+        let id = session
+            .rpc
+            .lock()
+            .await
+            .send_request("turn/start", json!({}))
+            .await
+            .unwrap();
+        let (turn, messages) = await_admission(&session, &input, id).await.unwrap();
+        assert_eq!(turn, "admitted-after-observations");
+        assert_eq!(messages.len(), count + 1);
+        for (sequence, message) in messages[..count].iter().enumerate() {
+            assert_eq!(message["params"]["sequence"], sequence);
+        }
+        assert_eq!(messages[count]["method"], "turn/started");
+        assert!(!session.is_fenced());
+        assert!(
+            provider
+                .bindings
+                .lock()
+                .await
+                .contains_key(&session.binding.id)
+        );
+        session.rpc.lock().await.close().await.unwrap();
+        peer.await.unwrap();
+    }
+
     /// Normal native completion collects automatically; late cancellation cannot touch a newer invocation.
     #[tokio::test]
     async fn completed_invocation_settles_once_and_late_cancel_preserves_successor() {
@@ -6758,6 +7235,89 @@ mod continuation_tests {
             session.active.lock().await.take();
             session.rpc.lock().await.close().await.unwrap();
         }).await.unwrap();
+    }
+
+    /// A cancellation response deadline cannot discard the worker or its later authoritative settlement.
+    #[tokio::test]
+    async fn cancellation_timeout_retains_collection_until_late_settlement() {
+        let (provider, session, _events, _socket) = compaction_fixture().await;
+        let input = request();
+        let scope = input.scope.clone();
+        let (cancel, mut cancelled) = mpsc::unbounded_channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let worker_session = session.clone();
+        let worker_scope = scope.clone();
+        let result = ExecutionResult::Cancelled {
+            completion: completion(&session, &input.configuration.model).await,
+        };
+        let worker = Arc::new(crate::retained_task::RetainedTask::new(
+            ProviderOperation::InputSubmit,
+            tokio::spawn(async move {
+                released.await.unwrap();
+                worker_session
+                    .outcomes
+                    .lock()
+                    .await
+                    .insert(worker_scope, result);
+                Ok(())
+            }),
+        ));
+        *session.active.lock().await = Some(ActiveExecution {
+            scope: scope.clone(),
+            turn_id: "slow-cancellation".into(),
+            turn_updates: watch::channel(Some("slow-cancellation".into())).0,
+            submissions: Arc::new(Mutex::new(Vec::new())),
+            request: input,
+            cancel,
+            task: Some(worker.clone()),
+        });
+        let (_, cancellation) = forge_provider_api::OperationCancellation::channel();
+        let operation = OperationContext::new(
+            forge_provider_api::OperationId::new("slow-cancellation").unwrap(),
+            std::time::Duration::from_secs(30),
+            cancellation,
+        )
+        .unwrap();
+        let cancelling_provider = provider.clone();
+        let cancelling_binding = session.binding.id.clone();
+        let cancelling_scope = scope.clone();
+        let cancelling_operation = operation.clone();
+        let cancelling = tokio::spawn(async move {
+            cancelling_provider
+                .cancel(
+                    cancelling_operation,
+                    &cancelling_binding,
+                    forge_provider_api::CancelRequest {
+                        scope: cancelling_scope,
+                    },
+                )
+                .await
+        });
+        cancelled.recv().await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        tokio::time::resume();
+        let error = cancelling.await.unwrap().unwrap_err();
+        assert!(matches!(error, ProviderError::Failure(failure)
+            if failure.kind() == ProviderFailureKind::Timeout
+                && failure.phase() == forge_provider_api::ProviderPhase::Collection
+                && failure.disposition() == forge_provider_api::FailureDisposition::Uncertain));
+        assert!(!worker.is_finished());
+        assert!(session.active.lock().await.is_some());
+        assert!(!session.settlements.lock().await.contains_key(&scope));
+        release.send(()).unwrap();
+        provider.records.cancel.join_all().await.unwrap();
+        let settled = provider
+            .cancel(
+                operation,
+                &session.binding.id,
+                forge_provider_api::CancelRequest { scope },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(settled.result, ExecutionResult::Cancelled { .. }));
+        assert!(session.active.lock().await.is_none());
+        session.rpc.lock().await.close().await.unwrap();
     }
 
     /// Failed filesystem preparation leaves the existing idle observer active and the binding reusable.

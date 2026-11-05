@@ -43,7 +43,6 @@ state.session = {
   context_usage = { used = 60000, size = 272000, remaining_percent = 78 },
 }
 state.model_list, state.model_provider = nil, nil
-state.configuring_config, state.task_config = nil, nil
 catalog.clear()
 
 ---@return ForgeHarnessModel[]
@@ -86,16 +85,6 @@ state.session.context_usage.size = 264000
 assert(models()[1].context_window[1].token_limit == 264000, "cache reuse ignored updated live capacity")
 assert(request_count == 1, "usage changes unnecessarily reloaded the model catalog")
 
-state.task_config = { model = "other-model", context_window = "default" }
-delivered = models()
-assert(delivered[1].context_window[1].token_limit == 264000, "pending selection hid the active model capacity")
-assert(delivered[2].context_window[1].token_limit == 128000, "pending model inherited the active session budget")
-state.task_config = { model = "gpt-test", context_window = "long_context" }
-delivered = models()
-assert(delivered[1].selected_context_window == "long_context", "pending context selection was lost")
-assert(delivered[1].context_window[2].token_limit == nil, "pending tier inherited the active default budget")
-state.task_config = nil
-
 state.session.context_window = "long_context"
 state.session.context_usage.size = 1000000
 delivered = models()
@@ -109,9 +98,20 @@ assert(models()[3].context_window == nil, "resolved model usage leaked into the 
 state.session.resolved_model = nil
 state.session.context_window = nil
 delivered = models()
-assert(delivered[3].context_window[1].id == "default"
-    and delivered[3].context_window[1].token_limit == 1000000,
-  "an active auto model without catalog limits did not acquire its live capacity")
+assert(delivered[3].context_window == nil,
+  "observed capacity must not manufacture a selectable context-window override")
+assert(delivered[3].observed_context_token_limit == 1000000,
+  "an active auto model without catalog limits lost its display-only capacity")
+local confirmed
+model_picker.open({ host = host, provider = "fixture_beta", model_list = { delivered[3] },
+  current_model = "auto", on_confirm = function(value) confirmed = value end })
+picker_view = picker._state_for_test()
+assert(vim.iter(picker_view.frame.lines):any(function(line) return line:find("1M", 1, true) end),
+  "display-only context capacity disappeared from the picker")
+picker_view.spec.on_confirm({ option = { value = delivered[3] } })
+assert(confirmed and confirmed.context_window == vim.NIL,
+  "confirming a display-only capacity sent a context-window override")
+picker.close(false)
 
 state.session.model = "gpt-test"
 for _, size in ipairs({ 0, -1 }) do

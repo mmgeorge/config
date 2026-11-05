@@ -1,4 +1,6 @@
 mod active;
+mod activity;
+pub use activity::{ActivityPhase, ActivitySnapshot};
 pub(crate) mod agent_command;
 mod change;
 mod change_result;
@@ -83,3 +85,4 @@ pub(crate) use thought::{
 pub use crate::turn::ToolCall;
 
 pub use content::{Commentary, CommentarySource, CommentaryTools, ExchangeEntry, ToolCounter};
+pub(crate) mod core_log;

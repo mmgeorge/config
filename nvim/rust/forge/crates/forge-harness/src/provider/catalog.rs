@@ -39,9 +39,16 @@ pub(crate) fn select_model_settings(
         let setting = preference.and_then(|preference| preference.model_setting.get(&model.id));
         model.selected_reasoning = setting
             .and_then(|setting| setting.reasoning.clone())
+            .filter(|choice| model.reasoning.contains(choice))
             .or_else(|| model.default_reasoning.clone());
         model.selected_context_window = setting
             .and_then(|setting| setting.context_window.clone())
+            .filter(|choice| {
+                model
+                    .context_window
+                    .iter()
+                    .any(|window| &window.id == choice)
+            })
             .or_else(|| model.default_context_window.clone());
     }
 }

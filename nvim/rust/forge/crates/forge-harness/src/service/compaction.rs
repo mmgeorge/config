@@ -101,7 +101,7 @@ mod tests {
             "workspace":root.path(),"data_root":root.path().join("data"),"client_id":"compaction-preflight",
             "provider":{"kind":"mock","command":[]},
         }))?;
-        let controller = SessionController::new(HarnessBroker::initialize(initialize)?)?;
+        let controller = SessionController::new(HarnessBroker::initialize(initialize)?).await?;
         let (messages, _output) = forge_protocol::outbound::channel();
         let request = Request {
             id: 1,

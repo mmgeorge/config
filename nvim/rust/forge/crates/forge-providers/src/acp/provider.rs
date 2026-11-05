@@ -379,9 +379,17 @@ impl AcpProvider {
                 ProviderFailureKind::Rejected,
             ));
         }
-        Ok(Self {
-            kind,
-            runtime: Arc::new(AcpRuntime::new(kind, command, &runtime_root)),
+        Ok(Self::from_runtime(
+            AcpRuntime::new(kind, command, &runtime_root),
+            runtime_root,
+        ))
+    }
+
+    /// Create an ACP owner from its selected adapter and native launch dependencies.
+    pub(super) fn from_runtime(runtime: AcpRuntime, runtime_root: PathBuf) -> Self {
+        Self {
+            kind: runtime.kind(),
+            runtime: Arc::new(runtime),
             cleanup: super::connection::AcpCleanup::default(),
             runtime_root,
             bindings: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -393,7 +401,7 @@ impl AcpProvider {
             shutdown_task: Arc::new(Mutex::new(None)),
             operations: Arc::new(AcpOperations::new()),
             pending_inputs: Arc::new(PendingInputs::new()),
-        })
+        }
     }
 
     /// Revoke an exact binding before publishing interruption, then retain all close phases.
@@ -457,7 +465,7 @@ impl AcpProvider {
         })
     }
 
-    /// Revoke cancellation's exact invocation before cleanup without touching a settled target's successor.
+    /// Retain exact invocation collection after cancellation observation ends without closing its binding.
     fn interrupt_cancel(
         self,
         binding: BindingId,
@@ -465,39 +473,15 @@ impl AcpProvider {
         interruption: forge_provider_api::OperationInterruption,
     ) -> Interruption<impl std::future::Future<Output = Result<(), ProviderError>> + Send + 'static>
     {
-        let provider = self.clone();
-        let session = self.binding(&binding, ProviderOperation::Cancel).ok();
-        let owns_active = session.as_ref().is_some_and(|session| {
-            let active = session
-                .active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if active.as_ref().is_some_and(|active| active.scope == scope) {
-                session.state.close_admission();
-                true
-            } else {
-                false
-            }
-        });
-        let disposition = if owns_active {
-            FailureDisposition::Invalidated
-        } else {
-            FailureDisposition::Uncertain
-        };
         let observation = interruption.failure(
             ProviderOperation::Cancel,
             ProviderPhase::Collection,
-            disposition,
+            FailureDisposition::Uncertain,
         );
-        let cause = observation.clone();
         Interruption::new(observation, async move {
-            if owns_active {
-                if let Some(session) = session {
-                    session.invalidate(cause).await;
-                }
-                return provider.close_session(&binding).await;
-            }
-            match provider
+            // The active invocation and its collection lock fence reuse until actual settlement.
+            // An expired observer does not authorize collecting independently owned terminals.
+            match self
                 .cancel_invocation(&binding, forge_provider_api::CancelRequest { scope })
                 .await
             {
@@ -512,49 +496,25 @@ impl AcpProvider {
         })
     }
 
-    /// Cancel the exact delivery invocation, then force close only if that same invocation still owns native work.
+    /// Collect interrupted delivery without replacing its invocation or shortening its lifetime.
     async fn collect_interrupted_input(
         &self,
         binding: &BindingId,
         scope: forge_provider_api::InvocationScope,
     ) -> Result<(), ProviderError> {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.cancel_invocation(
-                binding,
-                forge_provider_api::CancelRequest {
-                    scope: scope.clone(),
-                },
-            ),
-        )
-        .await
+        // Collection remains attached to this exact invocation after its observer expires.
+        // A shorter timer must not tear down independently owned terminal resources.
+        match self
+            .cancel_invocation(binding, forge_provider_api::CancelRequest { scope })
+            .await
         {
-            Ok(Ok(_)) => return Ok(()),
-            Ok(Err(ProviderError::Failure(failure)))
+            Ok(_) => Ok(()),
+            Err(ProviderError::Failure(failure))
                 if failure.kind() == ProviderFailureKind::WrongInvocation =>
             {
-                return Ok(());
+                Ok(())
             }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => {}
-        }
-        let session = self.binding(binding, ProviderOperation::InputSubmit)?;
-        let owns_active = {
-            let active = session
-                .active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if active.as_ref().is_some_and(|active| active.scope == scope) {
-                session.state.close_admission();
-                true
-            } else {
-                false
-            }
-        };
-        if owns_active {
-            self.close_session(binding).await
-        } else {
-            session.settlement(&scope).await.map(|_| ())
+            Err(error) => Err(error),
         }
     }
 
@@ -622,6 +582,7 @@ impl AcpProvider {
                 ProviderFailureKind::WrongInvocation,
             ));
         }
+        validate_configuration(&request.configuration.model, &request.configuration.access)?;
         let (acceptance, scope, task, started) = {
             let mut active = session
                 .active
@@ -712,6 +673,19 @@ impl AcpProvider {
             )
             .into());
         }
+        validate_configuration(&request.configuration.model, &request.configuration.access)?;
+        let mcp_servers = super::resources::mcp_launches(
+            ProviderOperation::SessionOpen,
+            &request.configuration.resources.mcp,
+        )?;
+        let runtime = self
+            .runtime
+            .resolve()
+            .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Runtime))?;
+        if self.kind == AcpKind::Claude {
+            runtime.validate_native_claude(&context).await?;
+        }
+        context.check_admission(ProviderOperation::SessionOpen)?;
         let _history_admission = self.history_admission.lock().await;
         context.check_admission(ProviderOperation::SessionOpen)?;
         if !self.admission.load(Ordering::Acquire) {
@@ -788,10 +762,6 @@ impl AcpProvider {
                 });
         }
         context.check_admission(ProviderOperation::SessionOpen)?;
-        let runtime = self
-            .runtime
-            .resolve()
-            .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Runtime))?;
         let binding_id = BindingId::new(uuid::Uuid::new_v4().to_string())
             .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Unknown))?;
         let scope = forge_provider_api::EventScope::Binding {
@@ -822,7 +792,7 @@ impl AcpProvider {
                 workspace: request.workspace.clone(),
                 session_id: request.history.resume_id().map(ToString::to_string),
                 control_endpoint: request.tool_endpoint.clone(),
-                mcp_servers: super::resources::mcp_launches(&request.configuration.resources.mcp)?,
+                mcp_servers,
                 resources: mcp_definitions(&selection),
                 profile: profile.path().to_owned(),
                 skills: request
@@ -833,6 +803,7 @@ impl AcpProvider {
                     .filter(|skill| skill.enabled)
                     .map(|skill| skill.name.clone())
                     .collect(),
+                system_instructions: request.system_instructions.clone(),
             },
             &cleanup,
         )
@@ -1001,6 +972,11 @@ impl AcpProvider {
                 ProviderFailureKind::ExecutionActive,
             ));
         }
+        validate_configuration(&configuration.model, &configuration.access)?;
+        let servers = super::resources::mcp_launches(
+            ProviderOperation::SessionConfigure,
+            &configuration.resources.mcp,
+        )?;
         let resources_changed =
             !same_resources(&*session.selection.lock().await, &configuration.resources);
         if resources_changed && self.kind == AcpKind::Antigravity {
@@ -1016,7 +992,6 @@ impl AcpProvider {
                 &configuration.resources.skills,
             )?);
             session.profiles.lock().await.push(profile.clone());
-            let servers = super::resources::mcp_launches(&configuration.resources.mcp)?;
             let skills = configuration
                 .resources
                 .skills
@@ -1112,10 +1087,10 @@ impl AcpProvider {
     ) -> Result<forge_provider_api::ProviderForkResult, ProviderError> {
         context.check_admission(ProviderOperation::SessionFork)?;
         if self.kind != AcpKind::Claude {
-            return Err(failure(
-                ProviderOperation::SessionFork,
-                ProviderFailureKind::Rejected,
-            ));
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::NativeFork,
+            )
+            .into());
         }
         let binding = match &request.source {
             forge_provider_api::ForkSource::Binding(binding) => binding.clone(),
@@ -1137,20 +1112,14 @@ impl AcpProvider {
                 ProviderFailureKind::WrongInvocation,
             ));
         }
-        if request.target.configuration.model.service_tier
-            != forge_provider_api::ServiceTier::Standard
-        {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::ServiceTier,
-            )
-            .into());
-        }
-        if request.target.configuration.model.context_window.is_some() {
-            return Err(forge_provider_api::capability::UnsupportedCapability(
-                forge_provider_api::capability::ProviderFeature::ContextWindowSelection,
-            )
-            .into());
-        }
+        validate_configuration(
+            &request.target.configuration.model,
+            &request.target.configuration.access,
+        )?;
+        let mcp = super::resources::mcp_launches(
+            ProviderOperation::SessionFork,
+            &request.target.configuration.resources.mcp,
+        )?;
         if session.has_active_prompt() {
             return Err(failure(
                 ProviderOperation::SessionFork,
@@ -1217,6 +1186,9 @@ impl AcpProvider {
                     .as_str(),
             ),
         };
+        session
+            .conversation
+            .validate_fork_instructions(&request.target.system_instructions)?;
         let skills = request
             .target
             .configuration
@@ -1231,7 +1203,6 @@ impl AcpProvider {
             &self.runtime_root,
             &request.target.configuration.resources.skills,
         )?);
-        let mcp = super::resources::mcp_launches(&request.target.configuration.resources.mcp)?;
         let id = session
             .conversation
             .fork(
@@ -1243,6 +1214,7 @@ impl AcpProvider {
                     profile: profile.path(),
                     model: target_model.model.as_deref(),
                     effort,
+                    system_instructions: &request.target.system_instructions,
                 },
             )
             .await
@@ -1455,11 +1427,12 @@ impl AcpProvider {
     /// Inspect installation and authentication methods through a disposable native handshake.
     async fn inspect_runtime(
         &self,
+        context: OperationContext,
         request: forge_provider_api::catalog::WorkspaceContext,
         cleanup: super::connection::AcpCleanup,
     ) -> Result<forge_provider_api::ProviderSetup, ProviderError> {
         let status = self.runtime.status();
-        let provider_version = match status.provider_version().await {
+        let provider_version = match status.provider_version(&context).await {
             Ok(Some(version)) => forge_provider_api::VersionObservation::Known { version },
             Ok(None) => forge_provider_api::VersionObservation::NotReported,
             Err(ProviderError::Failure(error)) => forge_provider_api::VersionObservation::Failed {
@@ -2448,6 +2421,7 @@ impl forge_provider_api::provider::Provider for AcpProvider {
         workspace: forge_provider_api::catalog::WorkspaceContext,
     ) -> Result<forge_provider_api::ProviderSetup, ProviderError> {
         let provider = self.clone();
+        let worker_context = context.clone();
         let payload = workspace.clone();
         let cleanup = self.cleanup.scope();
         let interrupt_cleanup = cleanup.clone();
@@ -2457,7 +2431,11 @@ impl forge_provider_api::provider::Provider for AcpProvider {
                 context,
                 ProviderOperation::Inspect,
                 payload,
-                async move { provider.inspect_runtime(workspace, cleanup).await },
+                async move {
+                    provider
+                        .inspect_runtime(worker_context, workspace, cleanup)
+                        .await
+                },
                 move |interruption| {
                     interrupt_cleanup.close_admission();
                     Interruption::new(
@@ -2808,13 +2786,8 @@ async fn close_binding(session: Arc<AcpBinding>) -> Result<(), ProviderError> {
     {
         errors.push(error);
     }
-    let settled = if let Some(scope) = &scope {
-        tokio::time::timeout(std::time::Duration::from_secs(5), session.settlement(scope))
-            .await
-            .ok()
-    } else {
-        None
-    };
+    // Explicit binding close owns the entire transport, including unresponsive prompts.
+    // Collect it before joining settlement instead of adding a second cancellation timer.
     let collected = match session.cleanup.shutdown().await {
         Ok(()) => true,
         Err(error) => {
@@ -2823,10 +2796,7 @@ async fn close_binding(session: Arc<AcpBinding>) -> Result<(), ProviderError> {
         }
     };
     if let Some(scope) = scope {
-        let result = match settled {
-            Some(result) => result,
-            None => session.settlement(&scope).await,
-        };
+        let result = session.settlement(&scope).await;
         if let Err(error) = result {
             errors.push(error);
         }
@@ -2905,7 +2875,7 @@ async fn run_prompt(
             .await
             .ok_or_else(|| failure(ProviderOperation::InputSubmit, ProviderFailureKind::Protocol))?;
         let current_model = session.native_model.lock().await.clone();
-        let prompt = match prompt_content(&request, session.conversation.supports_images()) {
+        let prompt = match prompt_content(&request, session.conversation.supports_images(), session.conversation.prompt_instructions()) {
             Ok(prompt) => prompt,
             Err(error) => return Err(reject_before_dispatch(&request.receipt, error).await),
         };
@@ -3173,16 +3143,26 @@ fn resolve_native_model(
     Ok(resolved)
 }
 
-/// Apply one invocation's supported ACP model and reasoning choices before prompt dispatch.
-async fn configure_model(
-    session: &AcpBinding,
+/// Reject unsupported native controls before allocating profiles or changing history ownership.
+fn validate_configuration(
+    model: &forge_provider_api::session::ModelSelection,
+    access: &forge_provider_api::access::AccessPolicy,
+) -> Result<(), ProviderError> {
+    use forge_provider_api::capability::{ProviderFeature, UnsupportedCapability};
+    if access.sandbox {
+        return Err(UnsupportedCapability(ProviderFeature::OsSandbox).into());
+    }
+    if access.isolation_mode.is_some() {
+        return Err(UnsupportedCapability(ProviderFeature::IsolationMode).into());
+    }
+    validate_model_selection(model)
+}
+
+/// Reject model shapes that ACP cannot encode without contacting the peer.
+fn validate_model_selection(
     requested: &forge_provider_api::session::ModelSelection,
-    retained: &forge_provider_api::session::ModelSelection,
-    mode: forge_provider_api::PromptMode,
 ) -> Result<(), ProviderError> {
     use forge_provider_api::ServiceTier;
-    use forge_provider_api::generation::ReasoningSelection;
-
     if requested.service_tier != ServiceTier::Standard {
         return Err(forge_provider_api::capability::UnsupportedCapability(
             forge_provider_api::capability::ProviderFeature::ServiceTier,
@@ -3195,6 +3175,19 @@ async fn configure_model(
         )
         .into());
     }
+    Ok(())
+}
+
+/// Apply one invocation's supported ACP model and reasoning choices before prompt dispatch.
+async fn configure_model(
+    session: &AcpBinding,
+    requested: &forge_provider_api::session::ModelSelection,
+    retained: &forge_provider_api::session::ModelSelection,
+    mode: forge_provider_api::PromptMode,
+) -> Result<(), ProviderError> {
+    use forge_provider_api::generation::ReasoningSelection;
+
+    validate_model_selection(requested)?;
     let resolved = resolve_native_model(session, requested, retained)?;
     let requested = &resolved;
 
@@ -3456,6 +3449,7 @@ fn prompt_input(input: &forge_provider_api::PromptInput) -> String {
 fn prompt_content(
     request: &PromptRequest,
     supports_images: bool,
+    base_instructions: Option<&str>,
 ) -> Result<Vec<serde_json::Value>, ProviderError> {
     let compact = request.recovered_inputs.is_empty()
         && matches!(&request.input, forge_provider_api::PromptInput::Text(text) if text == "/compact");
@@ -3464,6 +3458,9 @@ fn prompt_content(
     }
 
     let mut content = Vec::new();
+    if let Some(instructions) = base_instructions {
+        content.push(serde_json::json!({"type":"text","text":instructions}));
+    }
     for (index, recovered) in request.recovered_inputs.iter().enumerate() {
         content.push(serde_json::json!({
             "type":"text",
@@ -3597,7 +3594,7 @@ fn operation_failure(
 ) -> ProviderError {
     let kind = match error {
         ProviderError::Failure(failure) => failure.kind(),
-        ProviderError::Cancelled => ProviderFailureKind::Rejected,
+        ProviderError::Cancelled => ProviderFailureKind::Cancelled,
         _ => ProviderFailureKind::Unknown,
     };
     ProviderError::Failure(ProviderFailure::new(operation, kind).at_phase(phase, disposition))
@@ -3648,6 +3645,7 @@ mod tests {
         let script = directory.path().join("failed-open.cjs");
         std::fs::write(&script, r#"
 const readline=require('node:readline');
+if(process.argv.includes('--version')){console.log('2.1.302');process.exit(0);}
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const request=JSON.parse(line);if(request.id===undefined)return;let result={};
  if(request.method==='initialize')result={protocolVersion:1,agentInfo:{version:'99.0.0'},agentCapabilities:{loadSession:true}};
@@ -3679,7 +3677,10 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             history: forge_provider_api::SessionHistory::Durable { resume: None },
             configuration: forge_provider_api::SessionConfiguration {
                 model: Default::default(),
-                access: Default::default(),
+                access: forge_provider_api::access::AccessPolicy {
+                    sandbox: false,
+                    ..Default::default()
+                },
                 approval: forge_provider_api::approval::ApprovalMode::Ask,
                 resources: Default::default(),
             },
@@ -3796,12 +3797,11 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     #[tokio::test]
     async fn configuration_profile_cleanup_failure_preserves_postwrite_disposition() {
         let (directory, unused_provider, request) = failed_open_fixture(false);
-        let provider = AcpProvider::new(
-            forge_provider_api::ProviderId::new("claude").unwrap(),
-            unused_provider.runtime.status().command,
-            directory.path().join("claude-runtime"),
-        )
-        .unwrap();
+        let command = unused_provider.runtime.status().command;
+        let runtime_root = directory.path().join("claude-runtime");
+        let mut runtime = AcpRuntime::new(AcpKind::Claude, command.clone(), &runtime_root);
+        runtime.select_native_command(command);
+        let provider = AcpProvider::from_runtime(runtime, runtime_root);
         let opened = provider
             .session_open(operation_context(), request.clone())
             .await
@@ -3882,7 +3882,8 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
     async fn failed_initial_configuration_retains_binding_until_shutdown_collects_it() {
         let (_directory, provider, mut request) = failed_open_fixture(false);
         provider.cleanup.fail_next_collection(1);
-        request.configuration.model.context_window = Some("unsupported-window".into());
+        request.configuration.model.reasoning =
+            forge_provider_api::generation::ReasoningSelection::Level("unsupported-effort".into());
         assert!(
             matches!(provider.session_open(operation_context(), request).await, Err(ProviderError::Combined { primary, .. }) if matches!(*primary, ProviderError::Unsupported(_)))
         );
@@ -3964,7 +3965,10 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
                 system_instructions: "target instructions".into(),
                 configuration: forge_provider_api::SessionConfiguration {
                     model: Default::default(),
-                    access: Default::default(),
+                    access: forge_provider_api::access::AccessPolicy {
+                        sandbox: false,
+                        ..Default::default()
+                    },
                     approval: forge_provider_api::approval::ApprovalMode::Ask,
                     resources: forge_provider_api::ResourceSelection {
                         skills: Vec::new(),
@@ -4184,7 +4188,11 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             matches!(provider.session_fork(context.clone(), request.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::SessionMissing)
         );
         tokio::time::advance(std::time::Duration::from_millis(10)).await;
-        assert!(tokio::time::Instant::now() >= context.deadline());
+        assert!(
+            context
+                .deadline()
+                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+        );
         assert!(
             matches!(provider.session_fork(context.clone(), request.clone()).await, Err(ProviderError::Failure(failure)) if failure.kind() == ProviderFailureKind::SessionMissing)
         );
@@ -4265,7 +4273,10 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
                     ),
                     configuration: forge_provider_api::SessionConfiguration {
                         model: Default::default(),
-                        access: Default::default(),
+                        access: forge_provider_api::access::AccessPolicy {
+                            sandbox: false,
+                            ..Default::default()
+                        },
                         approval: forge_provider_api::approval::ApprovalMode::Ask,
                         resources: Default::default(),
                     },

@@ -1948,6 +1948,102 @@ async fn semantic_display_group_stages_and_unstages_only_its_raw_hunks() {
     }
 }
 
+/// Inserting an earlier staged group must not reuse a retained later group's block identity.
+#[tokio::test]
+async fn staging_hunks_in_reverse_order_keeps_unique_projection_ids() {
+    let (directory, service, _, writer) = fixture().await;
+    let mut updates = service.subscribe_updates();
+    let mut original = vec!["impl Engine {".to_owned(), "    fn run() {".to_owned()];
+    original.extend((0..70).map(|line| format!("        let value_{line} = {line};")));
+    original.extend(["    }".into(), "}".into()]);
+    let path = directory.path().join("reverse.rs");
+    std::fs::write(&path, original.join("\n") + "\n").unwrap();
+    git(directory.path(), &["add", "reverse.rs"]);
+    git(directory.path(), &["commit", "-m", "reverse fixture"]);
+    let mut changed = original.clone();
+    for row in [8, 28, 48] {
+        changed[row] = format!("        let changed_{row} = 999;");
+    }
+    std::fs::write(&path, changed.join("\n") + "\n").unwrap();
+    let opened = service
+        .open(
+            DocumentId("reverse-hunks".into()),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+    service
+        .demand(input(&opened, "reverse.rs", 1, "demand"))
+        .await
+        .unwrap();
+    for (sequence, row) in [(2, 48), (3, 8), (4, 28)] {
+        let snapshot = service.snapshot(&opened.document).await.unwrap();
+        service
+            .demand(section_input(
+                &snapshot,
+                "unstaged",
+                "reverse.rs",
+                sequence * 10,
+                "demand",
+            ))
+            .await
+            .unwrap();
+        let snapshot = service.snapshot(&opened.document).await.unwrap();
+        let selected = file(&snapshot, "reverse.rs", Some(StatusSection::Unstaged));
+        let loaded = body(&service, &snapshot, selected).await;
+        let (block, position) = loaded
+            .block
+            .iter()
+            .find_map(|block| {
+                block
+                    .text
+                    .wire_rows()
+                    .iter()
+                    .position(|text| *text == changed[row])
+                    .map(|position| (block, position))
+            })
+            .unwrap();
+        let mut action = input(&snapshot, "reverse.rs", sequence * 10 + 1, "stage");
+        action.location = body_location(selected, &loaded, block, position);
+        let outcome = service.input(action).await.unwrap().finish().await.unwrap();
+        assert!(
+            outcome
+                .target
+                .iter()
+                .all(|target| target.completion == TargetCompletion::Completed)
+        );
+        writer.acknowledge(outcome.operation);
+        let snapshot = service.snapshot(&opened.document).await.unwrap();
+        service
+            .demand(section_input(
+                &snapshot,
+                "staged",
+                "reverse.rs",
+                sequence * 10 + 2,
+                "demand",
+            ))
+            .await
+            .unwrap();
+        let snapshot = service.snapshot(&opened.document).await.unwrap();
+        let staged = file(&snapshot, "reverse.rs", Some(StatusSection::Staged));
+        let loaded = body(&service, &snapshot, staged).await;
+        let mut ids = std::collections::HashSet::new();
+        assert!(
+            loaded
+                .block
+                .iter()
+                .all(|block| ids.insert(block.id.clone()))
+        );
+        while let Ok(update) = updates.try_recv() {
+            assert!(update.diagnostic.is_empty(), "{:?}", update.diagnostic);
+        }
+    }
+    assert_eq!(
+        git(directory.path(), &["show", ":reverse.rs"]),
+        (changed.join("\n") + "\n").as_bytes()
+    );
+}
+
 fn is_hunk_heading(block: &forge_buffer::block::BufferBlock) -> bool {
     block
         .metadata
@@ -2323,6 +2419,204 @@ async fn ignoring_staged_changes_does_not_hide_a_failed_unstage() {
         StatusSection::Staged
     );
     service.close(&opened.document);
+}
+
+#[tokio::test]
+async fn redundant_stage_and_unstage_are_successful_noops() {
+    let (directory, service, _, writer) = fixture().await;
+    let opened = service
+        .open(
+            DocumentId("redundant-stage".into()),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+    let unstaged = git(directory.path(), &["diff", "--binary"]);
+    let noop = service
+        .input(input(&opened, "sample.txt", 1, "unstage"))
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert!(noop.target.is_empty());
+    assert_eq!(git(directory.path(), &["diff", "--binary"]), unstaged);
+    assert!(git(directory.path(), &["diff", "--cached", "--name-only"]).is_empty());
+
+    let staged = service
+        .input(input(&opened, "sample.txt", 2, "stage"))
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    writer.acknowledge(staged.operation);
+    let current = service.snapshot(&opened.document).await.unwrap();
+    let index = git(directory.path(), &["diff", "--cached", "--binary"]);
+    let noop = service
+        .input(input(&current, "sample.txt", 3, "stage"))
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert!(noop.target.is_empty());
+    assert_eq!(
+        git(directory.path(), &["diff", "--cached", "--binary"]),
+        index
+    );
+
+    let unstaged = service
+        .input(input(&current, "sample.txt", 4, "unstage"))
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    writer.acknowledge(unstaged.operation);
+    let current = service.snapshot(&opened.document).await.unwrap();
+    assert!(
+        service
+            .input(input(&current, "sample.txt", 5, "unstage"))
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap()
+            .target
+            .is_empty()
+    );
+    assert!(git(directory.path(), &["diff", "--cached", "--name-only"]).is_empty());
+}
+
+#[tokio::test]
+async fn queued_ignore_and_unignore_preserve_unchanged_file_targets() {
+    let (directory, service, _, _) = fixture().await;
+    let storage = tempfile::tempdir().unwrap();
+    service
+        .configure_ignored_directory(storage.path().to_owned())
+        .unwrap();
+    std::fs::write(directory.path().join("second.txt"), "second\n").unwrap();
+    let opened = service
+        .open(
+            DocumentId("queued-ignore".into()),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+    let second = input(&opened, "second.txt", 2, "ignore");
+    service
+        .act(input(&opened, "sample.txt", 1, "ignore"), None)
+        .await
+        .unwrap();
+    assert!(service.snapshot(&opened.document).await.unwrap().revision > opened.revision);
+    service.act(second, None).await.unwrap();
+    let ignored = service.snapshot(&opened.document).await.unwrap();
+    assert_eq!(
+        file(&ignored, "sample.txt", None).section,
+        StatusSection::Ignored
+    );
+    assert_eq!(
+        file(&ignored, "second.txt", None).section,
+        StatusSection::Ignored
+    );
+
+    let second = input(&ignored, "second.txt", 4, "unstage");
+    service
+        .act(input(&ignored, "sample.txt", 3, "unstage"), None)
+        .await
+        .unwrap();
+    service.act(second, None).await.unwrap();
+    assert!(
+        crate::ignored::load(Some(storage.path()), directory.path())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(git(directory.path(), &["diff", "--cached", "--name-only"]).is_empty());
+    assert_eq!(
+        std::fs::read(directory.path().join("sample.txt")).unwrap(),
+        b"new\n"
+    );
+}
+
+#[tokio::test]
+async fn queued_ignore_section_does_not_include_newly_observed_files() {
+    let (directory, service, _, _) = fixture().await;
+    let storage = tempfile::tempdir().unwrap();
+    service
+        .configure_ignored_directory(storage.path().to_owned())
+        .unwrap();
+    let opened = service
+        .open(
+            DocumentId("queued-ignore-section".into()),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+    let mut captured = input(&opened, "sample.txt", 1, "ignore");
+    captured.location = StatusLocation::Section {
+        section: StatusSection::Unstaged,
+    };
+    std::fs::write(directory.path().join("later.txt"), "not selected\n").unwrap();
+    service.refresh(&opened.document).await.unwrap();
+    service.act(captured, None).await.unwrap();
+    let current = service.snapshot(&opened.document).await.unwrap();
+    assert_eq!(
+        file(&current, "sample.txt", None).section,
+        StatusSection::Ignored
+    );
+    assert_eq!(
+        file(&current, "later.txt", None).section,
+        StatusSection::Untracked
+    );
+}
+
+#[tokio::test]
+async fn stale_ignore_rejects_changed_sources_and_does_not_relax_discard() {
+    let (directory, service, _, _) = fixture().await;
+    let storage = tempfile::tempdir().unwrap();
+    service
+        .configure_ignored_directory(storage.path().to_owned())
+        .unwrap();
+    let opened = service
+        .open(
+            DocumentId("changed-ignore".into()),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+    let ignore = input(&opened, "sample.txt", 1, "ignore");
+    let discard = input(&opened, "sample.txt", 2, "discard");
+    std::fs::write(
+        directory.path().join("sample.txt"),
+        "changed after capture\n",
+    )
+    .unwrap();
+    service.refresh(&opened.document).await.unwrap();
+    let error = match service.act(ignore, None).await {
+        Err(error) => error,
+        Ok(_) => panic!("changed source must not be silently ignored"),
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("selected file changed during refresh"),
+        "{error}"
+    );
+    let error = match service.act(discard, None).await {
+        Err(error) => error,
+        Ok(_) => panic!("stale discard must remain rejected"),
+    };
+    assert!(error.to_string().contains("stale revision"), "{error}");
+    assert!(
+        crate::ignored::load(Some(storage.path()), directory.path())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("sample.txt")).unwrap(),
+        b"changed after capture\n"
+    );
 }
 
 #[tokio::test]

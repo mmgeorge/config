@@ -298,7 +298,7 @@ impl SessionObservationInbox {
                         inbox.fail(failure.clone());
                     }
                     // Stop native work even when timeout publication fails.
-                    let cancellation = provider.cancel_invocation(scope.clone()).await.map(|_| ());
+                    let cancellation = provider.collect_invocation(scope.clone()).await.map(|_| ());
                     match (publication, cancellation) {
                         (Err(publication), Err(cancellation)) => {
                             return Err(ProviderError::Combined { primary: Box::new(publication), secondary: vec![cancellation] });
@@ -330,14 +330,10 @@ impl SessionObservationInbox {
         Ok(())
     }
 
-    /// Abort and collect old-generation watchdogs before replacing their native owner.
+    /// Close idle watchdogs and join already-started collection before replacing their native owner.
     pub(crate) async fn retire_background(&self) -> Result<()> {
         let _collection = self.background_collection.lock().await;
         self.close();
-        self.background_tasks
-            .lock()
-            .map_err(|_| inbox_poisoned("background watchdog task registry poisoned"))?
-            .abort_all();
         loop {
             let result = std::future::poll_fn(|context| match self.background_tasks.lock() {
                 Ok(mut tasks) => tasks.poll_join_next(context).map(Ok),

@@ -164,7 +164,7 @@ function M.open_skills(options)
                   current_skill_list = refreshed or {}
                   if picker.is_open(owner) then picker.update(spec()) end
                 end)
-              end, skill.resource_id)
+              end, skill.resource_id, skill.scope)
             end,
           },
           {
@@ -353,7 +353,7 @@ function M.open_mcp(options)
                 if closed or not picker.is_open(owner) or (options.is_current and not options.is_current()) then return end
                 if next(pending_by_id) then picker.update(build_spec()) return end
                 refresh()
-              end, definition.resource_id)
+              end, definition.resource_id, definition.scope)
             end,
           },
           {

@@ -137,12 +137,13 @@ impl CopilotTurnEvent {
         submission: Option<forge_provider_api::SubmissionId>,
         send: impl std::future::Future<Output = Result<String>>,
     ) -> Result<()> {
-        self.steer_native(submission, |_| send).await
+        self.steer_native(None, submission, |_| send).await
     }
 
     /// Retain steering and its exact synchronous transport-handoff authority through acknowledgement.
     pub async fn steer_native<'a, F, Fut>(
         &'a self,
+        expected_scope: Option<&forge_provider_api::InvocationScope>,
         submission: Option<forge_provider_api::SubmissionId>,
         send: F,
     ) -> Result<()>
@@ -150,7 +151,7 @@ impl CopilotTurnEvent {
         F: FnOnce(NativeSendAuthority<'a>) -> Fut,
         Fut: std::future::Future<Output = Result<String>>,
     {
-        let pending = self.admit_send(submission)?;
+        let pending = self.admit_send(submission, expected_scope)?;
         match send(NativeSendAuthority(self)).await {
             Ok(message_id) => pending.complete(Some(message_id)),
             Err(error) => {
@@ -421,6 +422,7 @@ impl CopilotTurnEvent {
     fn admit_send(
         &self,
         submission: Option<forge_provider_api::lifecycle::SubmissionId>,
+        expected_scope: Option<&forge_provider_api::InvocationScope>,
     ) -> Result<PendingSend<'_>> {
         let mut state = self
             .state
@@ -432,6 +434,21 @@ impl CopilotTurnEvent {
                 return Err(forge_provider_api::ProviderError::NotConsumed.into());
             }
         };
+        if expected_scope.is_some_and(|expected| {
+            delivery
+                .event_sink
+                .as_ref()
+                .and_then(|sink| sink.invocation_scope().ok())
+                != Some(expected)
+        }) {
+            return Err(forge_provider_api::ProviderError::from(
+                forge_provider_api::ProviderFailure::new(
+                    forge_provider_api::ProviderOperation::InputSteer,
+                    forge_provider_api::ProviderFailureKind::WrongInvocation,
+                ),
+            )
+            .into());
+        }
         if state.cancelled
             || delivery
                 .submission_cancelled
@@ -866,7 +883,7 @@ impl CopilotTurnEventGuard<'_> {
         F: FnOnce(NativeSendAuthority<'a>) -> Fut,
         Fut: std::future::Future<Output = Result<String>>,
     {
-        let pending = self.owner.admit_send(submission)?;
+        let pending = self.owner.admit_send(submission, None)?;
         {
             let mut state = self
                 .owner
@@ -2125,6 +2142,41 @@ mod tests {
         drop(guard);
         Ok(())
     }
+    /// Steering resumed after terminal collection cannot adopt a successor's native admission.
+    #[tokio::test]
+    async fn stale_steering_scope_cannot_dispatch_into_successor() -> Result<()> {
+        let turn = CopilotTurnEvent::default();
+        let owner = ExecutionOwner::root("session");
+        let old = InvocationScope::new(owner.clone(), "old");
+        let current = InvocationScope::new(owner, "successor");
+        let binding = forge_provider_api::BindingId::new("steering-race")?;
+        let (old_sink, _old_events) =
+            forge_provider_api::events::channel(binding.clone(), old.clone());
+        drop(turn.activate(Some(old_sink), None)?);
+        let (current_sink, _current_events) =
+            forge_provider_api::events::channel(binding, current.clone());
+        let _guard = turn.activate(Some(current_sink), None)?;
+        let dispatched = AtomicBool::new(false);
+        let error = turn
+            .steer_native(Some(&old), None, |_| async {
+                dispatched.store(true, Ordering::Release);
+                Ok("must not send".into())
+            })
+            .await
+            .unwrap_err();
+        assert!(!dispatched.load(Ordering::Acquire));
+        assert!(
+            matches!(error.downcast_ref::<forge_provider_api::ProviderError>(),
+            Some(forge_provider_api::ProviderError::Failure(failure))
+                if failure.kind() == forge_provider_api::ProviderFailureKind::WrongInvocation)
+        );
+        turn.steer_native(Some(&current), None, |_| async {
+            Ok("current accepted".into())
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Stop and transport handoff share a lock, so delayed preparation cannot write after abort.
     #[tokio::test]
     async fn native_handoff_rejects_prepared_input_after_stop_without_uncertainty() -> Result<()> {
@@ -2133,7 +2185,7 @@ mod tests {
         let (release, prepared) = tokio::sync::oneshot::channel();
         let wrote = AtomicBool::new(false);
         let written = &wrote;
-        let sending = turn.steer_native(None, move |authority| async move {
+        let sending = turn.steer_native(None, None, move |authority| async move {
             prepared.await?;
             authority.commit(|| written.store(true, Ordering::Release))?;
             Ok("unexpected".into())

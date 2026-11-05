@@ -93,10 +93,13 @@ impl ControlToolExecutor {
             let plan_document = runtime.plan_document().cloned();
             let execution_finished = runtime.execution_finished();
             drop(runtime);
+            // Question creation and wait retirement are owned by the session queue.
+            // Publish cancellation as a settled tool result so host-effect collection
+            // does not mistake this read wait for an abandoned mutation.
             let prepared = match prepared {
                 Ok(prepared) => tokio::select! {
                     biased;
-                    _ = cancelled.wait_for(|closed| *closed) => return Err(crate::broker::TurnCancelled.into()),
+                    _ = cancelled.wait_for(|closed| *closed) => Err(crate::tools::ToolError::from(crate::broker::TurnCancelled)),
                     wait = prepared.publish() => wait,
                 },
                 Err(error) => Err(error),
@@ -106,8 +109,8 @@ impl ControlToolExecutor {
                 Ok(wait) => {
                     let answers = tokio::select! {
                         biased;
-                        _ = cancelled.wait_for(|closed| *closed) => return Err(crate::broker::TurnCancelled.into()),
-                        answers = wait.answers() => answers,
+                        _ = cancelled.wait_for(|closed| *closed) => Err(crate::tools::ToolError::from(crate::broker::TurnCancelled)),
+                        answers = wait.answers() => answers.map_err(crate::tools::ToolError::from),
                     };
                     match answers {
                         Ok(answers) => {
@@ -119,7 +122,7 @@ impl ControlToolExecutor {
                                 message: serde_json::json!({"answers":answers}).to_string(),
                             })
                         }
-                        Err(error) => Err(error.into()),
+                        Err(error) => Err(error),
                     }
                 }
                 Err(error) => Err(error),
@@ -344,7 +347,7 @@ mod test {
         Ok(())
     }
     use serde_json::json;
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[tokio::test]
@@ -436,7 +439,7 @@ mod test {
             "exchange".into(),
             directory.path().into(),
             policy,
-            Arc::new(AtomicBool::new(false)),
+            tokio::sync::watch::channel(false).1,
         );
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         context.lsp = Some(scope);

@@ -17,29 +17,80 @@ pub struct ExecutionPermit {
     _permit: OwnedSemaphorePermit,
 }
 
-pub(crate) struct ExecutionAdmission(Arc<Semaphore>);
+/// Describe whether execution admission is available to new owners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExecutionFence {
+    /// Owners may acquire the execution slot.
+    Open,
+    /// Native collection has not proven quiescence; admission resumes when collection completes.
+    CollectionPending,
+    /// An unrecoverable failure permanently closed admission for this session.
+    Fatal,
+}
+
+/// Report that execution admission was permanently closed.
+#[derive(Debug, thiserror::Error)]
+#[error("execution admission is permanently closed")]
+pub(crate) struct ExecutionClosed;
+
+/// Grant the single execution slot, withholding it while collection is pending or after fatal failure.
+pub(crate) struct ExecutionAdmission {
+    permits: Arc<Semaphore>,
+    fence: tokio::sync::watch::Sender<ExecutionFence>,
+}
 
 impl ExecutionAdmission {
     fn new() -> Self {
-        Self(Arc::new(Semaphore::new(1)))
+        Self {
+            permits: Arc::new(Semaphore::new(1)),
+            fence: tokio::sync::watch::channel(ExecutionFence::Open).0,
+        }
     }
 
-    pub(crate) async fn acquire(&self) -> Result<ExecutionPermit, tokio::sync::AcquireError> {
-        self.0
-            .clone()
-            .acquire_owned()
-            .await
-            .map(|permit| ExecutionPermit { _permit: permit })
+    /// Wait for the slot, suspending while collection is pending and failing once fatally closed.
+    pub(crate) async fn acquire(&self) -> Result<ExecutionPermit, ExecutionClosed> {
+        let mut fence = self.fence.subscribe();
+        loop {
+            let current = *fence.borrow_and_update();
+            match current {
+                ExecutionFence::Fatal => return Err(ExecutionClosed),
+                ExecutionFence::Open => {
+                    let permit = tokio::select! {
+                        biased;
+                        changed = fence.changed() => {
+                            changed.map_err(|_| ExecutionClosed)?;
+                            continue;
+                        }
+                        permit = self.permits.clone().acquire_owned() => {
+                            permit.map_err(|_| ExecutionClosed)?
+                        }
+                    };
+                    // Linearize the grant against fence mutation after the asynchronous wait.
+                    let current = self.fence.borrow();
+                    match *current {
+                        ExecutionFence::Open => return Ok(ExecutionPermit { _permit: permit }),
+                        ExecutionFence::Fatal => return Err(ExecutionClosed),
+                        ExecutionFence::CollectionPending => continue,
+                    }
+                }
+                ExecutionFence::CollectionPending => {}
+            }
+            if fence.changed().await.is_err() {
+                return Err(ExecutionClosed);
+            }
+        }
     }
 
-    pub(crate) async fn acquire_owned(
-        self: Arc<Self>,
-    ) -> Result<ExecutionPermit, tokio::sync::AcquireError> {
+    pub(crate) async fn acquire_owned(self: Arc<Self>) -> Result<ExecutionPermit, ExecutionClosed> {
         self.acquire().await
     }
 
     pub(crate) fn try_acquire(&self) -> Result<ExecutionPermit, TryAcquireError> {
-        self.0
+        let fence = self.fence.borrow();
+        if *fence != ExecutionFence::Open {
+            return Err(TryAcquireError::Closed);
+        }
+        self.permits
             .clone()
             .try_acquire_owned()
             .map(|permit| ExecutionPermit { _permit: permit })
@@ -49,15 +100,46 @@ impl ExecutionAdmission {
         self.try_acquire()
     }
 
+    /// Get execution availability after applying the collection and fatal-admission fences.
     pub(crate) fn available_permits(&self) -> usize {
-        self.0.available_permits()
+        if *self.fence.borrow() == ExecutionFence::Open {
+            self.permits.available_permits()
+        } else {
+            0
+        }
     }
-    /// Get whether fatal collection permanently closed this session's execution admission.
+
+    /// Get whether an unrecoverable failure permanently closed this session's execution admission.
     pub(crate) fn is_closed(&self) -> bool {
-        self.0.is_closed()
+        *self.fence.borrow() == ExecutionFence::Fatal
     }
+
+    /// Withhold admission until native collection completes; a fatal closure is never downgraded.
+    pub(crate) fn fence_collection_pending(&self) {
+        self.fence.send_if_modified(|fence| {
+            let changed = *fence == ExecutionFence::Open;
+            if changed {
+                *fence = ExecutionFence::CollectionPending;
+            }
+            changed
+        });
+    }
+
+    /// Resume admission after collection proved quiescence, unless a fatal failure closed it.
+    pub(crate) fn lift_collection_pending(&self) {
+        self.fence.send_if_modified(|fence| {
+            let changed = *fence == ExecutionFence::CollectionPending;
+            if changed {
+                *fence = ExecutionFence::Open;
+            }
+            changed
+        });
+    }
+
+    /// Permanently close admission after an unrecoverable failure.
     pub(crate) fn close(&self) {
-        self.0.close();
+        self.fence.send_replace(ExecutionFence::Fatal);
+        self.permits.close();
     }
 }
 
@@ -203,6 +285,43 @@ impl Drop for CommandLease {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Keep admission blocked after a terminal worker releases its permit but cleanup is still owned.
+    #[tokio::test]
+    async fn collection_fence_outlives_native_execution_permit() -> Result<()> {
+        let coordinator = SessionCoordinator::new(Arc::new(Default::default()));
+        let permit = coordinator.execution.acquire().await?;
+        coordinator.execution.fence_collection_pending();
+        drop(permit);
+        assert_eq!(coordinator.execution.available_permits(), 0);
+        assert!(coordinator.execution.try_acquire().is_err());
+        let pending = coordinator.execution.acquire();
+        tokio::pin!(pending);
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        coordinator.execution.lift_collection_pending();
+        let permit = pending.await?;
+        drop(permit);
+        assert_eq!(coordinator.execution.available_permits(), 1);
+        Ok(())
+    }
+
+    /// Recheck a waiter admitted before fencing when the original execution releases its slot.
+    #[tokio::test]
+    async fn collection_fence_blocks_an_already_waiting_acquisition() -> Result<()> {
+        let coordinator = SessionCoordinator::new(Arc::new(Default::default()));
+        let original = coordinator.execution.acquire().await?;
+        let pending = coordinator.execution.acquire();
+        tokio::pin!(pending);
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        coordinator.execution.fence_collection_pending();
+        drop(original);
+        assert!(futures_util::poll!(&mut pending).is_pending());
+        assert_eq!(coordinator.execution.available_permits(), 0);
+        coordinator.execution.lift_collection_pending();
+        drop(pending.await?);
+        assert_eq!(coordinator.execution.available_permits(), 1);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn command_receipts_isolate_attempts_and_sessions() -> Result<()> {

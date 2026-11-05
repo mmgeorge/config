@@ -130,11 +130,11 @@ fn prepare_retry(input: &InputRevision, services: &OwnerServices) -> InputStage 
     if message.revision != input.revision {
         return InputStage::Ready(Err(crate::input::InputRejection::RevisionChanged.into()));
     }
-    let Some(submission) = &message.submission_id else {
+    let Some(submission) = &message.submission_id() else {
         return InputStage::Ready(Ok(PreparedInput::Ordinary));
     };
     if !matches!(
-        message.delivery,
+        message.delivery(),
         InputDelivery::Unknown | InputDelivery::Failed
     ) {
         return InputStage::Ready(Ok(PreparedInput::Ordinary));
@@ -221,7 +221,7 @@ pub(super) fn apply_input(
                     crate::input::InputRejection::InputMissing.into(),
                 ))?;
             if message.revision != input.revision
-                || message.submission_id.as_deref() != Some(submission.id())
+                || message.submission_id() != Some(submission.id())
             {
                 return Err(InputCommandFailure::Rejected(
                     crate::input::InputRejection::RevisionChanged.into(),

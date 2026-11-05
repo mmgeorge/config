@@ -118,41 +118,6 @@ impl TaskStatus {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-/// Identifies a durable user intent, including uncertain delivery outcomes.
-pub struct TaskOperation {
-    #[serde(default)]
-    pub revision: u64,
-    /// Client-generated idempotency key retained after uncertain delivery.
-    pub id: String,
-    /// Conversation receiving the intent.
-    pub session_id: String,
-    /// Immutable submitted action used to validate duplicate identities.
-    pub action: serde_json::Value,
-    /// Resolved policy including earlier pending permission intents.
-    pub permission_selection: Option<PermissionSelection>,
-    /// Durable admission, execution, or settlement outcome.
-    pub state: String,
-    /// Failure detail retained for reconnect and inspection.
-    pub error: Option<String>,
-    #[serde(default)]
-    /// Exchange current when the operation settled, bounding its status to that attempt.
-    pub exchange_id: Option<String>,
-    /// Admission time in Unix milliseconds.
-    pub created_at_ms: i64,
-}
-
-impl TaskOperation {
-    /// Projects bounded control status without retransmitting the submitted prompt.
-    pub fn view(&self) -> serde_json::Value {
-        serde_json::json!({
-            "id": self.id, "state": self.state, "revision": self.revision,
-            "action": self.action.get("action"),
-            "error": self.error,
-        })
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;

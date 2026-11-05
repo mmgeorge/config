@@ -114,7 +114,7 @@ mod test {
 
     #[test]
     fn lsp_guidance_follows_system_and_disappears_when_disabled() {
-        use std::sync::{Arc, atomic::AtomicBool};
+        use std::sync::Arc;
         let directory = tempfile::tempdir().unwrap();
         let service = Arc::new(crate::tools::lsp::LspService::default());
         let (sender, _receiver) = forge_protocol::outbound::channel();
@@ -131,7 +131,7 @@ mod test {
             "turn".into(),
             directory.path().into(),
             policy,
-            Arc::new(AtomicBool::new(false)),
+            tokio::sync::watch::channel(false).1,
         );
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         context.lsp = Some(scope);

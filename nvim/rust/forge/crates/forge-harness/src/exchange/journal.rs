@@ -9,6 +9,7 @@ use super::command::{
     Command, CommandFailure, CommandId, CommandOutcome, CommandRequest, CommandResult, InputChange,
     InputCommand, InputId, InputRevision,
 };
+use super::core_log::{CoreCommandKind, CoreOutcome, CoreRecord, CoreTransitionKind};
 
 /// Retain one command's durable progress without process-local resolver handles.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -94,6 +95,9 @@ pub(crate) enum CommandJournalError {
     /// The input transaction failed before a durable owner result was established.
     #[error("input state and command completion could not be committed")]
     InputCommit,
+    /// The metadata-only connection owner lost its synchronization invariant.
+    #[error("owner core evidence storage is unavailable")]
+    CoreUnavailable,
 }
 
 /// Own the session's admission journal; domain commits can use the same SQL tables.
@@ -117,6 +121,35 @@ impl CommandJournal {
         })
     }
 
+    /// Open metadata-only ownership with foreign-key enforcement against concurrent session deletion.
+    pub(crate) fn open_metadata(root: &Path, session: &str) -> Result<Self, CommandJournalError> {
+        let journal = Self::open(root, session)?;
+        journal
+            .connection
+            .pragma_update(None, "foreign_keys", "ON")?;
+        Ok(journal)
+    }
+
+    /// Append required lifecycle evidence through this owner's existing durable connection.
+    /// Failure is observable by the owner; no optional trace queue or filesystem writer is involved.
+    pub(crate) fn append_core(&mut self, record: &CoreRecord) -> Result<u64, CommandJournalError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let sequence = append_core_record(&transaction, &self.session, record)?;
+        transaction.commit()?;
+        Ok(sequence)
+    }
+
+    /// Check whether this owner has durable host history without allocating a hidden session.
+    pub(crate) fn has_durable_session(&self) -> Result<bool, CommandJournalError> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_record WHERE id=?1)",
+            [&self.session],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Recover unfinished intent as an explicit failure, never as implicit native replay.
     pub(crate) fn recover(&mut self) -> Result<(), CommandJournalError> {
         let transaction = self
@@ -124,16 +157,21 @@ impl CommandJournal {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let records = {
             let mut query = transaction.prepare(
-                "SELECT id,state FROM owner_command WHERE session_id=?1 AND json_extract(state,'$.state') IN ('queued','active') ORDER BY sequence",
+                "SELECT id,state,request FROM owner_command WHERE session_id=?1 AND json_extract(state,'$.state') IN ('queued','active') ORDER BY sequence",
             )?;
             query
                 .query_map([&self.session], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
-        for (id, state) in records {
+        for (id, state, request) in records {
             let previous: CommandState = serde_json::from_str(&state)?;
+            let was_active = matches!(&previous, CommandState::Active { .. });
             let next = CommandState::Finished {
                 revision: previous
                     .revision()
@@ -158,6 +196,33 @@ impl CommandJournal {
                 "UPDATE owner_command SET state=?3 WHERE session_id=?1 AND id=?2",
                 params![self.session, id, serde_json::to_string(&next)?],
             )?;
+            let CommandState::Finished { revision, outcome } = &next else {
+                unreachable!("restart recovery always records a finished command")
+            };
+            append_core_record(
+                &transaction,
+                &self.session,
+                &CoreRecord::CommandFinished {
+                    command: CommandId::new(id.clone())
+                        .map_err(|_| CommandJournalError::IdentityConflict)?,
+                    revision: *revision,
+                    outcome: CoreOutcome::command(outcome),
+                },
+            )?;
+            if was_active {
+                let request: CommandRequest = serde_json::from_str(&request)?;
+                append_core_record(
+                    &transaction,
+                    &self.session,
+                    &CoreRecord::OperationCompleted {
+                        operation: super::core_log::CoreOperation::Command {
+                            command: request.id,
+                            kind: CoreCommandKind::from(&request.command),
+                        },
+                        outcome: CoreOutcome::Interrupted,
+                    },
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(())
@@ -210,6 +275,14 @@ impl CommandJournal {
         let state = CommandState::Queued { revision: 1 };
         transaction.execute("INSERT INTO owner_command(session_id,id,sequence,request,state) VALUES(?1,?2,?3,?4,?5)",
             params![self.session,request.id.as_str(),sequence,serde_json::to_string(request)?,serde_json::to_string(&state)?])?;
+        append_core_record(
+            &transaction,
+            &self.session,
+            &CoreRecord::CommandAdmitted {
+                command: request.id.clone(),
+                kind: CoreCommandKind::from(&request.command),
+            },
+        )?;
         transaction.commit()?;
         Ok(CommandRecord {
             request: request.clone(),
@@ -237,7 +310,10 @@ impl CommandJournal {
             revision,
             task_commit: None,
         };
-        self.connection.execute(
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
             "UPDATE owner_command SET state=?3 WHERE session_id=?1 AND id=?2",
             params![
                 self.session,
@@ -245,6 +321,15 @@ impl CommandJournal {
                 serde_json::to_string(&next.state)?
             ],
         )?;
+        append_core_record(
+            &transaction,
+            &self.session,
+            &CoreRecord::CommandStarted {
+                command: record.request.id.clone(),
+                revision,
+            },
+        )?;
+        transaction.commit()?;
         Ok(next)
     }
 
@@ -489,6 +574,16 @@ fn checkpoint_task_command(
             serde_json::to_string(&state)?
         ],
     )?;
+    append_core_record(
+        transaction,
+        session,
+        &CoreRecord::TransitionCommitted {
+            command: Some(record.request.id.clone()),
+            invocation: None,
+            kind: CoreTransitionKind::TaskCommitted,
+            outcome: CoreOutcome::Pending,
+        },
+    )?;
     Ok(())
 }
 
@@ -633,17 +728,179 @@ fn finish_record(
             serde_json::to_string(&state)?
         ],
     )?;
+    let CommandState::Finished { revision, outcome } = &state else {
+        unreachable!("command completion always constructs a finished state")
+    };
+    append_core_record(
+        transaction,
+        session,
+        &CoreRecord::CommandFinished {
+            command: record.request.id.clone(),
+            revision: *revision,
+            outcome: CoreOutcome::command(outcome),
+        },
+    )?;
+    if matches!(record.state, CommandState::Active { .. }) {
+        append_core_record(
+            transaction,
+            session,
+            &CoreRecord::OperationCompleted {
+                operation: super::core_log::CoreOperation::Command {
+                    command: record.request.id.clone(),
+                    kind: CoreCommandKind::from(&record.request.command),
+                },
+                outcome: CoreOutcome::command(outcome),
+            },
+        )?;
+    }
     record.state = state;
     Ok(())
+}
+
+/// Append one safe core fact atomically with any domain mutation on this transaction.
+fn append_core_record(
+    transaction: &rusqlite::Transaction<'_>,
+    session: &str,
+    record: &CoreRecord,
+) -> Result<u64, CommandJournalError> {
+    let encoded = serde_json::to_string(record)?;
+    let previous: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(sequence),0) FROM owner_core_log WHERE session_id=?1",
+        [session],
+        |row| row.get(0),
+    )?;
+    let sequence = previous
+        .checked_add(1)
+        .ok_or(CommandJournalError::RevisionExhausted)?;
+    transaction.execute(
+        "INSERT INTO owner_core_log(session_id,sequence,record) VALUES(?1,?2,?3)",
+        params![session, sequence, encoded],
+    )?;
+    u64::try_from(sequence).map_err(|_| CommandJournalError::RevisionExhausted)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::input::{
-        InputAction, InputDelivery, InputIntent, InputMessage, InputOperation, InputPurpose,
-        SessionInputQueue,
+        InputAction, InputIntent, InputMessage, InputOperation, InputPurpose, SessionInputQueue,
     };
+
+    /// Read only the metadata journal so assertions cannot accidentally inspect the command payload table.
+    fn core_records(journal: &CommandJournal) -> anyhow::Result<Vec<(i64, String)>> {
+        let mut statement = journal.connection.prepare(
+            "SELECT sequence,record FROM owner_core_log WHERE session_id=?1 ORDER BY sequence",
+        )?;
+        Ok(statement
+            .query_map([&journal.session], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Required evidence survives reopen and disabled/cleared optional traces without retaining user content.
+    #[test]
+    fn core_evidence_survives_disabled_trace_and_reopen_without_payloads() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let _input = input_queue(root.path())?;
+        let trace = crate::trace::TraceStore::open(root.path())?;
+        trace.configure(false)?;
+        let request = CommandRequest::from_input(operation())?;
+        {
+            let mut journal = CommandJournal::open(root.path(), "session")?;
+            let admitted = journal.admit(&request)?;
+            journal.start(&admitted)?;
+            journal.finish(&request.id, Err(CommandFailure::Interrupted))?;
+            let event = forge_provider_api::BoundProviderEvent {
+                binding_id: forge_provider_api::BindingId::new("binding")?,
+                sequence: forge_provider_api::EventSequence::new(41),
+                event: forge_provider_api::ProviderEvent::Diagnostic {
+                    scope: forge_provider_api::EventScope::Binding {
+                        owner: forge_provider_api::ExecutionOwner::root("owner"),
+                    },
+                    diagnostic: forge_provider_api::ProviderDiagnostic {
+                        kind: forge_provider_api::ProviderFailureKind::Transport,
+                        message: forge_provider_api::diagnostic::SanitizedMessage::new(
+                            "private diagnostic content",
+                        )?,
+                        fatal: false,
+                    },
+                },
+            };
+            assert_eq!(journal.append_core(&CoreRecord::provider_event(&event))?, 5);
+            assert_eq!(
+                journal.append_core(&CoreRecord::CommandResponded {
+                    command: request.id.clone(),
+                    outcome: CoreOutcome::Interrupted,
+                })?,
+                6
+            );
+        }
+        trace.clear_session("session")?;
+        let journal = CommandJournal::open(root.path(), "session")?;
+        let records = core_records(&journal)?;
+        assert_eq!(
+            records
+                .iter()
+                .map(|(sequence, _)| *sequence)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6]
+        );
+        for (_, encoded) in &records {
+            let _: CoreRecord = serde_json::from_str(encoded)?;
+            assert!(!encoded.contains("retained input"));
+            assert!(!encoded.contains("private diagnostic content"));
+        }
+        assert!(matches!(serde_json::from_str::<CoreRecord>(&records[4].1)?,
+            CoreRecord::ProviderEventConsumed { sequence, kind: super::super::core_log::CoreProviderEventKind::Diagnostic, .. }
+                if sequence.get() == 41));
+        Ok(())
+    }
+
+    /// Required core persistence shares command transactions and cannot leave admitted or finished state ahead of evidence.
+    #[test]
+    fn core_write_failure_rolls_back_command_admission_start_and_completion() -> anyhow::Result<()>
+    {
+        let root = tempfile::tempdir()?;
+        let _input = input_queue(root.path())?;
+        let mut journal = CommandJournal::open(root.path(), "session")?;
+        let request = CommandRequest::from_input(operation())?;
+        let reject = "CREATE TRIGGER reject_core BEFORE INSERT ON owner_core_log BEGIN SELECT RAISE(ABORT,'fixture core storage failure'); END;";
+        journal.connection.execute_batch(reject)?;
+        assert!(journal.admit(&request).is_err());
+        assert!(journal.lookup(&request.id)?.is_none());
+        assert!(core_records(&journal)?.is_empty());
+        journal
+            .connection
+            .execute_batch("DROP TRIGGER reject_core")?;
+        let queued = journal.admit(&request)?;
+        journal.connection.execute_batch(reject)?;
+        assert!(journal.start(&queued).is_err());
+        assert!(matches!(
+            journal.lookup(&request.id)?.unwrap().state,
+            CommandState::Queued { revision: 1 }
+        ));
+        assert_eq!(core_records(&journal)?.len(), 1);
+        journal
+            .connection
+            .execute_batch("DROP TRIGGER reject_core")?;
+        journal.start(&queued)?;
+        journal.connection.execute_batch(reject)?;
+        assert!(
+            journal
+                .finish(&request.id, Err(CommandFailure::Interrupted))
+                .is_err()
+        );
+        assert!(matches!(
+            journal.lookup(&request.id)?.unwrap().state,
+            CommandState::Active { revision: 2, .. }
+        ));
+        assert_eq!(core_records(&journal)?.len(), 2);
+        journal
+            .connection
+            .execute_batch("DROP TRIGGER reject_core")?;
+        journal.finish(&request.id, Err(CommandFailure::Interrupted))?;
+        assert_eq!(core_records(&journal)?.len(), 4);
+        Ok(())
+    }
 
     /// Roll back task policy if its owner result cannot commit, then publish both together.
     #[test]
@@ -923,6 +1180,7 @@ mod tests {
 
     /// Create a real accepted-input journal sharing the command database.
     fn input_queue(root: &Path) -> anyhow::Result<SessionInputQueue> {
+        super::super::core_log::persist_test_session(root, "session")?;
         let submissions = crate::provider::submission::SubmissionStore::open(
             root,
             std::sync::Arc::new(crate::trace::TraceStore::open(root)?),
@@ -937,20 +1195,14 @@ mod tests {
             control_revision: 0,
             after_control: None,
             action: InputAction::Submit {
-                message: Box::new(InputMessage {
+                message: Box::new(InputMessage::queued(crate::input::InputDraft {
                     id: "input".into(),
-                    revision: 0,
                     text: "retained input".into(),
                     purpose: InputPurpose::User,
                     attachments: Vec::new(),
                     config: None,
                     intent: InputIntent::Queue,
-                    delivery: InputDelivery::Queued,
-                    route: None,
-                    reservation: None,
-                    submission_id: None,
-                    error: None,
-                }),
+                })),
             },
         }
     }

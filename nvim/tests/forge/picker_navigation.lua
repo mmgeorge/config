@@ -389,7 +389,7 @@ dofile("nvim/tests/forge/support/provider_catalog.lua").install()
       callback({ ask_model = state.ask_model })
     else error("unexpected request: " .. request.method) end
   end
-  controller.configure = function(params, _, completed)
+  controller.configure = function(params, completed)
     local session_id = state.session.id
     pending_response = function()
       if state.session.id ~= session_id then completed(false) return end

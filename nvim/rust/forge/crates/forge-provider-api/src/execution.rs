@@ -58,13 +58,14 @@ pub enum ExecutionOwnerError {
 }
 
 impl ExecutionOwner {
-    /// Derive an adapter lookup key while preserving legacy root-session controls.
+    /// Encode the complete owner for storage boundaries; runtime maps use `ExecutionOwner` directly.
     pub fn runtime_key(&self) -> String {
-        if self.is_root() {
-            self.session_id.to_string()
-        } else {
-            format!("{}:agent:{}", self.session_id, self.agent_id)
-        }
+        let Self {
+            session_id,
+            agent_id,
+        } = self;
+        serde_json::to_string(&(session_id, agent_id))
+            .expect("two string identities always have a JSON representation")
     }
     /// Resolve the primary conversation without selecting any child runtime.
     pub fn root(session_id: impl Into<String>) -> Self {
@@ -194,4 +195,42 @@ pub enum TurnUpdate {
 pub struct TurnSummary {
     pub duration_ms: u64,
     pub usage: Option<crate::usage::TokenUsage>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Owner serialization preserves separators, escaping, and the root/child distinction.
+    #[test]
+    fn storage_keys_preserve_complete_owner_identity() {
+        let owners = [
+            ExecutionOwner::root("a:agent:b"),
+            ExecutionOwner {
+                session_id: "a".into(),
+                agent_id: "b".into(),
+            },
+            ExecutionOwner {
+                session_id: "a".into(),
+                agent_id: "b:agent:c".into(),
+            },
+            ExecutionOwner {
+                session_id: "a:agent:b".into(),
+                agent_id: "c".into(),
+            },
+            ExecutionOwner {
+                session_id: "a\"\n".into(),
+                agent_id: "b:c".into(),
+            },
+        ];
+        let keys = owners
+            .iter()
+            .map(ExecutionOwner::runtime_key)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(keys.len(), owners.len());
+        for owner in owners {
+            let pair: (SessionId, AgentId) = serde_json::from_str(&owner.runtime_key()).unwrap();
+            assert_eq!(pair, (owner.session_id, owner.agent_id));
+        }
+    }
 }

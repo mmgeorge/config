@@ -512,9 +512,9 @@ async fn create_session(
     })
     .await
     .context("new session initialization worker failed")??;
-    let snapshot = broker.snapshot()?;
+    let controller = SessionController::new(broker).await?;
+    let snapshot = controller.observer.snapshot()?;
     let session = snapshot.session.clone();
-    let controller = SessionController::new(broker)?;
     registry
         .controller_by_id
         .write()

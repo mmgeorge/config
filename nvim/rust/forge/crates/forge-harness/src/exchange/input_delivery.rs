@@ -6,7 +6,6 @@ use forge_protocol::{message::SessionEvent, outbound::MessageSender};
 use tokio::{
     sync::{OwnedSemaphorePermit, oneshot},
     task::JoinHandle,
-    time::Instant,
 };
 
 use super::{
@@ -286,7 +285,6 @@ impl InputDeliveryRun {
                         task: tokio::spawn(async move {
                             observation.observe_provider_generation().await
                         }),
-                        deadline: deadline(60),
                     },
                 )
             }
@@ -349,14 +347,8 @@ impl InputDeliveryRun {
 
     /// Observe the current stage once without changing its owner-applied state.
     async fn poll_next(&mut self, foreground: ForegroundStatus) -> InputDeliveryEvent {
-        if self.preparing() && matches!(foreground, ForegroundStatus::Unavailable) {
-            return InputDeliveryEvent::Unavailable;
-        }
         match &mut self.stage {
-            DeliveryStage::Observation { task, deadline } => tokio::select! {
-                result = task => InputDeliveryEvent::Observation(result),
-                _ = tokio::time::sleep_until(*deadline) => InputDeliveryEvent::Deadline,
-            },
+            DeliveryStage::Observation { task } => InputDeliveryEvent::Observation(task.await),
             DeliveryStage::Work => match &mut self.work {
                 PreparationWork::Settings(run) => InputDeliveryEvent::Settings(run.next().await),
                 PreparationWork::Compaction(run) => {
@@ -371,47 +363,30 @@ impl InputDeliveryRun {
                     .next(foreground)
                     .await,
             ),
-            DeliveryStage::Attachments { task, deadline } => tokio::select! {
-                result = task => InputDeliveryEvent::Attachments(result),
-                _ = tokio::time::sleep_until(*deadline) => InputDeliveryEvent::Deadline,
-            },
-            DeliveryStage::Receipt { task, deadline, .. } => tokio::select! {
-                result = task => InputDeliveryEvent::Receipt(result),
-                _ = tokio::time::sleep_until(*deadline) => InputDeliveryEvent::Deadline,
-            },
+            DeliveryStage::Attachments { task } => InputDeliveryEvent::Attachments(task.await),
+            DeliveryStage::Receipt { task, .. } => InputDeliveryEvent::Receipt(task.await),
             DeliveryStage::Foreground { response, .. } => {
                 InputDeliveryEvent::Foreground(response.await)
             }
-            DeliveryStage::Steering {
-                task,
-                queued,
-                deadline,
-                ..
-            } => tokio::select! {
+            DeliveryStage::Steering { task, queued, .. } => tokio::select! {
                 result = task => InputDeliveryEvent::Steered(result),
                 handoff = async { match queued {
                     Some(queued) => { let mut observed = queued.clone(); observed.wait_for(|queued| *queued).await.map(drop) },
                     None => std::future::pending().await,
                 }} => InputDeliveryEvent::SteeringQueued(handoff),
-                _ = tokio::time::sleep_until(*deadline) => InputDeliveryEvent::Deadline,
             },
-            DeliveryStage::Reconcile { task, deadline, .. } => tokio::select! {
-                result = task => InputDeliveryEvent::Reconciled(Box::new(result)),
-                _ = tokio::time::sleep_until(*deadline) => InputDeliveryEvent::Deadline,
-            },
+            DeliveryStage::Reconcile { task, .. } => {
+                InputDeliveryEvent::Reconciled(Box::new(task.await))
+            }
             DeliveryStage::Replacement {
                 response,
-                deadline,
                 confirmed,
                 ..
             } => {
                 if *confirmed {
                     return InputDeliveryEvent::Ready;
                 }
-                tokio::select! {
-                    result = response => InputDeliveryEvent::Foreground(result),
-                    _ = tokio::time::sleep_until(*deadline) => InputDeliveryEvent::Deadline,
-                }
+                InputDeliveryEvent::Foreground(response.await)
             }
             DeliveryStage::Local | DeliveryStage::Rejected(_) => InputDeliveryEvent::Ready,
             DeliveryStage::Consumed => std::future::pending().await,
@@ -443,14 +418,6 @@ impl InputDeliveryRun {
         can_commit: bool,
     ) -> Result<InputDeliveryProgress, OperationFailure> {
         self.observation = InputObservation::Waiting;
-        if matches!(event, InputDeliveryEvent::Deadline) {
-            return Err(OperationFailure::JobDeadline);
-        }
-        if matches!(event, InputDeliveryEvent::Unavailable) {
-            return Err(OperationFailure::Transition(
-                super::transition::TransitionFailure::Uncertain,
-            ));
-        }
         match event {
             InputDeliveryEvent::Observation(result) => {
                 self.stage = DeliveryStage::Consumed;
@@ -460,6 +427,9 @@ impl InputDeliveryRun {
                 }
                 if let Some(reason) = self.steering_block_reason(services)? {
                     return self.finish_unprepared_steering(reason, services);
+                }
+                if let Some(reason) = self.interruption(services)? {
+                    return self.finish_interrupted(reason, None, receipts, services);
                 }
                 self.stage = DeliveryStage::Work;
                 if matches!(self.work, PreparationWork::None) {
@@ -528,7 +498,6 @@ impl InputDeliveryRun {
                                 self.stage = DeliveryStage::Replacement {
                                     work: id,
                                     response,
-                                    deadline: deadline(30),
                                     confirmed: false,
                                 };
                                 self.release_preparation();
@@ -616,7 +585,9 @@ impl InputDeliveryRun {
                 if let Some(reason) = self.steering_block_reason(services)? {
                     return self.finish_unprepared_steering(reason, services);
                 }
-                self.validate(services)?;
+                if let Some(reason) = self.interruption(services)? {
+                    return self.finish_interrupted(reason, None, receipts, services);
+                }
                 let provider = self
                     .generation
                     .as_ref()
@@ -665,11 +636,7 @@ impl InputDeliveryRun {
                         .persist_input_request(request, provider, origin)
                         .await
                 });
-                self.stage = DeliveryStage::Receipt {
-                    task,
-                    attachments,
-                    deadline: deadline(30),
-                };
+                self.stage = DeliveryStage::Receipt { task, attachments };
                 Ok(InputDeliveryProgress::waiting())
             }
             InputDeliveryEvent::Receipt(result) => {
@@ -739,7 +706,9 @@ impl InputDeliveryRun {
                         completion: None,
                     });
                 }
-                self.validate(services)?;
+                if let Some(reason) = self.interruption(services)? {
+                    return self.finish_interrupted(reason, Some(&submission), receipts, services);
+                }
                 let message = receipts
                     .capture_dispatch(&self.input, submission.receipt_id(), services)
                     .map_err(|error| OperationFailure::Domain(error.into()))?;
@@ -790,7 +759,6 @@ impl InputDeliveryRun {
                         submission,
                         queued: Some(queued),
                         flight,
-                        deadline: deadline(30),
                     };
                     self.control.take();
                     return Ok(InputDeliveryProgress::Waiting {
@@ -818,7 +786,7 @@ impl InputDeliveryRun {
                     confirmed: false,
                 };
                 self.release_preparation();
-                services.cancellation.arm(true);
+                services.cancellation.arm();
                 Ok(InputDeliveryProgress::Foreground(InputForegroundStart {
                     id,
                     source: InputForegroundSource::Input(receipt),
@@ -880,13 +848,18 @@ impl InputDeliveryRun {
                         });
                     }
                     Ok(result) => (
-                        if result.response.error().is_none() {
-                            InputExecutionResult::Completed
-                        } else {
-                            InputExecutionResult::Failed
+                        match result.response.error() {
+                            None => InputExecutionResult::Completed,
+                            Some(error) if error.code == "turn_cancelled" => {
+                                InputExecutionResult::Cancelled
+                            }
+                            Some(_) => InputExecutionResult::Failed,
                         },
                         result.event,
                     ),
+                    Err(error) if error.is::<crate::broker::TurnCancelled>() => {
+                        (InputExecutionResult::Cancelled, Vec::new())
+                    }
                     Err(_) => (InputExecutionResult::Failed, Vec::new()),
                 };
                 self.begin_reconcile(submission, execution, events, None, services);
@@ -946,7 +919,7 @@ impl InputDeliveryRun {
                 let (execution, failure) = match outcome {
                     Ok(()) => (InputExecutionResult::Completed, None),
                     Err(error) if error.is_clean_cancellation() => {
-                        (InputExecutionResult::Failed, None)
+                        (InputExecutionResult::Cancelled, None)
                     }
                     Err(error) => (InputExecutionResult::Failed, Some(error)),
                 };
@@ -1007,14 +980,12 @@ impl InputDeliveryRun {
                     events.push(SessionEvent {
                         session_id: services.observer.session_id().into(),
                         event: "session_changed".into(),
-                        payload: serde_json::to_value(
+                        payload: serde_json::json!({"snapshot":
                             services
                                 .observer
                                 .snapshot()
                                 .map_err(OperationFailure::Domain)?
-                                .session,
-                        )
-                        .map_err(|error| OperationFailure::Domain(error.into()))?,
+                        }),
                     });
                 }
                 Ok(InputDeliveryProgress::Finished {
@@ -1086,12 +1057,6 @@ impl InputDeliveryRun {
                         unreachable!("only synchronous input stages produce ready facts")
                     }
                 }
-            }
-            InputDeliveryEvent::Deadline => {
-                unreachable!("deadlines retain their actual work above")
-            }
-            InputDeliveryEvent::Unavailable => {
-                unreachable!("unavailable preparation retains actual work above")
             }
         }
     }
@@ -1236,7 +1201,7 @@ impl InputDeliveryRun {
             InputAbandonment::Paused
             | InputAbandonment::Retracted
             | InputAbandonment::Reconfigured => Some(InputDelivery::Queued),
-            InputAbandonment::Superseded => None,
+            InputAbandonment::Cancelled | InputAbandonment::Superseded => None,
         };
         let input = services
             .input
@@ -1256,8 +1221,66 @@ impl InputDeliveryRun {
         })
     }
 
-    /// Revalidate the immutable claimed input and applicable workflow before issuing another effect.
-    fn validate(&self, services: &OwnerServices) -> Result<(), OperationFailure> {
+    /// Settle deliberate preparation interruption without classifying it as failed acceptance.
+    fn finish_interrupted(
+        &mut self,
+        reason: InputAbandonment,
+        submission: Option<&Arc<Submission>>,
+        receipts: &mut InputReceipts,
+        services: &OwnerServices,
+    ) -> Result<InputDeliveryProgress, OperationFailure> {
+        let input = if let Some(submission) = submission {
+            receipts
+                .apply(
+                    InputReceiptFact::Abandoned {
+                        submission: submission.receipt_id().clone(),
+                        reason,
+                    },
+                    services,
+                )
+                .map_err(|error| OperationFailure::Domain(error.into()))?
+        } else {
+            let delivery = match reason {
+                InputAbandonment::Paused | InputAbandonment::Reconfigured => {
+                    Some(InputDelivery::Queued)
+                }
+                InputAbandonment::Cancelled
+                | InputAbandonment::Superseded
+                | InputAbandonment::Retracted => None,
+            };
+            let mut input = services
+                .input
+                .delivery_if_current(
+                    self.input.id.as_str(),
+                    InputDeliveryGuard::Claimed(self.input.revision),
+                    delivery,
+                    None,
+                    None,
+                )
+                .map_err(OperationFailure::Domain)?;
+            if matches!(
+                reason,
+                InputAbandonment::Cancelled | InputAbandonment::Retracted
+            ) && let Some(update) = &mut input
+            {
+                update.retracted = Some(self.input.id.as_str().into());
+            }
+            input
+        };
+        self.release_steering_order(services);
+        self.release_preparation();
+        Ok(InputDeliveryProgress::Finished {
+            events: Vec::new(),
+            input,
+            completion: None,
+        })
+    }
+
+    /// Classify owner-observed interruption before issuing another input effect.
+    fn interruption(
+        &self,
+        services: &OwnerServices,
+    ) -> Result<Option<InputAbandonment>, OperationFailure> {
         let snapshot = services
             .input
             .snapshot()
@@ -1266,29 +1289,32 @@ impl InputDeliveryRun {
             .messages
             .iter()
             .find(|message| message.id == self.input.id.as_str());
-        if current.is_none_or(|message| message.delivery != InputDelivery::Delivering)
-            || snapshot.suspended
-                && !matches!(
-                    self.message.purpose,
-                    crate::input::InputPurpose::Question { .. }
-                )
-            || *services.cancellation.subscribe().borrow()
-            || !crate::input::input_purpose_is_current(
-                &services.tasks,
-                &services.questions,
-                &self.message.purpose,
-                &services.root,
-                services.observer.session_id(),
-            )
-            .map_err(|error| OperationFailure::Domain(error.into()))?
-        {
-            return Err(OperationFailure::Transition(
-                super::transition::TransitionFailure::Rejected(
-                    super::command::CommandFailure::Interrupted,
-                ),
-            ));
+        if current.is_none_or(|message| message.delivery() != InputDelivery::Delivering) {
+            return Ok(Some(InputAbandonment::Superseded));
         }
-        Ok(())
+        if *services.cancellation.subscribe().borrow() {
+            return Ok(Some(InputAbandonment::Cancelled));
+        }
+        if snapshot.suspended
+            && !matches!(
+                self.message.purpose,
+                crate::input::InputPurpose::Question { .. }
+            )
+        {
+            return Ok(Some(InputAbandonment::Paused));
+        }
+        if !crate::input::input_purpose_is_current(
+            &services.tasks,
+            &services.questions,
+            &self.message.purpose,
+            &services.root,
+            services.observer.session_id(),
+        )
+        .map_err(|error| OperationFailure::Domain(error.into()))?
+        {
+            return Ok(Some(InputAbandonment::Superseded));
+        }
+        Ok(None)
     }
 
     /// Reuse root collection without waiting for this input preparation to collect itself.
@@ -1331,7 +1357,6 @@ impl InputDeliveryRun {
                         )
                         .await
                     }),
-                    deadline: deadline(30),
                 };
             }
         }
@@ -1365,7 +1390,6 @@ impl InputDeliveryRun {
             result,
             events,
             steering_failure,
-            deadline: deadline(30),
         };
     }
 
@@ -1492,8 +1516,6 @@ pub(super) enum InputDeliveryEvent {
         >,
     ),
     Ready,
-    Deadline,
-    Unavailable,
 }
 
 impl InputDeliveryEvent {
@@ -1511,8 +1533,6 @@ impl InputDeliveryEvent {
             Self::SteeringQueued(_) => "input_steering_queued",
             Self::Reconciled(_) => "input_receipt_reconciled",
             Self::Ready => "input_preparation_ready",
-            Self::Deadline => "input_preparation_deadline",
-            Self::Unavailable => "input_preparation_unavailable",
         }
     }
 }
@@ -1548,18 +1568,15 @@ pub(super) struct ReconciledInput {
 enum DeliveryStage {
     Observation {
         task: JoinHandle<ProviderGenerationPermit>,
-        deadline: Instant,
     },
     Work,
     Collecting,
     Attachments {
         task: JoinHandle<anyhow::Result<Vec<crate::attachment::InputAttachment>>>,
-        deadline: Instant,
     },
     Receipt {
         task: JoinHandle<Result<Arc<Submission>, crate::provider::ProviderError>>,
         attachments: Vec<crate::attachment::InputAttachment>,
-        deadline: Instant,
     },
     Foreground {
         work: uuid::Uuid,
@@ -1572,7 +1589,6 @@ enum DeliveryStage {
         submission: Arc<Submission>,
         queued: Option<tokio::sync::watch::Receiver<bool>>,
         flight: Arc<SteeringFlight>,
-        deadline: Instant,
     },
     Reconcile {
         task: JoinHandle<Result<ReconciledInput, crate::provider::ProviderError>>,
@@ -1580,22 +1596,15 @@ enum DeliveryStage {
         result: InputExecutionResult,
         events: Vec<SessionEvent>,
         steering_failure: Option<crate::provider::ProviderError>,
-        deadline: Instant,
     },
     Replacement {
         work: uuid::Uuid,
         response: oneshot::Receiver<anyhow::Result<DispatchResult>>,
-        deadline: Instant,
         confirmed: bool,
     },
     Local,
     Rejected(Option<OperationFailure>),
     Consumed,
-}
-
-/// Bound observation while keeping actual effects owned after the deadline.
-fn deadline(seconds: u64) -> Instant {
-    Instant::now() + std::time::Duration::from_secs(seconds)
 }
 
 #[cfg(test)]
@@ -1658,7 +1667,7 @@ mod tests {
     }
 
     /// Retain a completed worker across the owner's buffered-wake preflight without repolling it.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn input_delivery_buffers_completed_worker_until_owner_update() {
         let (release, wait) = oneshot::channel();
         let mut run = InputDeliveryRun {
@@ -1667,20 +1676,11 @@ mod tests {
                 revision: 1,
             },
             messages: None,
-            message: InputMessage {
-                id: "buffered-input".into(),
-                revision: 1,
-                text: "follow up".into(),
-                purpose: crate::input::InputPurpose::User,
-                attachments: Vec::new(),
-                config: None,
-                intent: crate::input::InputIntent::Auto,
-                delivery: InputDelivery::Delivering,
-                route: None,
-                reservation: None,
-                submission_id: None,
-                error: None,
-            },
+            message: serde_json::from_value(serde_json::json!({
+                "id":"buffered-input", "revision":1, "text":"follow up",
+                "delivery":"delivering", "route":"turn"
+            }))
+            .unwrap(),
             kind: DeliveryKind::Prompt,
             work: PreparationWork::None,
             stage: DeliveryStage::Attachments {
@@ -1688,7 +1688,6 @@ mod tests {
                     wait.await.unwrap();
                     Ok(Vec::new())
                 }),
-                deadline: deadline(60),
             },
             observation: InputObservation::Waiting,
             transition: None,
@@ -1700,7 +1699,14 @@ mod tests {
             terminal_events: Vec::new(),
             destination: InputDestination::Foreground,
         };
-        // Cancelling an unready observation must leave the worker observable.
+        // Cancellation can fence foreground access while preparation still owns its worker.
+        assert!(
+            run.next(ForegroundStatus::Unavailable)
+                .now_or_never()
+                .is_none()
+        );
+        assert!(run.next(ForegroundStatus::Local).now_or_never().is_none());
+        tokio::time::advance(std::time::Duration::from_secs(300)).await;
         assert!(run.next(ForegroundStatus::Local).now_or_never().is_none());
         release.send(()).unwrap();
         let event = tokio::time::timeout(
@@ -1716,6 +1722,184 @@ mod tests {
                 .now_or_never()
                 .is_none()
         );
+    }
+
+    /// Settle a held attachment worker as cancellation without failing or removing its queued successor.
+    #[tokio::test]
+    async fn cancelled_attachment_preparation_retracts_selected_input_and_preserves_successor()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut broker = HarnessBroker::initialize(serde_json::from_value(serde_json::json!({
+            "workspace":root.path(), "data_root":root.path().join("data"), "client_id":"cancel-preparation",
+            "provider":{"kind":"mock", "command":[]},
+        }))?)?;
+        let observer = broker.observer();
+        let input = Arc::new(crate::input::SessionInputQueue::open(
+            &broker.data_root,
+            observer.session_id(),
+            &broker.submission_store,
+        )?);
+        let coordinator = crate::command::SessionCoordinator::new(input.clone());
+        let services = OwnerServices {
+            provider_lifecycle: super::super::provider_lifecycle::ProviderLifecycle::new(
+                |provider| {
+                    Box::pin(async move {
+                        Ok(
+                            super::super::provider_lifecycle::ProviderInitialization::NotRequired {
+                                provider,
+                            },
+                        )
+                    })
+                },
+            ),
+            publications: Arc::new(super::super::publication::SessionPublications::open(
+                &broker.data_root,
+                observer.session_id(),
+            )?),
+            input: input.clone(),
+            submissions: broker.submission_store.clone(),
+            provider: Arc::new(std::sync::RwLock::new(broker.provider_handle())),
+            provider_lane: Arc::new(tokio::sync::RwLock::new(())),
+            catalog: Arc::new(tokio::sync::RwLock::new(broker.provider_catalog_request()?)),
+            resource_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            root: broker.data_root.clone(),
+            tasks: broker.task_controller.clone(),
+            questions: broker.questions.clone(),
+            presentation: broker.presentation(),
+            observer,
+            execution: coordinator.execution.clone(),
+            control: coordinator.control.clone(),
+            cancellation: broker.turn_cancellation(),
+            permissions: broker.permission_coordinator(),
+            children: broker.agent_coordinator(),
+            checks: broker.checks(),
+            goal_max_turns: broker.goal_max_turns,
+        };
+        for id in ["selected-input", "queued-successor"] {
+            input.apply(crate::input::InputOperation {
+                id: format!("submit-{id}"),
+                control_revision: 0,
+                after_control: None,
+                action: crate::input::InputAction::Submit {
+                    message: Box::new(crate::input::InputMessage::queued(
+                        crate::input::InputDraft {
+                            id: id.into(),
+                            text: id.into(),
+                            purpose: crate::input::InputPurpose::User,
+                            attachments: Vec::new(),
+                            config: None,
+                            intent: crate::input::InputIntent::Queue,
+                        },
+                    )),
+                },
+            })?;
+        }
+        let claimed = input
+            .claim("selected-input", 1, crate::input::InputRoute::Turn)?
+            .expect("selected input is queued");
+        let (release, resumed) = oneshot::channel();
+        let mut run = InputDeliveryRun {
+            input: InputRevision {
+                id: InputId::new(claimed.id.clone())?,
+                revision: claimed.revision,
+            },
+            messages: None,
+            message: claimed,
+            kind: DeliveryKind::Prompt,
+            work: PreparationWork::None,
+            stage: DeliveryStage::Attachments {
+                task: tokio::spawn(async move {
+                    resumed.await.expect("test releases attachment preparation");
+                    Ok(Vec::new())
+                }),
+            },
+            observation: InputObservation::Waiting,
+            transition: None,
+            selected: None,
+            collected: true,
+            execution: None,
+            control: None,
+            generation: None,
+            terminal_events: Vec::new(),
+            destination: InputDestination::Foreground,
+        };
+        assert!(run.next(ForegroundStatus::Local).now_or_never().is_none());
+        services.cancellation.arm();
+        services.cancellation.request();
+        assert!(
+            run.next(ForegroundStatus::Unavailable)
+                .now_or_never()
+                .is_none()
+        );
+        release
+            .send(())
+            .expect("attachment worker retains the barrier");
+        let event = run.next(ForegroundStatus::Unavailable).await;
+        let progress = run.update(
+            event,
+            ForegroundStatus::Unavailable,
+            &mut broker,
+            &services,
+            &mut InputReceipts::default(),
+            true,
+        )?;
+        let InputDeliveryProgress::Finished {
+            input: Some(update),
+            ..
+        } = progress
+        else {
+            panic!("intentional cancellation must finish without a failed acceptance");
+        };
+        assert!(update.error.is_none());
+        assert_eq!(update.retracted.as_deref(), Some("selected-input"));
+        let snapshot = input.snapshot()?;
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].id, "queued-successor");
+        assert_eq!(snapshot.messages[0].delivery(), InputDelivery::Queued);
+        broker.provider_handle().shutdown().await?;
+        Ok(())
+    }
+
+    /// Keep an admitted replacement's observation alive beyond the old acceptance cutoff.
+    #[tokio::test(start_paused = true)]
+    async fn replacement_acceptance_has_no_implicit_duration_deadline() {
+        let (completion, response) = oneshot::channel();
+        let mut run = InputDeliveryRun {
+            input: InputRevision {
+                id: InputId::new("pending-replacement").unwrap(),
+                revision: 1,
+            },
+            messages: None,
+            message: serde_json::from_value(serde_json::json!({
+                "id":"pending-replacement", "revision":1, "text":"follow up",
+                "delivery":"delivering", "route":"turn"
+            }))
+            .unwrap(),
+            kind: DeliveryKind::Prompt,
+            work: PreparationWork::None,
+            stage: DeliveryStage::Replacement {
+                work: uuid::Uuid::new_v4(),
+                response,
+                confirmed: false,
+            },
+            observation: InputObservation::Waiting,
+            transition: None,
+            selected: None,
+            collected: false,
+            execution: None,
+            control: None,
+            generation: None,
+            terminal_events: Vec::new(),
+            destination: InputDestination::Foreground,
+        };
+        assert!(run.next(ForegroundStatus::Local).now_or_never().is_none());
+        tokio::time::advance(std::time::Duration::from_secs(300)).await;
+        assert!(run.next(ForegroundStatus::Local).now_or_never().is_none());
+        drop(completion);
+        assert!(matches!(
+            run.next(ForegroundStatus::Local).await,
+            InputDeliveryEvent::Foreground(Err(_))
+        ));
     }
 
     /// Preserve collection uncertainty even when cancellation is the original cause.

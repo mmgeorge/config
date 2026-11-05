@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use super::{ProviderCompletion, ProviderEvent, ProviderEventSink, ProviderRequest, TurnAddress};
 use crate::trace::TraceStore;
 
-const RETRY_DELAY_SECONDS: [u64; 5] = [1, 5, 10, 30, 60];
+const RETRY_DELAY_SECONDS: [u64; 5] = [1, 5, 30, 60, 300];
 const CONTINUATION_PROMPT: &str = "Continue the previously accepted work from its current state. The preceding execution ended with a transient failure. Preserve completed work and tool effects; do not repeat the original user input or redo completed actions.";
 
 /// Rejects replay after tools, control results, or model output have been observed.
@@ -246,7 +246,7 @@ pub(crate) async fn execute_until_ready(
             }
         };
         progress.record("failed", json!({"category":failure.category}));
-        let Some(delay_seconds) = RETRY_DELAY_SECONDS.get(progress.attempt).copied() else {
+        let Some(delay) = retry_delay(progress.attempt, failure.retry_after) else {
             progress.record("exhausted", json!({"category":failure.category}));
             publish(&event_sink, address, None).await?;
             progress.pending = false;
@@ -259,10 +259,10 @@ pub(crate) async fn execute_until_ready(
         progress.attempt += 1;
         progress.pending = true;
         let retry_at_ms =
-            now_ms().saturating_add(i64::try_from(delay_seconds.saturating_mul(1000))?);
+            now_ms().saturating_add(i64::try_from(delay.as_millis()).unwrap_or(i64::MAX));
         progress.record(
             "scheduled",
-            json!({"delay_ms":delay_seconds * 1000,"retry_at_ms":retry_at_ms}),
+            json!({"delay_ms":u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),"retry_at_ms":retry_at_ms}),
         );
         publish(
             &event_sink,
@@ -274,7 +274,7 @@ pub(crate) async fn execute_until_ready(
             }),
         )
         .await?;
-        tokio::time::sleep(Duration::from_secs(delay_seconds)).await;
+        tokio::time::sleep(delay).await;
         progress.record("started", Value::Null);
         publish(
             &event_sink,
@@ -356,7 +356,7 @@ where
             return Err(error.into());
         };
         progress.record("failed", json!({"category":failure.category}));
-        let Some(delay_seconds) = RETRY_DELAY_SECONDS.get(progress.attempt).copied() else {
+        let Some(delay) = retry_delay(progress.attempt, failure.retry_after) else {
             progress.record("exhausted", json!({"category":failure.category}));
             publish(&event_sink, address.clone(), None).await?;
             progress.pending = false;
@@ -372,10 +372,11 @@ where
         let successor_sink = event_sink.successor_invocation_sink(&scope)?;
         progress.attempt += 1;
         progress.pending = true;
-        let retry_at_ms = now_ms().saturating_add(i64::try_from(delay_seconds * 1000)?);
+        let retry_at_ms =
+            now_ms().saturating_add(i64::try_from(delay.as_millis()).unwrap_or(i64::MAX));
         progress.record(
             "scheduled",
-            json!({"delay_ms":delay_seconds * 1000,"retry_at_ms":retry_at_ms}),
+            json!({"delay_ms":u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),"retry_at_ms":retry_at_ms}),
         );
         publish(
             &event_sink,
@@ -391,10 +392,10 @@ where
             tokio::select! {
                 biased;
                 () = admission.wait_closed() => return Err(crate::broker::TurnCancelled.into()),
-                () = tokio::time::sleep(Duration::from_secs(delay_seconds)) => {}
+                () = tokio::time::sleep(delay) => {}
             }
         } else {
-            tokio::time::sleep(Duration::from_secs(delay_seconds)).await;
+            tokio::time::sleep(delay).await;
         }
         progress.record("started", Value::Null);
         publish(
@@ -409,6 +410,13 @@ where
         .await?;
         event_sink = successor_sink;
     }
+}
+
+/// Honor provider-required waits without shortening the host's retry schedule.
+fn retry_delay(attempt: usize, required: Option<Duration>) -> Option<Duration> {
+    RETRY_DELAY_SECONDS
+        .get(attempt)
+        .map(|seconds| Duration::from_secs(*seconds).max(required.unwrap_or_default()))
 }
 
 /// Author a new logical input while preserving effective configuration and existing task authority.
@@ -536,6 +544,7 @@ mod tests {
                 failure: ExecutionFailure::Retryable {
                     address: address.clone(),
                     category: RetryCategory::TemporaryCapacity,
+                    retry_after: None,
                 },
             }
         } else {
@@ -733,6 +742,7 @@ mod tests {
                                 turn_id: "turn".into(),
                             },
                             category: RetryCategory::TemporaryCapacity,
+                            retry_after: None,
                         },
                     )))
                 }
@@ -800,6 +810,57 @@ mod tests {
         assert!(!replay_safe(&output));
     }
 
+    /// Delay the actual successor attempt until the provider-required recovery time.
+    #[tokio::test(start_paused = true)]
+    async fn provider_required_wait_delays_successor_attempt() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = TraceStore::open(directory.path())?;
+        let (sink, _stream) = crate::provider::events::channel(scope());
+        let started = tokio::time::Instant::now();
+        let mut attempt_count = 0;
+        run_policy(request(), sink, &trace, |_, sink, _| {
+            attempt_count += 1;
+            let first = attempt_count == 1;
+            async move {
+                if first {
+                    return Err(ProviderError::Retryable(Box::new(
+                        forge_provider_api::retry::RetryableFailure {
+                            address: TurnAddress {
+                                scope: sink.invocation_scope()?.clone(),
+                                thread_id: "thread".into(),
+                                turn_id: "turn".into(),
+                            },
+                            category: RetryCategory::RateLimited,
+                            retry_after: Some(Duration::from_secs(45)),
+                        },
+                    )));
+                }
+                Ok(ProviderCompletion::default())
+            }
+        })
+        .await?;
+        assert_eq!(attempt_count, 2);
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(started),
+            Duration::from_secs(45)
+        );
+        Ok(())
+    }
+
+    /// Keep required server waits and policy floors while preserving the five-retry boundary.
+    #[test]
+    fn provider_required_wait_extends_but_never_shortens_retry_delay() {
+        assert_eq!(
+            retry_delay(0, Some(Duration::from_secs(45))),
+            Some(Duration::from_secs(45))
+        );
+        assert_eq!(
+            retry_delay(4, Some(Duration::from_secs(2))),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(retry_delay(5, Some(Duration::from_secs(600))), None);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn retry_schedule_preserves_model_and_final_error() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -821,7 +882,7 @@ mod tests {
         assert_eq!(log.prompt_count.load(Ordering::SeqCst), 6);
         assert_eq!(log.continuation_count.load(Ordering::SeqCst), 5);
         assert_eq!(attempts.len(), 6);
-        for (index, delay) in RETRY_DELAY_SECONDS.iter().enumerate() {
+        for (index, delay) in [1, 5, 30, 60, 300].iter().enumerate() {
             assert_eq!(
                 attempts[index + 1].1.duration_since(attempts[index].1),
                 Duration::from_secs(*delay)

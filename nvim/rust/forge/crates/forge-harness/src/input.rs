@@ -9,8 +9,11 @@ use serde_json::Value;
 
 mod authority;
 mod journal;
+mod message;
 pub(crate) use authority::{InputAuthorityError, input_purpose_is_current};
 pub(crate) use journal::reserve_workflow_input;
+pub(crate) use message::InputDraft;
+pub use message::InputMessage;
 mod rejection;
 pub(crate) use rejection::InputRejection;
 
@@ -45,7 +48,7 @@ pub(crate) enum InputDeliveryGuard<'a> {
     Receipt(&'a forge_provider_api::SubmissionId),
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InputDelivery {
     #[default]
@@ -92,28 +95,6 @@ pub enum InputPurpose {
         completed_turn_id: crate::task::TaskTurnId,
         reason: String,
     },
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct InputMessage {
-    pub id: String,
-    #[serde(default)]
-    pub revision: u64,
-    pub text: String,
-    #[serde(default)]
-    pub purpose: InputPurpose,
-    #[serde(default)]
-    pub attachments: Vec<Value>,
-    pub config: Option<Value>,
-    #[serde(default)]
-    pub intent: InputIntent,
-    #[serde(default)]
-    pub delivery: InputDelivery,
-    #[serde(default)]
-    pub route: Option<InputRoute>,
-    pub reservation: Option<String>,
-    pub submission_id: Option<String>,
-    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -227,15 +208,17 @@ impl SessionInputQueue {
                 .revision
                 .checked_add(1)
                 .context("input revision exhausted")?;
-            // Preserve uncertainty; only proven acceptance removes an input.
+            // Preserve uncertain sends; accepted or explicitly cancelled inputs cannot be replayed.
+            let mut cancelled = std::collections::HashSet::new();
             for message in &mut state.snapshot.messages {
-                if message.reservation.take().is_some() {
+                if message.reservation().is_some() {
+                    message.reserve(None)?;
                     message.revision = message
                         .revision
                         .checked_add(1)
                         .context("input message revision exhausted")?;
                 }
-                if let Some(id) = &message.submission_id {
+                if let Some(id) = message.submission_id() {
                     let record = submissions.submission(id)?.record()?;
                     ensure!(
                         record.request.harness_session_id == session_id,
@@ -243,42 +226,43 @@ impl SessionInputQueue {
                     );
                     match record.delivery {
                         crate::provider::submission::SubmissionState::Accepted { .. } => {
-                            message.delivery = InputDelivery::Accepted;
+                            message.set_delivery(InputDelivery::Accepted, None, None)?;
                         }
                         crate::provider::submission::SubmissionState::Sending { .. } => {
-                            message.delivery = InputDelivery::Unknown;
-                            message.error =
-                                Some("Delivery requires reconciliation before retry".into());
+                            message.set_delivery(
+                                InputDelivery::Unknown,
+                                None,
+                                Some("Delivery requires reconciliation before retry".into()),
+                            )?;
                         }
                         crate::provider::submission::SubmissionState::Prepared => {
-                            message.delivery = InputDelivery::Failed;
-                            message.error = Some(
-                                "Interrupted before provider dispatch; retry explicitly".into(),
-                            );
+                            message.set_delivery(
+                                InputDelivery::Failed,
+                                None,
+                                Some(
+                                    "Interrupted before provider dispatch; retry explicitly".into(),
+                                ),
+                            )?;
                         }
                         crate::provider::submission::SubmissionState::Cancelled => {
-                            message.delivery = InputDelivery::Failed;
-                            message.error =
-                                Some("Previous submission was cancelled; retry explicitly".into());
+                            cancelled.insert(message.id.clone());
                         }
                     }
                     message.revision = message
                         .revision
                         .checked_add(1)
                         .context("input message revision exhausted")?;
-                } else if message.delivery == InputDelivery::Delivering {
-                    message.delivery = InputDelivery::Queued;
-                    message.route = None;
+                } else if message.delivery() == InputDelivery::Delivering {
+                    message.queue();
                     message.revision = message
                         .revision
                         .checked_add(1)
                         .context("input message revision exhausted")?;
                 }
             }
-            state
-                .snapshot
-                .messages
-                .retain(|message| message.delivery != InputDelivery::Accepted);
+            state.snapshot.messages.retain(|message| {
+                message.delivery() != InputDelivery::Accepted && !cancelled.contains(&message.id)
+            });
             if !state.snapshot.messages.is_empty() {
                 state.snapshot.suspended = true;
             }
@@ -318,7 +302,7 @@ impl SessionInputQueue {
             state.snapshot.revision,
             state.snapshot.messages.iter().any(|message| {
                 !matches!(
-                    message.delivery,
+                    message.delivery(),
                     InputDelivery::Delivering | InputDelivery::Accepted
                 )
             }),
@@ -401,7 +385,7 @@ impl SessionInputQueue {
             };
             if previous_revision == revision
                 || matches!(
-                    previous.delivery,
+                    previous.delivery(),
                     InputDelivery::Delivering | InputDelivery::Accepted | InputDelivery::Unknown
                 )
             {
@@ -411,12 +395,17 @@ impl SessionInputQueue {
                 .revision
                 .checked_add(1)
                 .context("input message revision exhausted")?;
-            message.submission_id = previous.submission_id.clone();
             *previous = message.clone();
         } else {
             message.revision = 1;
             state.submitted.insert(message.id.clone());
-            state.snapshot.messages.push(message.clone());
+            // Initial task input must precede the directive awaiting its dispatch acknowledgement.
+            // Ordinary queued input remains ordered behind the explicitly admitted task command.
+            if matches!(message.purpose, InputPurpose::TaskEntry { .. }) {
+                state.snapshot.messages.insert(0, message.clone());
+            } else {
+                state.snapshot.messages.push(message.clone());
+            }
         }
         let mut update = InputUpdate {
             upsert: vec![message],
@@ -556,13 +545,17 @@ impl SessionInputQueue {
             .iter_mut()
             .find(|message| message.id == *id)
             .ok_or(InputRejection::InputMissing)?;
-        if message.revision != *revision
-            || message.submission_id.as_deref() != Some(evidence.id.as_str())
-        {
+        if message.revision != *revision || message.submission_id() != Some(evidence.id.as_str()) {
             return Err(InputRejection::RevisionChanged);
         }
-        if message.delivery == InputDelivery::Unknown {
-            message.delivery = InputDelivery::Failed;
+        if message.delivery() == InputDelivery::Unknown {
+            message
+                .set_delivery(
+                    InputDelivery::Failed,
+                    None,
+                    message.error().map(str::to_owned),
+                )
+                .map_err(|_| InputRejection::DeliveryUnconfirmed)?;
         }
         Ok(())
     }
@@ -574,10 +567,10 @@ impl SessionInputQueue {
         match &operation.action {
             InputAction::Retry { id, revision } => {
                 let message = Self::editable(snapshot, id, *revision)?;
-                if message.delivery != InputDelivery::Failed {
+                if message.delivery() != InputDelivery::Failed {
                     return Err(InputRejection::DeliveryUnconfirmed);
                 }
-                if message.reservation.is_some() {
+                if message.reservation().is_some() {
                     return Err(InputRejection::EditInProgress);
                 }
             }
@@ -606,8 +599,7 @@ impl SessionInputQueue {
                 }
                 let message = Self::editable(snapshot, id, *revision)?;
                 if message
-                    .reservation
-                    .as_ref()
+                    .reservation()
                     .is_some_and(|owner| owner != reservation)
                 {
                     return Err(InputRejection::EditOwned);
@@ -620,7 +612,7 @@ impl SessionInputQueue {
                         return Err(InputRejection::DuplicateEdit);
                     }
                     let message = Self::editable(snapshot, &edit.id, edit.revision)?;
-                    if message.reservation.as_ref() != Some(reservation) {
+                    if message.reservation() != Some(reservation.as_str()) {
                         return Err(InputRejection::EditExpired);
                     }
                 }
@@ -647,10 +639,7 @@ impl SessionInputQueue {
                     .iter_mut()
                     .find(|message| message.id == id)
                     .expect("validated message");
-                message.delivery = InputDelivery::Queued;
-                message.submission_id = None;
-                message.route = None;
-                message.error = None;
+                message.queue();
                 message.revision += 1;
                 update.upsert.push(message.clone());
             }
@@ -661,11 +650,7 @@ impl SessionInputQueue {
             InputAction::Submit { message } => {
                 let mut message = *message;
                 message.revision = 1;
-                message.delivery = InputDelivery::Queued;
-                message.route = None;
-                message.reservation = None;
-                message.submission_id = None;
-                message.error = None;
+                message.queue();
                 let resume = message.intent == InputIntent::Auto
                     && (control_revision == snapshot.control_revision
                         || after_control.is_some()
@@ -694,7 +679,9 @@ impl SessionInputQueue {
                     .iter_mut()
                     .find(|entry| entry.id == id)
                     .expect("validated message");
-                message.reservation = Some(reservation);
+                message
+                    .reserve(Some(reservation))
+                    .expect("validated edit reservation");
                 message.revision += 1;
                 update.upsert.push(message.clone());
             }
@@ -715,9 +702,7 @@ impl SessionInputQueue {
                         if edit.config.is_some() {
                             message.config = edit.config;
                         }
-                        message.reservation = None;
-                        message.delivery = InputDelivery::Queued;
-                        message.error = None;
+                        message.queue();
                         message.revision += 1;
                         update.upsert.push(message.clone());
                     }
@@ -734,8 +719,8 @@ impl SessionInputQueue {
 
     fn release(snapshot: &mut InputSnapshot, reservation: &str, update: &mut InputUpdate) {
         for message in &mut snapshot.messages {
-            if message.reservation.as_deref() == Some(reservation) {
-                message.reservation = None;
+            if message.reservation() == Some(reservation) {
+                message.reserve(None).expect("reserved input is editable");
                 message.revision += 1;
                 update.upsert.push(message.clone());
             }
@@ -787,10 +772,10 @@ impl SessionInputQueue {
             || snapshot
                 .messages
                 .iter()
-                .any(|previous| previous.delivery == InputDelivery::Unknown)
+                .any(|previous| previous.delivery() == InputDelivery::Unknown)
             || message.revision != revision
-            || message.reservation.is_some()
-            || message.delivery != InputDelivery::Queued
+            || message.reservation().is_some()
+            || message.delivery() != InputDelivery::Queued
             || (route == InputRoute::Steering
                 && (message.intent != InputIntent::Auto
                     || message.config.is_some()
@@ -799,7 +784,7 @@ impl SessionInputQueue {
                 && snapshot.messages.iter().any(|other| {
                     !matches!(other.purpose, InputPurpose::TaskContinuation { .. })
                         && !matches!(
-                            other.delivery,
+                            other.delivery(),
                             InputDelivery::Delivering | InputDelivery::Accepted
                         )
                 }))
@@ -812,7 +797,7 @@ impl SessionInputQueue {
                     && !matches!(message.purpose, InputPurpose::TaskContinuation { .. });
             let steering_precedes_queue = route == InputRoute::Steering
                 && previous.intent == InputIntent::Queue
-                && previous.delivery == InputDelivery::Queued;
+                && previous.delivery() == InputDelivery::Queued;
             let question_precedes_suspended = snapshot.suspended
                 && matches!(
                     message.purpose,
@@ -827,15 +812,14 @@ impl SessionInputQueue {
                 return false;
             }
             !matches!(
-                previous.delivery,
+                previous.delivery(),
                 InputDelivery::Delivering | InputDelivery::Accepted
             )
         }) {
             return Ok(None);
         }
         let message = &mut snapshot.messages[index];
-        message.delivery = InputDelivery::Delivering;
-        message.route = Some(route);
+        message.claim(route);
         message.revision += 1;
         let claimed = message.clone();
         Self::advance(snapshot, &mut InputUpdate::default());
@@ -903,15 +887,15 @@ impl SessionInputQueue {
             let matches = match guard {
                 InputDeliveryGuard::Queued(revision) => {
                     message.revision == revision
-                        && message.delivery == InputDelivery::Queued
-                        && message.reservation.is_none()
-                        && message.submission_id.is_none()
+                        && message.delivery() == InputDelivery::Queued
+                        && message.reservation().is_none()
+                        && message.submission_id().is_none()
                 }
                 InputDeliveryGuard::Claimed(revision) => {
-                    message.revision == revision && message.delivery == InputDelivery::Delivering
+                    message.revision == revision && message.delivery() == InputDelivery::Delivering
                 }
                 InputDeliveryGuard::Receipt(receipt) => {
-                    message.submission_id.as_deref() == Some(receipt.as_str())
+                    message.submission_id() == Some(receipt.as_str())
                 }
             };
             if !matches {
@@ -919,7 +903,8 @@ impl SessionInputQueue {
             }
         }
         let mut update = InputUpdate::default();
-        if state.snapshot.messages[index].delivery == InputDelivery::Accepted && delivery.is_some()
+        if state.snapshot.messages[index].delivery() == InputDelivery::Accepted
+            && delivery.is_some()
         {
             return Ok(Some(InputUpdate {
                 revision: state.snapshot.revision,
@@ -929,9 +914,7 @@ impl SessionInputQueue {
         }
         if let Some(delivery) = delivery {
             let message = &mut state.snapshot.messages[index];
-            message.delivery = delivery;
-            message.submission_id = submission_id.or(message.submission_id.take());
-            message.error = error;
+            message.set_delivery(delivery, submission_id, error)?;
             message.revision += 1;
             update.upsert.push(message.clone());
         } else {
@@ -1011,7 +994,7 @@ impl SessionInputQueue {
             return Err(InputRejection::RevisionChanged);
         }
         if !matches!(
-            message.delivery,
+            message.delivery(),
             InputDelivery::Queued | InputDelivery::Failed
         ) {
             return Err(InputRejection::DeliveryStarted);

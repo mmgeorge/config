@@ -10,7 +10,7 @@ use forge_provider_api::generation::ReasoningSelection;
 use forge_provider_api::permissions::{PermissionRequest, PermissionResponse, ProviderPermissions};
 use forge_provider_api::session::{
     BindingId, InputAcceptance, ModelSelection, PromptRequest, RecoveryToken, ResourceLease,
-    SessionBinding, SessionMode, SessionRequest, SteeringAcceptance, SteeringRequest,
+    SessionBinding, SessionRequest, SteeringAcceptance, SteeringRequest,
 };
 use forge_provider_api::turn_control::{HostTurnStatus, TurnControl};
 use forge_provider_api::{
@@ -323,6 +323,7 @@ struct CallbackRegistration {
 
 #[derive(Default)]
 struct CallbackRouter {
+    shell: std::sync::OnceLock<Arc<super::shell_session::ShellSession>>,
     active: RwLock<HashMap<forge_provider_api::InvocationScope, CallbackRegistration>>,
     native_calls: RwLock<HashMap<String, InvocationCallbacks>>,
     mcp_tools: RwLock<HashMap<String, HashSet<String>>>,
@@ -390,6 +391,7 @@ impl CallbackRouter {
         if !matches!(*admission, CallbackAdmission::Closed) {
             *admission = CallbackAdmission::Settled;
         }
+        self.callbacks_changed.notify_waiters();
     }
 
     /// Permanently revoke a binding so no late invocation installation can restore admission.
@@ -398,6 +400,7 @@ impl CallbackRouter {
             .revoked
             .lock()
             .expect("callback admission lock is not poisoned") = CallbackAdmission::Closed;
+        self.callbacks_changed.notify_waiters();
     }
 
     /// Check authority again after an asynchronous permission barrier.
@@ -444,14 +447,11 @@ impl CallbackRouter {
             .map(move |server| {
                 let native = native.clone();
                 async move {
-                    let tools = tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        native.rpc().mcp().list_tools(
-                            github_copilot_sdk::rpc::McpListToolsRequest {
-                                server_name: server.clone(),
-                            },
-                        ),
-                    )
+                    let tools = super::operation::wait(native.rpc().mcp().list_tools(
+                        github_copilot_sdk::rpc::McpListToolsRequest {
+                            server_name: server.clone(),
+                        },
+                    ))
                     .await
                     .ok()?
                     .ok()?;
@@ -546,6 +546,7 @@ impl CallbackRouter {
                 .await
                 .entry(call_id.to_owned())
                 .or_insert(callbacks);
+            self.callbacks_changed.notify_waiters();
         }
     }
 
@@ -586,6 +587,7 @@ impl CallbackRouter {
             }
         }
         self.prune_settled_scope(scope, generation).await;
+        self.callbacks_changed.notify_waiters();
     }
 
     async fn callbacks_for_native_call(
@@ -705,6 +707,98 @@ impl TurnControl for CallbackRouter {
 
 #[async_trait]
 impl NativeCallbackRouter for CallbackRouter {
+    fn shell(&self) -> Option<Arc<super::shell_session::ShellSession>> {
+        self.shell.get().cloned()
+    }
+
+    /// Wait for the exact observed outer call before admitting a helper-side permission or tool.
+    async fn before_shell_native(&self, call_id: &str) -> Result<(), ProviderError> {
+        let mut cancellation = self.shell().map(|shell| shell.cancellation());
+        let original = if let Some(callbacks) = self.native_calls.read().await.get(call_id).cloned()
+        {
+            callbacks
+        } else {
+            let active = self.active.read().await;
+            let mut foreground = active
+                .values()
+                .filter(|registration| matches!(registration.phase, CallbackPhase::Foreground));
+            let original = foreground
+                .next()
+                .map(|registration| registration.callbacks.clone());
+            if foreground.next().is_some() {
+                return Err(failure(
+                    ProviderOperation::InputSubmit,
+                    ProviderFailureKind::ResourceConflict,
+                ));
+            }
+            original.ok_or_else(|| {
+                failure(
+                    ProviderOperation::InputSubmit,
+                    ProviderFailureKind::Rejected,
+                )
+            })?
+        };
+        loop {
+            let changed = self.callbacks_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.permits_effect() {
+                return Err(failure(
+                    ProviderOperation::InputSubmit,
+                    ProviderFailureKind::BindingClosed,
+                ));
+            }
+            if original.control.status(&original.scope).await?.cancelled {
+                return Err(ProviderError::Cancelled);
+            }
+            if let Some(callbacks) = self.native_calls.read().await.get(call_id).cloned() {
+                if callbacks.scope != original.scope || callbacks.generation != original.generation
+                {
+                    return Err(failure(
+                        ProviderOperation::InputSubmit,
+                        ProviderFailureKind::WrongInvocation,
+                    ));
+                }
+                break;
+            }
+            if !self
+                .active
+                .read()
+                .await
+                .get(&original.scope)
+                .is_some_and(|registration| {
+                    registration.callbacks.generation == original.generation
+                        && matches!(registration.phase, CallbackPhase::Foreground)
+                })
+            {
+                return Err(failure(
+                    ProviderOperation::InputSubmit,
+                    ProviderFailureKind::Rejected,
+                ));
+            }
+            tokio::select! {
+                _ = changed => {},
+                _ = async {
+                    match cancellation.as_mut() {
+                        Some(cancellation) => { let _ = cancellation.changed().await; },
+                        None => std::future::pending::<()>().await,
+                    }
+                } => return Err(ProviderError::Cancelled),
+            }
+        }
+        original.permissions.before_tool(&original.scope).await?;
+        if original.control.status(&original.scope).await?.cancelled {
+            return Err(ProviderError::Cancelled);
+        }
+        if !self.permits_effect() {
+            return Err(failure(
+                ProviderOperation::InputSubmit,
+                ProviderFailureKind::BindingClosed,
+            ));
+        }
+        Ok(())
+    }
+
     async fn call_native(
         &self,
         call_id: &str,
@@ -796,6 +890,9 @@ impl NativeCallbackRouter for CallbackRouter {
         }
         for callbacks in callbacks {
             callbacks.permissions.before_tool(&callbacks.scope).await?;
+            if callbacks.control.status(&callbacks.scope).await?.cancelled {
+                return Err(ProviderError::Cancelled);
+            }
         }
         if !self.permits_effect() {
             return Err(failure(
@@ -823,7 +920,6 @@ struct BindingState {
     binding: SessionBinding,
     open_operation: forge_provider_api::OperationId,
     owner: forge_provider_api::ExecutionOwner,
-    runtime_key: String,
     session: RwLock<Arc<CopilotSession>>,
     request: Mutex<SessionRequest>,
     sink: ProviderEventSink,
@@ -859,7 +955,7 @@ struct BindingState {
     close_failure: Mutex<Option<ProviderError>>,
     compactions:
         Mutex<HashMap<forge_provider_api::OperationId, Result<CompactionResult, ProviderError>>>,
-    terminals: Mutex<super::terminal::TerminalRegistry>,
+    terminals: Arc<Mutex<super::terminal::TerminalRegistry>>,
     terminals_collected: std::sync::atomic::AtomicBool,
     native_retired: std::sync::atomic::AtomicBool,
     history_deleted: std::sync::atomic::AtomicBool,
@@ -995,6 +1091,9 @@ impl BindingState {
 
     /// Fence native handoff and stop this already selected execution without consuming settlement.
     async fn interrupt(&self) -> Result<(), ProviderError> {
+        if let Some(shell) = self.callbacks.shell() {
+            shell.cancel_waits();
+        }
         self.turn
             .request_stop()
             .map_err(|_| failure(ProviderOperation::Cancel, ProviderFailureKind::Runtime))?;
@@ -1002,26 +1101,21 @@ impl BindingState {
             return Ok(());
         }
         let session = self.session.read().await.clone();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            // Stop and writer admission share one state lock; every admitted frame
-            // precedes abort, while handoffs attempted after stop are rejected.
-            let abort = session.abort().await;
-            let pending = self.turn.finish_pending_sends().await;
-            match (pending, abort) {
-                (Ok(()), result) | (result, Ok(())) => result,
-                (Err(primary), Err(secondary)) => Err(ProviderError::Combined {
-                    primary: Box::new(primary),
-                    secondary: vec![secondary],
-                }),
-            }
-        })
-        .await
-        .unwrap_or_else(|_| {
-            Err(failure(
-                ProviderOperation::Cancel,
-                ProviderFailureKind::Timeout,
-            ))
-        })
+        // Stop and writer admission share one state lock; every admitted frame
+        // precedes abort, while handoffs attempted after stop are rejected.
+        let abort = super::operation::wait(session.abort())
+            .await
+            .unwrap_or_else(Err);
+        let pending = super::operation::wait(self.turn.finish_pending_sends())
+            .await
+            .unwrap_or_else(Err);
+        match (pending, abort) {
+            (Ok(()), result) | (result, Ok(())) => result,
+            (Err(primary), Err(secondary)) => Err(ProviderError::Combined {
+                primary: Box::new(primary),
+                secondary: vec![secondary],
+            }),
+        }
     }
 
     /// Join native execution while retaining ownership if the waiter is cancelled or times out.
@@ -1030,25 +1124,7 @@ impl BindingState {
         let Some(task) = active.as_mut() else {
             return Ok(None);
         };
-        let result = match tokio::time::timeout(std::time::Duration::from_secs(30), &mut task.task)
-            .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                let failure =
-                    ProviderFailure::new(ProviderOperation::Cancel, ProviderFailureKind::Timeout)
-                        .at_phase(
-                            forge_provider_api::ProviderPhase::Collection,
-                            forge_provider_api::FailureDisposition::Invalidated,
-                        );
-                self.closing.store(true, Ordering::Release);
-                self.callbacks.revoke();
-                let _ = self
-                    .publish_invocation_settlement_failure(&task.scope, failure)
-                    .await;
-                return Err(ProviderError::Failure(failure));
-            }
-        };
+        let result = (&mut task.task).await;
         active.take();
         result
             .map(Some)
@@ -1058,6 +1134,14 @@ impl BindingState {
 
 #[async_trait]
 pub(super) trait NativeCallbackRouter: Send + Sync {
+    /// Get the binding-owned native shell helper when this is a live binding router.
+    fn shell(&self) -> Option<Arc<super::shell_session::ShellSession>> {
+        None
+    }
+    /// Revalidate the exact invocation immediately before a shell operation.
+    async fn before_shell_native(&self, call_id: &str) -> Result<(), ProviderError> {
+        self.before_tool_native(Some(call_id)).await
+    }
     async fn call_native(&self, call_id: &str, call: ToolCall) -> Result<String, ProviderError>;
     async fn authorize_native(
         &self,
@@ -1181,23 +1265,20 @@ impl CopilotProvider {
         let sessions = self.sessions.collect_failed_generation(&client).await?;
         for state in &bindings {
             // The failed native RPC generation is joined before waiting for preparation handoff.
-            tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                self.pending_inputs.cancel_binding(&state.binding.id),
-            )
-            .await
-            .map_err(|_| {
-                ProviderError::Failure(
-                    ProviderFailure::new(
-                        ProviderOperation::SessionClose,
-                        ProviderFailureKind::Timeout,
+            super::operation::wait(self.pending_inputs.cancel_binding(&state.binding.id))
+                .await
+                .map_err(|_| {
+                    ProviderError::Failure(
+                        ProviderFailure::new(
+                            ProviderOperation::SessionClose,
+                            ProviderFailureKind::Timeout,
+                        )
+                        .at_phase(
+                            forge_provider_api::ProviderPhase::Collection,
+                            forge_provider_api::FailureDisposition::Invalidated,
+                        ),
                     )
-                    .at_phase(
-                        forge_provider_api::ProviderPhase::Collection,
-                        forge_provider_api::FailureDisposition::Invalidated,
-                    ),
-                )
-            })?;
+                })?;
             // The observer already published terminal failure; only collection itself can block recovery.
             let _terminal = state.collect_execution().await?;
         }
@@ -2093,7 +2174,7 @@ impl CopilotProvider {
             return Ok(definitions);
         }
         let session = state.session.read().await.clone();
-        let startup_failures = self.sessions.mcp_failures(&state.runtime_key).await;
+        let startup_failures = self.sessions.mcp_failures(&state.owner).await;
         session.mcp_list(definitions, &startup_failures).await
     }
 
@@ -2105,17 +2186,16 @@ impl CopilotProvider {
         let state = self
             .binding(binding, ProviderOperation::TerminalList)
             .await?;
-        let mut snapshot = self
-            .sessions
-            .terminals(&state.runtime_key, state.owner.session_id.as_str())
-            .await
-            .map_err(|_| {
-                failure(
-                    ProviderOperation::TerminalList,
-                    ProviderFailureKind::Runtime,
-                )
-            })?;
-        state.terminals.lock().await.issue(&mut snapshot)?;
+        let snapshot = self.sessions.terminals(&state.owner).await.map_err(|_| {
+            failure(
+                ProviderOperation::TerminalList,
+                ProviderFailureKind::Runtime,
+            )
+        })?;
+        if let Some(shell) = state.callbacks.shell() {
+            shell.snapshot().await?;
+            return Ok(shell.publisher().snapshot());
+        }
         Ok(snapshot)
     }
 
@@ -2128,6 +2208,11 @@ impl CopilotProvider {
         let state = self
             .binding(binding, ProviderOperation::TerminalTerminate)
             .await?;
+        if let Some(shell) = state.callbacks.shell()
+            && shell.owns(terminal).await
+        {
+            return shell.terminate(terminal).await;
+        }
         let native = state
             .terminals
             .lock()
@@ -2140,7 +2225,7 @@ impl CopilotProvider {
                 )
             })?;
         self.sessions
-            .terminate(&state.runtime_key, &native)
+            .terminate(&state.owner, &native)
             .await
             .map_err(|_| {
                 failure(
@@ -2195,22 +2280,27 @@ impl CopilotProvider {
         if self.owners.lock().await.contains_key(&request.owner) {
             return Err(failure(
                 ProviderOperation::SessionOpen,
-                ProviderFailureKind::Rejected,
+                ProviderFailureKind::ResourceConflict,
             ));
         }
         if let Some(resume) = request.history.resume_id() {
-            let bindings = self.bindings.lock().await;
-            if bindings
+            let bindings = self
+                .bindings
+                .lock()
+                .await
                 .values()
-                .any(|state| state.binding.provider_session_id.as_ref() == Some(resume))
-            {
-                return Err(failure(
-                    ProviderOperation::SessionOpen,
-                    ProviderFailureKind::ResourceConflict,
-                ));
+                .cloned()
+                .collect::<Vec<_>>();
+            for state in bindings {
+                if state.session.read().await.id() == resume.as_str() {
+                    return Err(failure(
+                        ProviderOperation::SessionOpen,
+                        ProviderFailureKind::ResourceConflict,
+                    ));
+                }
             }
         }
-        let runtime_key = request.owner.runtime_key();
+        let runtime_key = request.owner.clone();
         let binding_id = BindingId::new(uuid::Uuid::new_v4().to_string())
             .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Unknown))?;
         let session_scope = forge_provider_api::EventScope::Binding {
@@ -2221,6 +2311,16 @@ impl CopilotProvider {
             .subscribe(runtime_key.clone(), sink.clone())
             .await;
         let callbacks = Arc::new(CallbackRouter::new(self.closed.clone()));
+        if !matches!(request.history, SessionHistory::IsolatedText(_)) {
+            let router: Arc<dyn NativeCallbackRouter> = callbacks.clone();
+            let shell = Arc::new(super::shell_session::ShellSession::new(
+                Arc::downgrade(&router),
+                request.owner.clone(),
+                sink.clone(),
+            ));
+            shell.set_cleanup_runtime(self.runtime.cleanup_runtime());
+            let _ = callbacks.shell.set(shell);
+        }
         let client_runtime = self.runtime.clone();
         let workspace = request.workspace.clone();
         let model_selection = request.configuration.model.clone();
@@ -2261,7 +2361,6 @@ impl CopilotProvider {
             .map(|resource| resource.name.clone())
             .collect::<Vec<_>>();
         let tools = request.tools.clone();
-        let mode = session_mode(request.mode);
         let options = super::session::SessionOptions {
             isolated_text: matches!(request.history, SessionHistory::IsolatedText(_)),
             session_id: request
@@ -2273,16 +2372,10 @@ impl CopilotProvider {
             reasoning_effort: None,
             context_tier: request.configuration.model.context_window.clone(),
             workspace: PathBuf::from(&request.workspace),
-            mode,
             system_message: request.system_instructions.clone(),
-            resources: match request.mode {
-                SessionMode::Background => super::session::ResourceDiscovery::Native,
-                SessionMode::Interactive | SessionMode::Child => {
-                    super::session::ResourceDiscovery::Managed {
-                        skill_directories: vec![profile_path.join("skills")],
-                        selected_mcp,
-                    }
-                }
+            resources: super::session::SessionResources {
+                skill_directories: vec![profile_path.join("skills")],
+                selected_mcp,
             },
             excluded_tools: Vec::new(),
             tools: tools.clone(),
@@ -2292,7 +2385,6 @@ impl CopilotProvider {
         let provider_tools: Arc<dyn ProviderTools> = callbacks.clone();
         let selection = SessionSelection {
             execution_owner: request.owner.clone(),
-            runtime_key: runtime_key.clone(),
             correlation_id: request.owner.session_id.to_string(),
             session_id: request
                 .history
@@ -2362,7 +2454,6 @@ impl CopilotProvider {
             binding: binding.clone(),
             open_operation: super::operation::id()?,
             owner: request.owner.clone(),
-            runtime_key: runtime_key.clone(),
             session: RwLock::new(session),
             request: Mutex::new(request.clone()),
             sink,
@@ -2384,7 +2475,7 @@ impl CopilotProvider {
             unconsumed: Mutex::new(HashSet::new()),
             close_failure: Mutex::new(None),
             compactions: Mutex::new(HashMap::new()),
-            terminals: Mutex::new(super::terminal::TerminalRegistry::default()),
+            terminals: Arc::new(Mutex::new(super::terminal::TerminalRegistry::default())),
             terminals_collected: std::sync::atomic::AtomicBool::new(false),
             native_retired: std::sync::atomic::AtomicBool::new(false),
             history_deleted: std::sync::atomic::AtomicBool::new(false),
@@ -2393,6 +2484,15 @@ impl CopilotProvider {
             .lock()
             .await
             .insert(binding_id.clone(), state.clone());
+        self.sessions
+            .observe_terminals(super::terminal::TerminalPublication {
+                owner: state.owner.clone(),
+                sink: state.sink.clone(),
+                registry: state.terminals.clone(),
+                publisher: state.callbacks.shell().map(|shell| shell.publisher()),
+            })
+            .await
+            .map_err(|_| failure(ProviderOperation::SessionOpen, ProviderFailureKind::Runtime))?;
         self.owners.lock().await.insert(request.owner, binding_id);
         if self.closed.load(Ordering::Acquire) {
             self.close_binding(&binding.id).await?;
@@ -2494,6 +2594,71 @@ impl CopilotProvider {
             ));
         }
         let session = state.session.read().await.clone();
+        if configuration.access == next_request.configuration.access
+            && configuration.approval == next_request.configuration.approval
+            && configuration.resources == next_request.configuration.resources
+        {
+            // Model selection changes neither native resource ownership nor the
+            // permission scope of independently running helper terminals.
+            let client = self.runtime.client(&next_request.workspace).await?;
+            let models = client.models().await?;
+            let (model, reasoning) = resolve_model_selection(
+                &configuration.model,
+                &models,
+                &self.descriptor().capability,
+            )?;
+            state.turn.reset().map_err(|_| {
+                failure(
+                    ProviderOperation::SessionConfigure,
+                    ProviderFailureKind::Protocol,
+                )
+            })?;
+            super::operation::dispatch_for(ProviderOperation::SessionConfigure)?;
+            if let Err(cause) = session
+                .set_model_confirmed(
+                    model.as_deref().unwrap_or("auto"),
+                    reasoning,
+                    configuration.model.context_window.as_deref(),
+                )
+                .await
+            {
+                return Err(ProviderError::Combined {
+                    primary: Box::new(
+                        state.invalidate_configuration(super::error::trace_failure_kind(&cause)),
+                    ),
+                    secondary: vec![cause],
+                });
+            }
+            next_request.configuration = configuration.clone();
+            *state.request.lock().await = next_request;
+            state.confirm_configuration_health(self.closed.load(Ordering::Acquire))?;
+            let capabilities = forge_provider_api::capability::CapabilityManifest::from_descriptor(
+                self.descriptor(),
+            );
+            if let Err(error) = state
+                .sink
+                .send_wait(forge_provider_api::ProviderEvent::CapabilitiesChanged {
+                    scope: forge_provider_api::EventScope::Binding {
+                        owner: state.owner.clone(),
+                    },
+                    capabilities: capabilities.clone(),
+                })
+                .await
+            {
+                return Err(ProviderError::Combined {
+                    primary: Box::new(
+                        state.invalidate_configuration(ProviderFailureKind::Transport),
+                    ),
+                    secondary: vec![ProviderError::from(error)],
+                });
+            }
+            state.confirm_configuration_health(self.closed.load(Ordering::Acquire))?;
+            return Ok(ConfiguredSession {
+                configuration,
+                capabilities,
+                watermark: state.sink.watermark(),
+            });
+        }
         let terminals =
             session
                 .terminal_snapshot()
@@ -2511,7 +2676,23 @@ impl CopilotProvider {
                     )),
                     secondary: vec![cause],
                 })?;
-        if !terminals.terminal.is_empty() {
+        let helper_has_terminals = match state.callbacks.shell() {
+            Some(shell) => !shell.snapshot().await?.terminal.is_empty(),
+            None => false,
+        };
+        if !terminals.terminal.is_empty() || helper_has_terminals {
+            return Err(failure(
+                ProviderOperation::SessionConfigure,
+                ProviderFailureKind::ResourceConflict,
+            ));
+        }
+        if let Some(shell) = state.callbacks.shell()
+            && shell.started().await
+            && !self
+                .sessions
+                .retains_identity_on_refresh(&state.owner)
+                .await
+        {
             return Err(failure(
                 ProviderOperation::SessionConfigure,
                 ProviderFailureKind::ResourceConflict,
@@ -2526,7 +2707,21 @@ impl CopilotProvider {
 
         if matches!(next_request.history, SessionHistory::Durable { .. }) {
             next_request.history = SessionHistory::Durable {
-                resume: state.binding.provider_session_id.clone(),
+                resume: Some(
+                    state
+                        .session
+                        .read()
+                        .await
+                        .id()
+                        .to_owned()
+                        .try_into()
+                        .map_err(|_| {
+                            failure(
+                                ProviderOperation::SessionConfigure,
+                                ProviderFailureKind::Protocol,
+                            )
+                        })?,
+                ),
             };
         }
         next_request.configuration = configuration.clone();
@@ -2580,7 +2775,6 @@ impl CopilotProvider {
             .map(|resource| resource.name.clone())
             .collect::<Vec<_>>();
         let tools = next_request.tools.clone();
-        let mode = session_mode(next_request.mode);
         let options = super::session::SessionOptions {
             isolated_text: matches!(next_request.history, SessionHistory::IsolatedText(_)),
             session_id: next_request
@@ -2592,16 +2786,10 @@ impl CopilotProvider {
             reasoning_effort: None,
             context_tier: next_request.configuration.model.context_window.clone(),
             workspace: PathBuf::from(&next_request.workspace),
-            mode,
             system_message: next_request.system_instructions.clone(),
-            resources: match next_request.mode {
-                SessionMode::Background => super::session::ResourceDiscovery::Native,
-                SessionMode::Interactive | SessionMode::Child => {
-                    super::session::ResourceDiscovery::Managed {
-                        skill_directories: vec![profile_path.join("skills")],
-                        selected_mcp,
-                    }
-                }
+            resources: super::session::SessionResources {
+                skill_directories: vec![profile_path.join("skills")],
+                selected_mcp,
             },
             excluded_tools: Vec::new(),
             tools: tools.clone(),
@@ -2611,7 +2799,6 @@ impl CopilotProvider {
         let provider_tools: Arc<dyn ProviderTools> = state.callbacks.clone();
         let selection = SessionSelection {
             execution_owner: next_request.owner.clone(),
-            runtime_key: state.runtime_key.clone(),
             correlation_id: next_request.owner.session_id.to_string(),
             session_id: next_request
                 .history
@@ -2693,8 +2880,36 @@ impl CopilotProvider {
             .callbacks
             .register_mcp_tools(&session, &next_request.configuration.resources)
             .await;
-        let resources = self.sessions.resources(&state.runtime_key).await;
+        let resources = self.sessions.resources(&state.owner).await;
+        let native_id = forge_provider_api::ProviderSessionId::try_from(session.id().to_owned())
+            .map_err(|_| {
+                failure(
+                    ProviderOperation::SessionConfigure,
+                    ProviderFailureKind::Protocol,
+                )
+            })?;
+        let identity_changed = state.session.read().await.id() != native_id.as_str();
         *state.session.write().await = session;
+        *state.terminals.lock().await = super::terminal::TerminalRegistry::default();
+        if matches!(next_request.history, SessionHistory::Durable { .. }) {
+            next_request.history = SessionHistory::Durable {
+                resume: Some(native_id.clone()),
+            };
+        }
+        self.sessions
+            .observe_terminals(super::terminal::TerminalPublication {
+                owner: state.owner.clone(),
+                sink: state.sink.clone(),
+                registry: state.terminals.clone(),
+                publisher: state.callbacks.shell().map(|shell| shell.publisher()),
+            })
+            .await
+            .map_err(|_| {
+                failure(
+                    ProviderOperation::SessionConfigure,
+                    ProviderFailureKind::Runtime,
+                )
+            })?;
         let replaced = std::mem::replace(&mut *state.retained_resources.lock().await, resources);
         if let Some(replaced) = replaced {
             state.retired_resources.lock().await.push(replaced);
@@ -2726,6 +2941,24 @@ impl CopilotProvider {
             });
         }
         state.confirm_configuration_health(self.closed.load(Ordering::Acquire))?;
+        if identity_changed
+            && let Err(error) = state
+                .sink
+                .send_wait(forge_provider_api::ProviderEvent::SessionIdentity {
+                    scope: forge_provider_api::EventScope::Binding {
+                        owner: state.owner.clone(),
+                    },
+                    provider_session_id: native_id,
+                })
+                .await
+        {
+            let cause = ProviderError::from(error);
+            let primary = state.invalidate_configuration(ProviderFailureKind::Transport);
+            return Err(ProviderError::Combined {
+                primary: Box::new(primary),
+                secondary: vec![cause],
+            });
+        }
         if let Err(error) = state
             .sink
             .send_wait(forge_provider_api::ProviderEvent::CapabilitiesChanged {
@@ -2865,6 +3098,9 @@ impl CopilotProvider {
             attachments: request.attachments,
         };
         callbacks.control.before_send(&request.scope).await?;
+        if let Some(shell) = state.callbacks.shell() {
+            shell.interrupt_waits();
+        }
         let session = state.session.read().await.clone();
         let workspace = session
             .workspace_path()
@@ -2873,12 +3109,16 @@ impl CopilotProvider {
             .into_owned();
         state
             .turn
-            .steer_native(submission_id.clone(), |authority| async {
-                session
-                    .steer(input, receipt, &request.scope, &workspace, authority)
-                    .await
-                    .map_err(anyhow::Error::new)
-            })
+            .steer_native(
+                Some(&request.scope),
+                submission_id.clone(),
+                |authority| async {
+                    session
+                        .steer(input, receipt, &request.scope, &workspace, authority)
+                        .await
+                        .map_err(anyhow::Error::new)
+                },
+            )
             .await
             .map_err(|error| {
                 error
@@ -2895,7 +3135,7 @@ impl CopilotProvider {
     async fn close_binding(&self, binding: &BindingId) -> Result<(), ProviderError> {
         let pending_preparation = self.pending_inputs.fence_binding(binding);
         let Some(state) = self.bindings.lock().await.get(binding).cloned() else {
-            return tokio::time::timeout(std::time::Duration::from_secs(30), pending_preparation)
+            return super::operation::wait(pending_preparation)
                 .await
                 .map_err(|_| {
                     ProviderError::Failure(
@@ -2914,41 +3154,38 @@ impl CopilotProvider {
         state.closing.store(true, Ordering::Release);
         state.callbacks.close_admission();
         let mut failures = Vec::new();
-        let should_stop =
-            match tokio::time::timeout(std::time::Duration::from_secs(10), state.admission.lock())
+        let shell_cleanup = match state.callbacks.shell() {
+            Some(shell) => Some(shell.start_close().await),
+            None => None,
+        };
+        let should_stop = match super::operation::wait(state.admission.lock()).await {
+            Ok(_admission) => state
+                .active
+                .lock()
                 .await
-            {
-                Ok(_admission) => state
+                .as_ref()
+                .is_some_and(|active| !active.task.is_finished()),
+            Err(_) => {
+                failures.push(ProviderError::Failure(
+                    ProviderFailure::new(
+                        ProviderOperation::SessionClose,
+                        ProviderFailureKind::Timeout,
+                    )
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Collection,
+                        forge_provider_api::FailureDisposition::Invalidated,
+                    ),
+                ));
+                state
                     .active
                     .lock()
                     .await
                     .as_ref()
-                    .is_some_and(|active| !active.task.is_finished()),
-                Err(_) => {
-                    failures.push(ProviderError::Failure(
-                        ProviderFailure::new(
-                            ProviderOperation::SessionClose,
-                            ProviderFailureKind::Timeout,
-                        )
-                        .at_phase(
-                            forge_provider_api::ProviderPhase::Collection,
-                            forge_provider_api::FailureDisposition::Invalidated,
-                        ),
-                    ));
-                    state
-                        .active
-                        .lock()
-                        .await
-                        .as_ref()
-                        .is_some_and(|active| !active.task.is_finished())
-                }
-            };
+                    .is_some_and(|active| !active.task.is_finished())
+            }
+        };
         if should_stop && let Err(error) = state.interrupt().await {
             failures.push(error);
-        }
-        match state.collect_execution().await {
-            Ok(None | Some(Ok(()))) => {}
-            Ok(Some(Err(error))) | Err(error) => failures.push(error),
         }
 
         // Attempt independent cleanup even when foreground collection failed. The binding
@@ -2958,7 +3195,7 @@ impl CopilotProvider {
             let terminals = if session.client_collected() {
                 Ok(())
             } else {
-                tokio::time::timeout(std::time::Duration::from_secs(10), session.terminate_all())
+                super::operation::wait(session.terminate_all())
                     .await
                     .unwrap_or_else(|_| {
                         Err(failure(
@@ -2973,12 +3210,7 @@ impl CopilotProvider {
             }
         }
         if !state.native_retired.load(Ordering::Acquire) {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                self.sessions.retire(&state.runtime_key),
-            )
-            .await
-            {
+            match super::operation::wait(self.sessions.retire(&state.owner)).await {
                 Ok(Ok(())) => state.native_retired.store(true, Ordering::Release),
                 Ok(Err(error)) => {
                     failures.push(error.downcast::<ProviderError>().unwrap_or_else(|_| {
@@ -3004,8 +3236,7 @@ impl CopilotProvider {
                 SessionHistory::IsolatedText(_)
             );
             if temporary && !state.history_deleted.load(Ordering::Acquire) {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(10),
+                match super::operation::wait(
                     session.inner.client().delete_session(session.inner.id()),
                 )
                 .await
@@ -3029,25 +3260,27 @@ impl CopilotProvider {
             }
         }
         // Native retirement precedes this wait so an in-flight preparation RPC cannot form a close cycle.
-        let preparations_collected =
-            match tokio::time::timeout(std::time::Duration::from_secs(30), pending_preparation)
-                .await
-            {
-                Ok(()) => true,
-                Err(_) => {
-                    failures.push(ProviderError::Failure(
-                        ProviderFailure::new(
-                            ProviderOperation::SessionClose,
-                            ProviderFailureKind::Timeout,
-                        )
-                        .at_phase(
-                            forge_provider_api::ProviderPhase::Collection,
-                            forge_provider_api::FailureDisposition::Invalidated,
-                        ),
-                    ));
-                    false
-                }
-            };
+        let preparations_collected = match super::operation::wait(pending_preparation).await {
+            Ok(()) => true,
+            Err(_) => {
+                failures.push(ProviderError::Failure(
+                    ProviderFailure::new(
+                        ProviderOperation::SessionClose,
+                        ProviderFailureKind::Timeout,
+                    )
+                    .at_phase(
+                        forge_provider_api::ProviderPhase::Collection,
+                        forge_provider_api::FailureDisposition::Invalidated,
+                    ),
+                ));
+                false
+            }
+        };
+        if let Some(cleanup) = shell_cleanup
+            && let Err(error) = cleanup.await
+        {
+            failures.push(error);
+        }
         let foreground_collected = preparations_collected
             && state.active.lock().await.is_none()
             && !state.turn.is_active()
@@ -3265,10 +3498,19 @@ impl CopilotProvider {
                     .binding(&binding, ProviderOperation::SessionFork)
                     .await?;
                 let workspace = state.request.lock().await.workspace.clone();
-                let id = state.binding.provider_session_id.clone().ok_or_else(|| {
-                    failure(
-                        ProviderOperation::InputSubmit,
+                if state.binding.provider_session_id.is_none() {
+                    return Err(failure(
+                        ProviderOperation::SessionFork,
                         ProviderFailureKind::Rejected,
+                    ));
+                }
+                let id = forge_provider_api::ProviderSessionId::try_from(
+                    state.session.read().await.id().to_owned(),
+                )
+                .map_err(|_| {
+                    failure(
+                        ProviderOperation::SessionFork,
+                        ProviderFailureKind::Protocol,
                     )
                 })?;
                 (id, None, workspace, Some(state))
@@ -3429,7 +3671,7 @@ impl CopilotProvider {
         );
         let result = self
             .sessions
-            .compact(&state.runtime_key, operation_id.as_str().to_owned())
+            .compact(&state.owner, operation_id.as_str().to_owned())
             .await
             .map(|compaction| CompactionResult {
                 compaction,
@@ -3838,13 +4080,9 @@ impl CopilotProvider {
         };
         state.callbacks.install(callbacks).await?;
         let callback_generation = state.callbacks.callbacks(&request.scope).await?.generation;
-        // Preserve this conversation on refresh once native dispatch becomes possible.
-        self.sessions
-            .mark_submitted(&state.runtime_key, &session)
-            .await?;
         let repair_caution = self
             .sessions
-            .repair(&state.runtime_key)
+            .repair(&state.owner)
             .await
             .map(|repair| repair.caution().to_owned());
         if let Err(error) = pending.check_admission(ProviderOperation::InputSubmit) {
@@ -3929,6 +4167,8 @@ impl CopilotProvider {
             }
         }));
         let collecting = state.clone();
+        let history_sessions = self.sessions.clone();
+        let history_session = state.session.read().await.clone();
         let collect_scope = invocation_scope.clone();
         let collector = tokio::spawn(async move {
             let outcome = task
@@ -3938,6 +4178,13 @@ impl CopilotProvider {
             let never_dispatched = dispatch_evidence
                 .as_ref()
                 .is_some_and(|operation| !operation.dispatched());
+            // Configuration waits for this collector; only a possible native send
+            // establishes history that a later replacement must resume.
+            if !never_dispatched {
+                history_sessions
+                    .mark_submitted(&collecting.owner, &history_session)
+                    .await?;
+            }
             if matches!(outcome, Err(ProviderError::NotConsumed)) || never_dispatched {
                 collecting
                     .unconsumed
@@ -3970,6 +4217,7 @@ impl CopilotProvider {
                         failure: forge_provider_api::ExecutionFailure::Retryable {
                             address: retryable.address.clone(),
                             category: retryable.category,
+                            retry_after: retryable.retry_after,
                         },
                     },
                     watermark: collecting.sink.watermark(),
@@ -4053,10 +4301,10 @@ impl CopilotProvider {
             }
         }
         drop(_admission);
-        match tokio::time::timeout(std::time::Duration::from_secs(30), acceptance).await {
-            Ok(Ok(Ok(()))) => {}
-            Ok(Ok(Err(error))) => return Err(error),
-            Ok(Err(_)) | Err(_) => return Err(ProviderError::DeliveryUncertain),
+        match acceptance.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => return Err(ProviderError::DeliveryUncertain),
         }
         Ok(InputAcceptance { submission_id })
     }
@@ -4171,13 +4419,6 @@ fn collect_profiles(
     })
 }
 
-fn session_mode(mode: SessionMode) -> forge_provider_api::PromptMode {
-    match mode {
-        SessionMode::Background => forge_provider_api::PromptMode::Background,
-        SessionMode::Interactive | SessionMode::Child => forge_provider_api::PromptMode::Chat,
-    }
-}
-
 fn resolve_model_selection(
     selection: &ModelSelection,
     models: &[forge_provider_api::ProviderModel],
@@ -4189,16 +4430,22 @@ fn resolve_model_selection(
             ProviderFailureKind::Rejected,
         )
     })?;
-    let selected_id = selection.model.as_deref().unwrap_or("auto");
-    let model = models
-        .iter()
-        .find(|model| model.id == selected_id)
-        .ok_or_else(|| {
-            failure(
-                ProviderOperation::SessionConfigure,
-                ProviderFailureKind::Rejected,
-            )
-        })?;
+    let model = match selection.model.as_deref() {
+        Some(selected) => models
+            .iter()
+            .find(|model| model.id == selected)
+            .ok_or_else(|| {
+                failure(
+                    ProviderOperation::SessionConfigure,
+                    ProviderFailureKind::Rejected,
+                )
+            })?,
+        None => models.iter().find(|model| model.is_default).ok_or(
+            forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::ModelDefaultReset,
+            ),
+        )?,
+    };
     if selection.service_tier != forge_provider_api::ServiceTier::Standard
         && !model.service_tiers.contains(&selection.service_tier)
     {
@@ -4222,6 +4469,17 @@ fn resolve_model_selection(
             ));
         }
     };
+    if selection.context_window.as_ref().is_some_and(|selected| {
+        !model
+            .context_window
+            .iter()
+            .any(|window| window.id == *selected)
+    }) {
+        return Err(forge_provider_api::capability::UnsupportedCapability(
+            forge_provider_api::capability::ProviderFeature::ContextWindowSelection,
+        )
+        .into());
+    }
     Ok((selection.model.clone(), reasoning))
 }
 
@@ -4265,7 +4523,8 @@ fn mcp_config(launch: &forge_provider_api::session::McpLaunch) -> (String, Map<S
     )
 }
 
-fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderError {
+/// Create a normalized failure for an operation inside the Copilot adapter.
+pub(super) fn failure(operation: ProviderOperation, kind: ProviderFailureKind) -> ProviderError {
     ProviderError::Failure(ProviderFailure::new(operation, kind))
 }
 
@@ -4303,6 +4562,94 @@ mod callback_tests {
     use super::*;
 
     pub(super) struct Authority;
+
+    /// Release a helper callback even when cancellation prevents its native start from being observed.
+    #[tokio::test]
+    async fn unobserved_shell_call_is_released_by_cancellation() {
+        let router = Arc::new(CallbackRouter::default());
+        let owner = forge_provider_api::ExecutionOwner::root("missing-shell-start");
+        let scope = forge_provider_api::InvocationScope::new(owner.clone(), "invocation");
+        install(&router, &scope).await;
+        let (sink, _events) = events::channel(
+            BindingId::new("missing-shell-start").unwrap(),
+            forge_provider_api::EventScope::Binding {
+                owner: owner.clone(),
+            },
+        );
+        let callbacks: Arc<dyn NativeCallbackRouter> = router.clone();
+        let shell = Arc::new(super::super::shell_session::ShellSession::new(
+            Arc::downgrade(&callbacks),
+            owner,
+            sink,
+        ));
+        assert!(router.shell.set(shell.clone()).is_ok());
+        let pending = router.before_shell_native("never-observed");
+        tokio::pin!(pending);
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        shell.cancel_waits();
+        assert!(matches!(pending.await, Err(ProviderError::Cancelled)));
+    }
+
+    /// Consult captured authority when cancellation already happened before the wait subscribed.
+    #[tokio::test]
+    async fn unobserved_shell_call_rejects_already_cancelled_authority() {
+        let router = CallbackRouter::default();
+        let scope = forge_provider_api::InvocationScope::new(
+            forge_provider_api::ExecutionOwner::root("pre-cancelled-shell"),
+            "invocation",
+        );
+        install(&router, &scope).await;
+        router
+            .active
+            .write()
+            .await
+            .get_mut(&scope)
+            .unwrap()
+            .callbacks
+            .control = Arc::new(CancelledControl);
+        assert!(matches!(
+            router.before_shell_native("never-observed").await,
+            Err(ProviderError::Cancelled)
+        ));
+    }
+
+    struct CancelledControl;
+
+    #[async_trait]
+    impl TurnControl for CancelledControl {
+        async fn before_send(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            Err(ProviderError::Cancelled)
+        }
+        async fn receive(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            Err(ProviderError::Cancelled)
+        }
+        async fn close(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn status(
+            &self,
+            _: &forge_provider_api::InvocationScope,
+        ) -> Result<HostTurnStatus, ProviderError> {
+            Ok(HostTurnStatus {
+                replay_safe: false,
+                control_handoff: false,
+                cancelled: true,
+                error: None,
+            })
+        }
+        fn tool_finished(&self, _: &forge_provider_api::InvocationScope, _: Option<&str>) -> bool {
+            false
+        }
+    }
 
     struct CancelledAuthority;
 
@@ -4424,6 +4771,30 @@ mod callback_tests {
                 .unwrap(),
             "tool completed"
         );
+    }
+
+    /// A no-tool foreground's collection cannot revoke tools admitted by the following invocation.
+    #[tokio::test]
+    async fn no_tool_exchange_collection_preserves_following_tool_authority() {
+        let router = CallbackRouter::default();
+        let owner = forge_provider_api::ExecutionOwner::root("callbacks");
+        let first = forge_provider_api::InvocationScope::new(owner.clone(), "no-tools");
+        let generation = install(&router, &first).await;
+        router.finish_foreground_scope(&first, generation).await;
+        router.revoke();
+        router.collect_callbacks().await;
+        router
+            .retire_all(&BindingId::new("binding").unwrap())
+            .await
+            .unwrap();
+        let next = forge_provider_api::InvocationScope::new(owner, "uses-tools");
+        install(&router, &next).await;
+        router.before_tool_native(None).await.unwrap();
+        router.bind_native_call("next-tool", &next).await;
+        call(&router, "next-tool").await;
+        router.release_native_call("next-tool").await;
+        assert!(router.callbacks(&first).await.is_err());
+        router.before_send(&next).await.unwrap();
     }
 
     /// Completing one tool cannot remove foreground authority needed by the next tool.
@@ -4947,8 +5318,8 @@ mod retained_recovery_tests {
             let closed_receipt = Arc::new(QueuedReceipt { id: forge_provider_api::SubmissionId::try_from("closed-input").unwrap(), attempt: forge_provider_api::DeliveryAttemptId::new("closed-attempt").unwrap(), sending: AtomicU64::new(0) });
             let closed_prompt = queued_request(&opened.binding.id, closed_scope.clone(), configuration.clone(), closed_receipt.clone());
             let closed_steer = SteeringRequest { scope: closed_scope, delivery: forge_provider_api::SteeringDelivery::Context, input: forge_provider_api::PromptInput::Text("cannot reopen".into()), attachments: Vec::new(), task: None };
-            let late_submit = provider.input_submit(context("collected-submit"), &opened.binding.id, closed_prompt).await.err().expect("collected binding admitted input");
-            let late_steer = provider.input_steer(context("collected-steer"), &opened.binding.id, closed_steer).await.err().expect("collected binding admitted steering");
+            let late_submit = provider.input_submit(context("collected-submit"), &opened.binding.id, closed_prompt).await.expect_err("collected binding admitted input");
+            let late_steer = provider.input_steer(context("collected-steer"), &opened.binding.id, closed_steer).await.expect_err("collected binding admitted steering");
             for (operation, cause) in [(ProviderOperation::InputSubmit, late_submit), (ProviderOperation::InputSteer, late_steer)] {
                 assert!(matches!(cause, ProviderError::Failure(error) if error.operation() == operation
                     && error.kind() == ProviderFailureKind::BindingClosed && error.phase() == forge_provider_api::ProviderPhase::Admission
@@ -5079,6 +5450,128 @@ mod retained_recovery_tests {
         );
     }
 
+    /// Empty discovery cannot fabricate a default model or dispatch a native session.
+    #[tokio::test]
+    async fn empty_catalog_rejects_default_before_native_session_creation() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (reader, writer, peer) = super::super::test_peer::streams(|request| {
+                let result = match request["method"].as_str().unwrap() {
+                    "status.get" => json!({"version":"1.0.103"}),
+                    "models.list" => json!({"models":[]}),
+                    method => panic!("empty model discovery dispatched native work: {method}"),
+                };
+                vec![super::super::test_peer::response(request, result)]
+            });
+            let root = tempfile::tempdir().unwrap();
+            let provider = CopilotProvider::new(Vec::new(), root.path().to_owned()).unwrap();
+            provider
+                .runtime
+                .attach_streams(reader, writer, root.path().to_owned())
+                .await
+                .unwrap();
+            let client = provider.runtime.client(".").await.unwrap();
+            assert!(client.models().await.unwrap().is_empty());
+            let result = provider
+                .session_open(
+                    context("empty-native-default"),
+                    SessionRequest {
+                        owner: forge_provider_api::ExecutionOwner::root("empty-native-default"),
+                        mode: forge_provider_api::SessionMode::Interactive,
+                        workspace: root.path().to_string_lossy().into_owned(),
+                        history: SessionHistory::Durable { resume: None },
+                        configuration: SessionConfiguration {
+                            model: ModelSelection::default(),
+                            access: forge_provider_api::access::AccessPolicy {
+                                sandbox: false,
+                                ..Default::default()
+                            },
+                            approval: forge_provider_api::approval::ApprovalMode::Ask,
+                            resources: Default::default(),
+                        },
+                        resource_lease: None,
+                        tools: Vec::new(),
+                        tool_endpoint: None,
+                        system_instructions: String::new(),
+                        trace: Arc::new(NullTrace),
+                    },
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(ProviderError::Unsupported(
+                    forge_provider_api::capability::UnsupportedCapability(
+                        forge_provider_api::capability::ProviderFeature::ModelDefaultReset
+                    )
+                ))
+            ));
+            assert!(provider.bindings.lock().await.is_empty());
+            provider
+                .shutdown(context("empty-native-default-shutdown"))
+                .await
+                .unwrap();
+            assert!(peer.collected().await.iter().all(|request| !matches!(
+                request["method"].as_str(),
+                Some("session.create" | "session.resume")
+            )));
+        })
+        .await
+        .expect("empty model catalog fixture timed out");
+    }
+
+    /// Persistent Background sessions keep requested tools, skills and inherited instructions.
+    #[tokio::test]
+    async fn persistent_background_keeps_normal_native_authority() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (reader, writer, peer) = super::super::test_peer::streams(|request| {
+                let result = match request["method"].as_str().unwrap() {
+                    "status.get" => json!({"version":"1.0.103"}),
+                    "models.list" => json!({"models":[{"id":"auto","name":"Auto","capabilities":{}}]}),
+                    "mcp.discover" | "session.mcp.listConfigured" => json!({"servers":[]}),
+                    "session.skills.list" => json!({"skills":[]}),
+                    "session.skills.reload" | "session.tasks.refresh" => json!({}),
+                    "session.tasks.list" => json!({"tasks":[]}),
+                    "session.create" => {
+                        let params = &request["params"];
+                        assert_eq!(params["systemMessage"]["mode"], "append");
+                        assert_eq!(params["systemMessage"]["content"], "background instructions");
+                        assert_eq!(params["enableSkills"], true);
+                        assert_eq!(params["enableConfigDiscovery"], false);
+                        assert_ne!(params["enableSessionStore"], false);
+                        assert!(params["availableTools"].is_null());
+                        assert_eq!(params["tools"][0]["name"], "background_fixture");
+                        assert!(params["skillDirectories"].as_array().is_some_and(|paths| !paths.is_empty()));
+                        json!({"sessionId":params["sessionId"], "workspacePath":std::env::temp_dir()})
+                    }
+                    "session.options.update" => {
+                        assert_ne!(request["params"]["skipCustomInstructions"], true);
+                        json!({"success":true})
+                    }
+                    "session.detach" => json!({"success":true}),
+                    method => panic!("unexpected persistent background request: {method}"),
+                };
+                vec![super::super::test_peer::response(request, result)]
+            });
+            let root = tempfile::tempdir().unwrap();
+            let provider = CopilotProvider::new(Vec::new(), root.path().to_owned()).unwrap();
+            provider.runtime.attach_streams(reader, writer, root.path().to_owned()).await.unwrap();
+            let opened = provider.session_open(context("persistent-background"), SessionRequest {
+                owner: forge_provider_api::ExecutionOwner::root("persistent-background"), mode: forge_provider_api::SessionMode::Background,
+                workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::Durable { resume: None },
+                configuration: SessionConfiguration { model: ModelSelection::default(),
+                    access: forge_provider_api::access::AccessPolicy { sandbox: false, ..Default::default() },
+                    approval: forge_provider_api::approval::ApprovalMode::Ask, resources: Default::default() },
+                resource_lease: None, tools: vec![forge_provider_api::control::ControlToolDefinition {
+                    name: "background_fixture", description: "fixture", input_schema: json!({"type":"object"}),
+                }], tool_endpoint: None, system_instructions: "background instructions".into(), trace: Arc::new(NullTrace),
+            }).await.unwrap();
+            assert!(opened.binding.provider_session_id.is_some());
+            provider.session_close(context("persistent-background-close"), &opened.binding.id).await.unwrap();
+            provider.shutdown(context("persistent-background-shutdown")).await.unwrap();
+            let requests = peer.collected().await;
+            assert_eq!(requests.iter().filter(|request| request["method"] == "session.create").count(), 1);
+        }).await.expect("persistent background fixture timed out");
+    }
+
     /// Shared text generation's sandbox request is enforced by zero native authority, not tool sandbox support.
     #[tokio::test]
     async fn isolated_text_accepts_shared_access_policy_without_enabling_native_authority() {
@@ -5120,7 +5613,7 @@ mod retained_recovery_tests {
             };
             assert!(provider.descriptor().capability.validate_access(&access).is_err(), "fixture must exercise the ordinary native-tool sandbox restriction");
             let opened = provider.session_open(context("shared-isolated-open"), SessionRequest {
-                owner: forge_provider_api::ExecutionOwner::root("shared-isolated"), mode: SessionMode::Background,
+                owner: forge_provider_api::ExecutionOwner::root("shared-isolated"), mode: forge_provider_api::SessionMode::Background,
                 workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::IsolatedText(forge_provider_api::IsolatedTextPolicy::new()),
                 configuration: SessionConfiguration { model: ModelSelection::default(), access, approval: forge_provider_api::approval::ApprovalMode::Deny, resources: Default::default() },
                 resource_lease: None, tools: Vec::new(), tool_endpoint: None,
@@ -5171,7 +5664,7 @@ mod retained_recovery_tests {
                 provider.runtime.attach_streams(reader, writer, root.path().to_owned()).await.unwrap();
                 let access = forge_provider_api::access::AccessPolicy { write_access: forge_provider_api::access::WriteScope::Off, ..Default::default() };
                 let result = provider.session_open(context("isolated-open"), SessionRequest {
-                    owner: forge_provider_api::ExecutionOwner::root("isolated-confirmation"), mode: SessionMode::Background,
+                    owner: forge_provider_api::ExecutionOwner::root("isolated-confirmation"), mode: forge_provider_api::SessionMode::Background,
                     workspace: root.path().to_string_lossy().into_owned(), history: SessionHistory::IsolatedText(forge_provider_api::IsolatedTextPolicy::new()),
                     configuration: SessionConfiguration { model: ModelSelection::default(), access, approval: forge_provider_api::approval::ApprovalMode::Deny, resources: forge_provider_api::ResourceSelection::default() },
                     resource_lease: None, tools: Vec::new(), tool_endpoint: None, system_instructions: String::new(), trace: Arc::new(NullTrace),
@@ -5195,12 +5688,19 @@ mod retained_recovery_tests {
         TransportFailure,
     }
 
+    #[derive(Clone, Copy)]
+    enum HelperBehavior {
+        PauseRejected,
+        ModelApplied,
+        ModelDeferred,
+    }
+
     /// Open the production adapter against an SDK peer that retains shell and abort state.
     async fn opened_fixture(
         shells: Arc<std::sync::atomic::AtomicBool>,
-        mut aborted: Option<tokio::sync::oneshot::Sender<()>>,
+        aborted: Option<tokio::sync::oneshot::Sender<()>>,
         abort_acknowledgement: AbortAcknowledgement,
-        mut terminal_ack: Option<(
+        terminal_ack: Option<(
             Arc<std::sync::atomic::AtomicBool>,
             tokio::sync::oneshot::Sender<()>,
         )>,
@@ -5210,21 +5710,80 @@ mod retained_recovery_tests {
         tempfile::TempDir,
         super::super::test_peer::SdkPeer,
     ) {
+        opened_helper_fixture(
+            shells,
+            aborted,
+            abort_acknowledgement,
+            terminal_ack,
+            HelperBehavior::PauseRejected,
+        )
+        .await
+    }
+
+    /// Select whether auxiliary queue admission succeeds while preserving the main lifecycle fixture.
+    async fn opened_helper_fixture(
+        shells: Arc<std::sync::atomic::AtomicBool>,
+        mut aborted: Option<tokio::sync::oneshot::Sender<()>>,
+        abort_acknowledgement: AbortAcknowledgement,
+        mut terminal_ack: Option<(
+            Arc<std::sync::atomic::AtomicBool>,
+            tokio::sync::oneshot::Sender<()>,
+        )>,
+        helper_behavior: HelperBehavior,
+    ) -> (
+        CopilotProvider,
+        OpenedSession,
+        tempfile::TempDir,
+        super::super::test_peer::SdkPeer,
+    ) {
         let mut held_terminal = None;
+        let mut helper_ids = HashSet::new();
+        let mut helper_tasks = Vec::<Value>::new();
         let (reader, writer, peer) = super::super::test_peer::streams(move |request| {
             let result = match request["method"].as_str().unwrap() {
                 "status.get" => json!({"version":"1.0.103"}),
                 "models.list" => json!({"models":[{
                     "id":"auto", "name":"Auto",
                     "capabilities":{"limits":{"max_context_window_tokens":128000},"supports":{"vision":false}}
-                }]}),
+                },{"id":"alternate","name":"Alternate","capabilities":{}}]}),
                 "mcp.discover" | "session.mcp.listConfigured" => json!({"servers":[]}),
                 "session.skills.list" => json!({"skills":[]}),
                 "session.create" | "session.resume" => {
+                    if request["params"]["availableTools"]
+                        .as_array()
+                        .is_some_and(|tools| {
+                            tools
+                                .iter()
+                                .any(|tool| tool == "powershell" || tool == "bash")
+                        })
+                    {
+                        helper_ids
+                            .insert(request["params"]["sessionId"].as_str().unwrap().to_owned());
+                    }
                     json!({"sessionId":request["params"]["sessionId"], "workspacePath":std::env::temp_dir()})
                 }
                 "session.skills.reload" => json!({}),
                 "session.options.update" | "session.detach" => json!({"success":true}),
+                "session.delete" => json!({}),
+                "session.queue.setDrainPaused" => {
+                    if matches!(helper_behavior, HelperBehavior::PauseRejected) {
+                        return vec![
+                            json!({"jsonrpc":"2.0", "id":request["id"], "error":{"code":-32603,"message":"fixture pause failure"}}),
+                        ];
+                    }
+                    json!({})
+                }
+                "session.tools.execute" => {
+                    helper_tasks.push(json!({"id":request["params"]["arguments"]["shellId"],"type":"shell","status":"running","attachmentMode":"attached","executionMode":"background","command":"fixture command"}));
+                    json!({"resultType":"success","textResultForLlm":"background fixture started"})
+                }
+                "session.model.switchTo" => {
+                    if matches!(helper_behavior, HelperBehavior::ModelDeferred) {
+                        json!({"status":"deferred","deferred":true,"modelId":"auto"})
+                    } else {
+                        json!({"status":"applied","deferred":false,"modelId":request["params"]["modelId"]})
+                    }
+                }
                 "session.tasks.refresh" => {
                     if terminal_ack
                         .as_ref()
@@ -5239,13 +5798,22 @@ mod retained_recovery_tests {
                     json!({})
                 }
                 "session.tasks.list" => {
-                    if shells.load(Ordering::Acquire) {
+                    if helper_ids.contains(request["params"]["sessionId"].as_str().unwrap()) {
+                        json!({"tasks":helper_tasks})
+                    } else if shells.load(Ordering::Acquire) {
                         json!({"tasks":[{"id":"background-shell", "type":"shell", "status":"running", "command":"fixture"}]})
                     } else {
                         json!({"tasks":[]})
                     }
                 }
                 "session.tasks.cancel" => {
+                    if helper_ids.contains(request["params"]["sessionId"].as_str().unwrap()) {
+                        helper_tasks.retain(|task| task["id"] != request["params"]["id"]);
+                        return vec![super::super::test_peer::response(
+                            request,
+                            json!({"cancelled":true}),
+                        )];
+                    }
                     shells.store(false, Ordering::Release);
                     if let Some((_, signal)) = terminal_ack.as_mut() {
                         let (replacement, _) = tokio::sync::oneshot::channel();
@@ -5292,7 +5860,7 @@ mod retained_recovery_tests {
                 context("open"),
                 SessionRequest {
                     owner: forge_provider_api::ExecutionOwner::root("lifecycle-fixture"),
-                    mode: SessionMode::Interactive,
+                    mode: forge_provider_api::SessionMode::Interactive,
                     workspace: root.path().to_string_lossy().into_owned(),
                     history: SessionHistory::Durable { resume: None },
                     configuration: SessionConfiguration {
@@ -5313,9 +5881,185 @@ mod retained_recovery_tests {
         (provider, opened, root, peer)
     }
 
+    /// The merged inventory must not hide an auxiliary session that failed scheduler isolation.
+    #[tokio::test]
+    async fn terminal_list_preserves_failed_helper_startup() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None).await;
+            let state = provider.binding(&opened.binding.id, ProviderOperation::InputSubmit).await.unwrap();
+            let scope = forge_provider_api::InvocationScope::new(state.owner.clone(), "helper-startup");
+            let authority = Arc::new(super::callback_tests::Authority);
+            state.callbacks.install(InvocationCallbacks {
+                scope: scope.clone(), generation: 0, permissions: authority.clone(), tools: authority.clone(), control: authority,
+                allowed_tools: HashSet::new(), _resource_lease: None, session_directory: None,
+            }).await.unwrap();
+            state.callbacks.bind_native_call("helper-startup-call", &scope).await;
+            let shell = state.callbacks.shell().unwrap();
+            let tool = if cfg!(windows) { super::super::shell_tools::ShellTool::PowerShell } else { super::super::shell_tools::ShellTool::Bash };
+            assert!(shell.execute("helper-startup-call", tool, json!({"command":"fixture", "description":"fixture"})).await.is_err());
+            assert!(matches!(provider.terminal_list(context("failed-helper-inventory"), &opened.binding.id).await,
+                Err(ProviderError::Failure(error)) if error.kind() == ProviderFailureKind::Protocol));
+            provider.session_close(context("failed-helper-close"), &opened.binding.id).await.unwrap();
+            provider.shutdown(context("failed-helper-shutdown")).await.unwrap();
+            peer.collected().await;
+        }).await.expect("failed helper inventory fixture timed out");
+    }
+
+    /// Keep a running helper, its handle, and the exact main session across an idle model update.
+    #[tokio::test]
+    async fn model_configuration_preserves_running_helper_and_rejects_resource_replacement() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, opened, _root, peer) = opened_helper_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None, HelperBehavior::ModelApplied).await;
+            let state = provider.binding(&opened.binding.id, ProviderOperation::SessionConfigure).await.unwrap();
+            let shell = running_configuration_helper(&state).await;
+            let before = shell.snapshot().await.unwrap();
+            assert_eq!(before.terminal.len(), 1);
+            let main = state.session.read().await.clone();
+            let mut desired = state.request.lock().await.configuration.clone();
+            desired.model.model = Some("alternate".into());
+            provider.session_configure(context("model-with-running-helper"), &opened.binding.id, desired.clone()).await.unwrap();
+            assert!(Arc::ptr_eq(&main, &*state.session.read().await));
+            assert_eq!(shell.snapshot().await.unwrap(), before);
+            assert_eq!(state.request.lock().await.configuration, desired);
+            assert!(!state.closing.load(Ordering::Acquire));
+            let mut incompatible = desired.clone();
+            incompatible.resources.skills.push(forge_provider_api::catalog::SkillDefinition {
+                resource_id:None, scope:None, name:"replacement-skill".into(), description:String::new(), enabled:true,
+                user_invocable:true, path:None, source:None, argument_hint:None,
+            });
+            assert!(matches!(provider.session_configure(context("resource-with-running-helper"), &opened.binding.id, incompatible).await,
+                Err(ProviderError::Failure(error)) if error.kind() == ProviderFailureKind::ResourceConflict && error.disposition() == forge_provider_api::FailureDisposition::Unchanged));
+            let mut invalid = desired.clone(); invalid.model.model = Some("not-in-catalog".into());
+            assert!(matches!(provider.session_configure(context("invalid-model-with-helper"), &opened.binding.id, invalid).await,
+                Err(ProviderError::Failure(error)) if error.kind() == ProviderFailureKind::Rejected && error.disposition() == forge_provider_api::FailureDisposition::Unchanged));
+            assert_eq!(state.request.lock().await.configuration, desired);
+            assert_eq!(shell.snapshot().await.unwrap(), before);
+            assert!(!state.closing.load(Ordering::Acquire));
+            provider.session_close(context("model-helper-close"), &opened.binding.id).await.unwrap();
+            provider.shutdown(context("model-helper-shutdown")).await.unwrap();
+            let requests = peer.collected().await;
+            assert_eq!(requests.iter().filter(|request| request["method"] == "session.create").count(), 2);
+            assert_eq!(requests.iter().filter(|request| request["method"] == "session.model.switchTo").count(), 1);
+            assert!(requests.iter().all(|request| request["method"] != "session.resume"));
+        }).await.expect("model update with helper fixture timed out");
+    }
+
+    /// A queued native switch is unconfirmed mutation and cannot commit a model selection.
+    #[tokio::test]
+    async fn deferred_model_configuration_invalidates_without_committing_requested_model() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, opened, _root, peer) = opened_helper_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None, HelperBehavior::ModelDeferred).await;
+            let state = provider.binding(&opened.binding.id, ProviderOperation::SessionConfigure).await.unwrap();
+            let original = state.request.lock().await.configuration.clone();
+            let mut desired = original.clone(); desired.model.model = Some("alternate".into());
+            assert!(matches!(provider.session_configure(context("deferred-model"), &opened.binding.id, desired).await,
+                Err(ProviderError::Combined {primary, ..}) if matches!(*primary, ProviderError::Failure(error)
+                    if error.kind() == ProviderFailureKind::Protocol && error.disposition() == forge_provider_api::FailureDisposition::Invalidated)));
+            assert_eq!(state.request.lock().await.configuration, original);
+            assert!(state.closing.load(Ordering::Acquire));
+            provider.session_close(context("deferred-close"), &opened.binding.id).await.unwrap();
+            provider.shutdown(context("deferred-shutdown")).await.unwrap();
+            peer.collected().await;
+        }).await.expect("deferred model acknowledgement fixture timed out");
+    }
+
+    /// Install exact invocation authority and launch one native helper task for configuration tests.
+    async fn running_configuration_helper(
+        state: &Arc<BindingState>,
+    ) -> Arc<super::super::shell_session::ShellSession> {
+        let scope =
+            forge_provider_api::InvocationScope::new(state.owner.clone(), "configuration-helper");
+        let authority = Arc::new(super::callback_tests::Authority);
+        state
+            .callbacks
+            .install(InvocationCallbacks {
+                scope: scope.clone(),
+                generation: 0,
+                permissions: authority.clone(),
+                tools: authority.clone(),
+                control: authority,
+                allowed_tools: HashSet::new(),
+                _resource_lease: None,
+                session_directory: None,
+            })
+            .await
+            .unwrap();
+        state
+            .callbacks
+            .bind_native_call("configuration-helper-call", &scope)
+            .await;
+        let shell = state.callbacks.shell().unwrap();
+        let tool = if cfg!(windows) {
+            super::super::shell_tools::ShellTool::PowerShell
+        } else {
+            super::super::shell_tools::ShellTool::Bash
+        };
+        shell.execute("configuration-helper-call", tool, json!({"command":"fixture", "description":"fixture", "mode":"async", "shellId":"configuration-survivor"})).await.unwrap();
+        shell
+    }
+
+    /// An admitted owner cannot acquire another writable native session or replace its first binding.
+    #[tokio::test]
+    async fn duplicate_owner_open_rejects_before_native_allocation() {
+        let (provider, opened, _root, peer) = opened_fixture(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            AbortAcknowledgement::Success,
+            None,
+        )
+        .await;
+        let state = provider
+            .binding(&opened.binding.id, ProviderOperation::SessionOpen)
+            .await
+            .unwrap();
+        let request = state.request.lock().await.clone();
+        assert!(
+            matches!(provider.session_open(context("duplicate-owner"), request).await,
+            Err(ProviderError::Failure(failure)) if failure.operation() == ProviderOperation::SessionOpen
+                && failure.kind() == ProviderFailureKind::ResourceConflict)
+        );
+        assert_eq!(
+            provider.owners.lock().await.get(&state.owner),
+            Some(&opened.binding.id)
+        );
+        provider
+            .session_close(context("owner-close"), &opened.binding.id)
+            .await
+            .unwrap();
+        provider.shutdown(context("owner-shutdown")).await.unwrap();
+        let requests = peer.collected().await;
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "session.create")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "models.list")
+                .count(),
+            1
+        );
+    }
+
     /// Both invocation collection paths publish on a real retained binding stream without poisoning it.
     #[tokio::test]
     async fn binding_stream_scopes_settlement_and_collection_failure_to_exact_invocations() {
+        // Terminal inventory is independently published on this same binding stream.
+        async fn next_lifecycle_event(
+            events: &mut forge_provider_api::events::ProviderEventStream,
+            binding: &BindingId,
+        ) -> forge_provider_api::BoundProviderEvent {
+            loop {
+                let event = events.recv().await.unwrap().unwrap();
+                assert_eq!(&event.binding_id, binding);
+                if !matches!(event.event, ProviderEvent::Terminals { .. }) {
+                    return event;
+                }
+            }
+        }
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, mut opened, _root, peer) = opened_fixture(
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -5334,7 +6078,7 @@ mod retained_recovery_tests {
                 },
                 watermark: state.sink.watermark(),
             }).await.unwrap();
-            let event = opened.events.recv().await.unwrap().unwrap();
+            let event = next_lifecycle_event(&mut opened.events, &state.binding.id).await;
             assert_eq!(event.binding_id, state.binding.id);
             assert_eq!(event.sequence, receipt.watermark);
             assert!(matches!(event.event, ProviderEvent::Settled { settlement }
@@ -5343,17 +6087,56 @@ mod retained_recovery_tests {
             let failure = ProviderFailure::new(ProviderOperation::Cancel, ProviderFailureKind::Timeout)
                 .at_phase(forge_provider_api::ProviderPhase::Collection, forge_provider_api::FailureDisposition::Invalidated);
             state.publish_invocation_settlement_failure(&failed_scope, failure).await.unwrap();
-            let event = opened.events.recv().await.unwrap().unwrap();
+            let event = next_lifecycle_event(&mut opened.events, &state.binding.id).await;
             assert!(matches!(event.event, ProviderEvent::SettlementFailed { scope, failure: received } if scope == failed_scope && received == failure));
             state.sink.send_wait(ProviderEvent::CapabilitiesChanged {
                 scope: forge_provider_api::EventScope::Binding { owner: state.owner.clone() },
                 capabilities: forge_provider_api::capability::CapabilityManifest::from_descriptor(provider.descriptor()),
             }).await.unwrap();
-            assert!(matches!(opened.events.recv().await.unwrap().unwrap().event, ProviderEvent::CapabilitiesChanged { .. }));
+            assert!(matches!(next_lifecycle_event(&mut opened.events, &state.binding.id).await.event, ProviderEvent::CapabilitiesChanged { .. }));
             provider.session_close(context("scoped-settlement-close"), &opened.binding.id).await.unwrap();
             provider.shutdown(context("scoped-settlement-shutdown")).await.unwrap();
             peer.collected().await;
         }).await.expect("binding-scoped settlement fixture timed out");
+    }
+
+    /// Retained foreground collection outlives the response budget without poisoning later reuse.
+    #[tokio::test(start_paused = true)]
+    async fn foreground_collection_retains_late_settlement_without_implicit_expiry() {
+        let (provider, opened, _root, peer) = opened_fixture(
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            None,
+            AbortAcknowledgement::Success,
+            None,
+        )
+        .await;
+        let state = provider
+            .binding(&opened.binding.id, ProviderOperation::Cancel)
+            .await
+            .unwrap();
+        let (release, released) = tokio::sync::oneshot::channel();
+        *state.active.lock().await = Some(ActiveExecution {
+            scope: forge_provider_api::InvocationScope::new(state.owner.clone(), "late-settlement"),
+            task: tokio::spawn(async move {
+                released.await.unwrap();
+                Ok(())
+            }),
+        });
+        let collecting = state.collect_execution();
+        tokio::pin!(collecting);
+        assert!(futures_util::poll!(collecting.as_mut()).is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        assert!(futures_util::poll!(collecting.as_mut()).is_pending());
+        assert!(!state.closing.load(Ordering::Acquire));
+        release.send(()).unwrap();
+        assert!(matches!(collecting.await, Ok(Some(Ok(())))));
+        assert!(state.active.lock().await.is_none());
+        provider
+            .session_close(context("late-close"), &opened.binding.id)
+            .await
+            .unwrap();
+        provider.shutdown(context("late-shutdown")).await.unwrap();
+        peer.collected().await;
     }
 
     /// A failed foreground join cannot skip independent shell termination and native retirement.
@@ -5460,12 +6243,82 @@ mod retained_recovery_tests {
         }).await.expect("retained cancellation result fixture timed out");
     }
 
+    /// An unused native session has no resumable history; replacement publishes its new identity.
+    #[tokio::test]
+    async fn configuration_replaces_unsubmitted_history_and_publishes_current_identity() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (provider, mut opened, _root, peer) = opened_fixture(
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                None,
+                AbortAcknowledgement::Success,
+                None,
+            )
+            .await;
+            let state = provider
+                .binding(&opened.binding.id, ProviderOperation::SessionConfigure)
+                .await
+                .unwrap();
+            let original = state.session.read().await.id().to_owned();
+            let mut configuration = state.request.lock().await.configuration.clone();
+            configuration.approval = forge_provider_api::approval::ApprovalMode::Allow;
+            provider
+                .session_configure(
+                    context("unused-configuration"),
+                    &opened.binding.id,
+                    configuration,
+                )
+                .await
+                .unwrap();
+            let current = state.session.read().await.id().to_owned();
+            assert_ne!(current, original);
+            loop {
+                if let ProviderEvent::SessionIdentity {
+                    provider_session_id,
+                    ..
+                } = opened.events.recv().await.unwrap().unwrap().event
+                {
+                    assert_eq!(provider_session_id.as_str(), current);
+                    break;
+                }
+            }
+            assert_eq!(
+                state
+                    .request
+                    .lock()
+                    .await
+                    .history
+                    .resume_id()
+                    .unwrap()
+                    .as_str(),
+                current
+            );
+            provider.shutdown(context("unused-shutdown")).await.unwrap();
+            let requests = peer.collected().await;
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request["method"] == "session.create")
+                    .count(),
+                2
+            );
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request["method"] != "session.resume")
+            );
+        })
+        .await
+        .expect("unused native history configuration timed out");
+    }
+
     /// Retained replay keeps cancellation effects after a native replacement commits late.
     #[tokio::test]
     async fn interrupted_configuration_commit_retains_invalidated_disposition() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let (provider, opened, _root, peer) = opened_fixture(Arc::new(std::sync::atomic::AtomicBool::new(false)), None, AbortAcknowledgement::Success, None).await;
             let state = provider.binding(&opened.binding.id, ProviderOperation::SessionConfigure).await.unwrap();
+            let native = state.session.read().await.clone();
+            provider.sessions.mark_submitted(&state.owner, &native).await.unwrap();
             let mut configuration = state.request.lock().await.configuration.clone();
             configuration.approval = forge_provider_api::approval::ApprovalMode::Allow;
             // Hold only the post-native commit slot so cancellation races a proven replacement.
@@ -5477,7 +6330,7 @@ mod retained_recovery_tests {
             tokio::pin!(configuring);
             assert!(futures_util::poll!(configuring.as_mut()).is_pending());
             loop {
-                if provider.sessions.resources(&state.runtime_key).await.is_some_and(|current| !Arc::ptr_eq(&current, &original)) { break; }
+                if provider.sessions.resources(&state.owner).await.is_some_and(|current| !Arc::ptr_eq(&current, &original)) { break; }
                 tokio::task::yield_now().await;
             }
             source.cancel();
@@ -5496,7 +6349,7 @@ mod retained_recovery_tests {
         }).await.expect("configuration commit race fixture timed out");
     }
 
-    /// Lost capability delivery after commit immediately revokes the changed binding.
+    /// Lost identity delivery after commit immediately revokes the changed binding.
     #[tokio::test]
     async fn committed_configuration_delivery_failure_invalidates_binding() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -5517,7 +6370,8 @@ mod retained_recovery_tests {
             provider.session_close(context("configure-delivery-close"), &binding).await.unwrap();
             provider.shutdown(context("configure-delivery-shutdown")).await.unwrap();
             let requests = peer.collected().await;
-            assert_eq!(requests.iter().filter(|request| request["method"] == "session.resume").count(), 1);
+            assert_eq!(requests.iter().filter(|request| request["method"] == "session.create").count(), 2);
+            assert!(requests.iter().all(|request| request["method"] != "session.resume"));
         }).await.expect("configuration delivery fixture timed out");
     }
 

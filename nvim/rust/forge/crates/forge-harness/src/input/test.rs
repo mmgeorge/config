@@ -1,25 +1,62 @@
 use super::*;
 
+/// Reject contradictory wire phases and leave a retained queue unchanged on invalid settlement.
+#[test]
+fn input_delivery_phase_rejects_missing_authority_atomically() -> Result<()> {
+    let base = serde_json::json!({"id":"message","text":"retain me","delivery":"queued"});
+    for invalid in [
+        serde_json::json!({"delivery":"queued","route":"turn"}),
+        serde_json::json!({"delivery":"accepted","route":"turn"}),
+        serde_json::json!({"delivery":"accepted","route":"turn","submission_id":"receipt","error":"failed"}),
+        serde_json::json!({"delivery":"unknown","route":"turn","submission_id":"receipt"}),
+        serde_json::json!({"delivery":"unknown","route":"turn","submission_id":"receipt","error":"uncertain","reservation":"editor"}),
+        serde_json::json!({"delivery":"delivering","route":"turn","reservation":"editor"}),
+    ] {
+        let mut record = base.clone();
+        record
+            .as_object_mut()
+            .unwrap()
+            .extend(invalid.as_object().unwrap().clone());
+        assert!(serde_json::from_value::<InputMessage>(record).is_err());
+    }
+    let input = SessionInputQueue::default();
+    input.apply(submit("message"))?;
+    input.claim("message", 1, InputRoute::Turn)?.unwrap();
+    let before = serde_json::to_value(input.snapshot()?)?;
+    assert!(
+        input
+            .delivery("message", Some(InputDelivery::Accepted), None, None)
+            .is_err()
+    );
+    assert_eq!(serde_json::to_value(input.snapshot()?)?, before);
+    assert!(
+        input
+            .delivery(
+                "message",
+                Some(InputDelivery::Unknown),
+                Some("receipt".into()),
+                None
+            )
+            .is_err()
+    );
+    assert_eq!(serde_json::to_value(input.snapshot()?)?, before);
+    Ok(())
+}
+
 fn submit(id: &str) -> InputOperation {
     InputOperation {
         id: format!("submit-{id}"),
         control_revision: 0,
         after_control: None,
         action: InputAction::Submit {
-            message: Box::new(InputMessage {
+            message: Box::new(InputMessage::queued(crate::input::InputDraft {
                 id: id.into(),
-                revision: 0,
                 text: format!("message {id}"),
                 purpose: crate::input::InputPurpose::User,
                 attachments: Vec::new(),
                 config: None,
                 intent: InputIntent::Queue,
-                delivery: InputDelivery::Queued,
-                route: None,
-                reservation: None,
-                submission_id: None,
-                error: None,
-            }),
+            })),
         },
     }
 }
@@ -62,7 +99,7 @@ fn stale_edit_returns_typed_rejection_without_changing_content() -> Result<()> {
     })?;
     assert_eq!(result.error_code, Some(InputRejection::RevisionChanged));
     assert_eq!(input.snapshot()?.messages[0].text, "message message");
-    assert!(input.snapshot()?.messages[0].reservation.is_none());
+    assert!(input.snapshot()?.messages[0].reservation().is_none());
     let restored: InputUpdate = serde_json::from_slice(&serde_json::to_vec(&result)?)?;
     assert_eq!(restored.error_code, Some(InputRejection::RevisionChanged));
     Ok(())
@@ -135,7 +172,7 @@ fn local_input_completion_cannot_remove_an_edited_or_reserved_revision() -> Resu
             .is_none()
     );
     assert_eq!(
-        input.snapshot()?.messages[0].delivery,
+        input.snapshot()?.messages[0].delivery(),
         InputDelivery::Queued
     );
     assert_eq!(
@@ -266,8 +303,8 @@ fn suspended_question_reply_bypasses_drafts_and_advances_queue_revision() -> Res
     let after = input.snapshot()?;
     assert!(after.suspended);
     assert!(after.revision > before.revision);
-    assert_eq!(after.messages[0].delivery, InputDelivery::Queued);
-    assert_eq!(after.messages[1].delivery, InputDelivery::Delivering);
+    assert_eq!(after.messages[0].delivery(), InputDelivery::Queued);
+    assert_eq!(after.messages[1].delivery(), InputDelivery::Delivering);
     Ok(())
 }
 
@@ -374,7 +411,7 @@ fn operations_preserve_delivery_and_edit_boundaries() -> Result<()> {
     )?;
     let restored = input;
     assert_eq!(
-        restored.snapshot()?.messages[0].delivery,
+        restored.snapshot()?.messages[0].delivery(),
         InputDelivery::Unknown
     );
     assert!(restored.claim("second", 3, InputRoute::Turn)?.is_none());
@@ -486,28 +523,15 @@ fn user_input_precedes_generated_continuation() -> Result<()> {
     Ok(())
 }
 
+/// Reject discarded host ownership fields instead of silently accepting a different request.
 #[test]
-fn legacy_task_bound_input_becomes_session_input() -> Result<()> {
-    let message: InputMessage = serde_json::from_value(serde_json::json!({
-        "id":"queued-before-replacement", "text":"Keep this message", "task_id":"replaced-task"
-    }))?;
-    assert!(matches!(message.purpose, InputPurpose::User));
-    let input = SessionInputQueue::default();
-    input.apply(InputOperation {
-        id: "submit-before-replacement".into(),
-        control_revision: 0,
-        after_control: None,
-        action: InputAction::Submit {
-            message: Box::new(message),
-        },
-    })?;
-    assert!(input.has_pending()?.1);
-    let admitted = input
-        .claim("queued-before-replacement", 1, InputRoute::Turn)?
-        .unwrap();
-    assert_eq!(admitted.text, "Keep this message");
-    assert!(serde_json::to_value(admitted)?.get("task_id").is_none());
-    Ok(())
+fn input_rejects_unknown_host_ownership_fields() {
+    assert!(
+        serde_json::from_value::<InputMessage>(serde_json::json!({
+            "id":"queued-input", "text":"Keep this message", "task_id":"foreign-task"
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -576,7 +600,13 @@ fn steering_bypasses_only_explicit_queued_messages() -> Result<()> {
 fn steering_respects_uncertain_delivery_and_configuration_barriers() -> Result<()> {
     let input = SessionInputQueue::default();
     input.apply(submit("uncertain"))?;
-    input.delivery("uncertain", Some(InputDelivery::Unknown), None, None)?;
+    input.claim("uncertain", 1, InputRoute::Turn)?.unwrap();
+    input.delivery(
+        "uncertain",
+        Some(InputDelivery::Unknown),
+        Some("uncertain-submission".into()),
+        Some("Acceptance is unknown".into()),
+    )?;
     let mut steering = submit("steering");
     if let InputAction::Submit { message } = &mut steering.action {
         message.intent = InputIntent::Auto;
@@ -634,7 +664,7 @@ fn accepted_input_never_returns_as_failed_and_retry_preserves_identity() -> Resu
     let retried = input.apply(retry.clone())?;
     assert!(retried.error.is_none());
     assert_eq!(retried.upsert[0].id, "message");
-    assert!(retried.upsert[0].submission_id.is_none());
+    assert!(retried.upsert[0].submission_id().is_none());
     assert!(
         input
             .claim("message", retried.upsert[0].revision, InputRoute::Turn)?
@@ -653,7 +683,7 @@ fn accepted_input_never_returns_as_failed_and_retry_preserves_identity() -> Resu
         Some("late failure".into()),
     )?;
     assert_eq!(
-        input.snapshot()?.messages[0].delivery,
+        input.snapshot()?.messages[0].delivery(),
         InputDelivery::Accepted
     );
     input.delivery("message", None, None, None)?;

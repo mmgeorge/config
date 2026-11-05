@@ -90,10 +90,7 @@ impl SessionController {
                 )?,
             )?,
             RuntimeMethod::SessionInputGet => {
-                let mut snapshot = serde_json::to_value(self.coordinator.submissions.snapshot()?)?;
-                snapshot["execution_busy"] =
-                    json!(self.coordinator.execution.available_permits() == 0);
-                snapshot
+                serde_json::to_value(self.coordinator.submissions.snapshot()?)?
             }
             _ => unreachable!("input routing accepts only input commands and queries"),
         };
@@ -170,7 +167,7 @@ impl SessionController {
     async fn admit_input(
         self: &Arc<Self>,
         sink: &MessageSender,
-        jobs: &mut JoinSet<bool>,
+        jobs: &mut JoinSet<()>,
     ) -> Result<InputProgress> {
         if let Some(progress) = self.exchange_owner.task_checks_ready(sink.clone()).await? {
             return Ok(match progress {
@@ -294,7 +291,7 @@ impl SessionController {
             && !snapshot.messages.iter().any(|message| {
                 matches!(message.purpose, crate::input::InputPurpose::User)
                     && !matches!(
-                        message.delivery,
+                        message.delivery(),
                         InputDelivery::Accepted | InputDelivery::Delivering
                     )
             })
@@ -328,9 +325,14 @@ impl SessionController {
     async fn complete_input_checks(
         self: &Arc<Self>,
         sink: &MessageSender,
-        jobs: &mut JoinSet<bool>,
+        jobs: &mut JoinSet<()>,
     ) -> Result<InputProgress> {
-        if !self.observer.completion_queue.deferred()? || self.checks.active()?.is_some() {
+        // The retained request owns queue completion until its reply is observed.
+        // Input notifications must not enqueue the same obligation repeatedly.
+        if !jobs.is_empty()
+            || !self.observer.completion_queue.deferred()?
+            || self.checks.active()?.is_some()
+        {
             return Ok(InputProgress::Waiting);
         }
         let sender = self.observer.check_owner_sender()?;
@@ -352,7 +354,6 @@ impl SessionController {
                 }
             }
             controller.coordinator.submissions.changed.notify_one();
-            false
         });
         Ok(InputProgress::Started)
     }
@@ -389,6 +390,47 @@ enum InputProgress {
 mod tests {
     use super::*;
 
+    /// Repeated wakeups retain one completion request until its result is collected.
+    #[tokio::test]
+    async fn deferred_checks_keep_one_in_flight_request() -> Result<()> {
+        let (_root, controller, _exchange) = super::super::question_event_test::fixture().await?;
+        let queue = &controller.observer.completion_queue;
+        let input = &controller.observer.input;
+        input.apply(InputOperation {
+            id: "deferred-check-input".into(), control_revision: 0, after_control: None,
+            action: crate::input::InputAction::Submit { message: Box::new(serde_json::from_value(json!({
+                "id":"pending-check-input", "text":"Queued input", "intent":"queue", "attachments":[]
+            }))?) },
+        })?;
+        assert!(queue.defer(crate::checks::CheckTiming::AfterQueue, "source")?);
+        input.apply(InputOperation {
+            id: "remove-check-input".into(),
+            control_revision: 0,
+            after_control: None,
+            action: crate::input::InputAction::Remove {
+                id: "pending-check-input".into(),
+                revision: 1,
+            },
+        })?;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        let mut jobs = JoinSet::new();
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        jobs.spawn(async move {
+            let _ = held.await;
+        });
+        for _ in 0..3 {
+            assert!(matches!(
+                controller.complete_input_checks(&sink, &mut jobs).await?,
+                InputProgress::Waiting
+            ));
+            assert_eq!(jobs.len(), 1);
+        }
+        release.send(()).unwrap();
+        jobs.join_next().await.unwrap()?;
+        controller.finish_exchange_owner().await?;
+        Ok(())
+    }
+
     /// Stop readiness after fatal admission closure without draining or dispatching queued input.
     #[tokio::test]
     async fn closed_execution_admission_stops_input_readiness_without_dispatch() -> Result<()> {
@@ -397,7 +439,8 @@ mod tests {
             SessionController::new(HarnessBroker::initialize(serde_json::from_value(json!({
                 "workspace":root.path(),"data_root":root.path().join("data"),
                 "client_id":"closed-readiness","provider":{"kind":"mock","command":[]},
-            }))?)?)?;
+            }))?)?)
+            .await?;
         controller
             .coordinator
             .submissions
@@ -416,7 +459,7 @@ mod tests {
         assert_eq!(after.revision, before.revision);
         assert_eq!(after.messages.len(), 1);
         assert_eq!(after.messages[0].id, "preserved-input");
-        assert_eq!(after.messages[0].delivery, InputDelivery::Queued);
+        assert_eq!(after.messages[0].delivery(), InputDelivery::Queued);
         assert!(controller.coordinator.execution.is_closed());
         controller.finish_exchange_owner().await?;
         Ok(())

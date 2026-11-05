@@ -155,7 +155,7 @@ impl HarnessBroker {
                     && self.agent_coordinator.active_count() == 0
                     && execution.is_none(),
                 agent: self.agent_coordinator.clone(),
-                cancelled: self.turn_cancellation.requested.clone(),
+                cancelled: self.turn_cancellation.subscribe(),
                 sink: self.event_sink.clone(),
             },
         );
@@ -195,7 +195,7 @@ impl HarnessBroker {
                 retry: Default::default(),
             }
             .run(),
-            self.turn_cancellation.clone(),
+            self.turn_cancellation.capture(),
             watchdog,
         );
         let mut scan_interval = tokio::time::interval_at(
@@ -233,7 +233,6 @@ impl HarnessBroker {
             },
             agent_revision,
             question_changes: self.questions.changed.subscribe(),
-            cleanup: self.turn_cancellation.cleanup.subscribe(),
             execution_receiver,
             pending_revision: None,
             task_authority,
@@ -256,7 +255,6 @@ impl HarnessBroker {
             pending_native_ready: None,
             retraction_boundary: None,
             scan_enabled: execution.is_some(),
-            cleanup_open: true,
             execution_open: true,
             _agent_lease: agent_lease,
             _check_lease: check_lease,

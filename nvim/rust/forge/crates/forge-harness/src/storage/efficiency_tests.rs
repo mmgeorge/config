@@ -255,15 +255,6 @@ fn runtime_projection_tracks_commits_without_database_reads() -> Result<()> {
         projection.runtime()?.active_task.as_ref().unwrap().title(),
         "committed"
     );
-    let mut operation: crate::task::TaskOperation = serde_json::from_value(serde_json::json!({
-        "id":"configure","session_id":"session","action":{"action":"configure"},"state":"admitted",
-        "permission_selection":null,"error":null,"created_at_ms":1
-    }))?;
-    writer.admit_task_operation(&operation)?;
-    assert!(projection.runtime()?.configuring);
-    operation.state = "completed".into();
-    writer.save_task_operation(&mut operation)?;
-    assert!(!projection.runtime()?.configuring);
     let plan: crate::plan::PlanRecord = serde_json::from_value(serde_json::json!({
         "id":"plan","session_id":"session","request":"plan","state":"awaiting_review",
         "working_path":"","model_revision":1,"submitted_version":1,"review_digest":"submitted","user_revision":0,"created_at_ms":0,"updated_at_ms":0
@@ -320,12 +311,13 @@ fn runtime_projection_tracks_commits_without_database_reads() -> Result<()> {
         },
         crate::plan::PlanPhase::Checking
     );
-    owner.connection.execute_batch("ALTER TABLE task_record RENAME TO hidden_task; ALTER TABLE task_operation RENAME TO hidden_operation;")?;
+    owner
+        .connection
+        .execute_batch("ALTER TABLE task_record RENAME TO hidden_task;")?;
     assert_eq!(
         projection.runtime()?.active_task.as_ref().unwrap().title(),
         "committed"
     );
-    assert!(!projection.runtime()?.configuring);
     Ok(())
 }
 

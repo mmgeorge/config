@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use tokio::sync::oneshot;
 
 use super::command::{CommandId, CommandRequest, CommandResult, ExecuteCommandError};
+use super::core_log::{CoreOutcome, CoreRecord};
 use super::journal::{CommandJournal, CommandJournalError, CommandRecord};
 
 /// Resolve one observer independently of the command's lifetime and retained result.
@@ -20,6 +21,42 @@ pub(super) struct CommandQueue {
 }
 
 impl CommandQueue {
+    /// Append safe core evidence through this queue's existing durable journal owner.
+    pub(super) fn append_core(
+        &mut self,
+        record: &super::core_log::CoreRecord,
+    ) -> Result<u64, CommandJournalError> {
+        self.journal.append_core(record)
+    }
+
+    /// End live observation through the sole journal owner while retaining active cleanup.
+    pub(super) fn lose_observation(
+        &mut self,
+        command: &mut QueuedCommand,
+        trace: &crate::trace::TraceStore,
+        session: &str,
+        step: u64,
+    ) {
+        if command
+            .lose_observation(&mut self.journal, trace, session, step)
+            .is_err()
+        {
+            self.retention_failed(trace, session, step);
+        }
+    }
+
+    /// Persist response-attempt evidence before publishing a result to one observer.
+    fn respond(
+        &mut self,
+        log: CommandResponseLog<'_>,
+        reply: CommandReply,
+        result: Result<CommandResult, ExecuteCommandError>,
+    ) {
+        if log.send(&mut self.journal, reply, result).is_err() {
+            self.retention_failed(log.trace, log.session, log.step);
+        }
+    }
+
     /// Couple command certification to the session's required publication storage.
     pub(super) fn bind_publications(
         &mut self,
@@ -110,11 +147,12 @@ impl CommandQueue {
             .map_err(|_| CommandJournalError::DomainCommit)
     }
 
-    /// Attach/replay an existing identity or durably append one bounded FIFO admission.
+    /// Attach/replay an existing identity or durably append one FIFO admission.
     pub(super) fn admit(
         &mut self,
         request: CommandRequest,
         reply: CommandReply,
+        task_admission: Option<tokio::sync::OwnedSemaphorePermit>,
         active: Option<&mut QueuedCommand>,
         trace: &crate::trace::TraceStore,
         session: &str,
@@ -126,19 +164,34 @@ impl CommandQueue {
             session,
             step,
         };
+        if let Err(error) = self.journal.append_core(&CoreRecord::CommandReceived {
+            command: request.id.clone(),
+            kind: super::core_log::CoreCommandKind::from(&request.command),
+        }) {
+            self.storage_failed(error, reply, response_log);
+            return;
+        }
         if self.storage_unavailable() {
             self.retention_failed(trace, session, step);
-            response_log.send(reply, Err(ExecuteCommandError::OutcomeUncommitted));
+            self.respond(
+                response_log,
+                reply,
+                Err(ExecuteCommandError::OutcomeUncommitted),
+            );
             return;
         }
         match self.availability {
             QueueAvailability::Open => {}
             QueueAvailability::Closing => {
-                response_log.send(reply, Err(ExecuteCommandError::OwnerClosed));
+                self.respond(response_log, reply, Err(ExecuteCommandError::OwnerClosed));
                 return;
             }
             QueueAvailability::StorageUnavailable => {
-                response_log.send(reply, Err(ExecuteCommandError::OutcomeUncommitted));
+                self.respond(
+                    response_log,
+                    reply,
+                    Err(ExecuteCommandError::OutcomeUncommitted),
+                );
                 return;
             }
         }
@@ -154,7 +207,11 @@ impl CommandQueue {
                 .and_then(|expected| Ok(expected == serde_json::to_vec(&request)?));
             match equal {
                 Ok(false) => {
-                    response_log.send(reply, Err(ExecuteCommandError::IdentityConflict));
+                    self.respond(
+                        response_log,
+                        reply,
+                        Err(ExecuteCommandError::IdentityConflict),
+                    );
                     return;
                 }
                 Err(error) => {
@@ -164,7 +221,11 @@ impl CommandQueue {
                 Ok(true) => {}
             }
             if let Some(outcome) = previous.completion() {
-                response_log.send(reply, outcome.map_err(ExecuteCommandError::Failed));
+                self.respond(
+                    response_log,
+                    reply,
+                    outcome.map_err(ExecuteCommandError::Failed),
+                );
                 return;
             }
             let destination = match active {
@@ -172,18 +233,10 @@ impl CommandQueue {
                 Some(_) | None => self.pending.get_mut(&request.id),
             };
             if let Some(command) = destination {
-                if command.waiters.len() < forge_protocol::MAX_PENDING_FRAMES {
-                    command.waiters.push(reply);
-                } else {
-                    response_log.send(reply, Err(ExecuteCommandError::ObservationLost));
-                }
+                command.waiters.push(reply);
                 return;
             }
             self.storage_failed(CommandJournalError::NotActive, reply, response_log);
-            return;
-        }
-        if self.pending.len() >= forge_protocol::MAX_PENDING_FRAMES {
-            response_log.send(reply, Err(ExecuteCommandError::QueueFull));
             return;
         }
         match self.journal.admit(&request) {
@@ -197,11 +250,17 @@ impl CommandQueue {
                     QueuedCommand {
                         record,
                         waiters: vec![reply],
+                        admitted_at: tokio::time::Instant::now(),
+                        task_admission,
                     },
                 );
             }
             Err(CommandJournalError::IdentityConflict) => {
-                response_log.send(reply, Err(ExecuteCommandError::IdentityConflict));
+                self.respond(
+                    response_log,
+                    reply,
+                    Err(ExecuteCommandError::IdentityConflict),
+                );
             }
             Err(error) => self.storage_failed(error, reply, response_log),
         }
@@ -225,6 +284,7 @@ impl CommandQueue {
         match self.journal.start(&command.record) {
             Ok(record) => {
                 command.record = record;
+                command.admitted_at = tokio::time::Instant::now();
                 trace.record(session, "exchange.command.started", serde_json::json!({
                     "command_id":id.as_str(),"sequence":command.record.sequence,"revision":command.record.state.revision(),"command":command.record.request.command.name(),"update_step":step,
                 }));
@@ -256,11 +316,19 @@ impl CommandQueue {
     ) {
         if self.storage_unavailable() {
             let mut command = command;
-            command.lose_observation(trace, session, step);
+            self.lose_observation(&mut command, trace, session, step);
             return;
         }
         match self.journal.finish(&command.record.request.id, outcome) {
-            Ok(record) => command.notify(record, trace, session, step),
+            Ok(record) => {
+                self.publish_completion(&record, trace, session, step);
+                if command
+                    .notify(&mut self.journal, record, trace, session, step)
+                    .is_err()
+                {
+                    self.retention_failed(trace, session, step);
+                }
+            }
             Err(error) => self.uncommitted(command, error, trace, session, step),
         }
     }
@@ -275,10 +343,35 @@ impl CommandQueue {
         step: u64,
     ) {
         if self.storage_unavailable() {
-            command.lose_observation(trace, session, step);
+            self.lose_observation(&mut command, trace, session, step);
             return;
         }
-        command.notify(record, trace, session, step);
+        self.publish_completion(&record, trace, session, step);
+        if command
+            .notify(&mut self.journal, record, trace, session, step)
+            .is_err()
+        {
+            self.retention_failed(trace, session, step);
+        };
+    }
+
+    /// Notify disconnected response observers that this exact durable result can be read once.
+    fn publish_completion(
+        &self,
+        record: &CommandRecord,
+        trace: &crate::trace::TraceStore,
+        session: &str,
+        step: u64,
+    ) {
+        let Some(publications) = &self.publications else {
+            return;
+        };
+        if let Err(error) = publications.publish_batch(vec![forge_protocol::message::SessionEvent {
+            session_id: session.into(), event: "command_completed".into(),
+            payload: serde_json::json!({"id":record.request.id,"revision":record.state.revision()}),
+        }]) {
+            trace.record(session, "exchange.command.notification_failed", serde_json::json!({"command_id":record.request.id,"update_step":step,"reason":error.to_string()}));
+        }
     }
 
     /// Terminate live observation after a failed write; never require a second failing write.
@@ -354,7 +447,11 @@ impl CommandQueue {
             "command_id":response_log.id.as_str(),"update_step":response_log.step,"reason":error.to_string(),
         }));
         self.availability = QueueAvailability::StorageUnavailable;
-        response_log.send(reply, Err(ExecuteCommandError::OutcomeUncommitted));
+        self.respond(
+            response_log,
+            reply,
+            Err(ExecuteCommandError::OutcomeUncommitted),
+        );
         self.fail_pending(
             ExecuteCommandError::OutcomeUncommitted,
             response_log.trace,
@@ -382,38 +479,56 @@ impl CommandQueue {
 pub(super) struct QueuedCommand {
     /// Immutable request and its committed active revision.
     pub(super) record: CommandRecord,
+    /// Monotonic active-command admission; FIFO waiting does not consume its response budget.
+    pub(super) admitted_at: tokio::time::Instant,
+    /// Reserved child-task capacity acquired before this command entered its parent's FIFO.
+    pub(super) task_admission: Option<tokio::sync::OwnedSemaphorePermit>,
     waiters: Vec<CommandReply>,
 }
 
 impl QueuedCommand {
     /// End live observation while retaining the command and its in-flight resource ownership.
-    pub(super) fn lose_observation(
+    fn lose_observation(
         &mut self,
+        journal: &mut CommandJournal,
         trace: &crate::trace::TraceStore,
         session: &str,
         step: u64,
-    ) {
+    ) -> Result<(), CommandJournalError> {
         let log = CommandResponseLog {
             id: &self.record.request.id,
             trace,
             session,
             step,
         };
+        let mut failure = None;
         for waiter in self.waiters.drain(..) {
-            log.send(waiter, Err(ExecuteCommandError::OutcomeUncommitted));
+            if failure.is_some() {
+                log.send_unretained(waiter, Err(ExecuteCommandError::OutcomeUncommitted));
+                continue;
+            }
+            if let Err(error) = log.send(
+                journal,
+                waiter,
+                Err(ExecuteCommandError::OutcomeUncommitted),
+            ) {
+                failure.get_or_insert(error);
+            }
         }
+        failure.map_or(Ok(()), Err)
     }
     /// Notify each attached observer after the journal proves the terminal outcome.
     fn notify(
         self,
+        journal: &mut CommandJournal,
         record: CommandRecord,
         trace: &crate::trace::TraceStore,
         session: &str,
         step: u64,
-    ) {
+    ) -> Result<(), CommandJournalError> {
         let Some(completion) = record.completion() else {
             self.fail_observers(ExecuteCommandError::ObservationLost, trace, session, step);
-            return;
+            return Err(CommandJournalError::NotActive);
         };
         trace.record(session, "exchange.command.completed", serde_json::json!({
             "command_id":record.request.id.as_str(),"sequence":record.sequence,"revision":record.state.revision(),"update_step":step,"succeeded":completion.is_ok(),
@@ -424,15 +539,24 @@ impl QueuedCommand {
             session,
             step,
         };
+        let mut failure = None;
         for reply in self.waiters {
-            log.send(
+            if failure.is_some() {
+                log.send_unretained(reply, Err(ExecuteCommandError::OutcomeUncommitted));
+                continue;
+            }
+            if let Err(error) = log.send(
+                journal,
                 reply,
                 completion.clone().map_err(ExecuteCommandError::Failed),
-            );
+            ) {
+                failure.get_or_insert(error);
+            }
         }
+        failure.map_or(Ok(()), Err)
     }
 
-    /// End observation without claiming that an uncommitted result is durable.
+    /// Release observers after storage failure without retrying the unavailable journal per waiter.
     fn fail_observers(
         self,
         error: ExecuteCommandError,
@@ -447,7 +571,7 @@ impl QueuedCommand {
             step,
         };
         for reply in self.waiters {
-            log.send(reply, Err(error.clone()));
+            log.send_unretained(reply, Err(error.clone()));
         }
     }
 }
@@ -473,7 +597,31 @@ struct CommandResponseLog<'scope> {
 
 impl CommandResponseLog<'_> {
     /// Notify one observer and record its exact identity even if the receiver was dropped.
-    fn send(self, reply: CommandReply, result: Result<CommandResult, ExecuteCommandError>) {
+    fn send(
+        self,
+        journal: &mut CommandJournal,
+        reply: CommandReply,
+        result: Result<CommandResult, ExecuteCommandError>,
+    ) -> Result<(), CommandJournalError> {
+        let persisted = journal.append_core(&CoreRecord::CommandResponded {
+            command: self.id.clone(),
+            outcome: CoreOutcome::response(&result),
+        });
+        let result = if persisted.is_ok() {
+            result
+        } else {
+            Err(ExecuteCommandError::OutcomeUncommitted)
+        };
+        self.send_unretained(reply, result);
+        persisted.map(|_| ())
+    }
+
+    /// Publish an explicitly uncertified response without blocking required control progress on failed storage.
+    fn send_unretained(
+        self,
+        reply: CommandReply,
+        result: Result<CommandResult, ExecuteCommandError>,
+    ) {
         let (sequence, revision) = match &result {
             Ok(result) => (Some(result.sequence), Some(result.revision)),
             Err(_) => (None, None),
@@ -488,5 +636,85 @@ impl CommandResponseLog<'_> {
                 "update_step":self.step,"error_code":code,"observed":observed,
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::command::{CancelExchangeRequest, Command, CommandFailure, InputControl};
+    use super::*;
+
+    /// Create captured cancellation intent without any caller payload or native work.
+    fn request(id: &str) -> CommandRequest {
+        CommandRequest {
+            id: CommandId::new(id).unwrap(),
+            command: Command::CancelExchange(CancelExchangeRequest::default()),
+            input_control: InputControl::default(),
+        }
+    }
+
+    /// A failed required response record fences admission and resolves all waiters without a trace queue dependency.
+    #[tokio::test]
+    async fn core_response_failure_downgrades_reply_and_releases_pending_observers()
+    -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        super::super::core_log::persist_test_session(root.path(), "session")?;
+        let trace = crate::trace::TraceStore::open(root.path())?;
+        trace.configure(false)?;
+        let mut queue = CommandQueue::open(root.path(), "session")?;
+        let (active_reply, active_response) = oneshot::channel();
+        let active_request = request("active");
+        queue.admit(
+            active_request.clone(),
+            active_reply,
+            None,
+            None,
+            &trace,
+            "session",
+            1,
+        );
+        let active = queue.start(&trace, "session", 2).unwrap();
+        let (pending_reply, pending_response) = oneshot::channel();
+        queue.admit(
+            request("pending"),
+            pending_reply,
+            None,
+            None,
+            &trace,
+            "session",
+            3,
+        );
+        let database = rusqlite::Connection::open(root.path().join("harness.sqlite3"))?;
+        database.execute_batch("CREATE TRIGGER reject_core_response BEFORE INSERT ON owner_core_log WHEN json_extract(NEW.record,'$.record')='command_responded' BEGIN SELECT RAISE(ABORT,'fixture core response failure'); END;")?;
+        queue.finish(
+            active,
+            Err(CommandFailure::Interrupted),
+            &trace,
+            "session",
+            4,
+        );
+        assert!(matches!(
+            active_response.await?,
+            Err(ExecuteCommandError::OutcomeUncommitted)
+        ));
+        assert!(matches!(
+            pending_response.await?,
+            Err(ExecuteCommandError::OutcomeUncommitted)
+        ));
+        assert!(queue.storage_unavailable());
+        assert!(!queue.has_pending());
+        assert!(
+            queue
+                .committed(&active_request.id)?
+                .unwrap()
+                .completion()
+                .is_some()
+        );
+        let responses: i64 = database.query_row(
+            "SELECT COUNT(*) FROM owner_core_log WHERE session_id='session' AND json_extract(record,'$.record')='command_responded'",
+            [], |row| row.get(0),
+        )?;
+        assert_eq!(responses, 0);
+        Ok(())
     }
 }

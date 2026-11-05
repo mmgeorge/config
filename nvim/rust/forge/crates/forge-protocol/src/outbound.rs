@@ -11,9 +11,7 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
 
-use crate::{MAX_FRAME_BYTES, MAX_PENDING_FRAMES, MAX_QUEUED_BYTES, RESERVED_CONTROL_RECORDS};
-
-pub const MAX_CONTROL_BYTES: usize = 4096;
+use crate::{MAX_FRAME_BYTES, MAX_PENDING_FRAMES, RESERVED_CONTROL_RECORDS};
 
 #[derive(Default)]
 struct Budget {
@@ -114,23 +112,25 @@ impl MessageSender {
         sender
     }
 
-    /// Uses reserved capacity for small acknowledgements and transfers larger responses losslessly.
+    /// Use reserved capacity up to the frame ceiling and transfer larger responses losslessly.
     pub async fn send_control_response(&self, response: Response) -> io::Result<()> {
-        if encode(&response, MAX_CONTROL_BYTES).is_err() {
-            return self.send_response(response).await;
-        }
+        let encoded = match encode(&response, MAX_FRAME_BYTES) {
+            Ok(encoded) => encoded,
+            Err(_) => return self.send_response(response).await,
+        };
         if let Some(observer) = &self.response_observer {
             observer(&response)?;
         }
-        self.send_control_wait(Message::Response(response)).await
+        self.send_encoded_wait(encoded, true).await
     }
     /// Transfers a session event atomically through bounded frames without discarding its payload.
     pub async fn send_event(&self, event: SessionEvent) -> io::Result<()> {
         crate::contract::validate("session", &event.event, &event.payload)
             .map_err(io::Error::other)?;
-        let message = Message::Event(event.clone());
-        if encode(&message, MAX_FRAME_BYTES).is_ok() {
-            return self.send_wait(message).await;
+        let session_id = event.session_id.clone();
+        let message = Message::Event(event);
+        if let Ok(encoded) = encode(&message, MAX_FRAME_BYTES) {
+            return self.send_encoded_wait(encoded, false).await;
         }
         let _permit = self.begin_transfer().await?;
         let transfer = crate::transfer::JsonTransfer::new(&message)?;
@@ -142,14 +142,14 @@ impl MessageSender {
             json!({"part_count":transfer.part_count(), "total_bytes":transfer.total_bytes()});
         for part in transfer {
             self.send_wait(Message::Event(SessionEvent {
-                session_id: event.session_id.clone(),
+                session_id: session_id.clone(),
                 event: "event.part".into(),
                 payload: json!({"transfer_id":transfer_id, "part":part}),
             }))
             .await?;
         }
         self.send_wait(Message::Event(SessionEvent {
-            session_id: event.session_id,
+            session_id,
             event: "event.complete".into(),
             payload: json!({"transfer_id":transfer_id, "part":completion}),
         }))
@@ -171,8 +171,8 @@ impl MessageSender {
         }
         let request_id = response.id;
         let response = Message::Response(response);
-        if crate::outbound::encode(&response, crate::MAX_FRAME_BYTES).is_ok() {
-            self.send_wait(response).await?;
+        if let Ok(encoded) = encode(&response, MAX_FRAME_BYTES) {
+            self.send_encoded_wait(encoded, false).await?;
             return Ok(());
         }
         let prepared = self.begin_transfer().await.and_then(|permit| {
@@ -245,10 +245,12 @@ impl MessageSender {
         }
     }
 
+    /// Admit one ordinary frame, or return `WouldBlock` without closing the transport.
     pub fn send(&self, message: impl Serialize) -> io::Result<()> {
         self.admit(message, false, false)
     }
 
+    /// Admit one reserved control frame, or return `WouldBlock` without closing the transport.
     pub fn send_control(&self, message: impl Serialize) -> io::Result<()> {
         self.admit(message, true, false)
     }
@@ -289,7 +291,9 @@ impl MessageSender {
     fn admit(&self, message: impl Serialize, control: bool, terminal: bool) -> io::Result<()> {
         let result = self.try_admit(message, control, terminal);
         if let Err(error) = &result {
-            self.record_failure(error);
+            if error.kind() != io::ErrorKind::WouldBlock {
+                self.record_failure(error);
+            }
         }
         result
     }
@@ -305,31 +309,42 @@ impl MessageSender {
         });
     }
 
-    fn try_admit(&self, message: impl Serialize, control: bool, terminal: bool) -> io::Result<()> {
+    /// Wait for a lane reservation while retaining the single successful encoding.
+    async fn send_encoded_wait(&self, bytes: Vec<u8>, control: bool) -> io::Result<()> {
+        let mut capacity = self.capacity.subscribe();
+        loop {
+            match self.reserve_frame(control, false) {
+                Ok(mut frame) => {
+                    self.set_frame_bytes(&mut frame, bytes);
+                    return self.publish_frame(frame);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error),
+            }
+            tokio::select! {
+                _ = capacity.changed() => {},
+                error = self.failed() => return Err(error),
+                _ = self.sender.closed() => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "output receiver closed")),
+            }
+        }
+    }
+
+    /// Reserve one queue entry before allocating its encoded contents.
+    fn reserve_frame(&self, control: bool, terminal: bool) -> io::Result<EncodedFrame> {
         if let Some(failure) = self.failure.borrow().clone() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, failure));
         }
-        let limit = if control {
-            MAX_CONTROL_BYTES
-        } else {
-            MAX_FRAME_BYTES
-        };
+        let limit = MAX_FRAME_BYTES;
         {
             let mut budget = self.budget.lock().expect("output budget lock");
-            let byte_limit = if control {
-                MAX_QUEUED_BYTES
-            } else {
-                MAX_QUEUED_BYTES - RESERVED_CONTROL_RECORDS * MAX_CONTROL_BYTES
-            };
             if budget.frames == MAX_PENDING_FRAMES
                 || (control && budget.frames - budget.normal == RESERVED_CONTROL_RECORDS)
                 || (!control && budget.normal == MAX_PENDING_FRAMES - RESERVED_CONTROL_RECORDS)
-                || budget.bytes + limit > byte_limit
             {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     format!(
-                        "output admission budget exhausted: {} queued frames ({} normal), {} queued bytes, requested frame reservation {limit}, byte budget {byte_limit}",
+                        "output admission capacity exhausted: {} queued frames ({} normal), {} queued bytes, requested frame reservation {limit}",
                         budget.frames, budget.normal, budget.bytes
                     ),
                 ));
@@ -338,21 +353,27 @@ impl MessageSender {
             budget.frames += 1;
             budget.normal += usize::from(!control);
         }
-        let mut frame = EncodedFrame {
+        Ok(EncodedFrame {
             bytes: Vec::new(),
             terminal,
             reservation: limit,
             control,
             budget: Arc::clone(&self.budget),
             capacity: self.capacity.clone(),
-        };
-        frame.bytes = encode(&message, limit)?;
-        {
-            let mut budget = self.budget.lock().expect("output budget lock");
-            budget.bytes -= limit - frame.bytes.len();
-            frame.reservation = frame.bytes.len();
-        }
-        let sender = if control {
+        })
+    }
+
+    /// Replace the provisional maximum reservation with the actual encoded length.
+    fn set_frame_bytes(&self, frame: &mut EncodedFrame, bytes: Vec<u8>) {
+        let mut budget = self.budget.lock().expect("output budget lock");
+        budget.bytes -= frame.reservation - bytes.len();
+        frame.reservation = bytes.len();
+        frame.bytes = bytes;
+    }
+
+    /// Publish an already reserved frame to its FIFO lane.
+    fn publish_frame(&self, frame: EncodedFrame) -> io::Result<()> {
+        let sender = if frame.control {
             &self.control_sender
         } else {
             &self.sender
@@ -360,6 +381,14 @@ impl MessageSender {
         sender
             .try_send(frame)
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))
+    }
+
+    /// Encode only after queue admission succeeds, and release failed reservations by drop.
+    fn try_admit(&self, message: impl Serialize, control: bool, terminal: bool) -> io::Result<()> {
+        let mut frame = self.reserve_frame(control, terminal)?;
+        let bytes = encode(&message, MAX_FRAME_BYTES)?;
+        self.set_frame_bytes(&mut frame, bytes);
+        self.publish_frame(frame)
     }
 }
 
@@ -501,6 +530,25 @@ mod tests {
         receiver.check().unwrap();
     }
 
+    /// Large control records retain reserved progress when ordinary events fill their lane.
+    #[tokio::test]
+    async fn full_frame_control_response_overtakes_saturated_bulk_lane() {
+        let (sender, mut receiver) = channel();
+        for sequence in 0..MAX_PENDING_FRAMES - RESERVED_CONTROL_RECORDS {
+            sender.send(sequence).unwrap();
+        }
+        let expected = Response::success(73, "control".repeat(4096)).unwrap();
+        sender
+            .send_control_response(expected.clone())
+            .await
+            .unwrap();
+        let frame = receiver.recv().await.unwrap().unwrap();
+        assert!(frame.bytes().len() > 4096);
+        let actual: Response = serde_json::from_slice(frame.bytes()).unwrap();
+        assert_eq!(actual.result(), expected.result());
+        receiver.check().unwrap();
+    }
+
     #[tokio::test]
     async fn producer_failure_survives_sender_drop_while_receiver_waits() {
         let (sender, mut receiver) = channel();
@@ -576,7 +624,7 @@ mod tests {
             observed.fetch_add(1, Ordering::Relaxed);
             Ok(())
         });
-        for size in [1, MAX_CONTROL_BYTES, MAX_FRAME_BYTES] {
+        for size in [1, 4096, MAX_FRAME_BYTES] {
             let expected = Response::success(169, "界".repeat(size)).unwrap();
             let producer = sender.send_control_response(expected.clone());
             let consumer = async {
@@ -677,13 +725,14 @@ mod tests {
     #[tokio::test]
     async fn reserved_control_capacity_precedes_bulk_output_without_reordering_each_lane() {
         let (sender, mut receiver) = channel();
-        for sequence in 0..MAX_PENDING_FRAMES - RESERVED_CONTROL_RECORDS {
+        let normal = MAX_PENDING_FRAMES - RESERVED_CONTROL_RECORDS;
+        for sequence in 0..normal {
             sender.send(sequence).unwrap();
         }
         for sequence in 0..RESERVED_CONTROL_RECORDS {
-            sender.send_control(sequence + 96).unwrap();
+            sender.send_control(sequence + normal).unwrap();
         }
-        for sequence in (96..MAX_PENDING_FRAMES).chain(0..96) {
+        for sequence in (normal..MAX_PENDING_FRAMES).chain(0..normal) {
             let frame = receiver.recv().await.unwrap().unwrap();
             assert_eq!(frame.bytes(), format!("{sequence}\n").as_bytes());
         }
@@ -696,7 +745,7 @@ mod tests {
         let event = SessionEvent {
             session_id: "session".into(),
             event: "exchange_updated".into(),
-            payload: json!({"text": "\"\\\n\u{03bb}".repeat(MAX_FRAME_BYTES)}),
+            payload: json!({"text": "\"\\\n\u{03bb}".repeat(MAX_FRAME_BYTES / 4)}),
         };
         let expected = serde_json::to_value(&event).unwrap();
         let producer = async {
@@ -778,27 +827,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn byte_budget_rejects_admission_before_the_record_limit() {
+    async fn large_backlog_preserves_output_and_reserved_control_capacity() {
         let (sender, mut receiver) = channel();
         let payload = "x".repeat(MAX_FRAME_BYTES - 3);
-        for _ in 0..15 {
+        for _ in 0..4 {
             sender.send(&payload).unwrap();
         }
-        assert_eq!(sender.budget.lock().unwrap().bytes, 15 * MAX_FRAME_BYTES);
-        assert!(sender.send(&payload).is_err());
-        assert!(receiver.recv().await.is_err());
+        assert_eq!(sender.budget.lock().unwrap().bytes, 4 * MAX_FRAME_BYTES);
+        sender.send_control("control").unwrap();
+        let control = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(control.bytes(), b"\"control\"\n");
+        drop(control);
+        for _ in 0..4 {
+            let frame = receiver.recv().await.unwrap().unwrap();
+            assert_eq!(frame.bytes().len(), MAX_FRAME_BYTES);
+        }
         drop(receiver);
         assert_eq!(sender.budget.lock().unwrap().bytes, 0);
     }
 
     #[tokio::test]
-    async fn normal_record_saturation_poison_connection_before_control_can_overtake() {
+    async fn normal_record_saturation_preserves_connection_and_control_progress() {
         let (sender, mut receiver) = channel();
         for _ in 0..MAX_PENDING_FRAMES - RESERVED_CONTROL_RECORDS {
             sender.send(0).unwrap();
         }
-        assert!(sender.send(0).is_err());
-        assert!(receiver.recv().await.is_err());
-        assert!(sender.send_control("terminal").is_err());
+        assert_eq!(
+            sender.send(0).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        receiver.check().unwrap();
+        sender.send_control("terminal").unwrap();
+        let frame = receiver.recv().await.unwrap().unwrap();
+        assert_eq!(frame.bytes(), b"\"terminal\"\n");
     }
 }

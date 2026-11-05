@@ -16,7 +16,7 @@ pub(crate) enum PriorFinalizationAction {
 
 pub(crate) struct PriorObservationJob {
     inbox: Arc<crate::provider::session_execution::SessionObservationInbox>,
-    cancellation: Arc<TurnCancellation>,
+    cancellation: Arc<TurnCancellationSignal>,
     settlement: Arc<tokio::sync::Notify>,
 }
 
@@ -37,7 +37,7 @@ pub(crate) struct PriorInitialJob {
 
 pub(crate) struct PriorFinalJob {
     capture: checkpoint_settlement::FinalCheckpointJob,
-    cancellation: Arc<TurnCancellation>,
+    cancellation: Arc<TurnCancellationSignal>,
 }
 
 impl PriorFinalJob {
@@ -93,7 +93,7 @@ impl HarnessBroker {
         events: &mut Vec<SessionEvent>,
     ) -> Result<PriorFinalizationAction> {
         anyhow::ensure!(
-            !self.turn_cancellation.requested.load(Ordering::Acquire),
+            !self.turn_cancellation.is_requested(),
             "prior finalization cancelled"
         );
         for observation in self.observer.session_events().drain()? {
@@ -123,7 +123,7 @@ impl HarnessBroker {
                 }
                 return Ok(PriorFinalizationAction::Wait(PriorObservationJob {
                     inbox: self.observer.session_events(),
-                    cancellation: self.turn_cancellation.clone(),
+                    cancellation: self.turn_cancellation.capture(),
                     settlement: self.reopened_execution.settlement_notification(),
                 }));
             }
@@ -134,7 +134,7 @@ impl HarnessBroker {
                 );
                 return Ok(PriorFinalizationAction::Wait(PriorObservationJob {
                     inbox: self.observer.session_events(),
-                    cancellation: self.turn_cancellation.clone(),
+                    cancellation: self.turn_cancellation.capture(),
                     settlement: self.reopened_execution.settlement_notification(),
                 }));
             }
@@ -185,7 +185,7 @@ impl HarnessBroker {
         }
         Ok(PriorFinalizationAction::Final(Box::new(PriorFinalJob {
             capture: self.prepare_final_checkpoint(&state.exchange, outcome)?,
-            cancellation: self.turn_cancellation.clone(),
+            cancellation: self.turn_cancellation.capture(),
         })))
     }
 

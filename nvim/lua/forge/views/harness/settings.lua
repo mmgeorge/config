@@ -6,6 +6,8 @@ local threshold = require("forge.views.harness.compaction_threshold")
 local notifications = require("forge.infra.notifications")
 local log_buffer_by_path = {}
 local log_revision_by_buffer = {}
+---@type table<string, ForgeHarnessLogStatus>
+local log_status_by_path = {}
 
 --- Category ownership for the existing setting sections, in display order.
 local configuration_category_list = {
@@ -145,41 +147,116 @@ local function formatted_json(value)
   return lines
 end
 
+---@class ForgeHarnessLogEntry
+---@field record? table
+---@field failure? string
+---@field source? string
+
+---Reassemble contiguous host log chunks without exposing transport envelopes as events.
+---@param source string[]
+---@return ForgeHarnessLogEntry[]
+local function log_entries(source)
+  local entries = {}
+  ---@type {id: string, count: integer, next: integer, pieces: string[], damaged: boolean}?
+  local pending
+  local function incomplete(reason)
+    if not pending then return end
+    entries[#entries + 1] = { failure = "Incomplete retained log record " .. pending.id .. ": " .. reason }
+    pending = nil
+  end
+  for _, line in ipairs(source) do
+    local ok, record = pcall(vim.json.decode, line)
+    if ok and type(record) == "table" and record.trace_chunk ~= nil then
+      local part = record.trace_chunk
+      if type(part) ~= "table" or type(part.id) ~= "string" or part.id == ""
+        or type(part.sequence) ~= "number" or part.sequence < 0 or part.sequence % 1 ~= 0
+        or type(part.part_count) ~= "number" or part.part_count < 1 or part.part_count % 1 ~= 0
+        or part.sequence >= part.part_count or type(part.payload_hex) ~= "string"
+        or #part.payload_hex % 2 ~= 0 or not part.payload_hex:match("^[%x]*$") then
+        incomplete("malformed continuation")
+        entries[#entries + 1] = { failure = "Incomplete retained log record: malformed chunk" }
+      else
+        if pending and (pending.id ~= part.id or part.sequence == 0) then incomplete("missing continuation") end
+        if not pending then
+          pending = { id = part.id, count = part.part_count, next = 0, pieces = {}, damaged = false }
+        end
+        if part.part_count ~= pending.count or part.sequence ~= pending.next then pending.damaged = true end
+        pending.next = part.sequence + 1
+        pending.pieces[#pending.pieces + 1] = part.payload_hex:gsub("..", function(byte)
+          return string.char(tonumber(byte, 16))
+        end)
+        if pending.next == pending.count then
+          if pending.damaged then incomplete("missing or out-of-order fragments")
+          else
+            local decoded, complete = pcall(vim.json.decode, table.concat(pending.pieces))
+            if decoded and type(complete) == "table" then
+              entries[#entries + 1] = { record = complete }
+              pending = nil
+            else incomplete("invalid reconstructed JSON") end
+          end
+        end
+      end
+    elseif line ~= "" then
+      incomplete("missing continuation")
+      if ok and type(record) == "table" then entries[#entries + 1] = { record = record }
+      else entries[#entries + 1] = { failure = "Invalid JSONL record", source = line } end
+    end
+  end
+  incomplete("missing continuation")
+  return entries
+end
+
+---Read every retained segment in chronological order and track rotation in the cache revision.
+---@param path string
+---@return {path: string, present: boolean}[]?, string?
+local function log_segments(path)
+  local segments, revision = {}, {}
+  for index = 10, 0, -1 do
+    local segment = index > 0 and (path .. "." .. index) or path
+    local metadata, failure = vim.uv.fs_stat(segment)
+    if not metadata and failure and not failure:find("ENOENT", 1, true) then
+      notifications.error(failure, "Harness logging")
+      return nil
+    end
+    segments[#segments + 1] = { path = segment, present = metadata ~= nil }
+    revision[#revision + 1] = metadata
+      and string.format("%d:%d:%d", metadata.size, metadata.mtime.sec, metadata.mtime.nsec) or "missing"
+  end
+  return segments, table.concat(revision, ":")
+end
+
 ---@param path string
 ---@param buffer integer
 ---@param force? boolean
 local function refresh_log(path, buffer, force)
-  local metadata, stat_error = vim.uv.fs_stat(path)
-  if not metadata and stat_error and not stat_error:find("ENOENT", 1, true) then
-    notifications.error(stat_error, "Harness logging")
-    return
-  end
-  local revision = metadata and string.format("%d:%d:%d", metadata.size, metadata.mtime.sec, metadata.mtime.nsec) or "missing"
-  if not force and revision == log_revision_by_buffer[buffer] then return end
-  local read_ok, source = pcall(function() return metadata and vim.fn.readfile(path) or {} end)
-  if not read_ok then
-    notifications.error(tostring(source), "Harness logging")
-    return
-  end
+  local segments, revision = log_segments(path)
+  if not segments or not force and revision == log_revision_by_buffer[buffer] then return end
+  local read_ok, source = pcall(function()
+    local source = {}
+    for _, segment in ipairs(segments) do
+      if segment.present then vim.list_extend(source, vim.fn.readfile(segment.path)) end
+    end
+    return source
+  end)
+  if not read_ok then notifications.error(tostring(source), "Harness logging") return end
   local lines = {}
-  for index, source_line in ipairs(source) do
-    local decode_ok, record = pcall(vim.json.decode, source_line)
-    if decode_ok and type(record) == "table" then
+  for index, entry in ipairs(log_entries(source)) do
+    local record = entry.record
+    if record then
       local timestamp = type(record.timestamp_ms) == "number"
-          and os.date("%Y-%m-%d %H:%M:%S", math.floor(record.timestamp_ms / 1000))
-          or "unknown time"
+          and os.date("%Y-%m-%d %H:%M:%S", math.floor(record.timestamp_ms / 1000)) or "unknown time"
       local event = type(record.event) == "string" and record.event or "unknown event"
       lines[#lines + 1] = string.format("%s  %s  #%d", timestamp, event, index)
       local payload = record.payload == nil and vim.NIL or record.payload
-      for _, payload_line in ipairs(formatted_json(payload)) do
-        lines[#lines + 1] = "  " .. payload_line
+      for _, payload_line in ipairs(formatted_json(payload)) do lines[#lines + 1] = "  " .. payload_line end
+      lines[#lines + 1] = ""
+    else
+      lines[#lines + 1] = entry.failure .. " #" .. index
+      if entry.source then
+        lines[#lines + 1] = entry.source
+        notifications.error(string.format("Invalid JSONL record #%d in %s", index, path), "Harness logging")
       end
       lines[#lines + 1] = ""
-    elseif source_line ~= "" then
-      lines[#lines + 1] = string.format("Invalid JSONL record #%d", index)
-      lines[#lines + 1] = source_line
-      lines[#lines + 1] = ""
-      notifications.error(string.format("Invalid JSONL record #%d in %s", index, path), "Harness logging")
     end
   end
   if #lines == 0 then lines = { "No log events yet" } end
@@ -192,9 +269,29 @@ local function refresh_log(path, buffer, force)
   log_revision_by_buffer[buffer] = revision
 end
 
----@param status { enabled: boolean }
+---@class ForgeHarnessLogStatus
+---@field enabled boolean
+---@field path? string
+---@field rejected_record_count? integer
+
+---Describe host-reported diagnostic loss beside the log's recording state.
+---@param status ForgeHarnessLogStatus
+---@return string
+local function log_title(status)
+  local rejected = status.rejected_record_count or 0
+  local loss = rejected > 0 and (" • %d record%s rejected"):format(rejected, rejected == 1 and "" or "s") or ""
+  return "Harness log • " .. (status.enabled and "On" or "Off") .. loss .. " • R refresh • q close"
+end
+
+---Adopt host logging status and refresh every visible viewer of that log.
+---@param status ForgeHarnessLogStatus
 function M.adopt(status)
   require("forge.infra.perf").setup({ harness = { enabled = status.enabled } })
+  if not status.path then return end
+  log_status_by_path[status.path] = vim.deepcopy(status)
+  local buffer = log_buffer_by_path[status.path]
+  if not buffer or not vim.api.nvim_buf_is_valid(buffer) then return end
+  for _, window in ipairs(vim.fn.win_findbuf(buffer)) do vim.wo[window].winbar = log_title(status) end
 end
 
 local function request(session_id, method, params, callback)
@@ -205,8 +302,8 @@ local function request(session_id, method, params, callback)
   end)
 end
 
-local function open_log(status)
-  local title = "Harness log • " .. (status.enabled and "On" or "Off") .. " • R refresh • q close"
+local function open_log(status, session_id)
+  local title = log_title(log_status_by_path[status.path] or status)
   local existing = log_buffer_by_path[status.path]
   if existing and vim.api.nvim_buf_is_valid(existing) then
     local windows = vim.fn.win_findbuf(existing)
@@ -227,7 +324,11 @@ local function open_log(status)
   vim.bo[buffer].filetype = "text"
   vim.keymap.set("n", "q", "<Cmd>tabclose<CR>", { buffer = buffer, silent = true })
   vim.wo.winbar = title
-  vim.keymap.set("n", "R", function() refresh_log(status.path, buffer) end, { buffer = buffer, desc = "Refresh Harness log" })
+  vim.keymap.set("n", "R", function()
+    request(session_id, "host.trace.status", {}, function()
+      if vim.api.nvim_buf_is_valid(buffer) then refresh_log(status.path, buffer) end
+    end)
+  end, { buffer = buffer, desc = "Refresh Harness log" })
   vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter", "CursorHold" }, {
     buffer = buffer,
     callback = function() refresh_log(status.path, buffer) end,
@@ -240,7 +341,7 @@ end
 function M.log(session_id, action)
   action = action or "open"
   if action == "open" or action == "" then
-    request(session_id, "host.trace.status", {}, open_log)
+    request(session_id, "host.trace.status", {}, function(status) open_log(status, session_id) end)
   elseif action == "on" or action == "off" then
     request(session_id, "host.trace.configure", { enabled = action == "on" })
   elseif action == "clear" then
@@ -265,10 +366,8 @@ function M.open(state, host, resume_state)
     if M._revision ~= owner_revision or not state.session or state.session.id ~= session_id then return end
     local pending = false
     ---@type table<string, any>
-    local active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
-      state.task_config or {})
-    active.access = (state.task_config or {}).access or (state.configuring_config or {}).access
-      or state.access_preference or active.access
+    local active = vim.deepcopy(assert(state.session))
+    active.access = state.access_preference or active.access
     active.status_thoughts = state.status_thoughts == true
     active.check_timing = state.check_timing or "after_queue"
     active.automatic_checks = state.automatic_checks == true
@@ -293,13 +392,12 @@ function M.open(state, host, resume_state)
       local session = require("forge.session")
       local previous = session.harness
       session.activate_harness(state)
-      require("forge.views.harness.controller").configure(params, false, function(applied)
+      require("forge.views.harness.controller").configure(params, function(applied)
         if not current() or revision ~= configuration_revision then
           if completed then completed(false) end
           return
         end
-        active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
-          state.task_config or {})
+        active = vim.deepcopy(assert(state.session))
         if applied and params.access then state.access_preference = vim.deepcopy(params.access) end
         active.access = state.access_preference or active.access
         active.status_thoughts = state.status_thoughts == true
@@ -481,7 +579,7 @@ function M.open(state, host, resume_state)
         for _, model in ipairs(models) do
           if model.id == selected then
             local speeds = require("forge.views.harness.model_options").speeds(model, state.capability or {})
-            configure({ model = selected, effort = model.default_reasoning or (model.reasoning or {})[1] or active.effort,
+            configure({ model = selected, effort = model.default_reasoning or (model.reasoning or {})[1] or "default",
               service_tier = vim.tbl_contains(speeds, active.service_tier or "default") and active.service_tier or "default" })
             return
           end

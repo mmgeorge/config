@@ -11,6 +11,30 @@ pub(super) fn apply_configuration(
     command: &QueuedCommand,
     services: &OwnerServices,
 ) -> Result<ConfigurationOutcome, ConfigurationCommitError> {
+    let outcome = commit_configuration(command, services)?;
+    let snapshot = services
+        .observer
+        .snapshot()
+        .map_err(ConfigurationCommitError::Snapshot)?;
+    services
+        .publications
+        .publish_batch(vec![forge_protocol::message::SessionEvent {
+            session_id: services.observer.session_id().into(),
+            event: "session_configured".into(),
+            payload: serde_json::json!({
+                "snapshot": snapshot,
+                "operation_id": command.record.request.id,
+            }),
+        }])
+        .map_err(ConfigurationCommitError::Publication)?;
+    Ok(outcome)
+}
+
+/// Apply the local policy before publishing its complete committed projection.
+fn commit_configuration(
+    command: &QueuedCommand,
+    services: &OwnerServices,
+) -> Result<ConfigurationOutcome, ConfigurationCommitError> {
     let change = match &command.record.request.command {
         Command::ConfigureSession(change) => change,
         Command::Task(_)
@@ -194,6 +218,12 @@ pub(super) fn apply_configuration(
 /// Preserve legacy storage causes while giving the owner finite commit-failure categories.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ConfigurationCommitError {
+    /// Committed policy could not be published to session observers.
+    #[error("configuration publication failed: {0}")]
+    Publication(#[source] super::publication::PublicationError),
+    /// The committed policy snapshot could not be read.
+    #[error("configuration snapshot failed: {0}")]
+    Snapshot(#[source] anyhow::Error),
     /// Validated policy could not apply to its captured scope or available definitions.
     #[error(transparent)]
     Rejected(super::command::ConfigurationRejection),

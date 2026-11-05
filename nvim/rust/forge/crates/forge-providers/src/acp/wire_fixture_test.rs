@@ -168,7 +168,10 @@ fn prompt_request(
         mode: forge_provider_api::input::PromptMode::Chat,
         configuration: forge_provider_api::session::InvocationConfiguration {
             model: forge_provider_api::session::ModelSelection::default(),
-            access: forge_provider_api::access::AccessPolicy::default(),
+            access: forge_provider_api::access::AccessPolicy {
+                sandbox: false,
+                ..Default::default()
+            },
             approval: forge_provider_api::approval::ApprovalMode::Ask,
         },
         task: None,
@@ -227,6 +230,32 @@ fn invocation_endpoint_replaces_only_the_native_host_server() {
     );
 }
 
+/// Native authentication cannot install a second timer that overrides its enclosing operation.
+#[tokio::test(start_paused = true)]
+async fn native_authentication_wait_uses_only_enclosing_operation_deadline() {
+    let fixture = WireFixture::start("held_auth").await.unwrap();
+    let authentication = fixture
+        .connection
+        .request("authenticate", json!({"methodId":"fixture"}));
+    tokio::pin!(authentication);
+    assert!(futures_util::poll!(&mut authentication).is_pending());
+    // The barrier response proves the peer has received and retained authentication.
+    fixture
+        .connection
+        .request("fixture/barrier", json!({}))
+        .await
+        .unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(121)).await;
+    assert!(futures_util::poll!(&mut authentication).is_pending());
+    fixture
+        .connection
+        .request("fixture/release_auth", json!({}))
+        .await
+        .unwrap();
+    authentication.await.unwrap();
+    fixture.connection.shutdown().await.unwrap();
+}
+
 struct IgnoreCallbacks;
 
 #[async_trait]
@@ -253,25 +282,32 @@ impl WireFixture {
         let script = directory.path().join("peer.cjs");
         let mode_path = directory.path().join("mode");
         std::fs::write(&mode_path, mode)?;
+        std::fs::write(directory.path().join("native-version"), "2.1.302")?;
         std::fs::write(
             &script,
             r#"
 const fs=require('node:fs');const readline=require('node:readline');
+if(process.argv.includes('--version')){console.log(fs.readFileSync(require('node:path').join(require('node:path').dirname(process.argv[2]),'native-version'),'utf8'));process.exit(0);}
 const write=value=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',...value})+'\n');
-let heldPrompt;
+let heldPrompt;let heldAuthentication;
+fs.watch(process.argv[2],()=>{if(heldPrompt!==undefined&&fs.readFileSync(process.argv[2],'utf8')==='release_cancel'){write({id:heldPrompt,result:{stopReason:'end_turn'}});heldPrompt=undefined;}});
 readline.createInterface({input:process.stdin}).on('line',line=>{
  const request=JSON.parse(line);fs.appendFileSync(process.argv[2]+'.requests',JSON.stringify(request)+'\n');
- if(request.id===undefined){if(request.method==='session/cancel'&&heldPrompt){write({id:heldPrompt,result:{stopReason:'cancelled'}});heldPrompt=undefined;}return;}let result={};
+ if(request.id===undefined){if(request.method==='session/cancel'&&heldPrompt&&fs.readFileSync(process.argv[2],'utf8')!=='held_cancel'){write({id:heldPrompt,result:{stopReason:'cancelled'}});heldPrompt=undefined;}return;}let result={};
  if(request.method==='fixture/release'&&heldPrompt){write({id:heldPrompt,result:{stopReason:'end_turn'}});heldPrompt=undefined;}
- if(request.method==='initialize')result={protocolVersion:1,agentInfo:{version:'99.0.0'},agentCapabilities:{loadSession:true}};
+ if(request.method==='authenticate'&&fs.readFileSync(process.argv[2],'utf8')==='held_auth'){heldAuthentication=request.id;return;}
+ if(request.method==='fixture/release_auth'&&heldAuthentication!==undefined){write({id:heldAuthentication,result:{}});heldAuthentication=undefined;}
+ if(request.method==='initialize')result={protocolVersion:1,agentInfo:{version:'99.0.0'},agentCapabilities:{loadSession:true,...(fs.readFileSync(process.argv[2],'utf8')==='native_instructions'?{sessionCapabilities:{fork:{},systemPrompt:{}}}:fs.readFileSync(process.argv[2],'utf8')==='fork_no_instructions'?{sessionCapabilities:{fork:{}}}:{})}};
+ if(request.method==='initialize'&&fs.readFileSync(process.argv[2],'utf8')==='disabled_extensions')result.agentCapabilities.sessionCapabilities={systemPrompt:{},fork:false,subagents:null};
  if(request.method==='session/load'&&fs.readFileSync(process.argv[2],'utf8')==='load_applied_error'){
   fs.writeFileSync(process.argv[2]+'.endpoint-applied',JSON.stringify(request.params.mcpServers));
   write({id:request.id,error:{code:-32603,message:'private failure after native endpoint apply'}});return;
  }
  if(request.method==='session/new'||request.method==='session/load')result={sessionId:'fixture',models:{currentModelId:'default-model',availableModels:[{modelId:'default-model'},{modelId:'other'}]},configOptions:[{id:'effort',currentValue:'medium',options:[{value:'low'},{value:'medium'},{value:'high'}]}]};
+ if(request.method==='session/fork')result={sessionId:'fork-child'};
  if(request.method==='session/prompt'||request.method==='_session/steering'){
   const mode=fs.readFileSync(process.argv[2],'utf8');
-  if(mode==='held'&&request.method==='session/prompt'){heldPrompt=request.id;return;}
+  if((mode==='held'||mode==='held_cancel')&&request.method==='session/prompt'){heldPrompt=request.id;return;}
   if(mode==='remote_error'){write({id:request.id,error:{code:-32603,message:'private native error'}});return;}
   if(mode==='invalid_request'){write({id:request.id,error:{code:-32600,message:'private invalid request detail'}});return;}
   if(request.method==='_session/steering')result=mode==='promptRequired'?{outcome:'promptRequired',reason:'noRunningTurn'}:{outcome:mode};
@@ -305,6 +341,17 @@ readline.createInterface({input:process.stdin}).on('line',line=>{
             connection,
             command,
         })
+    }
+
+    /// Build a provider using the production native-executable resolver and a real version peer.
+    fn claude_provider(&self, runtime_root: std::path::PathBuf) -> super::provider::AcpProvider {
+        let mut runtime = super::runtime::AcpRuntime::new(
+            super::AcpKind::Claude,
+            self.command.clone(),
+            &runtime_root,
+        );
+        runtime.select_native_command(self.command.clone());
+        super::provider::AcpProvider::from_runtime(runtime, runtime_root)
     }
 
     async fn ready(&self) -> Result<(), ProviderError> {
@@ -372,7 +419,10 @@ async fn native_settlement_does_not_wait_for_host_effects() {
                 history: forge_provider_api::SessionHistory::Durable { resume: None },
                 configuration: forge_provider_api::SessionConfiguration {
                     model: Default::default(),
-                    access: Default::default(),
+                    access: forge_provider_api::access::AccessPolicy {
+                        sandbox: false,
+                        ..Default::default()
+                    },
                     approval: forge_provider_api::approval::ApprovalMode::Ask,
                     resources: ResourceSelection::default(),
                 },
@@ -387,36 +437,6 @@ async fn native_settlement_does_not_wait_for_host_effects() {
         .unwrap();
     let mut stream = binding.events;
     let binding = binding.binding;
-    let rejected_receipt = receipt("rejected-submission");
-    let mut rejected = prompt_request(
-        &binding.id,
-        InvocationScope::new(owner.clone(), "rejected-exchange"),
-        rejected_receipt.clone(),
-        forge_provider_api::PromptInput::Text("test".into()),
-    );
-    rejected.configuration.model.context_window = Some("fixture-window".into());
-    assert!(matches!(
-        provider
-            .input_submit(operation_context(), &binding.id, rejected)
-            .await,
-        Err(ProviderError::PreparationFailed(_))
-    ));
-    assert!(rejected_receipt.state.lock().unwrap().rejected);
-    let rejected_scope = match stream.recv().await.unwrap().unwrap().event {
-        forge_provider_api::ProviderEvent::Settled { settlement } => settlement.scope,
-        event => panic!("unexpected rejected prompt event: {event:?}"),
-    };
-    provider
-        .cancel(
-            operation_context(),
-            &binding.id,
-            forge_provider_api::CancelRequest {
-                scope: rejected_scope,
-            },
-        )
-        .await
-        .unwrap();
-    stream.check().unwrap();
     let receipt = FixtureReceipt::new();
     let mut request = prompt_request(
         &binding.id,
@@ -691,7 +711,10 @@ async fn provider_fixture(
                 history: forge_provider_api::SessionHistory::Durable { resume: None },
                 configuration: forge_provider_api::SessionConfiguration {
                     model: Default::default(),
-                    access: Default::default(),
+                    access: forge_provider_api::access::AccessPolicy {
+                        sandbox: false,
+                        ..Default::default()
+                    },
                     approval: forge_provider_api::approval::ApprovalMode::Ask,
                     resources: Default::default(),
                 },
@@ -804,6 +827,218 @@ async fn input_admission_preserves_wrong_invocation_and_closed_binding_causes() 
     provider.shutdown(operation_context()).await.unwrap();
 }
 
+/// Expired cancellation retains collection without destroying the binding or rewriting late success.
+#[tokio::test]
+async fn cancel_timeout_retains_binding_until_late_settlement_and_reuse() {
+    use forge_provider_api::provider::Provider;
+    let (fixture, provider, opened) = provider_fixture("held_cancel").await;
+    let binding = opened.binding.id;
+    let mut events = opened.events;
+    let owner = forge_provider_api::ExecutionOwner::root("fixture-owner");
+    let scope = forge_provider_api::InvocationScope::new(owner.clone(), "late-cancel");
+    let request = prompt_request(
+        &binding,
+        scope.clone(),
+        receipt("late-cancel"),
+        forge_provider_api::PromptInput::Text("held native input".into()),
+    );
+    let (_, cancellation) = forge_provider_api::OperationCancellation::channel();
+    let submit_context = forge_provider_api::OperationContext::unbounded(
+        forge_provider_api::OperationId::new("held-unbounded-submit").unwrap(),
+        cancellation,
+    );
+    let submitted_provider = provider.clone();
+    let submitted_binding = binding.clone();
+    let submitted = tokio::spawn(async move {
+        submitted_provider
+            .input_submit(submit_context, &submitted_binding, request)
+            .await
+    });
+    let log_path = fixture._directory.path().join("mode.requests");
+    // The peer's request log is the dispatch barrier, independent of wall-clock delay.
+    loop {
+        if std::fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("session/prompt")
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    eprintln!("ACP cancel fixture: native prompt dispatched; pausing Tokio clock");
+    let (stop_watchdog, watchdog_stopped) = std::sync::mpsc::channel::<()>();
+    let watchdog_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog_failure = watchdog_fired.clone();
+    let release_path = fixture._directory.path().join("mode");
+    let watchdog = std::thread::spawn(move || {
+        if matches!(
+            watchdog_stopped.recv_timeout(std::time::Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ) {
+            watchdog_failure.store(true, std::sync::atomic::Ordering::Release);
+            eprintln!(
+                "ACP cancel fixture WATCHDOG: releasing native peer after missing observer response"
+            );
+            std::fs::write(release_path, "release_cancel").unwrap();
+        }
+    });
+    tokio::time::pause();
+    let (_, cancellation) = forge_provider_api::OperationCancellation::channel();
+    let context = forge_provider_api::OperationContext::new(
+        forge_provider_api::OperationId::new("late-cancel-observer").unwrap(),
+        std::time::Duration::from_secs(30),
+        cancellation,
+    )
+    .unwrap();
+    let cancellation = provider.cancel(
+        context.clone(),
+        &binding,
+        forge_provider_api::CancelRequest {
+            scope: scope.clone(),
+        },
+    );
+    tokio::pin!(cancellation);
+    assert!(futures_util::poll!(&mut cancellation).is_pending());
+    loop {
+        if std::fs::read_to_string(&log_path)
+            .unwrap()
+            .contains("session/cancel")
+        {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    eprintln!(
+        "ACP cancel fixture: native cancel dispatched; before advance now={:?}, deadline={:?}, remaining={:?}",
+        tokio::time::Instant::now(),
+        context.deadline(),
+        context.remaining()
+    );
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    let interrupted = context.interrupted();
+    tokio::pin!(interrupted);
+    let interruption_at_boundary = futures_util::poll!(&mut interrupted);
+    eprintln!(
+        "ACP cancel fixture: after advance now={:?}, deadline={:?}, remaining={:?}, direct_interruption={interruption_at_boundary:?}",
+        tokio::time::Instant::now(),
+        context.deadline(),
+        context.remaining()
+    );
+    // Pausing after native I/O preserves a sub-millisecond Instant. Tokio's timer wheel
+    // rounds its wakeup to a millisecond tick, so drive that tick without extending the budget.
+    let driver_tick = std::time::Duration::from_millis(1);
+    tokio::time::advance(driver_tick).await;
+    let interruption_after_tick = if interruption_at_boundary.is_pending() {
+        futures_util::poll!(&mut interrupted)
+    } else {
+        interruption_at_boundary
+    };
+    eprintln!(
+        "ACP cancel fixture: timer rounding tick={driver_tick:?}, overdue={:?}, direct_interruption={interruption_after_tick:?}",
+        tokio::time::Instant::now().saturating_duration_since(context.deadline().unwrap())
+    );
+    assert!(
+        matches!(
+            interruption_after_tick,
+            std::task::Poll::Ready(forge_provider_api::OperationInterruption::DeadlineElapsed)
+        ),
+        "original context deadline did not fire within one timer driver tick"
+    );
+    let observed = cancellation.await;
+    let observed_summary = match &observed {
+        Ok(settlement) => match &settlement.result {
+            forge_provider_api::ExecutionResult::Completed { .. } => "completed".to_owned(),
+            forge_provider_api::ExecutionResult::Cancelled { .. } => "cancelled".to_owned(),
+            forge_provider_api::ExecutionResult::Failed { .. } => "failed".to_owned(),
+        },
+        Err(error) => error.to_string(),
+    };
+    eprintln!(
+        "ACP cancel fixture: observer result={observed_summary}, watchdog_fired={}",
+        watchdog_fired.load(std::sync::atomic::Ordering::Acquire)
+    );
+    let _ = stop_watchdog.send(());
+    watchdog.join().unwrap();
+    assert!(
+        !watchdog_fired.load(std::sync::atomic::Ordering::Acquire),
+        "cancellation failed to respond at its original deadline plus timer tick: {observed_summary}"
+    );
+    assert!(
+        tokio::time::Instant::now() <= context.deadline().unwrap() + driver_tick,
+        "observer exceeded original deadline plus timer driver tick"
+    );
+    assert!(
+        matches!(&observed, Err(ProviderError::Failure(failure))
+        if failure.kind() == forge_provider_api::ProviderFailureKind::Timeout
+            && failure.disposition() == forge_provider_api::FailureDisposition::Uncertain),
+        "unexpected cancellation observer outcome: {observed_summary}"
+    );
+    let blocked = prompt_request(
+        &binding,
+        forge_provider_api::InvocationScope::new(owner.clone(), "blocked"),
+        receipt("blocked"),
+        forge_provider_api::PromptInput::Text("must await collection".into()),
+    );
+    assert!(
+        matches!(provider.input_submit(operation_context(), &binding, blocked).await,
+        Err(ProviderError::Failure(failure))
+            if failure.kind() == forge_provider_api::ProviderFailureKind::ExecutionActive)
+    );
+    tokio::time::resume();
+    std::fs::write(fixture._directory.path().join("mode"), "release_cancel").unwrap();
+    submitted.await.unwrap().unwrap();
+    let settled = next_settlement(&mut events).await;
+    assert_eq!(settled.scope, scope);
+    assert!(matches!(
+        settled.result,
+        forge_provider_api::ExecutionResult::Completed { .. }
+    ));
+    let replayed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            match provider
+                .cancel(
+                    context.clone(),
+                    &binding,
+                    forge_provider_api::CancelRequest {
+                        scope: scope.clone(),
+                    },
+                )
+                .await
+            {
+                Ok(settlement) => break settlement,
+                Err(ProviderError::Failure(failure))
+                    if failure.kind() == forge_provider_api::ProviderFailureKind::Timeout => {}
+                Err(error) => panic!("late authoritative cancellation failed: {error}"),
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(replayed.watermark, settled.watermark);
+    assert!(matches!(
+        replayed.result,
+        forge_provider_api::ExecutionResult::Completed { .. }
+    ));
+    std::fs::write(fixture._directory.path().join("mode"), "ok").unwrap();
+    let successor = prompt_request(
+        &binding,
+        forge_provider_api::InvocationScope::new(owner, "successor"),
+        receipt("successor"),
+        forge_provider_api::PromptInput::Text("same binding after late collection".into()),
+    );
+    provider
+        .input_submit(operation_context(), &binding, successor)
+        .await
+        .unwrap();
+    assert_eq!(next_settlement(&mut events).await.binding_id, binding);
+    provider
+        .session_close(operation_context(), &binding)
+        .await
+        .unwrap();
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
 /// A stale cancel must replay completed evidence while a successor continues running.
 #[tokio::test]
 async fn automatic_settlement_and_stale_cancel_preserve_successor() {
@@ -863,7 +1098,10 @@ async fn automatic_settlement_and_stale_cancel_preserve_successor() {
     .unwrap();
     let configuration = forge_provider_api::SessionConfiguration {
         model: Default::default(),
-        access: Default::default(),
+        access: forge_provider_api::access::AccessPolicy {
+            sandbox: false,
+            ..Default::default()
+        },
         approval: forge_provider_api::approval::ApprovalMode::Ask,
         resources: Default::default(),
     };
@@ -929,7 +1167,10 @@ async fn settled_configuration_preserves_binding_and_event_reader() {
             &binding,
             forge_provider_api::SessionConfiguration {
                 model: Default::default(),
-                access: Default::default(),
+                access: forge_provider_api::access::AccessPolicy {
+                    sandbox: false,
+                    ..Default::default()
+                },
                 approval: forge_provider_api::approval::ApprovalMode::Ask,
                 resources: Default::default(),
             },
@@ -1135,7 +1376,10 @@ fn resume_request(fixture: &WireFixture, owner: &str) -> forge_provider_api::Ses
         },
         configuration: forge_provider_api::SessionConfiguration {
             model: Default::default(),
-            access: Default::default(),
+            access: forge_provider_api::access::AccessPolicy {
+                sandbox: false,
+                ..Default::default()
+            },
             approval: forge_provider_api::approval::ApprovalMode::Ask,
             resources: Default::default(),
         },
@@ -1145,6 +1389,322 @@ fn resume_request(fixture: &WireFixture, owner: &str) -> forge_provider_api::Ses
         system_instructions: String::new(),
         trace: Arc::new(IgnoreTrace),
     }
+}
+
+/// Preserve base instructions through endpoint reloads using negotiated native delivery or text fallback.
+#[tokio::test]
+async fn base_instructions_survive_open_reload_and_resume() {
+    use forge_provider_api::provider::Provider;
+    for mode in ["native_instructions", "ok", "fork_no_instructions"] {
+        let fixture = WireFixture::start(mode).await.unwrap();
+        fixture.connection.shutdown().await.unwrap();
+        let provider = fixture.claude_provider(fixture._directory.path().join("runtime"));
+        let mut request = resume_request(&fixture, "instruction-owner");
+        request.history = forge_provider_api::SessionHistory::Durable { resume: None };
+        request.system_instructions = "base-instructions".into();
+        let opened = provider
+            .session_open(operation_context(), request.clone())
+            .await
+            .unwrap();
+        let fork_capability = opened
+            .capabilities
+            .capability
+            .iter()
+            .find(|entry| entry.id == forge_provider_api::capability::CapabilityId::NativeFork)
+            .unwrap();
+        assert_eq!(
+            matches!(
+                fork_capability.support,
+                forge_provider_api::capability::Support::Unsupported
+            ),
+            mode != "native_instructions"
+        );
+        let mut events = opened.events;
+        for index in 0..2 {
+            let mut prompt = prompt_request(
+                &opened.binding.id,
+                forge_provider_api::InvocationScope::new(
+                    request.owner.clone(),
+                    format!("instruction-{index}"),
+                ),
+                receipt(&format!("instruction-{index}")),
+                forge_provider_api::PromptInput::Text(format!("input-{index}")),
+            );
+            prompt.instructions = format!("dynamic-{index}");
+            prompt.tool_endpoint = Some(forge_provider_api::HostToolEndpoint {
+                url: format!("http://127.0.0.1:{}/mcp", 41000 + index),
+                headers: Default::default(),
+            });
+            provider
+                .input_submit(operation_context(), &opened.binding.id, prompt)
+                .await
+                .unwrap();
+            next_settlement(&mut events).await;
+        }
+        if mode != "ok" {
+            let forked = provider
+                .session_fork(
+                    operation_context(),
+                    forge_provider_api::SessionForkRequest {
+                        source: forge_provider_api::ForkSource::Binding(opened.binding.id.clone()),
+                        target: forge_provider_api::ForkTarget {
+                            owner: forge_provider_api::ExecutionOwner::root("fork-owner"),
+                            workspace: request.workspace.clone(),
+                            configuration: request.configuration.clone(),
+                            system_instructions: "fork-only".into(),
+                        },
+                    },
+                )
+                .await;
+            if mode == "native_instructions" {
+                forked.unwrap();
+            } else {
+                assert!(matches!(forked, Err(ProviderError::Unsupported(_))));
+            }
+        }
+        provider
+            .session_close(operation_context(), &opened.binding.id)
+            .await
+            .unwrap();
+        request.history = forge_provider_api::SessionHistory::Durable {
+            resume: Some("fixture".to_owned().try_into().unwrap()),
+        };
+        request.system_instructions = "resume-base".into();
+        let resumed = provider
+            .session_open(operation_context(), request.clone())
+            .await
+            .unwrap();
+        let mut prompt = prompt_request(
+            &resumed.binding.id,
+            forge_provider_api::InvocationScope::new(request.owner, "resumed-input"),
+            receipt("resumed-input"),
+            forge_provider_api::PromptInput::Text("resumed-input".into()),
+        );
+        prompt.instructions.clear();
+        provider
+            .input_submit(operation_context(), &resumed.binding.id, prompt)
+            .await
+            .unwrap();
+        next_settlement(&mut { resumed.events }).await;
+        provider
+            .session_close(operation_context(), &resumed.binding.id)
+            .await
+            .unwrap();
+        let requests = std::fs::read_to_string(fixture._directory.path().join("mode.requests"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for request in requests.iter().filter(|request| {
+            matches!(
+                request["method"].as_str(),
+                Some("session/new" | "session/load" | "session/fork")
+            )
+        }) {
+            let options = &request["params"]["_meta"]["claudeCode"]["options"];
+            assert_eq!(options["verbatimPrompts"], true);
+            for denied in [
+                "ProposeGoal",
+                "CronCreate",
+                "RemoteTrigger",
+                "ScheduleWakeup",
+            ] {
+                assert!(
+                    options["disallowedTools"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|tool| tool == denied)
+                );
+            }
+        }
+        let prompts = requests
+            .iter()
+            .filter(|request| request["method"] == "session/prompt")
+            .collect::<Vec<_>>();
+        assert_eq!(prompts.len(), 3);
+        assert_eq!(prompts[2]["params"]["prompt"][0]["text"], "resume-base");
+        if mode == "native_instructions" {
+            assert_eq!(prompts[0]["params"]["prompt"][0]["text"], "dynamic-0");
+            assert_eq!(prompts[1]["params"]["prompt"][0]["text"], "dynamic-1");
+            for request in requests.iter().filter(|request| {
+                request["method"] == "session/new" || request["method"] == "session/load"
+            }) {
+                assert_eq!(request["params"]["systemPrompt"]["mode"], "append");
+                assert!(matches!(
+                    request["params"]["systemPrompt"]["content"][0]["text"].as_str(),
+                    Some("base-instructions" | "resume-base")
+                ));
+            }
+            let fork = requests
+                .iter()
+                .find(|request| request["method"] == "session/fork")
+                .unwrap();
+            assert_eq!(
+                fork["params"]["systemPrompt"]["content"][0]["text"],
+                "fork-only"
+            );
+        } else {
+            assert!(
+                !requests
+                    .iter()
+                    .any(|request| request["method"] == "session/fork")
+            );
+            assert_eq!(
+                prompts[0]["params"]["prompt"][0]["text"],
+                "base-instructions"
+            );
+            assert_eq!(
+                prompts[1]["params"]["prompt"][0]["text"],
+                "base-instructions"
+            );
+            assert_eq!(prompts[2]["params"]["prompt"][0]["text"], "resume-base");
+        }
+    }
+}
+
+/// An old native CLI cannot silently ignore verbatim input when fresh or resumed history opens.
+#[tokio::test]
+async fn claude_old_native_cli_rejects_before_history_or_profile_mutation() {
+    use forge_provider_api::provider::Provider;
+    let fixture = WireFixture::start("native_instructions").await.unwrap();
+    fixture.connection.shutdown().await.unwrap();
+    std::fs::write(fixture._directory.path().join("native-version"), "2.1.247").unwrap();
+    let runtime_root = fixture._directory.path().join("runtime");
+    let provider = fixture.claude_provider(runtime_root.clone());
+    for resume in [false, true] {
+        let mut request = resume_request(&fixture, "unsupported-native");
+        if !resume {
+            request.history = forge_provider_api::SessionHistory::Durable { resume: None };
+        }
+        let result = provider.session_open(operation_context(), request).await;
+        assert!(matches!(result, Err(ProviderError::RuntimeVersion(
+            forge_provider_api::version::RuntimeVersionError::Unsupported { requirement, detected }
+        )) if *requirement.minimum() == semver::Version::new(2, 1, 248)
+            && detected == semver::Version::new(2, 1, 247)));
+    }
+    assert!(!runtime_root.exists());
+    assert!(!fixture._directory.path().join("mode.requests").exists());
+    provider.shutdown(operation_context()).await.unwrap();
+}
+
+/// Native scheduling stays disabled when a fresh Antigravity binding reloads or resumes.
+#[tokio::test]
+async fn antigravity_native_schedule_filter_survives_endpoint_reload_and_resume() {
+    use forge_provider_api::provider::Provider;
+    let (fixture, provider, opened) = provider_fixture("ok").await;
+    let binding = opened.binding.id;
+    let mut events = opened.events;
+    let mut request = prompt_request(
+        &binding,
+        forge_provider_api::InvocationScope::new(
+            forge_provider_api::ExecutionOwner::root("fixture-owner"),
+            "schedule-filter",
+        ),
+        receipt("schedule-filter"),
+        forge_provider_api::PromptInput::Text("ordinary input".into()),
+    );
+    request.tool_endpoint = Some(forge_provider_api::HostToolEndpoint {
+        url: "http://127.0.0.1:41002/mcp".into(),
+        headers: Default::default(),
+    });
+    provider
+        .input_submit(operation_context(), &binding, request)
+        .await
+        .unwrap();
+    next_settlement(&mut events).await;
+    provider
+        .session_close(operation_context(), &binding)
+        .await
+        .unwrap();
+    let resumed = provider
+        .session_open(
+            operation_context(),
+            resume_request(&fixture, "resumed-owner"),
+        )
+        .await
+        .unwrap();
+    provider
+        .session_close(operation_context(), &resumed.binding.id)
+        .await
+        .unwrap();
+    provider.shutdown(operation_context()).await.unwrap();
+    let requests = std::fs::read_to_string(fixture._directory.path().join("mode.requests"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|request| {
+            matches!(
+                request["method"].as_str(),
+                Some("session/new" | "session/load")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["method"] == "session/new")
+    );
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request["method"] == "session/load")
+            .count()
+            >= 2
+    );
+    for request in &requests {
+        assert_eq!(
+            request["params"]["_meta"]["antigravity"]["disabledTools"],
+            json!(["schedule"])
+        );
+    }
+}
+
+/// False and null extension fields cannot advertise or dispatch a native fork.
+#[tokio::test]
+async fn disabled_native_extensions_reject_fork_before_dispatch() {
+    use forge_provider_api::provider::Provider;
+    let fixture = WireFixture::start("disabled_extensions").await.unwrap();
+    fixture.connection.shutdown().await.unwrap();
+    let provider = fixture.claude_provider(fixture._directory.path().join("runtime"));
+    let opened = provider
+        .session_open(
+            operation_context(),
+            resume_request(&fixture, "source-owner"),
+        )
+        .await
+        .unwrap();
+    assert!(opened.capabilities.capability.iter().any(|entry| entry.id
+        == forge_provider_api::capability::CapabilityId::NativeFork
+        && entry.support == forge_provider_api::capability::Support::Unsupported));
+    let request = resume_request(&fixture, "target-owner");
+    let result = provider
+        .session_fork(
+            operation_context(),
+            forge_provider_api::SessionForkRequest {
+                source: forge_provider_api::ForkSource::Binding(opened.binding.id.clone()),
+                target: forge_provider_api::ForkTarget {
+                    owner: request.owner,
+                    workspace: request.workspace,
+                    configuration: request.configuration,
+                    system_instructions: "target instructions".into(),
+                },
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(ProviderError::Unsupported(_))));
+    let requests =
+        std::fs::read_to_string(fixture._directory.path().join("mode.requests")).unwrap();
+    assert!(
+        !requests
+            .lines()
+            .any(|request| request.contains("session/fork"))
+    );
+    provider
+        .session_close(operation_context(), &opened.binding.id)
+        .await
+        .unwrap();
+    provider.shutdown(operation_context()).await.unwrap();
 }
 
 /// Concurrent resumes cannot obtain two writable bindings for one native history.
@@ -1413,7 +1973,10 @@ async fn cancelled_configuration_context_rejects_before_native_mutation() {
             model: Some("other".into()),
             ..Default::default()
         },
-        access: Default::default(),
+        access: forge_provider_api::access::AccessPolicy {
+            sandbox: false,
+            ..Default::default()
+        },
         approval: forge_provider_api::approval::ApprovalMode::Ask,
         resources: Default::default(),
     };
@@ -1506,4 +2069,121 @@ async fn endpoint_reload_error_after_native_apply_invalidates_binding() {
         .session_close(operation_context(), &binding)
         .await
         .unwrap();
+}
+
+/// Invalid options must leave existing history, resources and invocation admission untouched.
+#[tokio::test]
+async fn unsupported_options_reject_before_native_or_profile_changes() {
+    use forge_provider_api::{
+        capability::{ProviderFeature, UnsupportedCapability},
+        provider::Provider,
+    };
+    let fixture = WireFixture::start("native_instructions").await.unwrap();
+    fixture.connection.shutdown().await.unwrap();
+    let runtime = fixture._directory.path().join("runtime");
+    let provider = fixture.claude_provider(runtime.clone());
+    let mut initial = resume_request(&fixture, "preflight-owner");
+    initial.history = forge_provider_api::SessionHistory::Durable { resume: None };
+    let opened = provider
+        .session_open(operation_context(), initial.clone())
+        .await
+        .unwrap();
+    let binding = opened.binding.id.clone();
+    let mut events = opened.events;
+    let mut cases = Vec::new();
+    let mut sandbox = initial.configuration.clone();
+    sandbox.access.sandbox = true;
+    cases.push((sandbox, ProviderFeature::OsSandbox));
+    let mut isolation = initial.configuration.clone();
+    isolation.access.isolation_mode = Some("unsupported".into());
+    cases.push((isolation, ProviderFeature::IsolationMode));
+    let mut context = initial.configuration.clone();
+    context.model.context_window = Some("unsupported".into());
+    cases.push((context, ProviderFeature::ContextWindowSelection));
+    let mut tier = initial.configuration.clone();
+    tier.model.service_tier = forge_provider_api::ServiceTier::Fast;
+    cases.push((tier, ProviderFeature::ServiceTier));
+    let mut mcp = initial.configuration.clone();
+    mcp.resources.mcp.push(forge_provider_api::McpLaunch {
+        name: "external".into(),
+        transport: forge_provider_api::McpTransport::Http {
+            url: "http://localhost.invalid".into(),
+            headers: Default::default(),
+        },
+        timeout: Some(std::time::Duration::from_secs(1)),
+        working_directory: None,
+        tools: None,
+    });
+    cases.push((mcp, ProviderFeature::McpLaunchRequirements));
+    let requests_path = fixture._directory.path().join("mode.requests");
+    let before = std::fs::read_to_string(&requests_path).unwrap();
+    let profiles = runtime.join("provider-runtime/claude");
+    let profile_count = std::fs::read_dir(&profiles).unwrap().count();
+    for (index, (configuration, expected)) in cases.into_iter().enumerate() {
+        // The same owner would be closed before validating a replacement in the old path.
+        let mut replacement = initial.clone();
+        replacement.configuration = configuration.clone();
+        assert!(
+            matches!(provider.session_open(operation_context(), replacement).await,
+            Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
+        );
+        assert!(
+            matches!(provider.session_configure(operation_context(), &binding, configuration.clone()).await,
+            Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
+        );
+        assert!(
+            matches!(provider.session_fork(operation_context(), forge_provider_api::SessionForkRequest {
+            source: forge_provider_api::ForkSource::Binding(binding.clone()),
+            target: forge_provider_api::ForkTarget { owner: forge_provider_api::ExecutionOwner::root("preflight-fork"),
+                workspace: initial.workspace.clone(), system_instructions: String::new(), configuration: configuration.clone() },
+        }).await, Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
+        );
+        if expected != ProviderFeature::McpLaunchRequirements {
+            let mut prompt = prompt_request(
+                &binding,
+                forge_provider_api::InvocationScope::new(
+                    initial.owner.clone(),
+                    format!("invalid-{index}"),
+                ),
+                receipt(&format!("invalid-{index}")),
+                forge_provider_api::PromptInput::Text("must not dispatch".into()),
+            );
+            prompt.configuration.model = configuration.model;
+            prompt.configuration.access = configuration.access;
+            prompt.tool_endpoint = Some(forge_provider_api::HostToolEndpoint {
+                url: "http://127.0.0.1:41000/mcp".into(),
+                headers: Default::default(),
+            });
+            assert!(
+                matches!(provider.input_submit(operation_context(), &binding, prompt).await,
+                Err(ProviderError::Unsupported(UnsupportedCapability(feature))) if feature == expected)
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(&requests_path).unwrap(),
+            before,
+            "preflight performed native I/O"
+        );
+        assert_eq!(
+            std::fs::read_dir(&profiles).unwrap().count(),
+            profile_count,
+            "preflight allocated a profile"
+        );
+    }
+    let prompt = prompt_request(
+        &binding,
+        forge_provider_api::InvocationScope::new(initial.owner, "after-preflight"),
+        receipt("after-preflight"),
+        forge_provider_api::PromptInput::Text("still usable".into()),
+    );
+    provider
+        .input_submit(operation_context(), &binding, prompt)
+        .await
+        .unwrap();
+    next_settlement(&mut events).await;
+    provider
+        .session_close(operation_context(), &binding)
+        .await
+        .unwrap();
+    provider.shutdown(operation_context()).await.unwrap();
 }

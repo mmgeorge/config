@@ -342,6 +342,9 @@ pub(crate) enum ConfigurationRejection {
     /// Project check definitions changed after selection.
     #[error("check definitions changed before preferences could apply")]
     CheckDefinitionsChanged,
+    /// The provider positively rejected the change without altering its configuration.
+    #[error("configuration was rejected ({0:?}); existing settings remain active")]
+    Provider(forge_provider_api::ProviderFailureKind),
     /// A prerequisite could not be read or validated before any execution effect.
     #[error("configuration prerequisites are unavailable; execution was not changed")]
     Unavailable,
@@ -366,6 +369,7 @@ impl ConfigurationRejection {
             Self::CheckCoverageUnavailable => "check_preferences_coverage_unavailable",
             Self::CheckTaskChanged => "check_preferences_task_changed",
             Self::CheckDefinitionsChanged => "check_preferences_definitions_changed",
+            Self::Provider(_) => "configuration_provider_rejected",
             Self::Unavailable => "configuration_unavailable",
         }
     }

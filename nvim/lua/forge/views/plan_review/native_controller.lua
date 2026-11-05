@@ -105,7 +105,6 @@ end
 
 local function action(review, name)
   if review.cancel_definition then review.cancel_definition() review.cancel_definition = nil end
-  if name == "rename_entity" and session.harness.busy then notice("A Harness request is already running") return end
   if name == "rename_entity" and (review.plan.historical_revision or review.plan.state ~= "awaiting_review") then
     notice("Only plans awaiting review can be renamed") return
   end
@@ -140,17 +139,14 @@ local function action(review, name)
       return
     elseif name == "rename_entity" and type(result.rename) == "table" then
       require("forge.views.plan_review.entity_rename").proposed(review, result.rename, captured, function(name, finish)
-        if session.harness.busy then finish() notice("A Harness request is already running") return end
-        session.harness.busy = true
         local queued = review.owner.submit("session.plan.entity.rename", { symbol = result.rename.symbol, name = name,
           expected_version = result.rename.expected_version }, function(renamed, failure)
-          session.harness.busy = false
           if failure then finish() notice(failure) return end
           local applied, update_failure = pcall(adopt_revision, review, renamed)
           finish()
           if not applied then notice(tostring(update_failure)) end
         end)
-        if not queued then session.harness.busy = false finish() end
+        if not queued then finish() end
       end)
     elseif name == "references" and type(result.references) == "table" then
       require("forge.views.plan_review.references").open(review, result.references, captured)
@@ -203,15 +199,12 @@ end
 
 local function submit(review, method, params)
   if review.plan.historical_revision then return end
-  if session.harness.busy then notifications.info("A Harness request is already running", "ForgePlanReview") return end
-  session.harness.busy = true
   local submitted_state = session.harness
   local controller = require("forge.views.harness.controller")
   controller.refresh_winbar()
   local queued = review.owner.submit(method, params, function(result, failure)
     if session.harness ~= submitted_state or not submitted_state.session
       or submitted_state.session.id ~= review.session_id then return end
-    session.harness.busy = false
     controller.refresh_winbar()
     if failure then
       notice(failure)
@@ -236,16 +229,12 @@ local function update_checks(review, enabled, tests, receive)
     if receive then receive(false) end
     return
   end
-  if session.harness.busy then notice("A Harness request is already running") if receive then receive(false) end return end
-  session.harness.busy = true
   local queued = review.owner.submit("session.plan.check.update", { enabled = enabled, tests = tests or {}, expected_version = review.owner.version }, function(result, failure)
-    session.harness.busy = false
     local applied = false
     if failure then notice(failure) else applied = adopt_revision(review, result) end
     if receive then receive(applied) end
     return applied
   end)
-  if not queued then session.harness.busy = false end
 end
 
 local function delete_tests(review)
@@ -268,23 +257,15 @@ local function delete_tests(review)
   require("forge.infra.confirm").open(lines, function()
     if not review.owner.is_current(captured, false) then notice("Plan changed while test deletion was awaiting confirmation") return end
     if next(checks) then update_checks(review, checks, tests) return end
-    if session.harness.busy then notice("A Harness request is already running") return end
-    session.harness.busy = true
     local queued = review.owner.submit("session.plan.test.delete", { tests = tests, expected_version = review.owner.version }, function(result, error)
-      session.harness.busy = false
       if error then notice(error) return end
       return adopt_revision(review, result)
     end)
-    if not queued then session.harness.busy = false end
   end, nil, { title = "Delete planned tests" })
 end
 
 local function prompt_decision(review, method, title)
   if review.plan.historical_revision or review.owner.closed then return end
-  if session.harness.busy then
-    notifications.info("A Harness request is already running", "ForgePlanReview")
-    return
-  end
   if review.decision_window and vim.api.nvim_win_is_valid(review.decision_window) then
     vim.api.nvim_set_current_win(review.decision_window)
     return

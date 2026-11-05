@@ -376,9 +376,6 @@ function CommandSource:get_completions(_, callback)
     local state = session.harness
     local selected = state.session or {}
     local model_id = selected.model or "default"
-    for _, configuration in ipairs({ state.task_config or {}, state.configuring_config or {} }) do
-      if configuration.model ~= nil then model_id = configuration.model break end
-    end
     local speed_list = model_options.speeds(model_options.find(model_list, model_id), state.capability or {})
     if command_start then
       local parent_command = prefix:match("^%s*(/%S+)%s+")

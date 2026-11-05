@@ -22,6 +22,8 @@ Headers keep their counts through mutations, because whole-file stage and unstag
 
 Stage and unstage use one native mutation journal per worktree, shared by every open Status document. Admission returns an `accepted` `StatusDelta` before Git runs, holding one confirmed observation and an ordered predicted index. A second action resolves against that prediction. Closing a view never releases an admitted write.
 
+Staging an already-staged selection, or unstaging an already-unstaged selection, completes without a write or an error. Inventory refreshes retain bounded selection history. Queued whole-file Ignore and Unignore actions can cross an unrelated revision change only after validating every original file's identity, section, source generation, and observed source. Section selections retain their original membership; newly appearing files are not added. Hunk selections and Discard keep their stricter revision checks.
+
 Each action has its own precondition:
 
 - **Whole-file staging** writes the worktree content current at execution, and requires no unchanged index entry.

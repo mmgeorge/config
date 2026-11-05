@@ -167,7 +167,7 @@ impl From<ExchangeClock> for ClockRecord {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(from = "PhaseRecord", into = "PhaseRecord")]
 /// Couples terminal outcomes to completion evidence and keeps legacy omissions explicit.
 pub(crate) enum ExchangePhase {
@@ -178,7 +178,7 @@ pub(crate) enum ExchangePhase {
     Finished(Completion),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Completion {
     outcome: ExchangeOutcome,
     timestamp: CompletionTimestamp,
@@ -186,7 +186,7 @@ pub(crate) struct Completion {
     finalized: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CompletionTimestamp {
     Recorded(i64),
     LegacyUnknown,

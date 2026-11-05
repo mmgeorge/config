@@ -9,6 +9,7 @@ local picker = require("forge.views.picker")
 local path = vim.fn.tempname() .. ".jsonl"
 vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","session_id":"settings-session","payload":{"method":"operation/start","items":["a,b","c"]}}' }, path)
 local enabled = false
+local rejected_record_count = 0
 local controller = require("forge.views.harness.controller")
 local original_configure = controller.configure
 local original_transition = controller.task_transition
@@ -84,9 +85,9 @@ client.request = function(request_specification, callback)
   end
   if method == "host.trace.configure" then enabled = params.enabled end
   if method == "session.trace.clear" then vim.fn.writefile({}, path) end
-  callback({ enabled = enabled, path = path })
+  callback({ enabled = enabled, path = path, rejected_record_count = rejected_record_count })
 end
-controller.configure = function(params, _, completed)
+controller.configure = function(params, completed)
   client.request({ session_id = "settings-session", method = "session.configure", params = params }, function(result)
     state.session = result
     if params.status_thoughts ~= nil then state.status_thoughts = params.status_thoughts end
@@ -496,6 +497,39 @@ local success, failure = xpcall(function()
   settings.log("settings-session")
   assert(#vim.api.nvim_list_tabpages() == before + 1, "log open duplicated the tab")
   assert(vim.api.nvim_get_current_buf() == log_buffer)
+  assert(not vim.wo.winbar:find("rejected", 1, true), "zero rejections appeared as diagnostic loss")
+  rejected_record_count = 7
+  local refresh = vim.fn.maparg("R", "n", false, true)
+  refresh.callback()
+  assert(vim.wo.winbar:find("7 records rejected", 1, true), "log refresh hid host-reported saturation")
+  rejected_record_count = 0
+  settings.adopt({ enabled = enabled, path = path, rejected_record_count = rejected_record_count })
+  assert(not vim.wo.winbar:find("rejected", 1, true), "adopting reset host status retained diagnostic loss")
+  local logical = vim.json.encode({ timestamp_ms = 1700000000123, event = "chunked",
+    payload = { text = "λ retained across rotations" } })
+  local split = assert(logical:find("λ", 1, true))
+  local function chunk(sequence, payload)
+    local hex = payload:gsub(".", function(byte) return ("%02x"):format(byte:byte()) end)
+    return vim.json.encode({ trace_chunk = { id = "retained-large-record", sequence = sequence,
+      part_count = 3, payload_hex = hex } })
+  end
+  vim.fn.writefile({ chunk(0, logical:sub(1, split)) }, path .. ".10")
+  vim.fn.writefile({ chunk(1, logical:sub(split + 1, split + 1)) }, path .. ".1")
+  vim.fn.writefile({ chunk(2, logical:sub(split + 2)),
+    '{"timestamp_ms":1700000000123,"event":"ordinary","payload":{"after_chunk":true}}' }, path)
+  refresh.callback()
+  log_text = table.concat(vim.api.nvim_buf_get_lines(log_buffer, 0, -1, false), "\n")
+  assert(log_text:find("chunked  #1", 1, true) and log_text:find("λ retained across rotations", 1, true),
+    "log viewer did not reassemble UTF-8 fragments across all retained archives: " .. log_text)
+  assert(log_text:find("ordinary  #2", 1, true), "chunk reassembly lost ordinary records or logical ordering")
+  assert(not log_text:find("unknown event", 1, true) and not log_text:find("trace_chunk", 1, true),
+    "chunk transport envelopes appeared as log events")
+  vim.fn.delete(path .. ".10")
+  refresh.callback()
+  log_text = table.concat(vim.api.nvim_buf_get_lines(log_buffer, 0, -1, false), "\n")
+  assert(log_text:find("Incomplete retained log record", 1, true), "missing archived fragments disappeared silently")
+  assert(log_text:find("ordinary  #2", 1, true), "incomplete chunks hid the following ordinary event")
+  vim.fn.delete(path .. ".1")
   settings.log("settings-session", "clear")
   assert(enabled)
   assert(vim.api.nvim_buf_get_lines(log_buffer, 0, -1, false)[1] == "No log events yet")
@@ -508,6 +542,7 @@ package.loaded["mini.clue"] = original_clue
 client.request = original_request
 commit_settings.request = original_commit_request
 vim.fn.delete(path)
+for index = 1, 10 do vim.fn.delete(path .. "." .. index) end
 if not success then error(failure) end
 print("harness_settings: passed")
 vim.cmd("qa!")

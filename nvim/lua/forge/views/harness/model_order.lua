@@ -9,6 +9,7 @@ local ModelOrder = {}
 ---@field context_window? {id: string, token_limit: integer?}[]
 ---@field default_context_window? string
 ---@field selected_context_window? string
+---@field observed_context_token_limit? integer Display-only runtime capacity; never a selectable override.
 ---@field vision? boolean
 ---@field description? string
 ---@field is_default? boolean

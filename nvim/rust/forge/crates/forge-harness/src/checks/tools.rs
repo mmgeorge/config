@@ -61,7 +61,7 @@ pub(crate) struct CheckToolScope {
     editing: Arc<AtomicBool>,
     can_run: bool,
     agent: Arc<crate::agent::AgentCoordinator>,
-    cancelled: Arc<AtomicBool>,
+    cancelled: tokio::sync::watch::Receiver<bool>,
     delivery: Mutex<Option<CheckDelivery>>,
     task_authority: Option<crate::tools::TaskAuthority>,
 }
@@ -87,7 +87,7 @@ pub(crate) struct CheckAuthority {
     pub editing: Arc<AtomicBool>,
     pub can_run: bool,
     pub agent: Arc<crate::agent::AgentCoordinator>,
-    pub cancelled: Arc<AtomicBool>,
+    pub cancelled: tokio::sync::watch::Receiver<bool>,
     pub sink: Option<crate::broker::publication::SessionUpdateSink>,
 }
 
@@ -202,7 +202,7 @@ impl CheckToolScope {
             .clone()
             .context("check tools belong to an inactive interaction")?;
         ensure!(
-            !self.cancelled.load(Ordering::Acquire),
+            !*self.cancelled.borrow(),
             "check tools belong to an inactive interaction"
         );
         if name == "check_run" {
@@ -312,7 +312,7 @@ impl CheckToolScope {
                     );
                 }
                 ensure!(
-                    !self.cancelled.load(Ordering::Acquire)
+                    !*self.cancelled.borrow()
                         && self
                             .delivery
                             .lock()
@@ -374,7 +374,7 @@ impl CheckToolScope {
                     "an agent started during check resolution"
                 );
                 json!({"run_id":self.runner.owner_sender()?.start(
-                    self.scope.clone(), call_id, retained_request, run, delivery.lifecycle, Arc::clone(&self.cancelled),
+                    self.scope.clone(), call_id, retained_request, run, delivery.lifecycle, self.cancelled.clone(),
                 ).await?})
             }
             "check_status" => {
@@ -444,7 +444,7 @@ impl CheckToolScope {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("check delivery lock poisoned"))?
                 .is_some()
-                && !self.cancelled.load(Ordering::Acquire),
+                && !*self.cancelled.borrow(),
             "check operation was interrupted during authorization"
         );
         Ok(())

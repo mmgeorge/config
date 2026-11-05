@@ -65,11 +65,6 @@ pub(crate) fn acp(error: AcpConnectionError, operation: ProviderOperation) -> Pr
             forge_provider_api::ProviderPhase::Preparation,
             forge_provider_api::FailureDisposition::Unchanged,
         ),
-        AcpConnectionError::Timeout { .. } => (
-            ProviderFailureKind::Timeout,
-            forge_provider_api::ProviderPhase::Observation,
-            forge_provider_api::FailureDisposition::Uncertain,
-        ),
         AcpConnectionError::Collection { process, reader } => {
             let normalized = |disposition| {
                 ProviderError::Failure(
@@ -103,12 +98,8 @@ pub(crate) fn acp(error: AcpConnectionError, operation: ProviderOperation) -> Pr
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn native_error_conversion_drops_payloads_and_source_chains() {
-        let timeout_source =
-            tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<()>())
-                .await
-                .expect_err("a zero-duration timeout must expire");
+    #[test]
+    fn native_error_conversion_drops_payloads_and_source_chains() {
         let failures = [
             (
                 codex(
@@ -127,17 +118,6 @@ mod tests {
                     ProviderOperation::InputSubmit,
                 ),
                 ProviderFailureKind::Unknown,
-            ),
-            (
-                acp(
-                    AcpConnectionError::Timeout {
-                        method: "native-secret-method".into(),
-                        seconds: 1,
-                        source: timeout_source,
-                    },
-                    ProviderOperation::InputSubmit,
-                ),
-                ProviderFailureKind::Timeout,
             ),
             (
                 acp(

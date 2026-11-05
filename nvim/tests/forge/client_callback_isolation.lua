@@ -5,6 +5,7 @@ local session = require("forge.session")
 local original_ensure, original_error = builder.ensure, notifications.error
 local diagnostic, sent = {}, {}
 local emit
+local initializing_harness = false
 local response_version = require("forge.protocol").VERSION
 builder.ensure = function(callback) callback({ ok = true, path = "callback-fixture" }) end
 notifications.error = function(message) diagnostic[#diagnostic + 1] = tostring(message) end
@@ -16,6 +17,9 @@ client._host_set_launcher_for_test(function(_, options, on_exit)
       local request = vim.json.decode(encoded)
       sent[request.method] = request.id
       if request.method == "host.initialize" then emit({ id = request.id, result = { protocol_version = response_version } }) end
+      if request.method == "provider.registry.list" and initializing_harness then
+        emit({ id = request.id, result = dofile("nvim/tests/forge/support/provider_catalog.lua").registry() })
+      end
       if request.method == "session.initialize" then emit({ id = request.id, result = { session = { id = "fixture" } } }) end
       if request.method == "host.trace.configure" then emit({ id = request.id, result = { enabled = false } }) end
       if request.method == "host.shutdown" then vim.schedule(function() on_exit({ code = 0 }) end) end
@@ -36,10 +40,10 @@ local succeeded, failure = xpcall(function()
   assert(client._client.ready and not client._client.draining)
 
   local completed = false
-  client.request({ method = "permissions.document.open", params = {} }, function() error("reply UI fixture failure") end)
+  client.request({ method = "provider.registry.list", params = {} }, function() error("reply UI fixture failure") end)
   client.request({ method = "repository.status.document", params = {} }, function(result) completed = result.ok end)
-  await(function() return sent["permissions.document.open"] and sent["repository.status.document"] end, "requests were not written")
-  emit({ id = sent["permissions.document.open"], result = { document = "policy" } })
+  await(function() return sent["provider.registry.list"] and sent["repository.status.document"] end, "requests were not written")
+  emit({ id = sent["provider.registry.list"], result = { document = "policy" } })
   emit({ id = sent["repository.status.document"], result = { ok = true } })
   await(function() return completed end, "throwing response consumer skipped independent reply")
   assert(client._client.ready and client._client.process and not client._client.draining)
@@ -47,14 +51,15 @@ local succeeded, failure = xpcall(function()
   assert(#diagnostic == 2 and diagnostic[1]:find("startup UI fixture failure", 1, true)
     and diagnostic[2]:find("reply UI fixture failure", 1, true), "consumer failure diagnostics were lost")
 
-  sent["permissions.document.open"] = nil
-  client.request({ method = "permissions.document.open", params = {} }, function() error("error UI fixture failure") end)
-  await(function() return sent["permissions.document.open"] end, "error request was not written")
-  emit({ id = sent["permissions.document.open"], error = { code = "fixture", message = "expected request error" } })
+  sent["provider.registry.list"] = nil
+  client.request({ method = "provider.registry.list", params = {} }, function() error("error UI fixture failure") end)
+  await(function() return sent["provider.registry.list"] end, "error request was not written")
+  emit({ id = sent["provider.registry.list"], error = { code = "fixture", message = "expected request error" } })
   await(function() return #diagnostic == 3 end, "error callback exception was not reported")
   assert(client._client.ready and not client._client.draining)
 
   local harness_started = false
+  initializing_harness = true
   client.session_initialize(function() error("Harness startup UI fixture failure") end)
   client.session_initialize(function(_, start_error) assert(not start_error) harness_started = true end)
   await(function() return harness_started end, "throwing Harness startup consumer skipped another waiter")

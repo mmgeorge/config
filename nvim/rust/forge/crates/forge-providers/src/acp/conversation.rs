@@ -39,6 +39,8 @@ pub struct ConversationOptions {
     pub resources: Vec<McpDefinition>,
     pub profile: PathBuf,
     pub skills: Vec<String>,
+    /// Preserve host base instructions independently from per-invocation guidance.
+    pub system_instructions: String,
 }
 
 /// Prepare the complete native target configuration for one durable fork.
@@ -49,6 +51,13 @@ pub(super) struct ForkConfiguration<'a> {
     pub profile: &'a std::path::Path,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
+    /// Replace source instructions with the separately owned target's instructions.
+    pub system_instructions: &'a str,
+}
+
+enum InstructionDelivery {
+    NativeAppend { resumed_prelude: Option<String> },
+    PromptPrelude(String),
 }
 
 /// Own the connection, negotiated capabilities, and native session configuration.
@@ -58,6 +67,7 @@ pub struct AcpConversation {
     state: Arc<AcpSessionState>,
     initialized: Value,
     configuration: tokio::sync::Mutex<Value>,
+    instructions: InstructionDelivery,
     fork_targets:
         tokio::sync::Mutex<std::collections::HashMap<forge_provider_api::OperationId, String>>,
 }
@@ -75,7 +85,7 @@ impl AcpConversation {
         let transport = AcpConnection::launch_retained(launch, state.clone(), cleanup)
             .await
             .map_err(|source| initialization_failure(&requirement, source))?;
-        let result: Result<(String, Value, Value)> = async {
+        let result: Result<(String, Value, Value, InstructionDelivery)> = async {
         let initialized = transport.request("initialize", json!({"protocolVersion":1,
             "clientInfo":{"name":"forge-harness","title":"Forge Harness","version":"0.1.0"},
             "clientCapabilities":{"session":{"compaction":{},"configOptions":{"boolean":{}}},"subagents":{}}})).await.map_err(|source| initialization_failure(&requirement, source))?;
@@ -93,6 +103,16 @@ impl AcpConversation {
             servers.push(json!({"type":"http","name":"forge-harness-control","url":endpoint.url,"headers":headers}));
         }
         let mut parameter = json!({"cwd":options.workspace,"mcpServers":servers});
+        let instructions = if initialized.pointer("/agentCapabilities/sessionCapabilities/systemPrompt").is_some_and(Value::is_object) {
+            append_system_instructions(&mut parameter, &options.system_instructions);
+            // Claude retains its original system prompt on resume until compaction.
+            // Supply current instructions as input too so resume cannot defer the host contract.
+            InstructionDelivery::NativeAppend {
+                resumed_prelude: options.session_id.as_ref().map(|_| options.system_instructions.clone()),
+            }
+        } else {
+            InstructionDelivery::PromptPrelude(options.system_instructions)
+        };
         parameter["mcpServers"]
             .as_array_mut()
             .context("ACP MCP list missing")?
@@ -106,8 +126,11 @@ impl AcpConversation {
             .update_catalog(json!({"mcpResources": resource_status}))
             .await;
         if options.kind == ProviderKind::Claude {
+            // ACP 0.99.1 passes SDK 0.3.312 options through on new/load/fork.
+            // Verbatim input blocks slash-command dispatch; denied tools cannot start native goals.
             parameter["_meta"] = json!({"claudeCode":{"emitRawSDKMessages":true,"options":{
-                "strictMcpConfig":true,"disallowedTools":["Agent","Task"]}}});
+                "strictMcpConfig":true,"verbatimPrompts":true,
+                "disallowedTools":["Agent","Task","ProposeGoal","CronCreate","RemoteTrigger","ScheduleWakeup"]}}});
             parameter["_meta"]["claudeCode"]["options"]["settings"] =
                 json!({"permissions":{"ask":["*"]}});
             parameter["_meta"]["claudeCode"]["options"]["plugins"] = json!([
@@ -117,6 +140,10 @@ impl AcpConversation {
                 options.skills.iter().map(|name| format!("forge-managed:{name}"))
                     .collect::<Vec<_>>()
             );
+        } else {
+            // ACP 1.4.5 exposes schedule by default, including through read-only policy.
+            // Its persisted built-in filter keeps continuation authority with Harness.
+            parameter["_meta"] = json!({"antigravity":{"disabledTools":["schedule"]}});
         }
         let response = if let Some(id) = &options.session_id {
             parameter["sessionId"] = json!(id);
@@ -139,15 +166,16 @@ impl AcpConversation {
             .context("ACP session response has no conversation identity")?;
         if let Some(expected) = &options.session_id { ensure!(&id == expected, "ACP loaded a different conversation identity"); }
         state.update_catalog(response.clone()).await;
-        Ok((id, initialized, parameter))
+        Ok((id, initialized, parameter, instructions))
         }.await;
         match result {
-            Ok((id, initialized, configuration)) => Ok(Self {
+            Ok((id, initialized, configuration, instructions)) => Ok(Self {
                 id,
                 transport,
                 state,
                 initialized,
                 configuration: tokio::sync::Mutex::new(configuration),
+                instructions,
                 fork_targets: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             }),
             Err(_) => {
@@ -195,6 +223,32 @@ impl AcpConversation {
             .pointer("/agentCapabilities/loadSession")
             .and_then(Value::as_bool)
             == Some(true)
+    }
+
+    /// Get immediate prompt guidance when native delivery is unavailable or deferred on resume.
+    pub(super) fn prompt_instructions(&self) -> Option<&str> {
+        match &self.instructions {
+            InstructionDelivery::NativeAppend { resumed_prelude } => {
+                resumed_prelude.as_deref().filter(|text| !text.is_empty())
+            }
+            InstructionDelivery::PromptPrelude(text) => (!text.is_empty()).then_some(text),
+        }
+    }
+
+    /// Reject a fork whose target instructions cannot be retained by the native history.
+    pub(super) fn validate_fork_instructions(
+        &self,
+        instructions: &str,
+    ) -> Result<(), ProviderError> {
+        if !instructions.is_empty()
+            && matches!(self.instructions, InstructionDelivery::PromptPrelude(_))
+        {
+            return Err(forge_provider_api::capability::UnsupportedCapability(
+                forge_provider_api::capability::ProviderFeature::NativeFork,
+            )
+            .into());
+        }
+        Ok(())
     }
 
     /// Send a native operation while preserving its transport error category.
@@ -401,11 +455,13 @@ impl AcpConversation {
             profile,
             model,
             effort,
+            system_instructions,
         } = target;
-        if self
+        self.validate_fork_instructions(system_instructions)?;
+        if !self
             .initialized
             .pointer("/agentCapabilities/sessionCapabilities/fork")
-            .is_none()
+            .is_some_and(Value::is_object)
         {
             return Err(forge_provider_api::capability::UnsupportedCapability(
                 forge_provider_api::capability::ProviderFeature::NativeFork,
@@ -417,6 +473,9 @@ impl AcpConversation {
             configuration["sessionId"] = json!(self.id);
             configuration["cwd"] = json!(workspace);
             configuration["mcpServers"] = json!(mcp_servers);
+            if matches!(self.instructions, InstructionDelivery::NativeAppend { .. }) {
+                append_system_instructions(&mut configuration, system_instructions);
+            }
             if let Some(options) = configuration.pointer_mut("/_meta/claudeCode/options") {
                 options["plugins"] = json!([{"type":"local","path":profile}]);
                 options["skills"] = json!(
@@ -573,10 +632,12 @@ impl AcpConversation {
     }
     /// Refine the host descriptor using negotiated native capabilities.
     pub async fn capabilities(&self, mut capability: ProviderCapability) -> ProviderCapability {
-        capability.native_fork &= self
-            .initialized
-            .pointer("/agentCapabilities/sessionCapabilities/fork")
-            .is_some();
+        capability.native_fork &=
+            matches!(self.instructions, InstructionDelivery::NativeAppend { .. })
+                && self
+                    .initialized
+                    .pointer("/agentCapabilities/sessionCapabilities/fork")
+                    .is_some_and(Value::is_object);
         capability.native_steer &= self
             .initialized
             .pointer("/_meta/steering/supported")
@@ -585,7 +646,7 @@ impl AcpConversation {
         capability.agent.observe = self
             .initialized
             .pointer("/agentCapabilities/sessionCapabilities/subagents")
-            .is_some();
+            .is_some_and(Value::is_object);
         let catalog = self.state.catalog().await;
         capability.effort_selection = find_option(&catalog, "thought_level")
             .or_else(|| find_option(&catalog, "effort"))
@@ -691,9 +752,6 @@ pub fn initialization_failure(
     source: AcpConnectionError,
 ) -> ProviderError {
     match source {
-        AcpConnectionError::Timeout { seconds, .. } => requirement
-            .probe_timed_out(std::time::Duration::from_secs(seconds))
-            .into(),
         AcpConnectionError::Configuration(_)
         | AcpConnectionError::Process { .. }
         | AcpConnectionError::Startup { .. }
@@ -722,6 +780,13 @@ pub fn validate_initialization(
         ));
     }
     Ok(validated)
+}
+
+/// Encode negotiated ACP append semantics while preserving the native provider preset.
+fn append_system_instructions(configuration: &mut Value, instructions: &str) {
+    configuration["systemPrompt"] = json!({
+        "mode": "append", "content": [{ "type": "text", "text": instructions }],
+    });
 }
 
 fn acp_failure(kind: forge_provider_api::ProviderFailureKind) -> ProviderError {

@@ -24,6 +24,15 @@ pub fn prepare_new_session(
         "source session uses a different configured provider"
     );
     let preference = store.load_preference(&source.workspace, &source.provider)?;
+    let model = preference
+        .as_ref()
+        .map_or_else(|| source.model.clone(), |value| value.model.clone());
+    let same_model = model == source.model;
+    let context_window = preference
+        .as_ref()
+        .and_then(|value| value.model_setting.get(&model))
+        .map(|setting| setting.context_window.clone())
+        .unwrap_or_else(|| same_model.then(|| source.context_window.clone()).flatten());
     let session_id = Uuid::new_v4().to_string();
     let mut child = HarnessSession {
         purpose: crate::session::SessionPurpose::Conversation,
@@ -41,9 +50,7 @@ pub fn prepare_new_session(
         provider_session_id: None,
         provider_checkpoint_id: None,
         provider_fork_state: ProviderForkState::Ready,
-        model: preference
-            .as_ref()
-            .map_or_else(|| source.model.clone(), |value| value.model.clone()),
+        model,
         provider_label: source.provider_label,
         resolved_model: None,
         effort: preference
@@ -57,12 +64,12 @@ pub fn prepare_new_session(
             .map_or(source.plan_compact, |value| value.plan_compact),
         approval_timeout: source.approval_timeout,
         tool_timeout: source.tool_timeout,
-        context_window: preference
-            .as_ref()
-            .and_then(|value| value.model_setting.get(&value.model))
-            .and_then(|setting| setting.context_window.clone())
-            .or(source.context_window),
-        service_tier: source.service_tier,
+        context_window,
+        service_tier: if same_model {
+            source.service_tier
+        } else {
+            Default::default()
+        },
         access: preference
             .as_ref()
             .map_or_else(|| source.access.clone(), |value| value.access.clone()),

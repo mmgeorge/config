@@ -75,9 +75,18 @@ function M.move(state, draft, direction)
   edit.entry = entry
   state.queue_edit = edit
   if entry.reservation ~= edit.reservation and not entry.local_only then
+    edit.reserving = edit.reserving or {}
+    if edit.reserving[entry.id] then return edit.drafts[entry] or queued_text(entry), nil, edit.attachments[entry] or entry.attachments end
+    edit.reserving[entry.id] = true
     input_state.perform(state, { kind = "reserve", id = entry.id, revision = entry.revision or 0,
       reservation = edit.reservation }, function(failure)
-      if failure and state.queue_edit == edit then edit.failure = failure end
+      edit.reserving[entry.id] = nil
+      if failure then edit.failure = failure end
+      if edit.commit and not next(edit.reserving) then
+        local commit = edit.commit
+        edit.commit = nil
+        commit()
+      end
     end)
   end
   return edit.drafts[entry] or queued_text(entry), nil, edit.attachments[entry] or entry.attachments
@@ -113,14 +122,29 @@ function M.finish(state, draft)
   if edit.failure and draft ~= "" then return nil, edit.failure .. ". Unqueue to retain this draft separately." end
   edit.drafts[edit.entry] = draft
   edit.attachments[edit.entry] = attachment.capture(state.composer_buf).attachments
-  local edits = {}
-  local local_edits = {}
+  local entries = {}
   for _, entry in ipairs(state.queue) do
-    local updated = edit.drafts[entry]
-    if updated ~= nil then
+    if edit.drafts[entry] ~= nil then entries[#entries + 1] = entry end
+  end
+  state.queue_edit = nil
+  local function failed(failure)
+    if not failure then return end
+    state.failed_queue_edit = edit
+    edit.failure = failure
+  end
+  local function commit()
+    if edit.failure then failed(edit.failure) return end
+    local edits = {}
+    for _, entry in ipairs(entries) do
+      local updated = edit.drafts[entry]
       if entry.local_only then
-        local_edits[#local_edits + 1] = { entry = entry, text = updated,
-          attachments = edit.attachments[entry] or entry.attachments or {} }
+        if entry.draft_state == "unknown" and updated:find("%S") then
+          failed("Confirm the original command before resubmitting this draft.")
+          return
+        end
+      elseif entry.reservation ~= edit.reservation then
+        failed("The queued message changed before its edit reservation completed.")
+        return
       else
         edits[#edits + 1] = { id = entry.id, revision = entry.revision or 0,
           text = edit.commit_text and edit.commit_text[entry] or updated,
@@ -128,18 +152,18 @@ function M.finish(state, draft)
           attachments = edit.attachments[entry] or entry.attachments or {} }
       end
     end
-  end
-  state.queue_edit = nil
-  for _, change in ipairs(local_edits) do
-    input_state.discard_rejected(state, change.entry.id)
-    if change.text:find("%S") then input_state.submit(state, change.text, change.attachments, "queue", change.entry.config) end
-  end
-  input_state.perform(state, { kind = "commit", reservation = edit.reservation, edits = edits }, function(failure)
-    if failure then
-      state.failed_queue_edit = edit
-      edit.failure = failure
+    for _, entry in ipairs(entries) do
+      local updated = edit.drafts[entry]
+      if entry.local_only then
+        input_state.discard_rejected(state, entry.id)
+        if updated:find("%S") then
+          input_state.submit(state, updated, edit.attachments[entry] or entry.attachments or {}, "queue", entry.config)
+        end
+      end
     end
-  end)
+    input_state.perform(state, { kind = "commit", reservation = edit.reservation, edits = edits }, failed)
+  end
+  if edit.reserving and next(edit.reserving) then edit.commit = commit else commit() end
   return edit.original_draft, nil, edit.original_attachments
 end
 
@@ -153,10 +177,12 @@ function M.staging(state, draft, entries)
   for _, entry in ipairs(entries or state.queue) do
     local text = edit and edit.drafts[entry] or queued_text(entry)
     if edit and entry == edit.entry then text = "[editing] " .. (draft or edit.drafts[entry] or queued_text(entry))
+    elseif entry.local_only and entry.draft_state == "pending" then
+      text = "[submitting] " .. text
     elseif entry.error then
       local keys = require("forge.shared.keymaps").view_keys_for("harness", "retry_input")
       local retry = keys[1] and (" " .. keys[1] .. " retry") or ""
-      text = "[" .. entry.delivery .. "]" .. retry .. " " .. text .. " — " .. entry.error
+      text = "[" .. (entry.draft_state or entry.delivery) .. "]" .. retry .. " " .. text .. " — " .. entry.error
     end
     staged[#staged + 1] = { id = entry.id, text = text, failed = entry.error ~= nil }
   end

@@ -42,6 +42,7 @@ pub(crate) struct PermissionConfigurationResult {
 
 /// Capture provider catalog work without retaining the broker across I/O.
 pub(crate) struct ConfigurationCatalogJob {
+    deadline: Option<tokio::time::Instant>,
     provider: Arc<Provider>,
     request: ProviderCatalogRequest,
     authority: Box<ConfigurationAuthority>,
@@ -54,6 +55,7 @@ pub(crate) struct ConfigurationCatalogResult {
 
 /// Own a provider settings reconciliation independently of the broker lock.
 pub(crate) struct ConfigurationReconcileJob {
+    deadline: Option<tokio::time::Instant>,
     provider: Arc<Provider>,
     request: ProviderRequest,
     selection: crate::settings::PortableSettings,
@@ -176,6 +178,12 @@ impl ConfigurationCandidate {
         };
         rebased.effort = selected.effort.clone();
         rebased.context_window = selected.context_window.clone();
+        if rebased.model != current.model
+            || rebased.resolved_model != current.resolved_model
+            || rebased.context_window != current.context_window
+        {
+            rebased.context_usage = None;
+        }
         rebased.service_tier = selected.service_tier;
         rebased.access = selected.access.clone();
         rebased.approval_mode = selected.approval_mode;
@@ -201,9 +209,20 @@ pub(crate) struct ConfigurationMcpNotices {
 }
 
 impl ConfigurationCatalogJob {
+    /// Restrict discovery to its enclosing configuration command's original deadline.
+    pub(crate) fn restrict_deadline(&mut self, deadline: tokio::time::Instant) {
+        self.deadline = Some(
+            self.deadline
+                .map_or(deadline, |current| current.min(deadline)),
+        );
+    }
+
     pub(crate) async fn run(self) -> Result<ConfigurationCatalogResult> {
         let context = self.provider.query_context(&self.request).await?;
-        let models = self.provider.model_list(context).await?;
+        let models = self
+            .provider
+            .model_list_before(context, self.deadline)
+            .await?;
         Ok(ConfigurationCatalogResult {
             authority: self.authority,
             models,
@@ -212,10 +231,44 @@ impl ConfigurationCatalogJob {
 }
 
 impl ConfigurationReconcileJob {
+    /// Recognize authoritative native rejection without treating independent cleanup uncertainty as unchanged.
+    pub(crate) fn unchanged_failure(error: &crate::provider::ProviderError) -> bool {
+        use crate::provider::ProviderError;
+        match error {
+            ProviderError::Failure(failure) => {
+                failure.operation() == forge_provider_api::ProviderOperation::SessionConfigure
+                    && failure.disposition() == forge_provider_api::FailureDisposition::Unchanged
+            }
+            ProviderError::Combined { primary, secondary } => {
+                Self::unchanged_failure(primary) && secondary.iter().all(Self::unchanged_failure)
+            }
+            ProviderError::PreparationFailed(cause) => Self::unchanged_failure(cause),
+            ProviderError::Unsupported(_) => true,
+            ProviderError::Contract(_)
+            | ProviderError::Cleanup(_)
+            | ProviderError::Observation(_)
+            | ProviderError::RuntimeVersion(_)
+            | ProviderError::PreparationCleanup { .. }
+            | ProviderError::NotConsumed
+            | ProviderError::DeliveryUncertain
+            | ProviderError::Cancelled
+            | ProviderError::Retryable(_)
+            | ProviderError::Delivery(_) => false,
+        }
+    }
+
+    /// Restrict native mutation to the original command budget before its worker starts.
+    pub(crate) fn restrict_deadline(&mut self, deadline: tokio::time::Instant) {
+        self.deadline = Some(
+            self.deadline
+                .map_or(deadline, |current| current.min(deadline)),
+        );
+    }
+
     pub(crate) async fn run(self) -> Result<ConfigurationReconcileResult> {
         let lane = self.controller.configuration_lane().lock_owned().await;
         self.controller.ensure_configuration_certain()?;
-        let guard = ConfigurationWriteGuard {
+        let mut guard = ConfigurationWriteGuard {
             registry: self.registry,
             owner: self.owner,
             controller: self.controller,
@@ -231,9 +284,10 @@ impl ConfigurationReconcileJob {
                 let _lane = lane;
                 let configured = self
                     .provider
-                    .session_configure(self.request, &self.selection)
-                    .await
-                    .map_err(crate::provider::session_execution::CleanupWorkFailure::Provider)?;
+                    .session_configure(self.request, &self.selection, self.deadline)
+                    .await;
+                // A completed native rejection is a result, not failed task collection.
+                // Keep it outside the cleanup ledger so it cannot poison later commands.
                 *retained_receipt.lock().map_err(|_| {
                     crate::provider::session_execution::CleanupWorkFailure::Provider(
                         crate::provider::ProviderError::DeliveryUncertain,
@@ -258,6 +312,15 @@ impl ConfigurationReconcileJob {
             .map_err(|_| anyhow::anyhow!("configuration receipt lock poisoned"))?
             .take()
             .context("configuration worker did not retain its binding receipt")?;
+        let receipt = match receipt {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if Self::unchanged_failure(&error) {
+                    guard.armed = false;
+                }
+                return Err(error.into());
+            }
+        };
         Ok(ConfigurationReconcileResult {
             authority: self.authority,
             completed: self.completed,
@@ -295,7 +358,7 @@ impl ConfigurationPreparation {
             || p.pointer("/ask_model/model").is_some()
             || p.get("plan_executor_effort").is_some()
             || p.get("plan_executor_enabled").and_then(Value::as_bool) == Some(true)
-            || (p.get("validate").and_then(Value::as_bool) == Some(true) && selection)
+            || selection
             || (nonstandard_tier
                 && (p.get("service_tier").is_some()
                     || p.get("model").and_then(Value::as_str).is_some()))
@@ -303,6 +366,105 @@ impl ConfigurationPreparation {
 }
 
 impl HarnessBroker {
+    /// Validate and commit explicit Background model controls before creating its input exchange.
+    pub(crate) async fn configure_background_model(
+        &mut self,
+        config: &crate::service::TextGenerationConfig,
+    ) -> Result<crate::settings::ValidatedModelSelection> {
+        anyhow::ensure!(
+            self.session.background.is_some(),
+            "Background request requires a Background session"
+        );
+        let context = self
+            .provider
+            .query_context(&self.provider_catalog_request()?)
+            .await?;
+        let catalog = self.provider.model_list(context).await?;
+        let selection = crate::settings::ValidatedModelSelection::background(
+            config,
+            &self.capability,
+            &catalog,
+        )?;
+        let mut selected = self.session.clone();
+        selection.apply(&mut selected);
+        self.store.save_owned_session(&selected, &self.client_id)?;
+        self.session = selected;
+        self.context_usage_fresh &= self.session.context_usage.is_some();
+        Ok(selection)
+    }
+
+    /// Resolve inherited tuning before a controller can publish state or dispatch input.
+    pub(crate) async fn resolve_inherited_model_settings(&mut self) -> Result<()> {
+        let context = self
+            .provider
+            .query_context(&self.provider_catalog_request()?)
+            .await?;
+        let models = self.provider.model_list(context).await?;
+        let model = models
+            .iter()
+            .find(|model| {
+                if self.session.model == "default" {
+                    model.is_default
+                } else {
+                    model.id == self.session.model
+                }
+            })
+            .context(ConfigurationRejection::ModelUnavailable)?;
+        let mut selected = self.session.clone();
+        if selected.effort != "default" && !model.reasoning.contains(&selected.effort) {
+            selected.effort = model
+                .default_reasoning
+                .as_ref()
+                .filter(|choice| model.reasoning.contains(choice))
+                .cloned()
+                .unwrap_or_else(|| "default".into());
+        }
+        if selected.context_window.as_ref().is_some_and(|choice| {
+            !model
+                .context_window
+                .iter()
+                .any(|window| &window.id == choice)
+        }) {
+            selected.context_window = model
+                .default_context_window
+                .as_ref()
+                .filter(|choice| {
+                    model
+                        .context_window
+                        .iter()
+                        .any(|window| &window.id == *choice)
+                })
+                .cloned();
+        }
+        if selected.service_tier.validate(&self.capability).is_err()
+            || selected.service_tier.validate_model(model).is_err()
+        {
+            selected.service_tier = crate::provider::ServiceTier::Standard;
+        }
+        if selected.effort == self.session.effort
+            && selected.context_window == self.session.context_window
+            && selected.service_tier == self.session.service_tier
+        {
+            return Ok(());
+        }
+        if selected.context_window != self.session.context_window {
+            selected.context_usage = None;
+        }
+        self.store.save_owned_session(&selected, &self.client_id)?;
+        self.trace.record(
+            &selected.id,
+            "session.inherited_model_settings_resolved",
+            json!({
+                "model": selected.model,
+                "effort": selected.effort,
+                "context_window": selected.context_window,
+                "service_tier": selected.service_tier,
+            }),
+        );
+        self.session = selected;
+        Ok(())
+    }
+
     /// Complete a durable configuration before replacing a fenced provider generation.
     pub(crate) fn recover_pending_configuration(&mut self) -> Result<bool> {
         let controller = self.task_controller.clone();
@@ -370,6 +532,25 @@ impl HarnessBroker {
         effective.approval_timeout = Some(self.session.approval_timeout);
         effective.tool_timeout = Some(self.session.tool_timeout);
         settings.confirm_application(&self.session.id, operation, revision, effective)?;
+        let fields: Vec<String> = action
+            .pointer("/config/setting_fields")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        self.store
+            .save_session_event(&crate::timeline::SessionEventRecord {
+                id: format!("{}:configuration:{operation}", self.session.id),
+                session_id: self.session.id.clone(),
+                owner: crate::timeline::TimelineOwner::session(&self.session.id),
+                created_at_ms: self.clock.now_ms(),
+                detail: crate::timeline::SessionEventKind::Configuration {
+                    operation_id: operation.to_owned(),
+                    state: "completed".into(),
+                    field: fields,
+                    reason: None,
+                },
+            })?;
         Ok(())
     }
 
@@ -457,8 +638,6 @@ impl HarnessBroker {
                 params["settings_revision"].as_u64() == Some(settings.revision),
                 ConfigurationRejection::SettingsChanged
             );
-            params["access"] =
-                serde_json::to_value(settings.desired.access.clone().unwrap_or_default())?;
             params["shell"] = serde_json::to_value(settings.desired.shell.unwrap_or_default())?;
             params["plan_compact"] = json!(
                 settings.desired.plan_compact.unwrap_or(false) && self.capability.native_compact
@@ -474,6 +653,10 @@ impl HarnessBroker {
                     params[key] = value.clone();
                 }
             }
+            params["access"] = serde_json::to_value(
+                self.capability
+                    .resolve_access(settings.desired.access.clone().unwrap_or_default()),
+            )?;
             resource_selection = Some(settings.desired);
         }
         Ok(Box::new(ConfigurationPreparation {
@@ -565,7 +748,6 @@ impl HarnessBroker {
                 || self.capability.effort_selection,
             ConfigurationRejection::EffortUnavailable,
         );
-        let validate_selection = params.get("validate").and_then(Value::as_bool) == Some(true);
         let mut plan_executor = self.session.plan_executor.clone();
         let mut plan_compact = self.session.plan_compact;
         if let Some(enabled) = params.get("plan_compact").and_then(Value::as_bool) {
@@ -625,15 +807,13 @@ impl HarnessBroker {
         {
             self.validate_configuration_executor(&plan_executor, models)?;
         }
-        let selected_tier = requested_service_tier.unwrap_or(self.session.service_tier);
+        let mut selected_tier = requested_service_tier.unwrap_or(self.session.service_tier);
         let validate_tier = selected_tier != crate::provider::ServiceTier::Standard
             && (requested_service_tier.is_some() || requested_model.is_some());
         if requested_model.is_some()
             || validate_tier
-            || (validate_selection
-                && (requested_model.is_some()
-                    || requested_effort.is_some()
-                    || requested_context_window.is_some()))
+            || requested_effort.is_some()
+            || requested_context_window.is_some()
         {
             let model_list = models;
             let selected_model = requested_model.unwrap_or_else(|| {
@@ -656,6 +836,23 @@ impl HarnessBroker {
                     ConfigurationRejection::ModelUnavailable
                 );
             }
+            if requested_model.is_some_and(|model| model != self.session.model) {
+                let model = target_model.context(ConfigurationRejection::ModelUnavailable)?;
+                if requested_effort.is_none() {
+                    configured.effort = model
+                        .default_reasoning
+                        .clone()
+                        .unwrap_or_else(|| "default".into());
+                }
+                if params.get("context_window").is_none() {
+                    configured.context_window = model.default_context_window.clone();
+                }
+                if requested_service_tier.is_none() && selected_tier.validate_model(model).is_err()
+                {
+                    selected_tier = crate::provider::ServiceTier::Standard;
+                    configured.service_tier = selected_tier;
+                }
+            }
             if validate_tier {
                 selected_tier
                     .validate_model(target_model.context(ConfigurationRejection::ModelUnavailable)?)
@@ -663,24 +860,21 @@ impl HarnessBroker {
             }
             if let Some(effort) = requested_effort {
                 let model = target_model.context(ConfigurationRejection::ModelUnavailable)?;
-                if !model.reasoning.is_empty() {
-                    anyhow::ensure!(
-                        model.reasoning.iter().any(|candidate| candidate == effort),
-                        ConfigurationRejection::EffortUnavailable
-                    );
-                }
+                anyhow::ensure!(
+                    effort == "default"
+                        || model.reasoning.iter().any(|candidate| candidate == effort),
+                    ConfigurationRejection::EffortUnavailable
+                );
             }
             if let Some(context_window) = requested_context_window {
                 let model = target_model.context(ConfigurationRejection::ModelUnavailable)?;
-                if !model.context_window.is_empty() {
-                    anyhow::ensure!(
-                        model
-                            .context_window
-                            .iter()
-                            .any(|candidate| candidate.id == context_window),
-                        ConfigurationRejection::ContextWindowUnavailable
-                    );
-                }
+                anyhow::ensure!(
+                    model
+                        .context_window
+                        .iter()
+                        .any(|candidate| candidate.id == context_window),
+                    ConfigurationRejection::ContextWindowUnavailable
+                );
             }
         }
         if let Some(model) = params.get("model").and_then(Value::as_str) {
@@ -751,13 +945,11 @@ impl HarnessBroker {
             || lsp_tools.is_some_and(|enabled| enabled != self.lsp.enabled(&self.session.id))
             || session_tools.is_some();
         if let Some(access) = &access {
+            self.capability
+                .validate_access(access)
+                .context(ConfigurationRejection::AccessPolicyInvalid)?;
             configured.access = access.clone();
         }
-        configured.access = forge_providers::registry::resolve(
-            &forge_providers::registry::select(&configured.provider)?,
-        )?
-        .capability
-        .resolve_access(configured.access.clone());
         let update_model_preference = requested_model.is_some()
             || requested_effort.is_some()
             || params.get("context_window").is_some();
@@ -1112,7 +1304,7 @@ impl HarnessBroker {
             .find(|candidate| candidate.id == model)
             .context(ConfigurationRejection::PlanExecutorUnavailable)?;
         anyhow::ensure!(
-            selected.reasoning.is_empty()
+            effort == "default"
                 || selected
                     .reasoning
                     .iter()
@@ -1127,6 +1319,7 @@ impl HarnessBroker {
     /// Capture catalog work and the authority that must still own its result.
     pub(crate) fn prepare_configuration_catalog(&self) -> Result<ConfigurationCatalogJob> {
         Ok(ConfigurationCatalogJob {
+            deadline: None,
             provider: Arc::clone(&self.provider),
             request: self.provider_catalog_request()?,
             authority: self.capture_configuration_authority()?,
@@ -1149,6 +1342,7 @@ impl HarnessBroker {
     ) -> Result<ConfigurationReconcileJob> {
         self.task_controller.ensure_configuration_certain()?;
         Ok(ConfigurationReconcileJob {
+            deadline: None,
             provider: Arc::clone(&self.provider),
             request,
             selection,
@@ -1360,7 +1554,15 @@ impl HarnessBroker {
         {
             None
         } else {
-            Some(access.validate()?)
+            let access = access.validate()?;
+            if action.get("permission_selection").is_some() {
+                self.capability
+                    .validate_access(&access)
+                    .context(ConfigurationRejection::AccessPolicyInvalid)?;
+                Some(access)
+            } else {
+                Some(self.capability.resolve_access(access))
+            }
         };
         Ok(PermissionConfiguration {
             session_id: self.session.id.clone(),
@@ -1417,7 +1619,6 @@ impl HarnessBroker {
             configured.approval_mode = captured.selected_approval;
             configured.approval_timeout = self.permission_coordinator.approval_timeout(&configured.id)?;
             if let Some(access) = &captured.selected_access { configured.access = access.clone(); }
-            configured.access = forge_providers::registry::resolve(&forge_providers::registry::select(&configured.provider)?)?.capability.resolve_access(configured.access);
             self.session = configured;
             self.permission_coordinator.configure_timeout(&self.session.id, self.session.approval_timeout)?;
             if let Err(error) = self.save_session() {
@@ -1432,8 +1633,8 @@ impl HarnessBroker {
                 settings.patch(crate::settings::SettingTarget { scope: crate::settings::SettingScope::Session,
                     workspace: &self.session.workspace, session: &self.session.id }, &portable)?;
             }
-            let update = SessionUpdate::Configuration { session: Box::new(self.session_view()?),
-                access_abbreviation: self.session.access.abbreviation().into(), operation_id: captured.operation_id,
+            let update = SessionUpdate::Configuration { snapshot: Box::new(self.snapshot()?),
+                operation_id: captured.operation_id,
                 catalog: Box::new(self.provider_catalog_request()?) };
             let delivery = self.prepare_provider_delivery(AppliedProviderEvent::Update(update))?;
             let resume = if captured.resume {
@@ -1680,8 +1881,7 @@ impl HarnessBroker {
         }
         self.emit_session_update(
             SessionUpdate::Configuration {
-                session: Box::new(self.session_view()?),
-                access_abbreviation: self.session.access.abbreviation().into(),
+                snapshot: Box::new(self.snapshot()?),
                 operation_id: self.active_operation_id.clone(),
                 catalog: Box::new(self.provider_catalog_request()?),
             },
@@ -1716,6 +1916,228 @@ impl HarnessBroker {
 #[cfg(test)]
 mod owned_tests {
     use super::*;
+
+    /// Preserve authoritative rejection without weakening the fence for uncertain writes.
+    #[tokio::test]
+    async fn configuration_native_rejection_preserves_binding_while_uncertainty_fences()
+    -> Result<()> {
+        use forge_provider_api::{
+            FailureDisposition, ProviderFailure, ProviderFailureKind, ProviderOperation,
+        };
+        for disposition in [FailureDisposition::Unchanged, FailureDisposition::Uncertain] {
+            let workspace = super::super::test::repository();
+            let data = tempfile::tempdir()?;
+            let mut broker =
+                super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+            let owner = crate::provider::ExecutionOwner::root(&broker.session.id);
+            let descriptor = forge_providers::registry::descriptor(
+                &forge_providers::registry::nonselectable_id().unwrap(),
+            )
+            .unwrap();
+            let native = crate::provider::test_support::EventFixtureProvider::new(
+                descriptor,
+                |request, sink, _| async move {
+                    sink.send_wait(ProviderEvent::Execution {
+                        observation: forge_provider_api::ExecutionObservation::new(
+                            request.scope,
+                            forge_provider_api::ExecutionUpdate::ResolvedWithoutExecution {
+                                covered_submissions: vec![request.submission_id],
+                                completed_at_ms: 1,
+                                result: forge_provider_api::ExecutionResult::Completed {
+                                    completion:
+                                        forge_provider_api::completion::ProviderCompletion::default(
+                                        )
+                                        .into(),
+                                },
+                            },
+                        )?,
+                    })
+                    .await?;
+                    Ok(())
+                },
+            );
+            let reject = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let bindings = Arc::new(std::sync::Mutex::new(Vec::new()));
+            native.with_session_configure({
+                let reject = reject.clone();
+                let bindings = bindings.clone();
+                move |binding, _| {
+                    let reject = reject.load(Ordering::Acquire);
+                    bindings.lock().unwrap().push(binding);
+                    async move {
+                        if reject {
+                            return Err(ProviderError::Failure(
+                                ProviderFailure::new(
+                                    ProviderOperation::SessionConfigure,
+                                    ProviderFailureKind::ResourceConflict,
+                                )
+                                .at_phase(
+                                    forge_provider_api::ProviderPhase::Admission,
+                                    disposition,
+                                ),
+                            ));
+                        }
+                        Ok(())
+                    }
+                }
+            });
+            let fixture = crate::provider::test_support::ProviderTestSession::from_native(native)?;
+            broker.set_provider_for_test(fixture.provider_handle());
+            let registry = broker.execution_registry();
+            let engine = registry.owner(owner.clone()).await?;
+            broker
+                .provider
+                .session_open(
+                    broker.provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
+                )
+                .await?;
+            let original = serde_json::to_value(&broker.session)?;
+            reject.store(true, Ordering::Release);
+            let preparation = broker.prepare_configuration(json!({"session_tools":false}))?;
+            let candidate = broker.build_configuration_candidate(preparation, &[])?;
+            let error = broker
+                .prepare_candidate_reconcile(&candidate)?
+                .unwrap()
+                .run()
+                .await
+                .err()
+                .context("native configuration unexpectedly succeeded")?;
+            let native_error = error
+                .downcast_ref::<ProviderError>()
+                .context("native failure identity was lost")?;
+            assert!(matches!(native_error, ProviderError::Failure(failure)
+                if failure.kind() == ProviderFailureKind::ResourceConflict && failure.disposition() == disposition));
+            assert_eq!(serde_json::to_value(&broker.session)?, original);
+            assert_eq!(
+                broker.task_controller.configuration_is_uncertain(),
+                disposition == FailureDisposition::Uncertain
+            );
+            if disposition == FailureDisposition::Unchanged {
+                assert!(ConfigurationReconcileJob::unchanged_failure(native_error));
+                registry.collect_cleanup().await?;
+                assert!(engine.is_healthy().await);
+                reject.store(false, Ordering::Release);
+                let preparation = broker.prepare_configuration(json!({"session_tools":false}))?;
+                let mut candidate = broker.build_configuration_candidate(preparation, &[])?;
+                let result = broker
+                    .prepare_candidate_reconcile(&candidate)?
+                    .unwrap()
+                    .run()
+                    .await?;
+                broker.certify_candidate_reconcile(&mut candidate, result)?;
+                broker.commit_configuration_candidate(candidate)?;
+                let bindings = bindings.lock().unwrap();
+                assert!(
+                    bindings.windows(2).all(|pair| pair[0] == pair[1]),
+                    "unchanged rejection replaced its binding"
+                );
+                drop(bindings);
+                let scope =
+                    crate::provider::InvocationScope::new(owner, "after-rejected-configuration");
+                let (sink, _events) = crate::provider::events::channel(scope);
+                engine
+                    .run_once(
+                        broker.provider_request(
+                            ProviderInput::from_text("Prompt after rejected configuration"),
+                            PromptMode::Chat,
+                        )?,
+                        sink,
+                        &broker.submission_store,
+                    )
+                    .await?;
+                engine.close().await?;
+            } else {
+                assert!(!ConfigurationReconcileJob::unchanged_failure(native_error));
+                assert!(
+                    broker
+                        .prepare_configuration_reconcile(
+                            broker
+                                .provider_request(ProviderInput::from_text(""), PromptMode::Chat)?,
+                            Default::default(),
+                        )
+                        .is_err(),
+                    "uncertain write admitted another configuration"
+                );
+            }
+            broker.provider.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    /// An empty advertised choice list must reject overrides before settings are persisted.
+    #[test]
+    fn context_override_without_advertised_choices_is_rejected() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let before = broker.session.context_window.clone();
+        let model = crate::provider::ProviderModel {
+            id: broker.session.model.clone(),
+            service_tiers: Vec::new(),
+            reasoning: Vec::new(),
+            default_reasoning: None,
+            selected_reasoning: None,
+            context_window: Vec::new(),
+            default_context_window: None,
+            selected_context_window: None,
+            vision: false,
+            description: None,
+            is_default: true,
+        };
+        let preparation = broker.prepare_configuration(json!({"context_window":"fabricated"}))?;
+        let rejected = broker.build_configuration_candidate(preparation, &[model]);
+        assert!(
+            rejected.is_err(),
+            "unadvertised context override was accepted"
+        );
+        assert_eq!(broker.session.context_window, before);
+        assert!(
+            broker
+                .store
+                .pending_configuration_intent(&broker.session.id)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    /// Resolve omitted controls against the newly selected model, never its predecessor.
+    #[test]
+    fn model_change_replaces_incompatible_inherited_controls() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let mut broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        broker.session.model = "previous-model".into();
+        broker.session.effort = "high".into();
+        broker.session.context_window = Some("large".into());
+        broker.session.service_tier = crate::provider::ServiceTier::Fast;
+        broker.session.context_usage = crate::session::ContextUsage::reported(900, 1000000);
+        let model = crate::provider::ProviderModel {
+            id: "next-model".into(),
+            service_tiers: Vec::new(),
+            reasoning: vec!["low".into()],
+            default_reasoning: Some("low".into()),
+            selected_reasoning: None,
+            context_window: Vec::new(),
+            default_context_window: None,
+            selected_context_window: None,
+            vision: false,
+            description: None,
+            is_default: false,
+        };
+        let preparation = broker.prepare_configuration(json!({"model":"next-model"}))?;
+        let mut candidate = broker.build_configuration_candidate(preparation, &[model])?;
+        candidate.rebase(&broker.session);
+        assert_eq!(candidate.configured.effort, "low");
+        assert!(candidate.configured.context_window.is_none());
+        assert_eq!(
+            candidate.configured.service_tier,
+            crate::provider::ServiceTier::Standard
+        );
+        assert!(candidate.configured.context_usage.is_none());
+        Ok(())
+    }
 
     /// Select whether a completed binding receipt still authorizes the pending host commit.
     #[derive(Clone, Copy)]
@@ -2107,6 +2529,36 @@ mod owned_tests {
         broker.session.model = "newer-model".to_owned();
         assert!(broker.commit_configuration_catalog(result).is_err());
         assert_eq!(broker.session.model, "newer-model");
+        Ok(())
+    }
+
+    /// Explicit policy errors must not become silent inherited-default resolution.
+    #[tokio::test]
+    async fn explicit_isolation_rejects_before_configuration_commit() -> Result<()> {
+        let workspace = super::super::test::repository();
+        let data = tempfile::tempdir()?;
+        let broker =
+            super::super::test::planning_question_broker(workspace.path(), data.path(), false);
+        let original = broker.session.access.clone();
+        let mut invalid = original.clone();
+        invalid.sandbox = false;
+        invalid.isolation_mode = Some("not-advertised".into());
+        let preparation = broker.prepare_configuration(json!({"access":invalid}))?;
+        let error = broker
+            .build_configuration_candidate(preparation, &[])
+            .err()
+            .expect("unadvertised isolation was accepted");
+        assert!(error.is::<forge_provider_api::model::AccessCapabilityError>());
+        assert_eq!(broker.session.access, original);
+        let mut unavailable_sandbox = original.clone();
+        unavailable_sandbox.sandbox = true;
+        let preparation = broker.prepare_configuration(json!({"access":unavailable_sandbox}))?;
+        assert!(
+            broker
+                .build_configuration_candidate(preparation, &[])
+                .is_err()
+        );
+        assert_eq!(broker.session.access, original);
         Ok(())
     }
 

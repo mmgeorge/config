@@ -30,7 +30,7 @@ end
 local function wait_settled()
   assert(vim.wait(15000, function()
     local input_idle = not state.input or (#state.input.pending == 0 and #state.input.confirmed == 0)
-    return #errors > 0 or (input_idle and not state.busy and not state.task_operation and not state.state_sync_pending)
+    return #errors > 0 or (input_idle and not require("forge.views.harness.activity").busy(state) and not state.state_sync_pending)
   end, 10), "task did not settle: " .. vim.inspect(task.current(state)))
   assert(#errors == 0, table.concat(errors, "\n"))
 end
