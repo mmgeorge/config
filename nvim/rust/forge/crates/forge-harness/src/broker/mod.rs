@@ -5638,13 +5638,10 @@ impl HarnessBroker {
                     .store
                     .latest_exchange(&self.session.id)?
                     .context("check setup source disappeared")?;
-                self.task_controller.observe_plan(
+                self.task_controller.observe_plan_response(
                     &mut self.store,
                     &current.permit(),
-                    crate::task::TaskTurnId {
-                        exchange_ordinal: exchange.ordinal,
-                        turn_ordinal: exchange.turn.len(),
-                    },
+                    &exchange,
                     after != setup_digest,
                     self.clock.now_ms(),
                 )?;
@@ -6414,7 +6411,9 @@ impl HarnessBroker {
             .as_mut()
             .context("foreground transaction already committed")?;
         if let Some(permit) = &runtime.task_permit {
-            permit.validate(self.task_controller.current()?.as_ref())?;
+            // A response can edit its own plan before its remaining events arrive.
+            // User control invalidates observation authority; those plan edits do not.
+            permit.validate_observation(self.task_controller.current()?.as_ref())?;
         }
         let mut events = Vec::new();
         let effects = self.apply_provider_event(

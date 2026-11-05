@@ -15,6 +15,129 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+enum PlanningRestart {
+    Permissions,
+    Effort,
+}
+
+/// Configuration restarts must not exhaust a plan before any uninterrupted response finishes.
+#[tokio::test]
+async fn planning_permission_restarts_preserve_no_progress_budget() -> Result<()> {
+    planning_configuration_restarts(PlanningRestart::Permissions).await
+}
+
+/// Model effort uses the same planning accounting as execution permission changes.
+#[tokio::test]
+async fn planning_effort_restarts_preserve_no_progress_budget() -> Result<()> {
+    planning_configuration_restarts(PlanningRestart::Effort).await
+}
+
+/// Drive real owner restarts with held native turns across both configuration routes.
+async fn planning_configuration_restarts(setting: PlanningRestart) -> Result<()> {
+    use crate::provider::mock_response::MockResponseCommand;
+    use forge_provider_api::testing::{TestPromptScript, TestPromptStep, TestPromptTerminal};
+    let root = tempfile::tempdir()?;
+    crate::checks::configure_fixture(root.path());
+    let service = service();
+    service.open_session(1, initialize(&root, "mock")).await?;
+    let registry = service.registry().await?;
+    let session_id = registry.initial_session_id().to_owned();
+    let controller = registry.resolve(&session_id).await?;
+    let provider = controller.provider_handle();
+    let control = provider.mock_response_control().unwrap();
+    let response = TestPromptScript {
+        acceptance: Default::default(),
+        steps: vec![TestPromptStep::Message {
+            role: forge_provider_api::MessageRole::Response,
+            text: "I have not changed the plan yet.".into(),
+        }],
+        terminal: TestPromptTerminal::Completed,
+    };
+    control
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Script {
+                script: response.clone(),
+            },
+        )
+        .await?;
+    let hold = control
+        .dispatch(
+            &session_id,
+            MockResponseCommand::Hold {
+                mode: None,
+                any_session: false,
+            },
+        )
+        .await?;
+    let (sink, mut output) = forge_protocol::outbound::channel();
+    let reader = tokio::spawn(async move {
+        while output.recv().await?.is_some() {}
+        Ok::<(), anyhow::Error>(())
+    });
+    controller.attach_input(&sink).await?;
+    let start = Request {
+        id: 2,
+        method: "session.command.apply".into(),
+        params: json!({"operation_id":"restart-plan","action":"plan","text":"Plan a small game"}),
+    };
+    service.prepare_task(Some(&session_id), &start).await?;
+    service
+        .dispatch(Some(session_id.clone()), start, &sink)
+        .await?;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        control.dispatch(
+            &session_id,
+            MockResponseCommand::Wait {
+                id: hold["id"].as_str().unwrap().into(),
+            },
+        ),
+    )
+    .await??;
+    let task_id = controller.task_controller.current()?.unwrap().id.clone();
+    let scenario = async {
+        let mut current_hold = hold["id"].as_str().unwrap().to_owned();
+        for index in 0..6 {
+            control.dispatch(&session_id, MockResponseCommand::Script {script:response.clone()}).await?;
+            let hold = control.dispatch(&session_id, MockResponseCommand::Hold {mode:None,any_session:false}).await?;
+            let request = match setting {
+                PlanningRestart::Effort => crate::service::native_settings::decode_command(&Request {
+                id:10+index,method:"session.command.apply".into(),
+                params:json!({"operation_id":format!("planning-effort-{index}"),"action":"configure","config":{"effort":if index%2==0 {"high"} else {"low"}}}),
+            })?,
+                PlanningRestart::Permissions => crate::service::native_permission::decode_command(&Request {
+                id:10+index,method:"session.command.apply".into(),
+                params:json!({"operation_id":format!("planning-toggle-{index}"),"action":"permission","change":{"kind":"toggle_write_enabled"}}),
+            })?,
+            };
+            tokio::time::timeout(Duration::from_secs(10), controller.exchange_owner.execute_identified(request,sink.clone())).await??;
+            tokio::time::timeout(Duration::from_secs(5), control.dispatch(&session_id, MockResponseCommand::Wait {id:hold["id"].as_str().unwrap().into()})).await??;
+            current_hold = hold["id"].as_str().unwrap().to_owned();
+            let task = controller.task_controller.current()?.unwrap();
+            assert_eq!(task.id, task_id);
+            let crate::task::WorkflowSnapshot::Plan { plan } = &task.workflow else { panic!("planning task replaced"); };
+            assert_eq!(plan.artifact.generation.budget.turn_count, 0, "configuration interrupted turn counted at toggle {index}");
+            assert_eq!(plan.artifact.generation.budget.consecutive_no_progress, 0);
+            assert_eq!(plan.artifact.state, crate::plan::PlanState::Generating);
+        }
+        let continuation = control.dispatch(&session_id, MockResponseCommand::Hold {mode:None,any_session:false}).await?;
+        control.dispatch(&session_id, MockResponseCommand::Release {id:current_hold}).await?;
+        tokio::time::timeout(Duration::from_secs(5), control.dispatch(&session_id, MockResponseCommand::Wait {id:continuation["id"].as_str().unwrap().into()})).await??;
+        let task = controller.task_controller.current()?.unwrap();
+        let crate::task::WorkflowSnapshot::Plan { plan } = &task.workflow else { panic!("planning task replaced"); };
+        assert_eq!(task.id, task_id);
+        assert_eq!(plan.artifact.generation.budget.turn_count, 1, "one completed response must count after interrupted attempts");
+        assert_eq!(plan.artifact.generation.budget.consecutive_no_progress, 1);
+        assert_eq!(plan.artifact.state, crate::plan::PlanState::Generating);
+        Ok::<(),anyhow::Error>(())
+    }.await;
+    service.shutdown(Duration::from_secs(10)).await?;
+    drop(sink);
+    tokio::time::timeout(Duration::from_secs(5), reader).await???;
+    scenario
+}
+
 fn goal_command_request(transport: &str, command: &str, id: u64) -> Request {
     let operation = format!("{transport}-{command}-{id}");
     let text = if command == "goal" {

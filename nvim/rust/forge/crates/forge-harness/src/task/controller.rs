@@ -839,15 +839,37 @@ impl SessionTaskController {
             .context("turn observation unexpectedly reused a command")
     }
 
-    /// Commits planning progress once per completed turn under the current contract.
-    pub(crate) fn observe_plan(
+    /// Count a completed response once; interruption and failure never consume the plan budget.
+    pub(crate) fn observe_plan_response(
         &self,
         store: &mut SqliteStore,
         permit: &TaskPermit,
-        completed_turn: crate::task::TaskTurnId,
+        exchange: &crate::exchange::Exchange,
         canonical_progress: bool,
         now_ms: i64,
     ) -> Result<Option<(crate::plan::PlanRecord, bool)>> {
+        use crate::turn::{TurnOutcome, TurnState};
+
+        let Some(response) = exchange.turn.last() else {
+            return Ok(None);
+        };
+        match response.state() {
+            TurnState::Finished {
+                outcome: TurnOutcome::Completed,
+            } => {}
+            TurnState::Running
+            | TurnState::Finished {
+                outcome: TurnOutcome::Cancelled | TurnOutcome::Interrupted | TurnOutcome::Failed,
+            } => return Ok(None),
+        }
+        ensure!(
+            exchange.session_id == self.session_id,
+            "planning response belongs to another session"
+        );
+        let completed_turn = crate::task::TaskTurnId {
+            exchange_ordinal: exchange.ordinal,
+            turn_ordinal: exchange.turn.len(),
+        };
         store.commit_task_change(
             &self.session_id,
             Some(permit.revision()),
@@ -2523,17 +2545,14 @@ mod tests {
                 2,
             )?
             .unwrap();
-        let completed = crate::task::TaskTurnId {
-            exchange_ordinal: 1,
-            turn_ordinal: 1,
-        };
+        let completed = planning_response(1, Some(crate::turn::TurnOutcome::Completed))?;
         let (plan, _) = controller
-            .observe_plan(&mut store, &task.permit(), completed.clone(), true, 3)?
+            .observe_plan_response(&mut store, &task.permit(), &completed, true, 3)?
             .unwrap();
         assert_eq!(plan.generation.budget.turn_count, 1);
         assert!(
             controller
-                .observe_plan(&mut store, &task.permit(), completed.clone(), true, 4)?
+                .observe_plan_response(&mut store, &task.permit(), &completed, true, 4)?
                 .is_none()
         );
         let saved = controller.current()?.unwrap();
@@ -2545,11 +2564,92 @@ mod tests {
         controller.change(&mut store, Some(&saved.revision), TaskChange::Pause, 5)?;
         assert!(
             controller
-                .observe_plan(&mut store, &task.permit(), completed, true, 6)
+                .observe_plan_response(&mut store, &task.permit(), &completed, true, 6)
                 .unwrap_err()
                 .is::<crate::task::StaleTask>()
         );
         Ok(())
+    }
+
+    /// Only completed responses advance the budget; real progress resets the no-change streak.
+    #[test]
+    fn planning_budget_counts_responses_not_interrupted_attempts() -> Result<()> {
+        use crate::turn::TurnOutcome;
+
+        let (_root, mut store, controller) = SessionTaskController::test_goal();
+        let previous = controller.current()?.unwrap();
+        let artifact = serde_json::from_value(serde_json::json!({
+            "id":"plan", "session_id":"session", "request":"Design the change",
+            "state":"generating", "working_path":"working.md", "model_revision":0,
+            "user_revision":0, "created_at_ms":1, "updated_at_ms":1
+        }))?;
+        controller.change(
+            &mut store,
+            Some(&previous.revision),
+            TaskChange::Install(Box::new(Task::plan(artifact, 2)?)),
+            2,
+        )?;
+        let mut ordinal = 0;
+        for completed in 1..=7 {
+            for outcome in [
+                None,
+                Some(TurnOutcome::Cancelled),
+                Some(TurnOutcome::Interrupted),
+                Some(TurnOutcome::Failed),
+            ] {
+                ordinal += 1;
+                let response = planning_response(ordinal, outcome)?;
+                let before = controller.current()?.unwrap();
+                assert!(
+                    controller
+                        .observe_plan_response(&mut store, &before.permit(), &response, true, 3)?
+                        .is_none()
+                );
+                assert_eq!(
+                    serde_json::to_value(controller.current()?)?,
+                    serde_json::to_value(Some(before))?
+                );
+            }
+            ordinal += 1;
+            let response = planning_response(ordinal, Some(TurnOutcome::Completed))?;
+            let task = controller.current()?.unwrap();
+            let changed = completed == 2;
+            let (plan, continuing) = controller
+                .observe_plan_response(&mut store, &task.permit(), &response, changed, 4)?
+                .unwrap();
+            assert_eq!(plan.generation.budget.turn_count, completed);
+            assert_eq!(
+                u32::from(plan.generation.budget.consecutive_no_progress),
+                if completed < 2 {
+                    completed
+                } else {
+                    completed - 2
+                }
+            );
+            assert_eq!(continuing, completed < 7);
+            assert_eq!(plan.state == crate::plan::PlanState::Failed, completed == 7);
+        }
+        assert_eq!(controller.current()?.unwrap().status(), TaskStatus::Blocked);
+        Ok(())
+    }
+
+    /// Build a recorded provider attempt with an explicit terminal outcome or active execution.
+    fn planning_response(
+        ordinal: u64,
+        outcome: Option<crate::turn::TurnOutcome>,
+    ) -> Result<crate::exchange::Exchange> {
+        let mut exchange: crate::exchange::Exchange = serde_json::from_value(serde_json::json!({
+            "id":format!("exchange-{ordinal}"), "session_id":"session", "agent_id":"agent",
+            "ordinal":ordinal, "prompt":"Plan", "state":"running", "created_at_ms":1,
+            "node_list":[], "attributed_matches_checkpoint":false
+        }))?;
+        let address = crate::turn::test_support::address(&exchange, "response");
+        let mut turn = crate::turn::Turn::new("response".into(), address, 1);
+        if let Some(outcome) = outcome {
+            turn.finish(outcome, 2)?;
+        }
+        exchange.turn.push(turn);
+        Ok(exchange)
     }
 
     #[test]

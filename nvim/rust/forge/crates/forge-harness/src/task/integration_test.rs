@@ -366,17 +366,17 @@ fn draft_prerequisites_continue_then_suspend_with_their_setup_position() -> Resu
     )?;
     for ordinal in 1..=5 {
         let task = controller.current()?.unwrap();
+        let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+            "id":format!("setup-{ordinal}"), "session_id":"session", "agent_id":"agent",
+            "ordinal":ordinal, "prompt":"Configure checks", "state":"running", "created_at_ms":1,
+            "node_list":[], "attributed_matches_checkpoint":false
+        }))?;
+        let address = crate::turn::test_support::address(&exchange, "response");
+        let mut turn = crate::turn::Turn::new("response".into(), address, 1);
+        turn.finish(crate::turn::TurnOutcome::Completed, 2)?;
+        exchange.turn.push(turn);
         let (_, continuing) = controller
-            .observe_plan(
-                &mut store,
-                &task.permit(),
-                TaskTurnId {
-                    exchange_ordinal: ordinal,
-                    turn_ordinal: 1,
-                },
-                false,
-                2,
-            )?
+            .observe_plan_response(&mut store, &task.permit(), &exchange, false, 2)?
             .unwrap();
         assert_eq!(continuing, ordinal < 5);
         let current = controller.current()?.unwrap();

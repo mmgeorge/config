@@ -1411,11 +1411,7 @@ impl HarnessBroker {
             {
                 finalization
                     .events
-                    .extend(self.finish_owned_planning_observation(
-                        planning,
-                        interaction,
-                        turn.clone(),
-                    )?);
+                    .extend(self.finish_owned_planning_observation(planning, interaction)?);
                 finalization.planning_observed_turn = Some(turn);
             }
         }
@@ -1639,12 +1635,11 @@ impl HarnessBroker {
         ))
     }
 
-    /// Record one planning turn once, retaining any resulting presentation for delivery.
+    /// Observe the recorded response, retaining any resulting presentation for delivery.
     fn finish_owned_planning_observation(
         &mut self,
         context: &foreground_dispatch::PlanningContext,
         interaction: &Exchange,
-        turn: crate::task::TaskTurnId,
     ) -> Result<Vec<SessionEvent>> {
         let Some(current) = self.task_controller.current()?.filter(|task| matches!(&task.workflow,
             crate::task::WorkflowSnapshot::Plan { plan } if plan.artifact.id == context.plan_id && !plan.paused)) else { return Ok(Vec::new()) };
@@ -1664,10 +1659,10 @@ impl HarnessBroker {
         let document = self
             .plan_file
             .read_working_document(&self.session.id, &context.plan_id)?;
-        let observed = match self.task_controller.observe_plan(
+        let observed = match self.task_controller.observe_plan_response(
             &mut self.store,
             &current.permit(),
-            turn,
+            interaction,
             document.version != context.before_version,
             self.clock.now_ms(),
         ) {

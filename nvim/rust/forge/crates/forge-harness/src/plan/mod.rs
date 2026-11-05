@@ -340,7 +340,7 @@ pub struct PlanGeneration {
 }
 
 impl PlanGeneration {
-    /// Record one provider turn and return whether another planning turn may run.
+    /// Count one completed response and allow continuation while its progress budget remains.
     pub fn observe(&mut self, canonical_progress: bool) -> bool {
         self.budget.observe(canonical_progress)
     }
